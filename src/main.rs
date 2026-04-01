@@ -85,27 +85,6 @@ fn write_kde_config(dir: &str, file: &str, entries: &[(&str, &str, &str)]) -> an
     Ok(())
 }
 
-fn detect_xdisplay(before: &std::collections::HashMap<String, u64>, deadline: std::time::Instant) -> anyhow::Result<String> {
-    for entry in std::fs::read_dir("/tmp/.X11-unix").into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let ino = std::os::unix::fs::MetadataExt::ino(&entry.metadata().map_err(|e| anyhow::anyhow!("{e}"))?);
-        if before.get(&name).is_none_or(|old_ino| *old_ino != ino) {
-            return Ok(format!(":{}", name.strip_prefix('X').unwrap_or(&name)));
-        }
-    }
-    anyhow::ensure!(std::time::Instant::now() < deadline, "XWayland display did not appear");
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    detect_xdisplay(before, deadline)
-}
-
-fn snapshot_x_sockets() -> std::collections::HashMap<String, u64> {
-    std::fs::read_dir("/tmp/.X11-unix").into_iter().flatten().flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            let ino = std::os::unix::fs::MetadataExt::ino(&e.metadata().ok()?);
-            Some((name, ino))
-        }).collect()
-}
 
 fn eis_devices_ready(dev: &Option<reis::ei::Device>, kb: &Option<reis::ei::Keyboard>) -> bool {
     matches!((dev, kb), (Some(_), Some(_)))
@@ -226,20 +205,11 @@ struct Eis {
     ptr_dev: reis::ei::Device,
     kbd_dev: reis::ei::Device,
     serial: u32,
-    #[expect(dead_code)] // held alive for EIS fd lifetime
-    conn: Box<dbus::blocking::Connection>,
 }
 
 impl Eis {
-    #[expect(clippy::wildcard_enum_match_arm)]
-    fn connect(dbus_addr: &str) -> anyhow::Result<Self> {
-        let mut ch = dbus::channel::Channel::open_private(dbus_addr).map_err(|e| anyhow::anyhow!("dbus: {e}"))?;
-        ch.register().map_err(|e| anyhow::anyhow!("dbus reg: {e}"))?;
-        let conn = dbus::blocking::Connection::from(ch);
-        let proxy = conn.with_proxy("org.kde.KWin", "/org/kde/KWin/EIS/RemoteDesktop", std::time::Duration::from_secs(5));
-        let (fd, _): (dbus::arg::OwnedFd, i32) = proxy.method_call("org.kde.KWin.EIS.RemoteDesktop", "connectToEIS", (63i32,))
-            .map_err(|e| anyhow::anyhow!("connectToEIS: {e}"))?;
-        let stream = UnixStream::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd.into_raw_fd()) });
+    fn from_fd(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
+        let stream = UnixStream::from(fd);
         let context = reis::ei::Context::new(stream)?;
         let resp = reis::handshake::ei_handshake_blocking(&context, "kwin-mcp", reis::ei::handshake::ContextType::Sender)
             .map_err(|e| anyhow::anyhow!("handshake: {e:?}"))?;
@@ -255,8 +225,7 @@ impl Eis {
         Ok(Self {
             context, abs_ptr: abs.ok_or_else(|| anyhow::anyhow!("no abs"))?,
             btn: bt.ok_or_else(|| anyhow::anyhow!("no btn"))?, scroll: sc.ok_or_else(|| anyhow::anyhow!("no scroll"))?,
-            kbd: kb.ok_or_else(|| anyhow::anyhow!("no kbd"))?, ptr_dev, kbd_dev,
-            serial, conn: Box::new(conn),
+            kbd: kb.ok_or_else(|| anyhow::anyhow!("no kbd"))?, ptr_dev, kbd_dev, serial,
         })
     }
 
@@ -278,9 +247,48 @@ impl Eis {
     }
 }
 
+// ── Portal session ──────────────────────────────────────────────────────
+
+async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use ashpd::desktop::remote_desktop::{RemoteDesktop, DeviceType, SelectDevicesOptions, ConnectToEISOptions, StartOptions};
+    use ashpd::desktop::CreateSessionOptions;
+    // Pre-seed permission store to skip consent dialog
+    // Derive our app_id the same way xdg-desktop-portal does (from systemd cgroup)
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let app_id = cgroup.split('/').filter_map(|seg| {
+        seg.strip_prefix("app-").and_then(|s| s.rsplit_once('-')).map(|(name, _)| name.to_owned())
+    }).next().unwrap_or_default();
+    let perm_proxy: zbus::Proxy = zbus::proxy::Builder::new(zbus_conn)
+        .destination("org.freedesktop.impl.portal.PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
+        .path("/org/freedesktop/impl/portal/PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
+        .interface("org.freedesktop.impl.portal.PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
+        .build().await.map_err(|e| anyhow::anyhow!("permission store proxy: {e}"))?;
+    let perms: &[&str] = &["yes"];
+    // Seed both the derived app_id and empty string to cover all cases
+    for id in [app_id.as_str(), ""] {
+        let _: Result<(), zbus::Error> = perm_proxy.call("SetPermission", &("kde-authorized", true, "remote-desktop", id, perms)).await;
+    }
+    // Create RemoteDesktop session
+    let rd = RemoteDesktop::with_connection(zbus_conn.clone()).await
+        .map_err(|e| anyhow::anyhow!("RemoteDesktop: {e}"))?;
+    let session = rd.create_session(CreateSessionOptions::default()).await
+        .map_err(|e| anyhow::anyhow!("create_session: {e}"))?;
+    rd.select_devices(&session, SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer)).await
+        .map_err(|e| anyhow::anyhow!("select_devices: {e}"))?.response()
+        .map_err(|e| anyhow::anyhow!("select_devices response: {e}"))?;
+    let started = rd.start(&session, None, StartOptions::default()).await
+        .map_err(|e| anyhow::anyhow!("start: {e}"))?.response()
+        .map_err(|e| anyhow::anyhow!("start response: {e}"))?;
+    let _devices = started.devices();
+    let eis_fd = rd.connect_to_eis(&session, ConnectToEISOptions::default()).await
+        .map_err(|e| anyhow::anyhow!("connect_to_eis: {e}"))?;
+    Ok(std::os::fd::OwnedFd::from(eis_fd))
+}
+
 // ── Session ──────────────────────────────────────────────────────────────
 
-struct Session { dbus_daemon: dbus_launch::Daemon, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, socket: String, xdisplay: String, width: u32, height: u32, eis: Eis }
+#[expect(dead_code)] // width, height, zbus_conn, bus_dir stored for future portal/screencast use
+struct Session { dbus_pid: u32, bus_dir: tempfile::TempDir, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, socket: String, xdisplay: String, xauthority: String, width: u32, height: u32, eis: Eis, zbus_conn: zbus::Connection }
 
 // ── Server ───────────────────────────────────────────────────────────────
 
@@ -292,6 +300,10 @@ impl KwinMcp {
     fn with_session<R>(&self, f: impl FnOnce(&Session) -> Result<R, McpError>) -> Result<R, McpError> {
         let guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
         match &*guard { Some(s) => f(s), None => Err(McpError::internal("no session — call session_start first")) }
+    }
+    fn zbus_conn(&self) -> Result<zbus::Connection, McpError> {
+        let guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+        match &*guard { Some(s) => Ok(s.zbus_conn.clone()), None => Err(McpError::internal("no session — call session_start first")) }
     }
 }
 
@@ -321,14 +333,153 @@ fn teardown(sess: Session) {
     if let Ok(pid) = i32::try_from(sess.child_pid) {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
     }
-    drop(sess.dbus_daemon);
+    if let Ok(pid) = i32::try_from(sess.dbus_pid) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+    }
 }
 
-fn win_pos(sess: &Session) -> Result<(i32, i32), McpError> {
-    unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr) };
-    let win = kdotool::get_active_window_info().map_err(eis_err)?;
+fn find_xwayland_info(kwin_pid: u32) -> (String, String) {
+    // Find Xwayland processes and check if they're children of our KWin
+    let Ok(entries) = std::fs::read_dir("/proc") else { return (String::new(), String::new()) };
+    for entry in entries.flatten() {
+        let pid_str = entry.file_name().to_string_lossy().to_string();
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) { continue; }
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid_str}/cmdline")) else { continue };
+        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        let is_xwayland = args.first().map_or(false, |a| {
+            std::str::from_utf8(a).map_or(false, |s| s.contains("Xwayland"))
+        });
+        if !is_xwayland { continue; }
+        // Check parent chain leads to our KWin
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid_str}/status")) else { continue };
+        let ppid = status.lines().find_map(|l| l.strip_prefix("PPid:\t")).and_then(|s| s.parse::<u32>().ok());
+        if ppid != Some(kwin_pid) { continue; }
+        // Found our Xwayland — extract display and -auth from args
+        let mut display = String::new();
+        let mut auth = String::new();
+        let mut i = 0;
+        while i < args.len() {
+            if let Ok(s) = std::str::from_utf8(args[i]) {
+                if s.starts_with(':') && display.is_empty() { display = s.to_owned(); }
+                if s == "-auth" {
+                    if let Some(next) = args.get(i + 1) {
+                        auth = std::str::from_utf8(next).unwrap_or("").to_owned();
+                    }
+                }
+            }
+            i += 1;
+        }
+        return (display, auth);
+    }
+    (String::new(), String::new())
+}
+
+async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String), McpError> {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(eis_err)?.as_millis();
+    let marker = format!("kwin-mcp-{ts}");
+    let cb_path = format!("/KWinMCP/{ts}");
+    let our_name = conn.unique_name().ok_or_else(|| McpError::internal("no bus name"))?.to_string();
+    let script = format!("var w = workspace.activeWindow;\
+        callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
+        w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
+        w:w.frameGeometry.width,h:w.frameGeometry.height,\
+        title:w.caption,id:w.internalId.toString()}}) : 'null');");
+    let script_file = std::env::temp_dir().join(format!("{marker}.js"));
+    std::fs::write(&script_file, &script).map_err(eis_err)?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let cb = KWinCallback { tx: std::sync::Mutex::new(Some(tx)) };
+    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
+    let registered = conn.object_server().at(&obj_path, cb).await.map_err(eis_err)?;
+    eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
+    if !registered { return Err(McpError::internal(format!("failed to register callback at {cb_path}"))); }
+    // Load and run the script
+    let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
+        .destination("org.kde.KWin").map_err(eis_err)?
+        .path("/Scripting").map_err(eis_err)?
+        .interface("org.kde.kwin.Scripting").map_err(eis_err)?
+        .build().await.map_err(eis_err)?;
+    let script_path = script_file.to_string_lossy().to_string();
+    let (script_id,): (i32,) = scripting.call("loadScript", &(script_path, &marker)).await.map_err(eis_err)?;
+    if script_id < 0 {
+        let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
+        let _ = std::fs::remove_file(&script_file);
+        return Err(McpError::internal(format!("KWin loadScript failed, id={script_id}")));
+    }
+    let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
+        .destination("org.kde.KWin").map_err(eis_err)?
+        .path(format!("/Scripting/Script{script_id}")).map_err(eis_err)?
+        .interface("org.kde.kwin.Script").map_err(eis_err)?
+        .build().await.map_err(eis_err)?;
+    let _: () = script_proxy.call("run", &()).await.map_err(eis_err)?;
+    // Wait for callback, then cleanup regardless of result
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx).await;
+    let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
+    let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
+    let _ = std::fs::remove_file(&script_file);
+    let json = result.map_err(|_| McpError::internal("KWin script timed out"))?
+        .map_err(|_| McpError::internal("KWin callback channel closed"))?;
+    if json == "null" { return Err(McpError::internal("KWin script error: No active window")); }
+    let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
+    let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal("no x"))?;
+    let y = v.get("y").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal("no y"))?;
+    let id = v.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     #[expect(clippy::as_conversions)]
-    Ok((win.x.round() as i32, win.y.round() as i32))
+    Ok((x.round() as i32, y.round() as i32, id))
+}
+
+struct KWinCallback { tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>> }
+
+#[zbus::interface(name = "org.kde.KWinMCP")]
+impl KWinCallback {
+    #[zbus(name = "result")]
+    fn result(&self, payload: String) {
+        if let Some(tx) = self.tx.lock().ok().and_then(|mut g| g.take()) {
+            let _ = tx.send(payload);
+        }
+    }
+}
+
+async fn kwin_env_vars(conn: &zbus::Connection) -> Result<(String, String), McpError> {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(eis_err)?.as_millis();
+    let marker = format!("kwin-env-{ts}");
+    let cb_path = format!("/KWinEnv/{ts}");
+    let our_name = conn.unique_name().ok_or_else(|| McpError::internal("no bus name"))?.to_string();
+    // KWin script that reads env via Qt and calls back
+    let script = format!("callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
+        JSON.stringify({{display:workspace.getenv('DISPLAY'),xauthority:workspace.getenv('XAUTHORITY')}}));");
+    let script_file = std::env::temp_dir().join(format!("{marker}.js"));
+    std::fs::write(&script_file, &script).map_err(eis_err)?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let cb = KWinCallback { tx: std::sync::Mutex::new(Some(tx)) };
+    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
+    let registered = conn.object_server().at(&obj_path, cb).await.map_err(eis_err)?;
+    if !registered { return Err(McpError::internal("failed to register env callback")); }
+    let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
+        .destination("org.kde.KWin").map_err(eis_err)?.path("/Scripting").map_err(eis_err)?
+        .interface("org.kde.kwin.Scripting").map_err(eis_err)?.build().await.map_err(eis_err)?;
+    let script_path = script_file.to_string_lossy().to_string();
+    let (script_id,): (i32,) = scripting.call("loadScript", &(script_path, &marker)).await.map_err(eis_err)?;
+    if script_id < 0 {
+        let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
+        let _ = std::fs::remove_file(&script_file);
+        return Err(McpError::internal("KWin loadScript failed for env query"));
+    }
+    let sp: zbus::Proxy = zbus::proxy::Builder::new(conn)
+        .destination("org.kde.KWin").map_err(eis_err)?.path(format!("/Scripting/Script{script_id}")).map_err(eis_err)?
+        .interface("org.kde.kwin.Script").map_err(eis_err)?.build().await.map_err(eis_err)?;
+    let _: () = sp.call("run", &()).await.map_err(eis_err)?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
+    let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
+    let _ = std::fs::remove_file(&script_file);
+    let json = result.map_err(|_| McpError::internal("KWin env script timed out"))?
+        .map_err(|_| McpError::internal("KWin env callback closed"))?;
+    let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
+    let display = v.get("display").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let xauth = v.get("xauthority").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    Ok((display, xauth))
 }
 
 struct AtspiNode {
@@ -380,7 +531,7 @@ impl KwinMcp {
         }
         let w = u32::try_from(width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params("width", e.to_string()))?;
         let h = u32::try_from(height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params("height", e.to_string()))?;
-        let result: Result<Session, anyhow::Error> = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let pid = std::process::id();
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| anyhow::anyhow!("{e}"))?.as_secs();
             let sock = format!("wayland-mcp-{pid}-{ts}");
@@ -391,17 +542,37 @@ impl KwinMcp {
             write_kde_config(&config_dir, "kwinrc", &[
                 ("Compositing", "ShadowSize", "0"),
                 ("org.kde.kdecoration2", "ShadowSize", "0"),
+                ("Xwayland", "XwaylandEisNoPrompt", "true"),
             ])?;
             write_kde_config(&config_dir, "kcminputrc", &[("Mouse", "cursorTheme", "breeze_cursors")])?;
             write_kde_config(&config_dir, "kdeglobals", &[("General", "ColorScheme", "BreezeDark")])?;
             std::fs::write(format!("{config_dir}/kwinrulesrc"),
                 "[1]\nDescription=nodecor\nnoborder=true\nnoborderrule=2\nwmclass=.*\nwmclassmatch=3\n[General]\ncount=1\n")?;
-            // Launch private D-Bus daemon
-            let mut launcher = dbus_launch::Launcher::daemon();
-            launcher.bus_type(dbus_launch::BusType::Session);
-            launcher.service_dir("/usr/share/dbus-1/services/");
-            let daemon = launcher.launch().map_err(|e| anyhow::anyhow!("dbus-launch: {e}"))?;
-            let dbus_addr = daemon.address().to_owned();
+            // Launch private D-Bus daemon with permissive policy for portal inter-service replies
+            let bus_dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
+            let bus_conf = format!(r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir={dir}</listen>
+  <servicedir>/usr/share/dbus-1/services/</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow receive_sender="*"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>"#, dir = bus_dir.path().display());
+            std::fs::write(bus_dir.path().join("bus.conf"), &bus_conf)?;
+            let mut dbus_child = std::process::Command::new("dbus-daemon")
+                .args(["--config-file", &bus_dir.path().join("bus.conf").to_string_lossy(), "--nofork", "--print-address"])
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+                .spawn().map_err(|e| anyhow::anyhow!("dbus-daemon spawn: {e}"))?;
+            let dbus_stdout = dbus_child.stdout.take().ok_or_else(|| anyhow::anyhow!("no dbus stdout"))?;
+            let mut dbus_reader = std::io::BufReader::new(dbus_stdout);
+            let mut dbus_addr = String::new();
+            std::io::BufRead::read_line(&mut dbus_reader, &mut dbus_addr).map_err(|e| anyhow::anyhow!("dbus addr: {e}"))?;
+            let dbus_addr = dbus_addr.trim().to_owned();
+            anyhow::ensure!(!dbus_addr.is_empty(), "dbus-daemon returned empty address");
+            let dbus_pid = dbus_child.id();
             // Get AT-SPI bus address
             let mut ch = dbus::channel::Channel::open_private(&dbus_addr).map_err(|e| anyhow::anyhow!("dbus: {e}"))?;
             ch.register().map_err(|e| anyhow::anyhow!("dbus reg: {e}"))?;
@@ -414,8 +585,7 @@ impl KwinMcp {
             let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
             let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
                 .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
-            // Snapshot X sockets, spawn KWin
-            let x_before = snapshot_x_sockets();
+            // Spawn KWin
             let mut cmd = std::process::Command::new("kwin_wayland");
             cmd.args(["--virtual", "--no-lockscreen", "--xwayland",
                        "--width", &w.to_string(), "--height", &h.to_string(), "--socket", &sock])
@@ -434,22 +604,30 @@ impl KwinMcp {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             std::thread::sleep(std::time::Duration::from_millis(300));
             wait_for_path(&sock_path, deadline)?;
-            let xdisplay = detect_xdisplay(&x_before, std::time::Instant::now() + std::time::Duration::from_secs(5))?;
+            // Try to find Xwayland child of our KWin (may not exist yet if lazy start)
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let (xdisplay, xauthority) = find_xwayland_info(child_pid);
             let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
             std::fs::create_dir_all(&scrdir)?;
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let eis = Eis::connect(&dbus_addr)?;
-            Ok(Session { dbus_daemon: daemon, dbus_addr, a11y_addr, child_pid, scrdir, socket: sock, xdisplay, width: w, height: h, eis })
+            Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, sock, xdisplay, xauthority, w, h))
         }).await.map_err(|e| McpError::internal(e.to_string()))?;
-        match result {
-            Ok(sess) => {
-                let msg = format!("session started pid={} dbus={} socket={} geometry={}x{}", sess.child_pid, sess.dbus_addr, sess.socket, sess.width, sess.height);
-                let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-                *guard = Some(sess);
-                Ok(ToolOutput::text(msg))
-            }
-            Err(e) => Err(McpError::internal(e.to_string())),
-        }
+        let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height) =
+            result.map_err(|e| McpError::internal(e.to_string()))?;
+        // Async: connect to our private bus via zbus, set up portal session, get EIS fd
+        let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(eis_err)?
+            .build().await.map_err(eis_err)?;
+        let eis_fd = portal_setup(&zbus_conn).await.map_err(eis_err)?;
+        // Read DISPLAY and XAUTHORITY from KWin via script callback
+        let (xdisplay, xauthority) = kwin_env_vars(&zbus_conn).await.unwrap_or((xdisplay, xauthority));
+        // Blocking: reis negotiation over the EIS fd
+        let eis = tokio::task::spawn_blocking(move || Eis::from_fd(eis_fd))
+            .await.map_err(|e| McpError::internal(e.to_string()))?
+            .map_err(eis_err)?;
+        let msg = format!("session started pid={child_pid} dbus={dbus_addr} socket={socket} display={xdisplay} geometry={width}x{height}");
+        let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+        *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height, eis, zbus_conn: zbus_conn.clone() });
+        Ok(ToolOutput::text(msg))
     }
 
     #[tool(description = "Stop the KWin session and clean up all processes.", destructive = true)]
@@ -463,9 +641,8 @@ impl KwinMcp {
 
     #[tool(description = "Screenshot the active window. Returns PNG path + window position/size.", read_only = true)]
     async fn screenshot(&self) -> Result<ToolOutput, McpError> {
+        let (_, _, win_id) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr) };
-            let win = kdotool::get_active_window_info().map_err(eis_err)?;
             let path = sess.scrdir.join("screenshot.png");
             let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
             let write_raw = write_fd.into_raw_fd();
@@ -483,7 +660,7 @@ impl KwinMcp {
             let msg = {
                 let m = dbus::Message::new_method_call("org.kde.KWin", "/org/kde/KWin/ScreenShot2",
                     "org.kde.KWin.ScreenShot2", "CaptureWindow").map_err(eis_err)?;
-                m.append3::<&str, &std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>>, dbus::arg::OwnedFd>(win.id.as_str(), &opts, pipe_fd)
+                m.append3::<&str, &std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>>, dbus::arg::OwnedFd>(win_id.as_str(), &opts, pipe_fd)
             };
             let reply = conn.channel().send_with_reply_and_block(msg, std::time::Duration::from_secs(5)).map_err(eis_err)?;
             // parse metadata from reply — first arg is a{sv} dict
@@ -520,8 +697,8 @@ impl KwinMcp {
             enc.set_depth(png::BitDepth::Eight);
             let mut writer = enc.write_header().map_err(eis_err)?;
             writer.write_image_data(&rgba).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("{} size={}x{} title={}",
-                path.to_string_lossy(), width, height, win.title)))
+            Ok(ToolOutput::text(format!("{} size={}x{}",
+                path.to_string_lossy(), width, height)))
         })
     }
 
@@ -559,8 +736,8 @@ impl KwinMcp {
     #[tool(description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
     async fn mouse_click(&self, x: serde_json::Value, y: serde_json::Value, button: Option<String>, double: Option<bool>, triple: Option<bool>) -> Result<ToolOutput, McpError> {
         let x = parse_int(x)?; let y = parse_int(y)?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let (wx, wy) = win_pos(sess)?;
             let code = btn_code(button.as_deref())?;
             let count = match (triple, double) {
                 (Some(true), _) => 3, (_, Some(true)) => 2,
@@ -583,8 +760,8 @@ impl KwinMcp {
     #[tool(description = "Move cursor to window-relative pixel coordinates. Triggers hover effects.", read_only = true)]
     async fn mouse_move(&self, x: serde_json::Value, y: serde_json::Value) -> Result<ToolOutput, McpError> {
         let x = parse_int(x)?; let y = parse_int(y)?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let (wx, wy) = win_pos(sess)?;
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
             Ok(ToolOutput::text(format!("moved ({x},{y})")))
         })
@@ -593,11 +770,11 @@ impl KwinMcp {
     #[tool(description = "Scroll at window-relative pixel coords. delta: positive=down/right, negative=up/left. horizontal/discrete are optional.")]
     async fn mouse_scroll(&self, x: serde_json::Value, y: serde_json::Value, delta: serde_json::Value, horizontal: Option<bool>, discrete: Option<bool>) -> Result<ToolOutput, McpError> {
         let x = parse_int(x)?; let y = parse_int(y)?; let delta = parse_int(delta)?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let (wx, wy) = win_pos(sess)?;
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
-            let horiz = match horizontal { Some(v) => v, None => false };
-            let disc = match discrete { Some(v) => v, None => false };
+            let horiz = horizontal.unwrap_or_default();
+            let disc = discrete.unwrap_or_default();
             let (dx, dy) = match horiz { true => (delta, 0), false => (0, delta) };
             sess.eis.scroll_do(dx, dy, disc).map_err(eis_err)?;
             Ok(ToolOutput::text(format!("scrolled {delta} at ({x},{y})")))
@@ -608,8 +785,8 @@ impl KwinMcp {
     async fn mouse_drag(&self, from_x: serde_json::Value, from_y: serde_json::Value, to_x: serde_json::Value, to_y: serde_json::Value, button: Option<String>) -> Result<ToolOutput, McpError> {
         let from_x = parse_int(from_x)?; let from_y = parse_int(from_y)?;
         let to_x = parse_int(to_x)?; let to_y = parse_int(to_y)?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let (wx, wy) = win_pos(sess)?;
             let code = btn_code(button.as_deref())?;
             sess.eis.move_abs(wx + from_x, wy + from_y).map_err(eis_err)?;
             sess.eis.button(code, true).map_err(eis_err)?;
@@ -667,11 +844,18 @@ impl KwinMcp {
     #[tool(description = "Launch app in session (non-blocking). Returns PID.")]
     async fn launch_app(&self, command: String) -> Result<ToolOutput, McpError> {
         self.with_session(|sess| {
+            // Refresh Xwayland info if not yet available (lazy start)
+            let (xdisp, xauth) = match sess.xdisplay.is_empty() {
+                true => find_xwayland_info(sess.child_pid),
+                false => (sess.xdisplay.clone(), sess.xauthority.clone()),
+            };
             let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", &command]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS")
+            cmd.args(["-c", &command]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS").env_remove("XAUTHORITY")
                 .env("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr).env("WAYLAND_DISPLAY", &sess.socket)
-                .env("DISPLAY", &sess.xdisplay).env("QT_QPA_PLATFORM", "wayland")
+                .env("QT_QPA_PLATFORM", "wayland")
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            if !xdisp.is_empty() { cmd.env("DISPLAY", &xdisp); }
+            if !xauth.is_empty() { cmd.env("XAUTHORITY", &xauth); }
             match cmd.spawn() {
                 Ok(child) => Ok(ToolOutput::text(format!("launched pid={}", child.id()))),
                 Err(e) => Err(McpError::internal(format!("spawn: {e}"))),
