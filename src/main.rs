@@ -21,66 +21,90 @@ fn parse_int(v: serde_json::Value) -> Result<i32, McpError> {
 
 // ── Evdev keycodes ───────────────────────────────────────────────────────
 
-fn modifier_code(name: &str) -> Option<u32> {
-    [("shift", 42u32), ("ctrl", 29), ("control", 29), ("alt", 56), ("super", 125), ("meta", 125)]
-        .iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
-}
-
-fn special_key(name: &str) -> Option<u32> {
-    [("return",28u32),("enter",28),("tab",15),("escape",1),("esc",1),("backspace",14),
-     ("delete",111),("space",57),("up",103),("down",108),("left",105),("right",106),
-     ("home",102),("end",107),("pageup",104),("page_up",104),("pagedown",109),("page_down",109),
-     ("insert",110),("f1",59),("f2",60),("f3",61),("f4",62),("f5",63),("f6",64),
-     ("f7",65),("f8",66),("f9",67),("f10",68),("f11",87),("f12",88)]
-        .iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
-}
+use keyboard_codes::{KeyCodeMapper, Platform};
 
 fn char_key(ch: char) -> Option<(u32, bool)> {
-    let normal = "`1234567890-=qwertyuiop[]\\asdfghjkl;'zxcvbnm,./ \t\n";
-    let shifted = "~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:\"ZXCVBNM<>?";
-    let codes: &[u32] = &[
-        41,2,3,4,5,6,7,8,9,10,11,12,13, 16,17,18,19,20,21,22,23,24,25,26,27,43,
-        30,31,32,33,34,35,36,37,38,39,40, 44,45,46,47,48,49,50,51,52,53, 57,15,28,
-    ];
-    normal.chars().zip(codes.iter()).find(|(c, _)| *c == ch).map(|(_, k)| (*k, false))
-        .or_else(|| shifted.chars().zip(codes.iter()).find(|(c, _)| *c == ch).map(|(_, k)| (*k, true)))
+    match ch {
+        'a'..='z' | '0'..='9' | '`' | '-' | '=' | '[' | ']' | '\\' | ';' | '\'' | ',' | '.' | '/' | ' ' | '\t' | '\n' => {
+            let input: keyboard_codes::KeyboardInput = String::from(ch).parse().ok()?;
+            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, false))
+        }
+        'A'..='Z' => {
+            let input: keyboard_codes::KeyboardInput = String::from(ch.to_ascii_lowercase()).parse().ok()?;
+            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, true))
+        }
+        '~' | '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' | '_' | '+' |
+        '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?' => {
+            let unshifted = match ch {
+                '~' => '`', '!' => '1', '@' => '2', '#' => '3', '$' => '4', '%' => '5',
+                '^' => '6', '&' => '7', '*' => '8', '(' => '9', ')' => '0', '_' => '-',
+                '+' => '=', '{' => '[', '}' => ']', '|' => '\\', ':' => ';', '"' => '\'',
+                '<' => ',', '>' => '.', '?' => '/',
+                _ => return None,
+            };
+            let input: keyboard_codes::KeyboardInput = String::from(unshifted).parse().ok()?;
+            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, true))
+        }
+        _ => None,
+    }
 }
 
 fn parse_combo(key: &str) -> (Vec<u32>, Option<u32>) {
-    let mut mods = Vec::new();
-    let mut main = None;
-    for part in key.split('+') {
-        let p = part.trim().to_lowercase();
-        match modifier_code(&p) {
-            Some(c) => mods.push(c),
-            None => main = match special_key(&p) {
-                Some(k) => Some(k),
-                None => match p.chars().next() { Some(ch) => char_key(ch).map(|(k, _)| k), None => None },
-            },
+    match keyboard_codes::parser::parse_shortcut_with_aliases(key) {
+        Ok(shortcut) => {
+            let mods: Vec<u32> = shortcut.modifiers.iter()
+                .filter_map(|m| u32::try_from(keyboard_codes::KeyboardInput::Modifier(*m).to_code(Platform::Linux)).ok())
+                .collect();
+            let main = u32::try_from(shortcut.key.to_code(Platform::Linux)).ok();
+            (mods, main)
+        }
+        Err(_) => {
+            // Fallback: try single char
+            match key.chars().next() { Some(ch) => (Vec::new(), char_key(ch).map(|(k, _)| k)), None => (Vec::new(), None) }
         }
     }
-    (mods, main)
 }
 
 fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
-    match btn { Some("left") | None => Ok(0x110), Some("right") => Ok(0x111), Some("middle") => Ok(0x112),
-        Some(bad) => Err(McpError::invalid_params("button", format!("unknown button '{bad}' — use left/right/middle"))) }
+    match btn {
+        Some("left") | None => Ok(0x110),
+        Some("right") => Ok(0x111),
+        Some("middle") => Ok(0x112),
+        Some(bad) => Err(McpError::invalid_params("button", format!("unknown button '{bad}' — use left/right/middle"))),
+    }
 }
 
-fn extract_session_addrs(child: &mut std::process::Child) -> anyhow::Result<(String, String)> {
-    let out = std::mem::replace(&mut child.stdout, None).ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-    let mut reader = std::io::BufReader::new(out);
-    let (mut dbus, mut a11y, mut line) = (None, None, std::string::String::with_capacity(256));
-    while dbus.is_none() || a11y.is_none() {
-        line.clear();
-        anyhow::ensure!(std::io::BufRead::read_line(&mut reader, &mut line).map_err(|e| anyhow::anyhow!("read addr: {e}"))? != 0, "missing addr line");
-        match line.trim().split_once('=') {
-            Some(("DBUS", v)) => dbus = Some(v.to_owned()),
-            Some(("ATSPI", v)) => a11y = Some(v.to_owned()),
-            Some(_) | None => {}
+fn write_kde_config(dir: &str, file: &str, entries: &[(&str, &str, &str)]) -> anyhow::Result<()> {
+    let mut out = String::new();
+    let mut current_group = "";
+    for &(group, key, value) in entries {
+        if group != current_group { out.push_str(&format!("[{group}]\n")); current_group = group; }
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    std::fs::write(format!("{dir}/{file}"), out)?;
+    Ok(())
+}
+
+fn detect_xdisplay(before: &std::collections::HashMap<String, u64>, deadline: std::time::Instant) -> anyhow::Result<String> {
+    for entry in std::fs::read_dir("/tmp/.X11-unix").into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ino = std::os::unix::fs::MetadataExt::ino(&entry.metadata().map_err(|e| anyhow::anyhow!("{e}"))?);
+        if before.get(&name).is_none_or(|old_ino| *old_ino != ino) {
+            return Ok(format!(":{}", name.strip_prefix('X').unwrap_or(&name)));
         }
     }
-    Ok((dbus.ok_or_else(|| anyhow::anyhow!("missing DBUS"))?, a11y.ok_or_else(|| anyhow::anyhow!("missing ATSPI"))?))
+    anyhow::ensure!(std::time::Instant::now() < deadline, "XWayland display did not appear");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    detect_xdisplay(before, deadline)
+}
+
+fn snapshot_x_sockets() -> std::collections::HashMap<String, u64> {
+    std::fs::read_dir("/tmp/.X11-unix").into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let ino = std::os::unix::fs::MetadataExt::ino(&e.metadata().ok()?);
+            Some((name, ino))
+        }).collect()
 }
 
 fn eis_devices_ready(dev: &Option<reis::ei::Device>, kb: &Option<reis::ei::Keyboard>) -> bool {
@@ -256,7 +280,7 @@ impl Eis {
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-struct Session { dbus_addr: String, a11y_addr: String, child_pid: u32, registry_pid: u32, scrdir: PathBuf, socket: String, xdisplay: String, eis: Eis }
+struct Session { dbus_daemon: dbus_launch::Daemon, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, socket: String, xdisplay: String, width: u32, height: u32, eis: Eis }
 
 // ── Server ───────────────────────────────────────────────────────────────
 
@@ -272,6 +296,33 @@ impl KwinMcp {
 }
 
 fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal(e.to_string()) }
+
+fn kill_bus_clients(dbus_addr: &str) {
+    let Ok(mut ch) = dbus::channel::Channel::open_private(dbus_addr) else { return };
+    if ch.register().is_err() { return; }
+    let conn = dbus::blocking::Connection::from(ch);
+    let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(2));
+    let names: Result<(Vec<String>,), _> = proxy.method_call("org.freedesktop.DBus", "ListNames", ());
+    let Ok((names,)) = names else { return };
+    let my_pid = std::process::id();
+    for name in &names {
+        if name.starts_with(':') {
+            let pid: Result<(u32,), _> = proxy.method_call("org.freedesktop.DBus", "GetConnectionUnixProcessID", (name.as_str(),));
+            if let Ok((pid,)) = pid && pid != my_pid && let Ok(p) = i32::try_from(pid) {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+    }
+}
+
+fn teardown(sess: Session) {
+    drop(sess.eis);
+    kill_bus_clients(&sess.dbus_addr);
+    if let Ok(pid) = i32::try_from(sess.child_pid) {
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
+    }
+    drop(sess.dbus_daemon);
+}
 
 fn win_pos(sess: &Session) -> Result<(i32, i32), McpError> {
     unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr) };
@@ -322,64 +373,77 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
 #[mcp_server(name = "kwin-mcp", version = "0.1.0", instructions = "KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1920x1080 screen.")]
 impl KwinMcp {
     #[tool(description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
-    async fn session_start(&self) -> Result<ToolOutput, McpError> {
+    async fn session_start(&self, width: Option<serde_json::Value>, height: Option<serde_json::Value>) -> Result<ToolOutput, McpError> {
         {
-            let guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-            match &*guard { Some(running) => return Ok(ToolOutput::text(format!("session already running pid={}", running.child_pid))), None => drop(guard) }
+            let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+            if let Some(old) = (*guard).take() { teardown(old); }
         }
-        let result: Result<Session, anyhow::Error> = tokio::task::spawn_blocking(|| {
+        let w = u32::try_from(width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params("width", e.to_string()))?;
+        let h = u32::try_from(height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params("height", e.to_string()))?;
+        let result: Result<Session, anyhow::Error> = tokio::task::spawn_blocking(move || {
             let pid = std::process::id();
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| anyhow::anyhow!("{e}"))?.as_secs();
             let sock = format!("wayland-mcp-{pid}-{ts}");
             let xdg = std::env::var("XDG_RUNTIME_DIR").map_err(|e| anyhow::anyhow!("XDG_RUNTIME_DIR: {e}"))?;
             let config_dir = format!("{}/.config/kwin-mcp", std::env::var("HOME").map_err(|e| anyhow::anyhow!("HOME: {e}"))?);
-            let script = format!("export XDG_CONFIG_HOME={config_dir}\n\
-                mkdir -p $XDG_CONFIG_HOME\n\
-                echo DBUS=$DBUS_SESSION_BUS_ADDRESS\n\
-                kwriteconfig6 --file kwinrc --group Compositing --key ShadowSize 0\n\
-                kwriteconfig6 --file kwinrc --group org.kde.kdecoration2 --key ShadowSize 0\n\
-                printf '[1]\\nDescription=nodecor\\nnoborder=true\\nnoborderrule=2\\nwmclass=.*\\nwmclassmatch=3\\n[General]\\ncount=1\\n' > $XDG_CONFIG_HOME/kwinrulesrc\n\
-                kwriteconfig6 --file kcminputrc --group Mouse --key cursorTheme breeze_cursors\n\
-                kwriteconfig6 --file kdeglobals --group General --key ColorScheme BreezeDark\n\
-                ATSPI=$(gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus --method org.a11y.Bus.GetAddress)\n\
-                ATSPI=${{ATSPI#*\\'}}\n\
-                ATSPI=${{ATSPI%%\\'*}}\n\
-                echo ATSPI=$ATSPI\n\
-                export AT_SPI_BUS_ADDRESS=$ATSPI\n\
-                dbus-update-activation-environment WAYLAND_DISPLAY={sock} QT_QPA_PLATFORM=wayland\n\
-                env -u WAYLAND_DISPLAY -u QT_QPA_PLATFORM KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-                KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --no-lockscreen \
-                --xwayland --width 1920 --height 1080 --socket {sock} & KP=$!\nwait $KP");
-            let mut cmd = std::process::Command::new("dbus-run-session");
-            cmd.args(["bash", "-c", &script]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+            // Write KDE config files
+            std::fs::create_dir_all(&config_dir)?;
+            write_kde_config(&config_dir, "kwinrc", &[
+                ("Compositing", "ShadowSize", "0"),
+                ("org.kde.kdecoration2", "ShadowSize", "0"),
+            ])?;
+            write_kde_config(&config_dir, "kcminputrc", &[("Mouse", "cursorTheme", "breeze_cursors")])?;
+            write_kde_config(&config_dir, "kdeglobals", &[("General", "ColorScheme", "BreezeDark")])?;
+            std::fs::write(format!("{config_dir}/kwinrulesrc"),
+                "[1]\nDescription=nodecor\nnoborder=true\nnoborderrule=2\nwmclass=.*\nwmclassmatch=3\n[General]\ncount=1\n")?;
+            // Launch private D-Bus daemon
+            let mut launcher = dbus_launch::Launcher::daemon();
+            launcher.bus_type(dbus_launch::BusType::Session);
+            launcher.service_dir("/usr/share/dbus-1/services/");
+            let daemon = launcher.launch().map_err(|e| anyhow::anyhow!("dbus-launch: {e}"))?;
+            let dbus_addr = daemon.address().to_owned();
+            // Get AT-SPI bus address
+            let mut ch = dbus::channel::Channel::open_private(&dbus_addr).map_err(|e| anyhow::anyhow!("dbus: {e}"))?;
+            ch.register().map_err(|e| anyhow::anyhow!("dbus reg: {e}"))?;
+            let conn = dbus::blocking::Connection::from(ch);
+            let proxy = conn.with_proxy("org.a11y.Bus", "/org/a11y/bus", std::time::Duration::from_secs(10));
+            let (a11y_addr,): (String,) = proxy.method_call("org.a11y.Bus", "GetAddress", ())
+                .map_err(|e| anyhow::anyhow!("a11y GetAddress: {e}"))?;
+            // Update D-Bus activation environment
+            let env_vars: std::collections::HashMap<&str, &str> = [("WAYLAND_DISPLAY", sock.as_str()), ("QT_QPA_PLATFORM", "wayland")].into_iter().collect();
+            let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
+            let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
+                .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
+            // Snapshot X sockets, spawn KWin
+            let x_before = snapshot_x_sockets();
+            let mut cmd = std::process::Command::new("kwin_wayland");
+            cmd.args(["--virtual", "--no-lockscreen", "--xwayland",
+                       "--width", &w.to_string(), "--height", &h.to_string(), "--socket", &sock])
+                .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
                 .env("KDE_FULL_SESSION", "true").env("KDE_SESSION_VERSION", "6")
                 .env("XDG_SESSION_TYPE", "wayland").env("XDG_CURRENT_DESKTOP", "KDE")
                 .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1").env("QT_ACCESSIBILITY", "1")
-                .env("XCURSOR_THEME", "breeze_cursors")
-                .env("XDG_CONFIG_HOME", &config_dir)
-                .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
-            let mut child = (unsafe { cmd.pre_exec(|| nix::unistd::setsid().map(drop).map_err(std::io::Error::from)) }).spawn()?;
+                .env("XCURSOR_THEME", "breeze_cursors").env("XDG_CONFIG_HOME", &config_dir)
+                .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1").env("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS", "1")
+                .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY").env_remove("QT_QPA_PLATFORM")
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            let child = (unsafe { cmd.pre_exec(|| nix::unistd::setsid().map(drop).map_err(std::io::Error::from)) }).spawn()?;
             let child_pid = child.id();
-            let (dbus_addr, a11y_addr) = extract_session_addrs(&mut child)?;
+            // Wait for wayland socket and XWayland display
             let sock_path = format!("{xdg}/{sock}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             std::thread::sleep(std::time::Duration::from_millis(300));
             wait_for_path(&sock_path, deadline)?;
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            let xdisplay = detect_xdisplay(&x_before, std::time::Instant::now() + std::time::Duration::from_secs(5))?;
             let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
             std::fs::create_dir_all(&scrdir)?;
-            let registry_pid = std::process::Command::new("/usr/lib/at-spi2-registryd")
-                .args(["--dbus-name", "org.a11y.atspi.Registry", "--use-gnome-session"])
-                .env("AT_SPI_BUS_ADDRESS", &a11y_addr)
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?.id();
             std::thread::sleep(std::time::Duration::from_millis(500));
             let eis = Eis::connect(&dbus_addr)?;
-            let xdisplay = format!(":{}", 10 + (pid % 90));
-            Ok(Session { dbus_addr, a11y_addr, child_pid, registry_pid, scrdir, socket: sock, xdisplay, eis })
+            Ok(Session { dbus_daemon: daemon, dbus_addr, a11y_addr, child_pid, scrdir, socket: sock, xdisplay, width: w, height: h, eis })
         }).await.map_err(|e| McpError::internal(e.to_string()))?;
         match result {
             Ok(sess) => {
-                let msg = format!("session started pid={} dbus={} socket={}", sess.child_pid, sess.dbus_addr, sess.socket);
+                let msg = format!("session started pid={} dbus={} socket={} geometry={}x{}", sess.child_pid, sess.dbus_addr, sess.socket, sess.width, sess.height);
                 let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
                 *guard = Some(sess);
                 Ok(ToolOutput::text(msg))
@@ -391,16 +455,8 @@ impl KwinMcp {
     #[tool(description = "Stop the KWin session and clean up all processes.", destructive = true)]
     async fn session_stop(&self) -> Result<ToolOutput, McpError> {
         let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-        let prev = std::mem::replace(&mut *guard, None);
-        match prev {
-            Some(sess) => {
-                let pid = sess.child_pid;
-                let registry_pid = sess.registry_pid;
-                drop(sess.eis);
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(i32::try_from(registry_pid).map_err(eis_err)?), nix::sys::signal::Signal::SIGTERM);
-                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(i32::try_from(pid).map_err(eis_err)?), nix::sys::signal::Signal::SIGTERM).map_err(eis_err)?;
-                Ok(ToolOutput::text(format!("stopped pid={pid}")))
-            }
+        match (*guard).take() {
+            Some(sess) => { let pid = sess.child_pid; teardown(sess); Ok(ToolOutput::text(format!("stopped pid={pid}"))) }
             None => Ok(ToolOutput::text("no session running")),
         }
     }
@@ -417,10 +473,11 @@ impl KwinMcp {
             ch.register().map_err(eis_err)?;
             let conn = dbus::blocking::Connection::from(ch);
             let pipe_fd = unsafe { dbus::arg::OwnedFd::new(write_raw) };
+            fn dbus_variant(v: Box<dyn dbus::arg::RefArg>) -> dbus::arg::Variant<Box<dyn dbus::arg::RefArg>> { dbus::arg::Variant(v) }
             let opts: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> = [
-                ("include-cursor".to_owned(), dbus::arg::Variant(Box::new(true) as Box<dyn dbus::arg::RefArg>)),
-                ("include-decoration".to_owned(), dbus::arg::Variant(Box::new(true) as Box<dyn dbus::arg::RefArg>)),
-                ("include-shadow".to_owned(), dbus::arg::Variant(Box::new(false) as Box<dyn dbus::arg::RefArg>)),
+                ("include-cursor".to_owned(), dbus_variant(Box::new(true))),
+                ("include-decoration".to_owned(), dbus_variant(Box::new(true))),
+                ("include-shadow".to_owned(), dbus_variant(Box::new(false))),
             ].into_iter().collect::<std::collections::HashMap<_, _>>();
             // CaptureWindow by UUID — window-only, no shadow
             let msg = {
@@ -627,7 +684,10 @@ impl KwinMcp {
 
 #[tokio::main]
 async fn main() -> Result<(), McpError> {
-    unsafe { nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN); }
+    unsafe {
+        nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN);
+        nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
+    }
     let kwin = KwinMcp::new();
     let server = ServerBuilder::new(kwin.clone()).with_tools(kwin).build();
     server.serve(StdioTransport::new()).await

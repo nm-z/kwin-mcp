@@ -16,6 +16,8 @@ mcpkit = "0.5"
 png = "0.17"
 kdotool = "0.2.2"
 atspi = { version = "0.29", features = ["tokio"] }
+dbus-launch = "0.2"
+keyboard-codes = "0.3"
 
 [lints.clippy]
 wildcard_enum_match_arm = "deny"
