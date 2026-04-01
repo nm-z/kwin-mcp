@@ -441,46 +441,6 @@ impl KWinCallback {
     }
 }
 
-async fn kwin_env_vars(conn: &zbus::Connection) -> Result<(String, String), McpError> {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(eis_err)?.as_millis();
-    let marker = format!("kwin-env-{ts}");
-    let cb_path = format!("/KWinEnv/{ts}");
-    let our_name = conn.unique_name().ok_or_else(|| McpError::internal("no bus name"))?.to_string();
-    // KWin script that reads env via Qt and calls back
-    let script = format!("callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
-        JSON.stringify({{display:workspace.getenv('DISPLAY'),xauthority:workspace.getenv('XAUTHORITY')}}));");
-    let script_file = std::env::temp_dir().join(format!("{marker}.js"));
-    std::fs::write(&script_file, &script).map_err(eis_err)?;
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let cb = KWinCallback { tx: std::sync::Mutex::new(Some(tx)) };
-    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
-    let registered = conn.object_server().at(&obj_path, cb).await.map_err(eis_err)?;
-    if !registered { return Err(McpError::internal("failed to register env callback")); }
-    let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin").map_err(eis_err)?.path("/Scripting").map_err(eis_err)?
-        .interface("org.kde.kwin.Scripting").map_err(eis_err)?.build().await.map_err(eis_err)?;
-    let script_path = script_file.to_string_lossy().to_string();
-    let (script_id,): (i32,) = scripting.call("loadScript", &(script_path, &marker)).await.map_err(eis_err)?;
-    if script_id < 0 {
-        let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
-        let _ = std::fs::remove_file(&script_file);
-        return Err(McpError::internal("KWin loadScript failed for env query"));
-    }
-    let sp: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin").map_err(eis_err)?.path(format!("/Scripting/Script{script_id}")).map_err(eis_err)?
-        .interface("org.kde.kwin.Script").map_err(eis_err)?.build().await.map_err(eis_err)?;
-    let _: () = sp.call("run", &()).await.map_err(eis_err)?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
-    let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
-    let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
-    let _ = std::fs::remove_file(&script_file);
-    let json = result.map_err(|_| McpError::internal("KWin env script timed out"))?
-        .map_err(|_| McpError::internal("KWin env callback closed"))?;
-    let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
-    let display = v.get("display").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    let xauth = v.get("xauthority").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    Ok((display, xauth))
-}
 
 struct AtspiNode {
     name: String,
@@ -585,9 +545,34 @@ impl KwinMcp {
             let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
             let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
                 .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
-            // Spawn KWin
+            // Pre-create Xwayland socket and auth for eager startup
+            let xw_display = {
+                let mut n = 2u32;
+                loop {
+                    if !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists() { break n; }
+                    n += 1;
+                    anyhow::ensure!(n < 100, "no free X display");
+                }
+            };
+            let xdisplay = format!(":{xw_display}");
+            let xauth_path = format!("{xdg}/xauth_mcp_{pid}");
+            // Generate xauth cookie
+            let mut cookie = [0u8; 16];
+            let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut cookie));
+            let cookie_hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = std::process::Command::new("xauth").args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            // Create X11 listen sockets
+            let xw_sock_path = format!("/tmp/.X11-unix/X{xw_display}");
+            let xw_listener = std::os::unix::net::UnixListener::bind(&xw_sock_path)
+                .map_err(|e| anyhow::anyhow!("bind X socket {xw_sock_path}: {e}"))?;
+            let xw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&xw_listener);
+            // Spawn KWin with pre-created Xwayland socket
             let mut cmd = std::process::Command::new("kwin_wayland");
             cmd.args(["--virtual", "--no-lockscreen", "--xwayland",
+                       "--xwayland-fd", &xw_fd.to_string(),
+                       "--xwayland-display", &xdisplay,
+                       "--xwayland-xauthority", &xauth_path,
                        "--width", &w.to_string(), "--height", &h.to_string(), "--socket", &sock])
                 .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
                 .env("KDE_FULL_SESSION", "true").env("KDE_SESSION_VERSION", "6")
@@ -597,16 +582,21 @@ impl KwinMcp {
                 .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1").env("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS", "1")
                 .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY").env_remove("QT_QPA_PLATFORM")
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-            let child = (unsafe { cmd.pre_exec(|| nix::unistd::setsid().map(drop).map_err(std::io::Error::from)) }).spawn()?;
+            let xauthority = xauth_path.clone();
+            let child = (unsafe { cmd.pre_exec(move || {
+                // Keep the X socket fd open for KWin to inherit
+                let _ = nix::fcntl::fcntl(xw_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+                nix::unistd::setsid().map(drop).map_err(std::io::Error::from)
+            }) }).spawn()?;
+            // We can drop the listener now — KWin inherited the fd
+            drop(xw_listener);
             let child_pid = child.id();
             // Wait for wayland socket and XWayland display
             let sock_path = format!("{xdg}/{sock}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             std::thread::sleep(std::time::Duration::from_millis(300));
             wait_for_path(&sock_path, deadline)?;
-            // Try to find Xwayland child of our KWin (may not exist yet if lazy start)
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let (xdisplay, xauthority) = find_xwayland_info(child_pid);
+            // Xwayland display and auth are known from pre-creation above
             let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
             std::fs::create_dir_all(&scrdir)?;
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -618,8 +608,6 @@ impl KwinMcp {
         let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(eis_err)?
             .build().await.map_err(eis_err)?;
         let eis_fd = portal_setup(&zbus_conn).await.map_err(eis_err)?;
-        // Read DISPLAY and XAUTHORITY from KWin via script callback
-        let (xdisplay, xauthority) = kwin_env_vars(&zbus_conn).await.unwrap_or((xdisplay, xauthority));
         // Blocking: reis negotiation over the EIS fd
         let eis = tokio::task::spawn_blocking(move || Eis::from_fd(eis_fd))
             .await.map_err(|e| McpError::internal(e.to_string()))?
