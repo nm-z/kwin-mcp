@@ -20,6 +20,7 @@ keyboard-codes = "0.3"
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 futures = "0.3"
 zbus = "5"
+libc = "0.2"
 
 [lints.clippy]
 wildcard_enum_match_arm = "deny"

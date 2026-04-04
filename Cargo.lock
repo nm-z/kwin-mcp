@@ -960,6 +960,7 @@ dependencies = [
  "dbus",
  "futures",
  "keyboard-codes",
+ "libc",
  "mcpkit",
  "nix",
  "png",

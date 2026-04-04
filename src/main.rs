@@ -159,6 +159,7 @@ fn drain_eis_events(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_eis_device(
     da: &reis::event::DeviceAdded, serial: u32,
     dev: &mut Option<reis::ei::Device>, kbd_dev: &mut Option<reis::ei::Device>,
@@ -282,7 +283,7 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<std::os::f
     let _devices = started.devices();
     let eis_fd = rd.connect_to_eis(&session, ConnectToEISOptions::default()).await
         .map_err(|e| anyhow::anyhow!("connect_to_eis: {e}"))?;
-    Ok(std::os::fd::OwnedFd::from(eis_fd))
+    Ok(eis_fd)
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
@@ -338,6 +339,17 @@ fn teardown(sess: Session) {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
     }
+    // Clean up X11 lock file and socket based on xdisplay (e.g. ":2" -> display 2)
+    if let Some(display_num) = sess.xdisplay.strip_prefix(':') {
+        let lock_path = format!("/tmp/.X{display_num}-lock");
+        let sock_path = format!("/tmp/.X11-unix/X{display_num}");
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&sock_path);
+    }
+    // Clean up xauthority file
+    if !sess.xauthority.is_empty() {
+        let _ = std::fs::remove_file(&sess.xauthority);
+    }
 }
 
 fn find_xwayland_info(kwin_pid: u32) -> (String, String) {
@@ -348,8 +360,8 @@ fn find_xwayland_info(kwin_pid: u32) -> (String, String) {
         if !pid_str.chars().all(|c| c.is_ascii_digit()) { continue; }
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid_str}/cmdline")) else { continue };
         let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
-        let is_xwayland = args.first().map_or(false, |a| {
-            std::str::from_utf8(a).map_or(false, |s| s.contains("Xwayland"))
+        let is_xwayland = args.first().is_some_and(|a| {
+            std::str::from_utf8(a).is_ok_and(|s| s.contains("Xwayland"))
         });
         if !is_xwayland { continue; }
         // Check parent chain leads to our KWin
@@ -363,10 +375,8 @@ fn find_xwayland_info(kwin_pid: u32) -> (String, String) {
         while i < args.len() {
             if let Ok(s) = std::str::from_utf8(args[i]) {
                 if s.starts_with(':') && display.is_empty() { display = s.to_owned(); }
-                if s == "-auth" {
-                    if let Some(next) = args.get(i + 1) {
-                        auth = std::str::from_utf8(next).unwrap_or("").to_owned();
-                    }
+                if s == "-auth" && let Some(next) = args.get(i + 1) {
+                    auth = std::str::from_utf8(next).unwrap_or("").to_owned();
                 }
             }
             i += 1;
@@ -545,32 +555,97 @@ impl KwinMcp {
             let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
             let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
                 .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
-            // Pre-create Xwayland socket and auth for eager startup
+            // Pre-create Xwayland sockets mirroring KWin's XwaylandSocket setup:
+            // 1. Lock file /tmp/.X{n}-lock
+            // 2. Filesystem socket /tmp/.X11-unix/X{n}
+            // 3. Abstract socket @/tmp/.X11-unix/X{n} (Linux)
             let xw_display = {
                 let mut n = 2u32;
                 loop {
-                    if !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists() { break n; }
+                    let lock_path = format!("/tmp/.X{n}-lock");
+                    let sock_path = format!("/tmp/.X11-unix/X{n}");
+                    if !std::path::Path::new(&lock_path).exists() && !std::path::Path::new(&sock_path).exists() {
+                        break n;
+                    }
                     n += 1;
                     anyhow::ensure!(n < 100, "no free X display");
                 }
             };
             let xdisplay = format!(":{xw_display}");
             let xauth_path = format!("{xdg}/xauth_mcp_{pid}");
+            // Create lock file (format: 10-char padded PID + newline, like KWin does)
+            let lock_path = format!("/tmp/.X{xw_display}-lock");
+            {
+                use std::io::Write;
+                let mut lock_file = std::fs::OpenOptions::new()
+                    .write(true).create_new(true).open(&lock_path)
+                    .map_err(|e| anyhow::anyhow!("create lock file {lock_path}: {e}"))?;
+                writeln!(lock_file, "{:>10}", pid).map_err(|e| anyhow::anyhow!("write lock file: {e}"))?;
+            }
             // Generate xauth cookie
             let mut cookie = [0u8; 16];
             let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut cookie));
             let cookie_hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
-            let _ = std::process::Command::new("xauth").args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
+            let xauth_status = std::process::Command::new("xauth")
+                .args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-            // Create X11 listen sockets
+            if !xauth_status.is_ok_and(|s| s.success()) {
+                let _ = std::fs::remove_file(&lock_path);
+                anyhow::bail!("xauth failed to add cookie for {xdisplay}");
+            }
+            // Create filesystem X11 listen socket
             let xw_sock_path = format!("/tmp/.X11-unix/X{xw_display}");
-            let xw_listener = std::os::unix::net::UnixListener::bind(&xw_sock_path)
-                .map_err(|e| anyhow::anyhow!("bind X socket {xw_sock_path}: {e}"))?;
-            let xw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&xw_listener);
-            // Spawn KWin with pre-created Xwayland socket
+            let _ = std::fs::remove_file(&xw_sock_path); // remove stale if any
+            let xw_unix_listener = std::os::unix::net::UnixListener::bind(&xw_sock_path)
+                .map_err(|e| { let _ = std::fs::remove_file(&lock_path); anyhow::anyhow!("bind X socket {xw_sock_path}: {e}") })?;
+            let xw_unix_fd = std::os::unix::io::AsRawFd::as_raw_fd(&xw_unix_listener);
+            // Create abstract X11 listen socket (Linux-specific)
+            let xw_abstract_fd = {
+                let sock_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+                if sock_fd < 0 {
+                    let _ = std::fs::remove_file(&lock_path);
+                    let _ = std::fs::remove_file(&xw_sock_path);
+                    anyhow::bail!("failed to create abstract socket");
+                }
+                // Build abstract sockaddr_un: sun_path[0] = '\0', then path without NUL terminator
+                let path_bytes = xw_sock_path.as_bytes();
+                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX)
+                    .map_err(|_| anyhow::anyhow!("AF_UNIX conversion failed"))?;
+                // Abstract: first byte is NUL, then the path
+                addr.sun_path[0] = 0;
+                for (i, &b) in path_bytes.iter().enumerate() {
+                    if i + 1 >= addr.sun_path.len() { break; }
+                    addr.sun_path[i + 1] = libc::c_char::try_from(i8::try_from(b).map_err(|_| anyhow::anyhow!("byte conversion"))?)
+                        .map_err(|_| anyhow::anyhow!("c_char conversion"))?;
+                }
+                // Length = offset of sun_path + 1 (NUL) + path length (no trailing NUL for abstract)
+                let addr_len = libc::socklen_t::try_from(std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + path_bytes.len())
+                    .map_err(|_| anyhow::anyhow!("addr_len conversion"))?;
+                let bind_res = unsafe {
+                    libc::bind(sock_fd, std::ptr::from_ref(&addr).cast::<libc::sockaddr>(), addr_len)
+                };
+                if bind_res < 0 {
+                    unsafe { libc::close(sock_fd); }
+                    let _ = std::fs::remove_file(&lock_path);
+                    let _ = std::fs::remove_file(&xw_sock_path);
+                    anyhow::bail!("failed to bind abstract socket");
+                }
+                if unsafe { libc::listen(sock_fd, 1) } < 0 {
+                    unsafe { libc::close(sock_fd); }
+                    let _ = std::fs::remove_file(&lock_path);
+                    let _ = std::fs::remove_file(&xw_sock_path);
+                    anyhow::bail!("failed to listen on abstract socket");
+                }
+                sock_fd
+            };
+            // Spawn KWin with both Xwayland socket fds
+            let xw_unix_fd_str = xw_unix_fd.to_string();
+            let xw_abstract_fd_str = xw_abstract_fd.to_string();
             let mut cmd = std::process::Command::new("kwin_wayland");
             cmd.args(["--virtual", "--no-lockscreen", "--xwayland",
-                       "--xwayland-fd", &xw_fd.to_string(),
+                       "--xwayland-fd", &xw_unix_fd_str,
+                       "--xwayland-fd", &xw_abstract_fd_str,
                        "--xwayland-display", &xdisplay,
                        "--xwayland-xauthority", &xauth_path,
                        "--width", &w.to_string(), "--height", &h.to_string(), "--socket", &sock])
@@ -584,12 +659,14 @@ impl KwinMcp {
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             let xauthority = xauth_path.clone();
             let child = (unsafe { cmd.pre_exec(move || {
-                // Keep the X socket fd open for KWin to inherit
-                let _ = nix::fcntl::fcntl(xw_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+                // Keep both X socket fds open for KWin to inherit
+                let _ = nix::fcntl::fcntl(xw_unix_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+                let _ = nix::fcntl::fcntl(xw_abstract_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
                 nix::unistd::setsid().map(drop).map_err(std::io::Error::from)
             }) }).spawn()?;
-            // We can drop the listener now — KWin inherited the fd
-            drop(xw_listener);
+            // We can drop the listeners now — KWin inherited the fds
+            drop(xw_unix_listener);
+            unsafe { libc::close(xw_abstract_fd); }
             let child_pid = child.id();
             // Wait for wayland socket and XWayland display
             let sock_path = format!("{xdg}/{sock}");
