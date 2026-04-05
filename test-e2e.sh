@@ -3,7 +3,14 @@
 # Uses a persistent coprocess, no sleeps, blocking reads with deadlines.
 set -euo pipefail
 
-BINARY="${1:-./target/debug/kwin-mcp}"
+SHOW_LOG=false
+BINARY="./target/debug/kwin-mcp"
+for arg in "$@"; do
+    case "$arg" in
+        --log) SHOW_LOG=true ;;
+        *) BINARY="$arg" ;;
+    esac
+done
 PASS=0 FAIL=0 ID=0
 FAIL_MSGS=""
 
@@ -217,10 +224,10 @@ echo "════════════════════════�
 if [ "$FAIL" -gt 0 ]; then
     echo "  FAILURES:"
     printf "%b" "$FAIL_MSGS"
-    if [ -f "$LOG" ]; then
+    if $SHOW_LOG && [ -f "$LOG" ]; then
         echo ""
         echo "  LOG (errors only):"
-        grep -i "error\|fatal\|fail\|crash" "$LOG" 2>/dev/null | head -10 | sed 's/^/  /'
+        grep -i "error\|fatal\|fail\|crash" "$LOG" 2>/dev/null | head -20 | sed 's/^/  /'
     fi
 fi
 echo ""
