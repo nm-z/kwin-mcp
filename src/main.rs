@@ -600,45 +600,21 @@ impl KwinMcp {
                 .map_err(|e| { let _ = std::fs::remove_file(&lock_path); anyhow::anyhow!("bind X socket {xw_sock_path}: {e}") })?;
             let xw_unix_fd = std::os::unix::io::AsRawFd::as_raw_fd(&xw_unix_listener);
             // Create abstract X11 listen socket (Linux-specific)
-            let xw_abstract_fd = {
-                let sock_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-                if sock_fd < 0 {
-                    let _ = std::fs::remove_file(&lock_path);
-                    let _ = std::fs::remove_file(&xw_sock_path);
-                    anyhow::bail!("failed to create abstract socket");
-                }
-                // Build abstract sockaddr_un: sun_path[0] = '\0', then path without NUL terminator
-                let path_bytes = xw_sock_path.as_bytes();
-                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-                addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX)
-                    .map_err(|_| anyhow::anyhow!("AF_UNIX conversion failed"))?;
-                // Abstract: first byte is NUL, then the path
-                addr.sun_path[0] = 0;
-                for (i, &b) in path_bytes.iter().enumerate() {
-                    if i + 1 >= addr.sun_path.len() { break; }
-                    addr.sun_path[i + 1] = libc::c_char::try_from(i8::try_from(b).map_err(|_| anyhow::anyhow!("byte conversion"))?)
-                        .map_err(|_| anyhow::anyhow!("c_char conversion"))?;
-                }
-                // Length = offset of sun_path + 1 (NUL) + path length (no trailing NUL for abstract)
-                let addr_len = libc::socklen_t::try_from(std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + path_bytes.len())
-                    .map_err(|_| anyhow::anyhow!("addr_len conversion"))?;
-                let bind_res = unsafe {
-                    libc::bind(sock_fd, std::ptr::from_ref(&addr).cast::<libc::sockaddr>(), addr_len)
-                };
-                if bind_res < 0 {
-                    unsafe { libc::close(sock_fd); }
-                    let _ = std::fs::remove_file(&lock_path);
-                    let _ = std::fs::remove_file(&xw_sock_path);
-                    anyhow::bail!("failed to bind abstract socket");
-                }
-                if unsafe { libc::listen(sock_fd, 1) } < 0 {
-                    unsafe { libc::close(sock_fd); }
-                    let _ = std::fs::remove_file(&lock_path);
-                    let _ = std::fs::remove_file(&xw_sock_path);
-                    anyhow::bail!("failed to listen on abstract socket");
-                }
-                sock_fd
-            };
+            let abstract_addr = nix::sys::socket::UnixAddr::new_abstract(xw_sock_path.as_bytes())
+                .map_err(|e| anyhow::anyhow!("abstract addr: {e}"))?;
+            let xw_abstract_sock = nix::sys::socket::socket(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+                None,
+            ).map_err(|e| { let _ = std::fs::remove_file(&lock_path); let _ = std::fs::remove_file(&xw_sock_path); anyhow::anyhow!("create abstract socket: {e}") })?;
+            nix::sys::socket::bind(std::os::fd::AsRawFd::as_raw_fd(&xw_abstract_sock), &abstract_addr)
+                .map_err(|e| { let _ = std::fs::remove_file(&lock_path); let _ = std::fs::remove_file(&xw_sock_path); anyhow::anyhow!("bind abstract socket: {e}") })?;
+            let backlog = nix::sys::socket::Backlog::new(1_i32)
+                .map_err(|e| anyhow::anyhow!("backlog: {e}"))?;
+            nix::sys::socket::listen(&xw_abstract_sock, backlog)
+                .map_err(|e| { let _ = std::fs::remove_file(&lock_path); let _ = std::fs::remove_file(&xw_sock_path); anyhow::anyhow!("listen abstract socket: {e}") })?;
+            let xw_abstract_fd = std::os::fd::AsRawFd::as_raw_fd(&xw_abstract_sock);
             // Spawn KWin with both Xwayland socket fds
             let xw_unix_fd_str = xw_unix_fd.to_string();
             let xw_abstract_fd_str = xw_abstract_fd.to_string();
@@ -666,7 +642,7 @@ impl KwinMcp {
             }) }).spawn()?;
             // We can drop the listeners now — KWin inherited the fds
             drop(xw_unix_listener);
-            unsafe { libc::close(xw_abstract_fd); }
+            drop(xw_abstract_sock);
             let child_pid = child.id();
             // Wait for wayland socket and XWayland display
             let sock_path = format!("{xdg}/{sock}");
