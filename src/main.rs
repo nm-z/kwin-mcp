@@ -1,6 +1,6 @@
 use mcpkit::prelude::*;
 use mcpkit::transport::stdio::StdioTransport;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -735,7 +735,7 @@ impl KwinMcp {
         let height = get_meta("height")?;
         let stride = get_meta("stride")?;
         // read raw ARGB32 pixels from pipe
-        let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
+        let mut reader = std::io::BufReader::new(std::fs::File::from(read_fd));
         let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
         let mut pixels = vec![0u8; total];
         std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
