@@ -10,18 +10,33 @@ use std::sync::{Arc, Mutex};
 
 type McpError = rmcp::ErrorData;
 
-// Claude Code serializes numbers to strings — this handles both formats
-fn parse_int(v: serde_json::Value) -> Result<i32, McpError> {
-    match v {
-        serde_json::Value::Number(n) => match n.as_i64() {
-            Some(val) => i32::try_from(val).map_err(|e| McpError::invalid_params(e.to_string(), None)),
-            None => Err(McpError::invalid_params("not an integer", None)),
-        },
-        serde_json::Value::String(s) => s.parse::<i32>().map_err(|e| McpError::invalid_params(e.to_string(), None)),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) =>
-            Err(McpError::invalid_params("expected integer", None)),
+// Claude Code serializes numbers to strings — FlexInt accepts both.
+// Implements JsonSchema so rmcp emits a proper schema instead of `true`.
+#[derive(Debug, Clone)]
+struct FlexInt(i32);
+impl<'de> serde::Deserialize<'de> for FlexInt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Number(n) => n.as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .map(FlexInt)
+                .ok_or_else(|| serde::de::Error::custom("not an i32")),
+            serde_json::Value::String(s) => s.parse::<i32>().map(FlexInt)
+                .map_err(serde::de::Error::custom),
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(serde::de::Error::custom("expected integer or string")),
+        }
     }
 }
+impl schemars::JsonSchema for FlexInt {
+    fn schema_name() -> std::borrow::Cow<'static, str> { "FlexInt".into() }
+    fn inline_schema() -> bool { true }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": ["integer", "string"], "description": "integer or string-encoded integer" })
+    }
+}
+
+fn parse_int(v: FlexInt) -> i32 { v.0 }
 
 // ── Evdev keycodes ───────────────────────────────────────────────────────
 
@@ -499,14 +514,14 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 struct SessionStartParams {
-    width: Option<serde_json::Value>,
-    height: Option<serde_json::Value>,
+    width: Option<FlexInt>,
+    height: Option<FlexInt>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
-    x: serde_json::Value,
-    y: serde_json::Value,
+    x: FlexInt,
+    y: FlexInt,
     button: Option<String>,
     double: Option<bool>,
     triple: Option<bool>,
@@ -514,25 +529,25 @@ struct MouseClickParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseMoveParams {
-    x: serde_json::Value,
-    y: serde_json::Value,
+    x: FlexInt,
+    y: FlexInt,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseScrollParams {
-    x: serde_json::Value,
-    y: serde_json::Value,
-    delta: serde_json::Value,
+    x: FlexInt,
+    y: FlexInt,
+    delta: FlexInt,
     horizontal: Option<bool>,
     discrete: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseDragParams {
-    from_x: serde_json::Value,
-    from_y: serde_json::Value,
-    to_x: serde_json::Value,
-    to_y: serde_json::Value,
+    from_x: FlexInt,
+    from_y: FlexInt,
+    to_x: FlexInt,
+    to_y: FlexInt,
     button: Option<String>,
 }
 
@@ -586,8 +601,8 @@ impl KwinMcp {
             let mut guard = self.session.lock().map_err(|e| McpError::internal_error(e.to_string(), None))?;
             if let Some(old) = (*guard).take() { teardown(old); }
         }
-        let w = u32::try_from(params.width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let h = u32::try_from(params.height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let w = u32::try_from(params.width.map(parse_int).unwrap_or(1920)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let h = u32::try_from(params.height.map(parse_int).unwrap_or(1080)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let pid = std::process::id();
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| anyhow::anyhow!("{e}"))?.as_secs();
@@ -903,7 +918,7 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "mouse_click", description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
     async fn mouse_click(&self, Parameters(params): Parameters<MouseClickParams>) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x)?; let y = parse_int(params.y)?;
+        let x = parse_int(params.x); let y = parse_int(params.y);
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             let code = btn_code(params.button.as_deref())?;
@@ -927,7 +942,7 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "mouse_move", description = "Move cursor to window-relative pixel coordinates. Triggers hover effects.", annotations(read_only_hint = true))]
     async fn mouse_move(&self, Parameters(params): Parameters<MouseMoveParams>) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x)?; let y = parse_int(params.y)?;
+        let x = parse_int(params.x); let y = parse_int(params.y);
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
@@ -937,7 +952,7 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "mouse_scroll", description = "Scroll at window-relative pixel coords. delta: positive=down/right, negative=up/left. horizontal/discrete are optional.")]
     async fn mouse_scroll(&self, Parameters(params): Parameters<MouseScrollParams>) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x)?; let y = parse_int(params.y)?; let delta = parse_int(params.delta)?;
+        let x = parse_int(params.x); let y = parse_int(params.y); let delta = parse_int(params.delta);
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
@@ -951,8 +966,8 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "mouse_drag", description = "Drag between window-relative pixel coords. Smooth 20-step interpolation. button: left/right/middle.")]
     async fn mouse_drag(&self, Parameters(params): Parameters<MouseDragParams>) -> Result<CallToolResult, McpError> {
-        let from_x = parse_int(params.from_x)?; let from_y = parse_int(params.from_y)?;
-        let to_x = parse_int(params.to_x)?; let to_y = parse_int(params.to_y)?;
+        let from_x = parse_int(params.from_x); let from_y = parse_int(params.from_y);
+        let to_x = parse_int(params.to_x); let to_y = parse_int(params.to_y);
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             let code = btn_code(params.button.as_deref())?;
