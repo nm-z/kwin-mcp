@@ -310,27 +310,23 @@ impl KwinMcp {
 
 fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal(e.to_string()) }
 
-fn kill_bus_clients(dbus_addr: &str) {
-    let Ok(mut ch) = dbus::channel::Channel::open_private(dbus_addr) else { return };
-    if ch.register().is_err() { return; }
-    let conn = dbus::blocking::Connection::from(ch);
-    let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(2));
-    let names: Result<(Vec<String>,), _> = proxy.method_call("org.freedesktop.DBus", "ListNames", ());
-    let Ok((names,)) = names else { return };
+async fn kill_bus_clients(conn: &zbus::Connection) {
+    let Ok(proxy) = zbus::fdo::DBusProxy::new(conn).await else { return };
+    let Ok(names) = proxy.list_names().await else { return };
     let my_pid = std::process::id();
     for name in &names {
-        if name.starts_with(':') {
-            let pid: Result<(u32,), _> = proxy.method_call("org.freedesktop.DBus", "GetConnectionUnixProcessID", (name.as_str(),));
-            if let Ok((pid,)) = pid && pid != my_pid && let Ok(p) = i32::try_from(pid) {
+        if name.as_str().starts_with(':') {
+            let pid = proxy.get_connection_unix_process_id(name.inner().clone()).await;
+            if let Ok(pid) = pid && pid != my_pid && let Ok(p) = i32::try_from(pid) {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
             }
         }
     }
 }
 
-fn teardown(sess: Session) {
+async fn teardown(sess: Session) {
     drop(sess.eis);
-    kill_bus_clients(&sess.dbus_addr);
+    kill_bus_clients(&sess.zbus_conn).await;
     if let Ok(pid) = i32::try_from(sess.child_pid) {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
     }
@@ -495,10 +491,11 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
 impl KwinMcp {
     #[tool(description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
     async fn session_start(&self, width: Option<serde_json::Value>, height: Option<serde_json::Value>) -> Result<ToolOutput, McpError> {
-        {
+        let old = {
             let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-            if let Some(old) = (*guard).take() { teardown(old); }
-        }
+            (*guard).take()
+        };
+        if let Some(old) = old { teardown(old).await; }
         let w = u32::try_from(width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params("width", e.to_string()))?;
         let h = u32::try_from(height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params("height", e.to_string()))?;
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -543,18 +540,6 @@ impl KwinMcp {
             let dbus_addr = dbus_addr.trim().to_owned();
             anyhow::ensure!(!dbus_addr.is_empty(), "dbus-daemon returned empty address");
             let dbus_pid = dbus_child.id();
-            // Get AT-SPI bus address
-            let mut ch = dbus::channel::Channel::open_private(&dbus_addr).map_err(|e| anyhow::anyhow!("dbus: {e}"))?;
-            ch.register().map_err(|e| anyhow::anyhow!("dbus reg: {e}"))?;
-            let conn = dbus::blocking::Connection::from(ch);
-            let proxy = conn.with_proxy("org.a11y.Bus", "/org/a11y/bus", std::time::Duration::from_secs(10));
-            let (a11y_addr,): (String,) = proxy.method_call("org.a11y.Bus", "GetAddress", ())
-                .map_err(|e| anyhow::anyhow!("a11y GetAddress: {e}"))?;
-            // Update D-Bus activation environment
-            let env_vars: std::collections::HashMap<&str, &str> = [("WAYLAND_DISPLAY", sock.as_str()), ("QT_QPA_PLATFORM", "wayland")].into_iter().collect();
-            let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
-            let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
-                .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
             // Pre-create Xwayland sockets mirroring KWin's XwaylandSocket setup:
             // 1. Lock file /tmp/.X{n}-lock
             // 2. Filesystem socket /tmp/.X11-unix/X{n}
@@ -677,13 +662,28 @@ impl KwinMcp {
             let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
             std::fs::create_dir_all(&scrdir)?;
             std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, sock, xdisplay, xauthority, w, h))
+            Ok((dbus_pid, bus_dir, dbus_addr, child_pid, scrdir, sock, xdisplay, xauthority, w, h))
         }).await.map_err(|e| McpError::internal(e.to_string()))?;
-        let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height) =
+        let (dbus_pid, bus_dir, dbus_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height) =
             result.map_err(|e| McpError::internal(e.to_string()))?;
         // Async: connect to our private bus via zbus, set up portal session, get EIS fd
         let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(eis_err)?
             .build().await.map_err(eis_err)?;
+        // Get AT-SPI bus address
+        let a11y_proxy: zbus::Proxy = zbus::proxy::Builder::new(&zbus_conn)
+            .destination("org.a11y.Bus").map_err(eis_err)?
+            .path("/org/a11y/bus").map_err(eis_err)?
+            .interface("org.a11y.Bus").map_err(eis_err)?
+            .build().await.map_err(eis_err)?;
+        let (a11y_addr,): (String,) = a11y_proxy.call("GetAddress", &()).await.map_err(eis_err)?;
+        // Update D-Bus activation environment
+        let env_vars: std::collections::HashMap<&str, &str> = [("WAYLAND_DISPLAY", socket.as_str()), ("QT_QPA_PLATFORM", "wayland")].into_iter().collect();
+        let bus_proxy: zbus::Proxy = zbus::proxy::Builder::new(&zbus_conn)
+            .destination("org.freedesktop.DBus").map_err(eis_err)?
+            .path("/org/freedesktop/DBus").map_err(eis_err)?
+            .interface("org.freedesktop.DBus").map_err(eis_err)?
+            .build().await.map_err(eis_err)?;
+        let _: () = bus_proxy.call("UpdateActivationEnvironment", &(env_vars,)).await.map_err(eis_err)?;
         let eis_fd = portal_setup(&zbus_conn).await.map_err(eis_err)?;
         // Blocking: reis negotiation over the EIS fd
         let eis = tokio::task::spawn_blocking(move || Eis::from_fd(eis_fd))
@@ -697,74 +697,68 @@ impl KwinMcp {
 
     #[tool(description = "Stop the KWin session and clean up all processes.", destructive = true)]
     async fn session_stop(&self) -> Result<ToolOutput, McpError> {
-        let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-        match (*guard).take() {
-            Some(sess) => { let pid = sess.child_pid; teardown(sess); Ok(ToolOutput::text(format!("stopped pid={pid}"))) }
+        let taken = {
+            let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+            (*guard).take()
+        };
+        match taken {
+            Some(sess) => { let pid = sess.child_pid; teardown(sess).await; Ok(ToolOutput::text(format!("stopped pid={pid}"))) }
             None => Ok(ToolOutput::text("no session running")),
         }
     }
 
     #[tool(description = "Screenshot the active window. Returns PNG path + window position/size.", read_only = true)]
     async fn screenshot(&self) -> Result<ToolOutput, McpError> {
-        let (_, _, win_id) = active_window_info(&self.zbus_conn()?).await?;
-        self.with_session(|sess| {
-            let path = sess.scrdir.join("screenshot.png");
-            let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
-            let write_raw = write_fd.into_raw_fd();
-            let mut ch = dbus::channel::Channel::open_private(&sess.dbus_addr).map_err(eis_err)?;
-            ch.register().map_err(eis_err)?;
-            let conn = dbus::blocking::Connection::from(ch);
-            let pipe_fd = unsafe { dbus::arg::OwnedFd::new(write_raw) };
-            fn dbus_variant(v: Box<dyn dbus::arg::RefArg>) -> dbus::arg::Variant<Box<dyn dbus::arg::RefArg>> { dbus::arg::Variant(v) }
-            let opts: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> = [
-                ("include-cursor".to_owned(), dbus_variant(Box::new(true))),
-                ("include-decoration".to_owned(), dbus_variant(Box::new(true))),
-                ("include-shadow".to_owned(), dbus_variant(Box::new(false))),
-            ].into_iter().collect::<std::collections::HashMap<_, _>>();
-            // CaptureWindow by UUID — window-only, no shadow
-            let msg = {
-                let m = dbus::Message::new_method_call("org.kde.KWin", "/org/kde/KWin/ScreenShot2",
-                    "org.kde.KWin.ScreenShot2", "CaptureWindow").map_err(eis_err)?;
-                m.append3::<&str, &std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>>, dbus::arg::OwnedFd>(win_id.as_str(), &opts, pipe_fd)
-            };
-            let reply = conn.channel().send_with_reply_and_block(msg, std::time::Duration::from_secs(5)).map_err(eis_err)?;
-            // parse metadata from reply — first arg is a{sv} dict
-            let meta: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> =
-                reply.read1().map_err(eis_err)?;
-            let get_meta = |key: &str| -> Result<u32, McpError> {
-                let val = meta.get(key).ok_or_else(|| McpError::internal(format!("no {key}")))?;
-                let n = val.0.as_u64().ok_or_else(|| McpError::internal(format!("{key} not u64")))?;
-                u32::try_from(n).map_err(|e| McpError::internal(e.to_string()))
-            };
-            let width = get_meta("width")?;
-            let height = get_meta("height")?;
-            let stride = get_meta("stride")?;
-            // read raw ARGB32 pixels from pipe
-            let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
-            let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
-            let mut pixels = vec![0u8; total];
-            std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
-            // BGRA (little-endian ARGB32) → RGBA for PNG
-            let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
-            let mut rgba = vec![0u8; px_count * 4];
-            for row in 0..height {
-                for col in 0..width {
-                    let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
-                    let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
-                    rgba[di] = pixels[si + 2]; rgba[di + 1] = pixels[si + 1];
-                    rgba[di + 2] = pixels[si]; rgba[di + 3] = pixels[si + 3];
-                }
+        let zbus_conn = self.zbus_conn()?;
+        let (_, _, win_id) = active_window_info(&zbus_conn).await?;
+        let path = self.with_session(|sess| Ok(sess.scrdir.join("screenshot.png")))?;
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
+        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+        let opts: std::collections::HashMap<&str, zbus::zvariant::Value> = [
+            ("include-cursor", zbus::zvariant::Value::from(true)),
+            ("include-decoration", zbus::zvariant::Value::from(true)),
+            ("include-shadow", zbus::zvariant::Value::from(false)),
+        ].into_iter().collect();
+        let ss_proxy: zbus::Proxy = zbus::proxy::Builder::new(&zbus_conn)
+            .destination("org.kde.KWin").map_err(eis_err)?
+            .path("/org/kde/KWin/ScreenShot2").map_err(eis_err)?
+            .interface("org.kde.KWin.ScreenShot2").map_err(eis_err)?
+            .build().await.map_err(eis_err)?;
+        let reply: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            ss_proxy.call("CaptureWindow", &(win_id.as_str(), &opts, pipe_fd)).await.map_err(eis_err)?;
+        let get_meta = |key: &str| -> Result<u32, McpError> {
+            let val = reply.get(key).ok_or_else(|| McpError::internal(format!("no {key}")))?;
+            let n: u32 = val.try_into().map_err(|e: zbus::zvariant::Error| McpError::internal(e.to_string()))?;
+            Ok(n)
+        };
+        let width = get_meta("width")?;
+        let height = get_meta("height")?;
+        let stride = get_meta("stride")?;
+        // read raw ARGB32 pixels from pipe
+        let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
+        let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
+        let mut pixels = vec![0u8; total];
+        std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
+        // BGRA (little-endian ARGB32) -> RGBA for PNG
+        let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
+        let mut rgba = vec![0u8; px_count * 4];
+        for row in 0..height {
+            for col in 0..width {
+                let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
+                let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
+                rgba[di] = pixels[si + 2]; rgba[di + 1] = pixels[si + 1];
+                rgba[di + 2] = pixels[si]; rgba[di + 3] = pixels[si + 3];
             }
-            // write PNG
-            let file = std::fs::File::create(&path).map_err(eis_err)?;
-            let mut enc = png::Encoder::new(file, width, height);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut writer = enc.write_header().map_err(eis_err)?;
-            writer.write_image_data(&rgba).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("{} size={}x{}",
-                path.to_string_lossy(), width, height)))
-        })
+        }
+        // write PNG
+        let file = std::fs::File::create(&path).map_err(eis_err)?;
+        let mut enc = png::Encoder::new(file, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(eis_err)?;
+        writer.write_image_data(&rgba).map_err(eis_err)?;
+        Ok(ToolOutput::text(format!("{} size={}x{}",
+            path.to_string_lossy(), width, height)))
     }
 
     #[tool(description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", read_only = true)]
