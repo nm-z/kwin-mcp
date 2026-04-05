@@ -710,8 +710,6 @@ dependencies = [
  "anyhow",
  "ashpd",
  "atspi",
- "chrono",
- "futures",
  "keyboard-codes",
  "nix",
  "png",
@@ -719,7 +717,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "zbus",
 ]

@@ -3,7 +3,6 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServiceExt;
 use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ashpd::desktop::remote_desktop::{RemoteDesktop, DeviceType, KeyState, Axis,
@@ -96,25 +95,6 @@ fn btn_code(btn: Option<&str>) -> Result<i32, McpError> {
     }
 }
 
-fn write_kde_config(dir: &str, file: &str, entries: &[(&str, &str, &str)]) -> anyhow::Result<()> {
-    let mut out = String::new();
-    let mut current_group = "";
-    for &(group, key, value) in entries {
-        if group != current_group { out.push_str(&format!("[{group}]\n")); current_group = group; }
-        out.push_str(&format!("{key}={value}\n"));
-    }
-    std::fs::write(format!("{dir}/{file}"), out)?;
-    Ok(())
-}
-
-
-fn wait_for_path(path: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
-    while !std::path::Path::new(path).exists() {
-        if std::time::Instant::now() > deadline { anyhow::bail!("socket {path} did not appear"); }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    Ok(())
-}
 
 // ── Portal session ──────────────────────────────────────────────────────
 
@@ -141,8 +121,7 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-#[expect(dead_code)] // width, height, bus_dir stored for future use / cleanup
-struct Session { dbus_pid: u32, bus_dir: tempfile::TempDir, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, log: std::fs::File, socket: String, width: u32, height: u32, portal: PortalSession, zbus_conn: zbus::Connection }
+struct Session { scrdir: PathBuf, portal: PortalSession, zbus_conn: zbus::Connection }
 
 // ── Server ───────────────────────────────────────────────────────────────
 
@@ -165,14 +144,6 @@ fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal_error(e.t
 
 fn teardown(sess: Session) {
     drop(sess.portal);
-    if let Ok(pid) = i32::try_from(sess.child_pid) {
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
-    }
-    if let Ok(pid) = i32::try_from(sess.dbus_pid) {
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
-    }
 }
 
 
@@ -285,10 +256,7 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
 // ── Tool parameter structs ──────────────────────────────────────────────
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
-struct SessionStartParams {
-    width: Option<FlexInt>,
-    height: Option<FlexInt>,
-}
+struct SessionStartParams {}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
@@ -349,7 +317,6 @@ struct AccessibilityTreeParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindUiElementsParams {
     query: String,
-    app_name: Option<String>,
 }
 
 // ── Tool implementations ────────────────────────────────────────────────
@@ -364,8 +331,8 @@ impl rmcp::ServerHandler for KwinMcp {
 
 #[rmcp::tool_router]
 impl KwinMcp {
-    #[rmcp::tool(name = "session_start", description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
-    async fn session_start(&self, Parameters(params): Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
+    #[rmcp::tool(name = "session_start", description = "Connect to the running KDE Wayland session for GUI automation. Must be called before any other tool.")]
+    async fn session_start(&self, Parameters(_params): Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
         eprintln!("kwin-mcp v{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
         let version_stamp = format!("kwin-mcp v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
@@ -373,113 +340,17 @@ impl KwinMcp {
             let mut guard = self.session.lock().await;
             if let Some(old) = (*guard).take() { teardown(old); }
         }
-        let w = u32::try_from(params.width.map(parse_int).unwrap_or(1920)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let h = u32::try_from(params.height.map(parse_int).unwrap_or(1080)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let pid = std::process::id();
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| anyhow::anyhow!("{e}"))?.as_secs();
-            let sock = format!("wayland-mcp-{pid}-{ts}");
-            let xdg = std::env::var("XDG_RUNTIME_DIR").map_err(|e| anyhow::anyhow!("XDG_RUNTIME_DIR: {e}"))?;
-            let config_dir = format!("{}/.config/kwin-mcp", std::env::var("HOME").map_err(|e| anyhow::anyhow!("HOME: {e}"))?);
-            // Write KDE config files
-            std::fs::create_dir_all(&config_dir)?;
-            write_kde_config(&config_dir, "kwinrc", &[
-                ("Compositing", "ShadowSize", "0"),
-                ("org.kde.kdecoration2", "ShadowSize", "0"),
-                ("Xwayland", "XwaylandEisNoPrompt", "true"),
-                ("Keyboard", "XkbRules", "evdev"),
-                ("Keyboard", "XkbModel", "pc105"),
-                ("Keyboard", "XkbLayout", "us"),
-            ])?;
-            write_kde_config(&config_dir, "kcminputrc", &[("Mouse", "cursorTheme", "breeze_cursors")])?;
-            // Symlink real XKB config into isolated config so KWin/Xwayland can compile keymaps
-            let xkb_dir = format!("{config_dir}/xkb");
-            let _ = std::os::unix::fs::symlink("/usr/share/X11/xkb", &xkb_dir);
-            write_kde_config(&config_dir, "kdeglobals", &[("General", "ColorScheme", "BreezeDark")])?;
-            std::fs::write(format!("{config_dir}/kwinrulesrc"),
-                "[1]\nDescription=nodecor\nnoborder=true\nnoborderrule=2\nwmclass=.*\nwmclassmatch=3\n[General]\ncount=1\n")?;
-            // Create runtime log early so all subprocesses can write to it
-            let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-            std::fs::create_dir_all(&scrdir)?;
-            let log = std::fs::OpenOptions::new().create(true).append(true)
-                .open(scrdir.join("kwin-mcp.log")).map_err(|e| anyhow::anyhow!("create log: {e}"))?;
-            // Launch private D-Bus daemon with permissive policy for portal inter-service replies
-            let bus_dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
-            let bus_conf = format!(r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:dir={dir}</listen>
-  <standard_session_servicedirs />
-  <policy context="default">
-    <allow send_destination="*" eavesdrop="true"/>
-    <allow eavesdrop="true"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>"#, dir = bus_dir.path().display());
-            std::fs::write(bus_dir.path().join("bus.conf"), &bus_conf)?;
-            let mut dbus_child = std::process::Command::new("dbus-daemon")
-                .args(["--config-file", &bus_dir.path().join("bus.conf").to_string_lossy(), "--nofork", "--print-address"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from))
-                .spawn().map_err(|e| anyhow::anyhow!("dbus-daemon spawn: {e}"))?;
-            let dbus_stdout = dbus_child.stdout.take().ok_or_else(|| anyhow::anyhow!("no dbus stdout"))?;
-            let mut dbus_reader = std::io::BufReader::new(dbus_stdout);
-            let mut dbus_addr = String::new();
-            std::io::BufRead::read_line(&mut dbus_reader, &mut dbus_addr).map_err(|e| anyhow::anyhow!("dbus addr: {e}"))?;
-            let dbus_addr = dbus_addr.trim().to_owned();
-            anyhow::ensure!(!dbus_addr.is_empty(), "dbus-daemon returned empty address");
-            let dbus_pid = dbus_child.id();
-            // Get AT-SPI bus address
-            let bconn = zbus::blocking::connection::Builder::address(dbus_addr.as_str())
-                .and_then(|b| b.build()).map_err(|e| anyhow::anyhow!("zbus connect: {e}"))?;
-            let a11y_proxy = zbus::blocking::Proxy::new(&bconn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
-                .map_err(|e| anyhow::anyhow!("a11y proxy: {e}"))?;
-            let a11y_reply = a11y_proxy.call_method("GetAddress", &())
-                .map_err(|e| anyhow::anyhow!("a11y GetAddress: {e}"))?;
-            let a11y_addr: String = a11y_reply.body().deserialize()
-                .map_err(|e| anyhow::anyhow!("a11y addr parse: {e}"))?;
-            // Update D-Bus activation environment
-            let env_vars: std::collections::HashMap<&str, &str> = [("WAYLAND_DISPLAY", sock.as_str()), ("QT_QPA_PLATFORM", "wayland")].into_iter().collect();
-            let bus_proxy = zbus::blocking::Proxy::new(&bconn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus")
-                .map_err(|e| anyhow::anyhow!("bus proxy: {e}"))?;
-            bus_proxy.call_method("UpdateActivationEnvironment", &(env_vars,))
-                .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
-            // Spawn KWin — it manages its own Xwayland sockets/xauth
-            let child = unsafe {
-                std::process::Command::new("kwin_wayland")
-                    .args(["--virtual", "--no-lockscreen", "--xwayland",
-                           "--width", &w.to_string(), "--height", &h.to_string(), "--socket", &sock])
-                    .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
-                    .env("KDE_FULL_SESSION", "true").env("KDE_SESSION_VERSION", "6")
-                    .env("XDG_SESSION_TYPE", "wayland").env("XDG_CURRENT_DESKTOP", "KDE")
-                    .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1").env("QT_ACCESSIBILITY", "1")
-                    .env("XCURSOR_THEME", "breeze_cursors").env("XDG_CONFIG_HOME", &config_dir)
-                    .env("XKB_DEFAULT_RULES", "evdev").env("XKB_DEFAULT_MODEL", "pc105").env("XKB_DEFAULT_LAYOUT", "us")
-                    .env("XKB_CONFIG_ROOT", "/usr/share/X11/xkb")
-                    .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1").env("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS", "1")
-                    .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY").env_remove("QT_QPA_PLATFORM")
-                    .stdout(log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from))
-                    .stderr(log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from))
-                    .pre_exec(|| nix::unistd::setsid().map(drop).map_err(std::io::Error::from))
-                    .spawn()?
-            };
-            let child_pid = child.id();
-            // Wait for wayland socket and XWayland display
-            let sock_path = format!("{xdg}/{sock}");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            wait_for_path(&sock_path, deadline)?;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, sock, w, h))
-        }).await.map_err(|e| ver_err(e.to_string()))?;
-        let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, socket, width, height) =
-            result.map_err(|e| ver_err(e.to_string()))?;
-        let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(|e| ver_err(e.to_string()))?
-            .build().await.map_err(|e| ver_err(e.to_string()))?;
+        let pid = std::process::id();
+        let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
+        std::fs::create_dir_all(&scrdir).map_err(|e| ver_err(e.to_string()))?;
+        // Connect to the user's existing session bus
+        let zbus_conn = zbus::Connection::session().await.map_err(|e| ver_err(e.to_string()))?;
+        let bus_name = zbus_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
+        // Set up RemoteDesktop portal for input injection
         let portal = portal_setup(&zbus_conn).await.map_err(|e| ver_err(e.to_string()))?;
-        let msg = format!("{version_stamp} — session started pid={child_pid} dbus={dbus_addr} socket={socket} geometry={width}x{height}");
+        let msg = format!("{version_stamp} — session started bus={bus_name}");
         let mut guard = self.session.lock().await;
-        *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, socket, width, height, portal, zbus_conn });
+        *guard = Some(Session { scrdir, portal, zbus_conn });
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -487,7 +358,7 @@ impl KwinMcp {
     async fn session_stop(&self) -> Result<CallToolResult, McpError> {
         let mut guard = self.session.lock().await;
         match (*guard).take() {
-            Some(sess) => { let pid = sess.child_pid; teardown(sess); Ok(CallToolResult::success(vec![Content::text(format!("stopped pid={pid}"))])) }
+            Some(sess) => { teardown(sess); Ok(CallToolResult::success(vec![Content::text("session stopped")])) }
             None => Ok(CallToolResult::success(vec![Content::text("no session running")])),
         }
     }
@@ -499,8 +370,7 @@ impl KwinMcp {
             let path = sess.scrdir.join("screenshot.png");
             let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
             let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-            let bconn = zbus::blocking::connection::Builder::address(sess.dbus_addr.as_str())
-                .and_then(|b| b.build()).map_err(eis_err)?;
+            let bconn = zbus::blocking::Connection::session().map_err(eis_err)?;
             let proxy = zbus::blocking::Proxy::new(&bconn, "org.kde.KWin", "/org/kde/KWin/ScreenShot2",
                 "org.kde.KWin.ScreenShot2").map_err(eis_err)?;
             let mut opts = std::collections::HashMap::new();
@@ -548,8 +418,7 @@ impl KwinMcp {
     #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
     async fn accessibility_tree(&self, Parameters(params): Parameters<AccessibilityTreeParams>) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let a11y = self.with_session(|s| Ok(s.a11y_addr.clone())).await?;
-        let conn = atspi::AccessibilityConnection::from_address(a11y.parse().map_err(eis_err)?).await.map_err(eis_err)?;
+        let conn = atspi::AccessibilityConnection::new().await.map_err(eis_err)?;
         let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
         let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(eis_err)?;
         let app_name = params.app_name.map(|s| s.to_lowercase());
@@ -574,7 +443,7 @@ impl KwinMcp {
     #[rmcp::tool(name = "find_ui_elements", description = "Search UI elements by name/role/description (case-insensitive).", annotations(read_only_hint = true))]
     async fn find_ui_elements(&self, Parameters(params): Parameters<FindUiElementsParams>) -> Result<CallToolResult, McpError> {
         let _ = &params.query;
-        self.with_session(|sess| { eprintln!("atspi stub dbus={} app={:?}", sess.dbus_addr, params.app_name); Err(McpError::internal_error("AT-SPI2 search not yet implemented", None)) }).await
+        self.with_session(|_sess| { Err(McpError::internal_error("AT-SPI2 search not yet implemented", None)) }).await
     }
 
     #[rmcp::tool(name = "mouse_click", description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
@@ -700,23 +569,12 @@ impl KwinMcp {
         Ok(CallToolResult::success(vec![Content::text(format!("key: {}", params.key))]))
     }
 
-    #[rmcp::tool(name = "launch_app", description = "Launch app in session (non-blocking). Returns PID.")]
+    #[rmcp::tool(name = "launch_app", description = "Launch an application by desktop file ID (e.g. 'org.kde.konsole').")]
     async fn launch_app(&self, Parameters(params): Parameters<LaunchAppParams>) -> Result<CallToolResult, McpError> {
-        self.with_session(|sess| {
-            let parts: Vec<&str> = params.command.split_whitespace().collect();
-            let bin = parts.first().ok_or_else(|| McpError::invalid_params("empty command", None))?;
-            let mut cmd = std::process::Command::new(bin);
-            cmd.args(&parts[1..])
-                .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS").env_remove("XAUTHORITY")
-                .env("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr).env("WAYLAND_DISPLAY", &sess.socket)
-                .env("QT_QPA_PLATFORM", "wayland")
-                .stdout(sess.log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from))
-                .stderr(sess.log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from));
-            match cmd.spawn() {
-                Ok(child) => Ok(CallToolResult::success(vec![Content::text(format!("launched pid={}", child.id()))])),
-                Err(e) => Err(McpError::internal_error(format!("spawn: {e}"), None)),
-            }
-        }).await
+        let conn = self.zbus_conn().await?;
+        let launcher = ashpd::desktop::dynamic_launcher::DynamicLauncherProxy::with_connection(conn).await.map_err(eis_err)?;
+        launcher.launch(&params.command, ashpd::desktop::dynamic_launcher::LaunchOptions::default()).await.map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(format!("launched: {}", params.command))]))
     }
 }
 
