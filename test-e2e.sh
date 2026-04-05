@@ -7,8 +7,8 @@ BINARY="${1:-./target/debug/kwin-mcp}"
 PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
 
 # Snapshot existing kwin/dbus processes before test
-PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort)
-PRE_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort)
+PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort || true)
+PRE_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort || true)
 PRE_KWIN_COUNT=$(echo "$PRE_KWIN" | grep -c . || true)
 PRE_DBUS_COUNT=$(echo "$PRE_DBUS" | grep -c . || true)
 PRE_TOTAL=$((PRE_KWIN_COUNT + PRE_DBUS_COUNT))
@@ -194,8 +194,8 @@ fi
 # ── 16. orphan check — no stragglers after session_stop ──
 echo "== orphan check =="
 # Compare against pre-test snapshot — only count NEW processes
-POST_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort)
-POST_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort)
+POST_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort || true)
+POST_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort || true)
 NEW_KWIN=$(comm -13 <(echo "$PRE_KWIN") <(echo "$POST_KWIN") | wc -l)
 NEW_DBUS=$(comm -13 <(echo "$PRE_DBUS") <(echo "$POST_DBUS") | wc -l)
 TOTAL_NEW=$((NEW_KWIN + NEW_DBUS))
