@@ -6,9 +6,14 @@ set -euo pipefail
 BINARY="${1:-./target/debug/kwin-mcp}"
 PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
 
+# Snapshot existing kwin/dbus processes before test
+PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort)
+PRE_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort)
+
 coproc MCP { "$BINARY" 2>/tmp/kwin-mcp-e2e-stderr.log; }
 MCP_PID=${MCP_PID}
-trap 'kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null' EXIT
+cleanup() { kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null; }
+trap cleanup EXIT
 
 send() { echo "$1" >&"${MCP[1]}"; }
 recv() {
@@ -168,8 +173,8 @@ fi
 echo "== session_stop =="
 ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"session_stop\",\"arguments\":{}}}"
-RESP=$(recv 15)
-echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "stopped pid=" && pass "session_stop works" || fail "session_stop failed"
+RESP=$(recv 30 || echo "TIMEOUT")
+echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "stopped pid=" && pass "session_stop works" || fail "session_stop failed: $RESP"
 
 # ── 15. tools after stop should error ──
 echo "== post-stop error check =="
@@ -180,6 +185,22 @@ if echo "$RESP" | jq -e '.error' >/dev/null 2>&1 || echo "$RESP" | jq -e '.resul
     pass "tools error after session_stop"
 else
     fail "tools should error after session_stop"
+fi
+
+# ── 16. orphan check — no stragglers after session_stop ──
+echo "== orphan check =="
+# Compare against pre-test snapshot — only count NEW processes
+POST_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort)
+POST_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort)
+NEW_KWIN=$(comm -13 <(echo "$PRE_KWIN") <(echo "$POST_KWIN") | wc -l)
+NEW_DBUS=$(comm -13 <(echo "$PRE_DBUS") <(echo "$POST_DBUS") | wc -l)
+TOTAL_NEW=$((NEW_KWIN + NEW_DBUS))
+if [ "$TOTAL_NEW" -eq 0 ]; then
+    pass "no new orphans after session_stop (0 stragglers)"
+else
+    fail "found $TOTAL_NEW new stragglers ($NEW_KWIN kwin, $NEW_DBUS dbus-daemon)"
+    comm -13 <(echo "$PRE_KWIN") <(echo "$POST_KWIN") | xargs -r -I{} ps -p {} -o pid,cmd || true
+    comm -13 <(echo "$PRE_DBUS") <(echo "$POST_DBUS") | xargs -r -I{} ps -p {} -o pid,cmd || true
 fi
 
 # ── Results ──

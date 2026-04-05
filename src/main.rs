@@ -329,26 +329,8 @@ impl KwinMcp {
 
 fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal_error(e.to_string(), None) }
 
-fn kill_bus_clients(dbus_addr: &str) {
-    let Ok(conn) = zbus::blocking::connection::Builder::address(dbus_addr)
-        .and_then(|b| b.build()) else { return };
-    let Ok(proxy) = zbus::blocking::Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus") else { return };
-    let Ok(names) = proxy.call_method("ListNames", &()) else { return };
-    let Ok(names): Result<Vec<String>, _> = names.body().deserialize() else { return };
-    let my_pid = std::process::id();
-    for name in &names {
-        if name.starts_with(':')
-            && let Ok(reply) = proxy.call_method("GetConnectionUnixProcessID", &(name.as_str(),))
-            && let Ok(pid) = reply.body().deserialize::<u32>()
-            && pid != my_pid && let Ok(p) = i32::try_from(pid) {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
-        }
-    }
-}
-
 fn teardown(sess: Session) {
     drop(sess.eis);
-    kill_bus_clients(&sess.dbus_addr);
     if let Ok(pid) = i32::try_from(sess.child_pid) {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
     }
