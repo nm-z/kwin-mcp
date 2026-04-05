@@ -2,6 +2,7 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Imple
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServiceExt;
 use serde::Deserialize;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use ashpd::desktop::remote_desktop::{RemoteDesktop, DeviceType, KeyState, Axis,
     NotifyKeyboardKeycodeOptions, NotifyPointerMotionAbsoluteOptions,
@@ -126,6 +127,18 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
     let stream_id = started.streams().first().map(|s| s.pipe_wire_node_id()).unwrap_or(0);
     eprintln!("portal: stream_id={stream_id} streams={}", started.streams().len());
     Ok(PortalSession { rd, session, stream_id })
+}
+
+// ── KWin ScreenShot2 typed proxy ─────────────────────────────────────────
+
+#[zbus::proxy(
+    interface = "org.kde.KWin.ScreenShot2",
+    default_service = "org.kde.KWin",
+    default_path = "/org/kde/KWin/ScreenShot2"
+)]
+trait KWinScreenShot2 {
+    #[zbus(name = "CaptureWindow")]
+    fn capture_window(&self, window_id: &str, options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>, pipe_fd: zbus::zvariant::OwnedFd) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
@@ -372,14 +385,43 @@ impl KwinMcp {
         }
     }
 
-    #[rmcp::tool(name = "screenshot", description = "Screenshot via portal. Returns file URI.", annotations(read_only_hint = true))]
+    #[rmcp::tool(name = "screenshot", description = "Screenshot the active window. Returns PNG path.", annotations(read_only_hint = true))]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
-        let response = ashpd::desktop::screenshot::Screenshot::request()
-            .interactive(false)
-            .modal(false)
-            .send().await.map_err(eis_err)?
-            .response().map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(response.uri().to_string())]))
+        let conn = self.zbus_conn().await?;
+        let (_, _, win_id) = active_window_info(&conn).await?;
+        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(eis_err)?;
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
+        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+        let meta = proxy.capture_window(&win_id, opts, pipe_fd).await.map_err(eis_err)?;
+        let get = |k: &str| -> Result<u32, McpError> {
+            u32::try_from(meta.get(k).ok_or_else(|| McpError::internal_error(format!("no {k}"), None))?)
+                .map_err(|_| McpError::internal_error(format!("{k} not u32"), None))
+        };
+        let (width, height, stride) = (get("width")?, get("height")?, get("stride")?);
+        let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
+        let total = usize::try_from(stride * height).map_err(eis_err)?;
+        let mut pixels = vec![0u8; total];
+        std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
+        // BGRA → RGBA
+        let px = usize::try_from(width * height).map_err(eis_err)?;
+        let mut rgba = vec![0u8; px * 4];
+        for row in 0..height { for col in 0..width {
+            let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
+            let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
+            rgba[di] = pixels[si + 2]; rgba[di + 1] = pixels[si + 1];
+            rgba[di + 2] = pixels[si]; rgba[di + 3] = pixels[si + 3];
+        }}
+        let path = std::env::temp_dir().join(format!("kwin-mcp-{}.png", std::process::id()));
+        let file = std::fs::File::create(&path).map_err(eis_err)?;
+        let mut enc = png::Encoder::new(file, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(eis_err)?;
+        writer.write_image_data(&rgba).map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), width, height))]))
     }
 
     #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
