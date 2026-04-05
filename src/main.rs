@@ -397,7 +397,7 @@ impl KwinMcp {
         drop(guard);
         let path = std::env::temp_dir().join(format!("kwin-mcp-{}.png", std::process::id()));
         let path_clone = path.clone();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, u32)> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, u32)> {
             let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, u32, u32)>();
             let mainloop = pipewire::main_loop::MainLoopRc::new(None)
                 .map_err(|e| anyhow::anyhow!("pw mainloop: {e}"))?;
@@ -452,7 +452,7 @@ impl KwinMcp {
             let mut writer = enc.write_header().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
             writer.write_image_data(&rgba).map_err(|e| anyhow::anyhow!("png data: {e}"))?;
             Ok((width, height))
-        })).await.map_err(|_| McpError::internal_error("screenshot timed out — no frame from virtual output", None))?.map_err(eis_err)?.map_err(eis_err)?;
+        }).await.map_err(eis_err)?.map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), result.0, result.1))]))
     }
 
