@@ -100,6 +100,7 @@ struct PortalSession {
     rd: RemoteDesktop,
     session: ashpd::desktop::Session<RemoteDesktop>,
     stream_id: u32,
+    pw_fd: std::os::fd::OwnedFd,
 }
 
 async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSession> {
@@ -116,7 +117,7 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
     let sc = Screencast::with_connection(zbus_conn.clone()).await
         .map_err(|e| anyhow::anyhow!("Screencast: {e}"))?;
     sc.select_sources(&session, SelectSourcesOptions::default()
-        .set_sources(SourceType::Monitor | SourceType::Window)
+        .set_sources(SourceType::Virtual | SourceType::Monitor)
         .set_cursor_mode(CursorMode::Embedded)).await
         .map_err(|e| anyhow::anyhow!("select_sources: {e}"))?.response()
         .map_err(|e| anyhow::anyhow!("select_sources response: {e}"))?;
@@ -124,8 +125,10 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
         .map_err(|e| anyhow::anyhow!("start: {e}"))?.response()
         .map_err(|e| anyhow::anyhow!("start response: {e}"))?;
     let stream_id = started.streams().first().map(|s| s.pipe_wire_node_id()).unwrap_or(0);
+    let pw_fd = sc.open_pipe_wire_remote(&session, ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default()).await
+        .map_err(|e| anyhow::anyhow!("open_pipe_wire_remote: {e}"))?;
     eprintln!("portal: stream_id={stream_id} streams={}", started.streams().len());
-    Ok(PortalSession { rd, session, stream_id })
+    Ok(PortalSession { rd, session, stream_id, pw_fd })
 }
 
 // ── KWin ScreenShot2 typed proxy ─────────────────────────────────────────
@@ -384,44 +387,73 @@ impl KwinMcp {
         }
     }
 
-    #[rmcp::tool(name = "screenshot", description = "Screenshot the active window. Returns PNG path.", annotations(read_only_hint = true))]
+    #[rmcp::tool(name = "screenshot", description = "Capture frame from the virtual output. Returns PNG path.", annotations(read_only_hint = true))]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
-        let conn = self.zbus_conn().await?;
-        let (_, _, win_id) = active_window_info(&conn).await?;
-        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(eis_err)?;
-        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
-        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-        let opts = std::collections::HashMap::from([
-            ("include-cursor", zbus::zvariant::Value::from(true)),
-            ("include-decoration", zbus::zvariant::Value::from(true)),
-        ]);
-        let meta = proxy.capture_window(&win_id, opts, pipe_fd).await.map_err(eis_err)?;
-        let get = |k: &str| -> Result<u32, McpError> {
-            u32::try_from(meta.get(k).ok_or_else(|| McpError::internal_error(format!("no {k}"), None))?)
-                .map_err(|_| McpError::internal_error(format!("{k} not u32"), None))
-        };
-        let (width, height, stride) = (get("width")?, get("height")?, get("stride")?);
-        let mut reader = std::io::BufReader::new(std::fs::File::from(read_fd));
-        let total = usize::try_from(stride * height).map_err(eis_err)?;
-        let mut pixels = vec![0u8; total];
-        std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
-        // BGRA → RGBA in-place, skip stride padding per row
-        let w = usize::try_from(width).map_err(eis_err)?;
-        let s = usize::try_from(stride).map_err(eis_err)?;
-        let mut rgba = Vec::with_capacity(w * usize::try_from(height).map_err(eis_err)? * 4);
-        for row in pixels.chunks_exact(s) {
-            for px in row[..w * 4].chunks_exact(4) {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-            }
-        }
+        let guard = self.session.lock().await;
+        let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
+        let stream_id = sess.portal.stream_id;
+        // Dup the fd so PipeWire can own it without consuming the portal's fd
+        let owned_fd = sess.portal.pw_fd.try_clone().map_err(eis_err)?;
+        drop(guard);
         let path = std::env::temp_dir().join(format!("kwin-mcp-{}.png", std::process::id()));
-        let file = std::fs::File::create(&path).map_err(eis_err)?;
-        let mut enc = png::Encoder::new(file, width, height);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().map_err(eis_err)?;
-        writer.write_image_data(&rgba).map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), width, height))]))
+        let path_clone = path.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, u32)> {
+            let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, u32, u32)>();
+            let mainloop = pipewire::main_loop::MainLoopRc::new(None)
+                .map_err(|e| anyhow::anyhow!("pw mainloop: {e}"))?;
+            let context = pipewire::context::ContextRc::new(&mainloop, None)
+                .map_err(|e| anyhow::anyhow!("pw context: {e}"))?;
+            let core = context.connect_fd_rc(owned_fd, None)
+                .map_err(|e| anyhow::anyhow!("pw connect_fd: {e}"))?;
+            let stream = pipewire::stream::StreamRc::new(core.clone(), "kwin-mcp-screenshot",
+                pipewire::properties::properties! {
+                    *pipewire::keys::MEDIA_TYPE => "Video",
+                    *pipewire::keys::MEDIA_CATEGORY => "Capture",
+                    *pipewire::keys::MEDIA_ROLE => "Screen",
+                }).map_err(|e| anyhow::anyhow!("pw stream: {e}"))?;
+            let loop_clone = mainloop.clone();
+            let _listener = stream.add_local_listener::<()>()
+                .param_changed(|_, _id, _user_data, _pod| {})
+                .process(move |stream, _user_data| {
+                    if let Some(mut buf) = stream.dequeue_buffer() {
+                        if let Some(data) = buf.datas_mut().first_mut() {
+                            let chunk = data.chunk();
+                            let stride = u32::try_from(chunk.stride()).unwrap_or(0);
+                            let w = stride / 4;
+                            let h = chunk.size() / stride.max(1);
+                            if let Some(slice) = data.data() {
+                                let s = usize::try_from(stride).unwrap_or(0);
+                                let wu = usize::try_from(w).unwrap_or(0);
+                                let mut rgba = Vec::with_capacity(wu * usize::try_from(h).unwrap_or(0) * 4);
+                                for row in slice.chunks(s) {
+                                    for px in row.get(..wu * 4).unwrap_or_default().chunks_exact(4) {
+                                        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                                    }
+                                }
+                                let _ = tx.send((rgba, w, h));
+                            }
+                        }
+                        loop_clone.quit();
+                    }
+                })
+                .register().map_err(|e| anyhow::anyhow!("pw listener: {e}"))?;
+            stream.connect(
+                libspa::utils::Direction::Input,
+                Some(stream_id),
+                pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
+                &mut [],
+            ).map_err(|e| anyhow::anyhow!("pw stream connect: {e}"))?;
+            mainloop.run();
+            let (rgba, width, height) = rx.recv().map_err(|e| anyhow::anyhow!("no frame: {e}"))?;
+            let file = std::fs::File::create(&path_clone).map_err(|e| anyhow::anyhow!("create png: {e}"))?;
+            let mut enc = png::Encoder::new(file, width, height);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
+            writer.write_image_data(&rgba).map_err(|e| anyhow::anyhow!("png data: {e}"))?;
+            Ok((width, height))
+        }).await.map_err(eis_err)?.map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), result.0, result.1))]))
     }
 
     #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
