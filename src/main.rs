@@ -86,8 +86,17 @@ fn write_kde_config(dir: &str, file: &str, entries: &[(&str, &str, &str)]) -> an
 }
 
 
-fn eis_devices_ready(dev: &Option<reis::ei::Device>, kb: &Option<reis::ei::Keyboard>) -> bool {
-    matches!((dev, kb), (Some(_), Some(_)))
+struct EisDevices {
+    dev: Option<reis::ei::Device>,
+    kbd_dev: Option<reis::ei::Device>,
+    abs: Option<reis::ei::PointerAbsolute>,
+    btn: Option<reis::ei::Button>,
+    scroll: Option<reis::ei::Scroll>,
+    kbd: Option<reis::ei::Keyboard>,
+}
+
+impl EisDevices {
+    fn ready(&self) -> bool { matches!((&self.dev, &self.kbd), (Some(_), Some(_))) }
 }
 
 // ── Recursive helpers ────────────────────────────────────────────────────
@@ -102,22 +111,18 @@ fn wait_for_path(path: &str, deadline: std::time::Instant) -> anyhow::Result<()>
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 fn negotiate_eis(
     context: &reis::ei::Context, conv: &mut reis::event::EiEventConverter, serial: u32,
-    deadline: std::time::Instant,
-    dev: &mut Option<reis::ei::Device>, kbd_dev: &mut Option<reis::ei::Device>,
-    abs: &mut Option<reis::ei::PointerAbsolute>,
-    bt: &mut Option<reis::ei::Button>, sc: &mut Option<reis::ei::Scroll>, kb: &mut Option<reis::ei::Keyboard>,
+    deadline: std::time::Instant, devs: &mut EisDevices,
 ) -> anyhow::Result<()> {
     if std::time::Instant::now() > deadline { return Ok(()); }
     context.read()?;
     drain_eis_pending(context, conv)?;
-    drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)?;
-    match eis_devices_ready(dev, kb) {
+    drain_eis_events(context, conv, serial, devs)?;
+    match devs.ready() {
         true => Ok(()),
         false => { std::thread::sleep(std::time::Duration::from_millis(100));
-            negotiate_eis(context, conv, serial, deadline, dev, kbd_dev, abs, bt, sc, kb) }
+            negotiate_eis(context, conv, serial, deadline, devs) }
     }
 }
 
@@ -133,12 +138,9 @@ fn drain_eis_pending(context: &reis::ei::Context, conv: &mut reis::event::EiEven
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 fn drain_eis_events(
     context: &reis::ei::Context, conv: &mut reis::event::EiEventConverter, serial: u32,
-    dev: &mut Option<reis::ei::Device>, kbd_dev: &mut Option<reis::ei::Device>,
-    abs: &mut Option<reis::ei::PointerAbsolute>,
-    bt: &mut Option<reis::ei::Button>, sc: &mut Option<reis::ei::Scroll>, kb: &mut Option<reis::ei::Keyboard>,
+    devs: &mut EisDevices,
 ) -> anyhow::Result<()> {
     match conv.next_event() {
         Some(reis::event::EiEvent::SeatAdded(sa)) => {
@@ -146,47 +148,41 @@ fn drain_eis_events(
                 reis::event::DeviceCapability::PointerAbsolute, reis::event::DeviceCapability::Button,
                 reis::event::DeviceCapability::Scroll, reis::event::DeviceCapability::Keyboard]);
             context.flush()?;
-            drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)
+            drain_eis_events(context, conv, serial, devs)
         }
         Some(reis::event::EiEvent::DeviceAdded(da)) => {
-            register_eis_device(&da, serial, dev, kbd_dev, abs, bt, sc, kb);
+            register_eis_device(&da, serial, devs);
             context.flush()?;
-            drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)
+            drain_eis_events(context, conv, serial, devs)
         }
         Some(reis::event::EiEvent::Disconnected(dc)) => { eprintln!("eis: disconnected {:?}", dc); anyhow::bail!("EIS disconnected") }
-        Some(other) => { eprintln!("eis: event {:?}", std::mem::discriminant(&other)); drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb) }
+        Some(other) => { eprintln!("eis: event {:?}", std::mem::discriminant(&other)); drain_eis_events(context, conv, serial, devs) }
         None => Ok(()),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn register_eis_device(
-    da: &reis::event::DeviceAdded, serial: u32,
-    dev: &mut Option<reis::ei::Device>, kbd_dev: &mut Option<reis::ei::Device>,
-    abs: &mut Option<reis::ei::PointerAbsolute>,
-    bt: &mut Option<reis::ei::Button>, sc: &mut Option<reis::ei::Scroll>, kb: &mut Option<reis::ei::Keyboard>,
-) {
+fn register_eis_device(da: &reis::event::DeviceAdded, serial: u32, devs: &mut EisDevices) {
     let has_ptr = da.device.has_capability(reis::event::DeviceCapability::PointerAbsolute);
     let has_kbd = da.device.has_capability(reis::event::DeviceCapability::Keyboard);
     // grab pointer device
-    match (has_ptr, &dev) {
+    match (has_ptr, &devs.dev) {
         (true, None) => {
             da.device.device().start_emulating(serial, 0);
-            *abs = da.device.interface::<reis::ei::PointerAbsolute>();
-            *bt = da.device.interface::<reis::ei::Button>();
-            *sc = da.device.interface::<reis::ei::Scroll>();
-            *dev = Some(da.device.device().clone());
-            match (da.device.interface::<reis::ei::Keyboard>(), &kb) {
-                (Some(k), None) => { *kb = Some(k); *kbd_dev = Some(da.device.device().clone()); }
+            devs.abs = da.device.interface::<reis::ei::PointerAbsolute>();
+            devs.btn = da.device.interface::<reis::ei::Button>();
+            devs.scroll = da.device.interface::<reis::ei::Scroll>();
+            devs.dev = Some(da.device.device().clone());
+            match (da.device.interface::<reis::ei::Keyboard>(), &devs.kbd) {
+                (Some(k), None) => { devs.kbd = Some(k); devs.kbd_dev = Some(da.device.device().clone()); }
                 (Some(_), Some(_)) | (None, Some(_)) | (None, None) => eprintln!("eis: ptr dev registered"),
             }
         }
         (true, Some(_)) | (false, Some(_)) | (false, None) => {
-            match (has_kbd, &kb) {
+            match (has_kbd, &devs.kbd) {
                 (true, None) => {
                     da.device.device().start_emulating(serial, 0);
-                    *kb = da.device.interface::<reis::ei::Keyboard>();
-                    *kbd_dev = Some(da.device.device().clone());
+                    devs.kbd = da.device.interface::<reis::ei::Keyboard>();
+                    devs.kbd_dev = Some(da.device.device().clone());
                 }
                 (true, Some(_)) => eprintln!("eis: kbd already registered"),
                 (false, Some(_)) | (false, None) => eprintln!("eis: skipping device"),
@@ -217,16 +213,16 @@ impl Eis {
         context.flush()?;
         let mut conv = reis::event::EiEventConverter::new(&context, resp);
         let serial = conv.connection().serial();
-        let (mut dev, mut kbd_d, mut abs, mut bt, mut sc, mut kb) = (None, None, None, None, None, None);
+        let mut devs = EisDevices { dev: None, kbd_dev: None, abs: None, btn: None, scroll: None, kbd: None };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        negotiate_eis(&context, &mut conv, serial, deadline, &mut dev, &mut kbd_d, &mut abs, &mut bt, &mut sc, &mut kb)?;
-        anyhow::ensure!(eis_devices_ready(&dev, &kb), "EIS negotiation timed out");
-        let ptr_dev = dev.ok_or_else(|| anyhow::anyhow!("no ptr dev"))?;
-        let kbd_dev = kbd_d.ok_or_else(|| anyhow::anyhow!("no kbd dev"))?;
+        negotiate_eis(&context, &mut conv, serial, deadline, &mut devs)?;
+        anyhow::ensure!(devs.ready(), "EIS negotiation timed out");
+        let ptr_dev = devs.dev.ok_or_else(|| anyhow::anyhow!("no ptr dev"))?;
+        let kbd_dev = devs.kbd_dev.ok_or_else(|| anyhow::anyhow!("no kbd dev"))?;
         Ok(Self {
-            context, abs_ptr: abs.ok_or_else(|| anyhow::anyhow!("no abs"))?,
-            btn: bt.ok_or_else(|| anyhow::anyhow!("no btn"))?, scroll: sc.ok_or_else(|| anyhow::anyhow!("no scroll"))?,
-            kbd: kb.ok_or_else(|| anyhow::anyhow!("no kbd"))?, ptr_dev, kbd_dev, serial,
+            context, abs_ptr: devs.abs.ok_or_else(|| anyhow::anyhow!("no abs"))?,
+            btn: devs.btn.ok_or_else(|| anyhow::anyhow!("no btn"))?, scroll: devs.scroll.ok_or_else(|| anyhow::anyhow!("no scroll"))?,
+            kbd: devs.kbd.ok_or_else(|| anyhow::anyhow!("no kbd"))?, ptr_dev, kbd_dev, serial,
         })
     }
 
