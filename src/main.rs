@@ -308,7 +308,7 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<std::os::f
 // ── Session ──────────────────────────────────────────────────────────────
 
 #[expect(dead_code)] // width, height, zbus_conn, bus_dir stored for future portal/screencast use
-struct Session { dbus_pid: u32, bus_dir: tempfile::TempDir, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, socket: String, xdisplay: String, xauthority: String, width: u32, height: u32, eis: Eis, zbus_conn: zbus::Connection }
+struct Session { dbus_pid: u32, bus_dir: tempfile::TempDir, dbus_addr: String, a11y_addr: String, child_pid: u32, scrdir: PathBuf, log: std::fs::File, socket: String, xdisplay: String, xauthority: String, width: u32, height: u32, eis: Eis, zbus_conn: zbus::Connection }
 
 // ── Server ───────────────────────────────────────────────────────────────
 
@@ -392,6 +392,7 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let cb_path = format!("/KWinMCP/{ts}");
     let our_name = conn.unique_name().ok_or_else(|| McpError::internal_error("no bus name", None))?.to_string();
     let script = format!("var w = workspace.activeWindow;\
+        if (!w) {{ var wl = workspace.windowList(); for (var i = 0; i < wl.length; i++) {{ if (wl[i].normalWindow) {{ w = wl[i]; workspace.activeWindow = w; break; }} }} }}\
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
         w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
         w:w.frameGeometry.width,h:w.frameGeometry.height,\
@@ -601,6 +602,11 @@ impl KwinMcp {
             write_kde_config(&config_dir, "kdeglobals", &[("General", "ColorScheme", "BreezeDark")])?;
             std::fs::write(format!("{config_dir}/kwinrulesrc"),
                 "[1]\nDescription=nodecor\nnoborder=true\nnoborderrule=2\nwmclass=.*\nwmclassmatch=3\n[General]\ncount=1\n")?;
+            // Create runtime log early so all subprocesses can write to it
+            let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
+            std::fs::create_dir_all(&scrdir)?;
+            let log = std::fs::OpenOptions::new().create(true).append(true)
+                .open(scrdir.join("kwin-mcp.log")).map_err(|e| anyhow::anyhow!("create log: {e}"))?;
             // Launch private D-Bus daemon with permissive policy for portal inter-service replies
             let bus_dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("tempdir: {e}"))?;
             let bus_conf = format!(r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -617,7 +623,8 @@ impl KwinMcp {
             std::fs::write(bus_dir.path().join("bus.conf"), &bus_conf)?;
             let mut dbus_child = std::process::Command::new("dbus-daemon")
                 .args(["--config-file", &bus_dir.path().join("bus.conf").to_string_lossy(), "--nofork", "--print-address"])
-                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from))
                 .spawn().map_err(|e| anyhow::anyhow!("dbus-daemon spawn: {e}"))?;
             let dbus_stdout = dbus_child.stdout.take().ok_or_else(|| anyhow::anyhow!("no dbus stdout"))?;
             let mut dbus_reader = std::io::BufReader::new(dbus_stdout);
@@ -683,16 +690,17 @@ impl KwinMcp {
                 nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN);
                 out
             };
-            let xauth_log = format!("/tmp/kwin-mcp-xauth-{pid}.log");
-            if let Ok(ref o) = xauth_out {
-                let _ = std::fs::write(&xauth_log, format!("exit: {}\nstdout: {}\nstderr: {}\n",
-                    o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
-            } else {
-                let _ = std::fs::write(&xauth_log, format!("spawn error: {:?}\n", xauth_out));
+            {
+                use std::io::Write;
+                let msg = match &xauth_out {
+                    Ok(o) => format!("xauth: exit={} stderr={}\n", o.status, String::from_utf8_lossy(&o.stderr)),
+                    Err(e) => format!("xauth: spawn error: {e}\n"),
+                };
+                let _ = log.try_clone().and_then(|mut f| f.write_all(msg.as_bytes()));
             }
             if !xauth_out.is_ok_and(|o| o.status.success()) {
                 let _ = std::fs::remove_file(&lock_path);
-                anyhow::bail!("xauth failed to add cookie for {xdisplay} — see {xauth_log}");
+                anyhow::bail!("xauth failed to add cookie for {xdisplay}");
             }
             // Create filesystem X11 listen socket
             let xw_sock_path = format!("/tmp/.X11-unix/X{xw_display}");
@@ -757,7 +765,8 @@ impl KwinMcp {
                 .env("XCURSOR_THEME", "breeze_cursors").env("XDG_CONFIG_HOME", &config_dir)
                 .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1").env("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS", "1")
                 .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY").env_remove("QT_QPA_PLATFORM")
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                .stdout(std::process::Stdio::null())
+                .stderr(log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from));
             let xauthority = xauth_path.clone();
             let child = (unsafe { cmd.pre_exec(move || {
                 // Keep both X socket fds open for KWin to inherit
@@ -774,13 +783,10 @@ impl KwinMcp {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             std::thread::sleep(std::time::Duration::from_millis(300));
             wait_for_path(&sock_path, deadline)?;
-            // Xwayland display and auth are known from pre-creation above
-            let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-            std::fs::create_dir_all(&scrdir)?;
             std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, sock, xdisplay, xauthority, w, h))
+            Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, sock, xdisplay, xauthority, w, h))
         }).await.map_err(|e| ver_err(e.to_string()))?;
-        let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height) =
+        let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, socket, xdisplay, xauthority, width, height) =
             result.map_err(|e| ver_err(e.to_string()))?;
         // Async: connect to our private bus via zbus, set up portal session, get EIS fd
         let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(|e| ver_err(e.to_string()))?
@@ -792,7 +798,7 @@ impl KwinMcp {
             .map_err(|e| ver_err(e.to_string()))?;
         let msg = format!("{version_stamp} — session started pid={child_pid} dbus={dbus_addr} socket={socket} display={xdisplay} geometry={width}x{height}");
         let mut guard = self.session.lock().map_err(|e| ver_err(e.to_string()))?;
-        *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height, eis, zbus_conn: zbus_conn.clone() });
+        *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, log, socket, xdisplay, xauthority, width, height, eis, zbus_conn: zbus_conn.clone() });
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -1009,7 +1015,8 @@ impl KwinMcp {
             cmd.args(["-c", &params.command]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS").env_remove("XAUTHORITY")
                 .env("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr).env("WAYLAND_DISPLAY", &sess.socket)
                 .env("QT_QPA_PLATFORM", "wayland")
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                .stdout(std::process::Stdio::null())
+                .stderr(sess.log.try_clone().map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from));
             if !xdisp.is_empty() { cmd.env("DISPLAY", &xdisp); }
             if !xauth.is_empty() { cmd.env("XAUTHORITY", &xauth); }
             match cmd.spawn() {
