@@ -1,5 +1,6 @@
 use mcpkit::prelude::*;
 use mcpkit::transport::stdio::StdioTransport;
+use nix::sys::signal::{signal, SigHandler, Signal};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -933,9 +934,10 @@ impl KwinMcp {
 
 #[tokio::main]
 async fn main() -> Result<(), McpError> {
+    // SAFETY: SigIgn is a trivial handler; no custom function pointer involved
     unsafe {
-        nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN);
-        nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
+        let _ = signal(Signal::SIGCHLD, SigHandler::SigIgn);
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
     }
     let kwin = KwinMcp::new();
     let server = ServerBuilder::new(kwin.clone()).with_tools(kwin).build();
