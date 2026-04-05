@@ -5,6 +5,7 @@ set -euo pipefail
 
 BINARY="${1:-./target/debug/kwin-mcp}"
 PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
+FAIL_MSGS=""
 
 # Snapshot existing kwin/dbus processes before test
 PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort || true)
@@ -26,9 +27,9 @@ recv() {
     echo "$line"
 }
 
-pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
-xfail() { echo "  XFAIL: $1 (known)"; EXPECTED_FAIL=$((EXPECTED_FAIL + 1)); }
+pass() { PASS=$((PASS + 1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); FAIL_MSGS="${FAIL_MSGS}  FAIL: $1\n"; }
+xfail() { EXPECTED_FAIL=$((EXPECTED_FAIL + 1)); }
 
 # ── 1. Initialize ──
 echo "== Initialize =="
@@ -210,6 +211,11 @@ fi
 # ── Results ──
 echo ""
 echo "═══════════════════════════════════════════"
-echo "  PASS: $PASS  XFAIL: $EXPECTED_FAIL  FAIL: $FAIL"
+if [ "$FAIL" -gt 0 ]; then
+    echo "  FAILURES:"
+    printf "%b" "$FAIL_MSGS"
+    echo ""
+fi
+echo "  $PASS pass, $EXPECTED_FAIL xfail, $FAIL fail"
 echo "═══════════════════════════════════════════"
 [ "$FAIL" -eq 0 ] || exit 1
