@@ -17,6 +17,7 @@ echo "== pre-existing stragglers: $PRE_TOTAL ($PRE_KWIN_COUNT kwin, $PRE_DBUS_CO
 
 coproc MCP { "$BINARY" 2>/tmp/kwin-mcp-e2e-stderr.log; }
 MCP_PID=${MCP_PID}
+echo "== MCP server PID: $MCP_PID =="
 cleanup() { kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null; }
 trap cleanup EXIT
 
@@ -72,6 +73,9 @@ send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"na
 RESP=$(recv 30)
 TEXT=$(echo "$RESP" | jq -r '.result.content[0].text' 2>/dev/null)
 [ -n "$TEXT" ] && [ "$TEXT" != "null" ] && pass "session_start succeeds" || fail "session_start failed: $(echo "$RESP" | head -c 200)"
+SCRDIR_PID=$(echo "$TEXT" | sed -n 's/.*socket=wayland-mcp-\([0-9]*\).*/\1/p')
+LOG="/tmp/kwin-mcp-${SCRDIR_PID}/kwin-mcp.log"
+echo "== runtime log: $LOG =="
 echo "$RESP" | jq -e '.result.isError == false' >/dev/null 2>&1 && pass "isError is false" || fail "isError not false"
 echo "$TEXT" | grep -q "kwin-mcp v" && pass "version stamp in output" || fail "no version stamp"
 
@@ -213,6 +217,11 @@ echo "════════════════════════�
 if [ "$FAIL" -gt 0 ]; then
     echo "  FAILURES:"
     printf "%b" "$FAIL_MSGS"
+    if [ -f "$LOG" ]; then
+        echo ""
+        echo "  LOG (errors only):"
+        grep -i "error\|fatal\|fail\|crash" "$LOG" 2>/dev/null | head -10 | sed 's/^/  /'
+    fi
 fi
 echo ""
 echo "  $PASS pass, $FAIL fail"
