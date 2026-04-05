@@ -93,12 +93,10 @@ fn eis_devices_ready(dev: &Option<reis::ei::Device>, kb: &Option<reis::ei::Keybo
 // ── Recursive helpers ────────────────────────────────────────────────────
 
 fn wait_for_path(path: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
-    match std::path::Path::new(path).exists() {
-        true => Ok(()),
-        false => match std::time::Instant::now() > deadline {
-            true => anyhow::bail!("socket {path} did not appear"),
-            false => { std::thread::sleep(std::time::Duration::from_millis(100)); wait_for_path(path, deadline) }
-        },
+    loop {
+        if std::path::Path::new(path).exists() { break Ok(()); }
+        if std::time::Instant::now() > deadline { anyhow::bail!("socket {path} did not appear"); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -110,26 +108,26 @@ fn negotiate_eis(
     abs: &mut Option<reis::ei::PointerAbsolute>,
     bt: &mut Option<reis::ei::Button>, sc: &mut Option<reis::ei::Scroll>, kb: &mut Option<reis::ei::Keyboard>,
 ) -> anyhow::Result<()> {
-    if std::time::Instant::now() > deadline { return Ok(()); }
-    context.read()?;
-    drain_eis_pending(context, conv)?;
-    drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)?;
-    match eis_devices_ready(dev, kb) {
-        true => Ok(()),
-        false => { std::thread::sleep(std::time::Duration::from_millis(100));
-            negotiate_eis(context, conv, serial, deadline, dev, kbd_dev, abs, bt, sc, kb) }
+    loop {
+        if std::time::Instant::now() > deadline { break Ok(()); }
+        context.read()?;
+        drain_eis_pending(context, conv)?;
+        drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)?;
+        if eis_devices_ready(dev, kb) { break Ok(()); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
 fn drain_eis_pending(context: &reis::ei::Context, conv: &mut reis::event::EiEventConverter) -> anyhow::Result<()> {
-    match context.pending_event() {
-        Some(reis::PendingRequestResult::Request(ev)) => {
-            conv.handle_event(ev).map_err(|e| anyhow::anyhow!("eis handle_event: {e:?}"))?;
-            drain_eis_pending(context, conv)
+    loop {
+        match context.pending_event() {
+            Some(reis::PendingRequestResult::Request(ev)) => {
+                conv.handle_event(ev).map_err(|e| anyhow::anyhow!("eis handle_event: {e:?}"))?;
+            }
+            Some(reis::PendingRequestResult::ParseError(e)) => anyhow::bail!("EIS parse: {e}"),
+            Some(reis::PendingRequestResult::InvalidObject(i)) => anyhow::bail!("EIS invalid: {i}"),
+            None => break Ok(()),
         }
-        Some(reis::PendingRequestResult::ParseError(e)) => anyhow::bail!("EIS parse: {e}"),
-        Some(reis::PendingRequestResult::InvalidObject(i)) => anyhow::bail!("EIS invalid: {i}"),
-        None => Ok(()),
     }
 }
 
@@ -140,22 +138,22 @@ fn drain_eis_events(
     abs: &mut Option<reis::ei::PointerAbsolute>,
     bt: &mut Option<reis::ei::Button>, sc: &mut Option<reis::ei::Scroll>, kb: &mut Option<reis::ei::Keyboard>,
 ) -> anyhow::Result<()> {
-    match conv.next_event() {
-        Some(reis::event::EiEvent::SeatAdded(sa)) => {
-            sa.seat.bind_capabilities(&[reis::event::DeviceCapability::Pointer,
-                reis::event::DeviceCapability::PointerAbsolute, reis::event::DeviceCapability::Button,
-                reis::event::DeviceCapability::Scroll, reis::event::DeviceCapability::Keyboard]);
-            context.flush()?;
-            drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)
+    loop {
+        match conv.next_event() {
+            Some(reis::event::EiEvent::SeatAdded(sa)) => {
+                sa.seat.bind_capabilities(&[reis::event::DeviceCapability::Pointer,
+                    reis::event::DeviceCapability::PointerAbsolute, reis::event::DeviceCapability::Button,
+                    reis::event::DeviceCapability::Scroll, reis::event::DeviceCapability::Keyboard]);
+                context.flush()?;
+            }
+            Some(reis::event::EiEvent::DeviceAdded(da)) => {
+                register_eis_device(&da, serial, dev, kbd_dev, abs, bt, sc, kb);
+                context.flush()?;
+            }
+            Some(reis::event::EiEvent::Disconnected(dc)) => { eprintln!("eis: disconnected {:?}", dc); anyhow::bail!("EIS disconnected") }
+            Some(other) => { eprintln!("eis: event {:?}", std::mem::discriminant(&other)); }
+            None => break Ok(()),
         }
-        Some(reis::event::EiEvent::DeviceAdded(da)) => {
-            register_eis_device(&da, serial, dev, kbd_dev, abs, bt, sc, kb);
-            context.flush()?;
-            drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb)
-        }
-        Some(reis::event::EiEvent::Disconnected(dc)) => { eprintln!("eis: disconnected {:?}", dc); anyhow::bail!("EIS disconnected") }
-        Some(other) => { eprintln!("eis: event {:?}", std::mem::discriminant(&other)); drain_eis_events(context, conv, serial, dev, kbd_dev, abs, bt, sc, kb) }
-        None => Ok(()),
     }
 }
 
