@@ -372,7 +372,7 @@ impl KwinMcp {
         }
     }
 
-    #[rmcp::tool(name = "screenshot", description = "Screenshot the active window via portal. Returns file URI.", annotations(read_only_hint = true))]
+    #[rmcp::tool(name = "screenshot", description = "Screenshot via portal. Returns file URI.", annotations(read_only_hint = true))]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
         let response = ashpd::desktop::screenshot::Screenshot::request()
             .interactive(false)
