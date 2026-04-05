@@ -4,7 +4,7 @@
 set -euo pipefail
 
 BINARY="${1:-./target/debug/kwin-mcp}"
-PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
+PASS=0 FAIL=0 ID=0
 FAIL_MSGS=""
 
 # Snapshot existing kwin/dbus processes before test
@@ -29,8 +29,6 @@ recv() {
 
 pass() { PASS=$((PASS + 1)); }
 fail() { FAIL=$((FAIL + 1)); FAIL_MSGS="${FAIL_MSGS}  FAIL: $1\n"; }
-xfail() { EXPECTED_FAIL=$((EXPECTED_FAIL + 1)); XFAIL_MSGS="${XFAIL_MSGS}  KNOWN: $1\n"; }
-XFAIL_MSGS=""
 
 # ── 1. Initialize ──
 echo "== Initialize =="
@@ -90,7 +88,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\",\"arguments\":{}}}"
 RESP=$(recv 15)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1 || echo "$RESP" | jq -e '.result.isError == true' >/dev/null 2>&1; then
-    xfail "screenshot — No active window (apps don't create windows in isolated session)"
+    fail "screenshot — No active window (apps don't create windows in isolated session)"
 else
     pass "screenshot returns content"
 fi
@@ -101,7 +99,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_move\",\"arguments\":{\"x\":500,\"y\":500}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "mouse_move — No active window"
+    fail "mouse_move — No active window"
 else
     pass "mouse_move works"
 fi
@@ -112,7 +110,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_click\",\"arguments\":{\"x\":500,\"y\":500}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "mouse_click — No active window"
+    fail "mouse_click — No active window"
 else
     pass "mouse_click works"
 fi
@@ -123,7 +121,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_scroll\",\"arguments\":{\"x\":500,\"y\":500,\"delta\":3}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "mouse_scroll — No active window"
+    fail "mouse_scroll — No active window"
 else
     pass "mouse_scroll works"
 fi
@@ -134,7 +132,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_drag\",\"arguments\":{\"from_x\":100,\"from_y\":100,\"to_x\":200,\"to_y\":200}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "mouse_drag — No active window"
+    fail "mouse_drag — No active window"
 else
     pass "mouse_drag works"
 fi
@@ -159,7 +157,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"accessibility_tree\",\"arguments\":{\"max_depth\":2}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "accessibility_tree — AT-SPI registry not running in isolated session"
+    fail "accessibility_tree — AT-SPI registry not running in isolated session"
 else
     pass "accessibility_tree works"
 fi
@@ -170,7 +168,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"find_ui_elements\",\"arguments\":{\"query\":\"button\"}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    xfail "find_ui_elements — not yet implemented"
+    fail "find_ui_elements — not yet implemented"
 else
     pass "find_ui_elements works"
 fi
@@ -216,11 +214,7 @@ if [ "$FAIL" -gt 0 ]; then
     echo "  FAILURES:"
     printf "%b" "$FAIL_MSGS"
 fi
-if [ "$EXPECTED_FAIL" -gt 0 ]; then
-    echo "  KNOWN ISSUES:"
-    printf "%b" "$XFAIL_MSGS"
-fi
 echo ""
-echo "  $PASS pass, $EXPECTED_FAIL known, $FAIL fail"
+echo "  $PASS pass, $FAIL fail"
 echo "═══════════════════════════════════════════"
 [ "$FAIL" -eq 0 ] || exit 1
