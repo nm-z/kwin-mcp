@@ -586,9 +586,13 @@ impl KwinMcp {
             let mut cookie = [0u8; 16];
             let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut cookie));
             let cookie_hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
-            let xauth_status = std::process::Command::new("xauth")
-                .args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            let xauth_status = unsafe {
+                std::process::Command::new("xauth")
+                    .args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                    .pre_exec(|| { nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_DFL); Ok(()) })
+                    .status()
+            };
             if !xauth_status.is_ok_and(|s| s.success()) {
                 let _ = std::fs::remove_file(&lock_path);
                 anyhow::bail!("xauth failed to add cookie for {xdisplay}");
