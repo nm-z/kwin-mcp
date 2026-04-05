@@ -666,7 +666,7 @@ impl KwinMcp {
                 // Keep both X socket fds open for KWin to inherit
                 let _ = nix::fcntl::fcntl(xw_unix_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
                 let _ = nix::fcntl::fcntl(xw_abstract_fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
-                nix::unistd::setsid().map(drop).map_err(std::io::Error::from)
+                Ok(())
             }) }).spawn()?;
             // We can drop the listeners now — KWin inherited the fds
             drop(xw_unix_listener);
@@ -942,6 +942,29 @@ async fn main() -> Result<(), McpError> {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
     let kwin = KwinMcp::new();
+    let session_for_cleanup = kwin.session.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let term = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => { let _ = s.recv().await; },
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        let sigint = async {
+            match signal(SignalKind::interrupt()) {
+                Ok(mut s) => { let _ = s.recv().await; },
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = term => {},
+            () = sigint => {},
+        }
+        if let Ok(mut guard) = session_for_cleanup.lock()
+            && let Some(sess) = guard.take() { teardown(sess); }
+        std::process::exit(0);
+    });
     let server = ServerBuilder::new(kwin.clone()).with_tools(kwin).build();
     server.serve(StdioTransport::new()).await
 }
