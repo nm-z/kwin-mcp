@@ -495,6 +495,11 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
 impl KwinMcp {
     #[tool(description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
     async fn session_start(&self, width: Option<serde_json::Value>, height: Option<serde_json::Value>) -> Result<ToolOutput, McpError> {
+        eprintln!("kwin-mcp v{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+        // Return version immediately so caller can confirm which binary is running
+        // (eprintln goes to stderr/logs, not MCP tool output)
+        let version_stamp = format!("kwin-mcp v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+        let ver_err = |e: String| McpError::internal(format!("{version_stamp} — {e}"));
         {
             let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
             if let Some(old) = (*guard).take() { teardown(old); }
@@ -586,16 +591,27 @@ impl KwinMcp {
             let mut cookie = [0u8; 16];
             let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut cookie));
             let cookie_hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
-            let xauth_status = unsafe {
-                std::process::Command::new("xauth")
+            let xauth_out = unsafe {
+                // Temporarily restore SIGCHLD so the parent can waitpid() on xauth.
+                // SIG_IGN breaks output() which must reap the child after it exits.
+                nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_DFL);
+                let out = std::process::Command::new("xauth")
                     .args(["-f", &xauth_path, "add", &xdisplay, "MIT-MAGIC-COOKIE-1", &cookie_hex])
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                    .pre_exec(|| { nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_DFL); Ok(()) })
-                    .status()
+                    .pre_exec(|| { Ok(()) })
+                    .output();
+                nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN);
+                out
             };
-            if !xauth_status.is_ok_and(|s| s.success()) {
+            let xauth_log = format!("/tmp/kwin-mcp-xauth-{pid}.log");
+            if let Ok(ref o) = xauth_out {
+                let _ = std::fs::write(&xauth_log, format!("exit: {}\nstdout: {}\nstderr: {}\n",
+                    o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
+            } else {
+                let _ = std::fs::write(&xauth_log, format!("spawn error: {:?}\n", xauth_out));
+            }
+            if !xauth_out.is_ok_and(|o| o.status.success()) {
                 let _ = std::fs::remove_file(&lock_path);
-                anyhow::bail!("xauth failed to add cookie for {xdisplay}");
+                anyhow::bail!("xauth failed to add cookie for {xdisplay} — see {xauth_log}");
             }
             // Create filesystem X11 listen socket
             let xw_sock_path = format!("/tmp/.X11-unix/X{xw_display}");
@@ -682,19 +698,19 @@ impl KwinMcp {
             std::fs::create_dir_all(&scrdir)?;
             std::thread::sleep(std::time::Duration::from_millis(500));
             Ok((dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, sock, xdisplay, xauthority, w, h))
-        }).await.map_err(|e| McpError::internal(e.to_string()))?;
+        }).await.map_err(|e| ver_err(e.to_string()))?;
         let (dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height) =
-            result.map_err(|e| McpError::internal(e.to_string()))?;
+            result.map_err(|e| ver_err(e.to_string()))?;
         // Async: connect to our private bus via zbus, set up portal session, get EIS fd
-        let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(eis_err)?
-            .build().await.map_err(eis_err)?;
-        let eis_fd = portal_setup(&zbus_conn).await.map_err(eis_err)?;
+        let zbus_conn = zbus::connection::Builder::address(dbus_addr.as_str()).map_err(|e| ver_err(e.to_string()))?
+            .build().await.map_err(|e| ver_err(e.to_string()))?;
+        let eis_fd = portal_setup(&zbus_conn).await.map_err(|e| ver_err(e.to_string()))?;
         // Blocking: reis negotiation over the EIS fd
         let eis = tokio::task::spawn_blocking(move || Eis::from_fd(eis_fd))
-            .await.map_err(|e| McpError::internal(e.to_string()))?
-            .map_err(eis_err)?;
-        let msg = format!("session started pid={child_pid} dbus={dbus_addr} socket={socket} display={xdisplay} geometry={width}x{height}");
-        let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+            .await.map_err(|e| ver_err(e.to_string()))?
+            .map_err(|e| ver_err(e.to_string()))?;
+        let msg = format!("{version_stamp} — session started pid={child_pid} dbus={dbus_addr} socket={socket} display={xdisplay} geometry={width}x{height}");
+        let mut guard = self.session.lock().map_err(|e| ver_err(e.to_string()))?;
         *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height, eis, zbus_conn: zbus_conn.clone() });
         Ok(ToolOutput::text(msg))
     }
