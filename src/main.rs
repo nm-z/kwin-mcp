@@ -365,54 +365,52 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "screenshot", description = "Screenshot the active window. Returns PNG path + window position/size.", annotations(read_only_hint = true))]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
-        let (_, _, win_id) = active_window_info(&self.zbus_conn().await?).await?;
-        self.with_session(|sess| {
-            let path = sess.scrdir.join("screenshot.png");
-            let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
-            let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-            let bconn = zbus::blocking::Connection::session().map_err(eis_err)?;
-            let proxy = zbus::blocking::Proxy::new(&bconn, "org.kde.KWin", "/org/kde/KWin/ScreenShot2",
-                "org.kde.KWin.ScreenShot2").map_err(eis_err)?;
-            let mut opts = std::collections::HashMap::new();
-            opts.insert("include-cursor", zbus::zvariant::Value::from(true));
-            opts.insert("include-decoration", zbus::zvariant::Value::from(true));
-            opts.insert("include-shadow", zbus::zvariant::Value::from(false));
-            let reply = proxy.call_method("CaptureWindow", &(win_id.as_str(), &opts, pipe_fd)).map_err(eis_err)?;
-            let meta: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
-                reply.body().deserialize().map_err(eis_err)?;
-            let get_meta = |key: &str| -> Result<u32, McpError> {
-                let val = meta.get(key).ok_or_else(|| McpError::internal_error(format!("no {key}"), None))?;
-                u32::try_from(val).map_err(|_| McpError::internal_error(format!("{key} not u32"), None))
-            };
-            let width = get_meta("width")?;
-            let height = get_meta("height")?;
-            let stride = get_meta("stride")?;
-            // read raw ARGB32 pixels from pipe
-            let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
-            let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
-            let mut pixels = vec![0u8; total];
-            std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
-            // BGRA (little-endian ARGB32) → RGBA for PNG
-            let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
-            let mut rgba = vec![0u8; px_count * 4];
-            for row in 0..height {
-                for col in 0..width {
-                    let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
-                    let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
-                    rgba[di] = pixels[si + 2]; rgba[di + 1] = pixels[si + 1];
-                    rgba[di + 2] = pixels[si]; rgba[di + 3] = pixels[si + 3];
-                }
+        let conn = self.zbus_conn().await?;
+        let (_, _, win_id) = active_window_info(&conn).await?;
+        let scrdir = self.with_session(|sess| Ok(sess.scrdir.clone())).await?;
+        let path = scrdir.join("screenshot.png");
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
+        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+        let proxy: zbus::Proxy = zbus::proxy::Builder::new(&conn)
+            .destination("org.kde.KWin").map_err(eis_err)?
+            .path("/org/kde/KWin/ScreenShot2").map_err(eis_err)?
+            .interface("org.kde.KWin.ScreenShot2").map_err(eis_err)?
+            .build().await.map_err(eis_err)?;
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+        opts.insert("include-shadow", zbus::zvariant::Value::from(false));
+        let reply = proxy.call_method("CaptureWindow", &(win_id.as_str(), &opts, pipe_fd)).await.map_err(eis_err)?;
+        let meta: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            reply.body().deserialize().map_err(eis_err)?;
+        let get_meta = |key: &str| -> Result<u32, McpError> {
+            let val = meta.get(key).ok_or_else(|| McpError::internal_error(format!("no {key}"), None))?;
+            u32::try_from(val).map_err(|_| McpError::internal_error(format!("{key} not u32"), None))
+        };
+        let width = get_meta("width")?;
+        let height = get_meta("height")?;
+        let stride = get_meta("stride")?;
+        let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
+        let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
+        let mut pixels = vec![0u8; total];
+        std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
+        let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
+        let mut rgba = vec![0u8; px_count * 4];
+        for row in 0..height {
+            for col in 0..width {
+                let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
+                let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
+                rgba[di] = pixels[si + 2]; rgba[di + 1] = pixels[si + 1];
+                rgba[di + 2] = pixels[si]; rgba[di + 3] = pixels[si + 3];
             }
-            // write PNG
-            let file = std::fs::File::create(&path).map_err(eis_err)?;
-            let mut enc = png::Encoder::new(file, width, height);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut writer = enc.write_header().map_err(eis_err)?;
-            writer.write_image_data(&rgba).map_err(eis_err)?;
-            Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}",
-                path.to_string_lossy(), width, height))]))
-        }).await
+        }
+        let file = std::fs::File::create(&path).map_err(eis_err)?;
+        let mut enc = png::Encoder::new(file, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(eis_err)?;
+        writer.write_image_data(&rgba).map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), width, height))]))
     }
 
     #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
