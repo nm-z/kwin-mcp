@@ -253,22 +253,6 @@ impl Eis {
 async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<std::os::fd::OwnedFd> {
     use ashpd::desktop::remote_desktop::{RemoteDesktop, DeviceType, SelectDevicesOptions, ConnectToEISOptions, StartOptions};
     use ashpd::desktop::CreateSessionOptions;
-    // Pre-seed permission store to skip consent dialog
-    // Derive our app_id the same way xdg-desktop-portal does (from systemd cgroup)
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    let app_id = cgroup.split('/').filter_map(|seg| {
-        seg.strip_prefix("app-").and_then(|s| s.rsplit_once('-')).map(|(name, _)| name.to_owned())
-    }).next().unwrap_or_default();
-    let perm_proxy: zbus::Proxy = zbus::proxy::Builder::new(zbus_conn)
-        .destination("org.freedesktop.impl.portal.PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
-        .path("/org/freedesktop/impl/portal/PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
-        .interface("org.freedesktop.impl.portal.PermissionStore").map_err(|e| anyhow::anyhow!("{e}"))?
-        .build().await.map_err(|e| anyhow::anyhow!("permission store proxy: {e}"))?;
-    let perms: &[&str] = &["yes"];
-    // Seed both the derived app_id and empty string to cover all cases
-    for id in [app_id.as_str(), ""] {
-        let _: Result<(), zbus::Error> = perm_proxy.call("SetPermission", &("kde-authorized", true, "remote-desktop", id, perms)).await;
-    }
     // Create RemoteDesktop session
     let rd = RemoteDesktop::with_connection(zbus_conn.clone()).await
         .map_err(|e| anyhow::anyhow!("RemoteDesktop: {e}"))?;
