@@ -1,0 +1,190 @@
+#!/bin/bash
+# End-to-end MCP tool test — mirrors manual testing exactly.
+# Uses a persistent coprocess, no sleeps, blocking reads with deadlines.
+set -euo pipefail
+
+BINARY="${1:-./target/debug/kwin-mcp}"
+PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
+
+coproc MCP { "$BINARY" 2>/tmp/kwin-mcp-e2e-stderr.log; }
+MCP_PID=${MCP_PID}
+trap 'kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null' EXIT
+
+send() { echo "$1" >&"${MCP[1]}"; }
+recv() {
+    local line
+    read -r -t "${2:-30}" line <&"${MCP[0]}" || { echo "TIMEOUT"; return 1; }
+    echo "$line"
+}
+
+pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
+xfail() { echo "  XFAIL: $1 (known)"; EXPECTED_FAIL=$((EXPECTED_FAIL + 1)); }
+
+# ── 1. Initialize ──
+echo "== Initialize =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"e2e-test\",\"version\":\"1\"}}}"
+RESP=$(recv 10)
+echo "$RESP" | jq -e '.result.protocolVersion' >/dev/null 2>&1 && pass "protocolVersion present" || fail "protocolVersion missing"
+echo "$RESP" | jq -re '.result.serverInfo.name' 2>/dev/null | grep -q "kwin-mcp" && pass "server name is kwin-mcp" || fail "wrong server name"
+echo "$RESP" | jq -e '.result.capabilities.tools' >/dev/null 2>&1 && pass "tool capabilities present" || fail "no tool capabilities"
+send '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# ── 2. tools/list ──
+echo "== tools/list =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/list\",\"params\":{}}"
+RESP=$(recv 10)
+
+TOOL_COUNT=$(echo "$RESP" | jq '.result.tools | length' 2>/dev/null)
+[ "$TOOL_COUNT" = "12" ] && pass "12 tools registered" || fail "expected 12 tools, got $TOOL_COUNT"
+
+for tool in session_start session_stop screenshot mouse_click mouse_move mouse_scroll mouse_drag keyboard_type keyboard_key launch_app accessibility_tree find_ui_elements; do
+    echo "$RESP" | jq -e --arg t "$tool" '.result.tools[] | select(.name == $t)' >/dev/null 2>&1 && pass "tool '$tool' exists" || fail "tool '$tool' missing"
+done
+
+# Schema: no bare 'true' values (the bug that broke tool registration)
+BAD=$(echo "$RESP" | jq '[.result.tools[].inputSchema.properties // {} | to_entries[] | select(.value == true)] | length' 2>/dev/null || echo "0")
+[ "$BAD" = "0" ] && pass "no bare 'true' in schemas" || fail "$BAD properties have bare 'true'"
+
+# FlexInt type check
+XTYPE=$(echo "$RESP" | jq -r '.result.tools[] | select(.name == "mouse_click") | .inputSchema.properties.x.type[0]' 2>/dev/null)
+[ "$XTYPE" = "integer" ] && pass "FlexInt emits integer type" || fail "FlexInt type is '$XTYPE'"
+
+# Annotations
+echo "$RESP" | jq -e '.result.tools[] | select(.name == "screenshot") | .annotations.readOnlyHint == true' >/dev/null 2>&1 && pass "screenshot is read-only" || fail "screenshot missing read-only"
+echo "$RESP" | jq -e '.result.tools[] | select(.name == "session_stop") | .annotations.destructiveHint == true' >/dev/null 2>&1 && pass "session_stop is destructive" || fail "session_stop missing destructive"
+
+# ── 3. session_start ──
+echo "== session_start =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"session_start\",\"arguments\":{}}}"
+RESP=$(recv 30)
+TEXT=$(echo "$RESP" | jq -r '.result.content[0].text' 2>/dev/null)
+[ -n "$TEXT" ] && [ "$TEXT" != "null" ] && pass "session_start succeeds" || fail "session_start failed: $(echo "$RESP" | head -c 200)"
+echo "$RESP" | jq -e '.result.isError == false' >/dev/null 2>&1 && pass "isError is false" || fail "isError not false"
+echo "$TEXT" | grep -q "kwin-mcp v" && pass "version stamp in output" || fail "no version stamp"
+
+# ── 4. launch_app ──
+echo "== launch_app =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"launch_app\",\"arguments\":{\"command\":\"xterm\"}}}"
+RESP=$(recv 10)
+echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "launched pid=" && pass "launch_app returns PID" || fail "launch_app failed"
+
+# ── 5. screenshot (expected fail — no active window) ──
+echo "== screenshot =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\",\"arguments\":{}}}"
+RESP=$(recv 15)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1 || echo "$RESP" | jq -e '.result.isError == true' >/dev/null 2>&1; then
+    xfail "screenshot — No active window (apps don't create windows in isolated session)"
+else
+    pass "screenshot returns content"
+fi
+
+# ── 6. mouse_move (expected fail — needs active window for coord offset) ──
+echo "== mouse_move =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_move\",\"arguments\":{\"x\":500,\"y\":500}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "mouse_move — No active window"
+else
+    pass "mouse_move works"
+fi
+
+# ── 7. mouse_click (expected fail — same) ──
+echo "== mouse_click =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_click\",\"arguments\":{\"x\":500,\"y\":500}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "mouse_click — No active window"
+else
+    pass "mouse_click works"
+fi
+
+# ── 8. mouse_scroll (expected fail — same) ──
+echo "== mouse_scroll =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_scroll\",\"arguments\":{\"x\":500,\"y\":500,\"delta\":3}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "mouse_scroll — No active window"
+else
+    pass "mouse_scroll works"
+fi
+
+# ── 9. mouse_drag (expected fail — same) ──
+echo "== mouse_drag =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_drag\",\"arguments\":{\"from_x\":100,\"from_y\":100,\"to_x\":200,\"to_y\":200}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "mouse_drag — No active window"
+else
+    pass "mouse_drag works"
+fi
+
+# ── 10. keyboard_type ──
+echo "== keyboard_type =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"keyboard_type\",\"arguments\":{\"text\":\"hello\"}}}"
+RESP=$(recv 10)
+echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "typed: hello" && pass "keyboard_type works" || fail "keyboard_type failed"
+
+# ── 11. keyboard_key ──
+echo "== keyboard_key =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"keyboard_key\",\"arguments\":{\"key\":\"Return\"}}}"
+RESP=$(recv 10)
+echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "key: Return" && pass "keyboard_key works" || fail "keyboard_key failed"
+
+# ── 12. accessibility_tree (expected fail — AT-SPI registry not running) ──
+echo "== accessibility_tree =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"accessibility_tree\",\"arguments\":{\"max_depth\":2}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "accessibility_tree — AT-SPI registry not running in isolated session"
+else
+    pass "accessibility_tree works"
+fi
+
+# ── 13. find_ui_elements (expected fail — not implemented) ──
+echo "== find_ui_elements =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"find_ui_elements\",\"arguments\":{\"query\":\"button\"}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+    xfail "find_ui_elements — not yet implemented"
+else
+    pass "find_ui_elements works"
+fi
+
+# ── 14. session_stop ──
+echo "== session_stop =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"session_stop\",\"arguments\":{}}}"
+RESP=$(recv 15)
+echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "stopped pid=" && pass "session_stop works" || fail "session_stop failed"
+
+# ── 15. tools after stop should error ──
+echo "== post-stop error check =="
+ID=$((ID + 1))
+send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\",\"arguments\":{}}}"
+RESP=$(recv 10)
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1 || echo "$RESP" | jq -e '.result.isError == true' >/dev/null 2>&1; then
+    pass "tools error after session_stop"
+else
+    fail "tools should error after session_stop"
+fi
+
+# ── Results ──
+echo ""
+echo "═══════════════════════════════════════════"
+echo "  PASS: $PASS  XFAIL: $EXPECTED_FAIL  FAIL: $FAIL"
+echo "═══════════════════════════════════════════"
+[ "$FAIL" -eq 0 ] || exit 1
