@@ -237,6 +237,21 @@ if [ "$FAIL" -gt 0 ]; then
         grep -i "error\|fatal\|fail\|crash" "$LOG" 2>/dev/null | head -20 | sed 's/^/  /'
     fi
 fi
+# Count stale X lock files
+STALE_LOCKS=0
+for f in /tmp/.X*-lock; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f" 2>/dev/null | tr -d ' ')
+    if [ -n "$pid" ] && ! ps -p "$pid" > /dev/null 2>&1; then
+        STALE_LOCKS=$((STALE_LOCKS + 1))
+    fi
+done
+
+echo ""
+echo "  COUNTS:"
+echo "    pre-existing stragglers: $PRE_TOTAL ($PRE_KWIN_COUNT kwin, $PRE_DBUS_COUNT dbus)"
+echo "    new stragglers:          $TOTAL_NEW ($NEW_KWIN kwin, $NEW_DBUS dbus)"
+echo "    stale X lock files:      $STALE_LOCKS"
 echo ""
 echo "  $PASS pass, $FAIL fail"
 echo "═══════════════════════════════════════════"
