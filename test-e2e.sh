@@ -9,6 +9,10 @@ PASS=0 FAIL=0 EXPECTED_FAIL=0 ID=0
 # Snapshot existing kwin/dbus processes before test
 PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort)
 PRE_DBUS=$(ps -eo pid,cmd | grep "dbus-daemon.*\.tmp" | grep -v grep | awk '{print $1}' | sort)
+PRE_KWIN_COUNT=$(echo "$PRE_KWIN" | grep -c . || true)
+PRE_DBUS_COUNT=$(echo "$PRE_DBUS" | grep -c . || true)
+PRE_TOTAL=$((PRE_KWIN_COUNT + PRE_DBUS_COUNT))
+echo "== pre-existing stragglers: $PRE_TOTAL ($PRE_KWIN_COUNT kwin, $PRE_DBUS_COUNT dbus-daemon) =="
 
 coproc MCP { "$BINARY" 2>/tmp/kwin-mcp-e2e-stderr.log; }
 MCP_PID=${MCP_PID}
