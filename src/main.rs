@@ -1,21 +1,25 @@
-use mcpkit::prelude::*;
-use mcpkit::transport::stdio::StdioTransport;
+use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Implementation};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::ServiceExt;
+use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+type McpError = rmcp::ErrorData;
+
 // Claude Code serializes numbers to strings — this handles both formats
 fn parse_int(v: serde_json::Value) -> Result<i32, McpError> {
     match v {
         serde_json::Value::Number(n) => match n.as_i64() {
-            Some(val) => i32::try_from(val).map_err(|e| McpError::invalid_params("coord", e.to_string())),
-            None => Err(McpError::invalid_params("coord", "not an integer")),
+            Some(val) => i32::try_from(val).map_err(|e| McpError::invalid_params(e.to_string(), None)),
+            None => Err(McpError::invalid_params("not an integer", None)),
         },
-        serde_json::Value::String(s) => s.parse::<i32>().map_err(|e| McpError::invalid_params("coord", e.to_string())),
+        serde_json::Value::String(s) => s.parse::<i32>().map_err(|e| McpError::invalid_params(e.to_string(), None)),
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) =>
-            Err(McpError::invalid_params("coord", "expected integer")),
+            Err(McpError::invalid_params("expected integer", None)),
     }
 }
 
@@ -70,7 +74,7 @@ fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
         Some("left") | None => Ok(0x110),
         Some("right") => Ok(0x111),
         Some("middle") => Ok(0x112),
-        Some(bad) => Err(McpError::invalid_params("button", format!("unknown button '{bad}' — use left/right/middle"))),
+        Some(bad) => Err(McpError::invalid_params(format!("unknown button '{bad}' — use left/right/middle"), None)),
     }
 }
 
@@ -299,16 +303,16 @@ struct KwinMcp { session: Arc<Mutex<Option<Session>>> }
 impl KwinMcp {
     fn new() -> Self { Self { session: Arc::new(Mutex::new(None)) } }
     fn with_session<R>(&self, f: impl FnOnce(&Session) -> Result<R, McpError>) -> Result<R, McpError> {
-        let guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-        match &*guard { Some(s) => f(s), None => Err(McpError::internal("no session — call session_start first")) }
+        let guard = self.session.lock().map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match &*guard { Some(s) => f(s), None => Err(McpError::internal_error("no session — call session_start first", None)) }
     }
     fn zbus_conn(&self) -> Result<zbus::Connection, McpError> {
-        let guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
-        match &*guard { Some(s) => Ok(s.zbus_conn.clone()), None => Err(McpError::internal("no session — call session_start first")) }
+        let guard = self.session.lock().map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match &*guard { Some(s) => Ok(s.zbus_conn.clone()), None => Err(McpError::internal_error("no session — call session_start first", None)) }
     }
 }
 
-fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal(e.to_string()) }
+fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal_error(e.to_string(), None) }
 
 fn kill_bus_clients(dbus_addr: &str) {
     let Ok(mut ch) = dbus::channel::Channel::open_private(dbus_addr) else { return };
@@ -390,7 +394,7 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(eis_err)?.as_millis();
     let marker = format!("kwin-mcp-{ts}");
     let cb_path = format!("/KWinMCP/{ts}");
-    let our_name = conn.unique_name().ok_or_else(|| McpError::internal("no bus name"))?.to_string();
+    let our_name = conn.unique_name().ok_or_else(|| McpError::internal_error("no bus name", None))?.to_string();
     let script = format!("var w = workspace.activeWindow;\
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
         w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
@@ -403,7 +407,7 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
     let registered = conn.object_server().at(&obj_path, cb).await.map_err(eis_err)?;
     eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
-    if !registered { return Err(McpError::internal(format!("failed to register callback at {cb_path}"))); }
+    if !registered { return Err(McpError::internal_error(format!("failed to register callback at {cb_path}"), None)); }
     // Load and run the script
     let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
         .destination("org.kde.KWin").map_err(eis_err)?
@@ -415,7 +419,7 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     if script_id < 0 {
         let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
         let _ = std::fs::remove_file(&script_file);
-        return Err(McpError::internal(format!("KWin loadScript failed, id={script_id}")));
+        return Err(McpError::internal_error(format!("KWin loadScript failed, id={script_id}"), None));
     }
     let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
         .destination("org.kde.KWin").map_err(eis_err)?
@@ -428,12 +432,12 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
     let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
     let _ = std::fs::remove_file(&script_file);
-    let json = result.map_err(|_| McpError::internal("KWin script timed out"))?
-        .map_err(|_| McpError::internal("KWin callback channel closed"))?;
-    if json == "null" { return Err(McpError::internal("KWin script error: No active window")); }
+    let json = result.map_err(|_| McpError::internal_error("KWin script timed out", None))?
+        .map_err(|_| McpError::internal_error("KWin callback channel closed", None))?;
+    if json == "null" { return Err(McpError::internal_error("KWin script error: No active window", None)); }
     let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
-    let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal("no x"))?;
-    let y = v.get("y").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal("no y"))?;
+    let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no x", None))?;
+    let y = v.get("y").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no y", None))?;
     let id = v.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     #[expect(clippy::as_conversions)]
     Ok((x.round() as i32, y.round() as i32, id))
@@ -491,21 +495,99 @@ async fn atspi_node(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Resu
     Ok(AtspiNode { name, role, states, bounds })
 }
 
-#[mcp_server(name = "kwin-mcp", version = "0.1.0", instructions = "KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1920x1080 screen.")]
+// ── Tool parameter structs ──────────────────────────────────────────────
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+struct SessionStartParams {
+    width: Option<serde_json::Value>,
+    height: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MouseClickParams {
+    x: serde_json::Value,
+    y: serde_json::Value,
+    button: Option<String>,
+    double: Option<bool>,
+    triple: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MouseMoveParams {
+    x: serde_json::Value,
+    y: serde_json::Value,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MouseScrollParams {
+    x: serde_json::Value,
+    y: serde_json::Value,
+    delta: serde_json::Value,
+    horizontal: Option<bool>,
+    discrete: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MouseDragParams {
+    from_x: serde_json::Value,
+    from_y: serde_json::Value,
+    to_x: serde_json::Value,
+    to_y: serde_json::Value,
+    button: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct KeyboardTypeParams {
+    text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct KeyboardKeyParams {
+    key: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct LaunchAppParams {
+    command: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AccessibilityTreeParams {
+    app_name: Option<String>,
+    max_depth: Option<u32>,
+    role: Option<String>,
+    show_elements: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FindUiElementsParams {
+    query: String,
+    app_name: Option<String>,
+}
+
+// ── Tool implementations ────────────────────────────────────────────────
+
+impl rmcp::ServerHandler for KwinMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
+            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1920x1080 screen.")
+    }
+}
+
+#[rmcp::tool_router]
 impl KwinMcp {
-    #[tool(description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
-    async fn session_start(&self, width: Option<serde_json::Value>, height: Option<serde_json::Value>) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "session_start", description = "Start an isolated KWin Wayland session. Must be called before any other tool.")]
+    async fn session_start(&self, Parameters(params): Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
         eprintln!("kwin-mcp v{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
-        // Return version immediately so caller can confirm which binary is running
-        // (eprintln goes to stderr/logs, not MCP tool output)
         let version_stamp = format!("kwin-mcp v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
-        let ver_err = |e: String| McpError::internal(format!("{version_stamp} — {e}"));
+        let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
-            let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+            let mut guard = self.session.lock().map_err(|e| McpError::internal_error(e.to_string(), None))?;
             if let Some(old) = (*guard).take() { teardown(old); }
         }
-        let w = u32::try_from(width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params("width", e.to_string()))?;
-        let h = u32::try_from(height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params("height", e.to_string()))?;
+        let w = u32::try_from(params.width.map(parse_int).transpose()?.unwrap_or(1920)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let h = u32::try_from(params.height.map(parse_int).transpose()?.unwrap_or(1080)).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let pid = std::process::id();
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| anyhow::anyhow!("{e}"))?.as_secs();
@@ -712,20 +794,20 @@ impl KwinMcp {
         let msg = format!("{version_stamp} — session started pid={child_pid} dbus={dbus_addr} socket={socket} display={xdisplay} geometry={width}x{height}");
         let mut guard = self.session.lock().map_err(|e| ver_err(e.to_string()))?;
         *guard = Some(Session { dbus_pid, bus_dir, dbus_addr, a11y_addr, child_pid, scrdir, socket, xdisplay, xauthority, width, height, eis, zbus_conn: zbus_conn.clone() });
-        Ok(ToolOutput::text(msg))
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
-    #[tool(description = "Stop the KWin session and clean up all processes.", destructive = true)]
-    async fn session_stop(&self) -> Result<ToolOutput, McpError> {
-        let mut guard = self.session.lock().map_err(|e| McpError::internal(e.to_string()))?;
+    #[rmcp::tool(name = "session_stop", description = "Stop the KWin session and clean up all processes.", annotations(destructive_hint = true))]
+    async fn session_stop(&self) -> Result<CallToolResult, McpError> {
+        let mut guard = self.session.lock().map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match (*guard).take() {
-            Some(sess) => { let pid = sess.child_pid; teardown(sess); Ok(ToolOutput::text(format!("stopped pid={pid}"))) }
-            None => Ok(ToolOutput::text("no session running")),
+            Some(sess) => { let pid = sess.child_pid; teardown(sess); Ok(CallToolResult::success(vec![Content::text(format!("stopped pid={pid}"))])) }
+            None => Ok(CallToolResult::success(vec![Content::text("no session running")])),
         }
     }
 
-    #[tool(description = "Screenshot the active window. Returns PNG path + window position/size.", read_only = true)]
-    async fn screenshot(&self) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "screenshot", description = "Screenshot the active window. Returns PNG path + window position/size.", annotations(read_only_hint = true))]
+    async fn screenshot(&self) -> Result<CallToolResult, McpError> {
         let (_, _, win_id) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             let path = sess.scrdir.join("screenshot.png");
@@ -752,20 +834,20 @@ impl KwinMcp {
             let meta: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> =
                 reply.read1().map_err(eis_err)?;
             let get_meta = |key: &str| -> Result<u32, McpError> {
-                let val = meta.get(key).ok_or_else(|| McpError::internal(format!("no {key}")))?;
-                let n = val.0.as_u64().ok_or_else(|| McpError::internal(format!("{key} not u64")))?;
-                u32::try_from(n).map_err(|e| McpError::internal(e.to_string()))
+                let val = meta.get(key).ok_or_else(|| McpError::internal_error(format!("no {key}"), None))?;
+                let n = val.0.as_u64().ok_or_else(|| McpError::internal_error(format!("{key} not u64"), None))?;
+                u32::try_from(n).map_err(|e| McpError::internal_error(e.to_string(), None))
             };
             let width = get_meta("width")?;
             let height = get_meta("height")?;
             let stride = get_meta("stride")?;
             // read raw ARGB32 pixels from pipe
             let mut reader = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
-            let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
+            let total = usize::try_from(stride.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
             let mut pixels = vec![0u8; total];
             std::io::Read::read_exact(&mut reader, &mut pixels).map_err(eis_err)?;
             // BGRA (little-endian ARGB32) → RGBA for PNG
-            let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal("overflow"))?).map_err(eis_err)?;
+            let px_count = usize::try_from(width.checked_mul(height).ok_or_else(|| McpError::internal_error("overflow", None))?).map_err(eis_err)?;
             let mut rgba = vec![0u8; px_count * 4];
             for row in 0..height {
                 for col in 0..width {
@@ -782,21 +864,21 @@ impl KwinMcp {
             enc.set_depth(png::BitDepth::Eight);
             let mut writer = enc.write_header().map_err(eis_err)?;
             writer.write_image_data(&rgba).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("{} size={}x{}",
-                path.to_string_lossy(), width, height)))
+            Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}",
+                path.to_string_lossy(), width, height))]))
         })
     }
 
-    #[tool(description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", read_only = true)]
-    async fn accessibility_tree(&self, app_name: Option<String>, max_depth: Option<u32>, role: Option<String>, show_elements: Option<bool>) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
+    async fn accessibility_tree(&self, Parameters(params): Parameters<AccessibilityTreeParams>) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
         let a11y = self.with_session(|s| Ok(s.a11y_addr.clone()))?;
         let conn = atspi::AccessibilityConnection::from_address(a11y.parse().map_err(eis_err)?).await.map_err(eis_err)?;
         let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
-        let limit = usize::try_from(max_depth.unwrap_or(8)).map_err(eis_err)?;
-        let app_name = app_name.map(|s| s.to_lowercase());
-        let role = role.map(|s| s.to_lowercase());
-        let show_elements = show_elements.unwrap_or(false);
+        let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(eis_err)?;
+        let app_name = params.app_name.map(|s| s.to_lowercase());
+        let role = params.role.map(|s| s.to_lowercase());
+        let show_elements = params.show_elements.unwrap_or(false);
         let mut out = Vec::new();
         let mut stack = root.get_children().await.map_err(eis_err)?.into_iter().rev().map(|obj| (obj, 0usize)).collect::<Vec<_>>();
         while let Some((obj, depth)) = stack.pop() {
@@ -810,21 +892,22 @@ impl KwinMcp {
                 for child in acc.get_children().await.unwrap_or_default().into_iter().rev() { stack.push((child, child_depth)); }
             }
         }
-        Ok(ToolOutput::text(out.join("\n")))
+        Ok(CallToolResult::success(vec![Content::text(out.join("\n"))]))
     }
 
-    #[tool(description = "Search UI elements by name/role/description (case-insensitive).", read_only = true)]
-    async fn find_ui_elements(&self, _query: String, _app_name: Option<String>) -> Result<ToolOutput, McpError> {
-        self.with_session(|sess| { eprintln!("atspi stub dbus={}", sess.dbus_addr); Err(McpError::internal("AT-SPI2 search not yet implemented")) })
+    #[rmcp::tool(name = "find_ui_elements", description = "Search UI elements by name/role/description (case-insensitive).", annotations(read_only_hint = true))]
+    async fn find_ui_elements(&self, Parameters(params): Parameters<FindUiElementsParams>) -> Result<CallToolResult, McpError> {
+        let _ = &params.query;
+        self.with_session(|sess| { eprintln!("atspi stub dbus={} app={:?}", sess.dbus_addr, params.app_name); Err(McpError::internal_error("AT-SPI2 search not yet implemented", None)) })
     }
 
-    #[tool(description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
-    async fn mouse_click(&self, x: serde_json::Value, y: serde_json::Value, button: Option<String>, double: Option<bool>, triple: Option<bool>) -> Result<ToolOutput, McpError> {
-        let x = parse_int(x)?; let y = parse_int(y)?;
+    #[rmcp::tool(name = "mouse_click", description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
+    async fn mouse_click(&self, Parameters(params): Parameters<MouseClickParams>) -> Result<CallToolResult, McpError> {
+        let x = parse_int(params.x)?; let y = parse_int(params.y)?;
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let code = btn_code(button.as_deref())?;
-            let count = match (triple, double) {
+            let code = btn_code(params.button.as_deref())?;
+            let count = match (params.triple, params.double) {
                 (Some(true), _) => 3, (_, Some(true)) => 2,
                 (Some(false) | None, Some(false) | None) => 1,
             };
@@ -838,41 +921,41 @@ impl KwinMcp {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 sess.eis.button(code, false).map_err(eis_err)?;
             }
-            Ok(ToolOutput::text(format!("clicked ({x},{y}) x{count}")))
+            Ok(CallToolResult::success(vec![Content::text(format!("clicked ({x},{y}) x{count}"))]))
         })
     }
 
-    #[tool(description = "Move cursor to window-relative pixel coordinates. Triggers hover effects.", read_only = true)]
-    async fn mouse_move(&self, x: serde_json::Value, y: serde_json::Value) -> Result<ToolOutput, McpError> {
-        let x = parse_int(x)?; let y = parse_int(y)?;
+    #[rmcp::tool(name = "mouse_move", description = "Move cursor to window-relative pixel coordinates. Triggers hover effects.", annotations(read_only_hint = true))]
+    async fn mouse_move(&self, Parameters(params): Parameters<MouseMoveParams>) -> Result<CallToolResult, McpError> {
+        let x = parse_int(params.x)?; let y = parse_int(params.y)?;
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("moved ({x},{y})")))
+            Ok(CallToolResult::success(vec![Content::text(format!("moved ({x},{y})"))]))
         })
     }
 
-    #[tool(description = "Scroll at window-relative pixel coords. delta: positive=down/right, negative=up/left. horizontal/discrete are optional.")]
-    async fn mouse_scroll(&self, x: serde_json::Value, y: serde_json::Value, delta: serde_json::Value, horizontal: Option<bool>, discrete: Option<bool>) -> Result<ToolOutput, McpError> {
-        let x = parse_int(x)?; let y = parse_int(y)?; let delta = parse_int(delta)?;
+    #[rmcp::tool(name = "mouse_scroll", description = "Scroll at window-relative pixel coords. delta: positive=down/right, negative=up/left. horizontal/discrete are optional.")]
+    async fn mouse_scroll(&self, Parameters(params): Parameters<MouseScrollParams>) -> Result<CallToolResult, McpError> {
+        let x = parse_int(params.x)?; let y = parse_int(params.y)?; let delta = parse_int(params.delta)?;
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
             sess.eis.move_abs(wx + x, wy + y).map_err(eis_err)?;
-            let horiz = horizontal.unwrap_or_default();
-            let disc = discrete.unwrap_or_default();
+            let horiz = params.horizontal.unwrap_or_default();
+            let disc = params.discrete.unwrap_or_default();
             let (dx, dy) = match horiz { true => (delta, 0), false => (0, delta) };
             sess.eis.scroll_do(dx, dy, disc).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("scrolled {delta} at ({x},{y})")))
+            Ok(CallToolResult::success(vec![Content::text(format!("scrolled {delta} at ({x},{y})"))]))
         })
     }
 
-    #[tool(description = "Drag between window-relative pixel coords. Smooth 20-step interpolation. button: left/right/middle.")]
-    async fn mouse_drag(&self, from_x: serde_json::Value, from_y: serde_json::Value, to_x: serde_json::Value, to_y: serde_json::Value, button: Option<String>) -> Result<ToolOutput, McpError> {
-        let from_x = parse_int(from_x)?; let from_y = parse_int(from_y)?;
-        let to_x = parse_int(to_x)?; let to_y = parse_int(to_y)?;
+    #[rmcp::tool(name = "mouse_drag", description = "Drag between window-relative pixel coords. Smooth 20-step interpolation. button: left/right/middle.")]
+    async fn mouse_drag(&self, Parameters(params): Parameters<MouseDragParams>) -> Result<CallToolResult, McpError> {
+        let from_x = parse_int(params.from_x)?; let from_y = parse_int(params.from_y)?;
+        let to_x = parse_int(params.to_x)?; let to_y = parse_int(params.to_y)?;
         let (wx, wy, _) = active_window_info(&self.zbus_conn()?).await?;
         self.with_session(|sess| {
-            let code = btn_code(button.as_deref())?;
+            let code = btn_code(params.button.as_deref())?;
             sess.eis.move_abs(wx + from_x, wy + from_y).map_err(eis_err)?;
             sess.eis.button(code, true).map_err(eis_err)?;
             let steps = 20i32;
@@ -883,14 +966,14 @@ impl KwinMcp {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             sess.eis.button(code, false).map_err(eis_err)?;
-            Ok(ToolOutput::text(format!("dragged ({from_x},{from_y})->({to_x},{to_y})")))
+            Ok(CallToolResult::success(vec![Content::text(format!("dragged ({from_x},{from_y})->({to_x},{to_y})"))]))
         })
     }
 
-    #[tool(description = "Type ASCII text character by character. For non-ASCII use keyboard_type_unicode.")]
-    async fn keyboard_type(&self, text: String) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "keyboard_type", description = "Type ASCII text character by character. For non-ASCII use keyboard_type_unicode.")]
+    async fn keyboard_type(&self, Parameters(params): Parameters<KeyboardTypeParams>) -> Result<CallToolResult, McpError> {
         self.with_session(|sess| {
-            for ch in text.chars() {
+            for ch in params.text.chars() {
                 match char_key(ch) {
                     Some((code, needs_shift)) => {
                         let shift: &[u32] = match needs_shift { true => &[42], false => &[] };
@@ -900,18 +983,17 @@ impl KwinMcp {
                         for s in shift { sess.eis.key(*s, false).map_err(eis_err)?; }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    None => return Err(McpError::invalid_params("text", format!("unmapped char '{ch}' — ASCII only"))),
+                    None => return Err(McpError::invalid_params(format!("unmapped char '{}' — ASCII only", ch), None)),
                 }
             }
-            Ok(ToolOutput::text(format!("typed: {text}")))
+            Ok(CallToolResult::success(vec![Content::text(format!("typed: {}", params.text))]))
         })
     }
 
-
-    #[tool(description = "Press key combo (e.g. 'Return', 'ctrl+c', 'alt+F4', 'shift+Tab').")]
-    async fn keyboard_key(&self, key: String) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "keyboard_key", description = "Press key combo (e.g. 'Return', 'ctrl+c', 'alt+F4', 'shift+Tab').")]
+    async fn keyboard_key(&self, Parameters(params): Parameters<KeyboardKeyParams>) -> Result<CallToolResult, McpError> {
         self.with_session(|sess| {
-            let (mods, main) = parse_combo(&key);
+            let (mods, main) = parse_combo(&params.key);
             for m in &mods { sess.eis.key(*m, true).map_err(eis_err)?; }
             match main {
                 Some(k) => {
@@ -919,15 +1001,15 @@ impl KwinMcp {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     sess.eis.key(k, false).map_err(eis_err)?;
                 }
-                None => return Err(McpError::invalid_params("key", format!("unknown key in combo '{key}'"))),
+                None => return Err(McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)),
             }
             for m in mods.iter().rev() { sess.eis.key(*m, false).map_err(eis_err)?; }
-            Ok(ToolOutput::text(format!("key: {key}")))
+            Ok(CallToolResult::success(vec![Content::text(format!("key: {}", params.key))]))
         })
     }
 
-    #[tool(description = "Launch app in session (non-blocking). Returns PID.")]
-    async fn launch_app(&self, command: String) -> Result<ToolOutput, McpError> {
+    #[rmcp::tool(name = "launch_app", description = "Launch app in session (non-blocking). Returns PID.")]
+    async fn launch_app(&self, Parameters(params): Parameters<LaunchAppParams>) -> Result<CallToolResult, McpError> {
         self.with_session(|sess| {
             // Refresh Xwayland info if not yet available (lazy start)
             let (xdisp, xauth) = match sess.xdisplay.is_empty() {
@@ -935,29 +1017,31 @@ impl KwinMcp {
                 false => (sess.xdisplay.clone(), sess.xauthority.clone()),
             };
             let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", &command]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS").env_remove("XAUTHORITY")
+            cmd.args(["-c", &params.command]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env_remove("DBUS_SESSION_BUS_ADDRESS").env_remove("XAUTHORITY")
                 .env("DBUS_SESSION_BUS_ADDRESS", &sess.dbus_addr).env("WAYLAND_DISPLAY", &sess.socket)
                 .env("QT_QPA_PLATFORM", "wayland")
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             if !xdisp.is_empty() { cmd.env("DISPLAY", &xdisp); }
             if !xauth.is_empty() { cmd.env("XAUTHORITY", &xauth); }
             match cmd.spawn() {
-                Ok(child) => Ok(ToolOutput::text(format!("launched pid={}", child.id()))),
-                Err(e) => Err(McpError::internal(format!("spawn: {e}"))),
+                Ok(child) => Ok(CallToolResult::success(vec![Content::text(format!("launched pid={}", child.id()))])),
+                Err(e) => Err(McpError::internal_error(format!("spawn: {e}"), None)),
             }
         })
     }
-
-
 }
 
 #[tokio::main]
-async fn main() -> Result<(), McpError> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN);
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
     let kwin = KwinMcp::new();
-    let server = ServerBuilder::new(kwin.clone()).with_tools(kwin).build();
-    server.serve(StdioTransport::new()).await
+    let router = rmcp::handler::server::router::Router::new(kwin)
+        .with_tools(KwinMcp::tool_router());
+    let transport = rmcp::transport::io::stdio();
+    let service = router.serve(transport).await?;
+    service.waiting().await?;
+    Ok(())
 }

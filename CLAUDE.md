@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust project using `mcpkit` for MCP protocol, `reis` for EIS (Emulated Input Sender) input control, `atspi` for AT-SPI2 accessibility tree traversal, and `dbus` for KWin D-Bus IPC. Serves over stdio transport.
+MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust project using `rmcp` for MCP protocol, `reis` for EIS (Emulated Input Sender) input control, `atspi` for AT-SPI2 accessibility tree traversal, and `zbus` for KWin D-Bus IPC. Serves over stdio transport.
 
 ## Build & Lint
 

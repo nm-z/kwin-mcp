@@ -1,6 +1,6 @@
 # kwin-mcp (Rust)
 
-MCP server for KDE Plasma 6 Wayland GUI automation. Rust implementation using `mcpkit` + `reis` + `zbus`.
+MCP server for KDE Plasma 6 Wayland GUI automation. Rust implementation using `rmcp` + `reis` + `zbus`.
 
 ## Show Accessibility Tree
 
