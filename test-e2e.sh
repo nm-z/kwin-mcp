@@ -13,6 +13,7 @@ for arg in "$@"; do
 done
 PASS=0 FAIL=0 ID=0
 FAIL_MSGS=""
+ISSUE_HITS=""
 
 # Snapshot existing kwin/dbus processes before test
 PRE_KWIN=$(ps -eo pid,cmd | grep "kwin_wayland.*--virtual" | grep -v grep | awk '{print $1}' | sort || true)
@@ -37,6 +38,8 @@ recv() {
 
 pass() { PASS=$((PASS + 1)); }
 fail() { FAIL=$((FAIL + 1)); FAIL_MSGS="${FAIL_MSGS}  FAIL: $1\n"; }
+# fail linked to a github issue: fail_issue <issue#> <message>
+fail_issue() { fail "#$1 — $2"; ISSUE_HITS="${ISSUE_HITS}$1\n"; }
 
 # ── 1. Initialize ──
 echo "== Initialize =="
@@ -98,7 +101,7 @@ echo "== xwayland check =="
 KWIN_PID=$(echo "$TEXT" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
 sleep 2
 XWAYLAND_COUNT=$(ps --ppid "$KWIN_PID" -o cmd 2>/dev/null | grep -c Xwayland || true)
-[ "$XWAYLAND_COUNT" -gt 0 ] && pass "Xwayland running (children of kwin $KWIN_PID)" || fail "Xwayland not running (0 children of kwin $KWIN_PID)"
+[ "$XWAYLAND_COUNT" -gt 0 ] && pass "Xwayland running (children of kwin $KWIN_PID)" || fail_issue 12 "Xwayland not running (0 children of kwin $KWIN_PID)"
 
 # ── 5. screenshot ──
 echo "== screenshot =="
@@ -106,7 +109,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\",\"arguments\":{}}}"
 RESP=$(recv 15)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1 || echo "$RESP" | jq -e '.result.isError == true' >/dev/null 2>&1; then
-    fail "screenshot — No active window (apps don't create windows in isolated session)"
+    fail_issue 12 "screenshot — no active window"
 else
     pass "screenshot returns content"
 fi
@@ -117,7 +120,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_move\",\"arguments\":{\"x\":500,\"y\":500}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "mouse_move — No active window"
+    fail_issue 12 "mouse_move — no active window"
 else
     pass "mouse_move works"
 fi
@@ -128,7 +131,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_click\",\"arguments\":{\"x\":500,\"y\":500}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "mouse_click — No active window"
+    fail_issue 12 "mouse_click — no active window"
 else
     pass "mouse_click works"
 fi
@@ -139,7 +142,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_scroll\",\"arguments\":{\"x\":500,\"y\":500,\"delta\":3}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "mouse_scroll — No active window"
+    fail_issue 12 "mouse_scroll — no active window"
 else
     pass "mouse_scroll works"
 fi
@@ -150,7 +153,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"mouse_drag\",\"arguments\":{\"from_x\":100,\"from_y\":100,\"to_x\":200,\"to_y\":200}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "mouse_drag — No active window"
+    fail_issue 12 "mouse_drag — no active window"
 else
     pass "mouse_drag works"
 fi
@@ -175,7 +178,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"accessibility_tree\",\"arguments\":{\"max_depth\":2}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "accessibility_tree — AT-SPI registry not running in isolated session"
+    fail_issue 13 "accessibility_tree — AT-SPI registry not running"
 else
     pass "accessibility_tree works"
 fi
@@ -186,7 +189,7 @@ ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"find_ui_elements\",\"arguments\":{\"query\":\"button\"}}}"
 RESP=$(recv 10)
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-    fail "find_ui_elements — not yet implemented"
+    fail_issue 14 "find_ui_elements — not yet implemented"
 else
     pass "find_ui_elements works"
 fi
@@ -247,6 +250,13 @@ for f in /tmp/.X*-lock; do
     fi
 done
 
+# Deduplicate and count issues hit
+if [ -n "$ISSUE_HITS" ]; then
+    echo "  ISSUES HIT:"
+    printf "%b" "$ISSUE_HITS" | sort -n | uniq -c | while read count num; do
+        echo "    #$num ($count failures)"
+    done
+fi
 echo ""
 echo "  COUNTS:"
 echo "    pre-existing stragglers: $PRE_TOTAL ($PRE_KWIN_COUNT kwin, $PRE_DBUS_COUNT dbus)"
