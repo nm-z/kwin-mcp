@@ -597,8 +597,14 @@ impl KwinMcp {
                 ("Compositing", "ShadowSize", "0"),
                 ("org.kde.kdecoration2", "ShadowSize", "0"),
                 ("Xwayland", "XwaylandEisNoPrompt", "true"),
+                ("Keyboard", "XkbRules", "evdev"),
+                ("Keyboard", "XkbModel", "pc105"),
+                ("Keyboard", "XkbLayout", "us"),
             ])?;
             write_kde_config(&config_dir, "kcminputrc", &[("Mouse", "cursorTheme", "breeze_cursors")])?;
+            // Symlink real XKB config into isolated config so KWin/Xwayland can compile keymaps
+            let xkb_dir = format!("{config_dir}/xkb");
+            let _ = std::os::unix::fs::symlink("/usr/share/X11/xkb", &xkb_dir);
             write_kde_config(&config_dir, "kdeglobals", &[("General", "ColorScheme", "BreezeDark")])?;
             std::fs::write(format!("{config_dir}/kwinrulesrc"),
                 "[1]\nDescription=nodecor\nnoborder=true\nnoborderrule=2\nwmclass=.*\nwmclassmatch=3\n[General]\ncount=1\n")?;
@@ -763,6 +769,8 @@ impl KwinMcp {
                 .env("XDG_SESSION_TYPE", "wayland").env("XDG_CURRENT_DESKTOP", "KDE")
                 .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1").env("QT_ACCESSIBILITY", "1")
                 .env("XCURSOR_THEME", "breeze_cursors").env("XDG_CONFIG_HOME", &config_dir)
+                .env("XKB_DEFAULT_RULES", "evdev").env("XKB_DEFAULT_MODEL", "pc105").env("XKB_DEFAULT_LAYOUT", "us")
+                .env("XKB_CONFIG_ROOT", "/usr/share/X11/xkb")
                 .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1").env("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS", "1")
                 .env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY").env_remove("QT_QPA_PLATFORM")
                 .stdout(std::process::Stdio::null())

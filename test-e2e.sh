@@ -93,7 +93,14 @@ send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"na
 RESP=$(recv 10)
 echo "$RESP" | jq -re '.result.content[0].text' 2>/dev/null | grep -q "launched pid=" && pass "launch_app returns PID" || fail "launch_app failed"
 
-# ── 5. screenshot (expected fail — no active window) ──
+# ── 4b. check Xwayland is running ──
+echo "== xwayland check =="
+KWIN_PID=$(echo "$TEXT" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+sleep 2
+XWAYLAND_COUNT=$(ps --ppid "$KWIN_PID" -o cmd 2>/dev/null | grep -c Xwayland || true)
+[ "$XWAYLAND_COUNT" -gt 0 ] && pass "Xwayland running (children of kwin $KWIN_PID)" || fail "Xwayland not running (0 children of kwin $KWIN_PID)"
+
+# ── 5. screenshot ──
 echo "== screenshot =="
 ID=$((ID + 1))
 send "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\",\"arguments\":{}}}"
