@@ -443,6 +443,13 @@ impl KwinMcp {
                 pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
                 &mut [],
             ).map_err(|e| anyhow::anyhow!("pw stream connect: {e}"))?;
+            // Timeout after 3 seconds if no frame arrives
+            let timeout_loop = mainloop.clone();
+            let _timer = mainloop.loop_().add_timer(move |_| { timeout_loop.quit(); });
+            _timer.update_timer(
+                Some(std::time::Duration::from_secs(3)),
+                Some(std::time::Duration::ZERO),
+            ).into_result().map_err(|e| anyhow::anyhow!("timer: {e}"))?;
             mainloop.run();
             let (rgba, width, height) = rx.recv().map_err(|e| anyhow::anyhow!("no frame: {e}"))?;
             let file = std::fs::File::create(&path_clone).map_err(|e| anyhow::anyhow!("create png: {e}"))?;
