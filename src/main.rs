@@ -330,19 +330,18 @@ impl KwinMcp {
 fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal_error(e.to_string(), None) }
 
 fn kill_bus_clients(dbus_addr: &str) {
-    let Ok(mut ch) = dbus::channel::Channel::open_private(dbus_addr) else { return };
-    if ch.register().is_err() { return; }
-    let conn = dbus::blocking::Connection::from(ch);
-    let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(2));
-    let names: Result<(Vec<String>,), _> = proxy.method_call("org.freedesktop.DBus", "ListNames", ());
-    let Ok((names,)) = names else { return };
+    let Ok(conn) = zbus::blocking::connection::Builder::address(dbus_addr)
+        .and_then(|b| b.build()) else { return };
+    let Ok(proxy) = zbus::blocking::Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus") else { return };
+    let Ok(names) = proxy.call_method("ListNames", &()) else { return };
+    let Ok(names): Result<Vec<String>, _> = names.body().deserialize() else { return };
     let my_pid = std::process::id();
     for name in &names {
-        if name.starts_with(':') {
-            let pid: Result<(u32,), _> = proxy.method_call("org.freedesktop.DBus", "GetConnectionUnixProcessID", (name.as_str(),));
-            if let Ok((pid,)) = pid && pid != my_pid && let Ok(p) = i32::try_from(pid) {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
-            }
+        if name.starts_with(':')
+            && let Ok(reply) = proxy.call_method("GetConnectionUnixProcessID", &(name.as_str(),))
+            && let Ok(pid) = reply.body().deserialize::<u32>()
+            && pid != my_pid && let Ok(p) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
         }
     }
 }
@@ -646,16 +645,19 @@ impl KwinMcp {
             anyhow::ensure!(!dbus_addr.is_empty(), "dbus-daemon returned empty address");
             let dbus_pid = dbus_child.id();
             // Get AT-SPI bus address
-            let mut ch = dbus::channel::Channel::open_private(&dbus_addr).map_err(|e| anyhow::anyhow!("dbus: {e}"))?;
-            ch.register().map_err(|e| anyhow::anyhow!("dbus reg: {e}"))?;
-            let conn = dbus::blocking::Connection::from(ch);
-            let proxy = conn.with_proxy("org.a11y.Bus", "/org/a11y/bus", std::time::Duration::from_secs(10));
-            let (a11y_addr,): (String,) = proxy.method_call("org.a11y.Bus", "GetAddress", ())
+            let bconn = zbus::blocking::connection::Builder::address(dbus_addr.as_str())
+                .and_then(|b| b.build()).map_err(|e| anyhow::anyhow!("zbus connect: {e}"))?;
+            let a11y_proxy = zbus::blocking::Proxy::new(&bconn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
+                .map_err(|e| anyhow::anyhow!("a11y proxy: {e}"))?;
+            let a11y_reply = a11y_proxy.call_method("GetAddress", &())
                 .map_err(|e| anyhow::anyhow!("a11y GetAddress: {e}"))?;
+            let a11y_addr: String = a11y_reply.body().deserialize()
+                .map_err(|e| anyhow::anyhow!("a11y addr parse: {e}"))?;
             // Update D-Bus activation environment
             let env_vars: std::collections::HashMap<&str, &str> = [("WAYLAND_DISPLAY", sock.as_str()), ("QT_QPA_PLATFORM", "wayland")].into_iter().collect();
-            let bus_proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", std::time::Duration::from_secs(5));
-            let _: () = bus_proxy.method_call("org.freedesktop.DBus", "UpdateActivationEnvironment", (env_vars,))
+            let bus_proxy = zbus::blocking::Proxy::new(&bconn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus")
+                .map_err(|e| anyhow::anyhow!("bus proxy: {e}"))?;
+            bus_proxy.call_method("UpdateActivationEnvironment", &(env_vars,))
                 .map_err(|e| anyhow::anyhow!("UpdateActivationEnvironment: {e}"))?;
             // Pre-create Xwayland sockets mirroring KWin's XwaylandSocket setup:
             // 1. Lock file /tmp/.X{n}-lock
@@ -827,31 +829,21 @@ impl KwinMcp {
         self.with_session(|sess| {
             let path = sess.scrdir.join("screenshot.png");
             let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
-            let write_raw = write_fd.into_raw_fd();
-            let mut ch = dbus::channel::Channel::open_private(&sess.dbus_addr).map_err(eis_err)?;
-            ch.register().map_err(eis_err)?;
-            let conn = dbus::blocking::Connection::from(ch);
-            let pipe_fd = unsafe { dbus::arg::OwnedFd::new(write_raw) };
-            fn dbus_variant(v: Box<dyn dbus::arg::RefArg>) -> dbus::arg::Variant<Box<dyn dbus::arg::RefArg>> { dbus::arg::Variant(v) }
-            let opts: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> = [
-                ("include-cursor".to_owned(), dbus_variant(Box::new(true))),
-                ("include-decoration".to_owned(), dbus_variant(Box::new(true))),
-                ("include-shadow".to_owned(), dbus_variant(Box::new(false))),
-            ].into_iter().collect::<std::collections::HashMap<_, _>>();
-            // CaptureWindow by UUID — window-only, no shadow
-            let msg = {
-                let m = dbus::Message::new_method_call("org.kde.KWin", "/org/kde/KWin/ScreenShot2",
-                    "org.kde.KWin.ScreenShot2", "CaptureWindow").map_err(eis_err)?;
-                m.append3::<&str, &std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>>, dbus::arg::OwnedFd>(win_id.as_str(), &opts, pipe_fd)
-            };
-            let reply = conn.channel().send_with_reply_and_block(msg, std::time::Duration::from_secs(5)).map_err(eis_err)?;
-            // parse metadata from reply — first arg is a{sv} dict
-            let meta: std::collections::HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> =
-                reply.read1().map_err(eis_err)?;
+            let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+            let bconn = zbus::blocking::connection::Builder::address(sess.dbus_addr.as_str())
+                .and_then(|b| b.build()).map_err(eis_err)?;
+            let proxy = zbus::blocking::Proxy::new(&bconn, "org.kde.KWin", "/org/kde/KWin/ScreenShot2",
+                "org.kde.KWin.ScreenShot2").map_err(eis_err)?;
+            let mut opts = std::collections::HashMap::new();
+            opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+            opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+            opts.insert("include-shadow", zbus::zvariant::Value::from(false));
+            let reply = proxy.call_method("CaptureWindow", &(win_id.as_str(), &opts, pipe_fd)).map_err(eis_err)?;
+            let meta: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                reply.body().deserialize().map_err(eis_err)?;
             let get_meta = |key: &str| -> Result<u32, McpError> {
                 let val = meta.get(key).ok_or_else(|| McpError::internal_error(format!("no {key}"), None))?;
-                let n = val.0.as_u64().ok_or_else(|| McpError::internal_error(format!("{key} not u64"), None))?;
-                u32::try_from(n).map_err(|e| McpError::internal_error(e.to_string(), None))
+                u32::try_from(val).map_err(|_| McpError::internal_error(format!("{key} not u32"), None))
             };
             let width = get_meta("width")?;
             let height = get_meta("height")?;

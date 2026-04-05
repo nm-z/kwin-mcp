@@ -10,7 +10,6 @@ tokio = { version = "1", features = ["full"] }
 reis = "0.5"
 nix = { version = "0.29", features = ["signal", "process", "fs"] }
 chrono = "0.4"
-dbus = "0.9"
 serde_json = "1"
 # Never use mcpkit — missing _meta, no adoption. rmcp is the official MCP SDK.
 rmcp = { version = "1.3", features = ["server", "transport-io"] }
