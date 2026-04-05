@@ -443,7 +443,9 @@ impl KwinMcp {
                 pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
                 &mut [],
             ).map_err(|e| anyhow::anyhow!("pw stream connect: {e}"))?;
+            eprintln!("pw: connecting to stream_id={stream_id}, running mainloop");
             mainloop.run();
+            eprintln!("pw: mainloop exited");
             let (rgba, width, height) = rx.recv().map_err(|e| anyhow::anyhow!("no frame: {e}"))?;
             let file = std::fs::File::create(&path_clone).map_err(|e| anyhow::anyhow!("create png: {e}"))?;
             let mut enc = png::Encoder::new(file, width, height);
