@@ -99,10 +99,12 @@ fn btn_code(btn: Option<&str>) -> Result<i32, McpError> {
 struct PortalSession {
     rd: RemoteDesktop,
     session: ashpd::desktop::Session<RemoteDesktop>,
+    stream_id: u32,
 }
 
 async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSession> {
     use ashpd::desktop::remote_desktop::{SelectDevicesOptions, StartOptions};
+    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType, CursorMode};
     use ashpd::desktop::CreateSessionOptions;
     let rd = RemoteDesktop::with_connection(zbus_conn.clone()).await
         .map_err(|e| anyhow::anyhow!("RemoteDesktop: {e}"))?;
@@ -111,10 +113,19 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
     rd.select_devices(&session, SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer)).await
         .map_err(|e| anyhow::anyhow!("select_devices: {e}"))?.response()
         .map_err(|e| anyhow::anyhow!("select_devices response: {e}"))?;
-    rd.start(&session, None, StartOptions::default()).await
+    let sc = Screencast::with_connection(zbus_conn.clone()).await
+        .map_err(|e| anyhow::anyhow!("Screencast: {e}"))?;
+    sc.select_sources(&session, SelectSourcesOptions::default()
+        .set_sources(SourceType::Monitor | SourceType::Window)
+        .set_cursor_mode(CursorMode::Embedded)).await
+        .map_err(|e| anyhow::anyhow!("select_sources: {e}"))?.response()
+        .map_err(|e| anyhow::anyhow!("select_sources response: {e}"))?;
+    let started = rd.start(&session, None, StartOptions::default()).await
         .map_err(|e| anyhow::anyhow!("start: {e}"))?.response()
         .map_err(|e| anyhow::anyhow!("start response: {e}"))?;
-    Ok(PortalSession { rd, session })
+    let stream_id = started.streams().first().map(|s| s.pipe_wire_node_id()).unwrap_or(0);
+    eprintln!("portal: stream_id={stream_id} streams={}", started.streams().len());
+    Ok(PortalSession { rd, session, stream_id })
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
@@ -414,7 +425,7 @@ impl KwinMcp {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
         let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, 0, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
+        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         for n in 0..count {
             if n > 0 { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
             sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Pressed, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
@@ -431,7 +442,7 @@ impl KwinMcp {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
         let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, 0, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
+        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!("moved ({x},{y})"))]))
     }
 
@@ -442,7 +453,7 @@ impl KwinMcp {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
         let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, 0, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
+        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         let horiz = params.horizontal.unwrap_or_default();
         if params.discrete.unwrap_or_default() {
             let axis = if horiz { Axis::Horizontal } else { Axis::Vertical };
@@ -463,13 +474,13 @@ impl KwinMcp {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
         let (ax, ay) = (f64::from(wx + from_x), f64::from(wy + from_y));
-        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, 0, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
+        sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Pressed, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
         let steps = 20i32;
         for step in 1..=steps {
             let cx = f64::from(wx + from_x + (to_x - from_x) * step / steps);
             let cy = f64::from(wy + from_y + (to_y - from_y) * step / steps);
-            sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, 0, cx, cy, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
+            sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, cx, cy, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
         sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Released, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
