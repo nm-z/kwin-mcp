@@ -379,8 +379,6 @@ fn startup_diagnostics(host_xdg_dir: &std::path::Path) -> String {
         "bootstrap.log",
         "dbus.log",
         "kwin.log",
-        "portal.log",
-        "portal-kde.log",
         "pipewire.log",
         "wireplumber.log",
         "atspi.log",
@@ -894,7 +892,6 @@ impl KwinMcp {
         }
         eprintln!("session_start: previous session cleared");
         let pid = std::process::id();
-        let uid = unsafe { nix::libc::geteuid() };
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         match std::fs::remove_dir_all(&host_xdg_dir) {
             Err(_) => {}
@@ -916,7 +913,7 @@ impl KwinMcp {
         container.tmpfsmount("/tmp");
         container.runctl(hakoniwa::Runctl::MountFallback);
         container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
-        container.bindmount_ro(&home, &home);
+        container.bindmount_rw(&home, &home);
         container.share(hakoniwa::Namespace::Pid);
         container.bindmount_ro("/proc", "/proc");
         // /sys is required: drmGetDevices2() enumerates GPUs via /sys/class/drm/,
@@ -983,22 +980,8 @@ impl KwinMcp {
                            container_stdin: std::io::PipeWriter| {
             let diagnostics = startup_diagnostics(&host_xdg_dir);
             eprintln!("session_start: startup error: {message}");
-            if std::env::var_os("KWIN_MCP_DEBUG_SKIP_STARTUP_TEARDOWN").is_some() {
-                eprintln!(
-                    "session_start: debug skip teardown host_xdg_dir={}",
-                    host_xdg_dir.display()
-                );
-                std::mem::forget(container);
-                std::mem::forget(container_child);
-                std::mem::forget(container_stdin);
-                Err(ver_err(format!(
-                    "{message}{diagnostics} (teardown skipped; host_xdg_dir={})",
-                    host_xdg_dir.display()
-                )))
-            } else {
-                teardown_container(container, container_child, container_stdin, &host_xdg_dir);
-                Err(ver_err(format!("{message}{diagnostics}")))
-            }
+            teardown_container(container, container_child, container_stdin, &host_xdg_dir);
+            Err(ver_err(format!("{message}{diagnostics}")))
         };
         eprintln!(
             "session_start: wait for dbus address path={}",
@@ -1103,7 +1086,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Take a screenshot via the Screenshot portal. Returns the file URI.",
+        description = "Take a screenshot via KWin ScreenShot2 D-Bus interface. Returns the file URI.",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
@@ -1260,13 +1243,61 @@ impl KwinMcp {
         &self,
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.with_session(|_sess| {
-            Err(McpError::internal_error(
-                format!("AT-SPI2 search not yet implemented: {}", params.query),
-                None,
-            ))
-        })
-        .await
+        use atspi::proxy::accessible::ObjectRefExt;
+        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
+            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        }).await?;
+        let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
+            .await
+            .map_err(eis_err)?
+            .get_address()
+            .await
+            .map_err(eis_err)?;
+        let a11y_addr = rewrite_bus_address_for_host(
+            &a11y_addr,
+            "/tmp/xdg",
+            &host_xdg_dir,
+        );
+        let addr: zbus::Address = a11y_addr.parse().map_err(eis_err)?;
+        let conn = atspi::AccessibilityConnection::from_address(addr)
+            .await
+            .map_err(eis_err)?;
+        let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
+        let query = params.query.to_lowercase();
+        let mut out = Vec::new();
+        let mut stack = root
+            .get_children()
+            .await
+            .map_err(eis_err)?
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        while let Some(obj) = stack.pop() {
+            let acc = obj
+                .as_accessible_proxy(conn.connection())
+                .await
+                .map_err(eis_err)?;
+            let node = atspi_node(&acc).await?;
+            if node.is_useful()
+                && (node.name.to_lowercase().contains(&query)
+                    || node.role.to_lowercase().contains(&query))
+            {
+                let (x, y, w, h) = node.bounds;
+                out.push(format!(
+                    "{}\t{}\t({}, {}, {}x{})",
+                    node.role, node.name, x, y, w, h
+                ));
+            }
+            for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        match out.is_empty() {
+            true => Ok(CallToolResult::success(vec![Content::text(
+                format!("no elements matching '{}'", params.query),
+            )])),
+            false => Ok(CallToolResult::success(vec![Content::text(out.join("\n"))])),
+        }
     }
 
     #[rmcp::tool(

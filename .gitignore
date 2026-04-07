@@ -4,3 +4,5 @@ backup-initial-commit.zip
 .worktrees
 .claude/worktrees/
 kwin/
+at-spi2-core/
+hakoniwa/

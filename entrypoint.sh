@@ -18,7 +18,6 @@ export XDG_CACHE_HOME=/tmp/cache
 export XDG_DATA_HOME=/tmp/state
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=KDE
-export QT_QPA_PLATFORM=wayland
 export WAYLAND_DISPLAY=wayland-0
 export KDE_DEBUG=0
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
@@ -51,13 +50,13 @@ if [ ! -s "${XDG_INNER}/dbus.address" ]; then echo 'dbus-daemon did not announce
 export DBUS_SESSION_BUS_ADDRESS="$(cat "${XDG_INNER}/dbus.address")"
 
 # KWin compositor
-KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --width 1920 --height 1080 2>"${XDG_INNER}/kwin.log" &
+KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --xwayland --width 1920 --height 1080 2>"${XDG_INNER}/kwin.log" &
 kwin_pid=$!
 n=0; while [ ! -S "${XDG_INNER}/wayland-0" ] && kill -0 "$dbus_pid" 2>/dev/null && kill -0 "$kwin_pid" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done
 if ! kill -0 "$kwin_pid" 2>/dev/null; then echo 'kwin_wayland exited before creating wayland-0' >> "${XDG_INNER}/bootstrap.log"; wait "$kwin_pid" || true; exit 1; fi
 if [ ! -S "${XDG_INNER}/wayland-0" ]; then echo 'kwin_wayland did not create wayland-0' >> "${XDG_INNER}/bootstrap.log"; exit 1; fi
 
-if ! dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH HOME USER QT_QPA_PLATFORM 2>>"${XDG_INNER}/bootstrap.log"; then
+if ! dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH HOME USER 2>>"${XDG_INNER}/bootstrap.log"; then
     echo 'dbus-update-activation-environment failed' >> "${XDG_INNER}/bootstrap.log"; exit 1
 fi
 
@@ -66,4 +65,7 @@ pipewire 2>"${XDG_INNER}/pipewire.log" &
 ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher 2>"${XDG_INNER}/atspi.log" &
 wireplumber 2>"${XDG_INNER}/wireplumber.log" &
 
-while read -r cmd; do eval "$cmd" & done
+# Ready — wait for app-launch commands on stdin (one per line)
+while read -r cmd; do
+    "$cmd" &
+done
