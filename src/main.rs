@@ -1,8 +1,3 @@
-use ashpd::desktop::remote_desktop::{
-    Axis, DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyPointerAxisDiscreteOptions,
-    NotifyPointerAxisOptions, NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions,
-    RemoteDesktop,
-};
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
@@ -56,7 +51,6 @@ fn parse_int(v: FlexInt) -> i32 {
     v.0
 }
 
-const PORTAL_APP_ID: &str = "io.github.kwin_mcp";
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STARTUP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -109,7 +103,13 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
             None,
         ))?,
     };
-    let input: keyboard_codes::KeyboardInput = String::from(raw)
+    let key_str = match raw {
+        ' ' => "Space".to_owned(),
+        '\t' => "Tab".to_owned(),
+        '\n' => "Return".to_owned(),
+        c => String::from(c),
+    };
+    let input: keyboard_codes::KeyboardInput = key_str
         .parse()
         .map_err(|e| McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None))?;
     let code = u32::try_from(input.to_code(Platform::Linux))
@@ -149,7 +149,7 @@ fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
     }
 }
 
-fn btn_code(btn: Option<&str>) -> Result<i32, McpError> {
+fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
     match btn {
         Some("left") | None => Ok(0x110),
         Some("right") => Ok(0x111),
@@ -161,131 +161,208 @@ fn btn_code(btn: Option<&str>) -> Result<i32, McpError> {
     }
 }
 
-// ── Portal session ──────────────────────────────────────────────────────
 
-struct PortalSession {
-    rd: RemoteDesktop,
-    session: ashpd::desktop::Session<RemoteDesktop>,
-    stream_id: u32,
+// ── KWin D-Bus proxies ──────────────────────────────────────────────────
+
+#[zbus::proxy(
+    interface = "org.kde.KWin.EIS.RemoteDesktop",
+    default_service = "org.kde.KWin",
+    default_path = "/org/kde/KWin/EIS/RemoteDesktop"
+)]
+trait KWinEis {
+    #[zbus(name = "connectToEIS")]
+    fn connect_to_eis(
+        &self,
+        capabilities: i32,
+    ) -> zbus::Result<(zbus::zvariant::OwnedFd, i32)>;
 }
 
-async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSession> {
-    use ashpd::desktop::CreateSessionOptions;
-    use ashpd::desktop::remote_desktop::{SelectDevicesOptions, StartOptions};
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
-    eprintln!("portal_setup: connect remote desktop");
-    let rd = RemoteDesktop::with_connection(zbus_conn.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("RemoteDesktop: {e}"))?;
-    eprintln!("portal_setup: create_session");
-    let session = rd
-        .create_session(CreateSessionOptions::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("create_session: {e}"))?;
-    eprintln!("portal_setup: create_session ok");
-    eprintln!("portal_setup: select_devices request sent");
-    let select_devices_request = tokio::time::timeout(
-        STARTUP_TIMEOUT,
-        rd.select_devices(
-            &session,
-            SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "select_devices request timed out after {}s",
-            STARTUP_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|e| anyhow::anyhow!("select_devices: {e}"))?;
-    eprintln!("portal_setup: select_devices request completed");
-    select_devices_request
-        .response()
-        .map_err(|e| anyhow::anyhow!("select_devices response: {e}"))?;
-    eprintln!("portal_setup: select_devices response ok");
-    eprintln!("portal_setup: connect screencast");
-    let sc = Screencast::with_connection(zbus_conn.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Screencast: {e}"))?;
-    eprintln!("portal_setup: select_sources request sent");
-    let select_sources_request = tokio::time::timeout(
-        STARTUP_TIMEOUT,
-        sc.select_sources(
-            &session,
-            SelectSourcesOptions::default()
-                .set_sources(SourceType::Virtual | SourceType::Monitor)
-                .set_cursor_mode(CursorMode::Embedded),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "select_sources request timed out after {}s",
-            STARTUP_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|e| anyhow::anyhow!("select_sources: {e}"))?;
-    eprintln!("portal_setup: select_sources request completed");
-    select_sources_request
-        .response()
-        .map_err(|e| anyhow::anyhow!("select_sources response: {e}"))?;
-    eprintln!("portal_setup: select_sources response ok");
-    eprintln!("portal_setup: start request sent");
-    let started = rd.start(&session, None, StartOptions::default());
-    let started_request = tokio::time::timeout(STARTUP_TIMEOUT, started)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "start request timed out after {}s",
-                STARTUP_TIMEOUT.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("start: {e}"))?;
-    eprintln!("portal_setup: start request completed");
-    let started = started_request
-        .response()
-        .map_err(|e| anyhow::anyhow!("start response: {e}"))?;
-    eprintln!("portal_setup: start response ok");
-    let stream_id = started
-        .streams()
-        .first()
-        .map(|s| s.pipe_wire_node_id())
-        .unwrap_or(0);
-    eprintln!(
-        "portal: stream_id={stream_id} streams={}",
-        started.streams().len()
-    );
-    Ok(PortalSession {
-        rd,
-        session,
-        stream_id,
-    })
+#[zbus::proxy(
+    interface = "org.kde.KWin.ScreenShot2",
+    default_service = "org.kde.KWin",
+    default_path = "/org/kde/KWin/ScreenShot2"
+)]
+trait KWinScreenShot2 {
+    #[zbus(name = "CaptureWindow")]
+    fn capture_window(
+        &self,
+        handle: &str,
+        options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
+        pipe_fd: zbus::zvariant::OwnedFd,
+    ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 }
 
-async fn register_portal_host_app(
-    zbus_conn: &zbus::Connection,
-) -> anyhow::Result<Option<ashpd::AppID>> {
-    let app_id = ashpd::AppID::try_from(PORTAL_APP_ID)?;
-    match ashpd::register_host_app_with_connection(zbus_conn.clone(), app_id.clone()).await {
-        Ok(()) => return Ok(Some(app_id)),
-        Err(ashpd::Error::PortalNotFound(_)) => {
-            eprintln!("portal registry unavailable; continuing without explicit registration")
-        }
-        Err(e) => {
-            let err = e.to_string();
-            if err.contains("Could not register app ID: Unable to open /proc/") {
-                eprintln!(
-                    "portal registry could not inspect external caller root; continuing without explicit registration"
-                );
-            } else {
-                return Err(anyhow::anyhow!(
-                    "host app registry registration failed: {e}"
-                ));
+// ── EIS input ───────────────────────────────────────────────────────────
+
+struct Eis {
+    context: reis::ei::Context,
+    abs_ptr: reis::ei::PointerAbsolute,
+    btn: reis::ei::Button,
+    scroll: reis::ei::Scroll,
+    kbd: reis::ei::Keyboard,
+    ptr_dev: reis::ei::Device,
+    kbd_dev: reis::ei::Device,
+    serial: u32,
+}
+
+impl Eis {
+    fn from_fd(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
+        let stream = std::os::unix::net::UnixStream::from(fd);
+        let context = reis::ei::Context::new(stream)?;
+        let resp = reis::handshake::ei_handshake_blocking(
+            &context,
+            "kwin-mcp",
+            reis::ei::handshake::ContextType::Sender,
+        )
+        .map_err(|e| anyhow::anyhow!("EIS handshake: {e:?}"))?;
+        context.flush()?;
+        let mut conv = reis::event::EiEventConverter::new(&context, resp);
+        let serial = conv.connection().serial();
+        let (mut dev, mut kbd_d) = (None, None);
+        let (mut abs, mut bt, mut sc, mut kb) = (None, None, None, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match (&dev, &kb) {
+                (Some(_), Some(_)) => break,
+                _ => match std::time::Instant::now() > deadline {
+                    true => anyhow::bail!("EIS negotiation timed out"),
+                    false => {}
+                },
             }
+            context.read()?;
+            while let Some(pending) = context.pending_event() {
+                match pending {
+                    reis::PendingRequestResult::Request(ev) => {
+                        conv.handle_event(ev)
+                            .map_err(|e| anyhow::anyhow!("EIS event: {e:?}"))?;
+                    }
+                    reis::PendingRequestResult::ParseError(e) => {
+                        anyhow::bail!("EIS parse: {e}")
+                    }
+                    reis::PendingRequestResult::InvalidObject(i) => {
+                        anyhow::bail!("EIS invalid object: {i}")
+                    }
+                }
+            }
+            while let Some(ev) = conv.next_event() {
+                match ev {
+                    reis::event::EiEvent::SeatAdded(sa) => {
+                        sa.seat.bind_capabilities(
+                            reis::event::DeviceCapability::Pointer
+                                | reis::event::DeviceCapability::PointerAbsolute
+                                | reis::event::DeviceCapability::Button
+                                | reis::event::DeviceCapability::Scroll
+                                | reis::event::DeviceCapability::Keyboard,
+                        );
+                        context.flush()?;
+                    }
+                    reis::event::EiEvent::DeviceAdded(da) => {
+                        let d = &da.device;
+                        match d.has_capability(reis::event::DeviceCapability::PointerAbsolute) {
+                            true => {
+                                d.device().start_emulating(serial, 0);
+                                abs = d.interface::<reis::ei::PointerAbsolute>();
+                                bt = d.interface::<reis::ei::Button>();
+                                sc = d.interface::<reis::ei::Scroll>();
+                                dev = Some(d.device().clone());
+                                match (d.interface::<reis::ei::Keyboard>(), &kb) {
+                                    (Some(k), None) => {
+                                        kb = Some(k);
+                                        kbd_d = Some(d.device().clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            false => match (
+                                d.has_capability(reis::event::DeviceCapability::Keyboard),
+                                &kb,
+                            ) {
+                                (true, None) => {
+                                    d.device().start_emulating(serial, 0);
+                                    kb = d.interface::<reis::ei::Keyboard>();
+                                    kbd_d = Some(d.device().clone());
+                                }
+                                _ => {}
+                            },
+                        }
+                        context.flush()?;
+                    }
+                    reis::event::EiEvent::Disconnected(_) => anyhow::bail!("EIS disconnected"),
+                    reis::event::EiEvent::SeatRemoved(_)
+                    | reis::event::EiEvent::DeviceRemoved(_)
+                    | reis::event::EiEvent::DevicePaused(_)
+                    | reis::event::EiEvent::DeviceResumed(_)
+                    | reis::event::EiEvent::KeyboardModifiers(_)
+                    | reis::event::EiEvent::Frame(_)
+                    | reis::event::EiEvent::DeviceStartEmulating(_)
+                    | reis::event::EiEvent::DeviceStopEmulating(_)
+                    | reis::event::EiEvent::PointerMotion(_)
+                    | reis::event::EiEvent::PointerMotionAbsolute(_)
+                    | reis::event::EiEvent::Button(_)
+                    | reis::event::EiEvent::ScrollDelta(_)
+                    | reis::event::EiEvent::ScrollStop(_)
+                    | reis::event::EiEvent::ScrollCancel(_)
+                    | reis::event::EiEvent::ScrollDiscrete(_)
+                    | reis::event::EiEvent::KeyboardKey(_)
+                    | reis::event::EiEvent::TouchDown(_)
+                    | reis::event::EiEvent::TouchUp(_)
+                    | reis::event::EiEvent::TouchMotion(_)
+                    | reis::event::EiEvent::TouchCancel(_) => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        Ok(Self {
+            context,
+            abs_ptr: abs.ok_or_else(|| anyhow::anyhow!("no EIS pointer"))?,
+            btn: bt.ok_or_else(|| anyhow::anyhow!("no EIS button"))?,
+            scroll: sc.ok_or_else(|| anyhow::anyhow!("no EIS scroll"))?,
+            kbd: kb.ok_or_else(|| anyhow::anyhow!("no EIS keyboard"))?,
+            ptr_dev: dev.ok_or_else(|| anyhow::anyhow!("no EIS ptr device"))?,
+            kbd_dev: kbd_d.ok_or_else(|| anyhow::anyhow!("no EIS kbd device"))?,
+            serial,
+        })
     }
-    Ok(None)
+
+    fn move_abs(&self, x: f32, y: f32) -> anyhow::Result<()> {
+        self.abs_ptr.motion_absolute(x, y);
+        self.ptr_dev.frame(self.serial, 0);
+        Ok(self.context.flush()?)
+    }
+
+    fn button(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
+        let st = match pressed {
+            true => reis::ei::button::ButtonState::Press,
+            false => reis::ei::button::ButtonState::Released,
+        };
+        self.btn.button(code, st);
+        self.ptr_dev.frame(self.serial, 0);
+        Ok(self.context.flush()?)
+    }
+
+    fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
+        self.scroll.scroll_discrete(dx, dy);
+        self.scroll.scroll_stop(0, 0, 0);
+        self.ptr_dev.frame(self.serial, 0);
+        Ok(self.context.flush()?)
+    }
+
+    fn scroll_smooth(&self, dx: f32, dy: f32) -> anyhow::Result<()> {
+        self.scroll.scroll(dx, dy);
+        self.scroll.scroll_stop(0, 0, 0);
+        self.ptr_dev.frame(self.serial, 0);
+        Ok(self.context.flush()?)
+    }
+
+    fn key(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
+        let st = match pressed {
+            true => reis::ei::keyboard::KeyState::Press,
+            false => reis::ei::keyboard::KeyState::Released,
+        };
+        self.kbd.key(code, st);
+        self.kbd_dev.frame(self.serial, 0);
+        Ok(self.context.flush()?)
+    }
 }
 
 fn log_tail(path: &std::path::Path, lines: usize) -> Option<String> {
@@ -308,8 +385,9 @@ fn startup_diagnostics(host_xdg_dir: &std::path::Path) -> String {
         "wireplumber.log",
         "atspi.log",
     ] {
-        if let Some(tail) = log_tail(&host_xdg_dir.join(name), 6) {
-            details.push(format!("{name}: {tail}"));
+        match log_tail(&host_xdg_dir.join(name), 6) {
+            Some(tail) => details.push(format!("{name}: {tail}")),
+            None => {}
         }
     }
     match details.is_empty() {
@@ -338,28 +416,29 @@ async fn wait_for_nonempty_file(
 ) -> Result<String, String> {
     loop {
         match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    return Ok(trimmed.to_owned());
+            Ok(contents) => match contents.trim() {
+                "" => {}
+                trimmed => return Ok(trimmed.to_owned()),
+            },
+            Err(e) => {
+                #[expect(clippy::wildcard_enum_match_arm)]
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => {}
+                    other => return Err(format!(
+                        "failed to read {description} at {} ({other:?}): {e}",
+                        path.display()
+                    )),
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "failed to read {description} at {}: {e}",
-                    path.display()
-                ));
-            }
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
+        match std::time::Instant::now() >= deadline {
+            true => return Err(format!(
                 "{description} did not appear at {} within {}s",
                 path.display(),
                 STARTUP_TIMEOUT.as_secs()
-            ));
+            )),
+            false => tokio::time::sleep(STARTUP_POLL).await,
         }
-        tokio::time::sleep(STARTUP_POLL).await;
     }
 }
 
@@ -385,52 +464,11 @@ async fn connect_session_bus(
     }
 }
 
-async fn wait_for_bus_names(
-    conn: &zbus::Connection,
-    names: &[&str],
-    deadline: std::time::Instant,
-) -> Result<(), String> {
-    let dbus = zbus::fdo::DBusProxy::new(conn)
-        .await
-        .map_err(|e| format!("failed to create org.freedesktop.DBus proxy: {e}"))?;
-    let mut last_missing = None::<String>;
-    loop {
-        let mut missing = Vec::new();
-        for name in names {
-            let bus_name = zbus::names::BusName::try_from(*name)
-                .map_err(|e| format!("invalid bus name '{name}': {e}"))?;
-            let has_owner = dbus
-                .name_has_owner(bus_name)
-                .await
-                .map_err(|e| format!("failed to query bus name '{name}': {e}"))?;
-            if !has_owner {
-                missing.push(*name);
-            }
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let missing_joined = missing.join(", ");
-        if last_missing.as_deref() != Some(missing_joined.as_str()) {
-            eprintln!("wait_for_bus_names: missing {missing_joined}");
-            last_missing = Some(missing_joined.clone());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out after {}s waiting for D-Bus names: {}",
-                STARTUP_TIMEOUT.as_secs(),
-                missing_joined
-            ));
-        }
-        tokio::time::sleep(STARTUP_POLL).await;
-    }
-}
-
 // ── Session ──────────────────────────────────────────────────────────────
 
 struct Session {
-    portal: PortalSession,
     zbus_conn: zbus::Connection,
+    eis: Eis,
     container: hakoniwa::Container,
     container_child: hakoniwa::Child,
     container_stdin: std::io::PipeWriter,
@@ -473,6 +511,16 @@ impl KwinMcp {
             )),
         }
     }
+    async fn host_xdg_dir(&self) -> Result<std::path::PathBuf, McpError> {
+        let guard = self.session.lock().await;
+        match &*guard {
+            Some(s) => Ok(s.host_xdg_dir.clone()),
+            None => Err(McpError::internal_error(
+                "no session — call session_start first",
+                None,
+            )),
+        }
+    }
 }
 
 fn eis_err(e: impl std::fmt::Display) -> McpError {
@@ -486,8 +534,8 @@ fn teardown_container(
     host_xdg_dir: &std::path::Path,
 ) {
     use std::io::Write;
-    // Kill all container processes via bash process group
-    match writeln!(container_stdin, "kill 0") {
+    // Kill bash's children, NOT kill 0 (kills shared process group = kwin-mcp too)
+    match writeln!(container_stdin, "pkill -P $$") {
         Err(e) => eprintln!("teardown kill 0: {e}"),
         Ok(()) => {}
     }
@@ -508,7 +556,6 @@ fn teardown_container(
 }
 
 fn teardown(sess: Session) {
-    drop(sess.portal);
     teardown_container(
         sess.container,
         sess.container_child,
@@ -517,7 +564,7 @@ fn teardown(sess: Session) {
     );
 }
 
-async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String), McpError> {
+async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), McpError> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(eis_err)?
@@ -535,8 +582,11 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         w:w.frameGeometry.width,h:w.frameGeometry.height,\
         title:w.caption,id:w.internalId.toString()}}) : 'null');"
     );
-    let script_file = std::env::temp_dir().join(format!("{marker}.js"));
+    let script_name = format!("{marker}.js");
+    let script_file = host_xdg_dir.join(&script_name);
     std::fs::write(&script_file, &script).map_err(eis_err)?;
+    // KWin sees /tmp/xdg/ inside the container
+    let container_script_path = format!("/tmp/xdg/{script_name}");
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let cb = KWinCallback {
         tx: std::sync::Mutex::new(Some(tx)),
@@ -568,9 +618,8 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         .build()
         .await
         .map_err(eis_err)?;
-    let script_path = script_file.to_string_lossy().to_string();
     let (script_id,): (i32,) = scripting
-        .call("loadScript", &(script_path, &marker))
+        .call("loadScript", &(&container_script_path, &marker))
         .await
         .map_err(eis_err)?;
     match script_id >= 0 {
@@ -876,26 +925,18 @@ impl KwinMcp {
         eprintln!("session_start: container configuration ready");
         // Entrypoint: start services sequentially with readiness checks
         let xdg_inner = "/tmp/xdg";
-        let portal_app_id = PORTAL_APP_ID;
         let entrypoint = format!(
             "\
 set -u\n\
 ulimit -c 0\n\
-mkdir -p {runtime_dir} /tmp/cache /tmp/state/applications /dev/dri\n\
+mkdir -p {runtime_dir} /tmp/cache /dev/dri\n\
 chmod 700 {runtime_dir}\n\
-cat > /tmp/state/applications/{portal_app_id}.desktop <<'EOF'\n\
-[Desktop Entry]\n\
-Type=Application\n\
-Name=KWin MCP\n\
-Exec=kwin-mcp\n\
-NoDisplay=true\n\
-EOF\n\
 printf '#!/bin/sh\\nexit 0\\n' > /tmp/kdialog && chmod +x /tmp/kdialog\n\
 dbus-daemon --session --address='unix:path={xdg_inner}/bus' --print-address=3 --print-pid=4 --nofork 3>{xdg_inner}/dbus.address 4>{xdg_inner}/dbus.pid 2>{xdg_inner}/dbus.log &\n\
 dbus_pid=$!\n\
 n=0; while [ ! -s {xdg_inner}/dbus.address ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
 if [ ! -s {xdg_inner}/dbus.address ]; then echo 'dbus-daemon did not announce an address' >> {xdg_inner}/bootstrap.log; wait \"$dbus_pid\" || true; exit 1; fi\n\
-kwin_wayland --virtual --width 1920 --height 1080 2>{xdg_inner}/kwin.log &\n\
+KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_COMPOSE=O2 kwin_wayland --virtual --width 1920 --height 1080 2>{xdg_inner}/kwin.log &\n\
 kwin_pid=$!\n\
 n=0; while [ ! -S {runtime_dir}/wayland-0 ] && kill -0 \"$dbus_pid\" 2>/dev/null && kill -0 \"$kwin_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
 if ! kill -0 \"$kwin_pid\" 2>/dev/null; then echo 'kwin_wayland exited before creating wayland-0' >> {xdg_inner}/bootstrap.log; wait \"$kwin_pid\" || true; exit 1; fi\n\
@@ -904,7 +945,6 @@ if ! dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURR
 pipewire 2>{xdg_inner}/pipewire.log &\n\
 at-spi-bus-launcher 2>{xdg_inner}/atspi.log &\n\
 wireplumber 2>{xdg_inner}/wireplumber.log &\n\
-xdg-desktop-portal 2>{xdg_inner}/portal.log &\n\
 while read -r cmd; do eval \"$cmd\" & done\n"
         );
         let mut cmd = container.command("/bin/bash");
@@ -1024,152 +1064,54 @@ while read -r cmd; do eval \"$cmd\" & done\n"
                 Err(e) => return cleanup_err(e, container, container_child, container_stdin),
             };
         eprintln!("session_start: connected to session bus");
-        eprintln!("session_start: wait for portal bus names");
-        match wait_for_bus_names(
-            &zbus_conn,
-            &[
-                "org.freedesktop.portal.Desktop",
-                "org.freedesktop.impl.portal.PermissionStore",
-            ],
-            std::time::Instant::now() + STARTUP_TIMEOUT,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => return cleanup_err(e, container, container_child, container_stdin),
+        // Wait for KWin to register on D-Bus
+        eprintln!("session_start: wait for org.kde.KWin");
+        let kwin_deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        let dbus_proxy = zbus::fdo::DBusProxy::new(&zbus_conn)
+            .await
+            .map_err(|e| ver_err(format!("DBus proxy: {e}")))?;
+        loop {
+            let kwin_name = zbus::names::BusName::try_from("org.kde.KWin")
+                .map_err(|e| ver_err(format!("invalid bus name: {e}")))?;
+            match dbus_proxy.name_has_owner(kwin_name).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => return cleanup_err(format!("name_has_owner: {e}"), container, container_child, container_stdin),
+            }
+            match std::time::Instant::now() >= kwin_deadline {
+                true => return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), container, container_child, container_stdin),
+                false => tokio::time::sleep(STARTUP_POLL).await,
+            }
         }
-        eprintln!("session_start: required bus names owned");
+        eprintln!("session_start: org.kde.KWin ready");
+        // Connect to KWin EIS for input injection
+        eprintln!("session_start: connect to KWin EIS");
+        let eis_proxy = match KWinEisProxy::new(&zbus_conn).await {
+            Ok(p) => p,
+            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), container, container_child, container_stdin),
+        };
+        // capabilities: 1=keyboard, 2=pointer, 4=touch → 3 = keyboard+pointer
+        let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(3).await {
+            Ok(r) => r,
+            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), container, container_child, container_stdin),
+        };
+        eprintln!("session_start: EIS fd received, negotiating");
+        let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
+        let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
+            Ok(Ok(eis)) => eis,
+            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), container, container_child, container_stdin),
+            Err(e) => return cleanup_err(format!("EIS task: {e}"), container, container_child, container_stdin),
+        };
+        eprintln!("session_start: EIS ready");
         let bus_name = zbus_conn
             .unique_name()
             .map(|n| n.to_string())
             .unwrap_or_default();
-        eprintln!("session_start: register host app");
-        let app_id =
-            match tokio::time::timeout(STARTUP_TIMEOUT, register_portal_host_app(&zbus_conn)).await
-            {
-                Ok(Ok(app_id)) => app_id,
-                Ok(Err(e)) => {
-                    return cleanup_err(
-                        format!("portal host app registration: {e}"),
-                        container,
-                        container_child,
-                        container_stdin,
-                    );
-                }
-                Err(_) => {
-                    return cleanup_err(
-                        format!(
-                            "portal host app registration timed out after {}s",
-                            STARTUP_TIMEOUT.as_secs()
-                        ),
-                        container,
-                        container_child,
-                        container_stdin,
-                    );
-                }
-            };
-        match &app_id {
-            Some(app_id) => eprintln!(
-                "session_start: register host app ok app_id={}",
-                app_id.as_ref()
-            ),
-            None => eprintln!("session_start: register host app skipped; using automatic caller detection"),
-        }
-        // Pre-approve RemoteDesktop permission so the portal doesn't show a dialog.
-        eprintln!("session_start: build permission store proxy");
-        let perm_store: zbus::Proxy = match tokio::time::timeout(STARTUP_TIMEOUT, async {
-            zbus::proxy::Builder::new(&zbus_conn)
-                .destination("org.freedesktop.impl.portal.PermissionStore")?
-                .path("/org/freedesktop/impl/portal/PermissionStore")?
-                .interface("org.freedesktop.impl.portal.PermissionStore")?
-                .build()
-                .await
-        })
-        .await
-        {
-            Ok(Ok(proxy)) => proxy,
-            Ok(Err(e)) => {
-                return cleanup_err(
-                    format!("permission store proxy: {e}"),
-                    container,
-                    container_child,
-                    container_stdin,
-                );
-            }
-            Err(_) => {
-                return cleanup_err(
-                    format!(
-                        "permission store proxy timed out after {}s",
-                        STARTUP_TIMEOUT.as_secs()
-                    ),
-                    container,
-                    container_child,
-                    container_stdin,
-                );
-            }
-        };
-        eprintln!("session_start: permission store proxy ready");
-        let perms: Vec<&str> = vec!["yes"];
-        let permission_app_id = app_id
-            .as_ref()
-            .map(|app_id| app_id.as_ref())
-            .unwrap_or("");
-        eprintln!("session_start: permission store preauth request");
-        match tokio::time::timeout(
-            STARTUP_TIMEOUT,
-            perm_store.call(
-                "SetPermission",
-                &(
-                    "kde-authorized",
-                    true,
-                    "remote-desktop",
-                    permission_app_id,
-                    &perms,
-                ),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => eprintln!("permission store: approved remote-desktop"),
-            Ok(Err(e)) => eprintln!("permission store: {e}"),
-            Err(_) => eprintln!(
-                "permission store: remote-desktop preauth timed out after {}s",
-                STARTUP_TIMEOUT.as_secs()
-            ),
-        }
-        eprintln!("session_start: portal_setup start");
-        // Wait for portal services to start, then set up RemoteDesktop
-        let portal = match tokio::time::timeout(STARTUP_TIMEOUT, portal_setup(&zbus_conn)).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                return cleanup_err(
-                    format!("portal setup: {e}"),
-                    container,
-                    container_child,
-                    container_stdin,
-                );
-            }
-            Err(_) => {
-                return cleanup_err(
-                    format!("portal setup hung after {}s", STARTUP_TIMEOUT.as_secs()),
-                    container,
-                    container_child,
-                    container_stdin,
-                );
-            }
-        };
-        let app_id_label = app_id
-            .as_ref()
-            .map(|app_id| app_id.as_ref())
-            .unwrap_or("<unregistered>");
-        let msg = format!(
-            "{version_stamp} — session started bus={bus_name} app_id={}",
-            app_id_label
-        );
+        let msg = format!("{version_stamp} — session started bus={bus_name}");
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
-            portal,
             zbus_conn,
+            eis,
             container,
             container_child,
             container_stdin,
@@ -1205,16 +1147,58 @@ while read -r cmd; do eval \"$cmd\" & done\n"
     )]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
         let conn = self.zbus_conn().await?;
-        let result = ashpd::desktop::screenshot::Screenshot::request()
-            .connection(Some(conn))
-            .send()
+        let xdg = self.host_xdg_dir().await?;
+        let (_, _, win_id) = active_window_info(&conn, &xdg).await?;
+        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(eis_err)?;
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
+        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+        opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
+        let meta = proxy
+            .capture_window(&win_id, opts, pipe_fd)
             .await
-            .map_err(eis_err)?
-            .response()
             .map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            result.uri().to_string(),
-        )]))
+        let get_u32 = |k: &str| -> Result<u32, McpError> {
+            let val = meta
+                .get(k)
+                .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
+            let n: u32 = val.try_into().map_err(eis_err)?;
+            Ok(n)
+        };
+        let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
+        let reader_file = std::fs::File::from(read_fd);
+        let total = usize::try_from(stride * height).map_err(eis_err)?;
+        let mut pixels = vec![0u8; total];
+        std::io::Read::read_exact(&mut std::io::BufReader::new(reader_file), &mut pixels)
+            .map_err(eis_err)?;
+        // BGRA premultiplied → RGBA
+        let px = usize::try_from(width * height).map_err(eis_err)?;
+        let mut rgba = vec![0u8; px * 4];
+        for row in 0..height {
+            for col in 0..width {
+                let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
+                let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
+                rgba[di] = pixels[si + 2];
+                rgba[di + 1] = pixels[si + 1];
+                rgba[di + 2] = pixels[si];
+                rgba[di + 3] = pixels[si + 3];
+            }
+        }
+        let path = xdg.join("screenshot.png");
+        let file = std::fs::File::create(&path).map_err(eis_err)?;
+        let mut enc = png::Encoder::new(file, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(eis_err)?;
+        writer.write_image_data(&rgba).map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} size={}x{}",
+            path.to_string_lossy(),
+            width,
+            height
+        ))]))
     }
 
     #[rmcp::tool(
@@ -1319,7 +1303,7 @@ while read -r cmd; do eval \"$cmd\" & done\n"
     ) -> Result<CallToolResult, McpError> {
         let x = parse_int(params.x);
         let y = parse_int(params.y);
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let count = match (params.triple, params.double) {
             (Some(true), _) => 3,
@@ -1330,46 +1314,16 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal
-            .rd
-            .notify_pointer_motion_absolute(
-                &sess.portal.session,
-                sess.portal.stream_id,
-                ax,
-                ay,
-                NotifyPointerMotionAbsoluteOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
+        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
         for n in 0..count {
             match n {
                 0 => {}
-                _ => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
             }
-            sess.portal
-                .rd
-                .notify_pointer_button(
-                    &sess.portal.session,
-                    code,
-                    KeyState::Pressed,
-                    NotifyPointerButtonOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            sess.eis.button(code, true).map_err(eis_err)?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            sess.portal
-                .rd
-                .notify_pointer_button(
-                    &sess.portal.session,
-                    code,
-                    KeyState::Released,
-                    NotifyPointerButtonOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            sess.eis.button(code, false).map_err(eis_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "clicked ({x},{y}) x{count}"
@@ -1387,23 +1341,13 @@ while read -r cmd; do eval \"$cmd\" & done\n"
     ) -> Result<CallToolResult, McpError> {
         let x = parse_int(params.x);
         let y = parse_int(params.y);
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal
-            .rd
-            .notify_pointer_motion_absolute(
-                &sess.portal.session,
-                sess.portal.stream_id,
-                ax,
-                ay,
-                NotifyPointerMotionAbsoluteOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
+        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "moved ({x},{y})"
         ))]))
@@ -1420,56 +1364,28 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         let x = parse_int(params.x);
         let y = parse_int(params.y);
         let delta = parse_int(params.delta);
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
-        sess.portal
-            .rd
-            .notify_pointer_motion_absolute(
-                &sess.portal.session,
-                sess.portal.stream_id,
-                ax,
-                ay,
-                NotifyPointerMotionAbsoluteOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
+        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
         let horiz = params.horizontal.unwrap_or_default();
         match params.discrete.unwrap_or_default() {
             true => {
-                let axis = match horiz {
-                    true => Axis::Horizontal,
-                    false => Axis::Vertical,
+                let (dx, dy) = match horiz {
+                    true => (delta, 0),
+                    false => (0, delta),
                 };
-                sess.portal
-                    .rd
-                    .notify_pointer_axis_discrete(
-                        &sess.portal.session,
-                        axis,
-                        delta,
-                        NotifyPointerAxisDiscreteOptions::default(),
-                    )
-                    .await
-                    .map_err(eis_err)?;
+                sess.eis.scroll_discrete(dx, dy).map_err(eis_err)?;
             }
             false => {
                 let (dx, dy) = match horiz {
-                    true => (f64::from(delta) * 15.0, 0.0),
-                    false => (0.0, f64::from(delta) * 15.0),
+                    true => (f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0, 0.0),
+                    false => (0.0, f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0),
                 };
-                sess.portal
-                    .rd
-                    .notify_pointer_axis(
-                        &sess.portal.session,
-                        dx,
-                        dy,
-                        NotifyPointerAxisOptions::default(),
-                    )
-                    .await
-                    .map_err(eis_err)?;
+                sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
             }
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1489,61 +1405,24 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         let from_y = parse_int(params.from_y);
         let to_x = parse_int(params.to_x);
         let to_y = parse_int(params.to_y);
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f64::from(wx + from_x), f64::from(wy + from_y));
-        sess.portal
-            .rd
-            .notify_pointer_motion_absolute(
-                &sess.portal.session,
-                sess.portal.stream_id,
-                ax,
-                ay,
-                NotifyPointerMotionAbsoluteOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
-        sess.portal
-            .rd
-            .notify_pointer_button(
-                &sess.portal.session,
-                code,
-                KeyState::Pressed,
-                NotifyPointerButtonOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
+        let ax = f32::from(i16::try_from(wx + from_x).map_err(eis_err)?);
+        let ay = f32::from(i16::try_from(wy + from_y).map_err(eis_err)?);
+        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
+        sess.eis.button(code, true).map_err(eis_err)?;
         let steps = 20i32;
         for step in 1..=steps {
-            let cx = f64::from(wx + from_x + (to_x - from_x) * step / steps);
-            let cy = f64::from(wy + from_y + (to_y - from_y) * step / steps);
-            sess.portal
-                .rd
-                .notify_pointer_motion_absolute(
-                    &sess.portal.session,
-                    sess.portal.stream_id,
-                    cx,
-                    cy,
-                    NotifyPointerMotionAbsoluteOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / steps).map_err(eis_err)?);
+            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / steps).map_err(eis_err)?);
+            sess.eis.move_abs(cx, cy).map_err(eis_err)?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        sess.portal
-            .rd
-            .notify_pointer_button(
-                &sess.portal.session,
-                code,
-                KeyState::Released,
-                NotifyPointerButtonOptions::default(),
-            )
-            .await
-            .map_err(eis_err)?;
+        sess.eis.button(code, false).map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "dragged ({from_x},{from_y})->({to_x},{to_y})"
         ))]))
@@ -1563,55 +1442,14 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         })?;
         for ch in params.text.chars() {
             let (code, needs_shift) = char_key(ch)?;
-            let kc = i32::try_from(code).map_err(eis_err)?;
             match needs_shift {
-                true => {
-                    sess.portal
-                        .rd
-                        .notify_keyboard_keycode(
-                            &sess.portal.session,
-                            42,
-                            KeyState::Pressed,
-                            NotifyKeyboardKeycodeOptions::default(),
-                        )
-                        .await
-                        .map_err(eis_err)?;
-                }
+                true => sess.eis.key(42, true).map_err(eis_err)?,
                 false => {}
             }
-            sess.portal
-                .rd
-                .notify_keyboard_keycode(
-                    &sess.portal.session,
-                    kc,
-                    KeyState::Pressed,
-                    NotifyKeyboardKeycodeOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
-            sess.portal
-                .rd
-                .notify_keyboard_keycode(
-                    &sess.portal.session,
-                    kc,
-                    KeyState::Released,
-                    NotifyKeyboardKeycodeOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            sess.eis.key(code, true).map_err(eis_err)?;
+            sess.eis.key(code, false).map_err(eis_err)?;
             match needs_shift {
-                true => {
-                    sess.portal
-                        .rd
-                        .notify_keyboard_keycode(
-                            &sess.portal.session,
-                            42,
-                            KeyState::Released,
-                            NotifyKeyboardKeycodeOptions::default(),
-                        )
-                        .await
-                        .map_err(eis_err)?;
-                }
+                true => sess.eis.key(42, false).map_err(eis_err)?,
                 false => {}
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1636,42 +1474,13 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         })?;
         let (mods, main) = parse_combo(&params.key)?;
         for m in &mods {
-            let kc = i32::try_from(*m).map_err(eis_err)?;
-            sess.portal
-                .rd
-                .notify_keyboard_keycode(
-                    &sess.portal.session,
-                    kc,
-                    KeyState::Pressed,
-                    NotifyKeyboardKeycodeOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            sess.eis.key(*m, true).map_err(eis_err)?;
         }
         match main {
             Some(k) => {
-                let kc = i32::try_from(k).map_err(eis_err)?;
-                sess.portal
-                    .rd
-                    .notify_keyboard_keycode(
-                        &sess.portal.session,
-                        kc,
-                        KeyState::Pressed,
-                        NotifyKeyboardKeycodeOptions::default(),
-                    )
-                    .await
-                    .map_err(eis_err)?;
+                sess.eis.key(k, true).map_err(eis_err)?;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                sess.portal
-                    .rd
-                    .notify_keyboard_keycode(
-                        &sess.portal.session,
-                        kc,
-                        KeyState::Released,
-                        NotifyKeyboardKeycodeOptions::default(),
-                    )
-                    .await
-                    .map_err(eis_err)?;
+                sess.eis.key(k, false).map_err(eis_err)?;
             }
             None => {
                 return Err(McpError::invalid_params(
@@ -1681,17 +1490,7 @@ while read -r cmd; do eval \"$cmd\" & done\n"
             }
         }
         for m in mods.iter().rev() {
-            let kc = i32::try_from(*m).map_err(eis_err)?;
-            sess.portal
-                .rd
-                .notify_keyboard_keycode(
-                    &sess.portal.session,
-                    kc,
-                    KeyState::Released,
-                    NotifyKeyboardKeycodeOptions::default(),
-                )
-                .await
-                .map_err(eis_err)?;
+            sess.eis.key(*m, false).map_err(eis_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "key: {}",

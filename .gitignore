@@ -3,3 +3,4 @@ target/
 backup-initial-commit.zip
 .worktrees
 .claude/worktrees/
+kwin/
