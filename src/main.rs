@@ -177,7 +177,6 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let cb_path = format!("/KWinMCP/{ts}");
     let our_name = conn.unique_name().ok_or_else(|| McpError::internal_error("no bus name", None))?.to_string();
     let script = format!("var w = workspace.activeWindow;\
-        if (!w) {{ var wl = workspace.windowList(); for (var i = 0; i < wl.length; i++) {{ if (wl[i].normalWindow) {{ w = wl[i]; workspace.activeWindow = w; break; }} }} }}\
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
         w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
         w:w.frameGeometry.width,h:w.frameGeometry.height,\
@@ -189,7 +188,7 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
     let registered = conn.object_server().at(&obj_path, cb).await.map_err(eis_err)?;
     eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
-    if !registered { return Err(McpError::internal_error(format!("failed to register callback at {cb_path}"), None)); }
+    match registered { true => {} false => return Err(McpError::internal_error(format!("failed to register callback at {cb_path}"), None)) }
     // Load and run the script
     let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
         .destination("org.kde.KWin").map_err(eis_err)?
@@ -198,10 +197,13 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         .build().await.map_err(eis_err)?;
     let script_path = script_file.to_string_lossy().to_string();
     let (script_id,): (i32,) = scripting.call("loadScript", &(script_path, &marker)).await.map_err(eis_err)?;
-    if script_id < 0 {
-        let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
-        let _ = std::fs::remove_file(&script_file);
-        return Err(McpError::internal_error(format!("KWin loadScript failed, id={script_id}"), None));
+    match script_id >= 0 {
+        true => {}
+        false => {
+            let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
+            let _ = std::fs::remove_file(&script_file);
+            return Err(McpError::internal_error(format!("KWin loadScript failed, id={script_id}"), None));
+        }
     }
     let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
         .destination("org.kde.KWin").map_err(eis_err)?
@@ -210,13 +212,11 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         .build().await.map_err(eis_err)?;
     let _: () = script_proxy.call("run", &()).await.map_err(eis_err)?;
     // Wait for callback, then cleanup regardless of result
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx).await;
+    let json = rx.await.map_err(|_| McpError::internal_error("KWin callback channel closed", None))?;
     let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
     let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
     let _ = std::fs::remove_file(&script_file);
-    let json = result.map_err(|_| McpError::internal_error("KWin script timed out", None))?
-        .map_err(|_| McpError::internal_error("KWin callback channel closed", None))?;
-    if json == "null" { return Err(McpError::internal_error("KWin script error: No active window", None)); }
+    match json.as_str() { "null" => return Err(McpError::internal_error("KWin script error: No active window", None)), _ => {} }
     let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
     let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no x", None))?;
     let y = v.get("y").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no y", None))?;
@@ -231,8 +231,9 @@ struct KWinCallback { tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<S
 impl KWinCallback {
     #[zbus(name = "result")]
     fn result(&self, payload: String) {
-        if let Some(tx) = self.tx.lock().ok().and_then(|mut g| g.take()) {
-            let _ = tx.send(payload);
+        match self.tx.lock().ok().and_then(|mut g| g.take()) {
+            Some(tx) => { let _ = tx.send(payload); }
+            None => {}
         }
     }
 }
@@ -362,7 +363,7 @@ impl KwinMcp {
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
             let mut guard = self.session.lock().await;
-            if let Some(old) = (*guard).take() { teardown(old); }
+            match (*guard).take() { Some(old) => teardown(old), None => {} }
         }
         let pid = std::process::id();
         let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
@@ -415,25 +416,35 @@ impl KwinMcp {
             let _listener = stream.add_local_listener::<()>()
                 .param_changed(|_, _id, _user_data, _pod| {})
                 .process(move |stream, _user_data| {
-                    if let Some(mut buf) = stream.dequeue_buffer() {
-                        if let Some(data) = buf.datas_mut().first_mut() {
-                            let chunk = data.chunk();
-                            let stride = u32::try_from(chunk.stride()).unwrap_or(0);
-                            let w = stride / 4;
-                            let h = chunk.size() / stride.max(1);
-                            if let Some(slice) = data.data() {
-                                let s = usize::try_from(stride).unwrap_or(0);
-                                let wu = usize::try_from(w).unwrap_or(0);
-                                let mut rgba = Vec::with_capacity(wu * usize::try_from(h).unwrap_or(0) * 4);
-                                for row in slice.chunks(s) {
-                                    for px in row.get(..wu * 4).unwrap_or_default().chunks_exact(4) {
-                                        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                    let buf = stream.dequeue_buffer();
+                    match buf {
+                        Some(mut buf) => {
+                            match buf.datas_mut().first_mut() {
+                                Some(data) => {
+                                    let chunk = data.chunk();
+                                    let stride = u32::try_from(chunk.stride()).unwrap_or(0);
+                                    let w = stride / 4;
+                                    let h = chunk.size() / stride.max(1);
+                                    match data.data() {
+                                        Some(slice) => {
+                                            let s = usize::try_from(stride).unwrap_or(0);
+                                            let wu = usize::try_from(w).unwrap_or(0);
+                                            let mut rgba = Vec::with_capacity(wu * usize::try_from(h).unwrap_or(0) * 4);
+                                            for row in slice.chunks(s) {
+                                                for px in row.get(..wu * 4).unwrap_or_default().chunks_exact(4) {
+                                                    rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                                                }
+                                            }
+                                            let _ = tx.send((rgba, w, h));
+                                        }
+                                        None => {}
                                     }
                                 }
-                                let _ = tx.send((rgba, w, h));
+                                None => {}
                             }
+                            loop_clone.quit();
                         }
-                        loop_clone.quit();
+                        None => {}
                     }
                 })
                 .register().map_err(|e| anyhow::anyhow!("pw listener: {e}"))?;
@@ -472,13 +483,16 @@ impl KwinMcp {
         while let Some((obj, depth)) = stack.pop() {
             let acc = obj.as_accessible_proxy(conn.connection()).await.map_err(eis_err)?;
             let node = atspi_node(&acc).await?;
-            if depth == 0 && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) { continue; }
-            let dominated = role.as_ref().map(|needle| node.role.to_lowercase().contains(needle)).unwrap_or(true) && (show_elements || node.is_useful());
-            if dominated { out.push(node.line(depth)); }
-            let child_depth = if dominated { depth + 1 } else { depth };
-            if child_depth <= limit {
-                for child in acc.get_children().await.unwrap_or_default().into_iter().rev() { stack.push((child, child_depth)); }
+            match (depth, app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true)) {
+                (0, false) => continue,
+                (_, _) => {}
             }
+            let dominated = role.as_ref().map(|needle| node.role.to_lowercase().contains(needle)).unwrap_or(true) && (show_elements || node.is_useful());
+            match dominated { true => out.push(node.line(depth)), false => {} }
+            let child_depth = match dominated { true => depth + 1, false => depth };
+            match child_depth <= limit { true => {
+                for child in acc.get_children().await.unwrap_or_default().into_iter().rev() { stack.push((child, child_depth)); }
+            } false => {} }
         }
         Ok(CallToolResult::success(vec![Content::text(out.join("\n"))]))
     }
@@ -503,9 +517,9 @@ impl KwinMcp {
         let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
         sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         for n in 0..count {
-            if n > 0 { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+            match n { 0 => {} _ => { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } }
             sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Pressed, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Released, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text(format!("clicked ({x},{y}) x{count}"))]))
@@ -531,12 +545,15 @@ impl KwinMcp {
         let (ax, ay) = (f64::from(wx + x), f64::from(wy + y));
         sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, ax, ay, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
         let horiz = params.horizontal.unwrap_or_default();
-        if params.discrete.unwrap_or_default() {
-            let axis = if horiz { Axis::Horizontal } else { Axis::Vertical };
-            sess.portal.rd.notify_pointer_axis_discrete(&sess.portal.session, axis, delta, NotifyPointerAxisDiscreteOptions::default()).await.map_err(eis_err)?;
-        } else {
-            let (dx, dy) = if horiz { (f64::from(delta) * 15.0, 0.0) } else { (0.0, f64::from(delta) * 15.0) };
-            sess.portal.rd.notify_pointer_axis(&sess.portal.session, dx, dy, NotifyPointerAxisOptions::default()).await.map_err(eis_err)?;
+        match params.discrete.unwrap_or_default() {
+            true => {
+                let axis = match horiz { true => Axis::Horizontal, false => Axis::Vertical };
+                sess.portal.rd.notify_pointer_axis_discrete(&sess.portal.session, axis, delta, NotifyPointerAxisDiscreteOptions::default()).await.map_err(eis_err)?;
+            }
+            false => {
+                let (dx, dy) = match horiz { true => (f64::from(delta) * 15.0, 0.0), false => (0.0, f64::from(delta) * 15.0) };
+                sess.portal.rd.notify_pointer_axis(&sess.portal.session, dx, dy, NotifyPointerAxisOptions::default()).await.map_err(eis_err)?;
+            }
         }
         Ok(CallToolResult::success(vec![Content::text(format!("scrolled {delta} at ({x},{y})"))]))
     }
@@ -557,7 +574,7 @@ impl KwinMcp {
             let cx = f64::from(wx + from_x + (to_x - from_x) * step / steps);
             let cy = f64::from(wy + from_y + (to_y - from_y) * step / steps);
             sess.portal.rd.notify_pointer_motion_absolute(&sess.portal.session, sess.portal.stream_id, cx, cy, NotifyPointerMotionAbsoluteOptions::default()).await.map_err(eis_err)?;
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         sess.portal.rd.notify_pointer_button(&sess.portal.session, code, KeyState::Released, NotifyPointerButtonOptions::default()).await.map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!("dragged ({from_x},{from_y})->({to_x},{to_y})"))]))
@@ -571,15 +588,11 @@ impl KwinMcp {
             match char_key(ch) {
                 Some((code, needs_shift)) => {
                     let kc = i32::try_from(code).map_err(eis_err)?;
-                    if needs_shift {
-                        sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                    }
+                    match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
                     sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
                     sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                    if needs_shift {
-                        sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 None => return Err(McpError::invalid_params(format!("unmapped char '{}' — ASCII only", ch), None)),
             }
@@ -600,7 +613,7 @@ impl KwinMcp {
             Some(k) => {
                 let kc = i32::try_from(k).map_err(eis_err)?;
                 sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
             }
             None => return Err(McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)),
