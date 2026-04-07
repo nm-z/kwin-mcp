@@ -1324,9 +1324,8 @@ impl KwinMcp {
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
         sess.eis.move_abs(ax, ay).map_err(eis_err)?;
         for n in 0..count {
-            match n {
-                0 => {}
-                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            if n > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             sess.eis.button(code, true).map_err(eis_err)?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1379,21 +1378,13 @@ impl KwinMcp {
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
         sess.eis.move_abs(ax, ay).map_err(eis_err)?;
         let horiz = params.horizontal.unwrap_or_default();
-        match params.discrete.unwrap_or_default() {
-            true => {
-                let (dx, dy) = match horiz {
-                    true => (delta, 0),
-                    false => (0, delta),
-                };
-                sess.eis.scroll_discrete(dx, dy).map_err(eis_err)?;
-            }
-            false => {
-                let (dx, dy) = match horiz {
-                    true => (f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0, 0.0),
-                    false => (0.0, f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0),
-                };
-                sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
-            }
+        if params.discrete.unwrap_or_default() {
+            let (dx, dy) = if horiz { (delta, 0) } else { (0, delta) };
+            sess.eis.scroll_discrete(dx, dy).map_err(eis_err)?;
+        } else {
+            let d = f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0;
+            let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
+            sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "scrolled {delta} at ({x},{y})"
@@ -1449,16 +1440,10 @@ impl KwinMcp {
         })?;
         for ch in params.text.chars() {
             let (code, needs_shift) = char_key(ch)?;
-            match needs_shift {
-                true => sess.eis.key(42, true).map_err(eis_err)?,
-                false => {}
-            }
+            if needs_shift { sess.eis.key(42, true).map_err(eis_err)?; }
             sess.eis.key(code, true).map_err(eis_err)?;
             sess.eis.key(code, false).map_err(eis_err)?;
-            match needs_shift {
-                true => sess.eis.key(42, false).map_err(eis_err)?,
-                false => {}
-            }
+            if needs_shift { sess.eis.key(42, false).map_err(eis_err)?; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1483,19 +1468,12 @@ impl KwinMcp {
         for m in &mods {
             sess.eis.key(*m, true).map_err(eis_err)?;
         }
-        match main {
-            Some(k) => {
-                sess.eis.key(k, true).map_err(eis_err)?;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                sess.eis.key(k, false).map_err(eis_err)?;
-            }
-            None => {
-                return Err(McpError::invalid_params(
-                    format!("unknown key in combo '{}'", params.key),
-                    None,
-                ));
-            }
-        }
+        let k = main.ok_or_else(|| {
+            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
+        })?;
+        sess.eis.key(k, true).map_err(eis_err)?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sess.eis.key(k, false).map_err(eis_err)?;
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(eis_err)?;
         }
