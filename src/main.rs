@@ -525,6 +525,10 @@ fn eis_err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
+fn text_result(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(text)])
+}
+
 fn teardown_container(
     container: hakoniwa::Container,
     mut container_child: hakoniwa::Child,
@@ -1061,7 +1065,7 @@ impl KwinMcp {
             container_stdin,
             host_xdg_dir,
         });
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(text_result(msg))
     }
 
     #[rmcp::tool(
@@ -1074,13 +1078,9 @@ impl KwinMcp {
         match (*guard).take() {
             Some(sess) => {
                 teardown(sess);
-                Ok(CallToolResult::success(vec![Content::text(
-                    "session stopped",
-                )]))
+                Ok(text_result("session stopped"))
             }
-            None => Ok(CallToolResult::success(vec![Content::text(
-                "no session running",
-            )])),
+            None => Ok(text_result("no session running")),
         }
     }
 
@@ -1137,12 +1137,12 @@ impl KwinMcp {
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header().map_err(eis_err)?;
         writer.write_image_data(&rgba).map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "{} size={}x{}",
             path.to_string_lossy(),
             width,
             height
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1231,7 +1231,7 @@ impl KwinMcp {
                 false => {}
             }
         }
-        Ok(CallToolResult::success(vec![Content::text(out.join("\n"))]))
+        Ok(text_result(out.join("\n")))
     }
 
     #[rmcp::tool(
@@ -1293,10 +1293,8 @@ impl KwinMcp {
             }
         }
         match out.is_empty() {
-            true => Ok(CallToolResult::success(vec![Content::text(
-                format!("no elements matching '{}'", params.query),
-            )])),
-            false => Ok(CallToolResult::success(vec![Content::text(out.join("\n"))])),
+            true => Ok(text_result(format!("no elements matching '{}'", params.query))),
+            false => Ok(text_result(out.join("\n"))),
         }
     }
 
@@ -1331,9 +1329,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             sess.eis.button(code, false).map_err(eis_err)?;
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "clicked ({x},{y}) x{count}"
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1354,9 +1352,9 @@ impl KwinMcp {
         })?;
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
         sess.eis.move_abs(ax, ay).map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "moved ({x},{y})"
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1386,9 +1384,9 @@ impl KwinMcp {
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "scrolled {delta} at ({x},{y})"
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1421,9 +1419,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         sess.eis.button(code, false).map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "dragged ({from_x},{from_y})->({to_x},{to_y})"
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1446,10 +1444,10 @@ impl KwinMcp {
             if needs_shift { sess.eis.key(42, false).map_err(eis_err)?; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "typed: {}",
             params.text
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1477,10 +1475,10 @@ impl KwinMcp {
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(eis_err)?;
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "key: {}",
             params.key
-        ))]))
+        )))
     }
 
     #[rmcp::tool(
@@ -1498,10 +1496,10 @@ impl KwinMcp {
         })?;
         writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
         sess.container_stdin.flush().map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(text_result(format!(
             "launched: {}",
             params.command
-        ))]))
+        )))
     }
 }
 
