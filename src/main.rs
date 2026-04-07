@@ -925,32 +925,10 @@ impl KwinMcp {
         container.bindmount_ro("/sys", "/sys");
         container.unshare(hakoniwa::Namespace::Network);
         eprintln!("session_start: container configuration ready");
-        // Entrypoint: start services sequentially with readiness checks
         let xdg_inner = "/tmp/xdg";
-        let entrypoint = format!(
-            "\
-set -u\n\
-ulimit -c 0\n\
-mkdir -p {runtime_dir} /tmp/cache\n\
-chmod 700 {runtime_dir}\n\
-printf '#!/bin/sh\\nexit 0\\n' > /tmp/kdialog && chmod +x /tmp/kdialog\n\
-dbus-daemon --session --address='unix:path={xdg_inner}/bus' --print-address=3 --print-pid=4 --nofork 3>{xdg_inner}/dbus.address 4>{xdg_inner}/dbus.pid 2>{xdg_inner}/dbus.log &\n\
-dbus_pid=$!\n\
-n=0; while [ ! -s {xdg_inner}/dbus.address ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
-if [ ! -s {xdg_inner}/dbus.address ]; then echo 'dbus-daemon did not announce an address' >> {xdg_inner}/bootstrap.log; wait \"$dbus_pid\" || true; exit 1; fi\n\
-KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --width 1920 --height 1080 2>{xdg_inner}/kwin.log &\n\
-kwin_pid=$!\n\
-n=0; while [ ! -S {runtime_dir}/wayland-0 ] && kill -0 \"$dbus_pid\" 2>/dev/null && kill -0 \"$kwin_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
-if ! kill -0 \"$kwin_pid\" 2>/dev/null; then echo 'kwin_wayland exited before creating wayland-0' >> {xdg_inner}/bootstrap.log; wait \"$kwin_pid\" || true; exit 1; fi\n\
-if [ ! -S {runtime_dir}/wayland-0 ]; then echo 'kwin_wayland did not create wayland-0' >> {xdg_inner}/bootstrap.log; exit 1; fi\n\
-if ! dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH HOME USER QT_QPA_PLATFORM=wayland 2>>{xdg_inner}/bootstrap.log; then echo 'dbus-update-activation-environment failed' >> {xdg_inner}/bootstrap.log; exit 1; fi\n\
-pipewire 2>{xdg_inner}/pipewire.log &\n\
-at-spi-bus-launcher 2>{xdg_inner}/atspi.log &\n\
-wireplumber 2>{xdg_inner}/wireplumber.log &\n\
-while read -r cmd; do eval \"$cmd\" & done\n"
-        );
+        let entrypoint = concat!(env!("CARGO_MANIFEST_DIR"), "/entrypoint.sh");
         let mut cmd = container.command("/bin/bash");
-        cmd.arg("-c").arg(entrypoint.as_str());
+        cmd.arg(entrypoint);
         cmd.env(
             "PATH",
             "/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/at-spi2-core",
@@ -958,6 +936,8 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         cmd.env("HOME", &home);
         let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
         cmd.env("USER", &user);
+        cmd.env("XDG_INNER", xdg_inner);
+        cmd.env("RUNTIME_DIR", runtime_dir.as_str());
         cmd.env("XDG_RUNTIME_DIR", runtime_dir.as_str());
         cmd.env("XDG_CACHE_HOME", "/tmp/cache");
         cmd.env("XDG_DATA_HOME", "/tmp/state");
