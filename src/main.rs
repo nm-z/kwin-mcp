@@ -210,10 +210,11 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         .build().await.map_err(eis_err)?;
     script_proxy.call::<_, (), ()>("run", &()).await.map_err(eis_err)?;
     // Wait for callback, then cleanup regardless of result
-    let json = rx.await.map_err(|_| McpError::internal_error("KWin callback channel closed", None))?;
+    let json_result = rx.await.map_err(|_| McpError::internal_error("KWin callback channel closed", None));
     conn.object_server().remove::<KWinCallback, _>(&obj_path).await.map_err(eis_err)?;
     let (_, ): (bool, ) = scripting.call("unloadScript", &(&marker,)).await.map_err(eis_err)?;
     std::fs::remove_file(&script_file).map_err(eis_err)?;
+    let json = json_result?;
     match json.as_str() { "null" => return Err(McpError::internal_error("KWin script error: No active window", None)), _ => {} }
     let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
     let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no x", None))?;
@@ -359,8 +360,8 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(name = "session_start", description = "Start an isolated KDE Wayland session in a container for GUI automation. Must be called before any other tool.")]
     async fn session_start(&self, Parameters(_params): Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
-        eprintln!("kwin-mcp v{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
-        let version_stamp = format!("kwin-mcp v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+        eprintln!("kwin-mcp v{}.{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"), env!("GIT_HASH"));
+        let version_stamp = format!("kwin-mcp v{}.{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"), env!("GIT_HASH"));
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
             let mut guard = self.session.lock().await;
@@ -377,26 +378,29 @@ impl KwinMcp {
         let mut container = hakoniwa::Container::new();
         container.rootfs("/").map_err(|e| ver_err(e.to_string()))?;
         container.devfsmount("/dev");
+        container.bindmount_rw("/dev/dri", "/dev/dri");
         container.tmpfsmount("/run");
         container.tmpfsmount("/tmp");
         container.runctl(hakoniwa::Runctl::MountFallback);
         container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
         container.bindmount_ro(&home, &home);
         container.share(hakoniwa::Namespace::Pid);
+        container.bindmount_rw("/proc", "/proc");
         container.unshare(hakoniwa::Namespace::Network);
         // Entrypoint: start services sequentially with readiness checks
         let xdg_inner = "/tmp/xdg";
         let entrypoint = format!("\
 ulimit -c 0\n\
-mkdir -p /run/user /tmp/cache /tmp/state\n\
+mkdir -p /run/user /tmp/cache /tmp/state /dev/dri\n\
 printf '#!/bin/sh\\nexit 0\\n' > /tmp/kdialog && chmod +x /tmp/kdialog\n\
 dbus-daemon --session --address='unix:path={xdg_inner}/bus' --nofork &\n\
-kwin_wayland --virtual --width 1920 --height 1080 2>/tmp/kwin.log &\n\
-n=0; while [ ! -S /run/user/wayland-0 ] && [ $n -lt 100 ]; do n=$((n+1)); done\n\
+kwin_wayland --drm --width 1920 --height 1080 2>/tmp/xdg/kwin.log &\n\
+n=0; while [ ! -S /run/user/wayland-0 ] && [ $n -lt 100 ]; do read -t 0.05 junk </dev/zero 2>/dev/null; n=$((n+1)); done\n\
 pipewire 2>/tmp/pipewire.log &\n\
 /usr/lib/at-spi2-core/at-spi-bus-launcher 2>/tmp/atspi.log &\n\
 wireplumber 2>/tmp/wireplumber.log &\n\
-/usr/lib/xdg-desktop-portal 2>/tmp/portal.log &\n\
+/usr/lib/xdg-desktop-portal 2>/tmp/xdg/portal.log &\n\
+{{ read -t 1 junk </dev/zero 2>/dev/null; /usr/lib/xdg-desktop-portal-kde 2>/tmp/xdg/portal-kde.log; }} &\n\
 while read -r cmd; do eval \"$cmd\" & done\n");
         let mut cmd = container.command("/bin/bash");
         cmd.arg("-c").arg(entrypoint.as_str());
@@ -414,6 +418,8 @@ while read -r cmd; do eval \"$cmd\" & done\n");
         cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
         cmd.env("GALLIUM_DRIVER", "llvmpipe");
         cmd.env("KDE_DEBUG", "0");
+        cmd.env("KWIN_DRM_VIRTUAL_BACKENDS", "1");
+        cmd.env("XDG_DESKTOP_PORTAL_TEST_APP_ID", "kwin-mcp");
         cmd.stdin(hakoniwa::Stdio::piped());
         cmd.stderr(hakoniwa::Stdio::inherit());
         let mut container_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
