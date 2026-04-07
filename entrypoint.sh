@@ -52,6 +52,7 @@ export DBUS_SESSION_BUS_ADDRESS="$(cat "${XDG_INNER}/dbus.address")"
 # KWin compositor
 KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --xwayland --width 1920 --height 1080 2>"${XDG_INNER}/kwin.log" &
 kwin_pid=$!
+echo "$dbus_pid $kwin_pid" > "${XDG_INNER}/pids"
 n=0; while [ ! -S "${XDG_INNER}/wayland-0" ] && kill -0 "$dbus_pid" 2>/dev/null && kill -0 "$kwin_pid" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done
 if ! kill -0 "$kwin_pid" 2>/dev/null; then echo 'kwin_wayland exited before creating wayland-0' >> "${XDG_INNER}/bootstrap.log"; wait "$kwin_pid" || true; exit 1; fi
 if [ ! -S "${XDG_INNER}/wayland-0" ]; then echo 'kwin_wayland did not create wayland-0' >> "${XDG_INNER}/bootstrap.log"; exit 1; fi
@@ -62,8 +63,11 @@ fi
 
 # Supporting services
 pipewire 2>"${XDG_INNER}/pipewire.log" &
+pw_pid=$!
 ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher 2>"${XDG_INNER}/atspi.log" &
+atspi_pid=$!
 wireplumber 2>"${XDG_INNER}/wireplumber.log" &
+echo "$dbus_pid $kwin_pid $pw_pid $atspi_pid $!" >> "${XDG_INNER}/pids"
 
 # Ready — wait for app-launch commands on stdin (one per line)
 while read -r cmd; do

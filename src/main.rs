@@ -525,28 +525,30 @@ fn eis_err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-async fn text_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>) -> CallToolResult {
+async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>, structured: serde_json::Value) -> CallToolResult {
     let s: String = text.into();
     let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
         rmcp::model::LoggingLevel::Info,
         serde_json::json!(s),
     )).await;
-    let mut r = CallToolResult::success(vec![Content::text(s.clone())]);
-    r.structured_content = Some(serde_json::json!({ "output": s }));
+    let mut r = CallToolResult::success(vec![Content::text(s)]);
+    r.structured_content = Some(structured);
     r
 }
 
 fn teardown_container(
     container: hakoniwa::Container,
     mut container_child: hakoniwa::Child,
-    mut container_stdin: std::io::PipeWriter,
+    container_stdin: std::io::PipeWriter,
     host_xdg_dir: &std::path::Path,
 ) {
-    use std::io::Write;
-    // Kill bash's children, NOT kill 0 (kills shared process group = kwin-mcp too)
-    match writeln!(container_stdin, "pkill -P $$") {
-        Err(e) => eprintln!("teardown kill 0: {e}"),
-        Ok(()) => {}
+    // Kill all container children directly — bash teardown races with container kill
+    if let Ok(pids) = std::fs::read_to_string(host_xdg_dir.join("pids")) {
+        for tok in pids.split_whitespace() {
+            if let Ok(pid) = tok.parse::<i32>() {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
+            }
+        }
     }
     drop(container_stdin);
     match container_child.kill() {
@@ -1073,7 +1075,12 @@ impl KwinMcp {
             container_stdin,
             host_xdg_dir,
         });
-        Ok(text_result(&peer, msg).await)
+        Ok(structured_result(&peer, msg, serde_json::json!({
+            "status": "started",
+            "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
+            "commit": env!("GIT_HASH"),
+            "bus": bus_name,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1086,9 +1093,9 @@ impl KwinMcp {
         match (*guard).take() {
             Some(sess) => {
                 teardown(sess);
-                Ok(text_result(&peer, "session stopped").await)
+                Ok(structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await)
             }
-            None => Ok(text_result(&peer, "no session running").await),
+            None => Ok(structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await),
         }
     }
 
@@ -1145,12 +1152,12 @@ impl KwinMcp {
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header().map_err(eis_err)?;
         writer.write_image_data(&rgba).map_err(eis_err)?;
-        Ok(text_result(&peer, format!(
-            "{} size={}x{}",
-            path.to_string_lossy(),
-            width,
-            height
-        )).await)
+        let path_str = path.to_string_lossy().to_string();
+        Ok(structured_result(&peer, format!("{path_str} size={width}x{height}"), serde_json::json!({
+            "path": path_str,
+            "width": width,
+            "height": height,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1240,7 +1247,8 @@ impl KwinMcp {
                 false => {}
             }
         }
-        Ok(text_result(&peer, out.join("\n")).await)
+        let tree = out.join("\n");
+        Ok(structured_result(&peer, tree.clone(), serde_json::json!({"tree": tree})).await)
     }
 
     #[rmcp::tool(
@@ -1303,8 +1311,11 @@ impl KwinMcp {
             }
         }
         match out.is_empty() {
-            true => Ok(text_result(&peer, format!("no elements matching '{}'", params.query)).await),
-            false => Ok(text_result(&peer, out.join("\n")).await),
+            true => Ok(structured_result(&peer, format!("no elements matching '{}'", params.query), serde_json::json!({"matches": 0, "query": params.query})).await),
+            false => {
+                let results = out.join("\n");
+                Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
+            }
         }
     }
 
@@ -1340,9 +1351,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             sess.eis.button(code, false).map_err(eis_err)?;
         }
-        Ok(text_result(&peer, format!(
-            "clicked ({x},{y}) x{count}"
-        )).await)
+        Ok(structured_result(&peer, format!("clicked ({x},{y}) x{count}"), serde_json::json!({
+            "action": "click", "x": x, "y": y, "count": count,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1364,9 +1375,9 @@ impl KwinMcp {
         })?;
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
         sess.eis.move_abs(ax, ay).map_err(eis_err)?;
-        Ok(text_result(&peer, format!(
-            "moved ({x},{y})"
-        )).await)
+        Ok(structured_result(&peer, format!("moved ({x},{y})"), serde_json::json!({
+            "action": "move", "x": x, "y": y,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1397,9 +1408,9 @@ impl KwinMcp {
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
         }
-        Ok(text_result(&peer, format!(
-            "scrolled {delta} at ({x},{y})"
-        )).await)
+        Ok(structured_result(&peer, format!("scrolled {delta} at ({x},{y})"), serde_json::json!({
+            "action": "scroll", "x": x, "y": y, "delta": delta,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1433,9 +1444,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         sess.eis.button(code, false).map_err(eis_err)?;
-        Ok(text_result(&peer, format!(
-            "dragged ({from_x},{from_y})->({to_x},{to_y})"
-        )).await)
+        Ok(structured_result(&peer, format!("dragged ({from_x},{from_y})->({to_x},{to_y})"), serde_json::json!({
+            "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1459,10 +1470,9 @@ impl KwinMcp {
             if needs_shift { sess.eis.key(42, false).map_err(eis_err)?; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Ok(text_result(&peer, format!(
-            "typed: {}",
-            params.text
-        )).await)
+        Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
+            "action": "type", "text": params.text,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1491,10 +1501,9 @@ impl KwinMcp {
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(eis_err)?;
         }
-        Ok(text_result(&peer, format!(
-            "key: {}",
-            params.key
-        )).await)
+        Ok(structured_result(&peer, format!("key: {}", params.key), serde_json::json!({
+            "action": "key", "key": params.key,
+        })).await)
     }
 
     #[rmcp::tool(
@@ -1513,10 +1522,9 @@ impl KwinMcp {
         })?;
         writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
         sess.container_stdin.flush().map_err(eis_err)?;
-        Ok(text_result(&peer, format!(
-            "launched: {}",
-            params.command
-        )).await)
+        Ok(structured_result(&peer, format!("launched: {}", params.command), serde_json::json!({
+            "action": "launch", "command": params.command,
+        })).await)
     }
 }
 
