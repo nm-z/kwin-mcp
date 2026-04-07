@@ -920,6 +920,8 @@ impl KwinMcp {
         container.bindmount_ro(&home, &home);
         container.share(hakoniwa::Namespace::Pid);
         container.bindmount_ro("/proc", "/proc");
+        // /sys is required: drmGetDevices2() enumerates GPUs via /sys/class/drm/,
+        // not /dev/dri. Without it KWin falls back to QPainter and ScreenShot2 fails.
         container.bindmount_ro("/sys", "/sys");
         container.unshare(hakoniwa::Namespace::Network);
         eprintln!("session_start: container configuration ready");
