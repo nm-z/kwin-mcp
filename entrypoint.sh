@@ -12,6 +12,7 @@ export PATH="/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/a
 export HOME="${HOME:-/home/${USER:-user}}"
 export USER="${USER:-user}"
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+export XDG_CONFIG_HOME=/tmp/config
 export XDG_CACHE_HOME=/tmp/cache
 export XDG_DATA_HOME=/tmp/state
 export XDG_SESSION_TYPE=wayland
@@ -19,6 +20,25 @@ export XDG_CURRENT_DESKTOP=KDE
 export QT_QPA_PLATFORM=wayland
 export WAYLAND_DISPLAY=wayland-0
 export KDE_DEBUG=0
+
+# KWin config: no decorations, no shadows for clean screenshots
+mkdir -p /tmp/config
+cat > /tmp/config/kwinrc <<'EOF'
+[org.kde.kdecoration2]
+BorderSize=None
+ShadowSize=0
+EOF
+cat > /tmp/config/kwinrulesrc <<'EOF'
+[1]
+Description=No decorations
+noborder=true
+noborderrule=2
+wmclassmatch=0
+
+[General]
+count=1
+rules=1
+EOF
 
 # D-Bus
 dbus-daemon --session --address="unix:path=${XDG_INNER}/bus" \
