@@ -120,3 +120,23 @@ Pipe receives raw ARGB32 premultiplied pixels — not PNG. Return dict has `widt
 **Window handle:** UUID string like `"{a1b2c3d4-e5f6-...}"`
 
 **Options dict keys:** `include-cursor`, `include-decoration`, `include-shadow`, `native-resolution`
+
+## Known Issue: Claude Code collapses MCP tool output
+
+Claude Code does not display MCP tool result text inline — it shows only the tool name and parameters (e.g. `● kwin-rust - launch_app (MCP)(command: "kate")`) with no output below. The result text IS returned to the model context and is usable, but is not rendered to the user in the terminal UI.
+
+The wire format is spec-correct:
+```json
+{
+  "content": [{"type": "text", "text": "launched: kate"}],
+  "isError": false
+}
+```
+
+**Attempted fixes that did NOT solve it:**
+- Adding `structuredContent` alongside `content` (GitHub issues #15412, #4427 suggested this)
+- Adding `annotations.audience: ["user"]` on content items (MCP spec audience hint)
+- Both `structuredContent` and `audience` together
+- Various `protocolVersion` values (`2024-11-05`, `2025-03-26`)
+
+This appears to be a Claude Code UI behavior, not a protocol issue. The tool output is delivered correctly and the model can read it — it just isn't shown expanded to the user.
