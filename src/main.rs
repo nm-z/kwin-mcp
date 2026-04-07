@@ -913,14 +913,14 @@ impl KwinMcp {
         container.rootfs("/").map_err(|e| ver_err(e.to_string()))?;
         container.devfsmount("/dev");
         container.bindmount_rw("/dev/dri", "/dev/dri");
-        container.bindmount_rw("/dev/fuse", "/dev/fuse");
         container.tmpfsmount("/run");
         container.tmpfsmount("/tmp");
         container.runctl(hakoniwa::Runctl::MountFallback);
         container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
         container.bindmount_ro(&home, &home);
         container.share(hakoniwa::Namespace::Pid);
-        container.bindmount_rw("/proc", "/proc");
+        container.bindmount_ro("/proc", "/proc");
+        container.bindmount_ro("/sys", "/sys");
         container.unshare(hakoniwa::Namespace::Network);
         eprintln!("session_start: container configuration ready");
         // Entrypoint: start services sequentially with readiness checks
@@ -929,14 +929,14 @@ impl KwinMcp {
             "\
 set -u\n\
 ulimit -c 0\n\
-mkdir -p {runtime_dir} /tmp/cache /dev/dri\n\
+mkdir -p {runtime_dir} /tmp/cache\n\
 chmod 700 {runtime_dir}\n\
 printf '#!/bin/sh\\nexit 0\\n' > /tmp/kdialog && chmod +x /tmp/kdialog\n\
 dbus-daemon --session --address='unix:path={xdg_inner}/bus' --print-address=3 --print-pid=4 --nofork 3>{xdg_inner}/dbus.address 4>{xdg_inner}/dbus.pid 2>{xdg_inner}/dbus.log &\n\
 dbus_pid=$!\n\
 n=0; while [ ! -s {xdg_inner}/dbus.address ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
 if [ ! -s {xdg_inner}/dbus.address ]; then echo 'dbus-daemon did not announce an address' >> {xdg_inner}/bootstrap.log; wait \"$dbus_pid\" || true; exit 1; fi\n\
-KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_COMPOSE=O2 kwin_wayland --virtual --width 1920 --height 1080 2>{xdg_inner}/kwin.log &\n\
+KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --width 1920 --height 1080 2>{xdg_inner}/kwin.log &\n\
 kwin_pid=$!\n\
 n=0; while [ ! -S {runtime_dir}/wayland-0 ] && kill -0 \"$dbus_pid\" 2>/dev/null && kill -0 \"$kwin_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
 if ! kill -0 \"$kwin_pid\" 2>/dev/null; then echo 'kwin_wayland exited before creating wayland-0' >> {xdg_inner}/bootstrap.log; wait \"$kwin_pid\" || true; exit 1; fi\n\
@@ -965,8 +965,6 @@ while read -r cmd; do eval \"$cmd\" & done\n"
         let dbus_addr = format!("unix:path={xdg_inner}/bus");
         cmd.env("DBUS_SESSION_BUS_ADDRESS", dbus_addr.as_str());
         cmd.env("WAYLAND_DISPLAY", "wayland-0");
-        cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
-        cmd.env("GALLIUM_DRIVER", "llvmpipe");
         cmd.env("KDE_DEBUG", "0");
         cmd.stdin(hakoniwa::Stdio::piped());
         eprintln!("session_start: command environment ready");
