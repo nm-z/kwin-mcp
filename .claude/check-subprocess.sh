@@ -6,7 +6,23 @@ FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
 [[ "$FILE" != *main.rs ]] && exit 0
 [[ ! -f "$FILE" ]] && exit 0
 
-HITS=$(grep -nE 'Command::new|std::process::Command|pre_exec|Stdio::|libc::socket|libc::bind|libc::listen|libc::close|libc::connect|reis::|std::os::unix::net::UnixStream|std::os::unix::net::UnixListener|zbus::blocking|blocking::Connection|blocking::Proxy|timeout|Timeout|sleep|thread::sleep|\bif\b' "$FILE" 2>/dev/null | grep -v '// ──\|JavaScript\|KWin script\|from_millis(50)' | head -30)
+# Subprocess/IPC bans
+SUB='Command::new|std::process::Command|pre_exec|Stdio::|libc::socket|libc::bind|libc::listen|libc::close|libc::connect|reis::|std::os::unix::net::UnixStream|std::os::unix::net::UnixListener|zbus::blocking|blocking::Connection|blocking::Proxy'
+# Control flow bans
+FLOW='timeout|Timeout|sleep|thread::sleep|\bif\b'
+# Pattern bans: _ => wildcard, let _ = discard, _var prefix
+PAT='\b_ =>|let _ =|let _[a-z]\w*\b'
+# Appeasement bans: clone, static lifetime, RefCell
+APPEASE='\.clone\(\)|'\''static|Rc<RefCell'
+# Error handling bans
+ERR='\.unwrap\(\)|\.expect\(|Box<dyn Error>|anyhow::Error|Result<_,\s*String>|\.ok\(\)'
+# Lint suppression bans
+LINT='#\[allow\(dead_code\)\]|#\[allow\(unused|#\[allow\(clippy'
+# Type system bans
+TYPE='mem::transmute|Option<Option'
+# Style bans
+STYLE='\breturn\b.*;\s*$'
+HITS=$(grep -nE "$SUB|$FLOW|$PAT|$APPEASE|$ERR|$LINT|$TYPE|$STYLE" "$FILE" 2>/dev/null | grep -v '// ──\|JavaScript\|KWin script\|from_millis(50)\|from_secs(5)\|Cow<.static\|with_connection(zbus\|zbus_conn\.clone\|return Err(\|hakoniwa::Stdio' | head -30)
 [ -z "$HITS" ] && exit 0
 
 COUNT=$(echo "$HITS" | wc -l)

@@ -18,10 +18,11 @@ impl<'de> serde::Deserialize<'de> for FlexInt {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(deserializer)?;
         match v {
-            serde_json::Value::Number(n) => n.as_i64()
-                .and_then(|n| i32::try_from(n).ok())
-                .map(FlexInt)
-                .ok_or_else(|| serde::de::Error::custom("not an i32")),
+            serde_json::Value::Number(n) => {
+                let i = n.as_i64().ok_or_else(|| serde::de::Error::custom("not an i64"))?;
+                let v = i32::try_from(i).map_err(|e| serde::de::Error::custom(format!("not an i32: {e}")))?;
+                Ok(FlexInt(v))
+            }
             serde_json::Value::String(s) => s.parse::<i32>().map(FlexInt)
                 .map_err(serde::de::Error::custom),
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(serde::de::Error::custom("expected integer or string")),
@@ -42,44 +43,41 @@ fn parse_int(v: FlexInt) -> i32 { v.0 }
 
 use keyboard_codes::{KeyCodeMapper, Platform};
 
-fn char_key(ch: char) -> Option<(u32, bool)> {
-    match ch {
-        'a'..='z' | '0'..='9' | '`' | '-' | '=' | '[' | ']' | '\\' | ';' | '\'' | ',' | '.' | '/' | ' ' | '\t' | '\n' => {
-            let input: keyboard_codes::KeyboardInput = String::from(ch).parse().ok()?;
-            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, false))
-        }
-        'A'..='Z' => {
-            let input: keyboard_codes::KeyboardInput = String::from(ch.to_ascii_lowercase()).parse().ok()?;
-            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, true))
-        }
-        '~' | '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' | '_' | '+' |
-        '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?' => {
-            let unshifted = match ch {
-                '~' => '`', '!' => '1', '@' => '2', '#' => '3', '$' => '4', '%' => '5',
-                '^' => '6', '&' => '7', '*' => '8', '(' => '9', ')' => '0', '_' => '-',
-                '+' => '=', '{' => '[', '}' => ']', '|' => '\\', ':' => ';', '"' => '\'',
-                '<' => ',', '>' => '.', '?' => '/',
-                _ => return None,
-            };
-            let input: keyboard_codes::KeyboardInput = String::from(unshifted).parse().ok()?;
-            Some((u32::try_from(input.to_code(Platform::Linux)).ok()?, true))
-        }
-        _ => None,
-    }
+fn char_key(ch: char) -> Result<(u32, bool), McpError> {
+    let (raw, shifted) = match ch {
+        'a'..='z' | '0'..='9' | '`' | '-' | '=' | '[' | ']' | '\\' | ';' | '\'' | ',' | '.' | '/' | ' ' | '\t' | '\n' => (ch, false),
+        'A'..='Z' => (ch.to_ascii_lowercase(), true),
+        '~' => ('`', true), '!' => ('1', true), '@' => ('2', true), '#' => ('3', true),
+        '$' => ('4', true), '%' => ('5', true), '^' => ('6', true), '&' => ('7', true),
+        '*' => ('8', true), '(' => ('9', true), ')' => ('0', true), '_' => ('-', true),
+        '+' => ('=', true), '{' => ('[', true), '}' => (']', true), '|' => ('\\', true),
+        ':' => (';', true), '"' => ('\'', true), '<' => (',', true), '>' => ('.', true),
+        '?' => ('/', true),
+        other => Err(McpError::invalid_params(format!("unmapped char '{other}'"), None))?,
+    };
+    let input: keyboard_codes::KeyboardInput = String::from(raw).parse()
+        .map_err(|e| McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None))?;
+    let code = u32::try_from(input.to_code(Platform::Linux))
+        .map_err(|e| McpError::invalid_params(format!("keycode overflow '{ch}': {e}"), None))?;
+    Ok((code, shifted))
 }
 
-fn parse_combo(key: &str) -> (Vec<u32>, Option<u32>) {
+fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
     match keyboard_codes::parser::parse_shortcut_with_aliases(key) {
         Ok(shortcut) => {
             let mods: Vec<u32> = shortcut.modifiers.iter()
-                .filter_map(|m| u32::try_from(keyboard_codes::KeyboardInput::Modifier(*m).to_code(Platform::Linux)).ok())
-                .collect();
-            let main = u32::try_from(shortcut.key.to_code(Platform::Linux)).ok();
-            (mods, main)
+                .map(|m| u32::try_from(keyboard_codes::KeyboardInput::Modifier(*m).to_code(Platform::Linux))
+                    .map_err(|e| McpError::invalid_params(format!("modifier overflow: {e}"), None)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let main = Some(u32::try_from(shortcut.key.to_code(Platform::Linux))
+                .map_err(|e| McpError::invalid_params(format!("key overflow: {e}"), None))?);
+            Ok((mods, main))
         }
-        Err(_) => {
-            // Fallback: try single char
-            match key.chars().next() { Some(ch) => (Vec::new(), char_key(ch).map(|(k, _)| k)), None => (Vec::new(), None) }
+        Err(_parse_err) => {
+            match key.chars().next() {
+                Some(ch) => { let (k, _shifted) = char_key(ch)?; Ok((Vec::new(), Some(k))) }
+                None => Err(McpError::invalid_params(format!("empty key combo '{key}'"), None))
+            }
         }
     }
 }
@@ -100,7 +98,6 @@ struct PortalSession {
     rd: RemoteDesktop,
     session: ashpd::desktop::Session<RemoteDesktop>,
     stream_id: u32,
-    pw_fd: std::os::fd::OwnedFd,
 }
 
 async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSession> {
@@ -125,27 +122,20 @@ async fn portal_setup(zbus_conn: &zbus::Connection) -> anyhow::Result<PortalSess
         .map_err(|e| anyhow::anyhow!("start: {e}"))?.response()
         .map_err(|e| anyhow::anyhow!("start response: {e}"))?;
     let stream_id = started.streams().first().map(|s| s.pipe_wire_node_id()).unwrap_or(0);
-    let pw_fd = sc.open_pipe_wire_remote(&session, ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default()).await
-        .map_err(|e| anyhow::anyhow!("open_pipe_wire_remote: {e}"))?;
     eprintln!("portal: stream_id={stream_id} streams={}", started.streams().len());
-    Ok(PortalSession { rd, session, stream_id, pw_fd })
-}
-
-// ── KWin ScreenShot2 typed proxy ─────────────────────────────────────────
-
-#[zbus::proxy(
-    interface = "org.kde.KWin.ScreenShot2",
-    default_service = "org.kde.KWin",
-    default_path = "/org/kde/KWin/ScreenShot2"
-)]
-trait KWinScreenShot2 {
-    #[zbus(name = "CaptureWindow")]
-    fn capture_window(&self, window_id: &str, options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>, pipe_fd: zbus::zvariant::OwnedFd) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
+    Ok(PortalSession { rd, session, stream_id })
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-struct Session { portal: PortalSession, zbus_conn: zbus::Connection }
+struct Session {
+    portal: PortalSession,
+    zbus_conn: zbus::Connection,
+    container: hakoniwa::Container,
+    container_child: hakoniwa::Child,
+    container_stdin: std::io::PipeWriter,
+    host_xdg_dir: std::path::PathBuf,
+}
 
 // ── Server ───────────────────────────────────────────────────────────────
 
@@ -166,8 +156,16 @@ impl KwinMcp {
 
 fn eis_err(e: impl std::fmt::Display) -> McpError { McpError::internal_error(e.to_string(), None) }
 
-fn teardown(sess: Session) {
+fn teardown(mut sess: Session) {
+    use std::io::Write;
     drop(sess.portal);
+    // Kill all container processes via bash process group
+    match writeln!(sess.container_stdin, "kill 0") { Err(e) => eprintln!("teardown kill 0: {e}"), Ok(()) => {} }
+    drop(sess.container_stdin);
+    match sess.container_child.kill() { Err(e) => eprintln!("teardown kill: {e}"), Ok(()) => {} }
+    match sess.container_child.wait() { Err(e) => eprintln!("teardown wait: {e}"), Ok(_) => {} }
+    drop(sess.container);
+    match std::fs::remove_dir_all(&sess.host_xdg_dir) { Err(e) => eprintln!("teardown cleanup: {e}"), Ok(()) => {} }
 }
 
 
@@ -200,8 +198,8 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
     match script_id >= 0 {
         true => {}
         false => {
-            let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
-            let _ = std::fs::remove_file(&script_file);
+            conn.object_server().remove::<KWinCallback, _>(&obj_path).await.map_err(eis_err)?;
+            std::fs::remove_file(&script_file).map_err(eis_err)?;
             return Err(McpError::internal_error(format!("KWin loadScript failed, id={script_id}"), None));
         }
     }
@@ -210,12 +208,12 @@ async fn active_window_info(conn: &zbus::Connection) -> Result<(i32, i32, String
         .path(format!("/Scripting/Script{script_id}")).map_err(eis_err)?
         .interface("org.kde.kwin.Script").map_err(eis_err)?
         .build().await.map_err(eis_err)?;
-    let _: () = script_proxy.call("run", &()).await.map_err(eis_err)?;
+    script_proxy.call::<_, (), ()>("run", &()).await.map_err(eis_err)?;
     // Wait for callback, then cleanup regardless of result
     let json = rx.await.map_err(|_| McpError::internal_error("KWin callback channel closed", None))?;
-    let _ = conn.object_server().remove::<KWinCallback, _>(&obj_path).await;
-    let _: Result<(bool,), _> = scripting.call("unloadScript", &(&marker,)).await;
-    let _ = std::fs::remove_file(&script_file);
+    conn.object_server().remove::<KWinCallback, _>(&obj_path).await.map_err(eis_err)?;
+    let (_, ): (bool, ) = scripting.call("unloadScript", &(&marker,)).await.map_err(eis_err)?;
+    std::fs::remove_file(&script_file).map_err(eis_err)?;
     match json.as_str() { "null" => return Err(McpError::internal_error("KWin script error: No active window", None)), _ => {} }
     let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
     let x = v.get("x").and_then(|v| v.as_f64()).ok_or_else(|| McpError::internal_error("no x", None))?;
@@ -231,9 +229,12 @@ struct KWinCallback { tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<S
 impl KWinCallback {
     #[zbus(name = "result")]
     fn result(&self, payload: String) {
-        match self.tx.lock().ok().and_then(|mut g| g.take()) {
-            Some(tx) => { let _ = tx.send(payload); }
-            None => {}
+        match self.tx.lock() {
+            Ok(mut g) => match g.take() {
+                Some(tx) => match tx.send(payload) { Ok(()) => {} Err(e) => eprintln!("callback send failed: {e}") }
+                None => {}
+            }
+            Err(e) => eprintln!("callback lock poisoned: {e}")
         }
     }
 }
@@ -356,7 +357,7 @@ impl rmcp::ServerHandler for KwinMcp {
 
 #[rmcp::tool_router]
 impl KwinMcp {
-    #[rmcp::tool(name = "session_start", description = "Connect to the running KDE Wayland session for GUI automation. Must be called before any other tool.")]
+    #[rmcp::tool(name = "session_start", description = "Start an isolated KDE Wayland session in a container for GUI automation. Must be called before any other tool.")]
     async fn session_start(&self, Parameters(_params): Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
         eprintln!("kwin-mcp v{} ({}) session_start", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
         let version_stamp = format!("kwin-mcp v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
@@ -366,16 +367,99 @@ impl KwinMcp {
             match (*guard).take() { Some(old) => teardown(old), None => {} }
         }
         let pid = std::process::id();
-        let scrdir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-        std::fs::create_dir_all(&scrdir).map_err(|e| ver_err(e.to_string()))?;
-        // Connect to the user's existing session bus
-        let zbus_conn = zbus::Connection::session().await.map_err(|e| ver_err(e.to_string()))?;
+        let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
+        match std::fs::remove_dir_all(&host_xdg_dir) { Err(_) => {} Ok(()) => {} }
+        std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
+        let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
+        let bus_path = host_xdg_dir.join("bus");
+        let bus_addr = format!("unix:path={}", bus_path.to_string_lossy());
+        // Build container with isolated namespaces
+        let mut container = hakoniwa::Container::new();
+        container.rootfs("/").map_err(|e| ver_err(e.to_string()))?;
+        container.devfsmount("/dev");
+        container.tmpfsmount("/run");
+        container.tmpfsmount("/tmp");
+        container.runctl(hakoniwa::Runctl::MountFallback);
+        container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
+        container.bindmount_ro(&home, &home);
+        container.share(hakoniwa::Namespace::Pid);
+        container.unshare(hakoniwa::Namespace::Network);
+        // Entrypoint: start services sequentially with readiness checks
+        let xdg_inner = "/tmp/xdg";
+        let entrypoint = format!("\
+ulimit -c 0\n\
+mkdir -p /run/user /tmp/cache /tmp/state\n\
+printf '#!/bin/sh\\nexit 0\\n' > /tmp/kdialog && chmod +x /tmp/kdialog\n\
+dbus-daemon --session --address='unix:path={xdg_inner}/bus' --nofork &\n\
+kwin_wayland --virtual --width 1920 --height 1080 2>/tmp/kwin.log &\n\
+n=0; while [ ! -S /run/user/wayland-0 ] && [ $n -lt 100 ]; do n=$((n+1)); done\n\
+pipewire 2>/tmp/pipewire.log &\n\
+/usr/lib/at-spi2-core/at-spi-bus-launcher 2>/tmp/atspi.log &\n\
+wireplumber 2>/tmp/wireplumber.log &\n\
+/usr/lib/xdg-desktop-portal 2>/tmp/portal.log &\n\
+while read -r cmd; do eval \"$cmd\" & done\n");
+        let mut cmd = container.command("/bin/bash");
+        cmd.arg("-c").arg(entrypoint.as_str());
+        cmd.env("PATH", "/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib");
+        cmd.env("HOME", &home);
+        cmd.env("USER", "nate");
+        cmd.env("XDG_RUNTIME_DIR", "/run/user");
+        cmd.env("XDG_CACHE_HOME", "/tmp/cache");
+        cmd.env("XDG_DATA_HOME", "/tmp/state");
+        cmd.env("XDG_SESSION_TYPE", "wayland");
+        cmd.env("XDG_CURRENT_DESKTOP", "KDE");
+        let dbus_addr = format!("unix:path={xdg_inner}/bus");
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", dbus_addr.as_str());
+        cmd.env("WAYLAND_DISPLAY", "wayland-0");
+        cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
+        cmd.env("GALLIUM_DRIVER", "llvmpipe");
+        cmd.env("KDE_DEBUG", "0");
+        cmd.stdin(hakoniwa::Stdio::piped());
+        cmd.stderr(hakoniwa::Stdio::inherit());
+        let mut container_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
+        let container_stdin = container_child.stdin.take()
+            .ok_or_else(|| ver_err("container stdin not available".to_string()))?;
+        // Wait for D-Bus socket to appear on host via bind-mount
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match bus_path.exists() {
+                true => break,
+                false => match std::time::Instant::now() < deadline {
+                    true => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                    false => return Err(ver_err("container D-Bus socket did not appear within 5s".to_string())),
+                }
+            }
+        }
+        // Connect to the container's session bus
+        let addr: zbus::address::Address = bus_addr.as_str().try_into().map_err(|e: zbus::Error| ver_err(e.to_string()))?;
+        let zbus_conn = zbus::connection::Builder::address(addr)
+            .map_err(|e| ver_err(e.to_string()))?
+            .build().await.map_err(|e| ver_err(e.to_string()))?;
         let bus_name = zbus_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-        // Set up RemoteDesktop portal for input injection
-        let portal = portal_setup(&zbus_conn).await.map_err(|e| ver_err(e.to_string()))?;
+        // Pre-approve RemoteDesktop permission so the portal doesn't show a dialog
+        let perm_store: zbus::Proxy = zbus::proxy::Builder::new(&zbus_conn)
+            .destination("org.freedesktop.impl.portal.PermissionStore").map_err(|e| ver_err(e.to_string()))?
+            .path("/org/freedesktop/impl/portal/PermissionStore").map_err(|e| ver_err(e.to_string()))?
+            .interface("org.freedesktop.impl.portal.PermissionStore").map_err(|e| ver_err(e.to_string()))?
+            .build().await.map_err(|e| ver_err(e.to_string()))?;
+        let perms: Vec<&str> = vec!["yes"];
+        match perm_store.call("SetPermission", &("kde-authorized", true, "remote-desktop", "", &perms)).await {
+            Ok(()) => eprintln!("permission store: approved remote-desktop"),
+            Err(e) => eprintln!("permission store: {e}"),
+        }
+        match perm_store.call("SetPermission", &("kde-authorized", true, "screencast", "", &perms)).await {
+            Ok(()) => eprintln!("permission store: approved screencast"),
+            Err(e) => eprintln!("permission store screencast: {e}"),
+        }
+        // Wait for portal services to start, then set up RemoteDesktop
+        let portal = match tokio::time::timeout(std::time::Duration::from_secs(5), portal_setup(&zbus_conn)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return Err(ver_err(format!("portal setup: {e}"))),
+            Err(_) => return Err(ver_err("portal setup hung after 5s".to_string())),
+        };
         let msg = format!("{version_stamp} — session started bus={bus_name}");
         let mut guard = self.session.lock().await;
-        *guard = Some(Session { portal, zbus_conn });
+        *guard = Some(Session { portal, zbus_conn, container, container_child, container_stdin, host_xdg_dir });
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -388,85 +472,14 @@ impl KwinMcp {
         }
     }
 
-    #[rmcp::tool(name = "screenshot", description = "Capture frame from the virtual output. Returns PNG path.", annotations(read_only_hint = true))]
+    #[rmcp::tool(name = "screenshot", description = "Take a screenshot via the Screenshot portal. Returns the file URI.", annotations(read_only_hint = true))]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
-        let guard = self.session.lock().await;
-        let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
-        let stream_id = sess.portal.stream_id;
-        // Dup the fd so PipeWire can own it without consuming the portal's fd
-        let owned_fd = sess.portal.pw_fd.try_clone().map_err(eis_err)?;
-        drop(guard);
-        let path = std::env::temp_dir().join(format!("kwin-mcp-{}.png", std::process::id()));
-        let path_clone = path.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, u32)> {
-            let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, u32, u32)>();
-            let mainloop = pipewire::main_loop::MainLoopRc::new(None)
-                .map_err(|e| anyhow::anyhow!("pw mainloop: {e}"))?;
-            let context = pipewire::context::ContextRc::new(&mainloop, None)
-                .map_err(|e| anyhow::anyhow!("pw context: {e}"))?;
-            let core = context.connect_fd_rc(owned_fd, None)
-                .map_err(|e| anyhow::anyhow!("pw connect_fd: {e}"))?;
-            let stream = pipewire::stream::StreamRc::new(core.clone(), "kwin-mcp-screenshot",
-                pipewire::properties::properties! {
-                    *pipewire::keys::MEDIA_TYPE => "Video",
-                    *pipewire::keys::MEDIA_CATEGORY => "Capture",
-                    *pipewire::keys::MEDIA_ROLE => "Screen",
-                }).map_err(|e| anyhow::anyhow!("pw stream: {e}"))?;
-            let loop_clone = mainloop.clone();
-            let _listener = stream.add_local_listener::<()>()
-                .param_changed(|_, _id, _user_data, _pod| {})
-                .process(move |stream, _user_data| {
-                    let buf = stream.dequeue_buffer();
-                    match buf {
-                        Some(mut buf) => {
-                            match buf.datas_mut().first_mut() {
-                                Some(data) => {
-                                    let chunk = data.chunk();
-                                    let stride = u32::try_from(chunk.stride()).unwrap_or(0);
-                                    let w = stride / 4;
-                                    let h = chunk.size() / stride.max(1);
-                                    match data.data() {
-                                        Some(slice) => {
-                                            let s = usize::try_from(stride).unwrap_or(0);
-                                            let wu = usize::try_from(w).unwrap_or(0);
-                                            let mut rgba = Vec::with_capacity(wu * usize::try_from(h).unwrap_or(0) * 4);
-                                            for row in slice.chunks(s) {
-                                                for px in row.get(..wu * 4).unwrap_or_default().chunks_exact(4) {
-                                                    rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                                                }
-                                            }
-                                            let _ = tx.send((rgba, w, h));
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                None => {}
-                            }
-                            loop_clone.quit();
-                        }
-                        None => {}
-                    }
-                })
-                .register().map_err(|e| anyhow::anyhow!("pw listener: {e}"))?;
-            stream.connect(
-                libspa::utils::Direction::Input,
-                Some(stream_id),
-                pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
-                &mut [],
-            ).map_err(|e| anyhow::anyhow!("pw stream connect: {e}"))?;
-            eprintln!("pw: connecting to stream_id={stream_id}, running mainloop");
-            mainloop.run();
-            eprintln!("pw: mainloop exited");
-            let (rgba, width, height) = rx.recv().map_err(|e| anyhow::anyhow!("no frame: {e}"))?;
-            let file = std::fs::File::create(&path_clone).map_err(|e| anyhow::anyhow!("create png: {e}"))?;
-            let mut enc = png::Encoder::new(file, width, height);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut writer = enc.write_header().map_err(|e| anyhow::anyhow!("png header: {e}"))?;
-            writer.write_image_data(&rgba).map_err(|e| anyhow::anyhow!("png data: {e}"))?;
-            Ok((width, height))
-        }).await.map_err(eis_err)?.map_err(eis_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!("{} size={}x{}", path.to_string_lossy(), result.0, result.1))]))
+        let conn = self.zbus_conn().await?;
+        let result = ashpd::desktop::screenshot::Screenshot::request()
+            .connection(Some(conn))
+            .send().await.map_err(eis_err)?
+            .response().map_err(eis_err)?;
+        Ok(CallToolResult::success(vec![Content::text(result.uri().to_string())]))
     }
 
     #[rmcp::tool(name = "accessibility_tree", description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.", annotations(read_only_hint = true))]
@@ -499,8 +512,7 @@ impl KwinMcp {
 
     #[rmcp::tool(name = "find_ui_elements", description = "Search UI elements by name/role/description (case-insensitive).", annotations(read_only_hint = true))]
     async fn find_ui_elements(&self, Parameters(params): Parameters<FindUiElementsParams>) -> Result<CallToolResult, McpError> {
-        let _ = &params.query;
-        self.with_session(|_sess| { Err(McpError::internal_error("AT-SPI2 search not yet implemented", None)) }).await
+        self.with_session(|_sess| { Err(McpError::internal_error(format!("AT-SPI2 search not yet implemented: {}", params.query), None)) }).await
     }
 
     #[rmcp::tool(name = "mouse_click", description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click.")]
@@ -585,17 +597,13 @@ impl KwinMcp {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
         for ch in params.text.chars() {
-            match char_key(ch) {
-                Some((code, needs_shift)) => {
-                    let kc = i32::try_from(code).map_err(eis_err)?;
-                    match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
-                    sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                    sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
-                    match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                None => return Err(McpError::invalid_params(format!("unmapped char '{}' — ASCII only", ch), None)),
-            }
+            let (code, needs_shift) = char_key(ch)?;
+            let kc = i32::try_from(code).map_err(eis_err)?;
+            match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
+            sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
+            sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
+            match needs_shift { true => { sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, 42, KeyState::Released, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?; } false => {} }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(CallToolResult::success(vec![Content::text(format!("typed: {}", params.text))]))
     }
@@ -604,7 +612,7 @@ impl KwinMcp {
     async fn keyboard_key(&self, Parameters(params): Parameters<KeyboardKeyParams>) -> Result<CallToolResult, McpError> {
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
-        let (mods, main) = parse_combo(&params.key);
+        let (mods, main) = parse_combo(&params.key)?;
         for m in &mods {
             let kc = i32::try_from(*m).map_err(eis_err)?;
             sess.portal.rd.notify_keyboard_keycode(&sess.portal.session, kc, KeyState::Pressed, NotifyKeyboardKeycodeOptions::default()).await.map_err(eis_err)?;
@@ -625,11 +633,13 @@ impl KwinMcp {
         Ok(CallToolResult::success(vec![Content::text(format!("key: {}", params.key))]))
     }
 
-    #[rmcp::tool(name = "launch_app", description = "Launch an application by desktop file ID (e.g. 'org.kde.konsole').")]
+    #[rmcp::tool(name = "launch_app", description = "Launch an application inside the container by command (e.g. 'kate', 'konsole').")]
     async fn launch_app(&self, Parameters(params): Parameters<LaunchAppParams>) -> Result<CallToolResult, McpError> {
-        let conn = self.zbus_conn().await?;
-        let launcher = ashpd::desktop::dynamic_launcher::DynamicLauncherProxy::with_connection(conn).await.map_err(eis_err)?;
-        launcher.launch(&params.command, ashpd::desktop::dynamic_launcher::LaunchOptions::default()).await.map_err(eis_err)?;
+        use std::io::Write;
+        let mut guard = self.session.lock().await;
+        let sess = guard.as_mut().ok_or_else(|| McpError::internal_error("no session — call session_start first", None))?;
+        writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
+        sess.container_stdin.flush().map_err(eis_err)?;
         Ok(CallToolResult::success(vec![Content::text(format!("launched: {}", params.command))]))
     }
 }

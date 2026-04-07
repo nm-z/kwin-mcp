@@ -14,11 +14,9 @@ rmcp = { version = "1.3", features = ["server", "transport-io"] }
 schemars = "1"
 atspi = { version = "0.29", features = ["tokio"] }
 keyboard-codes = "0.3"
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "dynamic_launcher", "pipewire"] }
-pipewire = "0.9"
-libspa = "0.9"
-png = "0.17"
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "screenshot"] }
 zbus = "5"
+hakoniwa = "1.4"
 
 [lints.clippy]
 wildcard_enum_match_arm = "deny"
