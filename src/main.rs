@@ -929,25 +929,8 @@ impl KwinMcp {
         let entrypoint = concat!(env!("CARGO_MANIFEST_DIR"), "/entrypoint.sh");
         let mut cmd = container.command("/bin/bash");
         cmd.arg(entrypoint);
-        cmd.env(
-            "PATH",
-            "/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/at-spi2-core",
-        );
-        cmd.env("HOME", &home);
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-        cmd.env("USER", &user);
         cmd.env("XDG_INNER", xdg_inner);
         cmd.env("RUNTIME_DIR", runtime_dir.as_str());
-        cmd.env("XDG_RUNTIME_DIR", runtime_dir.as_str());
-        cmd.env("XDG_CACHE_HOME", "/tmp/cache");
-        cmd.env("XDG_DATA_HOME", "/tmp/state");
-        cmd.env("XDG_SESSION_TYPE", "wayland");
-        cmd.env("XDG_CURRENT_DESKTOP", "KDE");
-        cmd.env("QT_QPA_PLATFORM", "wayland");
-        let dbus_addr = format!("unix:path={xdg_inner}/bus");
-        cmd.env("DBUS_SESSION_BUS_ADDRESS", dbus_addr.as_str());
-        cmd.env("WAYLAND_DISPLAY", "wayland-0");
-        cmd.env("KDE_DEBUG", "0");
         cmd.stdin(hakoniwa::Stdio::piped());
         eprintln!("session_start: command environment ready");
         let devnull = std::fs::File::options()
