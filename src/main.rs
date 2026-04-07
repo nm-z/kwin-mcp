@@ -895,7 +895,6 @@ impl KwinMcp {
         eprintln!("session_start: previous session cleared");
         let pid = std::process::id();
         let uid = unsafe { nix::libc::geteuid() };
-        let runtime_dir = format!("/run/user/{uid}");
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         match std::fs::remove_dir_all(&host_xdg_dir) {
             Err(_) => {}
@@ -930,7 +929,6 @@ impl KwinMcp {
         let mut cmd = container.command("/bin/bash");
         cmd.arg(entrypoint);
         cmd.env("XDG_INNER", xdg_inner);
-        cmd.env("RUNTIME_DIR", runtime_dir.as_str());
         cmd.stdin(hakoniwa::Stdio::piped());
         eprintln!("session_start: command environment ready");
         let devnull = std::fs::File::options()
@@ -1174,7 +1172,22 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let conn = atspi::AccessibilityConnection::new()
+        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
+            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        }).await?;
+        let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
+            .await
+            .map_err(eis_err)?
+            .get_address()
+            .await
+            .map_err(eis_err)?;
+        let a11y_addr = rewrite_bus_address_for_host(
+            &a11y_addr,
+            "/tmp/xdg",
+            &host_xdg_dir,
+        );
+        let addr: zbus::Address = a11y_addr.parse().map_err(eis_err)?;
+        let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
             .map_err(eis_err)?;
         let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
