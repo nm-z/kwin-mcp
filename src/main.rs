@@ -397,16 +397,17 @@ dbus-daemon --session --address='unix:path={xdg_inner}/bus' --nofork &\n\
 kwin_wayland --drm --width 1920 --height 1080 2>/tmp/xdg/kwin.log &\n\
 n=0; while [ ! -S /run/user/wayland-0 ] && [ $n -lt 100 ]; do read -t 0.05 junk </dev/zero 2>/dev/null; n=$((n+1)); done\n\
 pipewire 2>/tmp/pipewire.log &\n\
-/usr/lib/at-spi2-core/at-spi-bus-launcher 2>/tmp/atspi.log &\n\
+at-spi-bus-launcher 2>/tmp/atspi.log &\n\
 wireplumber 2>/tmp/wireplumber.log &\n\
-/usr/lib/xdg-desktop-portal 2>/tmp/xdg/portal.log &\n\
-{{ read -t 1 junk </dev/zero 2>/dev/null; /usr/lib/xdg-desktop-portal-kde 2>/tmp/xdg/portal-kde.log; }} &\n\
+xdg-desktop-portal 2>/tmp/xdg/portal.log &\n\
+{{ read -t 1 junk </dev/zero 2>/dev/null; xdg-desktop-portal-kde 2>/tmp/xdg/portal-kde.log; }} &\n\
 while read -r cmd; do eval \"$cmd\" & done\n");
         let mut cmd = container.command("/bin/bash");
         cmd.arg("-c").arg(entrypoint.as_str());
-        cmd.env("PATH", "/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib");
+        cmd.env("PATH", "/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/at-spi2-core");
         cmd.env("HOME", &home);
-        cmd.env("USER", "nate");
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
+        cmd.env("USER", &user);
         cmd.env("XDG_RUNTIME_DIR", "/run/user");
         cmd.env("XDG_CACHE_HOME", "/tmp/cache");
         cmd.env("XDG_DATA_HOME", "/tmp/state");
