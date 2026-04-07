@@ -121,22 +121,21 @@ Pipe receives raw ARGB32 premultiplied pixels — not PNG. Return dict has `widt
 
 **Options dict keys:** `include-cursor`, `include-decoration`, `include-shadow`, `native-resolution`
 
-## Known Issue: Claude Code collapses MCP tool output
+## Claude Code MCP tool output display
 
-Claude Code does not display MCP tool result text inline — it shows only the tool name and parameters (e.g. `● kwin-rust - launch_app (MCP)(command: "kate")`) with no output below. The result text IS returned to the model context and is usable, but is not rendered to the user in the terminal UI.
+Claude Code only shows MCP tool output to the user when ALL THREE are present:
 
-The wire format is spec-correct:
-```json
-{
-  "content": [{"type": "text", "text": "launched: kate"}],
-  "isError": false
-}
-```
+1. `notifications/message` (logging notification) sent before the result
+2. `structuredContent` field on the tool result
+3. `content` array with text items (for model context)
 
-**Attempted fixes that did NOT solve it:**
-- Adding `structuredContent` alongside `content` (GitHub issues #15412, #4427 suggested this)
-- Adding `annotations.audience: ["user"]` on content items (MCP spec audience hint)
-- Both `structuredContent` and `audience` together
-- Various `protocolVersion` values (`2024-11-05`, `2025-03-26`)
+The `text_result()` helper handles this. Output renders as `{"text":"..."}` — the raw `structuredContent` JSON.
 
-This appears to be a Claude Code UI behavior, not a protocol issue. The tool output is delivered correctly and the model can read it — it just isn't shown expanded to the user.
+**Does NOT work alone:**
+- `content` only → collapsed, user sees nothing
+- `content` + `structuredContent` → collapsed
+- `content` + `audience: ["user"]` annotation → collapsed
+- `content` + logging notification → collapsed
+- Logging notification + empty content → nothing for user or model
+
+Server must advertise `logging` capability via `enable_logging()` in `ServerCapabilities`.

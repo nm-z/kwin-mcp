@@ -525,8 +525,15 @@ fn eis_err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-fn text_result(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text)])
+async fn text_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>) -> CallToolResult {
+    let s: String = text.into();
+    let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
+        rmcp::model::LoggingLevel::Info,
+        serde_json::json!(s),
+    )).await;
+    let mut r = CallToolResult::success(vec![Content::text(s.clone())]);
+    r.structured_content = Some(serde_json::json!({ "text": s }));
+    r
 }
 
 fn teardown_container(
@@ -858,7 +865,7 @@ struct FindUiElementsParams {
 
 impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
             .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1920x1080 screen.")
     }
@@ -872,6 +879,7 @@ impl KwinMcp {
     )]
     async fn session_start(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(_params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
@@ -1065,7 +1073,7 @@ impl KwinMcp {
             container_stdin,
             host_xdg_dir,
         });
-        Ok(text_result(msg))
+        Ok(text_result(&peer, msg).await)
     }
 
     #[rmcp::tool(
@@ -1073,14 +1081,14 @@ impl KwinMcp {
         description = "Stop the KWin session and clean up all processes.",
         annotations(destructive_hint = true)
     )]
-    async fn session_stop(&self) -> Result<CallToolResult, McpError> {
+    async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut guard = self.session.lock().await;
         match (*guard).take() {
             Some(sess) => {
                 teardown(sess);
-                Ok(text_result("session stopped"))
+                Ok(text_result(&peer, "session stopped").await)
             }
-            None => Ok(text_result("no session running")),
+            None => Ok(text_result(&peer, "no session running").await),
         }
     }
 
@@ -1089,7 +1097,7 @@ impl KwinMcp {
         description = "Take a screenshot via KWin ScreenShot2 D-Bus interface. Returns the file URI.",
         annotations(read_only_hint = true)
     )]
-    async fn screenshot(&self) -> Result<CallToolResult, McpError> {
+    async fn screenshot(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let conn = self.zbus_conn().await?;
         let xdg = self.host_xdg_dir().await?;
         let (_, _, win_id) = active_window_info(&conn, &xdg).await?;
@@ -1137,12 +1145,12 @@ impl KwinMcp {
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header().map_err(eis_err)?;
         writer.write_image_data(&rgba).map_err(eis_err)?;
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "{} size={}x{}",
             path.to_string_lossy(),
             width,
             height
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1152,6 +1160,7 @@ impl KwinMcp {
     )]
     async fn accessibility_tree(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
@@ -1231,7 +1240,7 @@ impl KwinMcp {
                 false => {}
             }
         }
-        Ok(text_result(out.join("\n")))
+        Ok(text_result(&peer, out.join("\n")).await)
     }
 
     #[rmcp::tool(
@@ -1241,6 +1250,7 @@ impl KwinMcp {
     )]
     async fn find_ui_elements(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
@@ -1293,8 +1303,8 @@ impl KwinMcp {
             }
         }
         match out.is_empty() {
-            true => Ok(text_result(format!("no elements matching '{}'", params.query))),
-            false => Ok(text_result(out.join("\n"))),
+            true => Ok(text_result(&peer, format!("no elements matching '{}'", params.query)).await),
+            false => Ok(text_result(&peer, out.join("\n")).await),
         }
     }
 
@@ -1304,6 +1314,7 @@ impl KwinMcp {
     )]
     async fn mouse_click(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, McpError> {
         let x = parse_int(params.x);
@@ -1329,9 +1340,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             sess.eis.button(code, false).map_err(eis_err)?;
         }
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "clicked ({x},{y}) x{count}"
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1341,6 +1352,7 @@ impl KwinMcp {
     )]
     async fn mouse_move(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, McpError> {
         let x = parse_int(params.x);
@@ -1352,9 +1364,9 @@ impl KwinMcp {
         })?;
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
         sess.eis.move_abs(ax, ay).map_err(eis_err)?;
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "moved ({x},{y})"
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1363,6 +1375,7 @@ impl KwinMcp {
     )]
     async fn mouse_scroll(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, McpError> {
         let x = parse_int(params.x);
@@ -1384,9 +1397,9 @@ impl KwinMcp {
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
         }
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "scrolled {delta} at ({x},{y})"
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1395,6 +1408,7 @@ impl KwinMcp {
     )]
     async fn mouse_drag(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, McpError> {
         let from_x = parse_int(params.from_x);
@@ -1419,9 +1433,9 @@ impl KwinMcp {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         sess.eis.button(code, false).map_err(eis_err)?;
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "dragged ({from_x},{from_y})->({to_x},{to_y})"
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1430,6 +1444,7 @@ impl KwinMcp {
     )]
     async fn keyboard_type(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardTypeParams>,
     ) -> Result<CallToolResult, McpError> {
         let guard = self.session.lock().await;
@@ -1444,10 +1459,10 @@ impl KwinMcp {
             if needs_shift { sess.eis.key(42, false).map_err(eis_err)?; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "typed: {}",
             params.text
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1456,6 +1471,7 @@ impl KwinMcp {
     )]
     async fn keyboard_key(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         let guard = self.session.lock().await;
@@ -1475,10 +1491,10 @@ impl KwinMcp {
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(eis_err)?;
         }
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "key: {}",
             params.key
-        )))
+        )).await)
     }
 
     #[rmcp::tool(
@@ -1487,6 +1503,7 @@ impl KwinMcp {
     )]
     async fn launch_app(
         &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
         use std::io::Write;
@@ -1496,10 +1513,10 @@ impl KwinMcp {
         })?;
         writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
         sess.container_stdin.flush().map_err(eis_err)?;
-        Ok(text_result(format!(
+        Ok(text_result(&peer, format!(
             "launched: {}",
             params.command
-        )))
+        )).await)
     }
 }
 
