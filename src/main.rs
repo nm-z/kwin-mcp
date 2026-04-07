@@ -532,7 +532,7 @@ async fn text_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String
         serde_json::json!(s),
     )).await;
     let mut r = CallToolResult::success(vec![Content::text(s.clone())]);
-    r.structured_content = Some(serde_json::json!({ "text": s }));
+    r.structured_content = Some(serde_json::json!({ "output": s }));
     r
 }
 
