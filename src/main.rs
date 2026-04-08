@@ -905,6 +905,28 @@ impl KwinMcp {
             }
         }
         eprintln!("session_start: previous session cleared");
+        // Block startup if orphan container processes exist from prior sessions
+        let mut orphans = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with("kwin-mcp-") { continue; }
+                let pids_path = entry.path().join("pids");
+                if let Ok(contents) = std::fs::read_to_string(&pids_path) {
+                    for tok in contents.split_whitespace() {
+                        if let Ok(p) = tok.parse::<i32>() {
+                            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok() {
+                                orphans.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !orphans.is_empty() {
+            return Err(ver_err(format!("orphan processes from prior sessions: {orphans:?} — kill them before starting")));
+        }
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         match std::fs::remove_dir_all(&host_xdg_dir) {
@@ -939,6 +961,9 @@ impl KwinMcp {
         let entrypoint = concat!(env!("CARGO_MANIFEST_DIR"), "/entrypoint.sh");
         let mut cmd = container.command("/bin/bash");
         cmd.arg(entrypoint);
+        for (k, v) in std::env::vars() {
+            cmd.env(&k, &v);
+        }
         cmd.env("XDG_INNER", xdg_inner);
         cmd.stdin(hakoniwa::Stdio::piped());
         eprintln!("session_start: command environment ready");

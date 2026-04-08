@@ -8,19 +8,13 @@ chmod 1777 /tmp/.X11-unix
 chmod 700 "$XDG_INNER"
 printf '#!/bin/sh\nexit 0\n' > /tmp/kdialog && chmod +x /tmp/kdialog
 
-# Session environment — XDG_RUNTIME_DIR points to the shared dir so all
-# sockets (wayland, at-spi, dbus) are visible from the host.
+# Override only what the container needs different from host env
 export PATH="/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/at-spi2-core"
-export HOME="${HOME:-/home/${USER:-user}}"
-export USER="${USER:-user}"
 export XDG_RUNTIME_DIR="$XDG_INNER"
 export XDG_CONFIG_HOME=/tmp/config
 export XDG_CACHE_HOME=/tmp/cache
 export XDG_DATA_HOME=/tmp/state
-export XDG_SESSION_TYPE=wayland
-export XDG_CURRENT_DESKTOP=KDE
 export WAYLAND_DISPLAY=wayland-0
-export KDE_DEBUG=0
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 
 # KWin config: no decorations, no shadows for clean screenshots
