@@ -60,7 +60,7 @@ if [ ! -s "${XDG_INNER}/dbus.address" ]; then echo 'dbus-daemon did not announce
 export DBUS_SESSION_BUS_ADDRESS="$(cat "${XDG_INNER}/dbus.address")"
 
 # KWin compositor
-KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --xwayland --width 1920 --height 1080 2>"${XDG_INNER}/kwin.log" &
+KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --xwayland --width 1221 --height 977 2>"${XDG_INNER}/kwin.log" &
 kwin_pid=$!
 echo "$dbus_pid $kwin_pid" > "${XDG_INNER}/pids"
 n=0; while [ ! -S "${XDG_INNER}/wayland-0" ] && kill -0 "$dbus_pid" 2>/dev/null && kill -0 "$kwin_pid" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done

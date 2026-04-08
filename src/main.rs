@@ -869,7 +869,7 @@ impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
-            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1920x1080 screen.")
+            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1221x977 screen.")
     }
 }
 
@@ -1516,14 +1516,26 @@ impl KwinMcp {
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
         use std::io::Write;
-        let mut guard = self.session.lock().await;
-        let sess = guard.as_mut().ok_or_else(|| {
-            McpError::internal_error("no session — call session_start first", None)
-        })?;
-        writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
-        sess.container_stdin.flush().map_err(eis_err)?;
-        Ok(structured_result(&peer, format!("launched: {}", params.command), serde_json::json!({
-            "action": "launch", "command": params.command,
+        let (conn, xdg) = {
+            let mut guard = self.session.lock().await;
+            let sess = guard.as_mut().ok_or_else(|| {
+                McpError::internal_error("no session — call session_start first", None)
+            })?;
+            writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
+            sess.container_stdin.flush().map_err(eis_err)?;
+            (sess.zbus_conn.clone(), sess.host_xdg_dir.clone())
+        };
+        // Poll for window readiness (up to 15s)
+        for _ in 0..75_u32 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok((_, _, info)) = active_window_info(&conn, &xdg).await {
+                return Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
+                    "action": "launch", "command": params.command, "window": info,
+                })).await);
+            }
+        }
+        Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
+            "action": "launch", "command": params.command, "window": "timeout",
         })).await)
     }
 }
