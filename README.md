@@ -139,3 +139,23 @@ The `text_result()` helper handles this. Output renders as `{"text":"..."}` — 
 - Logging notification + empty content → nothing for user or model
 
 Server must advertise `logging` capability via `enable_logging()` in `ServerCapabilities`.
+
+## Screenshot dimensions and Anthropic image processing
+
+Anthropic resizes images with a long edge > 1568px before the model sees them. Quality degrades with no benefit beyond that threshold.
+
+| Aspect Ratio | Max size (no resize) |
+|---|---|
+| 1:1 | 1092x1092 |
+| 5:4 | 1221x977 |
+| 4:3 | 1268x951 |
+| 3:4 | 951x1268 |
+| 2:3 | 896x1344 |
+| 9:16 | 819x1456 |
+| 1:2 | 784x1568 |
+
+Current virtual display is 1920x1080 — fullscreen screenshots exceed the limit. Options:
+- Resize screenshots in the tool before returning (adds latency)
+- Lower virtual display to ~1568x882 (coordinates map 1:1, no resize needed)
+
+Images under 200px degrade accuracy. Token cost: ~1 token per 750 pixels. A 1092x1092 screenshot costs ~1590 tokens.

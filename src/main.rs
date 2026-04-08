@@ -933,7 +933,7 @@ impl KwinMcp {
         // /sys is required: drmGetDevices2() enumerates GPUs via /sys/class/drm/,
         // not /dev/dri. Without it KWin falls back to QPainter and ScreenShot2 fails.
         container.bindmount_ro("/sys", "/sys");
-        container.unshare(hakoniwa::Namespace::Network);
+        container.share(hakoniwa::Namespace::Network);
         eprintln!("session_start: container configuration ready");
         let xdg_inner = "/tmp/xdg";
         let entrypoint = concat!(env!("CARGO_MANIFEST_DIR"), "/entrypoint.sh");

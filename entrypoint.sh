@@ -3,7 +3,8 @@
 # Expects env: XDG_INNER (host-shared dir).
 set -u
 ulimit -c 0
-mkdir -p "$XDG_INNER" /tmp/cache /tmp/config
+mkdir -p "$XDG_INNER" /tmp/cache /tmp/config /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix
 chmod 700 "$XDG_INNER"
 printf '#!/bin/sh\nexit 0\n' > /tmp/kdialog && chmod +x /tmp/kdialog
 
@@ -27,6 +28,15 @@ cat > /tmp/config/kwinrc <<'EOF'
 [org.kde.kdecoration2]
 BorderSize=None
 ShadowSize=0
+
+[Compositing]
+LockScreenAutoLockEnabled=false
+EOF
+cat > /tmp/config/kscreenlockerrc <<'EOF'
+[Daemon]
+Autolock=false
+LockOnResume=false
+Timeout=0
 EOF
 cat > /tmp/config/kwinrulesrc <<'EOF'
 [1]
@@ -71,5 +81,5 @@ echo "$dbus_pid $kwin_pid $pw_pid $atspi_pid $!" >> "${XDG_INNER}/pids"
 
 # Ready — wait for app-launch commands on stdin (one per line)
 while read -r cmd; do
-    "$cmd" &
+    $cmd &
 done
