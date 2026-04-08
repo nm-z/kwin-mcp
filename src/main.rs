@@ -2,53 +2,30 @@ use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use serde::Deserialize;
+use serde_aux::field_attributes::deserialize_number_from_string;
 use std::sync::Arc;
 
 type McpError = rmcp::ErrorData;
 
-// Claude Code serializes numbers to strings — FlexInt accepts both.
-// Implements JsonSchema so rmcp emits a proper schema instead of `true`.
-#[derive(Debug, Clone)]
-struct FlexInt(i32);
-impl<'de> serde::Deserialize<'de> for FlexInt {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let v = serde_json::Value::deserialize(deserializer)?;
-        match v {
-            serde_json::Value::Number(n) => {
-                let i = n
-                    .as_i64()
-                    .ok_or_else(|| serde::de::Error::custom("not an i64"))?;
-                let v = i32::try_from(i)
-                    .map_err(|e| serde::de::Error::custom(format!("not an i32: {e}")))?;
-                Ok(FlexInt(v))
-            }
-            serde_json::Value::String(s) => s
-                .parse::<i32>()
-                .map(FlexInt)
-                .map_err(serde::de::Error::custom),
-            serde_json::Value::Null
-            | serde_json::Value::Bool(_)
-            | serde_json::Value::Array(_)
-            | serde_json::Value::Object(_) => {
-                Err(serde::de::Error::custom("expected integer or string"))
-            }
-        }
-    }
-}
-impl schemars::JsonSchema for FlexInt {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "FlexInt".into()
-    }
-    fn inline_schema() -> bool {
-        true
-    }
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({ "type": ["integer", "string"], "description": "integer or string-encoded integer" })
-    }
+#[derive(Debug, thiserror::Error)]
+enum KwinError {
+    #[error(transparent)] Zbus(#[from] zbus::Error),
+    #[error(transparent)] Zvariant(#[from] zbus::zvariant::Error),
+    #[error(transparent)] Io(#[from] std::io::Error),
+    #[error(transparent)] Nix(#[from] nix::Error),
+    #[error(transparent)] Anyhow(#[from] anyhow::Error),
+    #[error(transparent)] TryFromInt(#[from] std::num::TryFromIntError),
+    #[error(transparent)] SerdeJson(#[from] serde_json::Error),
+    #[error(transparent)] SystemTime(#[from] std::time::SystemTimeError),
+    #[error(transparent)] Atspi(#[from] atspi::AtspiError),
+    #[error(transparent)] Png(#[from] png::EncodingError),
+    #[error("{0}")] Msg(String),
 }
 
-fn parse_int(v: FlexInt) -> i32 {
-    v.0
+impl From<KwinError> for McpError {
+    fn from(e: KwinError) -> Self {
+        McpError::internal_error(e.to_string(), None)
+    }
 }
 
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -222,13 +199,8 @@ impl Eis {
         let (mut abs, mut bt, mut sc, mut kb) = (None, None, None, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match (&dev, &kb) {
-                (Some(_), Some(_)) => break,
-                _ => match std::time::Instant::now() > deadline {
-                    true => anyhow::bail!("EIS negotiation timed out"),
-                    false => {}
-                },
-            }
+            if dev.is_some() && kb.is_some() { break; }
+            if std::time::Instant::now() > deadline { anyhow::bail!("EIS negotiation timed out"); }
             context.read()?;
             while let Some(pending) = context.pending_event() {
                 match pending {
@@ -265,25 +237,18 @@ impl Eis {
                                 bt = d.interface::<reis::ei::Button>();
                                 sc = d.interface::<reis::ei::Scroll>();
                                 dev = Some(d.device().clone());
-                                match (d.interface::<reis::ei::Keyboard>(), &kb) {
-                                    (Some(k), None) => {
+                                if let (Some(k), None) = (d.interface::<reis::ei::Keyboard>(), &kb) {
                                         kb = Some(k);
                                         kbd_d = Some(d.device().clone());
                                     }
-                                    _ => {}
-                                }
                             }
-                            false => match (
-                                d.has_capability(reis::event::DeviceCapability::Keyboard),
-                                &kb,
-                            ) {
-                                (true, None) => {
+                            false => {
+                                if d.has_capability(reis::event::DeviceCapability::Keyboard) && kb.is_none() {
                                     d.device().start_emulating(serial, 0);
                                     kb = d.interface::<reis::ei::Keyboard>();
                                     kbd_d = Some(d.device().clone());
                                 }
-                                _ => {}
-                            },
+                            }
                         }
                         context.flush()?;
                     }
@@ -383,15 +348,11 @@ fn startup_diagnostics(host_xdg_dir: &std::path::Path) -> String {
         "wireplumber.log",
         "atspi.log",
     ] {
-        match log_tail(&host_xdg_dir.join(name), 6) {
-            Some(tail) => details.push(format!("{name}: {tail}")),
-            None => {}
+        if let Some(tail) = log_tail(&host_xdg_dir.join(name), 6) {
+            details.push(format!("{name}: {tail}"));
         }
     }
-    match details.is_empty() {
-        true => String::new(),
-        false => format!(" diagnostics: {}", details.join(" ; ")),
-    }
+    if details.is_empty() { String::new() } else { format!(" diagnostics: {}", details.join(" ; ")) }
 }
 
 fn rewrite_bus_address_for_host(
@@ -429,14 +390,14 @@ async fn wait_for_nonempty_file(
                 }
             }
         }
-        match std::time::Instant::now() >= deadline {
-            true => return Err(format!(
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
                 "{description} did not appear at {} within {}s",
                 path.display(),
                 STARTUP_TIMEOUT.as_secs()
-            )),
-            false => tokio::time::sleep(STARTUP_POLL).await,
+            ));
         }
+        tokio::time::sleep(STARTUP_POLL).await;
     }
 }
 
@@ -521,9 +482,6 @@ impl KwinMcp {
     }
 }
 
-fn eis_err(e: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(e.to_string(), None)
-}
 
 async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>, structured: serde_json::Value) -> CallToolResult {
     let s: String = text.into();
@@ -551,19 +509,10 @@ fn teardown_container(
         }
     }
     drop(container_stdin);
-    match container_child.kill() {
-        Err(e) => eprintln!("teardown kill: {e}"),
-        Ok(()) => {}
-    }
-    match container_child.wait() {
-        Err(e) => eprintln!("teardown wait: {e}"),
-        Ok(_) => {}
-    }
+    if let Err(e) = container_child.kill() { eprintln!("teardown kill: {e}"); }
+    if let Err(e) = container_child.wait() { eprintln!("teardown wait: {e}"); }
     drop(container);
-    match std::fs::remove_dir_all(host_xdg_dir) {
-        Err(e) => eprintln!("teardown cleanup: {e}"),
-        Ok(()) => {}
-    }
+    if let Err(e) = std::fs::remove_dir_all(host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
 }
 
 fn teardown(sess: Session) {
@@ -575,16 +524,15 @@ fn teardown(sess: Session) {
     );
 }
 
-async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), McpError> {
+async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), KwinError> {
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(eis_err)?
+        .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     let marker = format!("kwin-mcp-{ts}");
     let cb_path = format!("/KWinMCP/{ts}");
     let our_name = conn
         .unique_name()
-        .ok_or_else(|| McpError::internal_error("no bus name", None))?
+        .ok_or(KwinError::Msg("no bus name".to_owned()))?
         .to_string();
     let script = format!(
         "var w = workspace.activeWindow;\
@@ -595,111 +543,55 @@ async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::P
     );
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
-    std::fs::write(&script_file, &script).map_err(eis_err)?;
+    std::fs::write(&script_file, &script)?;
     // KWin sees /tmp/xdg/ inside the container
     let container_script_path = format!("/tmp/xdg/{script_name}");
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let cb = KWinCallback {
         tx: std::sync::Mutex::new(Some(tx)),
     };
-    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str()).map_err(eis_err)?;
-    let registered = conn
-        .object_server()
-        .at(&obj_path, cb)
-        .await
-        .map_err(eis_err)?;
+    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str())?;
+    let registered = conn.object_server().at(&obj_path, cb).await?;
     eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
-    match registered {
-        true => {}
-        false => {
-            return Err(McpError::internal_error(
-                format!("failed to register callback at {cb_path}"),
-                None,
-            ));
-        }
+    if !registered {
+        return Err(KwinError::Msg(format!("failed to register callback at {cb_path}")));
     }
     // Load and run the script
     let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin")
-        .map_err(eis_err)?
-        .path("/Scripting")
-        .map_err(eis_err)?
-        .interface("org.kde.kwin.Scripting")
-        .map_err(eis_err)?
+        .destination("org.kde.KWin")?
+        .path("/Scripting")?
+        .interface("org.kde.kwin.Scripting")?
         .build()
-        .await
-        .map_err(eis_err)?;
+        .await?;
     let (script_id,): (i32,) = scripting
         .call("loadScript", &(&container_script_path, &marker))
-        .await
-        .map_err(eis_err)?;
-    match script_id >= 0 {
-        true => {}
-        false => {
-            conn.object_server()
-                .remove::<KWinCallback, _>(&obj_path)
-                .await
-                .map_err(eis_err)?;
-            std::fs::remove_file(&script_file).map_err(eis_err)?;
-            return Err(McpError::internal_error(
-                format!("KWin loadScript failed, id={script_id}"),
-                None,
-            ));
-        }
+        .await?;
+    if script_id < 0 {
+        conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
+        std::fs::remove_file(&script_file)?;
+        return Err(KwinError::Msg(format!("KWin loadScript failed, id={script_id}")));
     }
     let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin")
-        .map_err(eis_err)?
-        .path(format!("/Scripting/Script{script_id}"))
-        .map_err(eis_err)?
-        .interface("org.kde.kwin.Script")
-        .map_err(eis_err)?
+        .destination("org.kde.KWin")?
+        .path(format!("/Scripting/Script{script_id}"))?
+        .interface("org.kde.kwin.Script")?
         .build()
-        .await
-        .map_err(eis_err)?;
-    script_proxy
-        .call::<_, (), ()>("run", &())
-        .await
-        .map_err(eis_err)?;
+        .await?;
+    script_proxy.call::<_, (), ()>("run", &()).await?;
     // Wait for callback, then cleanup regardless of result
     let json_result = rx
         .await
-        .map_err(|_| McpError::internal_error("KWin callback channel closed", None));
-    conn.object_server()
-        .remove::<KWinCallback, _>(&obj_path)
-        .await
-        .map_err(eis_err)?;
-    let (_,): (bool,) = scripting
-        .call("unloadScript", &(&marker,))
-        .await
-        .map_err(eis_err)?;
-    std::fs::remove_file(&script_file).map_err(eis_err)?;
+        .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()));
+    conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
+    let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
+    std::fs::remove_file(&script_file)?;
     let json = json_result?;
-    match json.as_str() {
-        "null" => {
-            return Err(McpError::internal_error(
-                "KWin script error: No active window",
-                None,
-            ));
-        }
-        _ => {}
+    if json == "null" {
+        return Err(KwinError::Msg("KWin script error: No active window".to_owned()));
     }
-    let v: serde_json::Value = serde_json::from_str(&json).map_err(eis_err)?;
-    let x = v
-        .get("x")
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| McpError::internal_error("no x", None))?;
-    let y = v
-        .get("y")
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| McpError::internal_error("no y", None))?;
-    let id = v
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
+    let info: WindowGeometry = serde_json::from_str(&json)?;
     #[expect(clippy::as_conversions)]
-    Ok((x.round() as i32, y.round() as i32, id))
+    Ok((info.x.round() as i32, info.y.round() as i32, info.id))
 }
 
 struct KWinCallback {
@@ -711,16 +603,23 @@ impl KWinCallback {
     #[zbus(name = "result")]
     fn result(&self, payload: String) {
         match self.tx.lock() {
-            Ok(mut g) => match g.take() {
-                Some(tx) => match tx.send(payload) {
-                    Ok(()) => {}
-                    Err(e) => eprintln!("callback send failed: {e}"),
-                },
-                None => {}
-            },
+            Ok(mut g) => {
+                if let Some(tx) = g.take()
+                    && let Err(e) = tx.send(payload) {
+                    eprintln!("callback send failed: {e}");
+                }
+            }
             Err(e) => eprintln!("callback lock poisoned: {e}"),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct WindowGeometry {
+    x: f64,
+    y: f64,
+    #[serde(default)]
+    id: String,
 }
 
 struct AtspiNode {
@@ -770,7 +669,7 @@ fn state_labels(states: &[String]) -> Vec<String> {
 
 async fn atspi_node(
     acc: &atspi::proxy::accessible::AccessibleProxy<'_>,
-) -> Result<AtspiNode, McpError> {
+) -> Result<AtspiNode, KwinError> {
     use atspi::proxy::proxy_ext::ProxyExt;
     let name = acc.name().await.unwrap_or_default();
     let role = acc.get_role_name().await.unwrap_or_default();
@@ -782,7 +681,7 @@ async fn atspi_node(
         .map(|s| format!("{s:?}"))
         .collect::<Vec<_>>();
     let states = state_labels(&raw_states);
-    let bounds = match acc.proxies().await.map_err(eis_err)?.component().await {
+    let bounds = match acc.proxies().await?.component().await {
         Ok(c) => c
             .get_extents(atspi::CoordType::Screen)
             .await
@@ -804,8 +703,10 @@ struct SessionStartParams {}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
-    x: FlexInt,
-    y: FlexInt,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    x: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    y: i32,
     button: Option<String>,
     double: Option<bool>,
     triple: Option<bool>,
@@ -813,25 +714,34 @@ struct MouseClickParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseMoveParams {
-    x: FlexInt,
-    y: FlexInt,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    x: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    y: i32,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseScrollParams {
-    x: FlexInt,
-    y: FlexInt,
-    delta: FlexInt,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    x: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    y: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    delta: i32,
     horizontal: Option<bool>,
     discrete: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseDragParams {
-    from_x: FlexInt,
-    from_y: FlexInt,
-    to_x: FlexInt,
-    to_y: FlexInt,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    from_x: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    from_y: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    to_x: i32,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    to_y: i32,
     button: Option<String>,
 }
 
@@ -899,10 +809,7 @@ impl KwinMcp {
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
             let mut guard = self.session.lock().await;
-            match (*guard).take() {
-                Some(old) => teardown(old),
-                None => {}
-            }
+            if let Some(old) = (*guard).take() { teardown(old); }
         }
         eprintln!("session_start: previous session cleared");
         // Block startup if orphan container processes exist from prior sessions
@@ -915,10 +822,9 @@ impl KwinMcp {
                 let pids_path = entry.path().join("pids");
                 if let Ok(contents) = std::fs::read_to_string(&pids_path) {
                     for tok in contents.split_whitespace() {
-                        if let Ok(p) = tok.parse::<i32>() {
-                            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok() {
-                                orphans.push(p);
-                            }
+                        if let Ok(p) = tok.parse::<i32>()
+                            && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok() {
+                            orphans.push(p);
                         }
                     }
                 }
@@ -929,10 +835,7 @@ impl KwinMcp {
         }
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-        match std::fs::remove_dir_all(&host_xdg_dir) {
-            Err(_) => {}
-            Ok(()) => {}
-        }
+        let _ = std::fs::remove_dir_all(&host_xdg_dir);
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         eprintln!(
             "session_start: host_xdg_dir ready path={}",
@@ -996,19 +899,10 @@ impl KwinMcp {
             Some(stdin) => stdin,
             None => {
                 let diagnostics = startup_diagnostics(&host_xdg_dir);
-                match container_child.kill() {
-                    Err(e) => eprintln!("teardown kill: {e}"),
-                    Ok(()) => {}
-                }
-                match container_child.wait() {
-                    Err(e) => eprintln!("teardown wait: {e}"),
-                    Ok(_) => {}
-                }
+                if let Err(e) = container_child.kill() { eprintln!("teardown kill: {e}"); }
+                if let Err(e) = container_child.wait() { eprintln!("teardown wait: {e}"); }
                 drop(container);
-                match std::fs::remove_dir_all(&host_xdg_dir) {
-                    Err(e) => eprintln!("teardown cleanup: {e}"),
-                    Ok(()) => {}
-                }
+                if let Err(e) = std::fs::remove_dir_all(&host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
                 return Err(ver_err(format!(
                     "container stdin not available{diagnostics}"
                 )));
@@ -1063,10 +957,10 @@ impl KwinMcp {
                 Ok(false) => {}
                 Err(e) => return cleanup_err(format!("name_has_owner: {e}"), container, container_child, container_stdin),
             }
-            match std::time::Instant::now() >= kwin_deadline {
-                true => return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), container, container_child, container_stdin),
-                false => tokio::time::sleep(STARTUP_POLL).await,
+            if std::time::Instant::now() >= kwin_deadline {
+                return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), container, container_child, container_stdin);
             }
+            tokio::time::sleep(STARTUP_POLL).await;
         }
         eprintln!("session_start: org.kde.KWin ready");
         // Connect to KWin EIS for input injection
@@ -1137,8 +1031,8 @@ impl KwinMcp {
         let conn = self.zbus_conn().await?;
         let xdg = self.host_xdg_dir().await?;
         let (_, _, win_id) = active_window_info(&conn, &xdg).await?;
-        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(eis_err)?;
-        let (read_fd, write_fd) = nix::unistd::pipe().map_err(eis_err)?;
+        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(KwinError::from)?;
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
         let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
         let mut opts = std::collections::HashMap::new();
         opts.insert("include-cursor", zbus::zvariant::Value::from(true));
@@ -1147,27 +1041,27 @@ impl KwinMcp {
         let meta = proxy
             .capture_window(&win_id, opts, pipe_fd)
             .await
-            .map_err(eis_err)?;
+            .map_err(KwinError::from)?;
         let get_u32 = |k: &str| -> Result<u32, McpError> {
             let val = meta
                 .get(k)
                 .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
-            let n: u32 = val.try_into().map_err(eis_err)?;
+            let n: u32 = val.try_into().map_err(KwinError::from)?;
             Ok(n)
         };
         let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
         let reader_file = std::fs::File::from(read_fd);
-        let total = usize::try_from(stride * height).map_err(eis_err)?;
+        let total = usize::try_from(stride * height).map_err(KwinError::from)?;
         let mut pixels = vec![0u8; total];
         std::io::Read::read_exact(&mut std::io::BufReader::new(reader_file), &mut pixels)
-            .map_err(eis_err)?;
+            .map_err(KwinError::from)?;
         // BGRA premultiplied → RGBA
-        let px = usize::try_from(width * height).map_err(eis_err)?;
+        let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
         for row in 0..height {
             for col in 0..width {
-                let si = usize::try_from(row * stride + col * 4).map_err(eis_err)?;
-                let di = usize::try_from((row * width + col) * 4).map_err(eis_err)?;
+                let si = usize::try_from(row * stride + col * 4).map_err(KwinError::from)?;
+                let di = usize::try_from((row * width + col) * 4).map_err(KwinError::from)?;
                 rgba[di] = pixels[si + 2];
                 rgba[di + 1] = pixels[si + 1];
                 rgba[di + 2] = pixels[si];
@@ -1175,12 +1069,12 @@ impl KwinMcp {
             }
         }
         let path = xdg.join("screenshot.png");
-        let file = std::fs::File::create(&path).map_err(eis_err)?;
+        let file = std::fs::File::create(&path).map_err(KwinError::from)?;
         let mut enc = png::Encoder::new(file, width, height);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().map_err(eis_err)?;
-        writer.write_image_data(&rgba).map_err(eis_err)?;
+        let mut writer = enc.write_header().map_err(KwinError::from)?;
+        writer.write_image_data(&rgba).map_err(KwinError::from)?;
         let path_str = path.to_string_lossy().to_string();
         Ok(structured_result(&peer, format!("{path_str} size={width}x{height}"), serde_json::json!({
             "path": path_str,
@@ -1205,21 +1099,21 @@ impl KwinMcp {
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
-            .map_err(eis_err)?
+            .map_err(KwinError::from)?
             .get_address()
             .await
-            .map_err(eis_err)?;
+            .map_err(KwinError::from)?;
         let a11y_addr = rewrite_bus_address_for_host(
             &a11y_addr,
             "/tmp/xdg",
             &host_xdg_dir,
         );
-        let addr: zbus::Address = a11y_addr.parse().map_err(eis_err)?;
+        let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
-            .map_err(eis_err)?;
-        let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
-        let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(eis_err)?;
+            .map_err(KwinError::from)?;
+        let root = conn.root_accessible_on_registry().await.map_err(KwinError::from)?;
+        let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(KwinError::from)?;
         let app_name = params.app_name.map(|s| s.to_lowercase());
         let role = params.role.map(|s| s.to_lowercase());
         let show_elements = params.show_elements.unwrap_or(false);
@@ -1227,7 +1121,7 @@ impl KwinMcp {
         let mut stack = root
             .get_children()
             .await
-            .map_err(eis_err)?
+            .map_err(KwinError::from)?
             .into_iter()
             .rev()
             .map(|obj| (obj, 0usize))
@@ -1236,44 +1130,22 @@ impl KwinMcp {
             let acc = obj
                 .as_accessible_proxy(conn.connection())
                 .await
-                .map_err(eis_err)?;
+                .map_err(KwinError::from)?;
             let node = atspi_node(&acc).await?;
-            match (
-                depth,
-                app_name
-                    .as_ref()
-                    .map(|needle| node.name.to_lowercase().contains(needle))
-                    .unwrap_or(true),
-            ) {
-                (0, false) => continue,
-                (_, _) => {}
+            if depth == 0 && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) {
+                continue;
             }
             let dominated = role
                 .as_ref()
                 .map(|needle| node.role.to_lowercase().contains(needle))
                 .unwrap_or(true)
                 && (show_elements || node.is_useful());
-            match dominated {
-                true => out.push(node.line(depth)),
-                false => {}
-            }
-            let child_depth = match dominated {
-                true => depth + 1,
-                false => depth,
-            };
-            match child_depth <= limit {
-                true => {
-                    for child in acc
-                        .get_children()
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .rev()
-                    {
-                        stack.push((child, child_depth));
-                    }
+            if dominated { out.push(node.line(depth)); }
+            let child_depth = if dominated { depth + 1 } else { depth };
+            if child_depth <= limit {
+                for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
+                    stack.push((child, child_depth));
                 }
-                false => {}
             }
         }
         let tree = out.join("\n");
@@ -1296,26 +1168,26 @@ impl KwinMcp {
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
-            .map_err(eis_err)?
+            .map_err(KwinError::from)?
             .get_address()
             .await
-            .map_err(eis_err)?;
+            .map_err(KwinError::from)?;
         let a11y_addr = rewrite_bus_address_for_host(
             &a11y_addr,
             "/tmp/xdg",
             &host_xdg_dir,
         );
-        let addr: zbus::Address = a11y_addr.parse().map_err(eis_err)?;
+        let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
-            .map_err(eis_err)?;
-        let root = conn.root_accessible_on_registry().await.map_err(eis_err)?;
+            .map_err(KwinError::from)?;
+        let root = conn.root_accessible_on_registry().await.map_err(KwinError::from)?;
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
         let mut stack = root
             .get_children()
             .await
-            .map_err(eis_err)?
+            .map_err(KwinError::from)?
             .into_iter()
             .rev()
             .collect::<Vec<_>>();
@@ -1323,7 +1195,7 @@ impl KwinMcp {
             let acc = obj
                 .as_accessible_proxy(conn.connection())
                 .await
-                .map_err(eis_err)?;
+                .map_err(KwinError::from)?;
             let node = atspi_node(&acc).await?;
             if node.is_useful()
                 && (node.name.to_lowercase().contains(&query)
@@ -1339,12 +1211,11 @@ impl KwinMcp {
                 stack.push(child);
             }
         }
-        match out.is_empty() {
-            true => Ok(structured_result(&peer, format!("no elements matching '{}'", params.query), serde_json::json!({"matches": 0, "query": params.query})).await),
-            false => {
-                let results = out.join("\n");
-                Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
-            }
+        if out.is_empty() {
+            Ok(structured_result(&peer, format!("no elements matching '{}'", params.query), serde_json::json!({"matches": 0, "query": params.query})).await)
+        } else {
+            let results = out.join("\n");
+            Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
         }
     }
 
@@ -1357,8 +1228,8 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x);
-        let y = parse_int(params.y);
+        let x = params.x;
+        let y = params.y;
         let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let count = match (params.triple, params.double) {
@@ -1370,15 +1241,15 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
-        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         for n in 0..count {
             if n > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            sess.eis.button(code, true).map_err(eis_err)?;
+            sess.eis.button(code, true).map_err(KwinError::from)?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            sess.eis.button(code, false).map_err(eis_err)?;
+            sess.eis.button(code, false).map_err(KwinError::from)?;
         }
         Ok(structured_result(&peer, format!("clicked ({x},{y}) x{count}"), serde_json::json!({
             "action": "click", "x": x, "y": y, "count": count,
@@ -1395,15 +1266,15 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x);
-        let y = parse_int(params.y);
+        let x = params.x;
+        let y = params.y;
         let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
-        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         Ok(structured_result(&peer, format!("moved ({x},{y})"), serde_json::json!({
             "action": "move", "x": x, "y": y,
         })).await)
@@ -1418,24 +1289,24 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, McpError> {
-        let x = parse_int(params.x);
-        let y = parse_int(params.y);
-        let delta = parse_int(params.delta);
+        let x = params.x;
+        let y = params.y;
+        let delta = params.delta;
         let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(eis_err)?), f32::from(i16::try_from(wy + y).map_err(eis_err)?));
-        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
+        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         let horiz = params.horizontal.unwrap_or_default();
         if params.discrete.unwrap_or_default() {
             let (dx, dy) = if horiz { (delta, 0) } else { (0, delta) };
-            sess.eis.scroll_discrete(dx, dy).map_err(eis_err)?;
+            sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
         } else {
-            let d = f32::from(i16::try_from(delta).map_err(eis_err)?) * 15.0;
+            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?) * 15.0;
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
-            sess.eis.scroll_smooth(dx, dy).map_err(eis_err)?;
+            sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
         }
         Ok(structured_result(&peer, format!("scrolled {delta} at ({x},{y})"), serde_json::json!({
             "action": "scroll", "x": x, "y": y, "delta": delta,
@@ -1451,28 +1322,28 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, McpError> {
-        let from_x = parse_int(params.from_x);
-        let from_y = parse_int(params.from_y);
-        let to_x = parse_int(params.to_x);
-        let to_y = parse_int(params.to_y);
+        let from_x = params.from_x;
+        let from_y = params.from_y;
+        let to_x = params.to_x;
+        let to_y = params.to_y;
         let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let ax = f32::from(i16::try_from(wx + from_x).map_err(eis_err)?);
-        let ay = f32::from(i16::try_from(wy + from_y).map_err(eis_err)?);
-        sess.eis.move_abs(ax, ay).map_err(eis_err)?;
-        sess.eis.button(code, true).map_err(eis_err)?;
+        let ax = f32::from(i16::try_from(wx + from_x).map_err(KwinError::from)?);
+        let ay = f32::from(i16::try_from(wy + from_y).map_err(KwinError::from)?);
+        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
+        sess.eis.button(code, true).map_err(KwinError::from)?;
         let steps = 20i32;
         for step in 1..=steps {
-            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / steps).map_err(eis_err)?);
-            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / steps).map_err(eis_err)?);
-            sess.eis.move_abs(cx, cy).map_err(eis_err)?;
+            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / steps).map_err(KwinError::from)?);
+            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / steps).map_err(KwinError::from)?);
+            sess.eis.move_abs(cx, cy).map_err(KwinError::from)?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        sess.eis.button(code, false).map_err(eis_err)?;
+        sess.eis.button(code, false).map_err(KwinError::from)?;
         Ok(structured_result(&peer, format!("dragged ({from_x},{from_y})->({to_x},{to_y})"), serde_json::json!({
             "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
         })).await)
@@ -1493,10 +1364,10 @@ impl KwinMcp {
         })?;
         for ch in params.text.chars() {
             let (code, needs_shift) = char_key(ch)?;
-            if needs_shift { sess.eis.key(42, true).map_err(eis_err)?; }
-            sess.eis.key(code, true).map_err(eis_err)?;
-            sess.eis.key(code, false).map_err(eis_err)?;
-            if needs_shift { sess.eis.key(42, false).map_err(eis_err)?; }
+            if needs_shift { sess.eis.key(42, true).map_err(KwinError::from)?; }
+            sess.eis.key(code, true).map_err(KwinError::from)?;
+            sess.eis.key(code, false).map_err(KwinError::from)?;
+            if needs_shift { sess.eis.key(42, false).map_err(KwinError::from)?; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
@@ -1519,16 +1390,16 @@ impl KwinMcp {
         })?;
         let (mods, main) = parse_combo(&params.key)?;
         for m in &mods {
-            sess.eis.key(*m, true).map_err(eis_err)?;
+            sess.eis.key(*m, true).map_err(KwinError::from)?;
         }
         let k = main.ok_or_else(|| {
             McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
         })?;
-        sess.eis.key(k, true).map_err(eis_err)?;
+        sess.eis.key(k, true).map_err(KwinError::from)?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        sess.eis.key(k, false).map_err(eis_err)?;
+        sess.eis.key(k, false).map_err(KwinError::from)?;
         for m in mods.iter().rev() {
-            sess.eis.key(*m, false).map_err(eis_err)?;
+            sess.eis.key(*m, false).map_err(KwinError::from)?;
         }
         Ok(structured_result(&peer, format!("key: {}", params.key), serde_json::json!({
             "action": "key", "key": params.key,
@@ -1550,8 +1421,8 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.container_stdin, "{}", params.command).map_err(eis_err)?;
-            sess.container_stdin.flush().map_err(eis_err)?;
+            writeln!(sess.container_stdin, "{}", params.command).map_err(KwinError::from)?;
+            sess.container_stdin.flush().map_err(KwinError::from)?;
             (sess.zbus_conn.clone(), sess.host_xdg_dir.clone())
         };
         // Poll for window readiness (up to 15s)
