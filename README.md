@@ -1,161 +1,75 @@
-# kwin-mcp (Rust)
+# kwin-mcp
 
-MCP server for KDE Plasma 6 Wayland GUI automation. Rust implementation using `rmcp` + `ashpd` + `zbus`.
+MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `hakoniwa` (container isolation).
 
-## XDG Desktop Portal
+## Tools
 
-      RemoteDesktop
-            org.freedesktop.portal.RemoteDesktop
-      ScreenCast
-            org.freedesktop.portal.ScreenCast
-      Screenshot
-            org.freedesktop.portal.Screenshot
-      Account
-            org.freedesktop.portal.Account
-      Background
-            org.freedesktop.portal.Background
-      Camera
-            org.freedesktop.portal.Camera
-      Clipboard
-            org.freedesktop.portal.Clipboard
-      Documents
-            org.freedesktop.portal.Documents
-      DynamicLauncher
-            org.freedesktop.portal.DynamicLauncher
-      Email
-            org.freedesktop.portal.Email
-      FileChooser
-            org.freedesktop.portal.FileChooser
-      FileTransfer
-            org.freedesktop.portal.FileTransfer
-      GameMode
-            org.freedesktop.portal.GameMode
-      GlobalShortcuts
-            org.freedesktop.portal.GlobalShortcuts
-      Inhibit
-            org.freedesktop.portal.Inhibit
-      InputCapture
-            org.freedesktop.portal.InputCapture
-      Location
-            org.freedesktop.portal.Location
-      MemoryMonitor
-            org.freedesktop.portal.MemoryMonitor
-      NetworkMonitor
-            org.freedesktop.portal.NetworkMonitor
-      Notification
-            org.freedesktop.portal.Notification
-      OpenURI
-            org.freedesktop.portal.OpenURI
-      PowerProfileMonitor
-            org.freedesktop.portal.PowerProfileMonitor
-      Print
-            org.freedesktop.portal.Print
-      ProxyResolver
-            org.freedesktop.portal.ProxyResolver
-      Realtime
-            org.freedesktop.portal.Realtime
-      Secret
-            org.freedesktop.portal.Secret
-      Settings
-            org.freedesktop.portal.Settings
-      Trash
-            org.freedesktop.portal.Trash
-      Usb
-            org.freedesktop.portal.Usb
-      Wallpaper
-            org.freedesktop.portal.Wallpaper
+| Tool | Description |
+|---|---|
+| `session_start` | Start an isolated KDE Wayland session. Must be called first. |
+| `session_stop` | Tear down the session and all container processes. |
+| `screenshot` | Capture the active window as PNG. |
+| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
+| `find_ui_elements` | Find UI elements by role/name (stubbed). |
+| `mouse_click` | Click at window-relative coordinates. |
+| `mouse_move` | Move pointer to window-relative coordinates. |
+| `mouse_scroll` | Scroll at window-relative coordinates. |
+| `mouse_drag` | Drag from one window-relative position to another. |
+| `keyboard_type` | Type a string of text. |
+| `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
+| `launch_app` | Launch an application and wait for its window. |
 
 ## Session Architecture
 
 ```
-systemd --user
-      dbus (session bus — user desktop)
-            kwin-mcp ← asks systemd to start isolated session
-      dbus (session bus — isolated)
-            dbus-broker
-            plasma-kwin_wayland
-            pipewire
-            wireplumber
-            xdg-desktop-portal
-            plasma-xdg-desktop-portal-kde
-            at-spi-dbus-bus
+kwin-mcp (host process)
+  └── hakoniwa container
+        ├── dbus-daemon        (isolated session bus, anonymous auth)
+        ├── kwin_wayland       (virtual display 1221x977, XWayland)
+        ├── pipewire
+        ├── wireplumber
+        ├── at-spi-bus-launcher
+        └── kwalletd6
 ```
 
-kwin-mcp is 1 process, 0 children. systemd manages all isolated session services.
-session_start creates the isolated bus via zbus_systemd StartTransientUnit.
-session_stop tears it down via StopUnit.
+`session_start` spawns the hakoniwa container via `entrypoint.sh`. All input and D-Bus calls from the host go into the container over the shared `XDG_RUNTIME_DIR`. `session_stop` kills the container process group.
 
-## Show Accessibility Tree
+All coordinates are window-relative — window position is added internally via `kdotool`.
 
-Requires `jq`.
+## Build
 
 ```bash
-./show-tree.sh
+cargo build          # debug
+cargo build --release
+cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
-Defaults to System Monitor. Override with environment variables if needed:
+## org.kde.KWin.ScreenShot2 — Method Reference
 
-```bash
-APP_COMMAND='QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 konsole' \
-APP_NAME='org.kde.konsole' \
-MAX_DEPTH=12 \
-SHOW_ELEMENTS=true \
-./show-tree.sh
-```
-
-## org.kde.KWin.ScreenShot2 — Complete Method Table
-
-| Method | D-Bus Signature | What it does |
+| Method | D-Bus Signature | Description |
 |---|---|---|
 | `CaptureWindow` | `(s handle, a{sv} options, h pipe) → a{sv}` | Specific window by UUID |
 | `CaptureActiveWindow` | `(a{sv} options, h pipe) → a{sv}` | Currently focused window |
-| `CaptureScreen` | `(s name, a{sv} options, h pipe) → a{sv}` | Monitor by name (e.g. "HDMI-1") |
+| `CaptureScreen` | `(s name, a{sv} options, h pipe) → a{sv}` | Monitor by name |
 | `CaptureActiveScreen` | `(a{sv} options, h pipe) → a{sv}` | Current monitor |
 | `CaptureArea` | `(i x, i y, u w, u h, a{sv} options, h pipe) → a{sv}` | Rectangle region |
 | `CaptureInteractive` | `(u kind, a{sv} options, h pipe) → a{sv}` | User picks (0=window, 1=screen) |
 | `CaptureWorkspace` | `(a{sv} options, h pipe) → a{sv}` | All screens composite (v3+) |
 
-Pipe receives raw ARGB32 premultiplied pixels — not PNG. Return dict has `width`, `height`, `stride`, `format`, `scale`.
-
-**Window handle:** UUID string like `"{a1b2c3d4-e5f6-...}"`
+Pipe receives raw ARGB32 premultiplied pixels. Return dict has `width`, `height`, `stride`, `format`, `scale`.
 
 **Options dict keys:** `include-cursor`, `include-decoration`, `include-shadow`, `native-resolution`
 
-## Claude Code MCP tool output display
+## Screenshot dimensions
 
-Claude Code only shows MCP tool output to the user when ALL THREE are present:
+Anthropic resizes images with a long edge > 1568px before the model sees them. The virtual display (1221x977) is sized to fit within this limit with no resize needed.
 
-1. `notifications/message` (logging notification) sent before the result
-2. `structuredContent` field on the tool result
-3. `content` array with text items (for model context)
-
-The `text_result()` helper handles this. Output renders as `{"text":"..."}` — the raw `structuredContent` JSON.
-
-**Does NOT work alone:**
-- `content` only → collapsed, user sees nothing
-- `content` + `structuredContent` → collapsed
-- `content` + `audience: ["user"]` annotation → collapsed
-- `content` + logging notification → collapsed
-- Logging notification + empty content → nothing for user or model
-
-Server must advertise `logging` capability via `enable_logging()` in `ServerCapabilities`.
-
-## Screenshot dimensions and Anthropic image processing
-
-Anthropic resizes images with a long edge > 1568px before the model sees them. Quality degrades with no benefit beyond that threshold.
-
-| Aspect Ratio | Max size (no resize) |
+| Aspect ratio | Max size (no resize) |
 |---|---|
-| 1:1 | 1092x1092 |
-| 5:4 | 1221x977 |
-| 4:3 | 1268x951 |
-| 3:4 | 951x1268 |
-| 2:3 | 896x1344 |
-| 9:16 | 819x1456 |
-| 1:2 | 784x1568 |
+| 1:1 | 1092×1092 |
+| 5:4 | 1221×977 |
+| 4:3 | 1268×951 |
+| 2:3 | 896×1344 |
+| 1:2 | 784×1568 |
 
-Current virtual display is 1920x1080 — fullscreen screenshots exceed the limit. Options:
-- Resize screenshots in the tool before returning (adds latency)
-- Lower virtual display to ~1568x882 (coordinates map 1:1, no resize needed)
-
-Images under 200px degrade accuracy. Token cost: ~1 token per 750 pixels. A 1092x1092 screenshot costs ~1590 tokens.
+Token cost: ~1 token per 750 pixels. A 1221×977 screenshot costs ~1590 tokens.
