@@ -3,22 +3,21 @@
 # Expects env: XDG_INNER (host-shared dir).
 set -u
 ulimit -c 0
-mkdir -p "$XDG_INNER" /tmp/cache /tmp/config /tmp/.X11-unix
+mkdir -p "$XDG_INNER" /tmp/.X11-unix /tmp/home-upper /tmp/home-work
 chmod 1777 /tmp/.X11-unix
 chmod 700 "$XDG_INNER"
+mount -t overlay overlay -o "lowerdir=${HOME},upperdir=/tmp/home-upper,workdir=/tmp/home-work" "$HOME"
 printf '#!/bin/sh\nexit 0\n' > /tmp/kdialog && chmod +x /tmp/kdialog
 
 # Override only what the container needs different from host env
 export PATH="/tmp:/usr/bin:/usr/sbin:/bin:/sbin:/usr/lib:/usr/libexec:/usr/lib/at-spi2-core"
 export XDG_RUNTIME_DIR="$XDG_INNER"
-export XDG_CONFIG_HOME=/tmp/config
-export XDG_CACHE_HOME=/tmp/cache
-export XDG_DATA_HOME=/tmp/state
 export WAYLAND_DISPLAY=wayland-0
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 
 # KWin config: no decorations, no shadows for clean screenshots
-cat > /tmp/config/kwinrc <<'EOF'
+mkdir -p "${HOME}/.config"
+cat > "${HOME}/.config/kwinrc" <<'EOF'
 [org.kde.kdecoration2]
 BorderSize=None
 ShadowSize=0
@@ -26,13 +25,13 @@ ShadowSize=0
 [Compositing]
 LockScreenAutoLockEnabled=false
 EOF
-cat > /tmp/config/kscreenlockerrc <<'EOF'
+cat > "${HOME}/.config/kscreenlockerrc" <<'EOF'
 [Daemon]
 Autolock=false
 LockOnResume=false
 Timeout=0
 EOF
-cat > /tmp/config/kwinrulesrc <<'EOF'
+cat > "${HOME}/.config/kwinrulesrc" <<'EOF'
 [1]
 Description=No decorations
 noborder=true
@@ -44,8 +43,9 @@ count=1
 rules=1
 EOF
 
-# D-Bus
-dbus-daemon --session --address="unix:path=${XDG_INNER}/bus" \
+# D-Bus (anonymous auth: container runs as uid 0, host connects as real uid)
+printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/dbus.conf
+dbus-daemon --config-file=/tmp/dbus.conf --address="unix:path=${XDG_INNER}/bus" \
     --print-address=3 --print-pid=4 --nofork \
     3>"${XDG_INNER}/dbus.address" 4>"${XDG_INNER}/dbus.pid" 2>"${XDG_INNER}/dbus.log" &
 dbus_pid=$!
@@ -71,7 +71,11 @@ pw_pid=$!
 ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher 2>"${XDG_INNER}/atspi.log" &
 atspi_pid=$!
 wireplumber 2>"${XDG_INNER}/wireplumber.log" &
-echo "$dbus_pid $kwin_pid $pw_pid $atspi_pid $!" >> "${XDG_INNER}/pids"
+wp_pid=$!
+
+kwalletd6 2>"${XDG_INNER}/kwalletd.log" &
+kw_pid=$!
+echo "$dbus_pid $kwin_pid $pw_pid $atspi_pid $wp_pid $kw_pid" >> "${XDG_INNER}/pids"
 
 # Ready — wait for app-launch commands on stdin (one per line)
 while read -r cmd; do

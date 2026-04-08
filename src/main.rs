@@ -446,7 +446,7 @@ async fn connect_session_bus(
 ) -> Result<zbus::Connection, String> {
     loop {
         let attempt_error = match zbus::connection::Builder::address(address) {
-            Ok(builder) => match builder.build().await {
+            Ok(builder) => match builder.auth_mechanism(zbus::AuthMechanism::Anonymous).build().await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => e.to_string(),
             },
@@ -942,6 +942,8 @@ impl KwinMcp {
         let bus_address_path = host_xdg_dir.join("dbus.address");
         // Build container with isolated namespaces
         let mut container = hakoniwa::Container::new();
+        container.uidmap(0);
+        container.gidmap(0);
         container.rootfs("/").map_err(|e| ver_err(e.to_string()))?;
         container.devfsmount("/dev");
         container.bindmount_rw("/dev/dri", "/dev/dri");
@@ -949,7 +951,7 @@ impl KwinMcp {
         container.tmpfsmount("/tmp");
         container.runctl(hakoniwa::Runctl::MountFallback);
         container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
-        container.bindmount_rw(&home, &home);
+        container.bindmount_ro(&home, &home);
         container.share(hakoniwa::Namespace::Pid);
         container.bindmount_ro("/proc", "/proc");
         // /sys is required: drmGetDevices2() enumerates GPUs via /sys/class/drm/,
@@ -1090,6 +1092,7 @@ impl KwinMcp {
             .unique_name()
             .map(|n| n.to_string())
             .unwrap_or_default();
+        let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name}");
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
@@ -1105,6 +1108,7 @@ impl KwinMcp {
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
             "bus": bus_name,
+            "workdir": workdir,
         })).await)
     }
 
