@@ -840,6 +840,10 @@ impl KwinMcp {
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
+            mkdir -p \"$HOME/.config\"\n\
+            printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
+            printf '[Daemon]\\nAutolock=false\\nLockOnResume=false\\nTimeout=0\\n' > \"$HOME/.config/kscreenlockerrc\"\n\
+            printf '[1]\\nDescription=No decorations\\nnoborder=true\\nnoborderrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
