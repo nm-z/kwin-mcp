@@ -834,11 +834,13 @@ impl KwinMcp {
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
 
+        let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args([
             "--die-with-parent",
             "--unshare-pid", "--unshare-uts", "--unshare-ipc",
-            "--overlay-src", "/", "--tmp-overlay", "/",
+            "--ro-bind", "/", "/",
+            "--overlay-src", &home, "--tmp-overlay", &home,
             "--dev", "/dev",
             "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
@@ -846,6 +848,7 @@ impl KwinMcp {
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
             "--proc", "/proc",
             "--tmpfs", "/tmp",
+            "--tmpfs", "/run",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             "--", "bash", "-c", &entrypoint,
         ]);
