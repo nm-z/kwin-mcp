@@ -807,7 +807,7 @@ impl KwinMcp {
         // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
         let entrypoint = format!(
             "set -u\n\
-            export XDG_RUNTIME_DIR=/run/user/$(id -u)\n\
+            export XDG_RUNTIME_DIR=/tmp/mcp-xdg\n\
             mkdir -p \"$XDG_RUNTIME_DIR\"\n\
             chmod 700 \"$XDG_RUNTIME_DIR\"\n\
             export WAYLAND_DISPLAY=wayland-0\n\
