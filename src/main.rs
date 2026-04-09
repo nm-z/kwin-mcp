@@ -111,7 +111,13 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
 }
 
 fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
-    match keyboard_codes::parser::parse_shortcut_with_aliases(key) {
+    // Aliases for keys the keyboard-codes crate doesn't recognize
+    let normalized = match key.to_lowercase().as_str() {
+        "return" => "Enter",
+        "backspace" => "Backspace",
+        _ => key,
+    };
+    match keyboard_codes::parser::parse_shortcut_with_aliases(normalized) {
         Ok(shortcut) => {
             let mods: Vec<u32> = shortcut
                 .modifiers
