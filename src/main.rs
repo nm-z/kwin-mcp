@@ -812,7 +812,8 @@ impl KwinMcp {
             chmod 700 \"$XDG_RUNTIME_DIR\"\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
-            dbus-daemon --session --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
+            printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
+            dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
             n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
