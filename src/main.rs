@@ -781,7 +781,7 @@ impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
-            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1221x977 screen.")
+            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1000x1000 screen.")
     }
 }
 
@@ -849,14 +849,14 @@ impl KwinMcp {
             mkdir -p \"$HOME/.config\"\n\
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
             printf '[Daemon]\\nAutolock=false\\nLockOnResume=false\\nTimeout=0\\n' > \"$HOME/.config/kscreenlockerrc\"\n\
-            printf '[1]\\nDescription=No decorations\\nnoborder=true\\nnoborderrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
+            printf '[1]\\nDescription=No decorations, maximized\\nnoborder=true\\nnoborderrule=2\\nmaximizehoriz=true\\nmaximizehorizrule=2\\nmaximizevert=true\\nmaximizevertrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
             n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width 1221 --height 977 &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width 1000 --height 1000 &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
