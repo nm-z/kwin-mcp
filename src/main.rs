@@ -845,8 +845,8 @@ impl KwinMcp {
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
             "--proc", "/proc",
-            "--bind", &xdg_dir_str, &xdg_dir_str,
             "--tmpfs", "/tmp",
+            "--bind", &xdg_dir_str, &xdg_dir_str,
             "--", "bash", "-c", &entrypoint,
         ]);
         cmd.stdin(std::process::Stdio::piped());
