@@ -875,6 +875,9 @@ impl KwinMcp {
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
             sed -i 's/ScaleFactor=.*/ScaleFactor=1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             sed -i 's/ScreenScaleFactors=.*/ScreenScaleFactors=/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/XftHintStyle=.*/XftHintStyle=hintnone/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/XftSubPixel=.*/XftSubPixel=none/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            printf '[General]\\nforceFontDPI=96\\n' > \"$HOME/.config/kcmfonts\"\n\
             sed -i 's/^font=.*/font=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             sed -i 's/^menuFont=.*/menuFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             sed -i 's/^smallestReadableFont=.*/smallestReadableFont=Noto Sans,12,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
