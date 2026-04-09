@@ -1119,11 +1119,14 @@ impl KwinMcp {
             .map(|obj| (obj, 0usize))
             .collect::<Vec<_>>();
         while let Some((obj, depth)) = stack.pop() {
-            let acc = obj
-                .as_accessible_proxy(&a11y_bus)
-                .await
-                .map_err(KwinError::from)?;
-            let node = atspi_node(&acc).await?;
+            let acc = match obj.as_accessible_proxy(&a11y_bus).await {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let node = match atspi_node(&acc).await {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
             if depth == 0 && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) {
                 continue;
             }
@@ -1184,11 +1187,14 @@ impl KwinMcp {
             .rev()
             .collect::<Vec<_>>();
         while let Some(obj) = stack.pop() {
-            let acc = obj
-                .as_accessible_proxy(&a11y_bus)
-                .await
-                .map_err(KwinError::from)?;
-            let node = atspi_node(&acc).await?;
+            let acc = match obj.as_accessible_proxy(&a11y_bus).await {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let node = match atspi_node(&acc).await {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
             if node.is_useful()
                 && (node.name.to_lowercase().contains(&query)
                     || node.role.to_lowercase().contains(&query))
