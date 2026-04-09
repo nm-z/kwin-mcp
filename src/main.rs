@@ -1,4 +1,3 @@
-#[expect(dead_code, reason = "wired into session lifecycle in the next task")]
 mod input_bridge;
 
 use rmcp::ServiceExt;
@@ -938,6 +937,28 @@ impl KwinMcp {
             Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin),
         };
         eprintln!("session_start: EIS ready");
+
+        // Register input devices on container D-Bus for KCM visibility
+        let mouse_sysname = mouse_evdev
+            .file_name()
+            .ok_or_else(|| ver_err("no mouse sysname".to_owned()))?
+            .to_string_lossy()
+            .to_string();
+        let kbd_sysname = kbd_evdev
+            .file_name()
+            .ok_or_else(|| ver_err("no keyboard sysname".to_owned()))?
+            .to_string_lossy()
+            .to_string();
+        let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
+        let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
+        if let Err(e) = input_bridge::register_device(&zbus_conn, mouse_dev).await {
+            return cleanup_err(format!("register mouse device: {e}"), bwrap_child, bwrap_stdin);
+        }
+        if let Err(e) = input_bridge::register_device(&zbus_conn, kbd_dev).await {
+            return cleanup_err(format!("register keyboard device: {e}"), bwrap_child, bwrap_stdin);
+        }
+        eprintln!("session_start: input devices registered on D-Bus");
+
         let bus_name = zbus_conn
             .unique_name()
             .map(|n| n.to_string())
