@@ -968,11 +968,8 @@ impl KwinMcp {
             .to_string();
         let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
         let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
-        if let Err(e) = input_bridge::register_device(&zbus_conn, mouse_dev).await {
-            return cleanup_err(format!("register mouse device: {e}"), bwrap_child, bwrap_stdin);
-        }
-        if let Err(e) = input_bridge::register_device(&zbus_conn, kbd_dev).await {
-            return cleanup_err(format!("register keyboard device: {e}"), bwrap_child, bwrap_stdin);
+        if let Err(e) = input_bridge::register_devices(&zbus_conn, vec![mouse_dev, kbd_dev]).await {
+            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin);
         }
         eprintln!("session_start: input devices registered on D-Bus");
 

@@ -858,13 +858,46 @@ impl InputDevice {
 
 }
 
-/// Register an `InputDevice` on the given connection at
-/// `/org/kde/KWin/InputDevice/{sys_name}`.
-pub async fn register_device(
+/// Manager that lists device sys-names and emits add/remove signals.
+pub struct InputDeviceManager {
+    sys_names: Vec<String>,
+}
+
+impl InputDeviceManager {
+    pub fn new(sys_names: Vec<String>) -> Self {
+        Self { sys_names }
+    }
+}
+
+#[zbus::interface(name = "org.kde.KWin.InputDeviceManager")]
+impl InputDeviceManager {
+    #[zbus(property, name = "devicesSysNames")]
+    fn devices_sys_names(&self) -> Vec<String> {
+        self.sys_names.clone()
+    }
+
+    #[zbus(signal)]
+    async fn device_added(signal_emitter: &zbus::object_server::SignalEmitter<'_>, sys_name: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn device_removed(signal_emitter: &zbus::object_server::SignalEmitter<'_>, sys_name: &str) -> zbus::Result<()>;
+}
+
+/// Register devices and the manager on the given connection.
+/// Requests `org.kde.KWin.MCP` as a well-known name for discoverability.
+pub async fn register_devices(
     conn: &zbus::Connection,
-    device: InputDevice,
+    devices: Vec<InputDevice>,
 ) -> Result<(), zbus::Error> {
-    let path = format!("/org/kde/KWin/InputDevice/{}", device.sys_name);
-    conn.object_server().at(path, device).await?;
+    let sys_names: Vec<String> = devices.iter().map(|d| d.sys_name.clone()).collect();
+    for device in devices {
+        let path = format!("/org/kde/KWin/InputDevice/{}", device.sys_name);
+        conn.object_server().at(path, device).await?;
+    }
+    conn.object_server()
+        .at("/org/kde/KWin/InputDevice", InputDeviceManager::new(sys_names))
+        .await?;
+    conn.request_name("org.kde.KWin.MCP")
+        .await?;
     Ok(())
 }
