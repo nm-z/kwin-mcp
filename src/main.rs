@@ -739,27 +739,6 @@ impl KwinMcp {
             if let Some(old) = (*guard).take() { teardown(old); }
         }
         eprintln!("session_start: previous session cleared");
-        // Block startup if orphan container processes exist from prior sessions
-        let mut orphans = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if !name_str.starts_with("kwin-mcp-") { continue; }
-                let pids_path = entry.path().join("pids");
-                if let Ok(contents) = std::fs::read_to_string(&pids_path) {
-                    for tok in contents.split_whitespace() {
-                        if let Ok(p) = tok.parse::<i32>()
-                            && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok() {
-                            orphans.push(p);
-                        }
-                    }
-                }
-            }
-        }
-        if !orphans.is_empty() {
-            return Err(ver_err(format!("orphan processes from prior sessions: {orphans:?} — kill them before starting")));
-        }
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         let _ = std::fs::remove_dir_all(&host_xdg_dir);
@@ -783,7 +762,9 @@ impl KwinMcp {
             n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --no-lockscreen --width 1221 --height 977 &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width 1221 --height 977 &\n\
+            sleep 0.3\n\
+            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER\n\
             ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher &\n\
             pipewire &\n\
             wireplumber &\n\
@@ -793,6 +774,7 @@ impl KwinMcp {
         );
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args([
+            "--die-with-parent",
             "--unshare-pid", "--unshare-uts", "--unshare-ipc",
             "--overlay-src", "/", "--tmp-overlay", "/",
             "--dev", "/dev",
