@@ -803,22 +803,22 @@ impl KwinMcp {
             host_xdg_dir.display()
         );
         let bus_socket_path = host_xdg_dir.join("bus");
+        let xdg_dir_str = host_xdg_dir.display().to_string();
         // Write AT-SPI dbus config with ANONYMOUS auth for cross-namespace access
         let atspi_conf_path = host_xdg_dir.join("accessibility.conf");
-        std::fs::write(&atspi_conf_path, concat!(
-            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" ",
-            "\"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n",
-            "<busconfig><type>accessibility</type>",
-            "<servicedir>/usr/share/dbus-1/accessibility-services</servicedir>",
-            "<auth>EXTERNAL</auth><auth>ANONYMOUS</auth><allow_anonymous/>",
-            "<listen>unix:dir=/tmp</listen>",
-            "<policy context=\"default\"><allow user=\"root\"/>",
-            "<allow send_destination=\"*\"/><allow receive_type=\"method_call\"/>",
-            "<allow receive_type=\"method_return\"/><allow receive_type=\"error\"/>",
-            "<allow receive_type=\"signal\"/><allow own=\"*\"/></policy>",
-            "</busconfig>"
+        std::fs::write(&atspi_conf_path, format!(
+            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
+            \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+            <busconfig><type>accessibility</type>\
+            <servicedir>/usr/share/dbus-1/accessibility-services</servicedir>\
+            <auth>EXTERNAL</auth><auth>ANONYMOUS</auth><allow_anonymous/>\
+            <listen>unix:dir={xdg_dir_str}</listen>\
+            <policy context=\"default\"><allow user=\"root\"/>\
+            <allow send_destination=\"*\"/><allow receive_type=\"method_call\"/>\
+            <allow receive_type=\"method_return\"/><allow receive_type=\"error\"/>\
+            <allow receive_type=\"signal\"/><allow own=\"*\"/></policy>\
+            </busconfig>"
         )).map_err(|e| ver_err(format!("write atspi config: {e}")))?;
-        let xdg_dir_str = host_xdg_dir.display().to_string();
         // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
         let entrypoint = format!(
             "set -u\n\
@@ -1152,8 +1152,8 @@ impl KwinMcp {
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
-            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        let zbus_conn = self.with_session(|s| {
+            Ok(s.zbus_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1161,7 +1161,6 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        let a11y_addr = a11y_addr.replace("/tmp/mcp-xdg", &host_xdg_dir.display().to_string());
         let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
