@@ -1,6 +1,6 @@
 # kwin-mcp
 
-MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `hakoniwa` (container isolation).
+MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
 
 ## Tools
 
@@ -10,7 +10,7 @@ MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rm
 | `session_stop` | Tear down the session and all container processes. |
 | `screenshot` | Capture the active window as PNG. |
 | `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
-| `find_ui_elements` | Find UI elements by role/name (stubbed). |
+| `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
 | `mouse_scroll` | Scroll at window-relative coordinates. |
@@ -23,18 +23,34 @@ MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rm
 
 ```
 kwin-mcp (host process)
-  └── hakoniwa container
+  ├── proxy_conn (owns org.kde.KWin on container D-Bus)
+  │     └── InputDeviceManager + InputDevice objects
+  │         (KCMs see virtual mouse/keyboard here)
+  ├── kwin_conn (talks to KWin via unique name)
+  │     └── EIS, ScreenShot2, Scripting
+  └── bwrap container (bubblewrap, overlayfs on $HOME)
         ├── dbus-daemon        (isolated session bus, anonymous auth)
-        ├── kwin_wayland       (virtual display 1221x977, XWayland)
-        ├── pipewire
-        ├── wireplumber
+        ├── kwin_wayland       (virtual display 1000x1000, XWayland)
+        ├── pipewire + wireplumber
         ├── at-spi-bus-launcher
-        └── kwalletd6
+        └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-`session_start` spawns the hakoniwa container via `entrypoint.sh`. All input and D-Bus calls from the host go into the container over the shared `XDG_RUNTIME_DIR`. `session_stop` kills the container process group.
+### Two-phase D-Bus startup
 
-All coordinates are window-relative — window position is added internally via `kdotool`.
+1. bwrap starts, dbus-daemon creates session bus
+2. Host `proxy_conn` claims `org.kde.KWin`, registers InputDevice objects
+3. Container starts KWin (gets unique name `:1.N`, not the well-known name)
+4. Host discovers KWin's unique name by probing for EIS interface
+5. Host `kwin_conn` connects to KWin via unique name for EIS/screenshots/scripting
+
+This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin`, while the MCP server talks to the real KWin compositor via its unique bus name.
+
+### HID isolation
+
+Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
+
+All coordinates are window-relative — window position is added internally via KWin scripting.
 
 ## Build
 
@@ -44,32 +60,17 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
-## org.kde.KWin.ScreenShot2 — Method Reference
+## Setup
 
-| Method | D-Bus Signature | Description |
-|---|---|---|
-| `CaptureWindow` | `(s handle, a{sv} options, h pipe) → a{sv}` | Specific window by UUID |
-| `CaptureActiveWindow` | `(a{sv} options, h pipe) → a{sv}` | Currently focused window |
-| `CaptureScreen` | `(s name, a{sv} options, h pipe) → a{sv}` | Monitor by name |
-| `CaptureActiveScreen` | `(a{sv} options, h pipe) → a{sv}` | Current monitor |
-| `CaptureArea` | `(i x, i y, u w, u h, a{sv} options, h pipe) → a{sv}` | Rectangle region |
-| `CaptureInteractive` | `(u kind, a{sv} options, h pipe) → a{sv}` | User picks (0=window, 1=screen) |
-| `CaptureWorkspace` | `(a{sv} options, h pipe) → a{sv}` | All screens composite (v3+) |
+Add your user to these groups:
+```
+sudo usermod -aG input,uinput,video,render $USER
+```
 
-Pipe receives raw ARGB32 premultiplied pixels. Return dict has `width`, `height`, `stride`, `format`, `scale`.
-
-**Options dict keys:** `include-cursor`, `include-decoration`, `include-shadow`, `native-resolution`
+Requires: `bubblewrap` (bwrap), KDE Plasma 6, KWin.
 
 ## Screenshot dimensions
 
-Anthropic resizes images with a long edge > 1568px before the model sees them. The virtual display (1221x977) is sized to fit within this limit with no resize needed.
+Virtual display is 1000×1000 (1MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
-| Aspect ratio | Max size (no resize) |
-|---|---|
-| 1:1 | 1092×1092 |
-| 5:4 | 1221×977 |
-| 4:3 | 1268×951 |
-| 2:3 | 896×1344 |
-| 1:2 | 784×1568 |
-
-Token cost: ~1 token per 750 pixels. A 1221×977 screenshot costs ~1590 tokens.
+Token cost: ~1 token per 750 pixels. A 1000×1000 screenshot costs ~1333 tokens.
