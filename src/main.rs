@@ -82,17 +82,31 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
             None,
         ))?,
     };
-    let key_str = match raw {
-        ' ' => "Space".to_owned(),
-        '\t' => "Tab".to_owned(),
-        '\n' => "Return".to_owned(),
-        c => String::from(c),
+    // Punctuation keys not in keyboard-codes crate — use evdev codes directly
+    let code: u32 = match raw {
+        '`' => 41,   // KEY_GRAVE
+        '-' => 12,   // KEY_MINUS
+        '=' => 13,   // KEY_EQUAL
+        '[' => 26,   // KEY_LEFTBRACE
+        ']' => 27,   // KEY_RIGHTBRACE
+        '\\' => 43,  // KEY_BACKSLASH
+        ';' => 39,   // KEY_SEMICOLON
+        '\'' => 40,  // KEY_APOSTROPHE
+        ',' => 51,   // KEY_COMMA
+        '.' => 52,   // KEY_DOT
+        '/' => 53,   // KEY_SLASH
+        ' ' => 57,   // KEY_SPACE
+        '\t' => 15,  // KEY_TAB
+        '\n' => 28,  // KEY_ENTER
+        _ => {
+            let key_str = String::from(raw);
+            let input: keyboard_codes::KeyboardInput = key_str
+                .parse()
+                .map_err(|e| McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None))?;
+            u32::try_from(input.to_code(Platform::Linux))
+                .map_err(|e| McpError::invalid_params(format!("keycode overflow '{ch}': {e}"), None))?
+        }
     };
-    let input: keyboard_codes::KeyboardInput = key_str
-        .parse()
-        .map_err(|e| McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None))?;
-    let code = u32::try_from(input.to_code(Platform::Linux))
-        .map_err(|e| McpError::invalid_params(format!("keycode overflow '{ch}': {e}"), None))?;
     Ok((code, shifted))
 }
 
