@@ -803,6 +803,21 @@ impl KwinMcp {
             host_xdg_dir.display()
         );
         let bus_socket_path = host_xdg_dir.join("bus");
+        // Write AT-SPI dbus config with ANONYMOUS auth for cross-namespace access
+        let atspi_conf_path = host_xdg_dir.join("accessibility.conf");
+        std::fs::write(&atspi_conf_path, concat!(
+            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" ",
+            "\"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n",
+            "<busconfig><type>accessibility</type>",
+            "<servicedir>/usr/share/dbus-1/accessibility-services</servicedir>",
+            "<auth>EXTERNAL</auth><auth>ANONYMOUS</auth><allow_anonymous/>",
+            "<listen>unix:dir=/tmp</listen>",
+            "<policy context=\"default\"><allow user=\"root\"/>",
+            "<allow send_destination=\"*\"/><allow receive_type=\"method_call\"/>",
+            "<allow receive_type=\"method_return\"/><allow receive_type=\"error\"/>",
+            "<allow receive_type=\"signal\"/><allow own=\"*\"/></policy>",
+            "</busconfig>"
+        )).map_err(|e| ver_err(format!("write atspi config: {e}")))?;
         let xdg_dir_str = host_xdg_dir.display().to_string();
         // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
         let entrypoint = format!(
@@ -819,7 +834,7 @@ impl KwinMcp {
             kwin_wayland --virtual --xwayland --no-lockscreen --width 1221 --height 977 &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER\n\
-            ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher &\n\
+            ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
             wireplumber &\n\
             while read -r cmd; do\n\
@@ -849,6 +864,7 @@ impl KwinMcp {
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
             "--bind", &xdg_dir_str, &xdg_dir_str,
+            "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
             "--", "bash", "-c", &entrypoint,
         ]);
         cmd.stdin(std::process::Stdio::piped());
