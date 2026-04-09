@@ -330,66 +330,13 @@ impl Eis {
     }
 }
 
-fn log_tail(path: &std::path::Path, lines: usize) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut tail = contents.lines().rev().take(lines).collect::<Vec<_>>();
-    tail.reverse();
-    let joined = tail.join(" | ").trim().to_owned();
-    (!joined.is_empty()).then_some(joined)
-}
-
-fn startup_diagnostics(host_xdg_dir: &std::path::Path) -> String {
-    let mut details = Vec::new();
-    for name in [
-        "bootstrap.log",
-        "dbus.log",
-        "kwin.log",
-        "pipewire.log",
-        "wireplumber.log",
-        "atspi.log",
-    ] {
-        if let Some(tail) = log_tail(&host_xdg_dir.join(name), 6) {
-            details.push(format!("{name}: {tail}"));
-        }
-    }
-    if details.is_empty() { String::new() } else { format!(" diagnostics: {}", details.join(" ; ")) }
-}
-
-fn rewrite_bus_address_for_host(
-    address: &str,
-    container_dir: &str,
-    host_dir: &std::path::Path,
-) -> String {
-    let container_prefix = format!("unix:path={container_dir}");
-    let host_prefix = format!("unix:path={}", host_dir.display());
-    match address.strip_prefix(&container_prefix) {
-        Some(rest) => format!("{host_prefix}{rest}"),
-        None => address.to_owned(),
-    }
-}
-
-async fn wait_for_nonempty_file(
+async fn wait_for_socket(
     path: &std::path::Path,
     description: &str,
     deadline: std::time::Instant,
-) -> Result<String, String> {
+) -> Result<(), String> {
     loop {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => match contents.trim() {
-                "" => {}
-                trimmed => return Ok(trimmed.to_owned()),
-            },
-            Err(e) => {
-                #[expect(clippy::wildcard_enum_match_arm)]
-                match e.kind() {
-                    std::io::ErrorKind::NotFound => {}
-                    other => return Err(format!(
-                        "failed to read {description} at {} ({other:?}): {e}",
-                        path.display()
-                    )),
-                }
-            }
-        }
+        if path.exists() { return Ok(()); }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "{description} did not appear at {} within {}s",
@@ -428,9 +375,8 @@ async fn connect_session_bus(
 struct Session {
     zbus_conn: zbus::Connection,
     eis: Eis,
-    container: hakoniwa::Container,
-    container_child: hakoniwa::Child,
-    container_stdin: std::io::PipeWriter,
+    bwrap_child: std::process::Child,
+    bwrap_stdin: std::process::ChildStdin,
     host_xdg_dir: std::path::PathBuf,
 }
 
@@ -494,34 +440,15 @@ async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<
     r
 }
 
-fn teardown_container(
-    container: hakoniwa::Container,
-    mut container_child: hakoniwa::Child,
-    container_stdin: std::io::PipeWriter,
-    host_xdg_dir: &std::path::Path,
-) {
-    // Kill all container children directly — bash teardown races with container kill
-    if let Ok(pids) = std::fs::read_to_string(host_xdg_dir.join("pids")) {
-        for tok in pids.split_whitespace() {
-            if let Ok(pid) = tok.parse::<i32>() {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
-            }
-        }
+fn teardown(mut sess: Session) {
+    drop(sess.bwrap_stdin);
+    // Kill the bwrap process group (negative PID = entire group)
+    let pid = sess.bwrap_child.id();
+    if let Ok(neg) = i32::try_from(pid).map(|p| -p) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
     }
-    drop(container_stdin);
-    if let Err(e) = container_child.kill() { eprintln!("teardown kill: {e}"); }
-    if let Err(e) = container_child.wait() { eprintln!("teardown wait: {e}"); }
-    drop(container);
-    if let Err(e) = std::fs::remove_dir_all(host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
-}
-
-fn teardown(sess: Session) {
-    teardown_container(
-        sess.container,
-        sess.container_child,
-        sess.container_stdin,
-        &sess.host_xdg_dir,
-    );
+    let _ = sess.bwrap_child.wait();
+    if let Err(e) = std::fs::remove_dir_all(&sess.host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
 }
 
 async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), KwinError> {
@@ -544,8 +471,8 @@ async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::P
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
     std::fs::write(&script_file, &script)?;
-    // KWin sees /tmp/xdg/ inside the container
-    let container_script_path = format!("/tmp/xdg/{script_name}");
+    // host_xdg_dir is bind-mounted at the same path inside bwrap
+    let container_script_path = script_file.to_string_lossy().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let cb = KWinCallback {
         tx: std::sync::Mutex::new(Some(tx)),
@@ -841,106 +768,86 @@ impl KwinMcp {
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
         );
-        let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
-        let bus_address_path = host_xdg_dir.join("dbus.address");
-        // Build container with isolated namespaces
-        let mut container = hakoniwa::Container::new();
-        container.uidmap(0);
-        container.gidmap(0);
-        container.rootfs("/").map_err(|e| ver_err(e.to_string()))?;
-        container.devfsmount("/dev");
-        container.bindmount_rw("/dev/dri", "/dev/dri");
-        container.tmpfsmount("/run");
-        container.tmpfsmount("/tmp");
-        container.runctl(hakoniwa::Runctl::MountFallback);
-        container.bindmount_rw(&host_xdg_dir.to_string_lossy(), "/tmp/xdg");
-        container.bindmount_ro(&home, &home);
-        container.share(hakoniwa::Namespace::Pid);
-        container.bindmount_ro("/proc", "/proc");
-        // /sys is required: drmGetDevices2() enumerates GPUs via /sys/class/drm/,
-        // not /dev/dri. Without it KWin falls back to QPainter and ScreenShot2 fails.
-        container.bindmount_ro("/sys", "/sys");
-        container.share(hakoniwa::Namespace::Network);
-        eprintln!("session_start: container configuration ready");
-        let xdg_inner = "/tmp/xdg";
-        let entrypoint = concat!(env!("CARGO_MANIFEST_DIR"), "/entrypoint.sh");
-        let mut cmd = container.command("/bin/bash");
-        cmd.arg(entrypoint);
-        for (k, v) in std::env::vars() {
-            cmd.env(&k, &v);
-        }
-        cmd.env("XDG_INNER", xdg_inner);
-        cmd.stdin(hakoniwa::Stdio::piped());
-        eprintln!("session_start: command environment ready");
-        let devnull = std::fs::File::options()
-            .write(true)
-            .open("/dev/null")
-            .map_err(|e| ver_err(format!("open /dev/null for container stdout: {e}")))?;
-        cmd.stdout(devnull);
-        cmd.stderr(hakoniwa::Stdio::inherit());
-        eprintln!("session_start: spawn container child");
-        let mut container_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
-        eprintln!(
-            "session_start: container child spawned pid={}",
-            container_child.id()
+        let bus_socket_path = host_xdg_dir.join("bus");
+        let xdg_dir_str = host_xdg_dir.display().to_string();
+        // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
+        let entrypoint = format!(
+            "set -u\n\
+            export XDG_RUNTIME_DIR=/run/user/$(id -u)\n\
+            mkdir -p \"$XDG_RUNTIME_DIR\"\n\
+            chmod 700 \"$XDG_RUNTIME_DIR\"\n\
+            export WAYLAND_DISPLAY=wayland-0\n\
+            export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
+            dbus-daemon --session --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
+            dbus_pid=$!\n\
+            n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
+            KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
+            kwin_wayland --virtual --no-lockscreen --width 1221 --height 977 &\n\
+            ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher &\n\
+            pipewire &\n\
+            wireplumber &\n\
+            while read -r cmd; do\n\
+                $cmd &\n\
+            done\n"
         );
-        match container_child.try_wait() {
-            Ok(Some(status)) => {
-                eprintln!("session_start: container child exited immediately status={status:?}")
-            }
-            Ok(None) => eprintln!("session_start: container child still running after spawn"),
-            Err(e) => eprintln!("session_start: container child try_wait failed: {e}"),
-        }
-        eprintln!(
-            "session_start: container child stdin available={}",
-            container_child.stdin.is_some()
-        );
-        let container_stdin = match container_child.stdin.take() {
+        let mut cmd = std::process::Command::new("bwrap");
+        cmd.args([
+            "--unshare-pid", "--unshare-uts", "--unshare-ipc",
+            "--overlay-src", "/", "--tmp-overlay", "/",
+            "--dev", "/dev",
+            "--dev-bind", "/dev/dri", "/dev/dri",
+            "--dev-bind", "/dev/uinput", "/dev/uinput",
+            "--proc", "/proc",
+            "--bind", &xdg_dir_str, &xdg_dir_str,
+            "--tmpfs", "/tmp",
+            "--", "bash", "-c", &entrypoint,
+        ]);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
+        eprintln!("session_start: spawning bwrap");
+        let mut bwrap_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
+        eprintln!("session_start: bwrap spawned pid={:?}", bwrap_child.id());
+        let bwrap_stdin = match bwrap_child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                let diagnostics = startup_diagnostics(&host_xdg_dir);
-                if let Err(e) = container_child.kill() { eprintln!("teardown kill: {e}"); }
-                if let Err(e) = container_child.wait() { eprintln!("teardown wait: {e}"); }
-                drop(container);
-                if let Err(e) = std::fs::remove_dir_all(&host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
-                return Err(ver_err(format!(
-                    "container stdin not available{diagnostics}"
-                )));
+                let _ = bwrap_child.kill();
+                let _ = bwrap_child.wait();
+                let _ = std::fs::remove_dir_all(&host_xdg_dir);
+                return Err(ver_err("bwrap stdin not available".to_owned()));
             }
         };
-        eprintln!("session_start: container stdin ready");
         let cleanup_err = |message: String,
-                           container: hakoniwa::Container,
-                           container_child: hakoniwa::Child,
-                           container_stdin: std::io::PipeWriter| {
-            let diagnostics = startup_diagnostics(&host_xdg_dir);
+                           mut bwrap_child: std::process::Child,
+                           bwrap_stdin: std::process::ChildStdin| {
             eprintln!("session_start: startup error: {message}");
-            teardown_container(container, container_child, container_stdin, &host_xdg_dir);
-            Err(ver_err(format!("{message}{diagnostics}")))
+            drop(bwrap_stdin);
+            let pid = bwrap_child.id();
+            if let Ok(neg) = i32::try_from(pid).map(|p| -p) {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
+            }
+            let _ = bwrap_child.wait();
+            let _ = std::fs::remove_dir_all(&host_xdg_dir);
+            Err(ver_err(message))
         };
-        eprintln!(
-            "session_start: wait for dbus address path={}",
-            bus_address_path.display()
-        );
-        let bus_addr_raw = match wait_for_nonempty_file(
-            &bus_address_path,
-            "D-Bus address",
+        // Wait for D-Bus socket to appear
+        eprintln!("session_start: wait for D-Bus socket at {}", bus_socket_path.display());
+        if let Err(e) = wait_for_socket(
+            &bus_socket_path,
+            "D-Bus socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
-        )
-        .await
-        {
-            Ok(addr) => addr,
-            Err(e) => return cleanup_err(e, container, container_child, container_stdin),
-        };
-        eprintln!("session_start: dbus address ready");
-        let bus_addr = rewrite_bus_address_for_host(&bus_addr_raw, xdg_inner, &host_xdg_dir);
-        eprintln!("session_start: host dbus address {bus_addr}");
-        eprintln!("session_start: connect to session bus");
+        ).await {
+            return cleanup_err(e, bwrap_child, bwrap_stdin);
+        }
+        eprintln!("session_start: D-Bus socket ready");
+        let bus_addr = format!("unix:path={xdg_dir_str}/bus");
+        eprintln!("session_start: connect to session bus at {bus_addr}");
         let zbus_conn =
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, container, container_child, container_stdin),
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin),
             };
         eprintln!("session_start: connected to session bus");
         // Wait for KWin to register on D-Bus
@@ -955,10 +862,10 @@ impl KwinMcp {
             match dbus_proxy.name_has_owner(kwin_name).await {
                 Ok(true) => break,
                 Ok(false) => {}
-                Err(e) => return cleanup_err(format!("name_has_owner: {e}"), container, container_child, container_stdin),
+                Err(e) => return cleanup_err(format!("name_has_owner: {e}"), bwrap_child, bwrap_stdin),
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), container, container_child, container_stdin);
+                return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), bwrap_child, bwrap_stdin);
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
@@ -967,19 +874,19 @@ impl KwinMcp {
         eprintln!("session_start: connect to KWin EIS");
         let eis_proxy = match KWinEisProxy::new(&zbus_conn).await {
             Ok(p) => p,
-            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), container, container_child, container_stdin),
+            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin),
         };
-        // capabilities: 1=keyboard, 2=pointer, 4=touch → 3 = keyboard+pointer
+        // capabilities: 1=keyboard, 2=pointer, 4=touch -> 3 = keyboard+pointer
         let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(3).await {
             Ok(r) => r,
-            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), container, container_child, container_stdin),
+            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin),
         };
         eprintln!("session_start: EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
         let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
-            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), container, container_child, container_stdin),
-            Err(e) => return cleanup_err(format!("EIS task: {e}"), container, container_child, container_stdin),
+            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin),
+            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin),
         };
         eprintln!("session_start: EIS ready");
         let bus_name = zbus_conn
@@ -992,9 +899,8 @@ impl KwinMcp {
         *guard = Some(Session {
             zbus_conn,
             eis,
-            container,
-            container_child,
-            container_stdin,
+            bwrap_child,
+            bwrap_stdin,
             host_xdg_dir,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
@@ -1094,8 +1000,8 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
-            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        let zbus_conn = self.with_session(|s| {
+            Ok(s.zbus_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1103,11 +1009,6 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        let a11y_addr = rewrite_bus_address_for_host(
-            &a11y_addr,
-            "/tmp/xdg",
-            &host_xdg_dir,
-        );
         let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
@@ -1163,8 +1064,8 @@ impl KwinMcp {
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
-            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        let zbus_conn = self.with_session(|s| {
+            Ok(s.zbus_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1172,11 +1073,6 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        let a11y_addr = rewrite_bus_address_for_host(
-            &a11y_addr,
-            "/tmp/xdg",
-            &host_xdg_dir,
-        );
         let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
@@ -1421,8 +1317,8 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.container_stdin, "{}", params.command).map_err(KwinError::from)?;
-            sess.container_stdin.flush().map_err(KwinError::from)?;
+            writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
+            sess.bwrap_stdin.flush().map_err(KwinError::from)?;
             (sess.zbus_conn.clone(), sess.host_xdg_dir.clone())
         };
         // Poll for window readiness (up to 15s)
