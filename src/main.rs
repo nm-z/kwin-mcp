@@ -1097,11 +1097,16 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
-        let conn = atspi::AccessibilityConnection::from_address(addr)
+        let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
+            .await
+            .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
+        let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
+            .destination("org.a11y.atspi.Registry")
+            .map_err(KwinError::from)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
             .await
             .map_err(KwinError::from)?;
-        let root = conn.root_accessible_on_registry().await.map_err(KwinError::from)?;
         let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(KwinError::from)?;
         let app_name = params.app_name.map(|s| s.to_lowercase());
         let role = params.role.map(|s| s.to_lowercase());
@@ -1117,7 +1122,7 @@ impl KwinMcp {
             .collect::<Vec<_>>();
         while let Some((obj, depth)) = stack.pop() {
             let acc = obj
-                .as_accessible_proxy(conn.connection())
+                .as_accessible_proxy(&a11y_bus)
                 .await
                 .map_err(KwinError::from)?;
             let node = atspi_node(&acc).await?;
@@ -1161,11 +1166,16 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
-        let conn = atspi::AccessibilityConnection::from_address(addr)
+        let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
+            .await
+            .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
+        let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
+            .destination("org.a11y.atspi.Registry")
+            .map_err(KwinError::from)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
             .await
             .map_err(KwinError::from)?;
-        let root = conn.root_accessible_on_registry().await.map_err(KwinError::from)?;
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
         let mut stack = root
@@ -1177,7 +1187,7 @@ impl KwinMcp {
             .collect::<Vec<_>>();
         while let Some(obj) = stack.pop() {
             let acc = obj
-                .as_accessible_proxy(conn.connection())
+                .as_accessible_proxy(&a11y_bus)
                 .await
                 .map_err(KwinError::from)?;
             let node = atspi_node(&acc).await?;
