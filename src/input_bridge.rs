@@ -514,6 +514,11 @@ impl InputDevice {
         true
     }
 
+    #[zbus(property, name = "isAnonymousInputDevice")]
+    fn is_anonymous_input_device(&self) -> bool {
+        false
+    }
+
     // ── Readwrite properties ─────────────────────────────────────────────
 
     #[zbus(property, name = "enabled")]
@@ -860,12 +865,13 @@ impl InputDevice {
 
 /// Manager that lists device sys-names and emits add/remove signals.
 pub struct InputDeviceManager {
-    sys_names: Vec<String>,
+    pointer_names: Vec<String>,
+    keyboard_names: Vec<String>,
 }
 
 impl InputDeviceManager {
-    pub fn new(sys_names: Vec<String>) -> Self {
-        Self { sys_names }
+    pub fn new(pointer_names: Vec<String>, keyboard_names: Vec<String>) -> Self {
+        Self { pointer_names, keyboard_names }
     }
 }
 
@@ -873,7 +879,24 @@ impl InputDeviceManager {
 impl InputDeviceManager {
     #[zbus(property, name = "devicesSysNames")]
     fn devices_sys_names(&self) -> Vec<String> {
-        self.sys_names.clone()
+        let mut all = self.pointer_names.clone();
+        all.extend(self.keyboard_names.clone());
+        all
+    }
+
+    #[zbus(name = "ListPointers")]
+    fn list_pointers(&self) -> Vec<String> {
+        self.pointer_names.clone()
+    }
+
+    #[zbus(name = "ListKeyboards")]
+    fn list_keyboards(&self) -> Vec<String> {
+        self.keyboard_names.clone()
+    }
+
+    #[zbus(name = "ListTouch")]
+    fn list_touch(&self) -> Vec<String> {
+        Vec::new()
     }
 
     #[zbus(signal)]
@@ -884,20 +907,23 @@ impl InputDeviceManager {
 }
 
 /// Register devices and the manager on the given connection.
-/// Requests `org.kde.KWin.MCP` as a well-known name for discoverability.
+/// The caller is expected to already own `org.kde.KWin` on this connection.
 pub async fn register_devices(
     conn: &zbus::Connection,
     devices: Vec<InputDevice>,
 ) -> Result<(), zbus::Error> {
-    let sys_names: Vec<String> = devices.iter().map(|d| d.sys_name.clone()).collect();
+    let mut pointer_names = Vec::new();
+    let mut keyboard_names = Vec::new();
+    for device in &devices {
+        if device.is_pointer { pointer_names.push(device.sys_name.clone()); }
+        if device.is_keyboard { keyboard_names.push(device.sys_name.clone()); }
+    }
     for device in devices {
         let path = format!("/org/kde/KWin/InputDevice/{}", device.sys_name);
         conn.object_server().at(path, device).await?;
     }
     conn.object_server()
-        .at("/org/kde/KWin/InputDevice", InputDeviceManager::new(sys_names))
-        .await?;
-    conn.request_name("org.kde.KWin.MCP")
+        .at("/org/kde/KWin/InputDevice", InputDeviceManager::new(pointer_names, keyboard_names))
         .await?;
     Ok(())
 }

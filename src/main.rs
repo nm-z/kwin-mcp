@@ -465,7 +465,9 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 // ── Session ──────────────────────────────────────────────────────────────
 
 struct Session {
-    zbus_conn: zbus::Connection,
+    kwin_conn: zbus::Connection,       // talks to KWin via its unique name
+    _proxy_conn: zbus::Connection,    // owns org.kde.KWin, has InputDevice objects (kept alive)
+    kwin_unique_name: String,
     eis: Eis,
     bwrap_child: std::process::Child,
     bwrap_stdin: std::process::ChildStdin,
@@ -500,10 +502,20 @@ impl KwinMcp {
             )),
         }
     }
-    async fn zbus_conn(&self) -> Result<zbus::Connection, McpError> {
+    async fn kwin_conn(&self) -> Result<zbus::Connection, McpError> {
         let guard = self.session.lock().await;
         match &*guard {
-            Some(s) => Ok(s.zbus_conn.clone()),
+            Some(s) => Ok(s.kwin_conn.clone()),
+            None => Err(McpError::internal_error(
+                "no session — call session_start first",
+                None,
+            )),
+        }
+    }
+    async fn kwin_unique_name(&self) -> Result<String, McpError> {
+        let guard = self.session.lock().await;
+        match &*guard {
+            Some(s) => Ok(s.kwin_unique_name.clone()),
             None => Err(McpError::internal_error(
                 "no session — call session_start first",
                 None,
@@ -545,7 +557,7 @@ fn teardown(mut sess: Session) {
     if let Err(e) = std::fs::remove_dir_all(&sess.host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
 }
 
-async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), KwinError> {
+async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), KwinError> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
@@ -577,9 +589,9 @@ async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::P
     if !registered {
         return Err(KwinError::Msg(format!("failed to register callback at {cb_path}")));
     }
-    // Load and run the script
+    // Load and run the script — target KWin's unique name, not org.kde.KWin (we own that)
     let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin")?
+        .destination(kwin_unique)?
         .path("/Scripting")?
         .interface("org.kde.kwin.Scripting")?
         .build()
@@ -593,7 +605,7 @@ async fn active_window_info(conn: &zbus::Connection, host_xdg_dir: &std::path::P
         return Err(KwinError::Msg(format!("KWin loadScript failed, id={script_id}")));
     }
     let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination("org.kde.KWin")?
+        .destination(kwin_unique)?
         .path(format!("/Scripting/Script{script_id}"))?
         .interface("org.kde.kwin.Script")?
         .build()
@@ -841,7 +853,6 @@ impl KwinMcp {
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
         );
-        let bus_socket_path = host_xdg_dir.join("bus");
         let xdg_dir_str = host_xdg_dir.display().to_string();
         // Write AT-SPI dbus config with ANONYMOUS auth for cross-namespace access
         let atspi_conf_path = host_xdg_dir.join("accessibility.conf");
@@ -891,6 +902,8 @@ impl KwinMcp {
             dbus_pid=$!\n\
             n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
+            touch '{xdg_dir_str}/dbus-ready'\n\
+            n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width 1000 --height 1000 &\n\
             sleep 0.3\n\
@@ -902,6 +915,29 @@ impl KwinMcp {
                 $cmd &\n\
             done\n"
         );
+        // Write fontconfig overrides to bind-mount over system files that force hinting/subpixel
+        let fc_hinting_path = host_xdg_dir.join("10-hinting-none.conf");
+        std::fs::write(&fc_hinting_path, "\
+            <?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+            <fontconfig>\n\
+            <match target=\"font\"><edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\
+            <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit></match>\n\
+            <match target=\"pattern\"><edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\
+            <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit></match>\n\
+            </fontconfig>\n"
+        ).map_err(|e| ver_err(format!("write fontconfig hinting: {e}")))?;
+        let fc_lcd_path = host_xdg_dir.join("11-lcdfilter-none.conf");
+        std::fs::write(&fc_lcd_path, "\
+            <?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+            <fontconfig>\n\
+            <match target=\"font\"><edit name=\"lcdfilter\" mode=\"assign\"><const>lcdnone</const></edit>\
+            <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit></match>\n\
+            <match target=\"pattern\"><edit name=\"lcdfilter\" mode=\"assign\"><const>lcdnone</const></edit>\
+            <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit></match>\n\
+            </fontconfig>\n"
+        ).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
+        let fc_hinting_str = fc_hinting_path.display().to_string();
+        let fc_lcd_str = fc_lcd_path.display().to_string();
         // Create uinput virtual devices before bwrap so we can bind-mount them
         let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) =
             create_uinput_devices().map_err(|e| ver_err(format!("uinput: {e}")))?;
@@ -926,6 +962,8 @@ impl KwinMcp {
             "--tmpfs", "/run",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
+            "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
+            "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
             "--", "bash", "-c", &entrypoint,
         ]);
         cmd.stdin(std::process::Stdio::piped());
@@ -956,48 +994,135 @@ impl KwinMcp {
             let _ = std::fs::remove_dir_all(&host_xdg_dir);
             Err(ver_err(message))
         };
-        // Wait for D-Bus socket to appear
-        eprintln!("session_start: wait for D-Bus socket at {}", bus_socket_path.display());
+        // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
+        let dbus_ready_path = host_xdg_dir.join("dbus-ready");
+        eprintln!("session_start: wait for dbus-ready at {}", dbus_ready_path.display());
         if let Err(e) = wait_for_socket(
-            &bus_socket_path,
-            "D-Bus socket",
+            &dbus_ready_path,
+            "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
             return cleanup_err(e, bwrap_child, bwrap_stdin);
         }
-        eprintln!("session_start: D-Bus socket ready");
+        eprintln!("session_start: dbus-ready");
         let bus_addr = format!("unix:path={xdg_dir_str}/bus");
-        eprintln!("session_start: connect to session bus at {bus_addr}");
-        let zbus_conn =
+
+        // Create proxy_conn: claims org.kde.KWin, registers InputDevice objects
+        // This must happen BEFORE KWin starts so we own the well-known name
+        eprintln!("session_start: creating proxy_conn");
+        let proxy_conn =
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
                 Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin),
             };
-        eprintln!("session_start: connected to session bus");
-        // Wait for KWin to register on D-Bus
-        eprintln!("session_start: wait for org.kde.KWin");
-        let kwin_deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-        let dbus_proxy = zbus::fdo::DBusProxy::new(&zbus_conn)
+        // Claim org.kde.KWin on proxy_conn (before KWin starts, so we get it first)
+        if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
+            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin);
+        }
+        eprintln!("session_start: proxy_conn owns org.kde.KWin");
+
+        // Register InputDevice objects on proxy_conn
+        let mouse_sysname = mouse_evdev
+            .file_name()
+            .ok_or_else(|| ver_err("no mouse sysname".to_owned()))?
+            .to_string_lossy()
+            .to_string();
+        let kbd_sysname = kbd_evdev
+            .file_name()
+            .ok_or_else(|| ver_err("no keyboard sysname".to_owned()))?
+            .to_string_lossy()
+            .to_string();
+        let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
+        let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
+        if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
+            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin);
+        }
+        eprintln!("session_start: input devices registered on proxy_conn");
+
+        // Signal bridge-ready so the entrypoint starts KWin
+        let bridge_ready_path = host_xdg_dir.join("bridge-ready");
+        std::fs::write(&bridge_ready_path, "").map_err(|e| ver_err(format!("write bridge-ready: {e}")))?;
+        eprintln!("session_start: bridge-ready signaled, KWin starting");
+
+        // Create kwin_conn: separate connection for talking to KWin
+        let kwin_conn =
+            match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
+            {
+                Ok(conn) => conn,
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin),
+            };
+
+        // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
+        let wayland_socket = host_xdg_dir.join("wayland-0");
+        eprintln!("session_start: wait for wayland-0");
+        if let Err(e) = wait_for_socket(
+            &wayland_socket,
+            "wayland-0 socket",
+            std::time::Instant::now() + STARTUP_TIMEOUT,
+        ).await {
+            return cleanup_err(e, bwrap_child, bwrap_stdin);
+        }
+        eprintln!("session_start: wayland-0 ready");
+
+        // Discover KWin's unique bus name — try each unique name for EIS interface
+        eprintln!("session_start: discovering KWin unique name");
+        let dbus_proxy = zbus::fdo::DBusProxy::new(&kwin_conn)
             .await
             .map_err(|e| ver_err(format!("DBus proxy: {e}")))?;
+        let kwin_unique_name;
+        let kwin_deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        // Skip our own connections
+        let proxy_unique = proxy_conn.unique_name()
+            .map(|n| n.to_string()).unwrap_or_default();
+        let kwin_conn_unique = kwin_conn.unique_name()
+            .map(|n| n.to_string()).unwrap_or_default();
         loop {
-            let kwin_name = zbus::names::BusName::try_from("org.kde.KWin")
-                .map_err(|e| ver_err(format!("invalid bus name: {e}")))?;
-            match dbus_proxy.name_has_owner(kwin_name).await {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(e) => return cleanup_err(format!("name_has_owner: {e}"), bwrap_child, bwrap_stdin),
+            let names = dbus_proxy.list_names().await
+                .map_err(|e| ver_err(format!("ListNames: {e}")))?;
+            let mut found = None;
+            for name in &names {
+                let name_str = name.as_str();
+                if !name_str.starts_with(':') { continue; }
+                if name_str == proxy_unique || name_str == kwin_conn_unique { continue; }
+                // Quick probe with timeout — Introspect the EIS path
+                let probe_result = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    async {
+                        let p: zbus::Proxy = zbus::proxy::Builder::new(&kwin_conn)
+                            .destination(name_str)?
+                            .path("/org/kde/KWin/EIS/RemoteDesktop")?
+                            .interface("org.freedesktop.DBus.Introspectable")?
+                            .build()
+                            .await?;
+                        let r: (String,) = p.call("Introspect", &()).await?;
+                        Ok::<String, zbus::Error>(r.0)
+                    }
+                ).await;
+                if let Ok(Ok(xml)) = probe_result {
+                    if xml.contains("connectToEIS") {
+                        found = Some(name_str.to_owned());
+                        break;
+                    }
+                }
+            }
+            if let Some(name) = found {
+                kwin_unique_name = name;
+                break;
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("org.kde.KWin did not appear on D-Bus".to_owned(), bwrap_child, bwrap_stdin);
+                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin);
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
-        eprintln!("session_start: org.kde.KWin ready");
-        // Connect to KWin EIS for input injection
+        eprintln!("session_start: KWin unique name = {kwin_unique_name}");
+
+        // Connect to KWin EIS using its unique name
         eprintln!("session_start: connect to KWin EIS");
-        let eis_proxy = match KWinEisProxy::new(&zbus_conn).await {
+        let eis_builder = KWinEisProxy::builder(&kwin_conn)
+            .destination(kwin_unique_name.as_str())
+            .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
+        let eis_proxy = match eis_builder.build().await {
             Ok(p) => p,
             Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin),
         };
@@ -1015,33 +1140,17 @@ impl KwinMcp {
         };
         eprintln!("session_start: EIS ready");
 
-        // Register input devices on container D-Bus for KCM visibility
-        let mouse_sysname = mouse_evdev
-            .file_name()
-            .ok_or_else(|| ver_err("no mouse sysname".to_owned()))?
-            .to_string_lossy()
-            .to_string();
-        let kbd_sysname = kbd_evdev
-            .file_name()
-            .ok_or_else(|| ver_err("no keyboard sysname".to_owned()))?
-            .to_string_lossy()
-            .to_string();
-        let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
-        let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
-        if let Err(e) = input_bridge::register_devices(&zbus_conn, vec![mouse_dev, kbd_dev]).await {
-            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin);
-        }
-        eprintln!("session_start: input devices registered on D-Bus");
-
-        let bus_name = zbus_conn
+        let bus_name = kwin_conn
             .unique_name()
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
-        let msg = format!("{version_stamp} — session started bus={bus_name}");
+        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
-            zbus_conn,
+            kwin_conn,
+            _proxy_conn: proxy_conn,
+            kwin_unique_name: kwin_unique_name.clone(),
             eis,
             bwrap_child,
             bwrap_stdin,
@@ -1054,6 +1163,7 @@ impl KwinMcp {
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
             "bus": bus_name,
+            "kwin_unique": kwin_unique_name,
             "workdir": workdir,
         })).await)
     }
@@ -1080,10 +1190,16 @@ impl KwinMcp {
         annotations(read_only_hint = true)
     )]
     async fn screenshot(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
-        let conn = self.zbus_conn().await?;
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
-        let (_, _, win_id) = active_window_info(&conn, &xdg).await?;
-        let proxy = KWinScreenShot2Proxy::new(&conn).await.map_err(KwinError::from)?;
+        let (_, _, win_id) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let proxy = KWinScreenShot2Proxy::builder(&conn)
+            .destination(kwin_unique.as_str())
+            .map_err(KwinError::from)?
+            .build()
+            .await
+            .map_err(KwinError::from)?;
         let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
         let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
         let mut opts = std::collections::HashMap::new();
@@ -1147,7 +1263,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
         let zbus_conn = self.with_session(|s| {
-            Ok(s.zbus_conn.clone())
+            Ok(s.kwin_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1219,7 +1335,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
         let zbus_conn = self.with_session(|s| {
-            Ok(s.zbus_conn.clone())
+            Ok(s.kwin_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1288,7 +1404,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let count = match (params.triple, params.double) {
             (Some(true), _) => 3,
@@ -1326,7 +1442,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -1350,7 +1466,7 @@ impl KwinMcp {
         let x = params.x;
         let y = params.y;
         let delta = params.delta;
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -1384,7 +1500,7 @@ impl KwinMcp {
         let from_y = params.from_y;
         let to_x = params.to_x;
         let to_y = params.to_y;
-        let (wx, wy, _) = active_window_info(&self.zbus_conn().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
         let code = btn_code(params.button.as_deref())?;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
@@ -1474,19 +1590,19 @@ impl KwinMcp {
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
         use std::io::Write;
-        let (conn, xdg) = {
+        let (conn, kwin_unique, xdg) = {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
             writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
-            (sess.zbus_conn.clone(), sess.host_xdg_dir.clone())
+            (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
         };
         // Poll for window readiness (up to 15s)
         for _ in 0..75_u32 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok((_, _, info)) = active_window_info(&conn, &xdg).await {
+            if let Ok((_, _, info)) = active_window_info(&conn, &kwin_unique, &xdg).await {
                 return Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
                     "action": "launch", "command": params.command, "window": info,
                 })).await);
