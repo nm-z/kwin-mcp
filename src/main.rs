@@ -869,6 +869,8 @@ impl KwinMcp {
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p \"$HOME/.config\"\n\
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
+            sed -i 's/ScaleFactor=.*/ScaleFactor=1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/ScreenScaleFactors=.*/ScreenScaleFactors=/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             printf '[Daemon]\\nAutolock=false\\nLockOnResume=false\\nTimeout=0\\n' > \"$HOME/.config/kscreenlockerrc\"\n\
             printf '[1]\\nDescription=No decorations, maximized\\nnoborder=true\\nnoborderrule=2\\nmaximizehoriz=true\\nmaximizehorizrule=2\\nmaximizevert=true\\nmaximizevertrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
