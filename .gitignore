@@ -2,7 +2,9 @@ target/
 .build_number
 backup-initial-commit.zip
 .worktrees
-.claude/worktrees/
+.claude/
+CLAUDE.md
+docs/superpowers/
 kwin/
 at-spi2-core/
 hakoniwa/
