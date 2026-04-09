@@ -807,9 +807,7 @@ impl KwinMcp {
         // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
         let entrypoint = format!(
             "set -u\n\
-            export XDG_RUNTIME_DIR=/tmp/mcp-xdg\n\
-            mkdir -p \"$XDG_RUNTIME_DIR\"\n\
-            chmod 700 \"$XDG_RUNTIME_DIR\"\n\
+            export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
@@ -821,8 +819,6 @@ impl KwinMcp {
             kwin_wayland --virtual --xwayland --no-lockscreen --width 1221 --height 977 &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER\n\
-            mkdir -p {xdg_dir_str}/at-spi\n\
-            ln -sf {xdg_dir_str}/at-spi /tmp/mcp-xdg/at-spi\n\
             ATSPI_DBUS_IMPLEMENTATION=dbus-daemon at-spi-bus-launcher &\n\
             pipewire &\n\
             wireplumber &\n\
@@ -1076,8 +1072,8 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         use atspi::proxy::accessible::ObjectRefExt;
-        let (zbus_conn, host_xdg_dir) = self.with_session(|s| {
-            Ok((s.zbus_conn.clone(), s.host_xdg_dir.clone()))
+        let zbus_conn = self.with_session(|s| {
+            Ok(s.zbus_conn.clone())
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -1085,9 +1081,6 @@ impl KwinMcp {
             .get_address()
             .await
             .map_err(KwinError::from)?;
-        // AT-SPI socket is in container's XDG_RUNTIME_DIR; rewrite to host-accessible path
-        // The container's /tmp/mcp-xdg/at-spi/ maps to {host_xdg_dir}/at-spi/ via symlink
-        let a11y_addr = a11y_addr.replace("/tmp/mcp-xdg", &host_xdg_dir.display().to_string());
         let addr: zbus::Address = a11y_addr.parse().map_err(KwinError::from)?;
         let conn = atspi::AccessibilityConnection::from_address(addr)
             .await
