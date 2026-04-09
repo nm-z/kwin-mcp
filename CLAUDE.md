@@ -22,22 +22,35 @@ All denied: `unwrap_used`, `expect_used`, `todo`, `unimplemented`, `unreachable`
 
 ## Architecture
 
-Everything lives in `src/main.rs` (~634 lines). Key layers:
+Everything lives in `src/main.rs` (~1333 lines). Key layers:
 
-- **Input parsing** (top of file): `parse_int`, `parse_combo`, `char_key`, `modifier_code`, `special_key`, `btn_code` — maps key names and characters to evdev keycodes. `parse_int` handles Claude Code's number-as-string serialization quirk.
-- **EIS negotiation**: `negotiate_eis`, `drain_eis_events`, `register_eis_device` — sets up pointer/keyboard devices with the EIS protocol via `reis`.
-- **`Eis` struct**: Holds EIS context, pointer/button/scroll/keyboard devices, D-Bus connection. Methods: `connect()`, `move_abs()`, `button()`, `scroll_do()`, `key()`.
-- **`Session` struct**: Owns the KWin child process, AT-SPI registry, D-Bus/ATSPI addresses, screenshot dir, EIS handle. Created by `session_start`, destroyed by `session_stop`.
+- **Input parsing** (top of file): `parse_combo`, `char_key`, `btn_code` — maps key names and characters to evdev keycodes via `keyboard-codes` crate.
+- **KWin D-Bus proxies**: `KWinEis`, `KWinScreenShot2` — zbus proxy traits for EIS input and screenshots.
+- **EIS input**: `Eis` struct holds EIS context, pointer/button/scroll/keyboard devices. Methods: `from_fd()`, `move_abs()`, `button()`, `scroll_discrete()`, `scroll_smooth()`, `key()`. Negotiation is blocking (`tokio::task::spawn_blocking`).
+- **`Session` struct**: Owns the bwrap child process, bwrap stdin (for launch_app), D-Bus connection, EIS handle, host XDG dir. Created by `session_start`, destroyed by `session_stop`.
 - **`KwinMcp` struct**: `Arc<Mutex<Option<Session>>>` — the MCP server. Implements `ToolHandler` with 12 tools. `with_session()` gates all tools behind session existence.
+
+## Container Architecture
+
+`session_start` spawns an isolated session via **bubblewrap (bwrap)**:
+- `--overlay-src / --tmp-overlay /` — overlayfs on host root, writes are ephemeral
+- `--die-with-parent` — auto-kills container if MCP server dies
+- `--unshare-pid --unshare-uts --unshare-ipc` — namespace isolation
+- `--dev-bind /dev/dri` and `--dev-bind /dev/uinput` — GPU and input device access
+- `--bind {host_xdg_dir}` — shared directory for D-Bus socket
+
+Inside the container, an inline bash entrypoint starts: dbus-daemon (socket in shared dir), KWin `--virtual --xwayland`, AT-SPI, PipeWire, WirePlumber. The host connects to the container's D-Bus via the shared socket. Apps are launched by writing commands to bwrap's stdin.
+
+`session_stop` kills the bwrap process group (negative PID SIGTERM) and removes the host XDG dir.
 
 ## MCP Tools
 
-`session_start` spawns an isolated KWin Wayland session (1920x1080, XWayland, own D-Bus). All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `kdotool::get_active_window_info()`. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters.
+`session_start` spawns an isolated KWin Wayland session (1221x977, XWayland, own D-Bus). All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `active_window_info()` KWin scripting. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters. `find_ui_elements` searches by name/role.
 
 ## Key Patterns
 
 - All coordinates are window-relative, converted to absolute internally
 - D-Bus screenshot returns raw ARGB32 premultiplied pixels, not PNG — the `screenshot` tool handles conversion
-- `session_start` runs in `tokio::task::spawn_blocking` because EIS negotiation is blocking I/O
-- SIGCHLD is ignored at startup to prevent zombie accumulation
-- `find_ui_elements` is stubbed out — not yet implemented
+- EIS negotiation is blocking I/O, runs in `tokio::task::spawn_blocking`
+- D-Bus socket at `{host_xdg_dir}/bus` — accessible from both host and container via bind-mount
+- Container inherits all host config via overlayfs — no manual kwinrc/service configuration
