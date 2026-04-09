@@ -1,3 +1,6 @@
+#[expect(dead_code, reason = "wired into session lifecycle in the next task")]
+mod input_bridge;
+
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
