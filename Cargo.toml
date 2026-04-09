@@ -19,6 +19,7 @@ reis = "0.6"
 png = "0.17"
 serde-aux = "4.5"
 thiserror = "2"
+evdev = "0.13"
 
 [lints.clippy]
 wildcard_enum_match_arm = "deny"

@@ -370,6 +370,59 @@ async fn connect_session_bus(
     }
 }
 
+// ── uinput virtual devices ──────────────────────────────────────────────
+
+fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::PathBuf, evdev::uinput::VirtualDevice, std::path::PathBuf), KwinError> {
+    // Mouse: buttons + relative axes
+    let mut mouse_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
+    mouse_keys.insert(evdev::KeyCode::BTN_LEFT);
+    mouse_keys.insert(evdev::KeyCode::BTN_RIGHT);
+    mouse_keys.insert(evdev::KeyCode::BTN_MIDDLE);
+
+    let mut mouse_axes = evdev::AttributeSet::<evdev::RelativeAxisCode>::new();
+    mouse_axes.insert(evdev::RelativeAxisCode::REL_X);
+    mouse_axes.insert(evdev::RelativeAxisCode::REL_Y);
+    mouse_axes.insert(evdev::RelativeAxisCode::REL_WHEEL);
+    mouse_axes.insert(evdev::RelativeAxisCode::REL_HWHEEL);
+
+    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()?
+        .name("kwin-mcp-virtual-mouse")
+        .with_phys(c"kwin-mcp/mouse")?
+        .with_keys(&mouse_keys)?
+        .with_relative_axes(&mouse_axes)?
+        .build()?;
+
+    let mouse_path = mouse_dev
+        .enumerate_dev_nodes_blocking()?
+        .next()
+        .ok_or_else(|| KwinError::Msg("uinput mouse: no devnode".to_owned()))??;
+
+    // Keyboard: all standard keys (KEY_ESC=1 through KEY_MAX=0x2ff)
+    let mut kbd_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
+    let mut code: u16 = 1;
+    loop {
+        if code > 0x2ff { break; }
+        kbd_keys.insert(evdev::KeyCode::new(code));
+        code = match code.checked_add(1) {
+            Some(v) => v,
+            None => break,
+        };
+    }
+
+    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()?
+        .name("kwin-mcp-virtual-keyboard")
+        .with_phys(c"kwin-mcp/keyboard")?
+        .with_keys(&kbd_keys)?
+        .build()?;
+
+    let kbd_path = kbd_dev
+        .enumerate_dev_nodes_blocking()?
+        .next()
+        .ok_or_else(|| KwinError::Msg("uinput keyboard: no devnode".to_owned()))??;
+
+    Ok((mouse_dev, mouse_path, kbd_dev, kbd_path))
+}
+
 // ── Session ──────────────────────────────────────────────────────────────
 
 struct Session {
@@ -378,6 +431,8 @@ struct Session {
     bwrap_child: std::process::Child,
     bwrap_stdin: std::process::ChildStdin,
     host_xdg_dir: std::path::PathBuf,
+    _uinput_mouse: evdev::uinput::VirtualDevice,
+    _uinput_keyboard: evdev::uinput::VirtualDevice,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -772,6 +827,13 @@ impl KwinMcp {
                 $cmd &\n\
             done\n"
         );
+        // Create uinput virtual devices before bwrap so we can bind-mount them
+        let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) =
+            create_uinput_devices().map_err(|e| ver_err(format!("uinput: {e}")))?;
+        let mouse_evdev_str = mouse_evdev.display().to_string();
+        let kbd_evdev_str = kbd_evdev.display().to_string();
+        eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
+
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args([
             "--die-with-parent",
@@ -780,6 +842,8 @@ impl KwinMcp {
             "--dev", "/dev",
             "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
+            "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
+            "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
             "--proc", "/proc",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             "--tmpfs", "/tmp",
@@ -884,6 +948,8 @@ impl KwinMcp {
             bwrap_child,
             bwrap_stdin,
             host_xdg_dir,
+            _uinput_mouse: uinput_mouse,
+            _uinput_keyboard: uinput_keyboard,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
