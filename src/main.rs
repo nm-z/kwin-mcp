@@ -111,13 +111,32 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
 }
 
 fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
-    // Aliases for keys the keyboard-codes crate doesn't recognize
-    let normalized = match key.to_lowercase().as_str() {
-        "return" => "Enter",
-        "backspace" => "Backspace",
-        _ => key,
+    // Standalone key names that keyboard-codes can't parse (it requires modifier+key)
+    let standalone = match key.to_lowercase().as_str() {
+        "return" | "enter" => Some(28_u32),    // KEY_ENTER
+        "backspace" => Some(14),               // KEY_BACKSPACE
+        "tab" => Some(15),                     // KEY_TAB
+        "escape" | "esc" => Some(1),           // KEY_ESC
+        "space" => Some(57),                   // KEY_SPACE
+        "delete" | "del" => Some(111),         // KEY_DELETE
+        "insert" => Some(110),                 // KEY_INSERT
+        "home" => Some(102),                   // KEY_HOME
+        "end" => Some(107),                    // KEY_END
+        "pageup" | "page_up" => Some(104),     // KEY_PAGEUP
+        "pagedown" | "page_down" => Some(109), // KEY_PAGEDOWN
+        "up" => Some(103),                     // KEY_UP
+        "down" => Some(108),                   // KEY_DOWN
+        "left" => Some(105),                   // KEY_LEFT
+        "right" => Some(106),                  // KEY_RIGHT
+        "f1" => Some(59), "f2" => Some(60), "f3" => Some(61), "f4" => Some(62),
+        "f5" => Some(63), "f6" => Some(64), "f7" => Some(65), "f8" => Some(66),
+        "f9" => Some(67), "f10" => Some(68), "f11" => Some(87), "f12" => Some(88),
+        _ => None,
     };
-    match keyboard_codes::parser::parse_shortcut_with_aliases(normalized) {
+    if let Some(code) = standalone {
+        return Ok((Vec::new(), Some(code)));
+    }
+    match keyboard_codes::parser::parse_shortcut_with_aliases(key) {
         Ok(shortcut) => {
             let mods: Vec<u32> = shortcut
                 .modifiers
@@ -845,6 +864,8 @@ impl KwinMcp {
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
+            export QT_SCALE_FACTOR=1\n\
+            export GDK_SCALE=1\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p \"$HOME/.config\"\n\
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
