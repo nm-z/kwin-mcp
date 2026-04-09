@@ -389,7 +389,6 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 
     let mut mouse_dev = evdev::uinput::VirtualDevice::builder()?
         .name("kwin-mcp-virtual-mouse")
-        .with_phys(c"kwin-mcp/mouse")?
         .with_keys(&mouse_keys)?
         .with_relative_axes(&mouse_axes)?
         .build()?;
@@ -413,7 +412,6 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 
     let mut kbd_dev = evdev::uinput::VirtualDevice::builder()?
         .name("kwin-mcp-virtual-keyboard")
-        .with_phys(c"kwin-mcp/keyboard")?
         .with_keys(&kbd_keys)?
         .build()?;
 
