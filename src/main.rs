@@ -875,6 +875,12 @@ impl KwinMcp {
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
             sed -i 's/ScaleFactor=.*/ScaleFactor=1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             sed -i 's/ScreenScaleFactors=.*/ScreenScaleFactors=/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^font=.*/font=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^menuFont=.*/menuFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^smallestReadableFont=.*/smallestReadableFont=Noto Sans,12,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^toolBarFont=.*/toolBarFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^activeFont=.*/activeFont=Noto Sans,14,-1,5,700,0,0,0,0,0,0,0,0,0,0,1,Bold/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
+            sed -i 's/^fixed=.*/fixed=Hack,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
             printf '[Daemon]\\nAutolock=false\\nLockOnResume=false\\nTimeout=0\\n' > \"$HOME/.config/kscreenlockerrc\"\n\
             printf '[1]\\nDescription=No decorations, maximized\\nnoborder=true\\nnoborderrule=2\\nmaximizehoriz=true\\nmaximizehorizrule=2\\nmaximizevert=true\\nmaximizevertrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
