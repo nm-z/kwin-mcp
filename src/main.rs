@@ -868,7 +868,7 @@ impl KwinMcp {
             export GDK_SCALE=1\n\
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
             mkdir -p \"$HOME/.config/fontconfig\"\n\
-            printf '<?xml version=\"1.0\"?>\\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\\n<fontconfig>\\n<match target=\"font\">\\n<edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\\n<edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit>\\n<edit name=\"antialias\" mode=\"assign\"><bool>false</bool></edit>\\n<edit name=\"rgba\" mode=\"assign\"><const>none</const></edit>\\n</match>\\n</fontconfig>\\n' > \"$HOME/.config/fontconfig/fonts.conf\"\n\
+            printf '<?xml version=\"1.0\"?>\\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\\n<fontconfig>\\n<match target=\"font\">\\n<edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\\n<edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit>\\n<edit name=\"antialias\" mode=\"assign\"><bool>true</bool></edit>\\n<edit name=\"rgba\" mode=\"assign\"><const>none</const></edit>\\n</match>\\n</fontconfig>\\n' > \"$HOME/.config/fontconfig/fonts.conf\"\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p \"$HOME/.config\"\n\
             printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
