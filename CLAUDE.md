@@ -27,7 +27,7 @@ Everything lives in `src/main.rs` (~1744 lines). Key layers:
 - **Input parsing** (top of file): `parse_combo`, `char_key`, `btn_code` — maps key names and characters to evdev keycodes via `keyboard-codes` crate.
 - **KWin D-Bus proxies**: `KWinEis`, `KWinScreenShot2` — zbus proxy traits for EIS input and screenshots.
 - **EIS input**: `Eis` struct holds EIS context, pointer/button/scroll/keyboard devices. Methods: `from_fd()`, `move_abs()`, `button()`, `scroll_discrete()`, `scroll_smooth()`, `key()`. Negotiation is blocking (`tokio::task::spawn_blocking`).
-- **CDP integration**: `chromiumoxide::Browser` stored as `Option<Arc<Browser>>` in Session. When `launch_app` is called with `chromium: true`, injects `--remote-debugging-port=<free_port>` and connects via WebSocket. `find_ui_elements` dispatches via `match`: CDP path queries DOM for interactive elements, AT-SPI path traverses the accessibility tree.
+- **CDP integration**: `chromiumoxide::Browser` stored as `Option<Arc<Browser>>` in Session. `launch_app` always injects `--remote-debugging-port=<free_port>` and tries CDP connection (2s timeout) — Chromium apps respond, native apps ignore the flag. `find_ui_elements` dispatches via `match`: CDP path queries DOM for interactive elements, AT-SPI path traverses the accessibility tree.
 - **`Session` struct**: Owns the bwrap child process, bwrap stdin (for launch_app), D-Bus connection, EIS handle, host XDG dir, optional CDP browser handle. Created by `session_start`, destroyed by `session_stop`.
 - **`KwinMcp` struct**: `Arc<Mutex<Option<Session>>>` — the MCP server. Implements `ToolHandler` with 12 tools. `with_session()` gates all tools behind session existence.
 
@@ -46,7 +46,7 @@ Inside the container, an inline bash entrypoint starts: dbus-daemon (socket in s
 
 ## MCP Tools
 
-`session_start` spawns an isolated KWin Wayland session (1221x977, XWayland, own D-Bus). All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `active_window_info()` KWin scripting. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters. `find_ui_elements` searches by name/role — for Chromium/Electron apps launched with `chromium: true`, it queries the DOM via CDP instead of AT-SPI. `launch_app` accepts `chromium: bool` to inject `--remote-debugging-port` and establish a CDP WebSocket connection.
+`session_start` spawns an isolated KWin Wayland session (1221x977, XWayland, own D-Bus). All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `active_window_info()` KWin scripting. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters. `find_ui_elements` searches by name/role — automatically uses CDP DOM queries for Chromium/Electron apps, AT-SPI for native apps. `launch_app` auto-detects Chromium apps by injecting `--remote-debugging-port` and attempting CDP connection.
 
 ## Key Patterns
 

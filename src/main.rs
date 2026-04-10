@@ -799,8 +799,6 @@ struct KeyboardKeyParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
-    #[serde(default)]
-    chromium: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1336,7 +1334,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search UI elements by name/role/description (case-insensitive). Falls back to CDP DOM queries for Chromium apps launched with chromium: true.",
+        description = "Search UI elements by name/role/description (case-insensitive). Uses CDP DOM queries for Chromium/Electron apps, AT-SPI for native apps.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -1643,7 +1641,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch an application inside the container. Set chromium: true for Electron/Chromium apps to enable CDP-based element discovery in find_ui_elements."
+        description = "Launch an application inside the container. Automatically detects Chromium/Electron apps and enables CDP-based element discovery in find_ui_elements."
     )]
     async fn launch_app(
         &self,
@@ -1653,21 +1651,12 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // If chromium mode, find a free port for CDP
-        let cdp_port = if params.chromium {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-            let port = listener.local_addr().map_err(KwinError::from)?.port();
-            drop(listener);
-            Some(port)
-        } else {
-            None
-        };
+        // Always allocate a CDP port — Chromium apps will use it, others ignore the flag
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
+        let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
+        drop(listener);
 
-        let cmd = if let Some(port) = cdp_port {
-            format!("{} --remote-debugging-port={port}", params.command)
-        } else {
-            params.command.clone()
-        };
+        let cmd = format!("{} --remote-debugging-port={cdp_port}", params.command);
 
         let (conn, kwin_unique, xdg) = {
             let mut guard = self.session.lock().await;
@@ -1689,41 +1678,34 @@ impl KwinMcp {
             }
         }
 
-        // If chromium mode, connect CDP after window is up
-        if let Some(port) = cdp_port {
-            let cdp_url = format!("http://127.0.0.1:{port}");
-
-            // Poll for CDP readiness (up to 15s) — Browser::connect handles /json/version internally
-            let mut connected = false;
-            for _ in 0..75_u32 {
-                match chromiumoxide::Browser::connect(&cdp_url).await {
-                    Ok((browser, mut handler)) => {
-                        tokio::spawn(async move { while handler.next().await.is_some() {} });
-                        let mut guard = self.session.lock().await;
-                        if let Some(sess) = guard.as_mut() {
-                            sess.cdp_browser = Some(Arc::new(browser));
-                        }
-                        connected = true;
-                        break;
+        // Try CDP connection (short timeout — 2s). Chromium apps respond, others don't.
+        let cdp_url = format!("http://127.0.0.1:{cdp_port}");
+        let mut cdp_connected = false;
+        for _ in 0..10_u32 {
+            match chromiumoxide::Browser::connect(&cdp_url).await {
+                Ok((browser, mut handler)) => {
+                    tokio::spawn(async move { while handler.next().await.is_some() {} });
+                    let mut guard = self.session.lock().await;
+                    if let Some(sess) = guard.as_mut() {
+                        sess.cdp_browser = Some(Arc::new(browser));
                     }
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
+                    cdp_connected = true;
+                    break;
                 }
-            }
-            if !connected {
-                eprintln!("CDP endpoint not ready after 15s");
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
             }
         }
 
         match window_info {
             Some(info) => Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": info,
-                "cdp": cdp_port.is_some(),
+                "cdp": cdp_connected,
             })).await),
             None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
-                "cdp": false,
+                "cdp": cdp_connected,
             })).await),
         }
     }
