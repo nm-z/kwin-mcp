@@ -738,6 +738,7 @@ struct SessionStartParams {
     /// When true, agent writes persist to the host filesystem.
     /// When false (default), all writes are ephemeral.
     #[serde(default)]
+    #[allow(dead_code)]
     writable: bool,
 }
 
@@ -1600,27 +1601,81 @@ impl KwinMcp {
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
         use std::io::Write;
+        use futures::StreamExt;
+
+        // If chromium mode, find a free port for CDP
+        let cdp_port = if params.chromium {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
+            let port = listener.local_addr().map_err(KwinError::from)?.port();
+            drop(listener);
+            Some(port)
+        } else {
+            None
+        };
+
+        let cmd = if let Some(port) = cdp_port {
+            format!("{} --remote-debugging-port={port}", params.command)
+        } else {
+            params.command.clone()
+        };
+
         let (conn, kwin_unique, xdg) = {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
+            writeln!(sess.bwrap_stdin, "{cmd}").map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
             (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
         };
+
         // Poll for window readiness (up to 15s)
+        let mut window_info = None;
         for _ in 0..75_u32 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok((_, _, info)) = active_window_info(&conn, &kwin_unique, &xdg).await {
-                return Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
-                    "action": "launch", "command": params.command, "window": info,
-                })).await);
+                window_info = Some(info);
+                break;
             }
         }
-        Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
-            "action": "launch", "command": params.command, "window": "timeout",
-        })).await)
+
+        // If chromium mode, connect CDP after window is up
+        if let Some(port) = cdp_port {
+            let cdp_url = format!("http://127.0.0.1:{port}");
+
+            // Poll for CDP readiness (up to 15s) — Browser::connect handles /json/version internally
+            let mut connected = false;
+            for _ in 0..75_u32 {
+                match chromiumoxide::Browser::connect(&cdp_url).await {
+                    Ok((browser, mut handler)) => {
+                        tokio::spawn(async move { while handler.next().await.is_some() {} });
+                        let mut guard = self.session.lock().await;
+                        if let Some(sess) = guard.as_mut() {
+                            sess.cdp_browser = Some(browser);
+                        }
+                        connected = true;
+                        break;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+            if !connected {
+                eprintln!("CDP endpoint not ready after 15s");
+            }
+        }
+
+        match window_info {
+            Some(info) => Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
+                "action": "launch", "command": params.command, "window": info,
+                "cdp": cdp_port.is_some(),
+            })).await),
+            None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
+                "action": "launch", "command": params.command, "window": "timeout",
+                "cdp": false,
+            })).await),
+        }
     }
 }
 
