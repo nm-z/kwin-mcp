@@ -559,7 +559,7 @@ fn teardown(mut sess: Session) {
     if let Err(e) = std::fs::remove_dir_all(&sess.host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
 }
 
-async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, String), KwinError> {
+async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
@@ -574,7 +574,9 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
         w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
         w:w.frameGeometry.width,h:w.frameGeometry.height,\
-        title:w.caption,id:w.internalId.toString()}}) : 'null');"
+        title:w.caption,id:w.internalId.toString(),\
+        resourceClass:w.resourceClass,resourceName:w.resourceName,\
+        pid:w.pid}}) : 'null');"
     );
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
@@ -626,7 +628,8 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     }
     let info: WindowGeometry = serde_json::from_str(&json)?;
     #[expect(clippy::as_conversions)]
-    Ok((info.x.round() as i32, info.y.round() as i32, info.id))
+    let (x, y) = (info.x.round() as i32, info.y.round() as i32);
+    Ok((x, y, info))
 }
 
 struct KWinCallback {
@@ -655,6 +658,12 @@ struct WindowGeometry {
     y: f64,
     #[serde(default)]
     id: String,
+    #[serde(default, rename = "resourceClass")]
+    resource_class: String,
+    #[serde(default, rename = "resourceName")]
+    resource_name: String,
+    #[serde(default)]
+    pid: i32,
 }
 
 struct AtspiNode {
@@ -1202,7 +1211,8 @@ impl KwinMcp {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
-        let (_, _, win_id) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let (_, _, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let win_id = win_geo.id;
         let proxy = KWinScreenShot2Proxy::builder(&conn)
             .destination(kwin_unique.as_str())
             .map_err(KwinError::from)?
@@ -1651,61 +1661,98 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // Always allocate a CDP port — Chromium apps will use it, others ignore the flag
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-        let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
-        drop(listener);
-
-        let cmd = format!("{} --remote-debugging-port={cdp_port}", params.command);
-
+        // Launch the app normally first
         let (conn, kwin_unique, xdg) = {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.bwrap_stdin, "{cmd}").map_err(KwinError::from)?;
+            writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
             (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
         };
 
         // Poll for window readiness (up to 15s)
-        let mut window_info = None;
+        let mut win_geo = None;
         for _ in 0..75_u32 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok((_, _, info)) = active_window_info(&conn, &kwin_unique, &xdg).await {
-                window_info = Some(info);
+            if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await {
+                win_geo = Some(geo);
                 break;
             }
         }
 
-        // Try CDP connection (short timeout — 2s). Chromium apps respond, others don't.
-        let cdp_url = format!("http://127.0.0.1:{cdp_port}");
+        // Check KWin window properties to detect Chromium/Electron
         let mut cdp_connected = false;
-        for _ in 0..10_u32 {
-            match chromiumoxide::Browser::connect(&cdp_url).await {
-                Ok((browser, mut handler)) => {
-                    tokio::spawn(async move { while handler.next().await.is_some() {} });
+        if let Some(ref geo) = win_geo {
+            let rc = geo.resource_class.to_lowercase();
+            let rn = geo.resource_name.to_lowercase();
+            let is_chromium = rc.contains("electron") || rn.contains("electron")
+                || rc.contains("chromium") || rn.contains("chromium")
+                || rc.contains("chrome") || rn.contains("chrome");
+
+            if is_chromium {
+                // Kill the app, relaunch with --remote-debugging-port
+                if geo.pid > 0 {
                     let mut guard = self.session.lock().await;
                     if let Some(sess) = guard.as_mut() {
-                        sess.cdp_browser = Some(Arc::new(browser));
+                        let _ = writeln!(sess.bwrap_stdin, "kill {}", geo.pid);
+                        let _ = sess.bwrap_stdin.flush();
                     }
-                    cdp_connected = true;
-                    break;
                 }
-                Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
+                let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
+                drop(listener);
+
+                let cmd = format!("{} --remote-debugging-port={cdp_port}", params.command);
+                {
+                    let mut guard = self.session.lock().await;
+                    let sess = guard.as_mut().ok_or_else(|| {
+                        McpError::internal_error("no session", None)
+                    })?;
+                    writeln!(sess.bwrap_stdin, "{cmd}").map_err(KwinError::from)?;
+                    sess.bwrap_stdin.flush().map_err(KwinError::from)?;
+                }
+
+                // Wait for window again
+                for _ in 0..75_u32 {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if active_window_info(&conn, &kwin_unique, &xdg).await.is_ok() {
+                        break;
+                    }
+                }
+
+                // Connect CDP (2s timeout)
+                let cdp_url = format!("http://127.0.0.1:{cdp_port}");
+                for _ in 0..10_u32 {
+                    match chromiumoxide::Browser::connect(&cdp_url).await {
+                        Ok((browser, mut handler)) => {
+                            tokio::spawn(async move { while handler.next().await.is_some() {} });
+                            let mut guard = self.session.lock().await;
+                            if let Some(sess) = guard.as_mut() {
+                                sess.cdp_browser = Some(Arc::new(browser));
+                            }
+                            cdp_connected = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
                 }
             }
         }
 
-        match window_info {
-            Some(info) => Ok(structured_result(&peer, format!("launched: {} window: {info}", params.command), serde_json::json!({
-                "action": "launch", "command": params.command, "window": info,
+        match win_geo {
+            Some(geo) => Ok(structured_result(&peer, format!("launched: {} window: {}", params.command, geo.id), serde_json::json!({
+                "action": "launch", "command": params.command, "window": geo.id,
                 "cdp": cdp_connected,
             })).await),
             None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
-                "cdp": cdp_connected,
+                "cdp": false,
             })).await),
         }
     }
