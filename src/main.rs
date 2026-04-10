@@ -1623,7 +1623,6 @@ impl KwinMcp {
             sess.eis.key(code, true).map_err(KwinError::from)?;
             sess.eis.key(code, false).map_err(KwinError::from)?;
             if needs_shift { sess.eis.key(42, false).map_err(KwinError::from)?; }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
             "action": "type", "text": params.text,
