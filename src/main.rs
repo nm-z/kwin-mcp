@@ -2018,11 +2018,12 @@ impl KwinMcp {
         // Launch (with CDP port if Chromium — Chrome requires --user-data-dir for CDP)
         let launch_cmd = match cdp_port {
             Some(port) => {
-                let mut cmd = format!("{} --remote-debugging-port={port}", params.command);
-                if !cmd.contains("--user-data-dir") {
-                    cmd.push_str(" --user-data-dir=/tmp/chrome-cdp");
+                if params.command.contains("--user-data-dir") {
+                    format!("{} --remote-debugging-port={port}", params.command)
+                } else {
+                    // Copy profile THEN launch (chained so cp finishes before Chrome starts)
+                    format!("cp -r $HOME/.config/google-chrome /tmp/chrome-cdp 2>/dev/null && {} --user-data-dir=/tmp/chrome-cdp --remote-debugging-port={port}", params.command)
                 }
-                cmd
             }
             None => params.command.clone(),
         };
@@ -2031,11 +2032,6 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            // Copy real Chrome profile so user stays logged in (Chrome requires non-default --user-data-dir for CDP)
-            if cdp_port.is_some() && !params.command.contains("--user-data-dir") {
-                let _ = writeln!(sess.bwrap_stdin, "cp -r $HOME/.config/google-chrome /tmp/chrome-cdp 2>/dev/null");
-                let _ = sess.bwrap_stdin.flush();
-            }
             writeln!(sess.bwrap_stdin, "{launch_cmd}").map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
         }
