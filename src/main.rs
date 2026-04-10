@@ -474,6 +474,7 @@ struct Session {
     host_xdg_dir: std::path::PathBuf,
     _uinput_mouse: evdev::uinput::VirtualDevice,
     _uinput_keyboard: evdev::uinput::VirtualDevice,
+    cdp_browser: Option<chromiumoxide::Browser>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -547,6 +548,7 @@ async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<
 }
 
 fn teardown(mut sess: Session) {
+    drop(sess.cdp_browser);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -1157,6 +1159,7 @@ impl KwinMcp {
             host_xdg_dir,
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
+            cdp_browser: None,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
