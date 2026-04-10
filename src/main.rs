@@ -747,7 +747,6 @@ struct SessionStartParams {
     /// When true, agent writes persist to the host filesystem.
     /// When false (default), all writes are ephemeral.
     #[serde(default)]
-    #[allow(dead_code)]
     writable: bool,
 }
 
@@ -1193,11 +1192,10 @@ impl KwinMcp {
                         Ok::<String, zbus::Error>(r.0)
                     }
                 ).await;
-                if let Ok(Ok(xml)) = probe_result {
-                    if xml.contains("connectToEIS") {
-                        found = Some(name_str.to_owned());
-                        break;
-                    }
+                if let Ok(Ok(xml)) = probe_result
+                    && xml.contains("connectToEIS") {
+                    found = Some(name_str.to_owned());
+                    break;
                 }
             }
             if let Some(name) = found {
@@ -1606,24 +1604,28 @@ impl KwinMcp {
 
         match cdp_browser {
             Some(browser) => {
-                // CDP path for Chromium/Electron apps
+                // CDP path for Chromium/Electron apps — query all non-chrome:// pages
                 if let Ok(pages) = browser.pages().await {
-                    if let Some(page) = pages.into_iter().next() {
-                        let js = r#"JSON.stringify(
-                            [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
-                                .filter(el => el.offsetParent !== null)
-                                .map(el => {
-                                    const r = el.getBoundingClientRect();
-                                    return {
-                                        role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                                        text: (el.textContent || '').trim().slice(0, 80),
-                                        x: Math.round(r.x), y: Math.round(r.y),
-                                        w: Math.round(r.width), h: Math.round(r.height)
-                                    };
-                                })
-                        )"#;
-                        #[derive(Deserialize)]
-                        struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
+                    let js = r#"JSON.stringify(
+                        [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
+                            .filter(el => el.offsetParent !== null)
+                            .map(el => {
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                                    text: (el.textContent || '').trim().slice(0, 80),
+                                    x: Math.round(r.x), y: Math.round(r.y),
+                                    w: Math.round(r.width), h: Math.round(r.height)
+                                };
+                            })
+                    )"#;
+                    #[derive(Deserialize)]
+                    struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
+                    for page in &pages {
+                        let url = page.url().await.ok().flatten().unwrap_or_default();
+                        if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
+                            continue;
+                        }
                         if let Ok(result) = page.evaluate(js).await
                             && let Some(val) = result.value()
                             && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
