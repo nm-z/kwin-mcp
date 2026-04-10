@@ -1941,9 +1941,15 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Launch (with CDP port if Chromium)
+        // Launch (with CDP port + isolated user-data-dir if Chromium)
         let launch_cmd = match cdp_port {
-            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+            Some(port) => {
+                let mut cmd = params.command.clone();
+                if !cmd.contains("--user-data-dir") {
+                    cmd.push_str(" --user-data-dir=/tmp/chrome-cdp");
+                }
+                format!("{cmd} --remote-debugging-port={port}")
+            }
             None => params.command.clone(),
         };
         {
