@@ -1914,6 +1914,21 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
+        // Detect Chromium/Electron from command string to inject CDP flag
+        let cmd_lower = params.command.to_lowercase();
+        let cmd_chromium = cmd_lower.contains("chrom") || cmd_lower.contains("electron")
+            || cmd_lower.contains("code") || cmd_lower.contains("brave")
+            || cmd_lower.contains("edge") || cmd_lower.contains("vivaldi");
+
+        let cdp_port = if cmd_chromium {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
+            let port = listener.local_addr().map_err(KwinError::from)?.port();
+            drop(listener);
+            Some(port)
+        } else {
+            None
+        };
+
         // Record current active window ID before launching
         let (conn, kwin_unique, xdg) = {
             let guard = self.session.lock().await;
@@ -1926,13 +1941,17 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Launch the app
+        // Launch (with CDP port if Chromium)
+        let launch_cmd = match cdp_port {
+            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+            None => params.command.clone(),
+        };
         {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
+            writeln!(sess.bwrap_stdin, "{launch_cmd}").map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
         }
 
@@ -1947,64 +1966,31 @@ impl KwinMcp {
             }
         }
 
-        // Check KWin window properties to detect Chromium/Electron
+        // Connect CDP if command hinted Chromium OR window confirms it (5s timeout)
         let mut cdp_connected = false;
-        if let Some(ref geo) = win_geo {
-            let rc = geo.resource_class.to_lowercase();
-            let rn = geo.resource_name.to_lowercase();
-            let is_chromium = rc.contains("electron") || rn.contains("electron")
+        let win_chromium = win_geo.as_ref().map(|g| {
+            let rc = g.resource_class.to_lowercase();
+            let rn = g.resource_name.to_lowercase();
+            eprintln!("launch_app: resourceClass={rc} resourceName={rn} pid={}", g.pid);
+            rc.contains("electron") || rn.contains("electron")
                 || rc.contains("chromium") || rn.contains("chromium")
-                || rc.contains("chrome") || rn.contains("chrome");
-
-            if is_chromium {
-                // Kill the app, relaunch with --remote-debugging-port
-                if geo.pid > 0 {
-                    let mut guard = self.session.lock().await;
-                    if let Some(sess) = guard.as_mut() {
-                        let _ = writeln!(sess.bwrap_stdin, "kill {}", geo.pid);
-                        let _ = sess.bwrap_stdin.flush();
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-                let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
-                drop(listener);
-
-                let cmd = format!("{} --remote-debugging-port={cdp_port}", params.command);
-                {
-                    let mut guard = self.session.lock().await;
-                    let sess = guard.as_mut().ok_or_else(|| {
-                        McpError::internal_error("no session", None)
-                    })?;
-                    writeln!(sess.bwrap_stdin, "{cmd}").map_err(KwinError::from)?;
-                    sess.bwrap_stdin.flush().map_err(KwinError::from)?;
-                }
-
-                // Wait for window again
-                for _ in 0..75_u32 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    if active_window_info(&conn, &kwin_unique, &xdg).await.is_ok() {
+                || rc.contains("chrome") || rn.contains("chrome")
+        }).unwrap_or(false);
+        if let Some(port) = cdp_port.filter(|_| cmd_chromium || win_chromium) {
+            let cdp_url = format!("http://127.0.0.1:{port}");
+            for _ in 0..25_u32 {
+                match chromiumoxide::Browser::connect(&cdp_url).await {
+                    Ok((browser, mut handler)) => {
+                        tokio::spawn(async move { while handler.next().await.is_some() {} });
+                        let mut guard = self.session.lock().await;
+                        if let Some(sess) = guard.as_mut() {
+                            sess.cdp_browser = Some(Arc::new(browser));
+                        }
+                        cdp_connected = true;
                         break;
                     }
-                }
-
-                // Connect CDP (2s timeout)
-                let cdp_url = format!("http://127.0.0.1:{cdp_port}");
-                for _ in 0..10_u32 {
-                    match chromiumoxide::Browser::connect(&cdp_url).await {
-                        Ok((browser, mut handler)) => {
-                            tokio::spawn(async move { while handler.next().await.is_some() {} });
-                            let mut guard = self.session.lock().await;
-                            if let Some(sess) = guard.as_mut() {
-                                sess.cdp_browser = Some(Arc::new(browser));
-                            }
-                            cdp_connected = true;
-                            break;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                 }
             }
