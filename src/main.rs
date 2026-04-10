@@ -751,6 +751,14 @@ struct SessionStartParams {
     writable: bool,
 }
 
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+struct ScreenshotParams {
+    /// Crop region [x1, y1, x2, y2] for pixel-level detail on a specific area.
+    /// Coordinates are window-relative pixels. Omit for full screenshot.
+    #[serde(default)]
+    region: Option<[i32; 4]>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -829,7 +837,7 @@ impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
-            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1000x1000 screen.")
+            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1280x800 screen.")
     }
 }
 
@@ -992,7 +1000,7 @@ impl KwinMcp {
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width 1000 --height 1000 &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width 1280 --height 800 &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
@@ -1226,6 +1234,147 @@ impl KwinMcp {
         };
         eprintln!("session_start: EIS ready");
 
+        // Forward host wallet/secret services into the container's D-Bus
+        let wallet_conn = match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await {
+            Ok(conn) => conn,
+            Err(e) => return cleanup_err(format!("wallet_conn: {e}"), bwrap_child, bwrap_stdin),
+        };
+        let host_conn = match zbus::Connection::session().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("session_start: host bus unavailable, skipping wallet forwarding: {e}");
+                // Non-fatal — wallet forwarding is best-effort
+                let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
+                let workdir = host_xdg_dir.display().to_string();
+                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
+                let mut guard = self.session.lock().await;
+                *guard = Some(Session {
+                    kwin_conn, _proxy_conn: proxy_conn, kwin_unique_name: kwin_unique_name.clone(),
+                    eis, bwrap_child, bwrap_stdin, host_xdg_dir,
+                    _uinput_mouse: uinput_mouse, _uinput_keyboard: uinput_keyboard,
+                    cdp_browser: None,
+                });
+                return Ok(structured_result(&peer, msg, serde_json::json!({
+                    "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
+                    "commit": env!("GIT_HASH"), "bus": bus_name, "kwin_unique": kwin_unique_name,
+                    "workdir": workdir, "writable": writable,
+                })).await);
+            }
+        };
+        // Discover wallet/secret services on host bus
+        let host_dbus = zbus::fdo::DBusProxy::new(&host_conn).await
+            .map_err(|e| ver_err(format!("host DBus proxy: {e}")))?;
+        let host_names = host_dbus.list_names().await
+            .map_err(|e| ver_err(format!("host ListNames: {e}")))?;
+        let wallet_names: Vec<String> = host_names.iter()
+            .filter(|n| {
+                let s = n.as_str();
+                s.contains("wallet") || s.contains("kwalletd") || s == "org.freedesktop.secrets"
+            })
+            .map(|n| n.to_string())
+            .collect();
+        for name in &wallet_names {
+            match wallet_conn.request_name(name.as_str()).await {
+                Ok(_) => eprintln!("session_start: wallet forwarding claimed {name}"),
+                Err(e) => eprintln!("session_start: wallet forwarding skip {name}: {e}"),
+            }
+        }
+        if !wallet_names.is_empty() {
+            // Spawn forwarding task: container bus → host bus
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                let mut container_stream = zbus::MessageStream::from(&wallet_conn);
+                let mut host_stream = zbus::MessageStream::from(&host_conn);
+                let serial_counter = std::sync::atomic::AtomicU32::new(1);
+                while let Some(Ok(msg)) = container_stream.next().await {
+                    if msg.message_type() != zbus::message::Type::MethodCall { continue; }
+                    let header = msg.header();
+                    let path = match header.path() {
+                        Some(p) => p.to_owned(),
+                        None => continue,
+                    };
+                    let iface = header.interface().map(|i| i.to_owned());
+                    let member = match header.member() {
+                        Some(m) => m.to_owned(),
+                        None => continue,
+                    };
+                    let dest = match header.destination() {
+                        Some(d) => d.to_string(),
+                        None => continue,
+                    };
+                    let body = msg.body();
+                    let body_data = body.data();
+                    let sig = body.signature().to_owned();
+                    let serial = serial_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let serial_nz = match std::num::NonZeroU32::new(serial) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let host_msg = unsafe {
+                        zbus::message::Message::method_call(path, member)
+                            .and_then(|b| b.destination(dest.as_str()))
+                            .and_then(|b| match &iface { Some(i) => b.interface(i.clone()), None => Ok(b) })
+                            .map(|b| b.serial(serial_nz))
+                            .and_then(|b| b.build_raw_body(body_data.bytes(), sig, vec![]))
+                    };
+                    let host_msg = match host_msg {
+                        Ok(m) => m,
+                        Err(e) => { eprintln!("wallet fwd: build error: {e}"); continue; }
+                    };
+                    if let Err(e) = host_conn.send(&host_msg).await {
+                        eprintln!("wallet fwd: send error: {e}");
+                        continue;
+                    }
+                    // Wait for reply matching our serial (5s timeout)
+                    let reply_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async {
+                            while let Some(Ok(reply)) = host_stream.next().await {
+                                if reply.header().reply_serial() == Some(serial_nz) {
+                                    return Some(reply);
+                                }
+                            }
+                            None
+                        }
+                    ).await;
+                    let reply = match reply_result {
+                        Ok(Some(r)) => r,
+                        _ => { eprintln!("wallet fwd: reply timeout serial={serial}"); continue; }
+                    };
+                    // Forward reply back to container
+                    let fwd_reply = match reply.message_type() {
+                        zbus::message::Type::MethodReturn => {
+                            let rb = reply.body();
+                            let rd = rb.data();
+                            unsafe {
+                                zbus::message::Message::method_return(&msg.header())
+                                    .and_then(|b| b.build_raw_body(rd.bytes(), rb.signature().to_owned(), vec![]))
+                            }
+                        }
+                        zbus::message::Type::Error => {
+                            let err_name = match reply.header().error_name() {
+                                Some(e) => e.to_owned(),
+                                None => match "org.freedesktop.DBus.Error.Failed".try_into() {
+                                    Ok(n) => n,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let rb = reply.body();
+                            let rd = rb.data();
+                            unsafe {
+                                zbus::message::Message::error(&msg.header(), err_name)
+                                    .and_then(|b| b.build_raw_body(rd.bytes(), rb.signature().to_owned(), vec![]))
+                            }
+                        }
+                        zbus::message::Type::MethodCall | zbus::message::Type::Signal => continue,
+                    };
+                    if let Ok(fwd) = fwd_reply {
+                        let _ = wallet_conn.send(&fwd).await;
+                    }
+                }
+            });
+        }
+
         let bus_name = kwin_conn
             .unique_name()
             .map(|n| n.to_string())
@@ -1274,10 +1423,14 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Take a screenshot via KWin ScreenShot2 D-Bus interface. Returns the file URI.",
+        description = "Take a screenshot. Pass region [x1, y1, x2, y2] to crop a specific area at full resolution for pixel-level detail.",
         annotations(read_only_hint = true)
     )]
-    async fn screenshot(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn screenshot(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<ScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -1325,18 +1478,40 @@ impl KwinMcp {
                 rgba[di + 3] = pixels[si + 3];
             }
         }
+        // Crop if region specified
+        let (out_rgba, out_w, out_h) = if let Some([x1, y1, x2, y2]) = params.region {
+            let cx1 = u32::try_from(x1.max(0)).map_err(KwinError::from)?.min(width);
+            let cy1 = u32::try_from(y1.max(0)).map_err(KwinError::from)?.min(height);
+            let cx2 = u32::try_from(x2.max(0)).map_err(KwinError::from)?.min(width);
+            let cy2 = u32::try_from(y2.max(0)).map_err(KwinError::from)?.min(height);
+            let cw = cx2.saturating_sub(cx1);
+            let ch = cy2.saturating_sub(cy1);
+            if cw == 0 || ch == 0 {
+                return Err(McpError::invalid_params("region has zero area", None));
+            }
+            let mut cropped = vec![0u8; usize::try_from(cw * ch * 4).map_err(KwinError::from)?];
+            for row in 0..ch {
+                let src = usize::try_from((cy1 + row) * width * 4 + cx1 * 4).map_err(KwinError::from)?;
+                let dst = usize::try_from(row * cw * 4).map_err(KwinError::from)?;
+                let len = usize::try_from(cw * 4).map_err(KwinError::from)?;
+                cropped[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
+            }
+            (cropped, cw, ch)
+        } else {
+            (rgba, width, height)
+        };
         let path = xdg.join("screenshot.png");
         let file = std::fs::File::create(&path).map_err(KwinError::from)?;
-        let mut enc = png::Encoder::new(file, width, height);
+        let mut enc = png::Encoder::new(file, out_w, out_h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header().map_err(KwinError::from)?;
-        writer.write_image_data(&rgba).map_err(KwinError::from)?;
+        writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
         let path_str = path.to_string_lossy().to_string();
-        Ok(structured_result(&peer, format!("{path_str} size={width}x{height}"), serde_json::json!({
+        Ok(structured_result(&peer, format!("{path_str} size={out_w}x{out_h}"), serde_json::json!({
             "path": path_str,
-            "width": width,
-            "height": height,
+            "width": out_w,
+            "height": out_h,
         })).await)
     }
 
@@ -1470,56 +1645,65 @@ impl KwinMcp {
                 }
             }
             None => {
-                // AT-SPI path for native apps
-                use atspi::proxy::accessible::ObjectRefExt;
-                let zbus_conn = self.with_session(|s| {
-                    Ok(s.kwin_conn.clone())
-                }).await?;
-                let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
-                    .await
-                    .map_err(KwinError::from)?
-                    .get_address()
-                    .await
-                    .map_err(KwinError::from)?;
-                let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
-                let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
-                    .destination("org.a11y.atspi.Registry")
-                    .map_err(KwinError::from)?
-                    .cache_properties(zbus::proxy::CacheProperties::No)
-                    .build()
-                    .await
-                    .map_err(KwinError::from)?;
-                let mut stack = root
-                    .get_children()
-                    .await
-                    .map_err(KwinError::from)?
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>();
-                while let Some(obj) = stack.pop() {
-                    let acc = match obj.as_accessible_proxy(&a11y_bus).await {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let node = match atspi_node(&acc).await {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    if node.is_useful()
-                        && (node.name.to_lowercase().contains(&query)
-                            || node.role.to_lowercase().contains(&query))
-                    {
-                        let (x, y, w, h) = node.bounds;
-                        out.push(format!(
-                            "{}\t{}\t({}, {}, {}x{})",
-                            node.role, node.name, x, y, w, h
-                        ));
+                // AT-SPI path for native apps (5s timeout)
+                let atspi_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    use atspi::proxy::accessible::ObjectRefExt;
+                    let zbus_conn = self.with_session(|s| {
+                        Ok(s.kwin_conn.clone())
+                    }).await?;
+                    let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
+                        .await
+                        .map_err(KwinError::from)?
+                        .get_address()
+                        .await
+                        .map_err(KwinError::from)?;
+                    let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
+                        .await
+                        .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
+                    let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
+                        .destination("org.a11y.atspi.Registry")
+                        .map_err(KwinError::from)?
+                        .cache_properties(zbus::proxy::CacheProperties::No)
+                        .build()
+                        .await
+                        .map_err(KwinError::from)?;
+                    let mut stack = root
+                        .get_children()
+                        .await
+                        .map_err(KwinError::from)?
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>();
+                    let mut results = Vec::new();
+                    while let Some(obj) = stack.pop() {
+                        let acc = match obj.as_accessible_proxy(&a11y_bus).await {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        let node = match atspi_node(&acc).await {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+                        if node.is_useful()
+                            && (node.name.to_lowercase().contains(&query)
+                                || node.role.to_lowercase().contains(&query))
+                        {
+                            let (x, y, w, h) = node.bounds;
+                            results.push(format!(
+                                "{}\t{}\t({}, {}, {}x{})",
+                                node.role, node.name, x, y, w, h
+                            ));
+                        }
+                        for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
+                            stack.push(child);
+                        }
                     }
-                    for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
-                        stack.push(child);
-                    }
+                    Ok::<Vec<String>, McpError>(results)
+                }).await;
+                match atspi_result {
+                    Ok(Ok(results)) => out.extend(results),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => eprintln!("find_ui_elements: AT-SPI traversal timed out after 5s"),
                 }
             }
         }
