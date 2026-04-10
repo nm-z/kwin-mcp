@@ -1046,6 +1046,7 @@ impl KwinMcp {
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
             "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
+            "--ro-bind-try", "/run/dbus", "/run/dbus",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
@@ -2014,9 +2015,15 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Launch (with CDP port if Chromium — clear profile locks first)
+        // Launch (with CDP port if Chromium — Chrome requires --user-data-dir for CDP)
         let launch_cmd = match cdp_port {
-            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+            Some(port) => {
+                let mut cmd = format!("{} --remote-debugging-port={port}", params.command);
+                if !cmd.contains("--user-data-dir") {
+                    cmd.push_str(" --user-data-dir=/tmp/chrome-cdp");
+                }
+                cmd
+            }
             None => params.command.clone(),
         };
         {
@@ -2024,17 +2031,11 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            if cdp_port.is_some() && !launch_cmd.contains("--user-data-dir") {
-                // Overlay breaks Chrome's LevelDB flock — must use real tmpfs dir.
-                // Copy login state from real profile so user stays authenticated.
-                let _ = writeln!(sess.bwrap_stdin, "mkdir -p /tmp/chrome-cdp/Default && cp $HOME/.config/google-chrome/Default/Cookies $HOME/.config/google-chrome/Default/Login\\ Data $HOME/.config/google-chrome/Default/Web\\ Data $HOME/.config/google-chrome/Local\\ State /tmp/chrome-cdp/ 2>/dev/null; cp $HOME/.config/google-chrome/Default/Cookies $HOME/.config/google-chrome/Default/Login\\ Data $HOME/.config/google-chrome/Default/Web\\ Data /tmp/chrome-cdp/Default/ 2>/dev/null");
+            // Copy real Chrome profile so user stays logged in (Chrome requires non-default --user-data-dir for CDP)
+            if cdp_port.is_some() && !params.command.contains("--user-data-dir") {
+                let _ = writeln!(sess.bwrap_stdin, "cp -r $HOME/.config/google-chrome /tmp/chrome-cdp 2>/dev/null");
                 let _ = sess.bwrap_stdin.flush();
             }
-            let launch_cmd = if cdp_port.is_some() && !launch_cmd.contains("--user-data-dir") {
-                format!("{launch_cmd} --user-data-dir=/tmp/chrome-cdp")
-            } else {
-                launch_cmd
-            };
             writeln!(sess.bwrap_stdin, "{launch_cmd}").map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
         }
