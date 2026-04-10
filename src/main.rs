@@ -1347,98 +1347,101 @@ impl KwinMcp {
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
 
-        // If CDP session exists, use it directly — skip AT-SPI (Electron apps don't expose it)
         let cdp_browser = self.session.lock().await
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
 
-        if let Some(browser) = cdp_browser {
-            if let Ok(pages) = browser.pages().await {
-                if let Some(page) = pages.into_iter().next() {
-                    let js = r#"JSON.stringify(
-                        [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
-                            .filter(el => el.offsetParent !== null)
-                            .map(el => {
-                                const r = el.getBoundingClientRect();
-                                return {
-                                    role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                                    text: (el.textContent || '').trim().slice(0, 80),
-                                    x: Math.round(r.x), y: Math.round(r.y),
-                                    w: Math.round(r.width), h: Math.round(r.height)
-                                };
-                            })
-                    )"#;
-                    #[derive(Deserialize)]
-                    struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
-                    if let Ok(result) = page.evaluate(js).await
-                        && let Some(val) = result.value()
-                        && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
-                        && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
-                    {
-                        for el in &elements {
-                            if el.w > 1 && el.h > 1
-                                && (el.text.to_lowercase().contains(&query)
-                                    || el.role.to_lowercase().contains(&query))
-                            {
-                                out.push(format!(
-                                    "{}\t{}\t({}, {}, {}x{})",
-                                    el.role, el.text, el.x, el.y, el.w, el.h
-                                ));
+        match cdp_browser {
+            Some(browser) => {
+                // CDP path for Chromium/Electron apps
+                if let Ok(pages) = browser.pages().await {
+                    if let Some(page) = pages.into_iter().next() {
+                        let js = r#"JSON.stringify(
+                            [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
+                                .filter(el => el.offsetParent !== null)
+                                .map(el => {
+                                    const r = el.getBoundingClientRect();
+                                    return {
+                                        role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                                        text: (el.textContent || '').trim().slice(0, 80),
+                                        x: Math.round(r.x), y: Math.round(r.y),
+                                        w: Math.round(r.width), h: Math.round(r.height)
+                                    };
+                                })
+                        )"#;
+                        #[derive(Deserialize)]
+                        struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
+                        if let Ok(result) = page.evaluate(js).await
+                            && let Some(val) = result.value()
+                            && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
+                            && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
+                        {
+                            for el in &elements {
+                                if el.w > 1 && el.h > 1
+                                    && (el.text.to_lowercase().contains(&query)
+                                        || el.role.to_lowercase().contains(&query))
+                                {
+                                    out.push(format!(
+                                        "{}\t{}\t({}, {}, {}x{})",
+                                        el.role, el.text, el.x, el.y, el.w, el.h
+                                    ));
+                                }
                             }
                         }
                     }
                 }
             }
-        } else {
-            // AT-SPI path for native apps
-            use atspi::proxy::accessible::ObjectRefExt;
-            let zbus_conn = self.with_session(|s| {
-                Ok(s.kwin_conn.clone())
-            }).await?;
-            let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
-                .await
-                .map_err(KwinError::from)?
-                .get_address()
-                .await
-                .map_err(KwinError::from)?;
-            let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
-                .await
-                .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
-            let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
-                .destination("org.a11y.atspi.Registry")
-                .map_err(KwinError::from)?
-                .cache_properties(zbus::proxy::CacheProperties::No)
-                .build()
-                .await
-                .map_err(KwinError::from)?;
-            let mut stack = root
-                .get_children()
-                .await
-                .map_err(KwinError::from)?
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            while let Some(obj) = stack.pop() {
-                let acc = match obj.as_accessible_proxy(&a11y_bus).await {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let node = match atspi_node(&acc).await {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                if node.is_useful()
-                    && (node.name.to_lowercase().contains(&query)
-                        || node.role.to_lowercase().contains(&query))
-                {
-                    let (x, y, w, h) = node.bounds;
-                    out.push(format!(
-                        "{}\t{}\t({}, {}, {}x{})",
-                        node.role, node.name, x, y, w, h
-                    ));
-                }
-                for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
-                    stack.push(child);
+            None => {
+                // AT-SPI path for native apps
+                use atspi::proxy::accessible::ObjectRefExt;
+                let zbus_conn = self.with_session(|s| {
+                    Ok(s.kwin_conn.clone())
+                }).await?;
+                let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
+                    .await
+                    .map_err(KwinError::from)?
+                    .get_address()
+                    .await
+                    .map_err(KwinError::from)?;
+                let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
+                let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
+                    .destination("org.a11y.atspi.Registry")
+                    .map_err(KwinError::from)?
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await
+                    .map_err(KwinError::from)?;
+                let mut stack = root
+                    .get_children()
+                    .await
+                    .map_err(KwinError::from)?
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                while let Some(obj) = stack.pop() {
+                    let acc = match obj.as_accessible_proxy(&a11y_bus).await {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let node = match atspi_node(&acc).await {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if node.is_useful()
+                        && (node.name.to_lowercase().contains(&query)
+                            || node.role.to_lowercase().contains(&query))
+                    {
+                        let (x, y, w, h) = node.bounds;
+                        out.push(format!(
+                            "{}\t{}\t({}, {}, {}x{})",
+                            node.role, node.name, x, y, w, h
+                        ));
+                    }
+                    for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
+                        stack.push(child);
+                    }
                 }
             }
         }
