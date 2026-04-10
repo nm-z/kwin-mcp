@@ -1515,7 +1515,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Get AT-SPI2 accessibility tree with widget roles, names, states, bounding boxes. By default hides zero-rect/internal nodes; set show_elements=true to include them.",
+        description = "Get accessibility tree with widget roles, names, states, bounding boxes. Uses CDP for Chromium/Electron apps, AT-SPI2 for native apps. By default hides zero-rect/internal nodes; set show_elements=true to include them.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -1523,6 +1523,76 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        // CDP path for Chromium/Electron apps
+        let cdp_browser = self.session.lock().await
+            .as_ref()
+            .and_then(|s| s.cdp_browser.clone());
+        if let Some(browser) = cdp_browser
+            && let Ok(pages) = browser.pages().await {
+                for page in &pages {
+                    let url = page.url().await.ok().flatten().unwrap_or_default();
+                    if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
+                        continue;
+                    }
+                    use chromiumoxide::cdp::browser_protocol::accessibility::{
+                        GetFullAxTreeParams, GetFullAxTreeReturns,
+                    };
+                    let depth = params.max_depth.map(i64::from);
+                    let mut cmd = GetFullAxTreeParams::builder();
+                    if let Some(d) = depth { cmd = cmd.depth(d); }
+                    if let Ok(result) = page.execute(cmd.build()).await {
+                        let returns: &GetFullAxTreeReturns = &result;
+                        // Build parent→children index
+                        let mut children_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                        let mut node_map: std::collections::HashMap<String, &chromiumoxide::cdp::browser_protocol::accessibility::AxNode> = std::collections::HashMap::new();
+                        let mut root_ids = Vec::new();
+                        for node in &returns.nodes {
+                            let id = node.node_id.inner().to_string();
+                            node_map.insert(id.clone(), node);
+                            if let Some(ref pid) = node.parent_id {
+                                children_map.entry(pid.inner().to_string()).or_default().push(id);
+                            } else {
+                                root_ids.push(id);
+                            }
+                        }
+                        // Walk tree depth-first
+                        let show = params.show_elements.unwrap_or(false);
+                        let role_filter = params.role.as_ref().map(|s| s.to_lowercase());
+                        let mut out = Vec::new();
+                        let mut stack: Vec<(String, usize)> = root_ids.into_iter().rev().map(|id| (id, 0_usize)).collect();
+                        while let Some((id, depth_level)) = stack.pop() {
+                            if let Some(node) = node_map.get(&id) {
+                                if node.ignored && !show { /* skip */ } else {
+                                    let role = node.role.as_ref()
+                                        .and_then(|v| v.value.as_ref())
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("none");
+                                    let name = node.name.as_ref()
+                                        .and_then(|v| v.value.as_ref())
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !name.is_empty() || show {
+                                        let dominated = role_filter.as_ref()
+                                            .map(|f| role.to_lowercase().contains(f))
+                                            .unwrap_or(true);
+                                        if dominated {
+                                            out.push(format!("{}{}\t{}", "  ".repeat(depth_level), role, name));
+                                        }
+                                    }
+                                }
+                                if let Some(kids) = children_map.get(&id) {
+                                    for kid in kids.iter().rev() {
+                                        stack.push((kid.clone(), depth_level + 1));
+                                    }
+                                }
+                            }
+                        }
+                        let tree = out.join("\n");
+                        return Ok(structured_result(&peer, tree.clone(), serde_json::json!({"tree": tree, "source": "cdp"})).await);
+                    }
+                }
+            }
+        // AT-SPI path for native apps
         use atspi::proxy::accessible::ObjectRefExt;
         let zbus_conn = self.with_session(|s| {
             Ok(s.kwin_conn.clone())
