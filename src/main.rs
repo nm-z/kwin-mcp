@@ -1045,8 +1045,6 @@ impl KwinMcp {
             "--proc", "/proc",
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
-            "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
-            "--ro-bind-try", "/run/dbus", "/run/dbus",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
@@ -1988,11 +1986,16 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // Detect Chromium/Electron from command string to inject CDP flag
+        // Detect Chromium/Electron apps that support CDP on the default profile
+        // Google Chrome and Edge block CDP without --user-data-dir, so skip them
         let cmd_lower = params.command.to_lowercase();
-        let cmd_chromium = cmd_lower.contains("chrom") || cmd_lower.contains("electron")
-            || cmd_lower.contains("code") || cmd_lower.contains("brave")
-            || cmd_lower.contains("edge") || cmd_lower.contains("vivaldi");
+        let cmd_chromium = if cmd_lower.contains("google-chrome") || cmd_lower.contains("edge") {
+            false
+        } else {
+            cmd_lower.contains("chromium") || cmd_lower.contains("electron")
+                || cmd_lower.contains("code") || cmd_lower.contains("brave")
+                || cmd_lower.contains("vivaldi")
+        };
 
         let cdp_port = if cmd_chromium {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
@@ -2015,16 +2018,8 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Launch (with CDP port if Chromium — Chrome requires --user-data-dir for CDP)
         let launch_cmd = match cdp_port {
-            Some(port) => {
-                if params.command.contains("--user-data-dir") {
-                    format!("{} --remote-debugging-port={port}", params.command)
-                } else {
-                    // Copy profile THEN launch (chained so cp finishes before Chrome starts)
-                    format!("cp -r $HOME/.config/google-chrome /tmp/chrome-cdp 2>/dev/null && {} --user-data-dir=/tmp/chrome-cdp --remote-debugging-port={port}", params.command)
-                }
-            }
+            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
             None => params.command.clone(),
         };
         {
