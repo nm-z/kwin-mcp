@@ -830,12 +830,12 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Start an isolated KDE Wayland session in a container for GUI automation. Must be called before any other tool."
+        description = "Start an isolated KDE Wayland session. Set writable=true to persist writes to host filesystem (default: false, all writes ephemeral). Must be called before any other tool."
     )]
     async fn session_start(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
-        Parameters(_params): Parameters<SessionStartParams>,
+        Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -879,53 +879,70 @@ impl KwinMcp {
             <allow receive_type=\"signal\"/><allow own=\"*\"/></policy>\
             </busconfig>"
         )).map_err(|e| ver_err(format!("write atspi config: {e}")))?;
-        // Inline entrypoint: sets up XDG, starts dbus/kwin/services, reads stdin for launch_app
-        let entrypoint = format!(
-            "set -u\n\
-            export XDG_RUNTIME_DIR={xdg_dir_str}\n\
-            export WAYLAND_DISPLAY=wayland-0\n\
-            export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
-            export QT_SCALE_FACTOR=1\n\
-            export GDK_SCALE=1\n\
-            export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
-            mkdir -p \"$HOME/.config/fontconfig\"\n\
-            printf '<?xml version=\"1.0\"?>\\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\\n<fontconfig>\\n<match target=\"font\">\\n<edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\\n<edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit>\\n<edit name=\"antialias\" mode=\"assign\"><bool>true</bool></edit>\\n<edit name=\"rgba\" mode=\"assign\"><const>none</const></edit>\\n</match>\\n</fontconfig>\\n' > \"$HOME/.config/fontconfig/fonts.conf\"\n\
-            rm -rf \"$HOME/.cache/fontconfig\" && fc-cache -f 2>/dev/null\n\
-            export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
-            mkdir -p \"$HOME/.config\"\n\
-            printf '[org.kde.kdecoration2]\\nBorderSize=None\\nShadowSize=0\\n\\n[Compositing]\\nLockScreenAutoLockEnabled=false\\n' > \"$HOME/.config/kwinrc\"\n\
-            sed -i 's/ScaleFactor=.*/ScaleFactor=1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/ScreenScaleFactors=.*/ScreenScaleFactors=/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/XftHintStyle=.*/XftHintStyle=hintnone/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/XftSubPixel=.*/XftSubPixel=none/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            printf '[General]\\nforceFontDPI=96\\n' > \"$HOME/.config/kcmfonts\"\n\
-            sed -i 's/^font=.*/font=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/^menuFont=.*/menuFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/^smallestReadableFont=.*/smallestReadableFont=Noto Sans,12,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/^toolBarFont=.*/toolBarFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/^activeFont=.*/activeFont=Noto Sans,14,-1,5,700,0,0,0,0,0,0,0,0,0,0,1,Bold/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            sed -i 's/^fixed=.*/fixed=Hack,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1/' \"$HOME/.config/kdeglobals\" 2>/dev/null\n\
-            printf '[Daemon]\\nAutolock=false\\nLockOnResume=false\\nTimeout=0\\n' > \"$HOME/.config/kscreenlockerrc\"\n\
-            printf '[1]\\nDescription=No decorations, maximized\\nnoborder=true\\nnoborderrule=2\\nmaximizehoriz=true\\nmaximizehorizrule=2\\nmaximizevert=true\\nmaximizevertrule=2\\nwmclassmatch=0\\n\\n[General]\\ncount=1\\nrules=1\\n' > \"$HOME/.config/kwinrulesrc\"\n\
-            printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
-            dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
-            dbus_pid=$!\n\
-            n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
-            export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
-            touch '{xdg_dir_str}/dbus-ready'\n\
-            n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
-            KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width 1000 --height 1000 &\n\
-            sleep 0.3\n\
-            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
-            at-spi-bus-launcher --launch-immediately &\n\
-            pipewire &\n\
-            wireplumber &\n\
-            while read -r cmd; do\n\
-                $cmd &\n\
-            done\n"
-        );
-        // Write fontconfig overrides to bind-mount over system files that force hinting/subpixel
+        // Write kwin-mcp display config files to host_xdg_dir for --ro-bind mounting.
+        // Protected from agent writes in both ephemeral and writable modes.
+        let kwinrc_path = host_xdg_dir.join("kwinrc");
+        std::fs::write(&kwinrc_path,
+            "[org.kde.kdecoration2]\nBorderSize=None\nShadowSize=0\n\n\
+             [Compositing]\nLockScreenAutoLockEnabled=false\n"
+        ).map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
+        let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
+        std::fs::write(&kwinrulesrc_path,
+            "[1]\nDescription=No decorations, maximized\nnoborder=true\nnoborderrule=2\n\
+             maximizehoriz=true\nmaximizehorizrule=2\nmaximizevert=true\nmaximizevertrule=2\n\
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+        ).map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
+        let kscreenlockerrc_path = host_xdg_dir.join("kscreenlockerrc");
+        std::fs::write(&kscreenlockerrc_path,
+            "[Daemon]\nAutolock=false\nLockOnResume=false\nTimeout=0\n"
+        ).map_err(|e| ver_err(format!("write kscreenlockerrc: {e}")))?;
+        let kcmfonts_path = host_xdg_dir.join("kcmfonts");
+        std::fs::write(&kcmfonts_path,
+            "[General]\nforceFontDPI=96\n"
+        ).map_err(|e| ver_err(format!("write kcmfonts: {e}")))?;
+        let fonts_conf_path = host_xdg_dir.join("fonts.conf");
+        std::fs::write(&fonts_conf_path,
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+             <fontconfig>\n\
+             <match target=\"font\">\n\
+             <edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\n\
+             <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit>\n\
+             <edit name=\"antialias\" mode=\"assign\"><bool>true</bool></edit>\n\
+             <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit>\n\
+             </match>\n\
+             </fontconfig>\n"
+        ).map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
+        // Read host kdeglobals and patch display settings for the virtual session
+        let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
+        let real_kdeglobals = std::path::Path::new(&home).join(".config/kdeglobals");
+        let mut kdeglobals_content = std::fs::read_to_string(&real_kdeglobals).unwrap_or_default();
+        let replacements = [
+            ("ScaleFactor=", "ScaleFactor=1"),
+            ("ScreenScaleFactors=", "ScreenScaleFactors="),
+            ("XftHintStyle=", "XftHintStyle=hintnone"),
+            ("XftSubPixel=", "XftSubPixel=none"),
+            ("font=", "font=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+            ("menuFont=", "menuFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+            ("smallestReadableFont=", "smallestReadableFont=Noto Sans,12,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+            ("toolBarFont=", "toolBarFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+            ("activeFont=", "activeFont=Noto Sans,14,-1,5,700,0,0,0,0,0,0,0,0,0,0,1,Bold"),
+            ("fixed=", "fixed=Hack,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+        ];
+        for (prefix, replacement) in replacements {
+            kdeglobals_content = kdeglobals_content
+                .lines()
+                .map(|line| {
+                    if line.starts_with(prefix) { replacement.to_owned() }
+                    else { line.to_owned() }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        let kdeglobals_path = host_xdg_dir.join("kdeglobals");
+        std::fs::write(&kdeglobals_path, &kdeglobals_content)
+            .map_err(|e| ver_err(format!("write kdeglobals: {e}")))?;
+        // Write fontconfig system overrides to bind-mount over files that force hinting/subpixel
         let fc_hinting_path = host_xdg_dir.join("10-hinting-none.conf");
         std::fs::write(&fc_hinting_path, "\
             <?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
@@ -948,6 +965,36 @@ impl KwinMcp {
         ).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
         let fc_hinting_str = fc_hinting_path.display().to_string();
         let fc_lcd_str = fc_lcd_path.display().to_string();
+        // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
+        let entrypoint = format!(
+            "set -u\n\
+            export XDG_RUNTIME_DIR={xdg_dir_str}\n\
+            export WAYLAND_DISPLAY=wayland-0\n\
+            export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
+            export QT_SCALE_FACTOR=1\n\
+            export GDK_SCALE=1\n\
+            export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
+            export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
+            export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
+            mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
+            printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
+            dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
+            dbus_pid=$!\n\
+            n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
+            touch '{xdg_dir_str}/dbus-ready'\n\
+            n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
+            kwin_wayland --virtual --xwayland --no-lockscreen --width 1000 --height 1000 &\n\
+            sleep 0.3\n\
+            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
+            at-spi-bus-launcher --launch-immediately &\n\
+            pipewire &\n\
+            wireplumber &\n\
+            while read -r cmd; do\n\
+                $cmd &\n\
+            done\n"
+        );
         // Create uinput virtual devices before bwrap so we can bind-mount them
         let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) =
             create_uinput_devices().map_err(|e| ver_err(format!("uinput: {e}")))?;
@@ -955,13 +1002,27 @@ impl KwinMcp {
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
 
-        let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
+        let writable = params.writable;
         let mut cmd = std::process::Command::new("bwrap");
+        cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+        if writable {
+            cmd.args(["--bind", "/", "/"]);
+        } else {
+            cmd.args(["--ro-bind", "/", "/", "--overlay-src", &home, "--tmp-overlay", &home]);
+        }
+        let kwinrc_str = kwinrc_path.display().to_string();
+        let kdeglobals_str = kdeglobals_path.display().to_string();
+        let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
+        let kscreenlockerrc_str = kscreenlockerrc_path.display().to_string();
+        let kcmfonts_str = kcmfonts_path.display().to_string();
+        let fonts_conf_str = fonts_conf_path.display().to_string();
+        let home_kwinrc = format!("{home}/.config/kwinrc");
+        let home_kdeglobals = format!("{home}/.config/kdeglobals");
+        let home_kwinrulesrc = format!("{home}/.config/kwinrulesrc");
+        let home_kscreenlockerrc = format!("{home}/.config/kscreenlockerrc");
+        let home_kcmfonts = format!("{home}/.config/kcmfonts");
+        let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
         cmd.args([
-            "--die-with-parent",
-            "--unshare-pid", "--unshare-uts", "--unshare-ipc",
-            "--ro-bind", "/", "/",
-            "--overlay-src", &home, "--tmp-overlay", &home,
             "--dev", "/dev",
             "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
@@ -971,9 +1032,17 @@ impl KwinMcp {
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
             "--bind", &xdg_dir_str, &xdg_dir_str,
+            // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
             "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
             "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
+            // $HOME config overrides (read-only — protects display settings from agent writes)
+            "--ro-bind", &kwinrc_str, &home_kwinrc,
+            "--ro-bind", &kdeglobals_str, &home_kdeglobals,
+            "--ro-bind", &kwinrulesrc_str, &home_kwinrulesrc,
+            "--ro-bind", &kscreenlockerrc_str, &home_kscreenlockerrc,
+            "--ro-bind", &kcmfonts_str, &home_kcmfonts,
+            "--ro-bind", &fonts_conf_str, &home_fonts_conf,
             "--", "bash", "-c", &entrypoint,
         ]);
         cmd.stdin(std::process::Stdio::piped());
@@ -1155,7 +1224,7 @@ impl KwinMcp {
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
-        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
+        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
@@ -1176,6 +1245,7 @@ impl KwinMcp {
             "bus": bus_name,
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
+            "writable": writable,
         })).await)
     }
 
