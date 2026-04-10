@@ -734,7 +734,12 @@ async fn atspi_node(
 // ── Tool parameter structs ──────────────────────────────────────────────
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
-struct SessionStartParams {}
+struct SessionStartParams {
+    /// When true, agent writes persist to the host filesystem.
+    /// When false (default), all writes are ephemeral.
+    #[serde(default)]
+    writable: bool,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
@@ -793,6 +798,8 @@ struct KeyboardKeyParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
+    #[serde(default)]
+    chromium: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
