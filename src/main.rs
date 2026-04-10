@@ -1006,7 +1006,7 @@ impl KwinMcp {
             pipewire &\n\
             wireplumber &\n\
             while read -r cmd; do\n\
-                $cmd &\n\
+                eval \"$cmd\" &\n\
             done\n"
         );
         // Create uinput virtual devices before bwrap so we can bind-mount them
@@ -2013,15 +2013,9 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Launch (with CDP port + isolated user-data-dir if Chromium)
+        // Launch (with CDP port if Chromium — clear profile locks first)
         let launch_cmd = match cdp_port {
-            Some(port) => {
-                let mut cmd = params.command.clone();
-                if !cmd.contains("--user-data-dir") {
-                    cmd.push_str(" --user-data-dir=/tmp/chrome-cdp");
-                }
-                format!("{cmd} --remote-debugging-port={port}")
-            }
+            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
             None => params.command.clone(),
         };
         {
@@ -2029,6 +2023,17 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
+            if cdp_port.is_some() && !launch_cmd.contains("--user-data-dir") {
+                // Overlay breaks Chrome's LevelDB flock — must use real tmpfs dir.
+                // Copy login state from real profile so user stays authenticated.
+                let _ = writeln!(sess.bwrap_stdin, "mkdir -p /tmp/chrome-cdp/Default && cp $HOME/.config/google-chrome/Default/Cookies $HOME/.config/google-chrome/Default/Login\\ Data $HOME/.config/google-chrome/Default/Web\\ Data $HOME/.config/google-chrome/Local\\ State /tmp/chrome-cdp/ 2>/dev/null; cp $HOME/.config/google-chrome/Default/Cookies $HOME/.config/google-chrome/Default/Login\\ Data $HOME/.config/google-chrome/Default/Web\\ Data /tmp/chrome-cdp/Default/ 2>/dev/null");
+                let _ = sess.bwrap_stdin.flush();
+            }
+            let launch_cmd = if cdp_port.is_some() && !launch_cmd.contains("--user-data-dir") {
+                format!("{launch_cmd} --user-data-dir=/tmp/chrome-cdp")
+            } else {
+                launch_cmd
+            };
             writeln!(sess.bwrap_stdin, "{launch_cmd}").map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
         }
