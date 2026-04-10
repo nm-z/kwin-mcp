@@ -572,8 +572,8 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     let script = format!(
         "var w = workspace.activeWindow;\
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
-        w ? JSON.stringify({{x:w.frameGeometry.x,y:w.frameGeometry.y,\
-        w:w.frameGeometry.width,h:w.frameGeometry.height,\
+        w ? JSON.stringify({{x:w.clientGeometry.x,y:w.clientGeometry.y,\
+        w:w.clientGeometry.width,h:w.clientGeometry.height,\
         title:w.caption,id:w.internalId.toString(),\
         resourceClass:w.resourceClass,resourceName:w.resourceName,\
         pid:w.pid}}) : 'null');"
