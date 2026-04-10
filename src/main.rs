@@ -1336,7 +1336,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search UI elements by name/role/description (case-insensitive).",
+        description = "Search UI elements by name/role/description (case-insensitive). Falls back to CDP DOM queries for Chromium apps launched with chromium: true.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -1639,7 +1639,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch an application inside the container by command (e.g. 'kate', 'konsole')."
+        description = "Launch an application inside the container. Set chromium: true for Electron/Chromium apps to enable CDP-based element discovery in find_ui_elements."
     )]
     async fn launch_app(
         &self,
