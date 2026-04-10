@@ -1914,22 +1914,34 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // Launch the app normally first
+        // Record current active window ID before launching
         let (conn, kwin_unique, xdg) = {
+            let guard = self.session.lock().await;
+            let sess = guard.as_ref().ok_or_else(|| {
+                McpError::internal_error("no session — call session_start first", None)
+            })?;
+            (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
+        };
+        let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
+            .map(|(_, _, geo)| geo.id)
+            .ok();
+
+        // Launch the app
+        {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
             writeln!(sess.bwrap_stdin, "{}", params.command).map_err(KwinError::from)?;
             sess.bwrap_stdin.flush().map_err(KwinError::from)?;
-            (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
-        };
+        }
 
-        // Poll for window readiness (up to 15s)
+        // Poll until a NEW window appears (different ID from before launch)
         let mut win_geo = None;
         for _ in 0..75_u32 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await {
+            if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await
+                && prev_window_id.as_deref() != Some(&geo.id) {
                 win_geo = Some(geo);
                 break;
             }
