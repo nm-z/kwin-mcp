@@ -1045,6 +1045,7 @@ impl KwinMcp {
             "--proc", "/proc",
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
+            "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
