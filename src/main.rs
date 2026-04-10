@@ -474,7 +474,7 @@ struct Session {
     host_xdg_dir: std::path::PathBuf,
     _uinput_mouse: evdev::uinput::VirtualDevice,
     _uinput_keyboard: evdev::uinput::VirtualDevice,
-    cdp_browser: Option<chromiumoxide::Browser>,
+    cdp_browser: Option<Arc<chromiumoxide::Browser>>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -1396,6 +1396,52 @@ impl KwinMcp {
                 stack.push(child);
             }
         }
+        // CDP fallback: try DOM queries if AT-SPI found nothing and a chromium session exists
+        if out.is_empty() {
+            let cdp_browser = self.session.lock().await
+                .as_ref()
+                .and_then(|s| s.cdp_browser.clone());
+
+            if let Some(browser) = cdp_browser {
+                if let Ok(pages) = browser.pages().await {
+                    if let Some(page) = pages.into_iter().next() {
+                        let js = r#"JSON.stringify(
+                            [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
+                                .filter(el => el.offsetParent !== null)
+                                .map(el => {
+                                    const r = el.getBoundingClientRect();
+                                    return {
+                                        role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                                        text: (el.textContent || '').trim().slice(0, 80),
+                                        x: Math.round(r.x), y: Math.round(r.y),
+                                        w: Math.round(r.width), h: Math.round(r.height)
+                                    };
+                                })
+                        )"#;
+                        #[derive(Deserialize)]
+                        struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
+                        if let Ok(result) = page.evaluate(js).await
+                            && let Some(val) = result.value()
+                            && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
+                            && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
+                        {
+                            for el in &elements {
+                                if el.w > 1 && el.h > 1
+                                    && (el.text.to_lowercase().contains(&query)
+                                        || el.role.to_lowercase().contains(&query))
+                                {
+                                    out.push(format!(
+                                        "{}\t{}\t({}, {}, {}x{})",
+                                        el.role, el.text, el.x, el.y, el.w, el.h
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if out.is_empty() {
             Ok(structured_result(&peer, format!("no elements matching '{}'", params.query), serde_json::json!({"matches": 0, "query": params.query})).await)
         } else {
@@ -1651,7 +1697,7 @@ impl KwinMcp {
                         tokio::spawn(async move { while handler.next().await.is_some() {} });
                         let mut guard = self.session.lock().await;
                         if let Some(sess) = guard.as_mut() {
-                            sess.cdp_browser = Some(browser);
+                            sess.cdp_browser = Some(Arc::new(browser));
                         }
                         connected = true;
                         break;
