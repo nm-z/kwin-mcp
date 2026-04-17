@@ -78,6 +78,10 @@ const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
 // launch_app: CDP connect retry.
 const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
+// screenshot cursor=true: half-edge of crop region around cursor (output covers
+// CURSOR_ZOOM_HALF_EDGE*2 source pixels). Render size / source pixels = zoom factor.
+const CURSOR_ZOOM_HALF_EDGE: i32 = 50;
+
 // ── Virtual-session display & font settings ──────────────────────────────
 
 const VIRTUAL_SCREEN_WIDTH: u32 = 2000;
@@ -685,12 +689,13 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
         .to_string();
     let script = format!(
         "var w = workspace.activeWindow;\
+        var c = workspace.cursorPos;\
         callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
         w ? JSON.stringify({{x:w.clientGeometry.x,y:w.clientGeometry.y,\
         w:w.clientGeometry.width,h:w.clientGeometry.height,\
         title:w.caption,id:w.internalId.toString(),\
         resourceClass:w.resourceClass,resourceName:w.resourceName,\
-        pid:w.pid}}) : 'null');"
+        pid:w.pid,cx:c.x,cy:c.y}}) : 'null');"
     );
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
@@ -1032,6 +1037,10 @@ struct WindowGeometry {
     resource_name: String,
     #[serde(default)]
     pid: i32,
+    #[serde(default)]
+    cx: f64,
+    #[serde(default)]
+    cy: f64,
 }
 
 struct AtspiNode {
@@ -1124,6 +1133,11 @@ struct ScreenshotParams {
     /// Coordinates are window-relative pixels. Omit for full screenshot.
     #[serde(default)]
     region: Option<[i32; 4]>,
+    /// When true, return a 10x-upscaled crop centered on the current cursor
+    /// position. Useful for confirming exactly what the cursor is hovering or
+    /// where a click would land. Mutually exclusive with `region`.
+    #[serde(default)]
+    cursor: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1758,7 +1772,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. Requires an active window (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. Pass cursor=true to crop a 100x100 px region centered on the cursor (~10x effective zoom when rendered) — useful for verifying exactly what the cursor is hovering or where a click would land. region and cursor are mutually exclusive. Requires an active window (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -1769,8 +1783,23 @@ impl KwinMcp {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
-        let (_, _, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
-        let win_id = win_geo.id;
+        if params.cursor && params.region.is_some() {
+            return Err(McpError::invalid_params("region and cursor are mutually exclusive", None));
+        }
+        let (win_x, win_y, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let win_id = win_geo.id.clone();
+        let region = if params.cursor {
+            #[expect(clippy::as_conversions)]
+            let (cx, cy) = (win_geo.cx.round() as i32 - win_x, win_geo.cy.round() as i32 - win_y);
+            Some([
+                cx - CURSOR_ZOOM_HALF_EDGE,
+                cy - CURSOR_ZOOM_HALF_EDGE,
+                cx + CURSOR_ZOOM_HALF_EDGE,
+                cy + CURSOR_ZOOM_HALF_EDGE,
+            ])
+        } else {
+            params.region
+        };
         let proxy = KWinScreenShot2Proxy::builder(&conn)
             .destination(kwin_unique.as_str())
             .map_err(KwinError::from)?
@@ -1814,7 +1843,7 @@ impl KwinMcp {
             }
         }
         // Crop if region specified
-        let (out_rgba, out_w, out_h) = if let Some([x1, y1, x2, y2]) = params.region {
+        let (out_rgba, out_w, out_h) = if let Some([x1, y1, x2, y2]) = region {
             let cx1 = u32::try_from(x1.max(0)).map_err(KwinError::from)?.min(width);
             let cy1 = u32::try_from(y1.max(0)).map_err(KwinError::from)?.min(height);
             let cx2 = u32::try_from(x2.max(0)).map_err(KwinError::from)?.min(width);
