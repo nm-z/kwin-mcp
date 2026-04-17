@@ -1259,8 +1259,9 @@ impl KwinMcp {
         }
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-        let _ = std::fs::remove_dir_all(&host_xdg_dir);
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
+        cleanup_stale_session_files(&host_xdg_dir);
+        std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
         eprintln!(
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
