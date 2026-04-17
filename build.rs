@@ -18,7 +18,6 @@ fn main() {
 
     println!("cargo:rustc-env=GIT_HASH={hash}");
     println!("cargo:rustc-env=BUILD_NUMBER={n}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs/heads");
-    println!("cargo:rerun-if-changed={build_file}");
+    // Run build.rs every build so GIT_HASH and BUILD_NUMBER are always fresh.
+    println!("cargo:rerun-if-changed=NONEXISTENT_FILE_FORCE_RERUN");
 }
