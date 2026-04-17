@@ -1493,7 +1493,6 @@ impl KwinMcp {
             None => {
                 let _ = bwrap_child.kill();
                 let _ = bwrap_child.wait();
-                let _ = std::fs::remove_dir_all(&host_xdg_dir);
                 return Err(ver_err("bwrap stdin not available".to_owned()));
             }
         };
@@ -1511,7 +1510,6 @@ impl KwinMcp {
             if let Ok(signed) = i32::try_from(dbus_proxy_pid) {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(signed), nix::sys::signal::Signal::SIGTERM);
             }
-            let _ = std::fs::remove_dir_all(&host_xdg_dir);
             Err(ver_err(message))
         };
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
