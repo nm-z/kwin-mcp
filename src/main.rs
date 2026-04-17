@@ -1096,7 +1096,7 @@ impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
-            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 1280x800 screen.")
+            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 2576x1455 screen.")
     }
 }
 
@@ -1259,7 +1259,7 @@ impl KwinMcp {
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width 1280 --height 800 &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width 2576 --height 1455 &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
