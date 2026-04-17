@@ -620,7 +620,6 @@ async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<
     r
 }
 
-#[allow(dead_code)]
 fn cleanup_stale_session_files(dir: &std::path::Path) {
     const STALE_FILES: &[&str] = &[
         "bus",
@@ -671,7 +670,7 @@ fn teardown(mut sess: Session) {
         let _ = proxy.kill();
         let _ = proxy.wait();
     }
-    if let Err(e) = std::fs::remove_dir_all(&sess.host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
+    cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
 async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
