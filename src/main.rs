@@ -30,21 +30,68 @@ impl From<KwinError> for McpError {
     }
 }
 
-const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const STARTUP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+// ── Kernel / protocol constants ──────────────────────────────────────────
+
+// Linux evdev keycode for LeftShift (include/uapi/linux/input-event-codes.h).
+const LINUX_KEY_LEFTSHIFT: u32 = 42;
+
+// KWin org.kde.KWin.EIS.RemoteDesktop.connectToEIS() capabilities bitfield.
+// bit 0 (0b001) = keyboard, bit 1 (0b010) = pointer, bit 2 (0b100) = touch.
+// 0b011 = keyboard + pointer (what this server needs).
+const EIS_CAPS_KBD_POINTER: i32 = 0b011;
+
+// ── Timings ──────────────────────────────────────────────────────────────
+
+use std::time::Duration;
+
+// Session startup: general session-bus / wayland socket wait.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_POLL: Duration = Duration::from_millis(50);
+
+// EIS (Emulated Input Sender) negotiation.
+const EIS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
+const EIS_NEGOTIATION_POLL: Duration = Duration::from_millis(50);
+
+// xdg-dbus-proxy socket appearance.
+const DBUS_PROXY_TIMEOUT: Duration = Duration::from_secs(3);
+const DBUS_PROXY_POLL: Duration = Duration::from_millis(20);
+
+// KWin unique-name discovery: per-candidate introspect probe timeout.
+const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+// AT-SPI tree traversal hard timeout (find_ui_elements).
+const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Input-event pacing (clicks, drag steps, key hold).
+const INPUT_EVENT_DELAY: Duration = Duration::from_millis(50);
+
+// Mouse drag interpolation step count.
+const DRAG_STEPS: i32 = 20;
+
+// Pixels per smooth-scroll tick.
+const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
+
+// launch_app: window-appear polling.
+const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
+
+// launch_app: CDP connect retry.
+const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
 // ── Virtual-session display & font settings ──────────────────────────────
-// Tuned for the 1280x800 virtual KWin session — no HiDPI scaling, no hinting/
-// subpixel AA (pixel-exact capture for the screenshot tool and the AI agent).
 
-const KDE_SCALE_FACTOR: &str = "1";
-const KDE_FORCE_FONT_DPI: u32 = 96;
-const KDE_HINT_STYLE: &str = "hintnone";
-const KDE_SUB_PIXEL: &str = "none";
+const VIRTUAL_SCREEN_WIDTH: u32 = 2000;
+const VIRTUAL_SCREEN_HEIGHT: u32 = 1875;
+
+const KDE_SCALE_FACTOR: &str = "1"; // 1 | 2 | 3
+const KDE_FORCE_FONT_DPI: u32 = 96; // 96 | 120 | 144 | 192
+const KDE_HINT_STYLE: &str = "hintnone"; // hintnone | hintslight | hintmedium | hintfull
+const KDE_SUB_PIXEL: &str = "none"; // none | rgb | bgr | vrgb | vbgr
 
 const UI_FONT_FAMILY: &str = "Noto Sans";
 const UI_FONT_SIZE: u32 = 14;
 const UI_FONT_SIZE_SMALL: u32 = 12;
+
 const FIXED_FONT_FAMILY: &str = "Hack";
 const FIXED_FONT_SIZE: u32 = 14;
 
@@ -262,7 +309,7 @@ impl Eis {
         let serial = conv.connection().serial();
         let (mut dev, mut kbd_d) = (None, None);
         let (mut abs, mut bt, mut sc, mut kb) = (None, None, None, None);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + EIS_NEGOTIATION_TIMEOUT;
         loop {
             if dev.is_some() && kb.is_some() { break; }
             if std::time::Instant::now() > deadline { anyhow::bail!("EIS negotiation timed out"); }
@@ -340,7 +387,7 @@ impl Eis {
                     | reis::event::EiEvent::TouchCancel(_) => {}
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(EIS_NEGOTIATION_POLL);
         }
         Ok(Self {
             context,
@@ -1119,8 +1166,8 @@ struct FindUiElementsParams {
 impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
-            .with_server_info(Implementation::new("kwin-mcp", "0.1.0"))
-            .with_instructions("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a 2000x1875 screen.")
+            .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .with_instructions(format!("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} screen."))
     }
 }
 
@@ -1287,7 +1334,7 @@ impl KwinMcp {
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width 2000 --height 1875 &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width {VIRTUAL_SCREEN_WIDTH} --height {VIRTUAL_SCREEN_HEIGHT} &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
@@ -1319,9 +1366,9 @@ impl KwinMcp {
         dbus_proxy_cmd.stderr(std::process::Stdio::inherit());
         eprintln!("session_start: spawning xdg-dbus-proxy → {proxy_sock_str}");
         let dbus_proxy_child = dbus_proxy_cmd.spawn().map_err(|e| ver_err(format!("xdg-dbus-proxy: {e}")))?;
-        let proxy_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let proxy_deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
         while !proxy_sock.exists() && std::time::Instant::now() < proxy_deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(DBUS_PROXY_POLL);
         }
         if !proxy_sock.exists() {
             return Err(ver_err("xdg-dbus-proxy socket never appeared".to_owned()));
@@ -1502,7 +1549,7 @@ impl KwinMcp {
                 if name_str == proxy_unique || name_str == kwin_conn_unique { continue; }
                 // Quick probe with timeout — Introspect the EIS path
                 let probe_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
+                    KWIN_NAME_PROBE_TIMEOUT,
                     async {
                         let p: zbus::Proxy = zbus::proxy::Builder::new(&kwin_conn)
                             .destination(name_str)?
@@ -1540,8 +1587,7 @@ impl KwinMcp {
             Ok(p) => p,
             Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin),
         };
-        // capabilities: 1=keyboard, 2=pointer, 4=touch -> 3 = keyboard+pointer
-        let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(3).await {
+        let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await {
             Ok(r) => r,
             Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin),
         };
@@ -1953,7 +1999,7 @@ impl KwinMcp {
             }
             None => {
                 // AT-SPI path for native apps (5s timeout)
-                let atspi_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let atspi_result = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
                     use atspi::proxy::accessible::ObjectRefExt;
                     let zbus_conn = self.with_session(|s| {
                         Ok(s.kwin_conn.clone())
@@ -2049,10 +2095,10 @@ impl KwinMcp {
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         for n in 0..count {
             if n > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(INPUT_EVENT_DELAY).await;
             }
             sess.eis.button(code, true).map_err(KwinError::from)?;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
             sess.eis.button(code, false).map_err(KwinError::from)?;
         }
         Ok(structured_result(&peer, format!("clicked ({x},{y}) x{count}"), serde_json::json!({
@@ -2108,7 +2154,7 @@ impl KwinMcp {
             let (dx, dy) = if horiz { (delta, 0) } else { (0, delta) };
             sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
         } else {
-            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?) * 15.0;
+            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?) * SCROLL_SMOOTH_PIXELS_PER_TICK;
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
         }
@@ -2140,12 +2186,11 @@ impl KwinMcp {
         let ay = f32::from(i16::try_from(wy + from_y).map_err(KwinError::from)?);
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         sess.eis.button(code, true).map_err(KwinError::from)?;
-        let steps = 20i32;
-        for step in 1..=steps {
-            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / steps).map_err(KwinError::from)?);
-            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / steps).map_err(KwinError::from)?);
+        for step in 1..=DRAG_STEPS {
+            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / DRAG_STEPS).map_err(KwinError::from)?);
+            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / DRAG_STEPS).map_err(KwinError::from)?);
             sess.eis.move_abs(cx, cy).map_err(KwinError::from)?;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
         }
         sess.eis.button(code, false).map_err(KwinError::from)?;
         Ok(structured_result(&peer, format!("dragged ({from_x},{from_y})->({to_x},{to_y})"), serde_json::json!({
@@ -2168,10 +2213,10 @@ impl KwinMcp {
         })?;
         for ch in params.text.chars() {
             let (code, needs_shift) = char_key(ch)?;
-            if needs_shift { sess.eis.key(42, true).map_err(KwinError::from)?; }
+            if needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, true).map_err(KwinError::from)?; }
             sess.eis.key(code, true).map_err(KwinError::from)?;
             sess.eis.key(code, false).map_err(KwinError::from)?;
-            if needs_shift { sess.eis.key(42, false).map_err(KwinError::from)?; }
+            if needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, false).map_err(KwinError::from)?; }
         }
         Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
             "action": "type", "text": params.text,
@@ -2199,7 +2244,7 @@ impl KwinMcp {
             McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
         })?;
         sess.eis.key(k, true).map_err(KwinError::from)?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(INPUT_EVENT_DELAY).await;
         sess.eis.key(k, false).map_err(KwinError::from)?;
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(KwinError::from)?;
@@ -2268,8 +2313,8 @@ impl KwinMcp {
 
         // Poll until a NEW window appears (different ID from before launch)
         let mut win_geo = None;
-        for _ in 0..75_u32 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..LAUNCH_WINDOW_POLLS {
+            tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
             if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await
                 && prev_window_id.as_deref() != Some(&geo.id) {
                 win_geo = Some(geo);
@@ -2289,7 +2334,7 @@ impl KwinMcp {
         }).unwrap_or(false);
         if let Some(port) = cdp_port.filter(|_| cmd_chromium || win_chromium) {
             let cdp_url = format!("http://127.0.0.1:{port}");
-            for _ in 0..25_u32 {
+            for _ in 0..CDP_CONNECT_POLLS {
                 match chromiumoxide::Browser::connect(&cdp_url).await {
                     Ok((browser, mut handler)) => {
                         tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -2301,7 +2346,7 @@ impl KwinMcp {
                         break;
                     }
                     Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
                     }
                 }
             }
