@@ -467,6 +467,7 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 struct Session {
     kwin_conn: zbus::Connection,       // talks to KWin via its unique name
     _proxy_conn: zbus::Connection,    // owns org.kde.KWin, has InputDevice objects (kept alive)
+    _wallet_conn: zbus::Connection,   // owns org.kde.kwalletd6, serves KWalletEmulator (kept alive)
     kwin_unique_name: String,
     eis: Eis,
     bwrap_child: std::process::Child,
@@ -475,6 +476,7 @@ struct Session {
     _uinput_mouse: evdev::uinput::VirtualDevice,
     _uinput_keyboard: evdev::uinput::VirtualDevice,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
+    dbus_proxy_child: Option<std::process::Child>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -556,6 +558,10 @@ fn teardown(mut sess: Session) {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
     }
     let _ = sess.bwrap_child.wait();
+    if let Some(mut proxy) = sess.dbus_proxy_child.take() {
+        let _ = proxy.kill();
+        let _ = proxy.wait();
+    }
     if let Err(e) = std::fs::remove_dir_all(&sess.host_xdg_dir) { eprintln!("teardown cleanup: {e}"); }
 }
 
@@ -650,6 +656,260 @@ impl KWinCallback {
             Err(e) => eprintln!("callback lock poisoned: {e}"),
         }
     }
+}
+
+// ── KWallet emulator — serves snapshot of host kwallet inside container ──
+
+struct WalletData {
+    network_wallet: String,
+    // folder → key → password bytes
+    entries: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>>>,
+}
+
+struct KWalletEmulator {
+    data: Arc<WalletData>,
+}
+
+#[zbus::interface(name = "org.kde.KWallet")]
+impl KWalletEmulator {
+    #[zbus(name = "isEnabled")]
+    async fn is_enabled(&self) -> bool { true }
+
+    #[zbus(name = "networkWallet")]
+    async fn network_wallet(&self) -> String { self.data.network_wallet.clone() }
+
+    #[zbus(name = "localWallet")]
+    async fn local_wallet(&self) -> String { self.data.network_wallet.clone() }
+
+    #[zbus(name = "wallets")]
+    async fn wallets(&self) -> Vec<String> { vec![self.data.network_wallet.clone()] }
+
+    #[zbus(name = "isOpen")]
+    async fn is_open(&self, _wallet: String) -> bool { true }
+
+    #[zbus(name = "open")]
+    async fn open(&self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        wallet: String, _w_id: i64, _appid: String,
+    ) -> i32 {
+        let emitter = emitter.to_owned();
+        tokio::spawn(async move {
+            let _ = Self::wallet_opened(&emitter, &wallet).await;
+        });
+        1
+    }
+
+    #[zbus(name = "openPath")]
+    async fn open_path(&self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        path: String, _w_id: i64, _appid: String,
+    ) -> i32 {
+        let emitter = emitter.to_owned();
+        tokio::spawn(async move {
+            let _ = Self::wallet_opened(&emitter, &path).await;
+        });
+        1
+    }
+
+    #[zbus(name = "openAsync")]
+    async fn open_async(&self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        _wallet: String, _w_id: i64, _appid: String, _handle_session: bool,
+    ) -> i32 {
+        let emitter = emitter.to_owned();
+        // tId must be positive and match what we'll emit in the walletAsyncOpened signal.
+        let tid: i32 = 1;
+        let handle: i32 = 1;
+        tokio::spawn(async move {
+            let _ = Self::wallet_async_opened(&emitter, tid, handle).await;
+        });
+        tid
+    }
+
+    #[zbus(signal, name = "walletAsyncOpened")]
+    async fn wallet_async_opened(emitter: &zbus::object_server::SignalEmitter<'_>, t_id: i32, handle: i32) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "walletOpened")]
+    async fn wallet_opened(emitter: &zbus::object_server::SignalEmitter<'_>, wallet: &str) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "walletClosed")]
+    async fn wallet_closed(emitter: &zbus::object_server::SignalEmitter<'_>, wallet: &str) -> zbus::Result<()>;
+
+    #[zbus(name = "close")]
+    async fn close(&self, _handle: i32, _force: bool, _appid: String) -> i32 { 0 }
+
+    #[zbus(name = "closeWallet")]
+    async fn close_wallet(&self, _wallet: String, _force: bool) -> i32 { 0 }
+
+    #[zbus(name = "sync")]
+    async fn sync(&self, _handle: i32, _appid: String) {}
+
+    #[zbus(name = "disconnectApplication")]
+    async fn disconnect_application(&self, _wallet: String, _appid: String) -> bool { true }
+
+    #[zbus(name = "folderList")]
+    async fn folder_list(&self, _handle: i32, _appid: String) -> Vec<String> {
+        match self.data.entries.lock() {
+            Ok(e) => e.keys().cloned().collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[zbus(name = "hasFolder")]
+    async fn has_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
+        match self.data.entries.lock() {
+            Ok(e) => e.contains_key(&folder),
+            Err(_) => false,
+        }
+    }
+
+    #[zbus(name = "createFolder")]
+    async fn create_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
+        if let Ok(mut e) = self.data.entries.lock() {
+            e.entry(folder).or_insert_with(std::collections::HashMap::new);
+            true
+        } else { false }
+    }
+
+    #[zbus(name = "entryList")]
+    async fn entry_list(&self, _handle: i32, folder: String, _appid: String) -> Vec<String> {
+        match self.data.entries.lock() {
+            Ok(e) => e.get(&folder).map(|f| f.keys().cloned().collect()).unwrap_or_default(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[zbus(name = "hasEntry")]
+    async fn has_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> bool {
+        match self.data.entries.lock() {
+            Ok(e) => e.get(&folder).is_some_and(|f| f.contains_key(&key)),
+            Err(_) => false,
+        }
+    }
+
+    #[zbus(name = "entryType")]
+    async fn entry_type(&self, _handle: i32, folder: String, key: String, _appid: String) -> i32 {
+        match self.data.entries.lock() {
+            Ok(e) => if e.get(&folder).is_some_and(|f| f.contains_key(&key)) { 1 } else { 0 },
+            Err(_) => 0,
+        }
+    }
+
+    #[zbus(name = "readPassword")]
+    async fn read_password(&self, _handle: i32, folder: String, key: String, _appid: String) -> String {
+        match self.data.entries.lock() {
+            Ok(e) => e.get(&folder)
+                .and_then(|f| f.get(&key))
+                .and_then(|b| String::from_utf8(b.clone()).ok())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    #[zbus(name = "readEntry")]
+    async fn read_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> Vec<u8> {
+        match self.data.entries.lock() {
+            Ok(e) => e.get(&folder).and_then(|f| f.get(&key)).cloned().unwrap_or_default(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[zbus(name = "writePassword")]
+    async fn write_password(&self, _handle: i32, folder: String, key: String, value: String, _appid: String) -> i32 {
+        if let Ok(mut e) = self.data.entries.lock() {
+            e.entry(folder).or_insert_with(std::collections::HashMap::new).insert(key, value.into_bytes());
+        }
+        0
+    }
+
+    #[zbus(name = "writeEntry")]
+    async fn write_entry(&self, _handle: i32, folder: String, key: String, value: Vec<u8>, _entry_type: i32, _appid: String) -> i32 {
+        if let Ok(mut e) = self.data.entries.lock() {
+            e.entry(folder).or_insert_with(std::collections::HashMap::new).insert(key, value);
+        }
+        0
+    }
+
+    #[zbus(name = "removeEntry")]
+    async fn remove_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> i32 {
+        if let Ok(mut e) = self.data.entries.lock()
+            && let Some(f) = e.get_mut(&folder)
+        {
+            f.remove(&key);
+        }
+        0
+    }
+
+    #[zbus(name = "removeFolder")]
+    async fn remove_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
+        if let Ok(mut e) = self.data.entries.lock() {
+            e.remove(&folder);
+            true
+        } else { false }
+    }
+}
+
+async fn dump_host_wallet(host_conn: &zbus::Connection)
+    -> Result<(String, std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>>), String>
+{
+    let dest = "org.kde.kwalletd6";
+    let path = "/modules/kwalletd6";
+    let iface = "org.kde.KWallet";
+    let appid = "kwin-mcp";
+
+    let reply = host_conn.call_method(Some(dest), path, Some(iface), "networkWallet", &()).await
+        .map_err(|e| format!("networkWallet: {e}"))?;
+    let network_wallet: String = reply.body().deserialize()
+        .map_err(|e| format!("networkWallet decode: {e}"))?;
+
+    let reply = host_conn.call_method(Some(dest), path, Some(iface), "open",
+        &(network_wallet.as_str(), 0i64, appid)).await
+        .map_err(|e| format!("open: {e}"))?;
+    let handle: i32 = reply.body().deserialize()
+        .map_err(|e| format!("open decode: {e}"))?;
+    if handle < 0 {
+        return Err(format!("host kwallet open returned {handle} (user denied access)"));
+    }
+
+    let reply = host_conn.call_method(Some(dest), path, Some(iface), "folderList",
+        &(handle, appid)).await
+        .map_err(|e| format!("folderList: {e}"))?;
+    let folders: Vec<String> = reply.body().deserialize()
+        .map_err(|e| format!("folderList decode: {e}"))?;
+
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>> =
+        std::collections::HashMap::new();
+    for folder in folders {
+        let reply = match host_conn.call_method(Some(dest), path, Some(iface), "entryList",
+            &(handle, folder.as_str(), appid)).await
+        {
+            Ok(r) => r,
+            Err(e) => { eprintln!("entryList {folder}: {e}"); continue; }
+        };
+        let keys: Vec<String> = match reply.body().deserialize() {
+            Ok(k) => k,
+            Err(e) => { eprintln!("entryList {folder} decode: {e}"); continue; }
+        };
+        let mut f_entries: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            let reply = match host_conn.call_method(Some(dest), path, Some(iface), "readEntry",
+                &(handle, folder.as_str(), key.as_str(), appid)).await
+            {
+                Ok(r) => r,
+                Err(e) => { eprintln!("readEntry {folder}/{key}: {e}"); continue; }
+            };
+            if let Ok(bytes) = reply.body().deserialize::<Vec<u8>>() {
+                f_entries.insert(key, bytes);
+            }
+        }
+        out.insert(folder, f_entries);
+    }
+
+    let _ = host_conn.call_method(Some(dest), path, Some(iface), "close",
+        &(handle, false, appid)).await;
+
+    Ok((network_wallet, out))
 }
 
 #[derive(Deserialize)]
@@ -1016,6 +1276,29 @@ impl KwinMcp {
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
 
+        // Spawn xdg-dbus-proxy to expose ONLY NetworkManager from host system bus
+        // into the container. Chromium needs NM to detect online state and not hang page loads.
+        let proxy_sock = host_xdg_dir.join("system_bus_socket");
+        let proxy_sock_str = proxy_sock.display().to_string();
+        let mut dbus_proxy_cmd = std::process::Command::new("xdg-dbus-proxy");
+        dbus_proxy_cmd.args([
+            "unix:path=/run/dbus/system_bus_socket",
+            &proxy_sock_str,
+            "--filter",
+            "--talk=org.freedesktop.NetworkManager",
+        ]);
+        dbus_proxy_cmd.stdout(std::process::Stdio::null());
+        dbus_proxy_cmd.stderr(std::process::Stdio::inherit());
+        eprintln!("session_start: spawning xdg-dbus-proxy → {proxy_sock_str}");
+        let dbus_proxy_child = dbus_proxy_cmd.spawn().map_err(|e| ver_err(format!("xdg-dbus-proxy: {e}")))?;
+        let proxy_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !proxy_sock.exists() && std::time::Instant::now() < proxy_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !proxy_sock.exists() {
+            return Err(ver_err("xdg-dbus-proxy socket never appeared".to_owned()));
+        }
+
         let writable = params.writable;
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
@@ -1045,11 +1328,18 @@ impl KwinMcp {
             "--proc", "/proc",
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
+            "--ro-bind-try", &proxy_sock_str, "/run/dbus/system_bus_socket",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
             "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
             "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
+            // Mask dbus service files so the container's dbus-daemon doesn't auto-activate
+            // the real kwalletd6/ksecretd — our emulator owns org.kde.kwalletd6 instead.
+            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.kwalletd6.service",
+            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.secretservicecompat.service",
+            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.kwallet.service",
+            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.secretprompter.service",
             // $HOME config overrides (read-only — protects display settings from agent writes)
             "--ro-bind", &kwinrc_str, &home_kwinrc,
             "--ro-bind", &kdeglobals_str, &home_kdeglobals,
@@ -1074,6 +1364,7 @@ impl KwinMcp {
                 return Err(ver_err("bwrap stdin not available".to_owned()));
             }
         };
+        let dbus_proxy_pid = dbus_proxy_child.id();
         let cleanup_err = |message: String,
                            mut bwrap_child: std::process::Child,
                            bwrap_stdin: std::process::ChildStdin| {
@@ -1084,6 +1375,9 @@ impl KwinMcp {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
             }
             let _ = bwrap_child.wait();
+            if let Ok(signed) = i32::try_from(dbus_proxy_pid) {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(signed), nix::sys::signal::Signal::SIGTERM);
+            }
             let _ = std::fs::remove_dir_all(&host_xdg_dir);
             Err(ver_err(message))
         };
@@ -1247,10 +1541,12 @@ impl KwinMcp {
                 let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
                 let mut guard = self.session.lock().await;
                 *guard = Some(Session {
-                    kwin_conn, _proxy_conn: proxy_conn, kwin_unique_name: kwin_unique_name.clone(),
+                    kwin_conn, _proxy_conn: proxy_conn, _wallet_conn: wallet_conn,
+                    kwin_unique_name: kwin_unique_name.clone(),
                     eis, bwrap_child, bwrap_stdin, host_xdg_dir,
                     _uinput_mouse: uinput_mouse, _uinput_keyboard: uinput_keyboard,
                     cdp_browser: None,
+                    dbus_proxy_child: Some(dbus_proxy_child),
                 });
                 return Ok(structured_result(&peer, msg, serde_json::json!({
                     "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
@@ -1259,118 +1555,27 @@ impl KwinMcp {
                 })).await);
             }
         };
-        // Discover wallet/secret services on host bus
-        let host_dbus = zbus::fdo::DBusProxy::new(&host_conn).await
-            .map_err(|e| ver_err(format!("host DBus proxy: {e}")))?;
-        let host_names = host_dbus.list_names().await
-            .map_err(|e| ver_err(format!("host ListNames: {e}")))?;
-        let wallet_names: Vec<String> = host_names.iter()
-            .filter(|n| {
-                let s = n.as_str();
-                s.contains("wallet") || s.contains("kwalletd") || s == "org.freedesktop.secrets"
-            })
-            .map(|n| n.to_string())
-            .collect();
-        for name in &wallet_names {
-            match wallet_conn.request_name(name.as_str()).await {
-                Ok(_) => eprintln!("session_start: wallet forwarding claimed {name}"),
-                Err(e) => eprintln!("session_start: wallet forwarding skip {name}: {e}"),
+        // Carbon-copy host kwallet into container at startup. Once dumped, serve it
+        // locally from an in-container emulator — no runtime host round-trips, no password prompts.
+        let (network_wallet, wallet_entries) = match dump_host_wallet(&host_conn).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("session_start: host kwallet dump failed: {e}");
+                ("kdewallet".to_owned(), std::collections::HashMap::new())
             }
+        };
+        let total_entries: usize = wallet_entries.values().map(|v| v.len()).sum();
+        eprintln!("session_start: kwallet dump: {} folders, {} entries", wallet_entries.len(), total_entries);
+        let wallet_data = Arc::new(WalletData {
+            network_wallet,
+            entries: std::sync::Mutex::new(wallet_entries),
+        });
+        let emulator = KWalletEmulator { data: wallet_data };
+        if let Err(e) = wallet_conn.object_server().at("/modules/kwalletd6", emulator).await {
+            eprintln!("session_start: register kwallet emulator failed: {e}");
         }
-        if !wallet_names.is_empty() {
-            // Spawn forwarding task: container bus → host bus
-            tokio::spawn(async move {
-                use futures::StreamExt;
-                let mut container_stream = zbus::MessageStream::from(&wallet_conn);
-                let mut host_stream = zbus::MessageStream::from(&host_conn);
-                let serial_counter = std::sync::atomic::AtomicU32::new(1);
-                while let Some(Ok(msg)) = container_stream.next().await {
-                    if msg.message_type() != zbus::message::Type::MethodCall { continue; }
-                    let header = msg.header();
-                    let path = match header.path() {
-                        Some(p) => p.to_owned(),
-                        None => continue,
-                    };
-                    let iface = header.interface().map(|i| i.to_owned());
-                    let member = match header.member() {
-                        Some(m) => m.to_owned(),
-                        None => continue,
-                    };
-                    let dest = match header.destination() {
-                        Some(d) => d.to_string(),
-                        None => continue,
-                    };
-                    let body = msg.body();
-                    let body_data = body.data();
-                    let sig = body.signature().to_owned();
-                    let serial = serial_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let serial_nz = match std::num::NonZeroU32::new(serial) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let host_msg = unsafe {
-                        zbus::message::Message::method_call(path, member)
-                            .and_then(|b| b.destination(dest.as_str()))
-                            .and_then(|b| match &iface { Some(i) => b.interface(i.clone()), None => Ok(b) })
-                            .map(|b| b.serial(serial_nz))
-                            .and_then(|b| b.build_raw_body(body_data.bytes(), sig, vec![]))
-                    };
-                    let host_msg = match host_msg {
-                        Ok(m) => m,
-                        Err(e) => { eprintln!("wallet fwd: build error: {e}"); continue; }
-                    };
-                    if let Err(e) = host_conn.send(&host_msg).await {
-                        eprintln!("wallet fwd: send error: {e}");
-                        continue;
-                    }
-                    // Wait for reply matching our serial (5s timeout)
-                    let reply_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        async {
-                            while let Some(Ok(reply)) = host_stream.next().await {
-                                if reply.header().reply_serial() == Some(serial_nz) {
-                                    return Some(reply);
-                                }
-                            }
-                            None
-                        }
-                    ).await;
-                    let reply = match reply_result {
-                        Ok(Some(r)) => r,
-                        _ => { eprintln!("wallet fwd: reply timeout serial={serial}"); continue; }
-                    };
-                    // Forward reply back to container
-                    let fwd_reply = match reply.message_type() {
-                        zbus::message::Type::MethodReturn => {
-                            let rb = reply.body();
-                            let rd = rb.data();
-                            unsafe {
-                                zbus::message::Message::method_return(&msg.header())
-                                    .and_then(|b| b.build_raw_body(rd.bytes(), rb.signature().to_owned(), vec![]))
-                            }
-                        }
-                        zbus::message::Type::Error => {
-                            let err_name = match reply.header().error_name() {
-                                Some(e) => e.to_owned(),
-                                None => match "org.freedesktop.DBus.Error.Failed".try_into() {
-                                    Ok(n) => n,
-                                    Err(_) => continue,
-                                },
-                            };
-                            let rb = reply.body();
-                            let rd = rb.data();
-                            unsafe {
-                                zbus::message::Message::error(&msg.header(), err_name)
-                                    .and_then(|b| b.build_raw_body(rd.bytes(), rb.signature().to_owned(), vec![]))
-                            }
-                        }
-                        zbus::message::Type::MethodCall | zbus::message::Type::Signal => continue,
-                    };
-                    if let Ok(fwd) = fwd_reply {
-                        let _ = wallet_conn.send(&fwd).await;
-                    }
-                }
-            });
+        if let Err(e) = wallet_conn.request_name("org.kde.kwalletd6").await {
+            eprintln!("session_start: claim org.kde.kwalletd6 failed: {e}");
         }
 
         let bus_name = kwin_conn
@@ -1383,6 +1588,7 @@ impl KwinMcp {
         *guard = Some(Session {
             kwin_conn,
             _proxy_conn: proxy_conn,
+            _wallet_conn: wallet_conn,
             kwin_unique_name: kwin_unique_name.clone(),
             eis,
             bwrap_child,
@@ -1391,6 +1597,7 @@ impl KwinMcp {
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
+            dbus_proxy_child: Some(dbus_proxy_child),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
