@@ -33,6 +33,30 @@ impl From<KwinError> for McpError {
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STARTUP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+// ── Virtual-session display & font settings ──────────────────────────────
+// Tuned for the 1280x800 virtual KWin session — no HiDPI scaling, no hinting/
+// subpixel AA (pixel-exact capture for the screenshot tool and the AI agent).
+
+const KDE_SCALE_FACTOR: &str = "1";
+const KDE_FORCE_FONT_DPI: u32 = 96;
+const KDE_HINT_STYLE: &str = "hintnone";
+const KDE_SUB_PIXEL: &str = "none";
+
+const UI_FONT_FAMILY: &str = "Noto Sans";
+const UI_FONT_SIZE: u32 = 14;
+const UI_FONT_SIZE_SMALL: u32 = 12;
+const FIXED_FONT_FAMILY: &str = "Hack";
+const FIXED_FONT_SIZE: u32 = 14;
+
+const FONT_WEIGHT_REGULAR: u32 = 400;
+const FONT_WEIGHT_BOLD: u32 = 700;
+
+fn qt_font_spec(family: &str, size: u32, weight: u32, bold_suffix: bool) -> String {
+    // Qt KConfig font format: family,size,-1,5,weight,0,0,0,0,0,0,0,0,0,0,1[,Bold]
+    let suffix = if bold_suffix { ",Bold" } else { "" };
+    format!("{family},{size},-1,5,{weight},0,0,0,0,0,0,0,0,0,0,1{suffix}")
+}
+
 // ── Evdev keycodes ───────────────────────────────────────────────────────
 
 use keyboard_codes::{KeyCodeMapper, Platform};
@@ -1172,42 +1196,46 @@ impl KwinMcp {
         ).map_err(|e| ver_err(format!("write kscreenlockerrc: {e}")))?;
         let kcmfonts_path = host_xdg_dir.join("kcmfonts");
         std::fs::write(&kcmfonts_path,
-            "[General]\nforceFontDPI=96\n"
+            format!("[General]\nforceFontDPI={KDE_FORCE_FONT_DPI}\n")
         ).map_err(|e| ver_err(format!("write kcmfonts: {e}")))?;
         let fonts_conf_path = host_xdg_dir.join("fonts.conf");
-        std::fs::write(&fonts_conf_path,
+        std::fs::write(&fonts_conf_path, format!(
             "<?xml version=\"1.0\"?>\n\
              <!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
              <fontconfig>\n\
              <match target=\"font\">\n\
              <edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\n\
-             <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit>\n\
+             <edit name=\"hintstyle\" mode=\"assign\"><const>{KDE_HINT_STYLE}</const></edit>\n\
              <edit name=\"antialias\" mode=\"assign\"><bool>true</bool></edit>\n\
-             <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit>\n\
+             <edit name=\"rgba\" mode=\"assign\"><const>{KDE_SUB_PIXEL}</const></edit>\n\
              </match>\n\
              </fontconfig>\n"
-        ).map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
+        )).map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
         // Read host kdeglobals and patch display settings for the virtual session
         let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
         let real_kdeglobals = std::path::Path::new(&home).join(".config/kdeglobals");
         let mut kdeglobals_content = std::fs::read_to_string(&real_kdeglobals).unwrap_or_default();
-        let replacements = [
-            ("ScaleFactor=", "ScaleFactor=1"),
-            ("ScreenScaleFactors=", "ScreenScaleFactors="),
-            ("XftHintStyle=", "XftHintStyle=hintnone"),
-            ("XftSubPixel=", "XftSubPixel=none"),
-            ("font=", "font=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
-            ("menuFont=", "menuFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
-            ("smallestReadableFont=", "smallestReadableFont=Noto Sans,12,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
-            ("toolBarFont=", "toolBarFont=Noto Sans,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
-            ("activeFont=", "activeFont=Noto Sans,14,-1,5,700,0,0,0,0,0,0,0,0,0,0,1,Bold"),
-            ("fixed=", "fixed=Hack,14,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+        let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
+        let ui_small = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE_SMALL, FONT_WEIGHT_REGULAR, false);
+        let ui_bold = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_BOLD, true);
+        let fixed = qt_font_spec(FIXED_FONT_FAMILY, FIXED_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
+        let replacements: [(&str, String); 10] = [
+            ("ScaleFactor=", format!("ScaleFactor={KDE_SCALE_FACTOR}")),
+            ("ScreenScaleFactors=", "ScreenScaleFactors=".to_owned()),
+            ("XftHintStyle=", format!("XftHintStyle={KDE_HINT_STYLE}")),
+            ("XftSubPixel=", format!("XftSubPixel={KDE_SUB_PIXEL}")),
+            ("font=", format!("font={ui_regular}")),
+            ("menuFont=", format!("menuFont={ui_regular}")),
+            ("smallestReadableFont=", format!("smallestReadableFont={ui_small}")),
+            ("toolBarFont=", format!("toolBarFont={ui_regular}")),
+            ("activeFont=", format!("activeFont={ui_bold}")),
+            ("fixed=", format!("fixed={fixed}")),
         ];
-        for (prefix, replacement) in replacements {
+        for (prefix, replacement) in &replacements {
             kdeglobals_content = kdeglobals_content
                 .lines()
                 .map(|line| {
-                    if line.starts_with(prefix) { replacement.to_owned() }
+                    if line.starts_with(prefix) { replacement.clone() }
                     else { line.to_owned() }
                 })
                 .collect::<Vec<_>>()
@@ -1218,25 +1246,25 @@ impl KwinMcp {
             .map_err(|e| ver_err(format!("write kdeglobals: {e}")))?;
         // Write fontconfig system overrides to bind-mount over files that force hinting/subpixel
         let fc_hinting_path = host_xdg_dir.join("10-hinting-none.conf");
-        std::fs::write(&fc_hinting_path, "\
-            <?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+        std::fs::write(&fc_hinting_path, format!(
+            "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
             <fontconfig>\n\
             <match target=\"font\"><edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\
-            <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit></match>\n\
+            <edit name=\"hintstyle\" mode=\"assign\"><const>{KDE_HINT_STYLE}</const></edit></match>\n\
             <match target=\"pattern\"><edit name=\"hinting\" mode=\"assign\"><bool>false</bool></edit>\
-            <edit name=\"hintstyle\" mode=\"assign\"><const>hintnone</const></edit></match>\n\
+            <edit name=\"hintstyle\" mode=\"assign\"><const>{KDE_HINT_STYLE}</const></edit></match>\n\
             </fontconfig>\n"
-        ).map_err(|e| ver_err(format!("write fontconfig hinting: {e}")))?;
+        )).map_err(|e| ver_err(format!("write fontconfig hinting: {e}")))?;
         let fc_lcd_path = host_xdg_dir.join("11-lcdfilter-none.conf");
-        std::fs::write(&fc_lcd_path, "\
-            <?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+        std::fs::write(&fc_lcd_path, format!(
+            "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
             <fontconfig>\n\
             <match target=\"font\"><edit name=\"lcdfilter\" mode=\"assign\"><const>lcdnone</const></edit>\
-            <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit></match>\n\
+            <edit name=\"rgba\" mode=\"assign\"><const>{KDE_SUB_PIXEL}</const></edit></match>\n\
             <match target=\"pattern\"><edit name=\"lcdfilter\" mode=\"assign\"><const>lcdnone</const></edit>\
-            <edit name=\"rgba\" mode=\"assign\"><const>none</const></edit></match>\n\
+            <edit name=\"rgba\" mode=\"assign\"><const>{KDE_SUB_PIXEL}</const></edit></match>\n\
             </fontconfig>\n"
-        ).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
+        )).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
         let fc_hinting_str = fc_hinting_path.display().to_string();
         let fc_lcd_str = fc_lcd_path.display().to_string();
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
@@ -1245,8 +1273,8 @@ impl KwinMcp {
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
-            export QT_SCALE_FACTOR=1\n\
-            export GDK_SCALE=1\n\
+            export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
+            export GDK_SCALE={KDE_SCALE_FACTOR}\n\
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
             export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
