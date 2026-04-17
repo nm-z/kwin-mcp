@@ -35,22 +35,35 @@ Everything lives in `src/main.rs` (~2300 lines). Key layers:
 
 ## Container Architecture
 
-`session_start` spawns an isolated session via **bubblewrap (bwrap)**:
+`session_start` spawns an isolated session via **bubblewrap (bwrap)**. It is **idempotent**: if a session is already running it returns `status=already_running` with the existing bus/workdir, no teardown. To restart, call `session_stop` first. bwrap args:
+
 - `--overlay-src $HOME --tmp-overlay $HOME` — overlayfs on user's home (default writable=false); `--bind / /` when `writable=true`
 - `--die-with-parent` — auto-kills container if MCP server dies
 - `--unshare-pid --unshare-uts --unshare-ipc` — namespace isolation (network is shared)
 - `--dev-bind /dev/dri` and `--dev-bind /dev/uinput` — GPU and input device access
-- `--bind {host_xdg_dir}` — shared directory for D-Bus socket
+- `--tmpfs /tmp` and `--tmpfs /run` — **applied unconditionally, AFTER the writable bind**. bwrap arg order = mount order, so these tmpfs mounts stack on top of the host root. Result: container `/tmp` and `/run` are always isolated RAM-only filesystems, invisible from the host, even with `writable=true`. This is intentional (socket/lockfile collision prevention for X11, PipeWire, Qt, Chromium). Writable mode only gives host-real access to everything *outside* `/tmp` and `/run` — i.e., `$HOME`, `/etc`, `/opt`, etc.
+- `--bind {host_xdg_dir}` — shared directory for D-Bus socket (bind-mounted *into* the tmpfs-hidden `/tmp/kwin-mcp-<pid>/` path)
 - `--ro-bind-try {host_xdg_dir}/system_bus_socket /run/dbus/system_bus_socket` — NetworkManager-only proxy socket from host
 - `--ro-bind /dev/null` over `org.kde.kwalletd6.service`, `org.kde.secretservicecompat.service`, `org.freedesktop.impl.portal.desktop.kwallet.service`, `org.kde.secretprompter.service` — masks these dbus service files so the container's dbus-daemon cannot auto-activate the real kwalletd6/ksecretd; our emulator owns the wallet name exclusively
 
-Inside the container, an inline bash entrypoint starts: dbus-daemon (socket in shared dir), KWin `--virtual --xwayland`, AT-SPI, PipeWire, WirePlumber. The host connects to the container's D-Bus via the shared socket. Apps are launched by writing commands to bwrap's stdin.
+Inside the container, an inline bash entrypoint starts: dbus-daemon (socket in shared dir), KWin `--virtual --xwayland --width {VIRTUAL_SCREEN_WIDTH} --height {VIRTUAL_SCREEN_HEIGHT}`, AT-SPI, PipeWire, WirePlumber. The host connects to the container's D-Bus via the shared socket. Apps are launched by writing commands to bwrap's stdin.
 
 `session_stop` kills the bwrap process group (negative PID SIGTERM), kills the xdg-dbus-proxy child, and removes the host XDG dir.
 
+## Top-of-file constants
+
+All tunables live in a single grouped block at the top of `main.rs` (lines ~33-95). Edit these, not inline values:
+
+- **Kernel/protocol**: `LINUX_KEY_LEFTSHIFT` (evdev 42), `EIS_CAPS_KBD_POINTER` (0b011 = keyboard+pointer bitfield for KWin EIS)
+- **Timings**: `STARTUP_TIMEOUT/POLL`, `EIS_NEGOTIATION_TIMEOUT/POLL`, `DBUS_PROXY_TIMEOUT/POLL`, `KWIN_NAME_PROBE_TIMEOUT`, `ATSPI_TRAVERSAL_TIMEOUT`, `INPUT_EVENT_DELAY` (used for click/drag/key pacing), `DRAG_STEPS` (mouse_drag interpolation count), `SCROLL_SMOOTH_PIXELS_PER_TICK`, `LAUNCH_POLL_INTERVAL`, `LAUNCH_WINDOW_POLLS`, `CDP_CONNECT_POLLS`
+- **Virtual screen**: `VIRTUAL_SCREEN_WIDTH`/`VIRTUAL_SCREEN_HEIGHT` — threaded through the bash entrypoint's `kwin_wayland --width/--height` AND the server's `with_instructions` description string
+- **Display/fonts**: `KDE_SCALE_FACTOR`, `KDE_FORCE_FONT_DPI`, `KDE_HINT_STYLE`, `KDE_SUB_PIXEL`, `UI_FONT_FAMILY`/`UI_FONT_SIZE`/`UI_FONT_SIZE_SMALL`, `FIXED_FONT_FAMILY`/`FIXED_FONT_SIZE`, `FONT_WEIGHT_REGULAR`/`FONT_WEIGHT_BOLD`. Inline comments list valid tokens. The `qt_font_spec()` helper encodes the Qt KConfig font-string format (`family,size,-1,5,weight,0,0,0,0,0,0,0,0,0,0,1[,Bold]`) — every kdeglobals replacement goes through it.
+
+Server name/version uses `env!("CARGO_PKG_NAME"/"CARGO_PKG_VERSION")` so MCP `get_info()` tracks `Cargo.toml` automatically.
+
 ## MCP Tools
 
-`session_start` spawns an isolated KWin Wayland session (1280x800, XWayland, own D-Bus). All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `active_window_info()` KWin scripting. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters. `find_ui_elements` searches by name/role — automatically uses CDP DOM queries for Chromium/Electron apps, AT-SPI for native apps. `launch_app` auto-detects Chromium apps by injecting `--remote-debugging-port` and attempting CDP connection. Chromium/Chrome in the container transparently read the host's kwallet data (cookies decrypt, saved passwords available) via the emulator — no prompts.
+`session_start` spawns an isolated KWin Wayland session (`VIRTUAL_SCREEN_WIDTH`x`VIRTUAL_SCREEN_HEIGHT`, XWayland, own D-Bus) and is idempotent. All other tools require an active session. `session_stop` kills the process group. Input tools (`mouse_*`, `keyboard_*`) use window-relative coordinates — window position is added internally via `active_window_info()` KWin scripting. Screenshots go through `org.kde.KWin.ScreenShot2` D-Bus interface, returning raw ARGB32 converted to PNG. `accessibility_tree` traverses AT-SPI2 with configurable depth/filters. `find_ui_elements` searches by name/role — automatically uses CDP DOM queries for Chromium/Electron apps, AT-SPI for native apps. `launch_app` auto-detects Chromium apps by injecting `--remote-debugging-port` and attempting CDP connection. Chromium/Chrome in the container transparently read the host's kwallet data (cookies decrypt, saved passwords available) via the emulator — no prompts.
 
 ## Key Patterns
 
