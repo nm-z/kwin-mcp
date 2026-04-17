@@ -48,7 +48,7 @@ Everything lives in `src/main.rs` (~2300 lines). Key layers:
 
 Inside the container, an inline bash entrypoint starts: dbus-daemon (socket in shared dir), KWin `--virtual --xwayland --width {VIRTUAL_SCREEN_WIDTH} --height {VIRTUAL_SCREEN_HEIGHT}`, AT-SPI, PipeWire, WirePlumber. The host connects to the container's D-Bus via the shared socket. Apps are launched by writing commands to bwrap's stdin.
 
-`session_stop` kills the bwrap process group (negative PID SIGTERM), kills the xdg-dbus-proxy child, and removes the host XDG dir.
+`session_stop` kills the bwrap process group (negative PID SIGTERM), kills the xdg-dbus-proxy child, and calls `cleanup_stale_session_files` on the host XDG dir — removes sockets (`bus`, `wayland-0*`, `pipewire-0*`, `system_bus_socket`), ready-files (`dbus-ready`, `bridge-ready`), stale entrypoint-created dirs (`at-spi`, `dbus-1`, `dconf`, `doc`), any `script_*.js` leftovers, and `screenshot.png`. The dir itself and its `tmp/` subdirectory are preserved. The `tmp/` subdir is the agent's persistent scratch — host and container share it bidirectionally (live, same inode via the existing `--bind {host_xdg_dir} {host_xdg_dir}`). Scratch survives `session_stop` and crashes; past session dirs accumulate until host reboot. `session_start` runs the same cleanup on entry (idempotent), then `mkdir_p`'s the `tmp/` subdir if missing.
 
 ## Top-of-file constants
 
