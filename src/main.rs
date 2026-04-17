@@ -1843,7 +1843,7 @@ impl KwinMcp {
             }
         }
         // Crop if region specified
-        let (out_rgba, out_w, out_h) = if let Some([x1, y1, x2, y2]) = region {
+        let (out_rgba, out_w, out_h, out_region) = if let Some([x1, y1, x2, y2]) = region {
             let cx1 = u32::try_from(x1.max(0)).map_err(KwinError::from)?.min(width);
             let cy1 = u32::try_from(y1.max(0)).map_err(KwinError::from)?.min(height);
             let cx2 = u32::try_from(x2.max(0)).map_err(KwinError::from)?.min(width);
@@ -1860,9 +1860,9 @@ impl KwinMcp {
                 let len = usize::try_from(cw * 4).map_err(KwinError::from)?;
                 cropped[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
             }
-            (cropped, cw, ch)
+            (cropped, cw, ch, Some([cx1, cy1, cx2, cy2]))
         } else {
-            (rgba, width, height)
+            (rgba, width, height, None)
         };
         let path = xdg.join("screenshot.png");
         let file = std::fs::File::create(&path).map_err(KwinError::from)?;
@@ -1872,11 +1872,15 @@ impl KwinMcp {
         let mut writer = enc.write_header().map_err(KwinError::from)?;
         writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
         let path_str = path.to_string_lossy().to_string();
-        Ok(structured_result(&peer, format!("{path_str} size={out_w}x{out_h}"), serde_json::json!({
+        let mut payload = serde_json::json!({
             "path": path_str,
             "width": out_w,
             "height": out_h,
-        })).await)
+        });
+        if let Some([rx1, ry1, rx2, ry2]) = out_region {
+            payload["region"] = serde_json::json!([rx1, ry1, rx2, ry2]);
+        }
+        Ok(structured_result(&peer, format!("{path_str} size={out_w}x{out_h}"), payload).await)
     }
 
     #[rmcp::tool(
