@@ -1167,7 +1167,13 @@ impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions(format!("KDE Wayland desktop automation. Call session_start first. Coordinates are pixels on a {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} screen."))
+            .with_instructions(format!(
+                "KDE Wayland desktop automation in an isolated container. \
+                Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
+                Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
+                All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
+                The virtual display is {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} but windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner."
+            ))
     }
 }
 
@@ -1175,7 +1181,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Start an isolated KDE Wayland session. Set writable=true to persist writes to host filesystem (default: false, all writes ephemeral). Must be called before any other tool."
+        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). To restart with different settings (e.g. toggle writable), call session_stop first. Set writable=true only if the task needs to persist files to the host; default false keeps writes ephemeral via an overlay."
     )]
     async fn session_start(
         &self,
@@ -1196,10 +1202,24 @@ impl KwinMcp {
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
-            let mut guard = self.session.lock().await;
-            if let Some(old) = (*guard).take() { teardown(old); }
+            let guard = self.session.lock().await;
+            if let Some(existing) = guard.as_ref() {
+                let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
+                let workdir = existing.host_xdg_dir.display().to_string();
+                let msg = format!(
+                    "{version_stamp} — session already running bus={bus_name} kwin={} workdir={workdir}. Call session_stop first to restart.",
+                    existing.kwin_unique_name,
+                );
+                return Ok(structured_result(&peer, msg, serde_json::json!({
+                    "status": "already_running",
+                    "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
+                    "commit": env!("GIT_HASH"),
+                    "bus": bus_name,
+                    "kwin_unique": existing.kwin_unique_name,
+                    "workdir": workdir,
+                })).await);
+            }
         }
-        eprintln!("session_start: previous session cleared");
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         let _ = std::fs::remove_dir_all(&host_xdg_dir);
@@ -1686,7 +1706,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Stop the KWin session and clean up all processes.",
+        description = "Tear down the current session and kill every process in the container. Call when finished — sessions do not auto-clean on disconnect. No-op if no session is running.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
@@ -1702,7 +1722,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Take a screenshot. Pass region [x1, y1, x2, y2] to crop a specific area at full resolution for pixel-level detail.",
+        description = "Capture the active window as a PNG written to the session workdir. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. Requires an active window (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -1796,7 +1816,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Get accessibility tree with widget roles, names, states, bounding boxes. Uses CDP for Chromium/Electron apps, AT-SPI2 for native apps. By default hides zero-rect/internal nodes; set show_elements=true to include them.",
+        description = "Dump the full widget hierarchy of the active app — roles, names, states, bounds — indented by depth. Use this when you need structural context (what exists, what contains what, what state things are in). Prefer find_ui_elements when you already know the name/role of one specific widget. app_name filters to matching top-level apps; max_depth caps traversal (default 8); role filters to matching role names. show_elements=true keeps zero-rect and unnamed nodes — default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -1938,7 +1958,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search UI elements by name/role/description (case-insensitive). Uses CDP DOM queries for Chromium/Electron apps, AT-SPI for native apps.",
+        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text, and bounding box — feed those coordinates into mouse_click/mouse_move. Use this when you know what you're looking for ('Submit', 'button', 'password'); use accessibility_tree instead when you need to explore structure first.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -2071,7 +2091,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_click",
-        description = "Click at window-relative pixel coordinates. button: left/right/middle. double/triple for multi-click."
+        description = "Move the cursor to (x,y) and click. Coordinates are pixels relative to the active window's top-left — the same frame returned by find_ui_elements and accessibility_tree, no manual offset needed. button defaults to left (use right for context menus, middle rarely). double=true for file-manager-style open, triple=true to select a whole paragraph. No need to call mouse_move first; the click already positions the cursor."
     )]
     async fn mouse_click(
         &self,
@@ -2108,7 +2128,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_move",
-        description = "Move cursor to window-relative pixel coordinates. Triggers hover effects.",
+        description = "Move the cursor to (x,y) in window-relative pixels without clicking. Use only when you need to trigger a hover effect (tooltip, CSS :hover, menu reveal). For clicks, call mouse_click directly — it already moves the cursor.",
         annotations(read_only_hint = true)
     )]
     async fn mouse_move(
@@ -2132,7 +2152,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_scroll",
-        description = "Scroll at window-relative pixel coords. delta: positive=down/right, negative=up/left. horizontal/discrete are optional."
+        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then a wheel event fires. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll (per-pixel, good for documents and web); set discrete=true for notch-style single clicks (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
     )]
     async fn mouse_scroll(
         &self,
@@ -2165,7 +2185,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_drag",
-        description = "Drag between window-relative pixel coords. Smooth 20-step interpolation. button: left/right/middle."
+        description = "Press button at (from_x, from_y), smoothly move to (to_x, to_y), release. Use for text selection, window dragging, drag-and-drop, and slider adjustments — a plain mouse_click followed by mouse_move will NOT trigger drag handlers, because the button is already released by then. button defaults to left. All coords are window-relative pixels."
     )]
     async fn mouse_drag(
         &self,
@@ -2200,7 +2220,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type ASCII text character by character. For non-ASCII use keyboard_type_unicode."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) into whatever currently has keyboard focus. Click or Tab into the target field first — this tool never focuses anything. For key combinations (Ctrl+A, Return, Escape, arrows, function keys) use keyboard_key instead. Non-ASCII chars are not supported and will error."
     )]
     async fn keyboard_type(
         &self,
@@ -2225,7 +2245,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press key combo (e.g. 'Return', 'ctrl+c', 'alt+F4', 'shift+Tab')."
+        description = "Press a single key or modifier combo — sent to whatever has focus. Syntax: bare names for standalone keys ('Return', 'Escape', 'Tab', 'Backspace', 'Delete', arrow keys, F1-F12, Home/End/PageUp/PageDown) or 'mod+mod+key' for combos ('ctrl+c', 'alt+F4', 'shift+Tab', 'ctrl+shift+t'). Use keyboard_type for literal text input instead."
     )]
     async fn keyboard_key(
         &self,
@@ -2256,7 +2276,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch an application inside the container. Automatically detects Chromium/Electron apps and enables CDP-based element discovery in find_ui_elements."
+        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — any writes it makes are ephemeral unless session_start was called with writable=true."
     )]
     async fn launch_app(
         &self,
