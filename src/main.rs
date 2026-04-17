@@ -620,6 +620,44 @@ async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<
     r
 }
 
+#[allow(dead_code)]
+fn cleanup_stale_session_files(dir: &std::path::Path) {
+    const STALE_FILES: &[&str] = &[
+        "bus",
+        "wayland-0",
+        "wayland-0.lock",
+        "pipewire-0",
+        "pipewire-0.lock",
+        "pipewire-0-manager",
+        "pipewire-0-manager.lock",
+        "system_bus_socket",
+        "dbus-ready",
+        "bridge-ready",
+        "screenshot.png",
+    ];
+    const STALE_DIRS: &[&str] = &[
+        "at-spi",
+        "dbus-1",
+        "dconf",
+        "doc",
+    ];
+    for name in STALE_FILES {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    for name in STALE_DIRS {
+        let _ = std::fs::remove_dir_all(dir.join(name));
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("script_") && name_str.ends_with(".js") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
     drop(sess.bwrap_stdin);
