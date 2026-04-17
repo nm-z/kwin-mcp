@@ -80,7 +80,7 @@ const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
 // screenshot cursor=true: half-edge of crop region around cursor (output covers
 // CURSOR_ZOOM_HALF_EDGE*2 source pixels). Render size / source pixels = zoom factor.
-const CURSOR_ZOOM_HALF_EDGE: i32 = 50;
+const CURSOR_ZOOM_HALF_EDGE: i32 = 200;
 
 // ── Virtual-session display & font settings ──────────────────────────────
 
