@@ -71,6 +71,6 @@ Requires: `bubblewrap` (bwrap), KDE Plasma 6, KWin.
 
 ## Screenshot dimensions
 
-Virtual display is 1000×1000 (1MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
+Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
-Token cost: ~1 token per 750 pixels. A 1000×1000 screenshot costs ~1333 tokens.
+Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
