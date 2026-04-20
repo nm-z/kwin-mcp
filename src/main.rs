@@ -1171,6 +1171,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 "KDE Wayland desktop automation in an isolated container. \
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
+                Never ask the user to click, type, or otherwise interact with this session for you — the user cannot access the agent's isolated desktop session. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 The virtual display is {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} but windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner."
             ))
