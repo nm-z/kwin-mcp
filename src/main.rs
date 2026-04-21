@@ -48,6 +48,9 @@ use std::time::Duration;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_POLL: Duration = Duration::from_millis(50);
 
+// Hard wall-clock limit for the entire session_start tool — abort if exceeded.
+const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+
 // EIS (Emulated Input Sender) negotiation.
 const EIS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 const EIS_NEGOTIATION_POLL: Duration = Duration::from_millis(50);
@@ -84,8 +87,8 @@ const CURSOR_ZOOM_HALF_EDGE: i32 = 200;
 
 // ── Virtual-session display & font settings ──────────────────────────────
 
-const VIRTUAL_SCREEN_WIDTH: u32 = 2000;
-const VIRTUAL_SCREEN_HEIGHT: u32 = 1875;
+const VIRTUAL_SCREEN_WIDTH: u32 = 1920;
+const VIRTUAL_SCREEN_HEIGHT: u32 = 1080;
 
 const KDE_SCALE_FACTOR: &str = "1"; // 1 | 2 | 3
 const KDE_FORCE_FONT_DPI: u32 = 96; // 96 | 120 | 144 | 192
@@ -295,10 +298,20 @@ struct Eis {
     kbd: reis::ei::Keyboard,
     ptr_dev: reis::ei::Device,
     kbd_dev: reis::ei::Device,
-    serial: u32,
+    serial: std::sync::atomic::AtomicU32,
+    start: std::time::Instant,
 }
 
 impl Eis {
+    fn next_serial(&self) -> u32 {
+        self.serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_micros()).unwrap_or(0)
+    }
+
     fn from_fd(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
         let stream = std::os::unix::net::UnixStream::from(fd);
         let context = reis::ei::Context::new(stream)?;
@@ -401,13 +414,14 @@ impl Eis {
             kbd: kb.ok_or_else(|| anyhow::anyhow!("no EIS keyboard"))?,
             ptr_dev: dev.ok_or_else(|| anyhow::anyhow!("no EIS ptr device"))?,
             kbd_dev: kbd_d.ok_or_else(|| anyhow::anyhow!("no EIS kbd device"))?,
-            serial,
+            serial: std::sync::atomic::AtomicU32::new(serial),
+            start: std::time::Instant::now(),
         })
     }
 
     fn move_abs(&self, x: f32, y: f32) -> anyhow::Result<()> {
         self.abs_ptr.motion_absolute(x, y);
-        self.ptr_dev.frame(self.serial, 0);
+        self.ptr_dev.frame(self.next_serial(), self.now_us());
         Ok(self.context.flush()?)
     }
 
@@ -417,21 +431,21 @@ impl Eis {
             false => reis::ei::button::ButtonState::Released,
         };
         self.btn.button(code, st);
-        self.ptr_dev.frame(self.serial, 0);
+        self.ptr_dev.frame(self.next_serial(), self.now_us());
         Ok(self.context.flush()?)
     }
 
     fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
         self.scroll.scroll_discrete(dx, dy);
         self.scroll.scroll_stop(0, 0, 0);
-        self.ptr_dev.frame(self.serial, 0);
+        self.ptr_dev.frame(self.next_serial(), self.now_us());
         Ok(self.context.flush()?)
     }
 
     fn scroll_smooth(&self, dx: f32, dy: f32) -> anyhow::Result<()> {
         self.scroll.scroll(dx, dy);
         self.scroll.scroll_stop(0, 0, 0);
-        self.ptr_dev.frame(self.serial, 0);
+        self.ptr_dev.frame(self.next_serial(), self.now_us());
         Ok(self.context.flush()?)
     }
 
@@ -441,7 +455,7 @@ impl Eis {
             false => reis::ei::keyboard::KeyState::Released,
         };
         self.kbd.key(code, st);
-        self.kbd_dev.frame(self.serial, 0);
+        self.kbd_dev.frame(self.next_serial(), self.now_us());
         Ok(self.context.flush()?)
     }
 }
@@ -1235,6 +1249,20 @@ impl KwinMcp {
         description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). To restart with different settings (e.g. toggle writable), call session_stop first. Set writable=true only if the task needs to persist files to the host; default false keeps writes ephemeral via an overlay."
     )]
     async fn session_start(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        params: Parameters<SessionStartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
+            Ok(res) => res,
+            Err(_) => Err(McpError::internal_error(
+                format!("session_start exceeded {}s hard limit", SESSION_START_HARD_TIMEOUT.as_secs()),
+                None,
+            )),
+        }
+    }
+
+    async fn session_start_inner(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
@@ -2329,17 +2357,79 @@ impl KwinMcp {
         for m in &mods {
             sess.eis.key(*m, true).map_err(KwinError::from)?;
         }
+        if !mods.is_empty() {
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+        }
         let k = main.ok_or_else(|| {
             McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
         })?;
         sess.eis.key(k, true).map_err(KwinError::from)?;
         tokio::time::sleep(INPUT_EVENT_DELAY).await;
         sess.eis.key(k, false).map_err(KwinError::from)?;
+        if !mods.is_empty() {
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+        }
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(KwinError::from)?;
         }
         Ok(structured_result(&peer, format!("key: {}", params.key), serde_json::json!({
             "action": "key", "key": params.key,
+        })).await)
+    }
+
+    #[rmcp::tool(
+        name = "keyboard_press",
+        description = "Press a key or combo WITHOUT releasing — useful when you need to hold the chord across a screenshot to verify a transient UI (e.g. a menu that opens on combo). Call keyboard_release with the same combo afterwards to release.")]
+    async fn keyboard_press(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<KeyboardKeyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let guard = self.session.lock().await;
+        let sess = guard.as_ref().ok_or_else(|| {
+            McpError::internal_error("no session — call session_start first", None)
+        })?;
+        let (mods, main) = parse_combo(&params.key)?;
+        for m in &mods {
+            sess.eis.key(*m, true).map_err(KwinError::from)?;
+        }
+        if !mods.is_empty() {
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+        }
+        let k = main.ok_or_else(|| {
+            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
+        })?;
+        sess.eis.key(k, true).map_err(KwinError::from)?;
+        Ok(structured_result(&peer, format!("press: {}", params.key), serde_json::json!({
+            "action": "press", "key": params.key,
+        })).await)
+    }
+
+    #[rmcp::tool(
+        name = "keyboard_release",
+        description = "Release a key or combo previously pressed via keyboard_press. Pass the same string.")]
+    async fn keyboard_release(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<KeyboardKeyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let guard = self.session.lock().await;
+        let sess = guard.as_ref().ok_or_else(|| {
+            McpError::internal_error("no session — call session_start first", None)
+        })?;
+        let (mods, main) = parse_combo(&params.key)?;
+        let k = main.ok_or_else(|| {
+            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
+        })?;
+        sess.eis.key(k, false).map_err(KwinError::from)?;
+        if !mods.is_empty() {
+            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+        }
+        for m in mods.iter().rev() {
+            sess.eis.key(*m, false).map_err(KwinError::from)?;
+        }
+        Ok(structured_result(&peer, format!("release: {}", params.key), serde_json::json!({
+            "action": "release", "key": params.key,
         })).await)
     }
 
