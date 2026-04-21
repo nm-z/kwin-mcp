@@ -286,6 +286,14 @@ trait KWinScreenShot2 {
         options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
         pipe_fd: zbus::zvariant::OwnedFd,
     ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
+
+    #[zbus(name = "CaptureScreen")]
+    fn capture_screen(
+        &self,
+        name: &str,
+        options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
+        pipe_fd: zbus::zvariant::OwnedFd,
+    ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 }
 
 // ── EIS input ───────────────────────────────────────────────────────────
@@ -1840,10 +1848,13 @@ impl KwinMcp {
         opts.insert("include-cursor", zbus::zvariant::Value::from(true));
         opts.insert("include-decoration", zbus::zvariant::Value::from(true));
         opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
+        // CaptureScreen composites all surfaces including popups (xdg_popup menus);
+        // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
         let meta = proxy
-            .capture_window(&win_id, opts, pipe_fd)
+            .capture_screen("Virtual-0", opts, pipe_fd)
             .await
             .map_err(KwinError::from)?;
+        let _ = &win_id;
         let get_u32 = |k: &str| -> Result<u32, McpError> {
             let val = meta
                 .get(k)
@@ -2477,9 +2488,18 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        let launch_cmd = match cdp_port {
-            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
-            None => params.command.clone(),
+        // Force Chromium/Chrome to use native Wayland so xdg_popup menus render
+        // (XWayland path produces focus ring only — menu surface never composites).
+        let needs_wayland_flag = (cmd_chromium
+            || cmd_lower.contains("google-chrome")
+            || cmd_lower.contains("edge"))
+            && !cmd_lower.contains("--ozone-platform");
+        let launch_cmd = {
+            let base = match cdp_port {
+                Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+                None => params.command.clone(),
+            };
+            if needs_wayland_flag { format!("{base} --ozone-platform=wayland") } else { base }
         };
         {
             let mut guard = self.session.lock().await;
