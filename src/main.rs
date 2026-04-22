@@ -68,6 +68,9 @@ const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
 // Input-event pacing (clicks, drag steps, key hold).
 const INPUT_EVENT_DELAY: Duration = Duration::from_millis(50);
 
+// Settle time between cursor move and button press in mouse_click.
+const MOVE_TO_CLICK_DELAY: Duration = Duration::from_millis(200);
+
 // Mouse drag interpolation step count.
 const DRAG_STEPS: i32 = 20;
 
@@ -87,8 +90,8 @@ const CURSOR_ZOOM_HALF_EDGE: i32 = 200;
 
 // ── Virtual-session display & font settings ──────────────────────────────
 
-const VIRTUAL_SCREEN_WIDTH: u32 = 1920;
-const VIRTUAL_SCREEN_HEIGHT: u32 = 1080;
+const VIRTUAL_SCREEN_WIDTH: u32 = 1232;
+const VIRTUAL_SCREEN_HEIGHT: u32 = 924;
 
 const KDE_SCALE_FACTOR: &str = "1"; // 1 | 2 | 3
 const KDE_FORCE_FONT_DPI: u32 = 96; // 96 | 120 | 144 | 192
@@ -635,6 +638,50 @@ impl KwinMcp {
 }
 
 
+struct CursorSprite {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// Hotspot position within the rasterized cursor PNG — the arrow tip in raw PNG
+/// coordinates. Determined once empirically for the fixed render size (see build.rs)
+/// so the runtime skips any per-call bbox scanning. If you change the SVG or the
+/// rsvg-convert height, rerun the one-shot trim command (`magick cursor.png
+/// -alpha extract -threshold 50% -format '%@' info:`) and update these.
+const CURSOR_HOTSPOT_X: i32 = 17;
+const CURSOR_HOTSPOT_Y: i32 = 10;
+
+/// High-visibility cursor sprite rasterized from cursor_v6_fixed.svg at build time
+/// (see build.rs). Lazily decoded once on first use. The tip of the arrow within
+/// the returned RGBA buffer is at (CURSOR_HOTSPOT_X, CURSOR_HOTSPOT_Y). Returns
+/// None only if the embedded PNG is malformed (shouldn't happen).
+fn cursor_sprite() -> Option<&'static CursorSprite> {
+    static CACHE: std::sync::OnceLock<Option<CursorSprite>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        const PNG_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.png"));
+        let decoder = png::Decoder::new(PNG_BYTES);
+        let mut reader = decoder.read_info().ok()?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).ok()?;
+        if info.bit_depth != png::BitDepth::Eight { return None; }
+        let raw = &buf[..info.buffer_size()];
+        let rgba: Vec<u8> = match info.color_type {
+            png::ColorType::Rgba => raw.to_vec(),
+            png::ColorType::Rgb => {
+                let mut out = Vec::with_capacity(raw.len() / 3 * 4);
+                for chunk in raw.chunks_exact(3) {
+                    out.extend_from_slice(chunk);
+                    out.push(255);
+                }
+                out
+            }
+            png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha | png::ColorType::Indexed => return None,
+        };
+        Some(CursorSprite { rgba, w: info.width, h: info.height })
+    }).as_ref()
+}
+
 async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>, structured: serde_json::Value) -> CallToolResult {
     let s: String = text.into();
     let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
@@ -1160,6 +1207,11 @@ struct ScreenshotParams {
     /// where a click would land. Mutually exclusive with `region`.
     #[serde(default)]
     cursor: bool,
+    /// When true, attach the PNG inline (base64) to the tool result so the
+    /// calling model can see the image directly without a follow-up read.
+    /// The file is still written to disk either way.
+    #[serde(default)]
+    inline: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1245,7 +1297,8 @@ impl rmcp::ServerHandler for KwinMcp {
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
-                The virtual display is {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} but windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner."
+                The virtual display is {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} but windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
+                Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click."
             ))
     }
 }
@@ -1806,9 +1859,47 @@ impl KwinMcp {
         }
     }
 
+    // Alpha-blends the high-visibility cursor sprite onto an RGBA buffer so that
+    // the arrow tip lands exactly at (cx, cy). The sprite is the raw rasterized
+    // PNG (with transparent padding and soft shadow); we shift its origin by the
+    // hardcoded CURSOR_HOTSPOT_* offsets instead of cropping at runtime.
+    fn overlay_cursor(rgba: &mut [u8], img_w: u32, img_h: u32, cx: i32, cy: i32) {
+        let Some(sprite) = cursor_sprite() else { return };
+        let origin_x = cx - CURSOR_HOTSPOT_X;
+        let origin_y = cy - CURSOR_HOTSPOT_Y;
+        for dy in 0..sprite.h {
+            let Ok(dy_i) = i32::try_from(dy) else { continue };
+            let py = origin_y + dy_i;
+            if py < 0 { continue; }
+            let Ok(py_u) = u32::try_from(py) else { continue };
+            if py_u >= img_h { continue; }
+            for dx in 0..sprite.w {
+                let Ok(dx_i) = i32::try_from(dx) else { continue };
+                let px = origin_x + dx_i;
+                if px < 0 { continue; }
+                let Ok(px_u) = u32::try_from(px) else { continue };
+                if px_u >= img_w { continue; }
+                let Some(s_lin) = dy.checked_mul(sprite.w).and_then(|v| v.checked_add(dx)).and_then(|v| v.checked_mul(4)) else { continue };
+                let Some(d_lin) = py_u.checked_mul(img_w).and_then(|v| v.checked_add(px_u)).and_then(|v| v.checked_mul(4)) else { continue };
+                let Ok(s) = usize::try_from(s_lin) else { continue };
+                let Ok(d) = usize::try_from(d_lin) else { continue };
+                if s + 3 >= sprite.rgba.len() || d + 3 >= rgba.len() { continue; }
+                let a = u32::from(sprite.rgba[s + 3]);
+                if a == 0 { continue; }
+                let inv = 255 - a;
+                for c in 0..3 {
+                    let src_c = u32::from(sprite.rgba[s + c]);
+                    let dst_c = u32::from(rgba[d + c]);
+                    rgba[d + c] = u8::try_from((src_c * a + dst_c * inv) / 255).unwrap_or(255);
+                }
+                rgba[d + 3] = 255;
+            }
+        }
+    }
+
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. The returned image is 1:1 with the display — every pixel in the PNG corresponds to exactly one pixel on the virtual screen, so coordinates you read off the image feed directly into mouse_click/mouse_move with no scaling. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -1903,13 +1994,29 @@ impl KwinMcp {
         } else {
             (rgba, width, height, None)
         };
+        // Overlay the high-visibility cursor onto the output buffer. Cursor position
+        // is absolute in the captured screen frame; if we cropped, shift into the
+        // output frame by the crop's top-left. Sprite hotspot (top-left tip of the
+        // arrow) lands exactly on the cursor pixel.
+        let (crop_ox, crop_oy) = out_region.map(|r| (r[0], r[1])).unwrap_or((0, 0));
+        #[expect(clippy::as_conversions)]
+        let cursor_abs_x = win_geo.cx.round() as i32;
+        #[expect(clippy::as_conversions)]
+        let cursor_abs_y = win_geo.cy.round() as i32;
+        let crop_ox_i = i32::try_from(crop_ox).unwrap_or(0);
+        let crop_oy_i = i32::try_from(crop_oy).unwrap_or(0);
+        let mut out_rgba = out_rgba;
+        Self::overlay_cursor(&mut out_rgba, out_w, out_h, cursor_abs_x - crop_ox_i, cursor_abs_y - crop_oy_i);
         let path = xdg.join("screenshot.png");
-        let file = std::fs::File::create(&path).map_err(KwinError::from)?;
-        let mut enc = png::Encoder::new(file, out_w, out_h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().map_err(KwinError::from)?;
-        writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
+        let mut png_bytes: Vec<u8> = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, out_w, out_h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().map_err(KwinError::from)?;
+            writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
+        }
+        std::fs::write(&path, &png_bytes).map_err(KwinError::from)?;
         let path_str = path.to_string_lossy().to_string();
         let mut payload = serde_json::json!({
             "path": path_str,
@@ -1919,7 +2026,28 @@ impl KwinMcp {
         if let Some([rx1, ry1, rx2, ry2]) = out_region {
             payload["region"] = serde_json::json!([rx1, ry1, rx2, ry2]);
         }
-        Ok(structured_result(&peer, format!("{path_str} size={out_w}x{out_h}"), payload).await)
+        let text = format!("{path_str} size={out_w}x{out_h}");
+        if params.inline {
+            // Claude Code's MCP client hides content[] when structured_content is also
+            // set, so we can't return both the image AND a structured field at the
+            // same time. Instead, serialize the payload into a text block so the
+            // image renders AND the machine-readable data is still recoverable by
+            // parsing that block as JSON.
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
+            let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
+                rmcp::model::LoggingLevel::Info,
+                serde_json::json!(text),
+            )).await;
+            Ok(CallToolResult::success(vec![
+                Content::text(text),
+                Content::text(payload_text),
+                Content::image(b64, "image/png"),
+            ]))
+        } else {
+            Ok(structured_result(&peer, text, payload).await)
+        }
     }
 
     #[rmcp::tool(
@@ -2221,6 +2349,7 @@ impl KwinMcp {
         })?;
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
+        tokio::time::sleep(MOVE_TO_CLICK_DELAY).await;
         for n in 0..count {
             if n > 0 {
                 tokio::time::sleep(INPUT_EVENT_DELAY).await;

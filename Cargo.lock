@@ -1131,6 +1131,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "atspi",
+ "base64",
  "chromiumoxide",
  "evdev",
  "futures",
