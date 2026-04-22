@@ -577,6 +577,7 @@ struct Session {
     _uinput_keyboard: evdev::uinput::VirtualDevice,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     dbus_proxy_child: Option<std::process::Child>,
+    viewer_child: Option<std::process::Child>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -732,6 +733,12 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
+    // Kill the viewer first so it can flush any pending wayland requests
+    // before the container's compositor disappears.
+    if let Some(mut viewer) = sess.viewer_child.take() {
+        let _ = viewer.kill();
+        let _ = viewer.wait();
+    }
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -744,6 +751,38 @@ fn teardown(mut sess: Session) {
         let _ = proxy.wait();
     }
     cleanup_stale_session_files(&sess.host_xdg_dir);
+}
+
+/// Resolve the kwin-viewer binary by replacing the basename of our own
+/// current_exe. Returns None if the binary doesn't exist — the viewer is
+/// an optional convenience, not required for MCP tool operation.
+fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    let dir = me.parent()?;
+    let candidate = dir.join("kwin-viewer");
+    if candidate.exists() { Some(candidate) } else { None }
+}
+
+/// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
+/// if anything goes wrong the agent's MCP tools still work; the user just
+/// doesn't see a live preview.
+fn spawn_viewer(host_xdg_dir: &std::path::Path) -> Option<std::process::Child> {
+    let bin = resolve_viewer_binary()?;
+    match std::process::Command::new(&bin)
+        .arg(host_xdg_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            eprintln!("session_start: spawned viewer pid={}", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("session_start: viewer spawn failed ({e}), continuing without preview");
+            None
+        }
+    }
 }
 
 async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
@@ -1772,6 +1811,7 @@ impl KwinMcp {
                 let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
                 let workdir = host_xdg_dir.display().to_string();
                 let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
+                let viewer_child = spawn_viewer(&host_xdg_dir);
                 let mut guard = self.session.lock().await;
                 *guard = Some(Session {
                     kwin_conn, _proxy_conn: proxy_conn, _wallet_conn: wallet_conn,
@@ -1780,6 +1820,7 @@ impl KwinMcp {
                     _uinput_mouse: uinput_mouse, _uinput_keyboard: uinput_keyboard,
                     cdp_browser: None,
                     dbus_proxy_child: Some(dbus_proxy_child),
+                    viewer_child,
                 });
                 return Ok(structured_result(&peer, msg, serde_json::json!({
                     "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
@@ -1817,6 +1858,7 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
+        let viewer_child = spawn_viewer(&host_xdg_dir);
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
@@ -1831,6 +1873,7 @@ impl KwinMcp {
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
             dbus_proxy_child: Some(dbus_proxy_child),
+            viewer_child,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",

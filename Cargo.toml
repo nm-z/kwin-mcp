@@ -23,6 +23,20 @@ serde-aux = "4.5"
 thiserror = "2"
 evdev = "0.13"
 base64 = "0.22"
+screen-13 = { git = "https://github.com/attackgoat/screen-13", rev = "d9f961c" }
+screen-13-window = { git = "https://github.com/attackgoat/screen-13", rev = "d9f961c" }
+winit = "0.30"
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+pipewire = "0.9"
+
+[[bin]]
+name = "kwin-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "kwin-viewer"
+path = "src/bin/kwin-viewer.rs"
 
 [lints.clippy]
 wildcard_enum_match_arm = "deny"
