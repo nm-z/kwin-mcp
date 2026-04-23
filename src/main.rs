@@ -1228,14 +1228,6 @@ async fn atspi_node(
 // ── Tool parameter structs ──────────────────────────────────────────────
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
-struct SessionStartParams {
-    /// When true, agent writes persist to the host filesystem.
-    /// When false (default), all writes are ephemeral.
-    #[serde(default)]
-    writable: bool,
-}
-
-#[derive(Deserialize, schemars::JsonSchema, Default)]
 struct ScreenshotParams {
     /// Crop region [x1, y1, x2, y2] for pixel-level detail on a specific area.
     /// Coordinates are window-relative pixels. Omit for full screenshot.
@@ -1346,14 +1338,13 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). To restart with different settings (e.g. toggle writable), call session_stop first. Set writable=true only if the task needs to persist files to the host; default false keeps writes ephemeral via an overlay."
+        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Container writes to $HOME land in a persistent overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/ — host-visible, RAM-only (host /tmp is tmpfs), never touches real host files. Writes survive session_stop until the MCP server exits."
     )]
     async fn session_start(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
-        params: Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
+        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer)).await {
             Ok(res) => res,
             Err(_) => Err(McpError::internal_error(
                 format!("session_start exceeded {}s hard limit", SESSION_START_HARD_TIMEOUT.as_secs()),
@@ -1365,7 +1356,6 @@ impl KwinMcp {
     async fn session_start_inner(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
-        Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -1425,7 +1415,7 @@ impl KwinMcp {
             </busconfig>"
         )).map_err(|e| ver_err(format!("write atspi config: {e}")))?;
         // Write kwin-mcp display config files to host_xdg_dir for --ro-bind mounting.
-        // Protected from agent writes in both ephemeral and writable modes.
+        // Protected from agent writes: the ro-bind shadows the overlay-upper entry.
         let kwinrc_path = host_xdg_dir.join("kwinrc");
         std::fs::write(&kwinrc_path,
             "[org.kde.kdecoration2]\nBorderSize=None\nShadowSize=0\n\n\
@@ -1574,14 +1564,16 @@ impl KwinMcp {
             return Err(ver_err("xdg-dbus-proxy socket never appeared".to_owned()));
         }
 
-        let writable = params.writable;
+        let overlay_upper = host_xdg_dir.join("tmp/overlay-upper");
+        let overlay_work = host_xdg_dir.join("tmp/overlay-work");
+        std::fs::create_dir_all(&overlay_upper).map_err(|e| ver_err(e.to_string()))?;
+        std::fs::create_dir_all(&overlay_work).map_err(|e| ver_err(e.to_string()))?;
+        let overlay_upper_str = overlay_upper.display().to_string();
+        let overlay_work_str = overlay_work.display().to_string();
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
-        if writable {
-            cmd.args(["--bind", "/", "/"]);
-        } else {
-            cmd.args(["--ro-bind", "/", "/", "--overlay-src", &home, "--tmp-overlay", &home]);
-        }
+        cmd.args(["--ro-bind", "/", "/", "--overlay-src", &home,
+            "--overlay", &overlay_upper_str, &overlay_work_str, &home]);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
@@ -1810,7 +1802,7 @@ impl KwinMcp {
                 // Non-fatal — wallet forwarding is best-effort
                 let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
                 let workdir = host_xdg_dir.display().to_string();
-                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
+                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
                 let viewer_child = spawn_viewer(&host_xdg_dir);
                 let mut guard = self.session.lock().await;
                 *guard = Some(Session {
@@ -1825,7 +1817,7 @@ impl KwinMcp {
                 return Ok(structured_result(&peer, msg, serde_json::json!({
                     "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
                     "commit": env!("GIT_HASH"), "bus": bus_name, "kwin_unique": kwin_unique_name,
-                    "workdir": workdir, "writable": writable,
+                    "workdir": workdir,
                 })).await);
             }
         };
@@ -1857,7 +1849,7 @@ impl KwinMcp {
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
-        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} writable={writable}");
+        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
         let viewer_child = spawn_viewer(&host_xdg_dir);
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
@@ -1882,7 +1874,6 @@ impl KwinMcp {
             "bus": bus_name,
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
-            "writable": writable,
         })).await)
     }
 
@@ -2618,7 +2609,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — any writes it makes are ephemeral unless session_start was called with writable=true."
+        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
     )]
     async fn launch_app(
         &self,

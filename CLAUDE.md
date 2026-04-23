@@ -37,11 +37,11 @@ Everything lives in `src/main.rs` (~2300 lines). Key layers:
 
 `session_start` spawns an isolated session via **bubblewrap (bwrap)**. It is **idempotent**: if a session is already running it returns `status=already_running` with the existing bus/workdir, no teardown. To restart, call `session_stop` first. bwrap args:
 
-- `--overlay-src $HOME --tmp-overlay $HOME` — overlayfs on user's home (default writable=false); `--bind / /` when `writable=true`
+- `--ro-bind / / --overlay-src $HOME --overlay {host_xdg_dir}/tmp/overlay-upper {host_xdg_dir}/tmp/overlay-work $HOME`: host root mounted read-only; writes to $HOME land in a persistent overlay UPPERDIR inside the session scratch dir. Host-visible *only* at `/tmp/kwin-mcp-<pid>/tmp/overlay-upper/...`, RAM-only (host `/tmp` is tmpfs), and survive `session_stop` until the MCP server exits. Real host `~/.config/...` is never written. There is no second mode — the previous `--bind / /` writable path was removed because it let container chrome corrupt host chrome's Preferences/Local State/Secure Preferences/trusted_vault.pb and steal SingletonLock.
 - `--die-with-parent` — auto-kills container if MCP server dies
 - `--unshare-pid --unshare-uts --unshare-ipc` — namespace isolation (network is shared)
 - `--dev-bind /dev/dri` and `--dev-bind /dev/uinput` — GPU and input device access
-- `--tmpfs /tmp` and `--tmpfs /run` — **applied unconditionally, AFTER the writable bind**. bwrap arg order = mount order, so these tmpfs mounts stack on top of the host root. Result: container `/tmp` and `/run` are always isolated RAM-only filesystems, invisible from the host, even with `writable=true`. This is intentional (socket/lockfile collision prevention for X11, PipeWire, Qt, Chromium). Writable mode only gives host-real access to everything *outside* `/tmp` and `/run` — i.e., `$HOME`, `/etc`, `/opt`, etc.
+- `--tmpfs /tmp` and `--tmpfs /run` — **applied AFTER the overlay**. bwrap arg order = mount order, so these tmpfs mounts stack on top of the host root. Container `/tmp` and `/run` are isolated RAM-only filesystems, invisible from the host (socket/lockfile collision prevention for X11, PipeWire, Qt, Chromium).
 - `--bind {host_xdg_dir}` — shared directory for D-Bus socket (bind-mounted *into* the tmpfs-hidden `/tmp/kwin-mcp-<pid>/` path)
 - `--ro-bind-try {host_xdg_dir}/system_bus_socket /run/dbus/system_bus_socket` — NetworkManager-only proxy socket from host
 - `--ro-bind /dev/null` over `org.kde.kwalletd6.service`, `org.kde.secretservicecompat.service`, `org.freedesktop.impl.portal.desktop.kwallet.service`, `org.kde.secretprompter.service` — masks these dbus service files so the container's dbus-daemon cannot auto-activate the real kwalletd6/ksecretd; our emulator owns the wallet name exclusively
