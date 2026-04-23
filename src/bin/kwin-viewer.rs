@@ -353,10 +353,10 @@ fn forward_input(
                 // Snap the container's cursor to the window position first
                 // so the press lands where the user's eyes are, not wherever
                 // the container cursor happened to stop last session.
-                if let Some(pos) = state.last_pos {
-                    if let Some((x, y)) = map_window_to_virtual(pos, win_w, win_h) {
-                        fake_input.pointer_motion_absolute(x, y);
-                    }
+                if let Some(pos) = state.last_pos
+                    && let Some((x, y)) = map_window_to_virtual(pos, win_w, win_h)
+                {
+                    fake_input.pointer_motion_absolute(x, y);
                 }
                 state.held_buttons = state.held_buttons.saturating_add(1);
             } else {
