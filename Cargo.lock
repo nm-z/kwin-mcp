@@ -1683,6 +1683,7 @@ dependencies = [
  "chromiumoxide",
  "evdev",
  "futures",
+ "glob",
  "keyboard-codes",
  "nix 0.30.1",
  "pipewire",

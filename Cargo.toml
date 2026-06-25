@@ -23,6 +23,7 @@ serde-aux = "4.5"
 thiserror = "2"
 evdev = "0.13"
 base64 = "0.22"
+glob = "0.3"
 screen-13 = { git = "https://github.com/attackgoat/screen-13", rev = "d9f961c" }
 screen-13-window = { git = "https://github.com/attackgoat/screen-13", rev = "d9f961c" }
 winit = "0.30"

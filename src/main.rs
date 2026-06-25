@@ -1589,16 +1589,6 @@ impl KwinMcp {
         cmd.args([
             "--dev", "/dev",
             "--dev-bind", "/dev/dri", "/dev/dri",
-            // NVIDIA GPUs expose their GBM/EGL driver through these char nodes, which
-            // live OUTSIDE /dev/dri. Without them the NVIDIA render node (often the
-            // primary GBM device) loads as driver=(null) → eglInitialize fails → KWin's
-            // virtual backend can't composite → ScreenShot2 returns Error.Cancelled.
-            // -try so non-NVIDIA hosts (where these don't exist) still start.
-            "--dev-bind-try", "/dev/nvidia0", "/dev/nvidia0",
-            "--dev-bind-try", "/dev/nvidiactl", "/dev/nvidiactl",
-            "--dev-bind-try", "/dev/nvidia-modeset", "/dev/nvidia-modeset",
-            "--dev-bind-try", "/dev/nvidia-uvm", "/dev/nvidia-uvm",
-            "--dev-bind-try", "/dev/nvidia-uvm-tools", "/dev/nvidia-uvm-tools",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
@@ -1624,8 +1614,17 @@ impl KwinMcp {
             "--ro-bind", &kscreenlockerrc_str, &home_kscreenlockerrc,
             "--ro-bind", &kcmfonts_str, &home_kcmfonts,
             "--ro-bind", &fonts_conf_str, &home_fonts_conf,
-            "--", "bash", "-c", &entrypoint,
         ]);
+        // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
+        // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
+        // them the NVIDIA render node (often the primary GBM device) loads as
+        // driver=(null) → eglInitialize fails → KWin's virtual backend can't composite
+        // → ScreenShot2 returns Error.Cancelled. Glob so we pick up whatever this host
+        // exposes; -try so non-NVIDIA hosts (no matches) still start.
+        for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
+            cmd.arg("--dev-bind-try").arg(&path).arg(&path);
+        }
+        cmd.args(["--", "bash", "-c", &entrypoint]);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::inherit());
