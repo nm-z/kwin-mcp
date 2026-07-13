@@ -19,6 +19,7 @@ use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
 use screen_13_window::WindowBuilder;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -124,9 +125,20 @@ wayland_client::delegate_noop!(WlState: ignore ZkdeScreencastUnstableV1);
 wayland_client::delegate_noop!(WlState: ignore OrgKdeKwinFakeInput);
 
 fn main() -> anyhow::Result<()> {
-    let session_dir = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid>"))?;
+    let mut argv = std::env::args().skip(1);
+    let session_dir = argv
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]"))?;
+    // Virtual display size, passed by kwin-mcp at spawn. Defaults match the
+    // server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
+    let virt_w: u32 = match argv.next() {
+        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("width '{v}': {e}"))?,
+        None => 3840,
+    };
+    let virt_h: u32 = match argv.next() {
+        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("height '{v}': {e}"))?,
+        None => 2160,
+    };
     let session_path = std::path::PathBuf::from(&session_dir);
     anyhow::ensure!(
         session_path.join("wayland-0").exists(),
@@ -194,7 +206,7 @@ fn main() -> anyhow::Result<()> {
     let _pw_thread = {
         let mailbox = Arc::clone(&mailbox);
         std::thread::spawn(move || {
-            if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox) {
+            if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, (virt_w, virt_h)) {
                 eprintln!("kwin-viewer: pipewire loop exited: {e}");
             }
         })
@@ -217,7 +229,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let window = WindowBuilder::default()
-        .window(|wa| wa.with_title("kwin-viewer").with_inner_size(winit::dpi::LogicalSize::new(1232, 924)))
+        .window(|wa| wa.with_title("kwin-viewer").with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -238,6 +250,7 @@ fn main() -> anyhow::Result<()> {
                 &conn_for_loop,
                 frame.width,
                 frame.height,
+                (virt_w, virt_h),
                 &mut input_state,
             );
         }
@@ -309,13 +322,19 @@ struct InputState {
     // Currently-held mouse buttons. Non-empty means we're in a drag and
     // pointer motions should be forwarded so the drag actually drags.
     held_buttons: u32,
+    // Evdev keycodes currently held inside the container. We forcibly
+    // release them on focus loss; otherwise a missed Released event (e.g.
+    // user releases Shift outside the viewer window) leaves a modifier
+    // stuck inside the container, and every subsequent letter the user
+    // types arrives shifted — looks exactly like "I cant type."
+    held_keys: HashSet<u32>,
 }
 
-fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32) -> Option<(f64, f64)> {
+fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {
     if win_w == 0 || win_h == 0 { return None }
     Some((
-        pos.0 * 1232.0 / f64::from(win_w),
-        pos.1 * 924.0 / f64::from(win_h),
+        pos.0 * f64::from(virt.0) / f64::from(win_w),
+        pos.1 * f64::from(virt.1) / f64::from(win_h),
     ))
 }
 
@@ -325,9 +344,26 @@ fn forward_input(
     conn: &Connection,
     win_w: u32,
     win_h: u32,
+    virt: (u32, u32),
     state: &mut InputState,
 ) {
     let Event::WindowEvent { event, .. } = event else { return };
+    if let WindowEvent::Focused(false) = event {
+        // Drain any keys that were forwarded as pressed but whose Released
+        // event we may not see — release them all so no modifier stays
+        // stuck inside the container while the user is elsewhere on host.
+        for &code in &state.held_keys {
+            fake_input.keyboard_key(code, 0);
+        }
+        if !state.held_keys.is_empty() {
+            eprintln!(
+                "kwin-viewer: focus lost — released {} held key(s)",
+                state.held_keys.len()
+            );
+            state.held_keys.clear();
+            let _ = conn.flush();
+        }
+    }
     match event {
         WindowEvent::CursorMoved { position, .. } => {
             // Always record the latest cursor position locally so a subsequent
@@ -336,7 +372,7 @@ fn forward_input(
             // — idle hover must not touch the agent's session.
             state.last_pos = Some((position.x, position.y));
             if state.held_buttons == 0 { return }
-            if let Some((x, y)) = map_window_to_virtual((position.x, position.y), win_w, win_h) {
+            if let Some((x, y)) = map_window_to_virtual((position.x, position.y), win_w, win_h, virt) {
                 fake_input.pointer_motion_absolute(x, y);
                 let _ = conn.flush();
             }
@@ -354,7 +390,7 @@ fn forward_input(
                 // so the press lands where the user's eyes are, not wherever
                 // the container cursor happened to stop last session.
                 if let Some(pos) = state.last_pos
-                    && let Some((x, y)) = map_window_to_virtual(pos, win_w, win_h)
+                    && let Some((x, y)) = map_window_to_virtual(pos, win_w, win_h, virt)
                 {
                     fake_input.pointer_motion_absolute(x, y);
                 }
@@ -376,11 +412,15 @@ fn forward_input(
         }
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
-            if let Some(evdev) = key_code_to_evdev(kc) {
-                let pressed = matches!(key.state, ElementState::Pressed);
-                fake_input.keyboard_key(evdev, if pressed { 1 } else { 0 });
-                let _ = conn.flush();
+            let Some(evdev) = key_code_to_evdev(kc) else { return };
+            let pressed = matches!(key.state, ElementState::Pressed);
+            if pressed {
+                state.held_keys.insert(evdev);
+            } else {
+                state.held_keys.remove(&evdev);
             }
+            fake_input.keyboard_key(evdev, if pressed { 1 } else { 0 });
+            let _ = conn.flush();
         }
         _ => {}
     }
@@ -420,7 +460,7 @@ fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
 // PipeWire path: connect to the container's PIPEWIRE_REMOTE socket, create an
 // input stream targeting the screencast node KWin handed us, advertise SHM
 // RGBA-family formats, and copy each frame into the mailbox.
-fn run_pipewire(socket_path: PathBuf, node_id: u32, mailbox: FrameMailbox) -> anyhow::Result<()> {
+fn run_pipewire(socket_path: PathBuf, node_id: u32, mailbox: FrameMailbox, virt: (u32, u32)) -> anyhow::Result<()> {
     use pipewire as pw;
     use pw::spa;
     use spa::pod::Pod;
@@ -502,7 +542,7 @@ fn run_pipewire(socket_path: PathBuf, node_id: u32, mailbox: FrameMailbox) -> an
         })
         .register()?;
 
-    let format_pod = build_format_pod()?;
+    let format_pod = build_format_pod(virt)?;
     let mut params = [Pod::from_bytes(&format_pod).ok_or_else(|| anyhow::anyhow!("format pod invalid"))?];
 
     stream.connect(
@@ -516,7 +556,7 @@ fn run_pipewire(socket_path: PathBuf, node_id: u32, mailbox: FrameMailbox) -> an
     Ok(())
 }
 
-fn build_format_pod() -> anyhow::Result<Vec<u8>> {
+fn build_format_pod(virt: (u32, u32)) -> anyhow::Result<Vec<u8>> {
     use pipewire as pw;
     use pw::spa;
     let obj = spa::pod::object!(
@@ -536,7 +576,7 @@ fn build_format_pod() -> anyhow::Result<Vec<u8>> {
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoSize,
             Choice, Range, Rectangle,
-            spa::utils::Rectangle { width: 1232, height: 924 },
+            spa::utils::Rectangle { width: virt.0, height: virt.1 },
             spa::utils::Rectangle { width: 1, height: 1 },
             spa::utils::Rectangle { width: 8192, height: 8192 }
         ),

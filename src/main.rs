@@ -90,8 +90,16 @@ const CURSOR_ZOOM_HALF_EDGE: i32 = 200;
 
 // ── Virtual-session display & font settings ──────────────────────────────
 
-const VIRTUAL_SCREEN_WIDTH: u32 = 1232;
-const VIRTUAL_SCREEN_HEIGHT: u32 = 924;
+// Compiled-in defaults. Overridable at server launch via --width/--height CLI
+// flags, and per-session via session_start's optional width/height params
+// (unless the server was launched with --no-override, which pins the CLI/
+// compiled size and silently ignores tool params).
+const VIRTUAL_SCREEN_WIDTH: u32 = 3840;
+const VIRTUAL_SCREEN_HEIGHT: u32 = 2160;
+// Sanity bounds for any requested dimension. Max matches the viewer's
+// PipeWire format-pod range ceiling (kwin-viewer.rs build_format_pod).
+const MIN_SCREEN_DIM: u32 = 240;
+const MAX_SCREEN_DIM: u32 = 8192;
 
 const KDE_SCALE_FACTOR: &str = "1"; // 1 | 2 | 3
 const KDE_FORCE_FONT_DPI: u32 = 96; // 96 | 120 | 144 | 192
@@ -578,19 +586,34 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     dbus_proxy_child: Option<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    screen_width: u32,
+    screen_height: u32,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
 
+/// Virtual display size policy resolved from CLI flags at server launch.
+/// `width`/`height` are the session default (compiled constants unless
+/// --width/--height overrode them); `locked` (--no-override) makes
+/// session_start ignore its optional width/height params entirely.
+#[derive(Clone, Copy)]
+struct DisplayConfig {
+    width: u32,
+    height: u32,
+    locked: bool,
+}
+
 #[derive(Clone)]
 struct KwinMcp {
     session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    display: DisplayConfig,
 }
 
 impl KwinMcp {
-    fn new() -> Self {
+    fn new(display: DisplayConfig) -> Self {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
+            display,
         }
     }
     async fn with_session<R>(
@@ -707,6 +730,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "dbus-ready",
         "bridge-ready",
         "screenshot.png",
+        "viewer.log",
     ];
     const STALE_DIRS: &[&str] = &[
         "at-spi",
@@ -765,13 +789,18 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work; the user just
-/// doesn't see a live preview.
-fn spawn_viewer(host_xdg_dir: &std::path::Path) -> Option<std::process::Child> {
+/// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
+/// crashes and input-forwarding diagnostics survive past the spawn.
+fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Option<std::process::Child> {
     let bin = resolve_viewer_binary()?;
+    let log_path = host_xdg_dir.join("viewer.log");
+    let log_file = std::fs::File::create(&log_path).ok()?;
     match std::process::Command::new(&bin)
         .arg(host_xdg_dir)
+        .arg(width.to_string())
+        .arg(height.to_string())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file))
         .spawn()
     {
         Ok(child) => {
@@ -1317,6 +1346,16 @@ struct FindUiElementsParams {
     query: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SessionStartParams {
+    /// Virtual display width in pixels for this session. Omit to use the
+    /// server default. Ignored when the server was launched with --no-override.
+    width: Option<u32>,
+    /// Virtual display height in pixels for this session. Omit to use the
+    /// server default. Ignored when the server was launched with --no-override.
+    height: Option<u32>,
+}
+
 // ── Tool implementations ────────────────────────────────────────────────
 
 impl rmcp::ServerHandler for KwinMcp {
@@ -1328,8 +1367,13 @@ impl rmcp::ServerHandler for KwinMcp {
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
-                The virtual display is {VIRTUAL_SCREEN_WIDTH}x{VIRTUAL_SCREEN_HEIGHT} but windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
-                Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click."
+                {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
+                Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click.",
+                size_line = if self.display.locked {
+                    format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
+                } else {
+                    format!("The virtual display defaults to {}x{}; session_start accepts optional width/height to override it for that session.", self.display.width, self.display.height)
+                },
             ))
     }
 }
@@ -1338,13 +1382,14 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Container writes to $HOME land in a persistent overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/ — host-visible, RAM-only (host /tmp is tmpfs), never touches real host files. Writes survive session_stop until the MCP server exits."
+        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect. Container writes to $HOME land in a persistent overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/ — host-visible, RAM-only (host /tmp is tmpfs), never touches real host files. Writes survive session_stop until the MCP server exits."
     )]
     async fn session_start(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer)).await {
+        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
             Ok(res) => res,
             Err(_) => Err(McpError::internal_error(
                 format!("session_start exceeded {}s hard limit", SESSION_START_HARD_TIMEOUT.as_secs()),
@@ -1356,6 +1401,7 @@ impl KwinMcp {
     async fn session_start_inner(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
+        params: SessionStartParams,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -1376,8 +1422,8 @@ impl KwinMcp {
                 let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
                 let workdir = existing.host_xdg_dir.display().to_string();
                 let msg = format!(
-                    "{version_stamp} — session already running bus={bus_name} kwin={} workdir={workdir}. Call session_stop first to restart.",
-                    existing.kwin_unique_name,
+                    "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
+                    existing.kwin_unique_name, existing.screen_width, existing.screen_height,
                 );
                 return Ok(structured_result(&peer, msg, serde_json::json!({
                     "status": "already_running",
@@ -1386,9 +1432,35 @@ impl KwinMcp {
                     "bus": bus_name,
                     "kwin_unique": existing.kwin_unique_name,
                     "workdir": workdir,
+                    "width": existing.screen_width,
+                    "height": existing.screen_height,
                 })).await);
             }
         }
+        // Resolve the virtual display size: tool params > CLI flags > compiled
+        // defaults — unless --no-override locked it at the CLI/compiled value.
+        let (screen_w, screen_h) = if self.display.locked {
+            if params.width.is_some() || params.height.is_some() {
+                eprintln!(
+                    "session_start: size params ignored (--no-override), using {}x{}",
+                    self.display.width, self.display.height
+                );
+            }
+            (self.display.width, self.display.height)
+        } else {
+            let w = params.width.unwrap_or(self.display.width);
+            let h = params.height.unwrap_or(self.display.height);
+            for (name, v) in [("width", w), ("height", h)] {
+                if !(MIN_SCREEN_DIM..=MAX_SCREEN_DIM).contains(&v) {
+                    return Err(McpError::invalid_params(
+                        format!("{name} {v} out of range {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}"),
+                        None,
+                    ));
+                }
+            }
+            (w, h)
+        };
+        eprintln!("session_start: virtual display {screen_w}x{screen_h}");
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
@@ -1524,7 +1596,7 @@ impl KwinMcp {
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width {VIRTUAL_SCREEN_WIDTH} --height {VIRTUAL_SCREEN_HEIGHT} &\n\
+            kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
@@ -1811,8 +1883,8 @@ impl KwinMcp {
                 // Non-fatal — wallet forwarding is best-effort
                 let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
                 let workdir = host_xdg_dir.display().to_string();
-                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
-                let viewer_child = spawn_viewer(&host_xdg_dir);
+                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
+                let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
                 let mut guard = self.session.lock().await;
                 *guard = Some(Session {
                     kwin_conn, _proxy_conn: proxy_conn, _wallet_conn: wallet_conn,
@@ -1822,11 +1894,12 @@ impl KwinMcp {
                     cdp_browser: None,
                     dbus_proxy_child: Some(dbus_proxy_child),
                     viewer_child,
+                    screen_width: screen_w, screen_height: screen_h,
                 });
                 return Ok(structured_result(&peer, msg, serde_json::json!({
                     "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
                     "commit": env!("GIT_HASH"), "bus": bus_name, "kwin_unique": kwin_unique_name,
-                    "workdir": workdir,
+                    "workdir": workdir, "width": screen_w, "height": screen_h,
                 })).await);
             }
         };
@@ -1858,8 +1931,8 @@ impl KwinMcp {
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
-        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name}");
-        let viewer_child = spawn_viewer(&host_xdg_dir);
+        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
+        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
@@ -1875,6 +1948,8 @@ impl KwinMcp {
             cdp_browser: None,
             dbus_proxy_child: Some(dbus_proxy_child),
             viewer_child,
+            screen_width: screen_w,
+            screen_height: screen_h,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -1883,6 +1958,8 @@ impl KwinMcp {
             "bus": bus_name,
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
+            "width": screen_w,
+            "height": screen_h,
         })).await)
     }
 
@@ -2736,12 +2813,50 @@ impl KwinMcp {
     }
 }
 
+fn parse_cli_args() -> Result<DisplayConfig, String> {
+    let mut cfg = DisplayConfig {
+        width: VIRTUAL_SCREEN_WIDTH,
+        height: VIRTUAL_SCREEN_HEIGHT,
+        locked: false,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
+            "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
+            "--no-override" => cfg.locked = true,
+            other => {
+                return Err(format!(
+                    "unknown argument '{other}' — usage: kwin-mcp [--width N] [--height N] [--no-override]"
+                ))
+            }
+        }
+    }
+    Ok(cfg)
+}
+
+fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u32, String> {
+    let v = args.next().ok_or_else(|| format!("{flag} requires a value"))?;
+    let n: u32 = v.parse().map_err(|e| format!("{flag} '{v}': {e}"))?;
+    if !(MIN_SCREEN_DIM..=MAX_SCREEN_DIM).contains(&n) {
+        return Err(format!("{flag} {n} out of range {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}"));
+    }
+    Ok(n)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
-    let kwin = KwinMcp::new();
+    let display = parse_cli_args()?;
+    eprintln!(
+        "kwin-mcp: display default {}x{}{}",
+        display.width,
+        display.height,
+        if display.locked { " (locked, --no-override)" } else { "" }
+    );
+    let kwin = KwinMcp::new(display);
     let router =
         rmcp::handler::server::router::Router::new(kwin).with_tools(KwinMcp::tool_router());
     let transport = rmcp::transport::io::stdio();
