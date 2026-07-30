@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+procfs = "0.18"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 nix = { version = "0.30", features = ["signal", "fs"] }

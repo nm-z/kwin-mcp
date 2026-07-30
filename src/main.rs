@@ -5,6 +5,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use serde::Deserialize;
 use serde_aux::field_attributes::deserialize_number_from_string;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type McpError = rmcp::ErrorData;
@@ -568,6 +569,267 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
         .ok_or_else(|| KwinError::Msg("uinput keyboard: no devnode".to_owned()))??;
 
     Ok((mouse_dev, mouse_path, kbd_dev, kbd_path))
+}
+
+// ── Mount-aware overlay ──────────────────────────────────────────────────
+
+struct MountInventory {
+    records: Vec<procfs::process::MountInfo>,
+}
+
+impl MountInventory {
+    fn read() -> anyhow::Result<Self> {
+        Ok(Self {
+            records: procfs::process::Process::myself()?.mountinfo()?.0,
+        })
+    }
+
+    fn is_mount_point(&self, path: &Path) -> bool {
+        self.records.iter().any(|mount| mount.mount_point == path)
+    }
+
+    fn has_descendant(&self, path: &Path) -> bool {
+        self.records
+            .iter()
+            .any(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
+    }
+
+    fn descendants(&self, path: &Path) -> Vec<PathBuf> {
+        let mut descendants: Vec<PathBuf> = self
+            .records
+            .iter()
+            .filter(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
+            .map(|mount| mount.mount_point.clone())
+            .collect();
+        descendants.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        descendants.dedup();
+        descendants
+    }
+}
+
+fn path_error(action: &str, path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{action} {}: {error}", path.display())
+}
+
+struct OverlayMount {
+    lower: PathBuf,
+    upper: PathBuf,
+    work: PathBuf,
+    destination: PathBuf,
+}
+
+struct OverlayPlan {
+    staging_root: Option<PathBuf>,
+    overlays: Vec<OverlayMount>,
+    read_only_binds: Vec<PathBuf>,
+}
+
+impl OverlayPlan {
+    fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
+        command.args(["--ro-bind", "/", "/"]);
+        if let Some(staging_root) = &self.staging_root {
+            command.arg("--bind").arg(staging_root).arg(target);
+        }
+        for overlay in &self.overlays {
+            command
+                .arg("--overlay-src")
+                .arg(&overlay.lower)
+                .arg("--overlay")
+                .arg(&overlay.upper)
+                .arg(&overlay.work)
+                .arg(&overlay.destination);
+        }
+        for path in &self.read_only_binds {
+            command.arg("--ro-bind").arg(path).arg(path);
+        }
+    }
+}
+
+fn create_staging_directory(
+    source: &Path,
+    destination: &Path,
+    initialize: bool,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(destination)
+        .map_err(|error| path_error("create staging directory", destination, error))?;
+    if initialize {
+        let permissions = std::fs::metadata(source)
+            .map_err(|error| path_error("read permissions", source, error))?
+            .permissions();
+        std::fs::set_permissions(destination, permissions)
+            .map_err(|error| path_error("set staging permissions", destination, error))?;
+    }
+    Ok(())
+}
+
+fn staging_entry_exists(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(path_error("inspect staging entry", path, error)),
+    }
+}
+
+struct SplitOverlayContext<'a> {
+    target: &'a Path,
+    staging_root: &'a Path,
+    upper_root: &'a Path,
+    work_root: &'a Path,
+    mounts: &'a MountInventory,
+    initialize: bool,
+}
+
+fn prepare_split_overlay_directory(
+    source_directory: &Path,
+    context: &SplitOverlayContext<'_>,
+    overlays: &mut Vec<OverlayMount>,
+    read_only_binds: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let relative_directory = source_directory
+        .strip_prefix(context.target)
+        .map_err(|error| path_error("derive relative path", source_directory, error))?;
+    let staged_directory = context.staging_root.join(relative_directory);
+    create_staging_directory(source_directory, &staged_directory, context.initialize)?;
+
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(source_directory)
+        .map_err(|error| path_error("read directory", source_directory, error))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| path_error("read directory entries", source_directory, error))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let source = entry.path();
+        let relative = source
+            .strip_prefix(context.target)
+            .map_err(|error| path_error("derive relative path", &source, error))?;
+        let staged = context.staging_root.join(relative);
+        let file_type = entry
+            .file_type()
+            .map_err(|error| path_error("inspect entry", &source, error))?;
+
+        if context.mounts.is_mount_point(&source) {
+            if file_type.is_dir() {
+                create_staging_directory(&source, &staged, context.initialize)?;
+            }
+            continue;
+        }
+
+        if file_type.is_dir() {
+            if context.mounts.has_descendant(&source) {
+                prepare_split_overlay_directory(&source, context, overlays, read_only_binds)?;
+            } else {
+                create_staging_directory(&source, &staged, context.initialize)?;
+                let upper = context.upper_root.join(relative);
+                let work = context.work_root.join(relative);
+                std::fs::create_dir_all(&upper)
+                    .map_err(|error| path_error("create overlay upperdir", &upper, error))?;
+                std::fs::create_dir_all(&work)
+                    .map_err(|error| path_error("create overlay workdir", &work, error))?;
+                overlays.push(OverlayMount {
+                    lower: source.clone(),
+                    upper,
+                    work,
+                    destination: source,
+                });
+            }
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            if context.initialize && !staging_entry_exists(&staged)? {
+                let target = std::fs::read_link(&source)
+                    .map_err(|error| path_error("read symlink", &source, error))?;
+                std::os::unix::fs::symlink(&target, &staged)
+                    .map_err(|error| path_error("copy symlink", &staged, error))?;
+            }
+        } else if file_type.is_file() {
+            if context.initialize && !staging_entry_exists(&staged)? {
+                match std::fs::copy(&source, &staged) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        let _ = std::fs::remove_file(&staged);
+                        read_only_binds.push(source);
+                    }
+                    Err(error) => {
+                        return Err(path_error("copy file", &source, error));
+                    }
+                }
+            }
+        } else {
+            read_only_binds.push(source);
+        }
+    }
+    Ok(())
+}
+
+fn prepare_overlay_plan(
+    target: &Path,
+    session_tmp: &Path,
+    mounts: &MountInventory,
+) -> anyhow::Result<OverlayPlan> {
+    let excluded_mounts = mounts.descendants(target);
+    if excluded_mounts.is_empty() {
+        let upper = session_tmp.join("overlay-upper");
+        let work = session_tmp.join("overlay-work");
+        std::fs::create_dir_all(&upper)
+            .map_err(|error| path_error("create overlay upperdir", &upper, error))?;
+        std::fs::create_dir_all(&work)
+            .map_err(|error| path_error("create overlay workdir", &work, error))?;
+        return Ok(OverlayPlan {
+            staging_root: None,
+            overlays: vec![OverlayMount {
+                lower: target.to_path_buf(),
+                upper,
+                work,
+                destination: target.to_path_buf(),
+            }],
+            read_only_binds: Vec::new(),
+        });
+    }
+
+    let staging_root = session_tmp.join("overlay-root");
+    let initialized_marker = session_tmp.join("overlay-root.initialized");
+    let initialize = !initialized_marker.exists();
+    let upper_root = session_tmp.join("overlay-upper");
+    let work_root = session_tmp.join("overlay-work");
+    std::fs::create_dir_all(&upper_root)
+        .map_err(|error| path_error("create overlay upper root", &upper_root, error))?;
+    std::fs::create_dir_all(&work_root)
+        .map_err(|error| path_error("create overlay work root", &work_root, error))?;
+
+    let context = SplitOverlayContext {
+        target,
+        staging_root: &staging_root,
+        upper_root: &upper_root,
+        work_root: &work_root,
+        mounts,
+        initialize,
+    };
+    let mut overlays = Vec::new();
+    let mut read_only_binds = excluded_mounts;
+    prepare_split_overlay_directory(target, &context, &mut overlays, &mut read_only_binds)?;
+    read_only_binds.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    read_only_binds.dedup();
+    if initialize {
+        std::fs::write(&initialized_marker, b"split-overlay-v1\n")
+            .map_err(|error| path_error("write staging marker", &initialized_marker, error))?;
+    }
+
+    Ok(OverlayPlan {
+        staging_root: Some(staging_root),
+        overlays,
+        read_only_binds,
+    })
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
@@ -1522,7 +1784,34 @@ impl KwinMcp {
         )).map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
         // Read host kdeglobals and patch display settings for the virtual session
         let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
-        let real_kdeglobals = std::path::Path::new(&home).join(".config/kdeglobals");
+        let overlay_target = PathBuf::from(&home);
+        if !overlay_target.is_absolute() {
+            return Err(ver_err(format!("overlay target must be absolute: {}", overlay_target.display())));
+        }
+        let mount_inventory = MountInventory::read()
+            .map_err(|e| ver_err(format!("read mount inventory: {e:#}")))?;
+        let overlay_exclusions = mount_inventory.descendants(&overlay_target);
+        eprintln!(
+            "session_start: mount inventory={} overlay-exclusions={}",
+            mount_inventory.records.len(),
+            overlay_exclusions.len()
+        );
+        for mount in &overlay_exclusions {
+            eprintln!("session_start: excluding mount from overlay: {}", mount.display());
+        }
+        let overlay_plan = prepare_overlay_plan(
+            &overlay_target,
+            &host_xdg_dir.join("tmp"),
+            &mount_inventory,
+        )
+        .map_err(|e| ver_err(format!("prepare overlays: {e:#}")))?;
+        eprintln!(
+            "session_start: overlay plan={} overlays={} read-only-mounts={}",
+            if overlay_plan.staging_root.is_some() { "split" } else { "whole" },
+            overlay_plan.overlays.len(),
+            overlay_plan.read_only_binds.len()
+        );
+        let real_kdeglobals = overlay_target.join(".config/kdeglobals");
         let mut kdeglobals_content = std::fs::read_to_string(&real_kdeglobals).unwrap_or_default();
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE_SMALL, FONT_WEIGHT_REGULAR, false);
@@ -1636,16 +1925,9 @@ impl KwinMcp {
             return Err(ver_err("xdg-dbus-proxy socket never appeared".to_owned()));
         }
 
-        let overlay_upper = host_xdg_dir.join("tmp/overlay-upper");
-        let overlay_work = host_xdg_dir.join("tmp/overlay-work");
-        std::fs::create_dir_all(&overlay_upper).map_err(|e| ver_err(e.to_string()))?;
-        std::fs::create_dir_all(&overlay_work).map_err(|e| ver_err(e.to_string()))?;
-        let overlay_upper_str = overlay_upper.display().to_string();
-        let overlay_work_str = overlay_work.display().to_string();
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
-        cmd.args(["--ro-bind", "/", "/", "--overlay-src", &home,
-            "--overlay", &overlay_upper_str, &overlay_work_str, &home]);
+        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
