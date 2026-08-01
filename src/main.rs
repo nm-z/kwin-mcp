@@ -848,6 +848,8 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     dbus_proxy_child: Option<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    viewer_socket: std::path::PathBuf,
+    viewer_endpoint: tokio::task::JoinHandle<()>,
     screen_width: u32,
     screen_height: u32,
 }
@@ -858,11 +860,19 @@ struct Session {
 /// `width`/`height` are the session default (compiled constants unless
 /// --width/--height overrode them); `locked` (--no-override) makes
 /// session_start ignore its optional width/height params entirely.
-#[derive(Clone, Copy)]
+#[derive(Clone, serde::Deserialize)]
+struct ChromeExtension {
+    id: String,
+    update_url: String,
+}
+
+#[derive(Clone)]
 struct DisplayConfig {
     width: u32,
     height: u32,
     locked: bool,
+    server: bool,
+    chrome_extension: Option<ChromeExtension>,
 }
 
 #[derive(Clone)]
@@ -1019,12 +1029,12 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
-    // Kill the viewer first so it can flush any pending wayland requests
-    // before the container's compositor disappears.
     if let Some(mut viewer) = sess.viewer_child.take() {
         let _ = viewer.kill();
         let _ = viewer.wait();
     }
+    sess.viewer_endpoint.abort();
+    let _ = std::fs::remove_file(&sess.viewer_socket);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -1039,9 +1049,6 @@ fn teardown(mut sess: Session) {
     cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
-/// Resolve the kwin-viewer binary by replacing the basename of our own
-/// current_exe. Returns None if the binary doesn't exist — the viewer is
-/// an optional convenience, not required for MCP tool operation.
 fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     let me = std::env::current_exe().ok()?;
     let dir = me.parent()?;
@@ -1049,20 +1056,33 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     if candidate.exists() { Some(candidate) } else { None }
 }
 
-/// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
-/// if anything goes wrong the agent's MCP tools still work; the user just
-/// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
-/// crashes and input-forwarding diagnostics survive past the spawn.
-fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Option<std::process::Child> {
+fn start_viewer_endpoint(
+    host_xdg_dir: &std::path::Path,
+    width: u32,
+    height: u32,
+) -> Result<(std::path::PathBuf, tokio::task::JoinHandle<()>), KwinError> {
+    use tokio::io::AsyncWriteExt;
+
+    let socket_path = host_xdg_dir.join("viewer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).map_err(KwinError::from)?;
+    let payload = serde_json::json!({
+        "session_dir": host_xdg_dir,
+        "width": width,
+        "height": height,
+    })
+    .to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream.write_all(payload.as_bytes()).await;
+        }
+    });
+    Ok((socket_path, task))
+}
+
+fn spawn_viewer(viewer_socket: &std::path::Path) -> Option<std::process::Child> {
     let bin = resolve_viewer_binary()?;
-    let log_path = host_xdg_dir.join("viewer.log");
-    let log_file = std::fs::File::create(&log_path).ok()?;
     match std::process::Command::new(&bin)
-        .arg(host_xdg_dir)
-        .arg(width.to_string())
-        .arg(height.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
+        .arg(viewer_socket)
         .spawn()
     {
         Ok(child) => {
@@ -1728,6 +1748,23 @@ impl KwinMcp {
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
+        let chrome_policies = self
+            .display
+            .chrome_extension
+            .as_ref()
+            .map(|extension| {
+                let directory = host_xdg_dir.join("chrome-policies");
+                std::fs::create_dir_all(&directory)?;
+                std::fs::write(
+                    directory.join("extension.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "ExtensionInstallForcelist": [format!("{};{}", extension.id, extension.update_url)],
+                    }))?,
+                )?;
+                anyhow::Ok(directory)
+            })
+            .transpose()
+            .map_err(|error| ver_err(format!("chrome extension metadata: {error}")))?;
         eprintln!(
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
@@ -1969,6 +2006,11 @@ impl KwinMcp {
             "--ro-bind", &kcmfonts_str, &home_kcmfonts,
             "--ro-bind", &fonts_conf_str, &home_fonts_conf,
         ]);
+        if let Some(directory) = chrome_policies {
+            cmd.arg("--ro-bind")
+                .arg(directory)
+                .arg("/etc/opt/chrome/policies/managed");
+        }
         // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
         // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
         // them the NVIDIA render node (often the primary GBM device) loads as
@@ -2152,6 +2194,8 @@ impl KwinMcp {
             Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin),
         };
         eprintln!("session_start: EIS ready");
+        let (viewer_socket, viewer_endpoint) =
+            start_viewer_endpoint(&host_xdg_dir, screen_w, screen_h)?;
 
         // Forward host wallet/secret services into the container's D-Bus
         let wallet_conn = match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await {
@@ -2160,30 +2204,7 @@ impl KwinMcp {
         };
         let host_conn = match zbus::Connection::session().await {
             Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("session_start: host bus unavailable, skipping wallet forwarding: {e}");
-                // Non-fatal — wallet forwarding is best-effort
-                let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-                let workdir = host_xdg_dir.display().to_string();
-                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-                let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
-                let mut guard = self.session.lock().await;
-                *guard = Some(Session {
-                    kwin_conn, _proxy_conn: proxy_conn, _wallet_conn: wallet_conn,
-                    kwin_unique_name: kwin_unique_name.clone(),
-                    eis, bwrap_child, bwrap_stdin, host_xdg_dir,
-                    _uinput_mouse: uinput_mouse, _uinput_keyboard: uinput_keyboard,
-                    cdp_browser: None,
-                    dbus_proxy_child: Some(dbus_proxy_child),
-                    viewer_child,
-                    screen_width: screen_w, screen_height: screen_h,
-                });
-                return Ok(structured_result(&peer, msg, serde_json::json!({
-                    "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
-                    "commit": env!("GIT_HASH"), "bus": bus_name, "kwin_unique": kwin_unique_name,
-                    "workdir": workdir, "width": screen_w, "height": screen_h,
-                })).await);
-            }
+            Err(e) => return cleanup_err(format!("host bus: {e}"), bwrap_child, bwrap_stdin),
         };
         // Carbon-copy host kwallet into container at startup. Once dumped, serve it
         // locally from an in-container emulator — no runtime host round-trips, no password prompts.
@@ -2214,7 +2235,9 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
+        let viewer_child = (!self.display.server)
+            .then(|| spawn_viewer(&viewer_socket))
+            .flatten();
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
@@ -2230,6 +2253,8 @@ impl KwinMcp {
             cdp_browser: None,
             dbus_proxy_child: Some(dbus_proxy_child),
             viewer_child,
+            viewer_socket,
+            viewer_endpoint,
             screen_width: screen_w,
             screen_height: screen_h,
         });
@@ -3100,6 +3125,8 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
+        server: false,
+        chrome_extension: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3107,9 +3134,16 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
+            "--server" => cfg.server = true,
+            "--chrome-extension" => {
+                let value = args.next().ok_or("--chrome-extension requires JSON")?;
+                cfg.chrome_extension = Some(serde_json::from_str(&value).map_err(|error| {
+                    format!("--chrome-extension invalid JSON: {error}")
+                })?);
+            }
             other => {
                 return Err(format!(
-                    "unknown argument '{other}' — usage: kwin-mcp [--width N] [--height N] [--no-override]"
+                    "unknown argument '{other}': usage: kwin-mcp [--server] [--width N] [--height N] [--no-override] [--chrome-extension JSON]"
                 ))
             }
         }
@@ -3133,10 +3167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let display = parse_cli_args()?;
     eprintln!(
-        "kwin-mcp: display default {}x{}{}",
+        "kwin-mcp: display default {}x{}{}{}",
         display.width,
         display.height,
-        if display.locked { " (locked, --no-override)" } else { "" }
+        if display.locked { " (locked, --no-override)" } else { "" },
+        if display.server { " (server)" } else { "" }
     );
     let kwin = KwinMcp::new(display);
     let router =

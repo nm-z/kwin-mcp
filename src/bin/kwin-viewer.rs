@@ -9,7 +9,7 @@
 
 //! Live viewer for a kwin-mcp container.
 //!
-//! Connects to /tmp/kwin-mcp-<pid>/ (passed as argv[1]), negotiates a
+//! Connects to a kwin-mcp viewer socket (passed as argv[1]), negotiates a
 //! zkde_screencast_unstable_v1 feed against the container's KWin, consumes
 //! the resulting PipeWire video node, and renders frames into a screen-13
 //! window. Mouse/keyboard events on the window are forwarded back into the
@@ -20,7 +20,7 @@ use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
 use screen_13_window::WindowBuilder;
 use std::collections::HashSet;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -125,20 +125,26 @@ wayland_client::delegate_noop!(WlState: ignore ZkdeScreencastUnstableV1);
 wayland_client::delegate_noop!(WlState: ignore OrgKdeKwinFakeInput);
 
 fn main() -> anyhow::Result<()> {
-    let mut argv = std::env::args().skip(1);
-    let session_dir = argv
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]"))?;
-    // Virtual display size, passed by kwin-mcp at spawn. Defaults match the
-    // server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
-    let virt_w: u32 = match argv.next() {
-        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("width '{v}': {e}"))?,
-        None => 3840,
-    };
-    let virt_h: u32 = match argv.next() {
-        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("height '{v}': {e}"))?,
-        None => 2160,
-    };
+    let viewer_socket = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock"))?;
+    let mut endpoint = UnixStream::connect(&viewer_socket)?;
+    let mut metadata = String::new();
+    endpoint.read_to_string(&mut metadata)?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+    let session_dir = metadata["session_dir"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("viewer endpoint omitted session_dir"))?;
+    let virt_w = u32::try_from(
+        metadata["width"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("viewer endpoint omitted width"))?,
+    )?;
+    let virt_h = u32::try_from(
+        metadata["height"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("viewer endpoint omitted height"))?,
+    )?;
     let session_path = std::path::PathBuf::from(&session_dir);
     anyhow::ensure!(
         session_path.join("wayland-0").exists(),
