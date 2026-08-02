@@ -573,47 +573,15 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 
 // ── Mount-aware overlay ──────────────────────────────────────────────────
 
-struct MountInventory {
-    records: Vec<procfs::process::MountInfo>,
-}
+const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 
-impl MountInventory {
-    fn read() -> anyhow::Result<Self> {
-        Ok(Self {
-            records: procfs::process::Process::myself()?.mountinfo()?.0,
-        })
-    }
-
-    fn is_mount_point(&self, path: &Path) -> bool {
-        self.records.iter().any(|mount| mount.mount_point == path)
-    }
-
-    fn has_descendant(&self, path: &Path) -> bool {
-        self.records
-            .iter()
-            .any(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
-    }
-
-    fn descendants(&self, path: &Path) -> Vec<PathBuf> {
-        let mut descendants: Vec<PathBuf> = self
-            .records
-            .iter()
-            .filter(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
-            .map(|mount| mount.mount_point.clone())
-            .collect();
-        descendants.sort_by(|left, right| {
-            left.components()
-                .count()
-                .cmp(&right.components().count())
-                .then_with(|| left.cmp(right))
-        });
-        descendants.dedup();
-        descendants
-    }
-}
-
-fn path_error(action: &str, path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::anyhow!("{action} {}: {error}", path.display())
+fn mount_descendants(mounts: &[procfs::process::MountInfo], path: &Path) -> Vec<PathBuf> {
+    let mut descendants: Vec<PathBuf> = mounts.iter()
+        .filter(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
+        .map(|mount| mount.mount_point.clone()).collect();
+    descendants.sort_by(|left, right| left.components().count().cmp(&right.components().count()).then_with(|| left.cmp(right)));
+    descendants.dedup();
+    descendants
 }
 
 struct OverlayMount {
@@ -623,15 +591,20 @@ struct OverlayMount {
     destination: PathBuf,
 }
 
+#[derive(Default)]
+struct SocketLinks(Vec<(PathBuf, PathBuf)>);
+impl Drop for SocketLinks {
+    fn drop(&mut self) { for (path, target) in &self.0 { if std::fs::read_link(path).is_ok_and(|link| link == *target) { let _ = std::fs::remove_file(path); } } } }
 struct OverlayPlan {
     staging_root: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
+    socket_binds: Vec<PathBuf>, socket_links: SocketLinks,
 }
 
 impl OverlayPlan {
     fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
-        command.args(["--ro-bind", "/", "/"]);
+        command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
         if let Some(staging_root) = &self.staging_root {
             command.arg("--bind").arg(staging_root).arg(target);
         }
@@ -647,6 +620,39 @@ impl OverlayPlan {
         for path in &self.read_only_binds {
             command.arg("--ro-bind").arg(path).arg(path);
         }
+        for (index, source) in self.socket_binds.iter().enumerate() {
+            let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
+            command.arg("--dir").arg(&destination).arg("--ro-bind").arg(source).arg(destination);
+        }
+    }
+
+    fn expose_sockets(&mut self, target: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        let canonical_target = std::fs::canonicalize(target)?;
+        let mut sockets: Vec<(PathBuf, PathBuf)> = procfs::net::unix()?.into_iter().filter_map(|entry| {
+            if entry.state != procfs::net::UnixState::UNCONNECTED { return None; }
+            let path = entry.path?; let parent = std::fs::canonicalize(path.parent()?).ok()?;
+            (path.starts_with(target) && parent.starts_with(&canonical_target)
+                && std::fs::metadata(&path).is_ok_and(|meta| meta.file_type().is_socket())).then_some((path, parent))
+        }).filter(|(path, _)| !self.read_only_binds.iter().any(|mount| path != mount && path.starts_with(mount))).collect();
+        sockets.sort(); sockets.dedup();
+        for (path, parent) in sockets {
+            self.read_only_binds.retain(|mount| mount != &path);
+            let index = self.socket_binds.iter().position(|bind| bind == &parent).unwrap_or_else(|| { let index = self.socket_binds.len(); self.socket_binds.push(parent); index });
+            let mount = self.overlays.iter().filter(|overlay| path.starts_with(&overlay.destination)).max_by_key(|overlay| overlay.destination.components().count());
+            let link = if let Some(overlay) = mount { overlay.upper.join(path.strip_prefix(&overlay.destination)?) }
+                else { self.staging_root.as_ref().ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?.join(path.strip_prefix(target)?) };
+            std::fs::create_dir_all(link.parent().ok_or_else(|| anyhow::anyhow!("no parent for {}", link.display()))?)?;
+            let generated = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}")).join(path.file_name().ok_or_else(|| anyhow::anyhow!("unnamed socket {}", path.display()))?);
+            match std::fs::symlink_metadata(&link) {
+                Ok(_) => anyhow::bail!("refusing to replace {}", link.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::os::unix::fs::symlink(&generated, &link)?;
+            self.socket_links.0.push((link, generated));
+        }
+        Ok(())
     }
 }
 
@@ -655,24 +661,11 @@ fn create_staging_directory(
     destination: &Path,
     initialize: bool,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(destination)
-        .map_err(|error| path_error("create staging directory", destination, error))?;
+    std::fs::create_dir_all(destination)?;
     if initialize {
-        let permissions = std::fs::metadata(source)
-            .map_err(|error| path_error("read permissions", source, error))?
-            .permissions();
-        std::fs::set_permissions(destination, permissions)
-            .map_err(|error| path_error("set staging permissions", destination, error))?;
+        std::fs::set_permissions(destination, std::fs::metadata(source)?.permissions())?;
     }
     Ok(())
-}
-
-fn staging_entry_exists(path: &Path) -> anyhow::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(path_error("inspect staging entry", path, error)),
-    }
 }
 
 struct SplitOverlayContext<'a> {
@@ -680,7 +673,7 @@ struct SplitOverlayContext<'a> {
     staging_root: &'a Path,
     upper_root: &'a Path,
     work_root: &'a Path,
-    mounts: &'a MountInventory,
+    mounts: &'a [procfs::process::MountInfo],
     initialize: bool,
 }
 
@@ -690,29 +683,21 @@ fn prepare_split_overlay_directory(
     overlays: &mut Vec<OverlayMount>,
     read_only_binds: &mut Vec<PathBuf>,
 ) -> anyhow::Result<()> {
-    let relative_directory = source_directory
-        .strip_prefix(context.target)
-        .map_err(|error| path_error("derive relative path", source_directory, error))?;
+    let relative_directory = source_directory.strip_prefix(context.target)?;
     let staged_directory = context.staging_root.join(relative_directory);
     create_staging_directory(source_directory, &staged_directory, context.initialize)?;
 
-    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(source_directory)
-        .map_err(|error| path_error("read directory", source_directory, error))?
-        .collect::<Result<_, _>>()
-        .map_err(|error| path_error("read directory entries", source_directory, error))?;
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(source_directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let source = entry.path();
-        let relative = source
-            .strip_prefix(context.target)
-            .map_err(|error| path_error("derive relative path", &source, error))?;
+        let relative = source.strip_prefix(context.target)?;
         let staged = context.staging_root.join(relative);
-        let file_type = entry
-            .file_type()
-            .map_err(|error| path_error("inspect entry", &source, error))?;
+        let file_type = entry.file_type()?;
+        let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
 
-        if context.mounts.is_mount_point(&source) {
+        if context.mounts.iter().any(|mount| mount.mount_point == source) {
             if file_type.is_dir() {
                 create_staging_directory(&source, &staged, context.initialize)?;
             }
@@ -720,16 +705,14 @@ fn prepare_split_overlay_directory(
         }
 
         if file_type.is_dir() {
-            if context.mounts.has_descendant(&source) {
+            if context.mounts.iter().any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source)) {
                 prepare_split_overlay_directory(&source, context, overlays, read_only_binds)?;
             } else {
                 create_staging_directory(&source, &staged, context.initialize)?;
                 let upper = context.upper_root.join(relative);
                 let work = context.work_root.join(relative);
-                std::fs::create_dir_all(&upper)
-                    .map_err(|error| path_error("create overlay upperdir", &upper, error))?;
-                std::fs::create_dir_all(&work)
-                    .map_err(|error| path_error("create overlay workdir", &work, error))?;
+                std::fs::create_dir_all(&upper)?;
+                std::fs::create_dir_all(&work)?;
                 overlays.push(OverlayMount {
                     lower: source.clone(),
                     upper,
@@ -741,23 +724,18 @@ fn prepare_split_overlay_directory(
         }
 
         if file_type.is_symlink() {
-            if context.initialize && !staging_entry_exists(&staged)? {
-                let target = std::fs::read_link(&source)
-                    .map_err(|error| path_error("read symlink", &source, error))?;
-                std::os::unix::fs::symlink(&target, &staged)
-                    .map_err(|error| path_error("copy symlink", &staged, error))?;
+            if context.initialize && !staged_exists {
+                std::os::unix::fs::symlink(std::fs::read_link(&source)?, &staged)?;
             }
         } else if file_type.is_file() {
-            if context.initialize && !staging_entry_exists(&staged)? {
+            if context.initialize && !staged_exists {
                 match std::fs::copy(&source, &staged) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                         let _ = std::fs::remove_file(&staged);
                         read_only_binds.push(source);
                     }
-                    Err(error) => {
-                        return Err(path_error("copy file", &source, error));
-                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
         } else {
@@ -770,26 +748,17 @@ fn prepare_split_overlay_directory(
 fn prepare_overlay_plan(
     target: &Path,
     session_tmp: &Path,
-    mounts: &MountInventory,
+    mounts: &[procfs::process::MountInfo],
 ) -> anyhow::Result<OverlayPlan> {
-    let excluded_mounts = mounts.descendants(target);
+    let excluded_mounts = mount_descendants(mounts, target);
     if excluded_mounts.is_empty() {
         let upper = session_tmp.join("overlay-upper");
         let work = session_tmp.join("overlay-work");
-        std::fs::create_dir_all(&upper)
-            .map_err(|error| path_error("create overlay upperdir", &upper, error))?;
-        std::fs::create_dir_all(&work)
-            .map_err(|error| path_error("create overlay workdir", &work, error))?;
-        return Ok(OverlayPlan {
-            staging_root: None,
-            overlays: vec![OverlayMount {
-                lower: target.to_path_buf(),
-                upper,
-                work,
-                destination: target.to_path_buf(),
-            }],
-            read_only_binds: Vec::new(),
-        });
+        std::fs::create_dir_all(&upper)?;
+        std::fs::create_dir_all(&work)?;
+        let overlay = OverlayMount { lower: target.to_path_buf(), upper, work, destination: target.to_path_buf() };
+        return Ok(OverlayPlan { staging_root: None, overlays: vec![overlay], read_only_binds: Vec::new(),
+            socket_binds: Vec::new(), socket_links: SocketLinks::default() });
     }
 
     let staging_root = session_tmp.join("overlay-root");
@@ -797,10 +766,8 @@ fn prepare_overlay_plan(
     let initialize = !initialized_marker.exists();
     let upper_root = session_tmp.join("overlay-upper");
     let work_root = session_tmp.join("overlay-work");
-    std::fs::create_dir_all(&upper_root)
-        .map_err(|error| path_error("create overlay upper root", &upper_root, error))?;
-    std::fs::create_dir_all(&work_root)
-        .map_err(|error| path_error("create overlay work root", &work_root, error))?;
+    std::fs::create_dir_all(&upper_root)?;
+    std::fs::create_dir_all(&work_root)?;
 
     let context = SplitOverlayContext {
         target,
@@ -821,14 +788,14 @@ fn prepare_overlay_plan(
     });
     read_only_binds.dedup();
     if initialize {
-        std::fs::write(&initialized_marker, b"split-overlay-v1\n")
-            .map_err(|error| path_error("write staging marker", &initialized_marker, error))?;
+        std::fs::write(&initialized_marker, b"split-overlay-v1\n")?;
     }
 
     Ok(OverlayPlan {
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
+        socket_binds: Vec::new(), socket_links: SocketLinks::default(),
     })
 }
 
@@ -848,6 +815,7 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     dbus_proxy_child: Option<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    _socket_links: SocketLinks,
     screen_width: u32,
     screen_height: u32,
 }
@@ -1049,18 +1017,64 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     if candidate.exists() { Some(candidate) } else { None }
 }
 
+async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
+    use std::os::unix::fs::FileTypeExt;
+    let (inherited_display, inherited_runtime) = (std::env::var_os("WAYLAND_DISPLAY"), std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
+    let socket = |runtime: &Path, display: &std::ffi::OsStr| if Path::new(display).is_absolute() { PathBuf::from(display) } else { runtime.join(display) };
+    if let (Some(runtime), Some(display)) = (&inherited_runtime, &inherited_display) {
+        let path = socket(runtime, display); anyhow::ensure!(std::fs::metadata(&path)?.file_type().is_socket(), "{} is not a Unix socket", path.display());
+        return Ok((runtime.clone(), display.clone()));
+    }
+    let system = zbus::Connection::system().await?;
+    let login = zbus::Proxy::new(&system, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager").await?;
+    let (user_path,): (zbus::zvariant::OwnedObjectPath,) = login.call("GetUserByPID", &(std::process::id(),)).await?;
+    let user = zbus::Proxy::new(&system, "org.freedesktop.login1", user_path, "org.freedesktop.login1.User").await?;
+    let runtime = inherited_runtime.unwrap_or(PathBuf::from(user.get_property::<String>("RuntimePath").await?));
+    let display = if let Some(display) = inherited_display {
+        display
+    } else {
+        let (_, session_path): (String, zbus::zvariant::OwnedObjectPath) = user.get_property("Display").await?;
+        let session = zbus::Proxy::new(&system, "org.freedesktop.login1", session_path, "org.freedesktop.login1.Session").await?;
+        anyhow::ensure!(session.get_property::<bool>("Active").await?
+            && session.get_property::<String>("State").await? == "active"
+            && session.get_property::<String>("Type").await? == "wayland", "no active logind Wayland session");
+        let managed = async {
+            let address = format!("unix:path={}/bus", runtime.display());
+            let user_bus = zbus::connection::Builder::address(address.as_str())?.build().await?;
+            let manager = zbus::Proxy::new(&user_bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager").await?;
+            anyhow::Ok(manager.get_property::<Vec<String>>("Environment").await?.into_iter()
+            .find_map(|entry| entry.strip_prefix("WAYLAND_DISPLAY=").map(std::ffi::OsString::from))
+            .filter(|display| std::fs::metadata(socket(&runtime, display)).is_ok_and(|meta| meta.file_type().is_socket())))
+        }.await.ok().flatten();
+        managed.or_else(|| std::fs::read_dir(&runtime).ok()?.filter_map(Result::ok).filter_map(|entry| {
+                let name = entry.file_name();
+                let number = name.to_str()?.strip_prefix("wayland-")?.parse::<u32>().ok()?;
+                entry.file_type().ok()?.is_socket().then_some((number, name))
+            }).min_by_key(|entry| entry.0).map(|entry| entry.1))
+            .ok_or_else(|| anyhow::anyhow!("no Wayland socket in {}", runtime.display()))?
+    };
+    let socket = socket(&runtime, &display);
+    anyhow::ensure!(std::fs::metadata(&socket)?.file_type().is_socket(), "{} is not a Unix socket", socket.display());
+    Ok((runtime, display))
+}
+
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work; the user just
 /// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
 /// crashes and input-forwarding diagnostics survive past the spawn.
-fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Option<std::process::Child> {
-    let bin = resolve_viewer_binary()?;
+async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Option<std::process::Child> {
     let log_path = host_xdg_dir.join("viewer.log");
-    let log_file = std::fs::File::create(&log_path).ok()?;
+    let mut log_file = std::fs::File::create(&log_path).ok()?;
+    let bin = resolve_viewer_binary().or_else(|| { let _ = std::io::Write::write_all(&mut log_file, b"kwin-viewer: binary not found\n"); None })?;
+    let (runtime, display) = host_wayland().await.map_err(|error| {
+            let _ = std::io::Write::write_all(&mut log_file, format!("kwin-viewer: host Wayland resolution failed: {error:#}\n").as_bytes());
+        }).ok()?;
     match std::process::Command::new(&bin)
         .arg(host_xdg_dir)
         .arg(width.to_string())
         .arg(height.to_string())
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("WAYLAND_DISPLAY", display)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(log_file))
         .spawn()
@@ -1070,6 +1084,7 @@ fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Opti
             Some(child)
         }
         Err(e) => {
+            let _ = std::fs::write(&log_path, format!("kwin-viewer: spawn failed: {e}\n"));
             eprintln!("session_start: viewer spawn failed ({e}), continuing without preview");
             None
         }
@@ -1788,23 +1803,25 @@ impl KwinMcp {
         if !overlay_target.is_absolute() {
             return Err(ver_err(format!("overlay target must be absolute: {}", overlay_target.display())));
         }
-        let mount_inventory = MountInventory::read()
+        let mount_inventory = procfs::process::Process::myself().and_then(|process| process.mountinfo()).map(|mounts| mounts.0)
             .map_err(|e| ver_err(format!("read mount inventory: {e:#}")))?;
-        let overlay_exclusions = mount_inventory.descendants(&overlay_target);
+        let overlay_exclusions = mount_descendants(&mount_inventory, &overlay_target);
         eprintln!(
             "session_start: mount inventory={} overlay-exclusions={}",
-            mount_inventory.records.len(),
+            mount_inventory.len(),
             overlay_exclusions.len()
         );
         for mount in &overlay_exclusions {
             eprintln!("session_start: excluding mount from overlay: {}", mount.display());
         }
-        let overlay_plan = prepare_overlay_plan(
+        let mut overlay_plan = prepare_overlay_plan(
             &overlay_target,
             &host_xdg_dir.join("tmp"),
             &mount_inventory,
         )
         .map_err(|e| ver_err(format!("prepare overlays: {e:#}")))?;
+        overlay_plan.expose_sockets(&overlay_target)
+            .map_err(|e| ver_err(format!("expose host sockets: {e:#}")))?;
         eprintln!(
             "session_start: overlay plan={} overlays={} read-only-mounts={}",
             if overlay_plan.staging_root.is_some() { "split" } else { "whole" },
@@ -1948,7 +1965,6 @@ impl KwinMcp {
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
             "--proc", "/proc",
             "--tmpfs", "/tmp",
-            "--tmpfs", "/run",
             "--ro-bind-try", &proxy_sock_str, "/run/dbus/system_bus_socket",
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
@@ -2158,33 +2174,7 @@ impl KwinMcp {
             Ok(conn) => conn,
             Err(e) => return cleanup_err(format!("wallet_conn: {e}"), bwrap_child, bwrap_stdin),
         };
-        let host_conn = match zbus::Connection::session().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("session_start: host bus unavailable, skipping wallet forwarding: {e}");
-                // Non-fatal — wallet forwarding is best-effort
-                let bus_name = kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-                let workdir = host_xdg_dir.display().to_string();
-                let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-                let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
-                let mut guard = self.session.lock().await;
-                *guard = Some(Session {
-                    kwin_conn, _proxy_conn: proxy_conn, _wallet_conn: wallet_conn,
-                    kwin_unique_name: kwin_unique_name.clone(),
-                    eis, bwrap_child, bwrap_stdin, host_xdg_dir,
-                    _uinput_mouse: uinput_mouse, _uinput_keyboard: uinput_keyboard,
-                    cdp_browser: None,
-                    dbus_proxy_child: Some(dbus_proxy_child),
-                    viewer_child,
-                    screen_width: screen_w, screen_height: screen_h,
-                });
-                return Ok(structured_result(&peer, msg, serde_json::json!({
-                    "status": "started", "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
-                    "commit": env!("GIT_HASH"), "bus": bus_name, "kwin_unique": kwin_unique_name,
-                    "workdir": workdir, "width": screen_w, "height": screen_h,
-                })).await);
-            }
-        };
+        if let Ok(host_conn) = zbus::Connection::session().await {
         // Carbon-copy host kwallet into container at startup. Once dumped, serve it
         // locally from an in-container emulator — no runtime host round-trips, no password prompts.
         let (network_wallet, wallet_entries) = match dump_host_wallet(&host_conn).await {
@@ -2207,6 +2197,9 @@ impl KwinMcp {
         if let Err(e) = wallet_conn.request_name("org.kde.kwalletd6").await {
             eprintln!("session_start: claim org.kde.kwalletd6 failed: {e}");
         }
+        } else {
+            eprintln!("session_start: host bus unavailable, skipping wallet forwarding");
+        }
 
         let bus_name = kwin_conn
             .unique_name()
@@ -2214,7 +2207,8 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h);
+        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h).await;
+        let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
@@ -2230,6 +2224,7 @@ impl KwinMcp {
             cdp_browser: None,
             dbus_proxy_child: Some(dbus_proxy_child),
             viewer_child,
+            _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
         });

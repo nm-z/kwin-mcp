@@ -1,6 +1,6 @@
 # kwin-mcp
 
-MCP server for KDE Plasma 6 Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
+MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
 
 ## Tools
 
@@ -52,6 +52,10 @@ Virtual input devices are created via `/dev/uinput` (requires `input` group). Th
 
 All coordinates are window-relative — window position is added internally via KWin scripting.
 
+### Home socket exposure
+
+At `session_start`, every active pathname socket beneath `$HOME` is exposed automatically. This includes sensitive control sockets. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths. Socket replacements at discovered names remain live; new socket names require a new session.
+
 ## Build
 
 ```bash
@@ -67,7 +71,7 @@ Add your user to these groups:
 sudo usermod -aG input,uinput,video,render $USER
 ```
 
-Requires: `bubblewrap` (bwrap), KDE Plasma 6, KWin.
+Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor.
 
 ## Screenshot dimensions
 
