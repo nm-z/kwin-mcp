@@ -1887,6 +1887,11 @@ impl KwinMcp {
             "set -u\n\
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
+            export XDG_CURRENT_DESKTOP=KDE\n\
+            export XDG_SESSION_DESKTOP=KDE\n\
+            export DESKTOP_SESSION=plasma\n\
+            export KDE_FULL_SESSION=true\n\
+            export KDE_SESSION_VERSION=6\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
             export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
             export GDK_SCALE={KDE_SCALE_FACTOR}\n\
@@ -1904,7 +1909,7 @@ impl KwinMcp {
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
             sleep 0.3\n\
-            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
+            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DESKTOP_SESSION KDE_FULL_SESSION KDE_SESSION_VERSION QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
             wireplumber &\n\
@@ -2972,7 +2977,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
+        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. Chromium-family browsers default to the session's KWallet emulator unless the command already specifies --password-store. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
     )]
     async fn launch_app(
         &self,
@@ -3016,17 +3021,25 @@ impl KwinMcp {
 
         // Force Chromium/Chrome to use native Wayland so xdg_popup menus render
         // (XWayland path produces focus ring only — menu surface never composites).
-        let needs_wayland_flag = (cmd_chromium
-            || cmd_lower.contains("google-chrome")
-            || cmd_lower.contains("edge"))
-            && !cmd_lower.contains("--ozone-platform");
-        let launch_cmd = {
-            let base = match cdp_port {
-                Some(port) => format!("{} --remote-debugging-port={port}", params.command),
-                None => params.command.clone(),
-            };
-            if needs_wayland_flag { format!("{base} --ozone-platform=wayland") } else { base }
+        let needs_wayland_flag =
+            (cmd_chromium || cmd_lower.contains("google-chrome") || cmd_lower.contains("edge"))
+                && !cmd_lower.contains("--ozone-platform");
+        let needs_kwallet_flag = (cmd_lower.contains("google-chrome")
+            || cmd_lower.contains("chromium")
+            || cmd_lower.contains("edge")
+            || cmd_lower.contains("brave")
+            || cmd_lower.contains("vivaldi"))
+            && !cmd_lower.contains("--password-store");
+        let mut launch_cmd = match cdp_port {
+            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+            None => params.command.clone(),
         };
+        if needs_wayland_flag {
+            launch_cmd.push_str(" --ozone-platform=wayland");
+        }
+        if needs_kwallet_flag {
+            launch_cmd.push_str(" --password-store=kwallet6");
+        }
         {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
