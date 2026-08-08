@@ -815,6 +815,7 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     dbus_proxy_child: Option<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    clipboard_children: Vec<std::process::Child>,
     _socket_links: SocketLinks,
     screen_width: u32,
     screen_height: u32,
@@ -987,6 +988,16 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
+    // Reap the clipboard watchers and any wl-copy daemons they left holding a
+    // selection. They run in their own process group, so a negative-PID SIGTERM
+    // takes down the whole group.
+    for mut child in std::mem::take(&mut sess.clipboard_children) {
+        if let Ok(neg) = i32::try_from(child.id()).map(|p| -p) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(mut viewer) = sess.viewer_child.take() {
@@ -1015,6 +1026,112 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     let dir = me.parent()?;
     let candidate = dir.join("kwin-viewer");
     if candidate.exists() { Some(candidate) } else { None }
+}
+
+/// Browser launch commands we know how to detect. The container mounts the host
+/// root read-only, so anything on the host's PATH is runnable inside the session
+/// by the same command. Ordered most- to least-common so the injected hint reads
+/// sensibly. `chromium` is called out separately by callers because it's the only
+/// one that exposes CDP on its default profile.
+const KNOWN_BROWSERS: &[&str] = &[
+    "google-chrome-stable",
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+    "brave",
+    "brave-browser",
+    "firefox",
+    "firefox-esr",
+    "vivaldi-stable",
+    "vivaldi",
+    "microsoft-edge-stable",
+    "microsoft-edge",
+    "opera",
+];
+
+/// Scan the host PATH for known browser commands. Returns the runnable command
+/// names in KNOWN_BROWSERS order. Deduplicates so a name reachable from two PATH
+/// entries is reported once. Runs once at server launch (see `main`).
+fn detect_browsers() -> Vec<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    KNOWN_BROWSERS
+        .iter()
+        .filter(|name| {
+            dirs.iter().any(|dir| {
+                let candidate = dir.join(name);
+                std::fs::metadata(&candidate).is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+            })
+        })
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Two-way clipboard bridge between the host compositor and the container's
+/// nested KWin, using host-side `wl-clipboard` (`wl-paste --watch` + `wl-copy`).
+/// Text only — that's what issue #29 asks for and it sidesteps binary/MIME edge
+/// cases. Each direction runs a watcher that fires on selection change and mirrors
+/// the new text to the other side, but only when the other side differs — that
+/// dedup is what stops the two watchers from ping-ponging an identical value
+/// forever. Non-fatal: if wl-clipboard is missing or a watcher won't spawn, the
+/// agent's tools still work; there's just no clipboard sync. Watchers run in their
+/// own process group so teardown can reap any `wl-copy` daemons they left holding
+/// a selection.
+fn spawn_clipboard_bridge(
+    host_runtime: &Path,
+    host_display: &std::ffi::OsStr,
+    container_xdg_dir: &Path,
+) -> Vec<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    if which_on_path("wl-paste").is_none() || which_on_path("wl-copy").is_none() {
+        eprintln!("clipboard bridge: wl-clipboard not found on PATH, skipping");
+        return Vec::new();
+    }
+    let host_runtime = host_runtime.display().to_string();
+    let host_display = host_display.to_string_lossy().to_string();
+    let container_xdg = container_xdg_dir.display().to_string();
+    // (watcher-side env, sink-side env) for each direction.
+    let host_env = [("XDG_RUNTIME_DIR", host_runtime.as_str()), ("WAYLAND_DISPLAY", host_display.as_str())];
+    let container_env = [("XDG_RUNTIME_DIR", container_xdg.as_str()), ("WAYLAND_DISPLAY", "wayland-0")];
+    let directions = [
+        ("host->container", host_env, container_env),
+        ("container->host", container_env, host_env),
+    ];
+    let mut children = Vec::new();
+    for (label, watch_env, sink_env) in directions {
+        let (sink_rt, sink_disp) = (sink_env[0].1, sink_env[1].1);
+        // `wl-paste -w` runs this shell on each change, feeding the new selection on
+        // stdin. Copy it to the sink only if the sink's current text differs.
+        let script = format!(
+            "v=$(cat); [ \"$v\" = \"$(XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-paste -n -t text 2>/dev/null)\" ] \
+             || printf %s \"$v\" | XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-copy -t text/plain"
+        );
+        let mut cmd = std::process::Command::new("wl-paste");
+        cmd.args(["-t", "text", "-w", "sh", "-c", &script]);
+        cmd.env("XDG_RUNTIME_DIR", watch_env[0].1);
+        cmd.env("WAYLAND_DISPLAY", watch_env[1].1);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.process_group(0);
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("clipboard bridge: {label} watcher pid={}", child.id());
+                children.push(child);
+            }
+            Err(e) => eprintln!("clipboard bridge: {label} spawn failed: {e}"),
+        }
+    }
+    children
+}
+
+/// Minimal PATH lookup for an executable name (no external `which`).
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate).is_ok().then_some(candidate)
+    })
 }
 
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
@@ -2208,6 +2325,15 @@ impl KwinMcp {
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
         let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h).await;
+        // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
+        // the same host Wayland resolution as the viewer.
+        let clipboard_children = match host_wayland().await {
+            Ok((runtime, display)) => spawn_clipboard_bridge(&runtime, &display, &host_xdg_dir),
+            Err(e) => {
+                eprintln!("session_start: clipboard bridge skipped (host Wayland: {e:#})");
+                Vec::new()
+            }
+        };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
@@ -2224,6 +2350,7 @@ impl KwinMcp {
             cdp_browser: None,
             dbus_proxy_child: Some(dbus_proxy_child),
             viewer_child,
+            clipboard_children,
             _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
@@ -3014,18 +3141,30 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
+        // Any Chromium-family browser (chromium/brave/vivaldi/chrome/edge) benefits
+        // from the Wayland + kwallet flags below.
+        let is_chromium_family = cmd_chromium
+            || cmd_lower.contains("google-chrome")
+            || cmd_lower.contains("chrome")
+            || cmd_lower.contains("edge");
         // Force Chromium/Chrome to use native Wayland so xdg_popup menus render
         // (XWayland path produces focus ring only — menu surface never composites).
-        let needs_wayland_flag = (cmd_chromium
-            || cmd_lower.contains("google-chrome")
-            || cmd_lower.contains("edge"))
-            && !cmd_lower.contains("--ozone-platform");
+        let needs_wayland_flag = is_chromium_family && !cmd_lower.contains("--ozone-platform");
+        // Force the kwallet6 password store so Chrome reads its "Chrome Safe Storage"
+        // key from our in-container KWallet emulator instead of auto-selecting the
+        // xdg-desktop-portal Secret backend (which isn't running in the container and
+        // leaves Chrome prompting "Authentication required"). The profile's cookies
+        // are v10/v11 — derived from that kwallet passphrase — so this decrypts them
+        // and Chrome comes up already logged in (issue #30).
+        let needs_password_store = is_chromium_family && !cmd_lower.contains("--password-store");
         let launch_cmd = {
-            let base = match cdp_port {
+            let mut base = match cdp_port {
                 Some(port) => format!("{} --remote-debugging-port={port}", params.command),
                 None => params.command.clone(),
             };
-            if needs_wayland_flag { format!("{base} --ozone-platform=wayland") } else { base }
+            if needs_wayland_flag { base.push_str(" --ozone-platform=wayland"); }
+            if needs_password_store { base.push_str(" --password-store=kwallet6"); }
+            base
         };
         {
             let mut guard = self.session.lock().await;
@@ -3134,8 +3273,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if display.locked { " (locked, --no-override)" } else { "" }
     );
     let kwin = KwinMcp::new(display);
+    // Inject the host's installed browsers into the launch_app description so the
+    // agent knows what it can actually run without guessing (issue #28).
+    let mut tool_router = KwinMcp::tool_router();
+    let browsers = detect_browsers();
+    eprintln!("kwin-mcp: detected browsers: {}", if browsers.is_empty() { "(none)".to_owned() } else { browsers.join(", ") });
+    if let Some(route) = tool_router.map.get_mut("launch_app") {
+        let hint = if browsers.is_empty() {
+            "\n\nNo known browser was found on this host's PATH.".to_owned()
+        } else {
+            format!(
+                "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
+                 Only 'chromium' exposes CDP DOM queries on its default profile; the others still \
+                 launch, screenshot, and accept input normally.",
+                browsers.join(", ")
+            )
+        };
+        let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
+        route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
+    }
     let router =
-        rmcp::handler::server::router::Router::new(kwin).with_tools(KwinMcp::tool_router());
+        rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
     service.waiting().await?;
