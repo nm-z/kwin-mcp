@@ -3,7 +3,7 @@ mod input_bridge;
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_aux::field_attributes::deserialize_number_from_string;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1208,25 +1208,26 @@ async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -
     }
 }
 
-async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
+async fn run_kwin_script(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &std::path::Path,
+    script_body: &str,
+) -> Result<String, KwinError> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
+        .as_nanos();
     let marker = format!("kwin-mcp-{ts}");
     let cb_path = format!("/KWinMCP/{ts}");
     let our_name = conn
         .unique_name()
         .ok_or(KwinError::Msg("no bus name".to_owned()))?
         .to_string();
+    let our_name_json = serde_json::to_string(&our_name)?;
+    let cb_path_json = serde_json::to_string(&cb_path)?;
     let script = format!(
-        "var w = workspace.activeWindow;\
-        var c = workspace.cursorPos;\
-        callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
-        w ? JSON.stringify({{x:w.clientGeometry.x,y:w.clientGeometry.y,\
-        w:w.clientGeometry.width,h:w.clientGeometry.height,\
-        title:w.caption,id:w.internalId.toString(),\
-        resourceClass:w.resourceClass,resourceName:w.resourceName,\
-        pid:w.pid,cx:c.x,cy:c.y}}) : 'null');"
+        "{script_body}\n\
+        callDBus({our_name_json},{cb_path_json},'org.kde.KWinMCP','result',JSON.stringify(result));"
     );
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
@@ -1239,7 +1240,7 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     };
     let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str())?;
     let registered = conn.object_server().at(&obj_path, cb).await?;
-    eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
+    eprintln!("run_kwin_script: our_name={our_name} path={cb_path} registered={registered}");
     if !registered {
         return Err(KwinError::Msg(format!("failed to register callback at {cb_path}")));
     }
@@ -1264,15 +1265,36 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
         .interface("org.kde.kwin.Script")?
         .build()
         .await?;
-    script_proxy.call::<_, (), ()>("run", &()).await?;
+    if let Err(error) = script_proxy.call::<_, (), ()>("run", &()).await {
+        conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
+        let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
+        std::fs::remove_file(&script_file)?;
+        return Err(error.into());
+    }
     // Wait for callback, then cleanup regardless of result
-    let json_result = rx
+    let result = rx
         .await
         .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()));
     conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
     let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
     std::fs::remove_file(&script_file)?;
-    let json = json_result?;
+    result
+}
+
+async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
+    let json = run_kwin_script(
+        conn,
+        kwin_unique,
+        host_xdg_dir,
+        "var w = workspace.activeWindow;\
+         var c = workspace.cursorPos;\
+         var result = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
+         w:w.clientGeometry.width,h:w.clientGeometry.height,\
+         title:w.caption,id:w.internalId.toString(),\
+         resourceClass:w.resourceClass,resourceName:w.resourceName,\
+         pid:w.pid,cx:c.x,cy:c.y} : null;",
+    )
+    .await?;
     if json == "null" {
         return Err(KwinError::Msg("KWin script error: No active window".to_owned()));
     }
@@ -1280,6 +1302,149 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     #[expect(clippy::as_conversions)]
     let (x, y) = (info.x.round() as i32, info.y.round() as i32);
     Ok((x, y, info))
+}
+
+#[derive(Deserialize, Serialize)]
+struct WindowSnapshot {
+    id: String,
+    title: String,
+    #[serde(rename = "resourceClass")]
+    resource_class: String,
+    #[serde(rename = "resourceName")]
+    resource_name: String,
+    pid: i32,
+    active: bool,
+    minimized: bool,
+    modal: bool,
+    transient: bool,
+    dialog: bool,
+    popup: bool,
+    #[serde(rename = "transientFor")]
+    transient_for: Option<String>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    #[serde(rename = "stackingOrder")]
+    stacking_order: i32,
+}
+
+impl WindowSnapshot {
+    fn summary(&self) -> String {
+        let mut flags = Vec::new();
+        if self.active {
+            flags.push("active");
+        }
+        if self.minimized {
+            flags.push("minimized");
+        }
+        if self.modal {
+            flags.push("modal");
+        }
+        if self.transient {
+            flags.push("transient");
+        }
+        if self.dialog {
+            flags.push("dialog");
+        }
+        if self.popup {
+            flags.push("popup");
+        }
+        let flags = if flags.is_empty() {
+            "normal".to_owned()
+        } else {
+            flags.join(",")
+        };
+        let transient_for = self
+            .transient_for
+            .as_deref()
+            .map(|id| format!(" transient_for={id}"))
+            .unwrap_or_default();
+        format!(
+            "[{flags}] id={} title={:?} app={}/{} pid={} geometry=({:.0},{:.0} {:.0}x{:.0}) stack={}{}",
+            self.id,
+            self.title,
+            self.resource_class,
+            self.resource_name,
+            self.pid,
+            self.x,
+            self.y,
+            self.w,
+            self.h,
+            self.stacking_order,
+            transient_for,
+        )
+    }
+}
+
+async fn window_snapshots(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+) -> Result<Vec<WindowSnapshot>, KwinError> {
+    let json = run_kwin_script(
+        conn,
+        kwin_unique,
+        host_xdg_dir,
+        "var result = [];\
+         var windows = workspace.stackingOrder;\
+         for (var i = windows.length - 1; i >= 0; --i) {\
+           var w = windows[i];\
+           if (!w.managed || w.deleted || w.desktopWindow || w.dock || w.outline) continue;\
+           var g = w.clientGeometry;\
+           result.push({\
+             id:w.internalId.toString(),title:w.caption,\
+             resourceClass:w.resourceClass,resourceName:w.resourceName,pid:w.pid,\
+             active:w.active,minimized:w.minimized,modal:w.modal,transient:w.transient,\
+             dialog:w.dialog,popup:w.popupWindow,\
+             transientFor:w.transientFor ? w.transientFor.internalId.toString() : null,\
+             x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder\
+           });\
+         }",
+    )
+    .await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+async fn activate_window(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    window_id: &str,
+) -> Result<WindowSnapshot, KwinError> {
+    let window_id_json = serde_json::to_string(window_id)?;
+    let script = format!(
+        "var targetId = {window_id_json};\
+         var result = false;\
+         var windows = workspace.stackingOrder;\
+         for (var i = 0; i < windows.length; ++i) {{\
+           var w = windows[i];\
+           if (w.internalId.toString() !== targetId) continue;\
+           w.minimized = false;\
+           workspace.raiseWindow(w);\
+           workspace.activeWindow = w;\
+           result = true;\
+           break;\
+         }}"
+    );
+    let activated: bool = serde_json::from_str(
+        &run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?,
+    )?;
+    if !activated {
+        return Err(KwinError::Msg(format!("no window with id {window_id}")));
+    }
+    tokio::time::sleep(INPUT_EVENT_DELAY).await;
+    let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
+    let window = windows
+        .into_iter()
+        .find(|window| window.id == window_id)
+        .ok_or_else(|| KwinError::Msg(format!("window {window_id} disappeared")))?;
+    if !window.active {
+        return Err(KwinError::Msg(format!(
+            "KWin did not activate window {window_id}"
+        )));
+    }
+    Ok(window)
 }
 
 struct KWinCallback {
@@ -1750,6 +1915,12 @@ struct SessionStartParams {
     height: Option<u32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WindowActivateParams {
+    /// Exact window ID returned by window_list.
+    window_id: String,
+}
+
 // ── Tool implementations ────────────────────────────────────────────────
 
 impl rmcp::ServerHandler for KwinMcp {
@@ -1760,6 +1931,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 "KDE Wayland desktop automation in an isolated container. \
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
+                If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
                 Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click.",
@@ -2381,6 +2553,59 @@ impl KwinMcp {
             }
             None => Ok(structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await),
         }
+    }
+
+    #[rmcp::tool(
+        name = "window_list",
+        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized state, and modal/transient relationships. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
+        annotations(read_only_hint = true)
+    )]
+    async fn window_list(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
+        let xdg = self.host_xdg_dir().await?;
+        let windows = window_snapshots(&conn, &kwin_unique, &xdg).await?;
+        let text = if windows.is_empty() {
+            "no managed windows".to_owned()
+        } else {
+            windows
+                .iter()
+                .map(WindowSnapshot::summary)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let count = windows.len();
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({"count": count, "windows": windows}),
+        )
+        .await)
+    }
+
+    #[rmcp::tool(
+        name = "window_activate",
+        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
+    )]
+    async fn window_activate(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<WindowActivateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
+        let xdg = self.host_xdg_dir().await?;
+        let window = activate_window(&conn, &kwin_unique, &xdg, &params.window_id).await?;
+        let text = format!("activated {}", window.summary());
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({"status": "activated", "window": window}),
+        )
+        .await)
     }
 
     // Alpha-blends the high-visibility cursor sprite onto an RGBA buffer so that

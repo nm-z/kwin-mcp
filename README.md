@@ -9,6 +9,8 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `session_start` | Start an isolated KDE Wayland session. Must be called first. |
 | `session_stop` | Tear down the session and all container processes. |
 | `screenshot` | Capture the active window as PNG. |
+| `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
+| `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
 | `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
 | `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
