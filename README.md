@@ -78,9 +78,9 @@ Virtual input devices are created via `/dev/uinput` (requires `input` group). Th
 
 All coordinates are window-relative — window position is added internally via KWin scripting.
 
-### Home socket exposure
+### Host socket exposure
 
-At `session_start`, every active pathname socket beneath `$HOME` is exposed automatically. This includes sensitive control sockets. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths. Socket replacements at discovered names remain live; new socket names require a new session.
+At `session_start`, active pathname sockets beneath `$HOME` and non-graphical user-runtime sockets are exposed automatically. Sockets owned by processes attached to the host display, desktop application scopes, input devices, or the desktop session slice remain isolated. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each exposed socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths. Socket replacements at discovered names remain live; new socket names require a new session.
 
 ## Build
 
