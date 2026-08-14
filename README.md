@@ -23,6 +23,28 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 
 Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
 
+## Strict host-GUI isolation
+
+Normal Codex shell commands inherit the host desktop's Wayland, X11, and session-bus environment, so an accidental command can open or control a real host window. Launch Codex through `kwin-mcp-strict` to remove those channels from Codex and its shell tools while forwarding the original values only to the configured `kwin-mcp` stdio server:
+
+```bash
+# Assumes the MCP entry in config.toml is named "kwin-mcp".
+target/release/kwin-mcp-strict --
+
+# Forward Codex arguments after the separator.
+target/release/kwin-mcp-strict -- --model gpt-5.6-terra
+```
+
+The launcher uses Codex's one-run `--config` overrides for `mcp_servers.<id>.env`, so it does not rewrite `~/.codex/config.toml`. Use `--mcp-server NAME` if the configured server has a different name, and `--codex PATH` if `codex` is not on `PATH`. The KWin MCP process retains the host-session values needed by its viewer, clipboard bridge, and wallet integration; apps continue to receive the isolated session's replacements.
+
+Strict mode is fail-closed for inherited values and profile-based shell reinjection. Restoring normal host-desktop access requires an explicit opt-out from a host terminal:
+
+```bash
+target/release/kwin-mcp-strict --allow-host-gui --
+```
+
+This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
+
 ## Session Architecture
 
 ```
