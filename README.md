@@ -21,6 +21,8 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
 
+Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
+
 ## Session Architecture
 
 ```

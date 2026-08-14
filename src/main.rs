@@ -832,6 +832,7 @@ struct DisplayConfig {
     width: u32,
     height: u32,
     locked: bool,
+    viewer_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -2496,7 +2497,12 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h).await;
+        let viewer_child = if self.display.viewer_enabled {
+            spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
+        } else {
+            eprintln!("session_start: viewer disabled (--no-viewer)");
+            None
+        };
         // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
         // the same host Wayland resolution as the viewer.
         let clipboard_children = match host_wayland().await {
@@ -3459,6 +3465,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
+        viewer_enabled: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3466,9 +3473,10 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
+            "--no-viewer" => cfg.viewer_enabled = false,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}' — usage: kwin-mcp [--width N] [--height N] [--no-override]"
+                    "unknown argument '{other}' — usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer]"
                 ))
             }
         }
@@ -3492,10 +3500,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let display = parse_cli_args()?;
     eprintln!(
-        "kwin-mcp: display default {}x{}{}",
+        "kwin-mcp: display default {}x{}{}; viewer {}",
         display.width,
         display.height,
-        if display.locked { " (locked, --no-override)" } else { "" }
+        if display.locked { " (locked, --no-override)" } else { "" },
+        if display.viewer_enabled {
+            "enabled"
+        } else {
+            "disabled (--no-viewer)"
+        }
     );
     let kwin = KwinMcp::new(display);
     // Inject the host's installed browsers into the launch_app description so the
