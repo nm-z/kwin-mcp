@@ -1,0 +1,7 @@
+interface:
+  display_name: "KWin MCP Routing"
+  short_description: "Keep GUI work off Nate's live session"
+  default_prompt: "Use $kwin-mcp to perform this GUI task in the isolated KWin MCP copy unless the requested result explicitly must appear in Nate's session."
+
+policy:
+  allow_implicit_invocation: true
