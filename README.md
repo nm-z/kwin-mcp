@@ -32,6 +32,8 @@ kwin-mcp --server
 kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
 ```
 
+Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir after `session_stop`. Without the flag, `session_stop` retains the existing workdir behavior.
+
 ## Strict host-GUI isolation
 
 Normal Codex shell commands inherit the host desktop's Wayland, X11, and session-bus environment, so an accidental command can open or control a real host window. Launch Codex through `kwin-mcp-strict` to remove those channels from Codex and its shell tools while forwarding the original values only to the configured `kwin-mcp` stdio server:
