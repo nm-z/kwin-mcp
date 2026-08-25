@@ -916,6 +916,7 @@ struct DisplayConfig {
     height: u32,
     locked: bool,
     viewer_enabled: bool,
+    autoclean: bool,
 }
 
 #[derive(Clone)]
@@ -1071,7 +1072,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
     }
 }
 
-fn teardown(mut sess: Session) {
+fn teardown(mut sess: Session, autoclean: bool) -> std::io::Result<()> {
     drop(sess.cdp_browser);
     // Reap the clipboard watchers and any wl-copy daemons they left holding a
     // selection. They run in their own process group, so a negative-PID SIGTERM
@@ -1108,8 +1109,13 @@ fn teardown(mut sess: Session) {
             let _ = std::fs::set_permissions(path, permissions);
         }
     }
-    let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
-    cleanup_stale_session_files(&sess.host_xdg_dir);
+    if autoclean {
+        std::fs::remove_dir_all(&sess.host_xdg_dir)
+    } else {
+        let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
+        cleanup_stale_session_files(&sess.host_xdg_dir);
+        Ok(())
+    }
 }
 
 /// Resolve the kwin-viewer binary by replacing the basename of our own
@@ -2397,14 +2403,15 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and kill every process in the container. Call when finished — sessions do not auto-clean on disconnect. No-op if no session is running.",
+        description = "Tear down the current session and kill every process in the container. When the server was launched with --autoclean, also remove the session workdir. Call when finished; sessions do not auto-clean on disconnect. No-op if no session is running.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut guard = self.session.lock().await;
         match (*guard).take() {
             Some(sess) => {
-                teardown(sess);
+                teardown(sess, self.display.autoclean)
+                    .map_err(|error| McpError::internal_error(format!("session stopped but autoclean failed: {error}"), None))?;
                 Ok(structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await)
             }
             None => Ok(structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await),
@@ -3318,6 +3325,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
         viewer_enabled: true,
+        autoclean: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3326,9 +3334,10 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
             "--no-viewer" => cfg.viewer_enabled = false,
+            "--autoclean" => cfg.autoclean = true,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean]"
                 ))
             }
         }
