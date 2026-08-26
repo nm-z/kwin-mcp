@@ -1,4 +1,5 @@
 mod input_bridge;
+mod launch_command;
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
@@ -3180,7 +3181,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
+        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. Chromium-family browsers are started with --password-store=kwallet6 so saved logins and cookies decrypt from the host wallet, unless the command already passes --password-store. Injected switches go into the browser's own arguments, so compound commands like 'google-chrome-stable URL && echo done' still configure the browser. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
     )]
     async fn launch_app(
         &self,
@@ -3190,16 +3191,17 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // Detect Chromium/Electron apps that support CDP on the default profile
+        // Locate the Chromium-family browser inside the shell command line and
+        // learn which switches its own argv already sets. Scanning the whole
+        // line instead put injected switches on a later command (`chrome URL &&
+        // echo done` handed them to echo) and let any text elsewhere in the
+        // line suppress an injection Chrome needed.
+        let browser = launch_command::find_browser_invocation(&params.command)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         // Google Chrome and Edge block CDP without --user-data-dir, so skip them
-        let cmd_lower = params.command.to_lowercase();
-        let cmd_chromium = if cmd_lower.contains("google-chrome") || cmd_lower.contains("edge") {
-            false
-        } else {
-            cmd_lower.contains("chromium") || cmd_lower.contains("electron")
-                || cmd_lower.contains("code") || cmd_lower.contains("brave")
-                || cmd_lower.contains("vivaldi")
-        };
+        let cmd_chromium = browser
+            .as_ref()
+            .is_some_and(|found| found.kind == launch_command::BrowserKind::CdpCapable);
 
         let cdp_port = if cmd_chromium {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
@@ -3228,23 +3230,32 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        let is_chromium_family = cmd_chromium
-            || cmd_lower.contains("google-chrome")
-            || cmd_lower.contains("chrome")
-            || cmd_lower.contains("edge");
-        let needs_wayland_flag = is_chromium_family && !cmd_lower.contains("--ozone-platform");
-        let needs_password_store = is_chromium_family && !cmd_lower.contains("--password-store");
         let launch_cmd = {
-            let mut command = match cdp_port {
-                Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+            let command = match &browser {
+                // Switches go into the browser's own argv, right after the
+                // program word: --ozone-platform=wayland so xdg_popup menus
+                // composite, and --password-store=kwallet6 so credentials come
+                // from the host kwalletd6 reachable on the session service bus.
+                Some(found) => {
+                    let mut switches = Vec::new();
+                    if let Some(port) = cdp_port {
+                        switches.push(format!("--remote-debugging-port={port}"));
+                    }
+                    if !found.has_ozone_platform {
+                        switches.push("--ozone-platform=wayland".to_owned());
+                    }
+                    if !found.has_password_store {
+                        switches.push("--password-store=kwallet6".to_owned());
+                    }
+                    eprintln!(
+                        "launch_app: browser={} switches=[{}]",
+                        found.program,
+                        switches.join(" ")
+                    );
+                    found.with_switches(&params.command, &switches)
+                }
                 None => params.command.clone(),
             };
-            if needs_wayland_flag {
-                command.push_str(" --ozone-platform=wayland");
-            }
-            if needs_password_store {
-                command.push_str(" --password-store=kwallet6");
-            }
             format!(
                 "env DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
             )
