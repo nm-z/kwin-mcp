@@ -23,7 +23,7 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 
 Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
 
-Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir after `session_stop`. Without the flag, `session_stop` retains the existing workdir behavior.
+Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. The server takes cleanup ownership of the workdir as soon as `session_start` creates it, so a start that fails, is cancelled, or hits the hard timeout removes it too. Removal first normalizes permissions inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block it. If removal still fails, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag, `session_stop` retains the existing workdir behavior.
 
 ## Strict host-GUI isolation
 

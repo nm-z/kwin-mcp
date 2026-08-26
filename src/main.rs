@@ -922,6 +922,11 @@ struct DisplayConfig {
 #[derive(Clone)]
 struct KwinMcp {
     session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    /// Session workdir that --autoclean still owns and must delete. Set the
+    /// moment session_start creates the directory, so failed, cancelled, and
+    /// timed-out starts are covered too, and cleared only once the directory is
+    /// actually gone, so a failed delete stays retryable through session_stop.
+    autoclean_workdir: Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
     display: DisplayConfig,
 }
 
@@ -929,6 +934,7 @@ impl KwinMcp {
     fn new(display: DisplayConfig) -> Self {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
+            autoclean_workdir: Arc::new(tokio::sync::Mutex::new(None)),
             display,
         }
     }
@@ -973,6 +979,34 @@ impl KwinMcp {
                 "no session — call session_start first",
                 None,
             )),
+        }
+    }
+    /// Autoclean an owned session workdir left behind by a session_start attempt
+    /// that published no Session, covering the failed paths and the cancelled
+    /// hard-timeout path. A published Session keeps its workdir for session_stop.
+    /// Ownership survives a failed delete, so session_stop can retry it.
+    async fn autoclean_unpublished_workdir(&self, error: McpError) -> McpError {
+        if self.session.lock().await.is_some() {
+            return error;
+        }
+        let mut owned = self.autoclean_workdir.lock().await;
+        let Some(dir) = owned.clone() else {
+            return error;
+        };
+        match remove_session_workdir(&dir) {
+            Ok(()) => {
+                eprintln!("session_start: autoclean removed {}", dir.display());
+                *owned = None;
+                error
+            }
+            Err(remove_error) => McpError::internal_error(
+                format!(
+                    "{}; session workdir {} not removed: {remove_error}. Cleanup is still owned, call session_stop to retry.",
+                    error.message,
+                    dir.display()
+                ),
+                None,
+            ),
         }
     }
 }
@@ -1072,7 +1106,47 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
     }
 }
 
-fn teardown(mut sess: Session, autoclean: bool) -> std::io::Result<()> {
+/// Restore owner read/write/traverse bits on every directory inside an owned
+/// session workdir so removal cannot be blocked by a mode-000 directory that a
+/// launched command created in the overlay upper layer. Symlinks are never
+/// followed and never chmod'd, so the walk stays inside `dir`.
+fn make_session_workdir_removable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    const OWNER_RWX: u32 = 0o700;
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !metadata.is_dir() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    if permissions.mode() & OWNER_RWX != OWNER_RWX {
+        permissions.set_mode(permissions.mode() | OWNER_RWX);
+        let _ = std::fs::set_permissions(dir, permissions);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        make_session_workdir_removable(&entry.path());
+    }
+}
+
+/// Delete an owned session workdir for --autoclean. Permissions inside the
+/// workdir are normalized first so container-created directories cannot block
+/// the delete. An already absent directory is the wanted end state, so a retry
+/// after a partial failure converges instead of reporting a new error.
+fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
+    make_session_workdir_removable(dir);
+    if let Err(error) = std::fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
     // Reap the clipboard watchers and any wl-copy daemons they left holding a
     // selection. They run in their own process group, so a negative-PID SIGTERM
@@ -1109,13 +1183,8 @@ fn teardown(mut sess: Session, autoclean: bool) -> std::io::Result<()> {
             let _ = std::fs::set_permissions(path, permissions);
         }
     }
-    if autoclean {
-        std::fs::remove_dir_all(&sess.host_xdg_dir)
-    } else {
-        let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
-        cleanup_stale_session_files(&sess.host_xdg_dir);
-        Ok(())
-    }
+    let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
+    cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
 /// Resolve the kwin-viewer binary by replacing the basename of our own
@@ -1802,12 +1871,16 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
+        let outcome = match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
             Ok(res) => res,
             Err(_) => Err(McpError::internal_error(
                 format!("session_start exceeded {}s hard limit", SESSION_START_HARD_TIMEOUT.as_secs()),
                 None,
             )),
+        };
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => Err(self.autoclean_unpublished_workdir(error).await),
         }
     }
 
@@ -1877,6 +1950,11 @@ impl KwinMcp {
         let pid = std::process::id();
         let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
+        // Take cleanup ownership as soon as the workdir exists so every terminal
+        // outcome of this start, published Session or not, has an owner.
+        if self.display.autoclean {
+            *self.autoclean_workdir.lock().await = Some(host_xdg_dir.clone());
+        }
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
         eprintln!(
@@ -2403,19 +2481,41 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and kill every process in the container. When the server was launched with --autoclean, also remove the session workdir. Call when finished; sessions do not auto-clean on disconnect. No-op if no session is running.",
+        description = "Tear down the current session and kill every process in the container. When the server was launched with --autoclean, also remove the session workdir, including a workdir left behind by a failed session_start; if that removal fails the call errors and keeps the workdir owned, so calling session_stop again retries it. Call when finished; sessions do not auto-clean on disconnect. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
-        let mut guard = self.session.lock().await;
-        match (*guard).take() {
-            Some(sess) => {
-                teardown(sess, self.display.autoclean)
-                    .map_err(|error| McpError::internal_error(format!("session stopped but autoclean failed: {error}"), None))?;
-                Ok(structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await)
-            }
-            None => Ok(structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await),
+        let stopped = self.session.lock().await.take();
+        let had_session = stopped.is_some();
+        if let Some(sess) = stopped {
+            teardown(sess);
         }
+        let mut owned = self.autoclean_workdir.lock().await;
+        let Some(dir) = owned.clone() else {
+            return Ok(if had_session {
+                structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await
+            } else {
+                structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await
+            });
+        };
+        remove_session_workdir(&dir).map_err(|error| McpError::internal_error(
+            format!(
+                "session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
+                dir.display()
+            ),
+            None,
+        ))?;
+        *owned = None;
+        let workdir = dir.display().to_string();
+        let (status, message) = if had_session {
+            ("stopped", format!("session stopped, workdir {workdir} removed"))
+        } else {
+            ("cleaned", format!("no session running, leftover workdir {workdir} removed"))
+        };
+        Ok(structured_result(&peer, message, serde_json::json!({
+            "status": status,
+            "workdir_removed": workdir,
+        })).await)
     }
 
     #[rmcp::tool(
