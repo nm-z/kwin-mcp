@@ -15,6 +15,7 @@
 //! window. Mouse/keyboard events on the window are forwarded back into the
 //! container via org_kde_kwin_fake_input.
 
+use nix::poll::{PollFd, PollFlags, PollTimeout};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
@@ -23,10 +24,12 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_plasma::fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
 use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate::{
     self as kde_keystate, OrgKdeKwinKeystate,
@@ -57,9 +60,10 @@ const BTN_MIDDLE: u32 = 0x112;
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
 
-// How long a Num Lock injection may take to show up as a stateChanged event
-// from the isolated compositor before we call the synchronization failed.
-const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+// NUMLOCK_CONFIRM_TIMEOUT and DISPATCH_POLL_INTERVAL come from the
+// [viewer.keystate] table of kwin-mcp.toml, which build.rs deserializes,
+// validates, and emits as these constants. They are defined nowhere else.
+include!(concat!(env!("OUT_DIR"), "/viewer_settings.rs"));
 
 struct Frame {
     width: u32,
@@ -75,6 +79,128 @@ struct Frame {
 // producer never blocks if the consumer is slow.
 type FrameMailbox = Arc<Mutex<Option<Frame>>>;
 
+// Cooperative stop signal shared by every thread the viewer owns. Whatever
+// ends first sets it: the user closing the window, a compositor dropping a
+// connection, or the screencast stream failing. The winit loop leaves on the
+// next frame and main then joins the threads and closes the connections.
+#[derive(Clone, Default)]
+struct Shutdown(Arc<AtomicBool>);
+
+impl Shutdown {
+    fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+// Dispatch `queue` until shutdown is requested or the connection ends.
+// Readiness is polled with DISPATCH_POLL_INTERVAL rather than blocked on, so a
+// stop request is honored even while its compositor is silent and no dispatch
+// thread can outlive the viewer.
+fn pump_queue<S>(
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    shutdown: &Shutdown,
+) -> anyhow::Result<()> {
+    let timeout = PollTimeout::try_from(DISPATCH_POLL_INTERVAL)
+        .map_err(|error| anyhow::anyhow!("dispatch poll interval: {error}"))?;
+    while !shutdown.requested() {
+        queue.dispatch_pending(state)?;
+        queue.flush()?;
+        // None means events are already buffered; dispatch them first.
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        // Poll the descriptor this guard reads, and end the borrow before the
+        // guard is consumed below.
+        let (ready, revents) = {
+            let mut fds = [PollFd::new(guard.connection_fd(), PollFlags::POLLIN)];
+            let ready = nix::poll::poll(&mut fds, timeout);
+            (ready, fds[0].revents())
+        };
+        // poll reports hangup, error, and invalid-descriptor conditions
+        // whether or not they were requested. They all mean the compositor is
+        // gone, and reading a half-closed socket that still holds a partial
+        // message answers WouldBlock, so stop here rather than spin.
+        if revents.is_some_and(|flags| {
+            flags.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+        }) {
+            anyhow::bail!("wayland socket hung up");
+        }
+        match ready {
+            Ok(0) => drop(guard),
+            Ok(_) => match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            },
+            Err(nix::errno::Errno::EINTR) => drop(guard),
+            Err(error) => return Err(anyhow::anyhow!("poll wayland socket: {error}")),
+        }
+    }
+    queue.dispatch_pending(state)?;
+    Ok(())
+}
+
+// A wayland dispatch thread plus the connection it reads. Dropping it requests
+// shutdown and joins the thread, so every exit path out of main, including the
+// error paths, tears the thread down and closes the socket.
+struct DispatchThread {
+    label: String,
+    shutdown: Shutdown,
+    handle: Option<JoinHandle<()>>,
+    conn: Connection,
+}
+
+impl DispatchThread {
+    fn spawn<S: Send + 'static>(
+        label: String,
+        conn: Connection,
+        mut queue: EventQueue<S>,
+        mut state: S,
+        shutdown: &Shutdown,
+    ) -> anyhow::Result<Self> {
+        let thread_shutdown = shutdown.clone();
+        let thread_label = label.clone();
+        let handle = std::thread::Builder::new()
+            .name(label.clone())
+            .spawn(move || {
+                if let Err(error) = pump_queue(&mut queue, &mut state, &thread_shutdown) {
+                    eprintln!("kwin-viewer: {thread_label} connection ended: {error}");
+                }
+                // A connection that ended cannot be recovered, and a viewer
+                // without it would sit on a frozen picture, so end the viewer.
+                thread_shutdown.request();
+            })?;
+        Ok(Self {
+            label,
+            shutdown: shutdown.clone(),
+            handle: Some(handle),
+            conn,
+        })
+    }
+
+    // The connection this thread reads, for sending requests on it.
+    fn connection(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Drop for DispatchThread {
+    fn drop(&mut self) {
+        self.shutdown.request();
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            eprintln!("kwin-viewer: {} dispatch thread panicked", self.label);
+        }
+    }
+}
+
 struct WlState {
     output: Option<wl_output::WlOutput>,
     screencast: Option<ZkdeScreencastUnstableV1>,
@@ -83,6 +209,7 @@ struct WlState {
     node_id: Option<u32>,
     failed: Option<String>,
     closed: bool,
+    shutdown: Shutdown,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
@@ -122,8 +249,17 @@ impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for WlState {
     ) {
         match event {
             zs_stream::Event::Created { node } => state.node_id = Some(node),
-            zs_stream::Event::Failed { error } => state.failed = Some(error),
-            zs_stream::Event::Closed => state.closed = true,
+            // The feed is the reason the viewer exists: once KWin fails or
+            // closes the stream there is nothing left to show, so shut down
+            // instead of holding the window open on a stale frame.
+            zs_stream::Event::Failed { error } => {
+                state.failed = Some(error);
+                state.shutdown.request();
+            }
+            zs_stream::Event::Closed => {
+                state.closed = true;
+                state.shutdown.request();
+            }
             _ => {}
         }
     }
@@ -165,11 +301,31 @@ impl NumLockShared {
             self.updated.notify_all();
         }
     }
+
+    // Newest state the compositor confirmed, without asking it again.
+    fn latest(&self, source: &str) -> anyhow::Result<bool> {
+        let watch = self
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{source} key-state mutex poisoned"))?;
+        watch
+            .enabled
+            .ok_or_else(|| anyhow::anyhow!("{source} compositor did not report Num Lock state"))
+    }
 }
 
 struct NumLockState {
     proxy: Option<OrgKdeKwinKeystate>,
     shared: Arc<NumLockShared>,
+}
+
+impl Drop for NumLockState {
+    // The dispatch thread owns this state and drops it when it stops, so a
+    // waiter learns immediately that this compositor can no longer confirm
+    // anything instead of waiting out the full confirmation timeout.
+    fn drop(&mut self) {
+        self.shared.end();
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for NumLockState {
@@ -218,6 +374,9 @@ impl Dispatch<OrgKdeKwinKeystate, ()> for NumLockState {
 struct NumLockWatcher {
     source: &'static str,
     shared: Arc<NumLockShared>,
+    // Dropped last in this struct, after the fields above, so the thread is
+    // joined and the key-state socket is closed when the watcher goes away.
+    dispatch: DispatchThread,
 }
 
 impl NumLockWatcher {
@@ -226,9 +385,9 @@ impl NumLockWatcher {
     // version 5 plain Shift/Ctrl/Alt/Meta typing produces events too. A
     // resource that is only read on demand therefore grows an unread backlog
     // until the compositor tears the connection down. Each watcher owns a
-    // thread that dispatches its queue for the viewer's lifetime and keeps
-    // only the newest confirmed Num Lock state.
-    fn spawn(conn: Connection, source: &'static str) -> anyhow::Result<Self> {
+    // dispatch thread that services its queue for the viewer's lifetime and
+    // keeps only the newest confirmed Num Lock state.
+    fn spawn(conn: Connection, source: &'static str, shutdown: &Shutdown) -> anyhow::Result<Self> {
         let mut queue = conn.new_event_queue::<NumLockState>();
         let _registry = conn.display().get_registry(&queue.handle(), ());
         let shared = Arc::new(NumLockShared::default());
@@ -243,33 +402,37 @@ impl NumLockWatcher {
         // The compositor only pushes changes, so ask once for the current set.
         proxy.fetchStates();
         queue.roundtrip(&mut state)?;
-        let watcher = Self { source, shared };
-        watcher.latest()?;
-        std::thread::Builder::new()
-            .name(format!("numlock-{source}"))
-            .spawn(move || {
-                while queue.blocking_dispatch(&mut state).is_ok() {}
-                state.shared.end();
-                eprintln!("kwin-viewer: {source} key-state watcher stopped");
-            })?;
-        Ok(watcher)
-    }
-
-    // Newest state the compositor confirmed, without asking it again.
-    fn latest(&self) -> anyhow::Result<bool> {
-        let watch = self
-            .shared
-            .watch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("{} key-state mutex poisoned", self.source))?;
-        watch.enabled.ok_or_else(|| {
-            anyhow::anyhow!("{} compositor did not report Num Lock state", self.source)
+        // Confirm the compositor answered before handing the queue to a
+        // thread, so a watcher that never reports fails on its own instead of
+        // tripping the shared shutdown through the thread it would own.
+        shared.latest(source)?;
+        Ok(Self {
+            source,
+            shared,
+            dispatch: DispatchThread::spawn(
+                format!("keystate-{source}"),
+                conn,
+                queue,
+                state,
+                shutdown,
+            )?,
         })
     }
 
+    fn latest(&self) -> anyhow::Result<bool> {
+        self.shared.latest(self.source)
+    }
+
     // Block until the compositor confirms `expected`, so callers never assume
-    // an injected transition landed.
-    fn wait_for(&self, expected: bool, timeout: Duration) -> anyhow::Result<()> {
+    // an injected transition landed. The wait ends early when the watcher
+    // stops or the viewer starts shutting down, and it is bounded by `timeout`
+    // in every case, so a wedged compositor cannot pin the caller.
+    fn wait_for(
+        &self,
+        expected: bool,
+        timeout: Duration,
+        shutdown: &Shutdown,
+    ) -> anyhow::Result<()> {
         let wanted = if expected { "enabled" } else { "disabled" };
         let deadline = Instant::now() + timeout;
         let mut watch = self
@@ -286,16 +449,24 @@ impl NumLockWatcher {
                 "{} key-state watcher stopped before confirming Num Lock {wanted}",
                 self.source
             );
+            anyhow::ensure!(
+                !shutdown.requested(),
+                "{} Num Lock confirmation dropped: the viewer is shutting down",
+                self.source
+            );
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
                 "{} compositor did not confirm Num Lock {wanted} within {timeout:?}",
                 self.source
             );
+            // Wake at least once per dispatch poll interval so a shutdown
+            // request is never ignored for the whole confirmation timeout.
+            let slice = remaining.min(DISPATCH_POLL_INTERVAL);
             let (guard, _) = self
                 .shared
                 .updated
-                .wait_timeout(watch, remaining)
+                .wait_timeout(watch, slice)
                 .map_err(|_| anyhow::anyhow!("{} key-state mutex poisoned", self.source))?;
             watch = guard;
         }
@@ -309,6 +480,7 @@ fn evdev_code(key: evdev::KeyCode) -> u32 {
 struct NumLockSync {
     host: NumLockWatcher,
     isolated: NumLockWatcher,
+    shutdown: Shutdown,
 }
 
 impl NumLockSync {
@@ -325,7 +497,7 @@ impl NumLockSync {
         fake_input.keyboard_key(code, 0);
         conn.flush()?;
         self.isolated
-            .wait_for(host_enabled, NUMLOCK_CONFIRM_TIMEOUT)?;
+            .wait_for(host_enabled, NUMLOCK_CONFIRM_TIMEOUT, &self.shutdown)?;
         eprintln!(
             "kwin-viewer: synchronized isolated Num Lock {}",
             if host_enabled { "enabled" } else { "disabled" }
@@ -363,16 +535,22 @@ fn main() -> anyhow::Result<()> {
 
     pipewire::init();
 
-    let host_numlock = NumLockWatcher::spawn(Connection::connect_to_env()?, "host")?;
+    // One signal for the whole process. Every thread created below watches it,
+    // and every one of them sets it when its own connection ends.
+    let shutdown = Shutdown::default();
+
+    let host_numlock = NumLockWatcher::spawn(Connection::connect_to_env()?, "host", &shutdown)?;
     let isolated_numlock_sock = UnixStream::connect(session_path.join("wayland-0"))?;
     let isolated_numlock = NumLockWatcher::spawn(
         Connection::from_socket(isolated_numlock_sock)
             .map_err(|e| anyhow::anyhow!("isolated key-state connect: {e:?}"))?,
         "isolated",
+        &shutdown,
     )?;
     let numlock = NumLockSync {
         host: host_numlock,
         isolated: isolated_numlock,
+        shutdown: shutdown.clone(),
     };
 
     let wayland_sock = UnixStream::connect(session_path.join("wayland-0"))?;
@@ -390,6 +568,7 @@ fn main() -> anyhow::Result<()> {
         node_id: None,
         failed: None,
         closed: false,
+        shutdown: shutdown.clone(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -421,36 +600,38 @@ fn main() -> anyhow::Result<()> {
 
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
 
-    // The join handle keeps the pipewire thread alive for the rest of main;
-    // it spins its own loop. The isolated wayland connection stays in use
-    // past this point: the dispatch thread below drains its events, the winit
-    // loop sends and flushes fake_input requests on it, and Num Lock
-    // synchronization injects key presses through it on focus.
+    // The pipewire loop runs on its own thread and is stopped through this
+    // channel, so main can join it instead of leaving it behind on exit.
     let pipewire_sock = session_path.join("pipewire-0");
-    let _pw_thread = {
+    let (pw_quit, pw_quit_rx) = pipewire::channel::channel::<()>();
+    let pw_thread = {
         let mailbox = Arc::clone(&mailbox);
-        std::thread::spawn(move || {
-            if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, (virt_w, virt_h)) {
-                eprintln!("kwin-viewer: pipewire loop exited: {e}");
-            }
-        })
+        let shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("pipewire".to_owned())
+            .spawn(move || {
+                if let Err(e) = run_pipewire(
+                    pipewire_sock,
+                    node_id,
+                    mailbox,
+                    (virt_w, virt_h),
+                    pw_quit_rx,
+                ) {
+                    eprintln!("kwin-viewer: pipewire loop exited: {e}");
+                }
+                // Losing the video feed ends the viewer the same way a dead
+                // wayland connection does.
+                shutdown.request();
+            })?
     };
 
-    // Dispatch thread for Wayland events (stream closed, roundtrips for fake_input flushes).
-    let conn_dispatch = conn.clone();
-    let _wl_thread = std::thread::spawn(move || {
-        let mut eq = conn_dispatch.new_event_queue::<WlState>();
-        let _ = conn_dispatch.display().get_registry(&eq.handle(), ());
-        let mut dummy = WlState {
-            output: None, screencast: None, fake_input: None,
-            stream: None, node_id: None, failed: None, closed: false,
-        };
-        loop {
-            if eq.blocking_dispatch(&mut dummy).is_err() {
-                break;
-            }
-        }
-    });
+    // The screencast connection keeps serving the queue that carries the
+    // stream's Closed and Failed events, and it stays the connection the winit
+    // loop sends fake_input requests on. Moving the real state here, instead of
+    // dispatching a throwaway copy, is what lets a closed stream end the viewer.
+    let wl_dispatch =
+        DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, &shutdown)?;
+    let conn = wl_dispatch.connection();
 
     let window = WindowBuilder::default()
         .window(|wa| wa.with_title("kwin-viewer").with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
@@ -462,16 +643,21 @@ fn main() -> anyhow::Result<()> {
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
 
-    let fake_input_for_loop = fake_input.clone();
-    let conn_for_loop = conn.clone();
     let mut input_state = InputState::default();
 
-    window.run(move |frame| {
+    let run_result = window.run(|mut frame| {
+        // Leave as soon as anything the viewer depends on has ended, so the
+        // window never sits on a dead session and main can join the threads.
+        if shutdown.requested() {
+            frame.exit();
+            return;
+        }
+
         for event in frame.events {
             forward_input(
                 event,
-                &fake_input_for_loop,
-                &conn_for_loop,
+                &fake_input,
+                conn,
                 (frame.width, frame.height),
                 (virt_w, virt_h),
                 &mut input_state,
@@ -531,8 +717,22 @@ fn main() -> anyhow::Result<()> {
         // are arriving. Explicitly requesting a redraw each frame guarantees
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
-    })?;
+    });
 
+    // Ordered teardown, reached on every exit including a window error, which
+    // is why the run result is held instead of propagated straight away.
+    // Requesting shutdown lets every dispatch thread leave its poll within
+    // DISPATCH_POLL_INTERVAL; the pipewire loop is quit through its channel and
+    // joined here, and dropping wl_dispatch and numlock joins the remaining
+    // threads and closes their sockets.
+    shutdown.request();
+    if pw_quit.send(()).is_err() {
+        eprintln!("kwin-viewer: pipewire loop already gone");
+    }
+    if pw_thread.join().is_err() {
+        eprintln!("kwin-viewer: pipewire thread panicked");
+    }
+    run_result?;
     Ok(())
 }
 
@@ -711,12 +911,24 @@ fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
 // PipeWire path: connect to the container's PIPEWIRE_REMOTE socket, create an
 // input stream targeting the screencast node KWin handed us, advertise SHM
 // RGBA-family formats, and copy each frame into the mailbox.
-fn run_pipewire(socket_path: PathBuf, node_id: u32, mailbox: FrameMailbox, virt: (u32, u32)) -> anyhow::Result<()> {
+fn run_pipewire(
+    socket_path: PathBuf,
+    node_id: u32,
+    mailbox: FrameMailbox,
+    virt: (u32, u32),
+    quit: pipewire::channel::Receiver<()>,
+) -> anyhow::Result<()> {
     use pipewire as pw;
     use pw::spa;
     use spa::pod::Pod;
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    // Lets main stop this loop and join the thread instead of leaving it
+    // running on a session that is going away.
+    let _quit = quit.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        move |()| mainloop.quit()
+    });
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     // remote.name as an absolute path bypasses XDG_RUNTIME_DIR joining, so we
     // can keep the host's env untouched and still land on the container's

@@ -1699,6 +1699,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "wayland-client",
  "wayland-protocols-plasma",
  "winit",

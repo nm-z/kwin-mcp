@@ -1,0 +1,17 @@
+# Authoritative tunables for the kwin-mcp binaries.
+#
+# build.rs deserializes this file into typed settings, validates every field,
+# and generates the constants the binaries use. Nothing here has a compiled-in
+# default: a missing, unknown, or out-of-range field fails the build instead of
+# silently falling back to a literal.
+
+[viewer.keystate]
+# Milliseconds the viewer waits for the isolated compositor to confirm an
+# injected Num Lock transition over org_kde_kwin_keystate before it reports the
+# synchronization as failed. Valid range: 50 to 60000.
+numlock_confirm_timeout_ms = 2000
+
+# Milliseconds a viewer wayland dispatch thread waits for socket readiness
+# before re-checking the shutdown request. This bounds how long viewer teardown
+# waits for each dispatch thread to finish. Valid range: 1 to 5000.
+dispatch_poll_interval_ms = 100
