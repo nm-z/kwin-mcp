@@ -25,8 +25,11 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_plasma::fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
+use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate::{
+    self as kde_keystate, OrgKdeKwinKeystate,
+};
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::{
     self as zs_stream, ZkdeScreencastStreamUnstableV1,
 };
@@ -40,6 +43,7 @@ use winit::keyboard::PhysicalKey;
 // though the container's KWin advertises higher. Binding above a binding's
 // known version panics the scanner-generated code.
 const FAKE_INPUT_VERSION: u32 = 5;
+const KEYSTATE_VERSION: u32 = 5;
 const SCREENCAST_VERSION: u32 = 4;
 const WL_OUTPUT_VERSION: u32 = 4;
 
@@ -124,6 +128,127 @@ wayland_client::delegate_noop!(WlState: ignore wl_output::WlOutput);
 wayland_client::delegate_noop!(WlState: ignore ZkdeScreencastUnstableV1);
 wayland_client::delegate_noop!(WlState: ignore OrgKdeKwinFakeInput);
 
+struct NumLockState {
+    proxy: Option<OrgKdeKwinKeystate>,
+    enabled: Option<bool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for NumLockState {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+            && interface == "org_kde_kwin_keystate"
+        {
+            state.proxy = Some(registry.bind(name, version.min(KEYSTATE_VERSION), qh, ()));
+        }
+    }
+}
+
+impl Dispatch<OrgKdeKwinKeystate, ()> for NumLockState {
+    fn event(
+        state: &mut Self,
+        _: &OrgKdeKwinKeystate,
+        event: kde_keystate::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let kde_keystate::Event::StateChanged {
+            key,
+            state: key_state,
+        } = event
+            && key == kde_keystate::Key::Numlock as u32
+        {
+            state.enabled = Some(key_state == kde_keystate::State::Locked as u32);
+        }
+    }
+}
+
+struct NumLockMonitor {
+    source: &'static str,
+    queue: EventQueue<NumLockState>,
+    state: NumLockState,
+}
+
+impl NumLockMonitor {
+    fn new(conn: Connection, source: &'static str) -> anyhow::Result<Self> {
+        let mut queue = conn.new_event_queue::<NumLockState>();
+        let _registry = conn.display().get_registry(&queue.handle(), ());
+        let mut state = NumLockState {
+            proxy: None,
+            enabled: None,
+        };
+        queue.roundtrip(&mut state)?;
+        anyhow::ensure!(
+            state.proxy.is_some(),
+            "{source} compositor did not advertise org_kde_kwin_keystate"
+        );
+        Ok(Self {
+            source,
+            queue,
+            state,
+        })
+    }
+
+    fn read(&mut self) -> anyhow::Result<bool> {
+        self.state.enabled = None;
+        self.state
+            .proxy
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} key-state proxy disappeared", self.source))?
+            .fetchStates();
+        self.queue.roundtrip(&mut self.state)?;
+        self.state.enabled.ok_or_else(|| {
+            anyhow::anyhow!("{} compositor did not report Num Lock state", self.source)
+        })
+    }
+}
+
+fn evdev_code(key: evdev::KeyCode) -> u32 {
+    u32::from(key.0)
+}
+
+struct NumLockSync {
+    host: NumLockMonitor,
+    isolated: NumLockMonitor,
+}
+
+impl NumLockSync {
+    fn apply(
+        &mut self,
+        fake_input: &OrgKdeKwinFakeInput,
+        conn: &Connection,
+    ) -> anyhow::Result<()> {
+        let host_enabled = self.host.read()?;
+        if host_enabled == self.isolated.read()? {
+            return Ok(());
+        }
+        let code = evdev_code(evdev::KeyCode::KEY_NUMLOCK);
+        fake_input.keyboard_key(code, 1);
+        fake_input.keyboard_key(code, 0);
+        conn.roundtrip()?;
+        anyhow::ensure!(
+            self.isolated.read()? == host_enabled,
+            "isolated compositor did not apply the host Num Lock state"
+        );
+        eprintln!(
+            "kwin-viewer: synchronized isolated Num Lock {}",
+            if host_enabled { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     let session_dir = argv
@@ -153,6 +278,18 @@ fn main() -> anyhow::Result<()> {
 
     pipewire::init();
 
+    let host_numlock = NumLockMonitor::new(Connection::connect_to_env()?, "host")?;
+    let isolated_numlock_sock = UnixStream::connect(session_path.join("wayland-0"))?;
+    let isolated_numlock = NumLockMonitor::new(
+        Connection::from_socket(isolated_numlock_sock)
+            .map_err(|e| anyhow::anyhow!("isolated key-state connect: {e:?}"))?,
+        "isolated",
+    )?;
+    let mut numlock = NumLockSync {
+        host: host_numlock,
+        isolated: isolated_numlock,
+    };
+
     let wayland_sock = UnixStream::connect(session_path.join("wayland-0"))?;
     let conn = Connection::from_socket(wayland_sock)
         .map_err(|e| anyhow::anyhow!("wayland connect: {e:?}"))?;
@@ -180,6 +317,7 @@ fn main() -> anyhow::Result<()> {
     // error event, just nothing happens. Must be the first request on the
     // proxy, before any pointer/button/key call.
     fake_input.authenticate("kwin-viewer".into(), "live viewer input forwarding".into());
+    numlock.apply(&fake_input, &conn)?;
 
     let stream = screencast.stream_output(&output, ScPointer::Embedded.into(), &qh, ());
     state.stream = Some(stream);
@@ -241,6 +379,7 @@ fn main() -> anyhow::Result<()> {
     let fake_input_for_loop = fake_input.clone();
     let conn_for_loop = conn.clone();
     let mut input_state = InputState::default();
+    let mut numlock_for_loop = numlock;
 
     window.run(move |frame| {
         for event in frame.events {
@@ -248,10 +387,10 @@ fn main() -> anyhow::Result<()> {
                 event,
                 &fake_input_for_loop,
                 &conn_for_loop,
-                frame.width,
-                frame.height,
+                (frame.width, frame.height),
                 (virt_w, virt_h),
                 &mut input_state,
+                &mut numlock_for_loop,
             );
         }
 
@@ -342,12 +481,17 @@ fn forward_input(
     event: &Event<()>,
     fake_input: &OrgKdeKwinFakeInput,
     conn: &Connection,
-    win_w: u32,
-    win_h: u32,
+    window_size: (u32, u32),
     virt: (u32, u32),
     state: &mut InputState,
+    numlock: &mut NumLockSync,
 ) {
     let Event::WindowEvent { event, .. } = event else { return };
+    if let WindowEvent::Focused(true) = event
+        && let Err(error) = numlock.apply(fake_input, conn)
+    {
+        eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
+    }
     if let WindowEvent::Focused(false) = event {
         // Drain any keys that were forwarded as pressed but whose Released
         // event we may not see — release them all so no modifier stays
@@ -372,7 +516,9 @@ fn forward_input(
             // — idle hover must not touch the agent's session.
             state.last_pos = Some((position.x, position.y));
             if state.held_buttons == 0 { return }
-            if let Some((x, y)) = map_window_to_virtual((position.x, position.y), win_w, win_h, virt) {
+            if let Some((x, y)) =
+                map_window_to_virtual((position.x, position.y), window_size.0, window_size.1, virt)
+            {
                 fake_input.pointer_motion_absolute(x, y);
                 let _ = conn.flush();
             }
@@ -390,7 +536,8 @@ fn forward_input(
                 // so the press lands where the user's eyes are, not wherever
                 // the container cursor happened to stop last session.
                 if let Some(pos) = state.last_pos
-                    && let Some((x, y)) = map_window_to_virtual(pos, win_w, win_h, virt)
+                    && let Some((x, y)) =
+                        map_window_to_virtual(pos, window_size.0, window_size.1, virt)
                 {
                     fake_input.pointer_motion_absolute(x, y);
                 }
@@ -444,6 +591,25 @@ fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
         K::BracketLeft => 26, K::BracketRight => 27, K::Backslash => 43, K::Semicolon => 39,
         K::Quote => 40, K::Backquote => 41, K::Comma => 51, K::Period => 52, K::Slash => 53,
         K::CapsLock => 58,
+        K::NumLock => evdev_code(evdev::KeyCode::KEY_NUMLOCK),
+        K::Numpad0 => evdev_code(evdev::KeyCode::KEY_KP0),
+        K::Numpad1 => evdev_code(evdev::KeyCode::KEY_KP1),
+        K::Numpad2 => evdev_code(evdev::KeyCode::KEY_KP2),
+        K::Numpad3 => evdev_code(evdev::KeyCode::KEY_KP3),
+        K::Numpad4 => evdev_code(evdev::KeyCode::KEY_KP4),
+        K::Numpad5 => evdev_code(evdev::KeyCode::KEY_KP5),
+        K::Numpad6 => evdev_code(evdev::KeyCode::KEY_KP6),
+        K::Numpad7 => evdev_code(evdev::KeyCode::KEY_KP7),
+        K::Numpad8 => evdev_code(evdev::KeyCode::KEY_KP8),
+        K::Numpad9 => evdev_code(evdev::KeyCode::KEY_KP9),
+        K::NumpadAdd => evdev_code(evdev::KeyCode::KEY_KPPLUS),
+        K::NumpadComma => evdev_code(evdev::KeyCode::KEY_KPCOMMA),
+        K::NumpadDecimal => evdev_code(evdev::KeyCode::KEY_KPDOT),
+        K::NumpadDivide => evdev_code(evdev::KeyCode::KEY_KPSLASH),
+        K::NumpadEnter => evdev_code(evdev::KeyCode::KEY_KPENTER),
+        K::NumpadEqual => evdev_code(evdev::KeyCode::KEY_KPEQUAL),
+        K::NumpadMultiply => evdev_code(evdev::KeyCode::KEY_KPASTERISK),
+        K::NumpadSubtract => evdev_code(evdev::KeyCode::KEY_KPMINUS),
         K::F1 => 59, K::F2 => 60, K::F3 => 61, K::F4 => 62, K::F5 => 63, K::F6 => 64,
         K::F7 => 65, K::F8 => 66, K::F9 => 67, K::F10 => 68, K::F11 => 87, K::F12 => 88,
         K::ArrowUp => 103, K::ArrowDown => 108, K::ArrowLeft => 105, K::ArrowRight => 106,
