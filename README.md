@@ -32,7 +32,7 @@ kwin-mcp --server
 kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
 ```
 
-Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir after `session_stop`. Without the flag, `session_stop` retains the existing workdir behavior.
+Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. The server takes cleanup ownership of the workdir as soon as `session_start` creates it, so a start that fails, is cancelled, or hits the hard timeout removes it too. Removal first normalizes permissions inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block it. If removal still fails, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag, `session_stop` retains the existing workdir behavior.
 
 ## Strict host-GUI isolation
 
