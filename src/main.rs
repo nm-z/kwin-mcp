@@ -3,7 +3,7 @@ mod input_bridge;
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_aux::field_attributes::deserialize_number_from_string;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -520,6 +520,41 @@ async fn connect_session_bus(
     }
 }
 
+fn spawn_dbus_proxy(
+    address: &str,
+    socket: &Path,
+    rules: &[&str],
+) -> anyhow::Result<std::process::Child> {
+    use std::os::unix::fs::FileTypeExt;
+    let _ = std::fs::remove_file(socket);
+    let mut command = std::process::Command::new("xdg-dbus-proxy");
+    terminate_with_parent(&mut command);
+    command.arg(address).arg(socket).arg("--filter").args(rules);
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
+    while !std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("D-Bus proxy socket did not appear at {}", socket.display());
+        }
+        std::thread::sleep(DBUS_PROXY_POLL);
+    }
+    Ok(child)
+}
+
+fn terminate_with_parent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
+                .map_err(std::io::Error::other)
+        });
+    }
+}
+
 // ── uinput virtual devices ──────────────────────────────────────────────
 
 fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::PathBuf, evdev::uinput::VirtualDevice, std::path::PathBuf), KwinError> {
@@ -626,22 +661,42 @@ impl OverlayPlan {
         }
     }
 
-    fn expose_sockets(&mut self, target: &Path) -> anyhow::Result<()> {
-        use std::os::unix::fs::FileTypeExt;
+    fn expose_sockets(
+        &mut self,
+        target: &Path,
+        host_runtime: &Path,
+        isolated_runtime: &Path,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let canonical_target = std::fs::canonicalize(target)?;
-        let mut sockets: Vec<(PathBuf, PathBuf)> = procfs::net::unix()?.into_iter().filter_map(|entry| {
+        let canonical_runtime = std::fs::canonicalize(host_runtime)?;
+        let current_uid = procfs::process::Process::myself()?.uid()?;
+        let graphical_inodes = graphical_socket_inodes()?;
+        let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?.into_iter().filter_map(|entry| {
             if entry.state != procfs::net::UnixState::UNCONNECTED { return None; }
             let path = entry.path?; let parent = std::fs::canonicalize(path.parent()?).ok()?;
-            (path.starts_with(target) && parent.starts_with(&canonical_target)
-                && std::fs::metadata(&path).is_ok_and(|meta| meta.file_type().is_socket())).then_some((path, parent))
-        }).filter(|(path, _)| !self.read_only_binds.iter().any(|mount| path != mount && path.starts_with(mount))).collect();
+            let metadata = std::fs::metadata(&path).ok()?;
+            if metadata.uid() != current_uid || !metadata.file_type().is_socket()
+                || graphical_inodes.contains(&entry.inode) { return None; }
+            if path.starts_with(target) && parent.starts_with(&canonical_target) {
+                Some((path.clone(), parent, path))
+            } else if path.starts_with(host_runtime) && parent.starts_with(&canonical_runtime) {
+                Some((path.clone(), parent, isolated_runtime.join(path.strip_prefix(host_runtime).ok()?)))
+            } else {
+                None
+            }
+        }).filter(|(path, _, _)| !self.read_only_binds.iter().any(|mount| path != mount && path.starts_with(mount))).collect();
         sockets.sort(); sockets.dedup();
-        for (path, parent) in sockets {
+        for (path, parent, destination) in sockets {
             self.read_only_binds.retain(|mount| mount != &path);
             let index = self.socket_binds.iter().position(|bind| bind == &parent).unwrap_or_else(|| { let index = self.socket_binds.len(); self.socket_binds.push(parent); index });
-            let mount = self.overlays.iter().filter(|overlay| path.starts_with(&overlay.destination)).max_by_key(|overlay| overlay.destination.components().count());
-            let link = if let Some(overlay) = mount { overlay.upper.join(path.strip_prefix(&overlay.destination)?) }
-                else { self.staging_root.as_ref().ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?.join(path.strip_prefix(target)?) };
+            let link = if path.starts_with(target) {
+                let mount = self.overlays.iter().filter(|overlay| path.starts_with(&overlay.destination)).max_by_key(|overlay| overlay.destination.components().count());
+                if let Some(overlay) = mount { overlay.upper.join(path.strip_prefix(&overlay.destination)?) }
+                    else { self.staging_root.as_ref().ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?.join(path.strip_prefix(target)?) }
+            } else {
+                destination
+            };
             std::fs::create_dir_all(link.parent().ok_or_else(|| anyhow::anyhow!("no parent for {}", link.display()))?)?;
             let generated = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}")).join(path.file_name().ok_or_else(|| anyhow::anyhow!("unnamed socket {}", path.display()))?);
             match std::fs::symlink_metadata(&link) {
@@ -654,6 +709,32 @@ impl OverlayPlan {
         }
         Ok(())
     }
+}
+
+fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
+    let host_display = std::env::var_os("DISPLAY");
+    let host_wayland = std::env::var_os("WAYLAND_DISPLAY");
+    let mut graphical = std::collections::HashSet::new();
+    for process in procfs::process::all_processes()?.flatten() {
+        let environment = process.environ().unwrap_or_default();
+        let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
+        let display_attached = host_display.as_ref().is_some_and(|value| environment.get(std::ffi::OsStr::new("DISPLAY")) == Some(value))
+            || host_wayland.as_ref().is_some_and(|value| environment.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")) == Some(value));
+        let desktop_scope = cgroup.contains("/session.slice/")
+            || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
+        let descriptors: Vec<procfs::process::FDInfo> = process.fd().into_iter().flatten().flatten().collect();
+        let input_attached = descriptors.iter().any(|descriptor| match &descriptor.target {
+            procfs::process::FDTarget::Path(path) => path == Path::new("/dev/uinput") || path.starts_with("/dev/input"),
+            _ => false,
+        });
+        if display_attached || desktop_scope || input_attached {
+            graphical.extend(descriptors.into_iter().filter_map(|descriptor| match descriptor.target {
+                procfs::process::FDTarget::Socket(inode) => Some(inode),
+                _ => None,
+            }));
+        }
+    }
+    Ok(graphical)
 }
 
 fn create_staging_directory(
@@ -804,8 +885,9 @@ fn prepare_overlay_plan(
 struct Session {
     kwin_conn: zbus::Connection,       // talks to KWin via its unique name
     _proxy_conn: zbus::Connection,    // owns org.kde.KWin, has InputDevice objects (kept alive)
-    _wallet_conn: zbus::Connection,   // owns org.kde.kwalletd6, serves KWalletEmulator (kept alive)
     kwin_unique_name: String,
+    service_bus_address: String,
+    atspi_bus_address: String,
     eis: Eis,
     bwrap_child: std::process::Child,
     bwrap_stdin: std::process::ChildStdin,
@@ -813,8 +895,10 @@ struct Session {
     _uinput_mouse: evdev::uinput::VirtualDevice,
     _uinput_keyboard: evdev::uinput::VirtualDevice,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
-    dbus_proxy_child: Option<std::process::Child>,
+    service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    clipboard_children: Vec<std::process::Child>,
+    overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
     screen_height: u32,
@@ -831,6 +915,7 @@ struct DisplayConfig {
     width: u32,
     height: u32,
     locked: bool,
+    viewer_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -957,6 +1042,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "pipewire-0-manager",
         "pipewire-0-manager.lock",
         "system_bus_socket",
+        "service_bus_socket",
         "dbus-ready",
         "bridge-ready",
         "screenshot.png",
@@ -987,6 +1073,16 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
+    // Reap the clipboard watchers and any wl-copy daemons they left holding a
+    // selection. They run in their own process group, so a negative-PID SIGTERM
+    // takes down the whole group.
+    for mut child in std::mem::take(&mut sess.clipboard_children) {
+        if let Ok(neg) = i32::try_from(child.id()).map(|p| -p) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(mut viewer) = sess.viewer_child.take() {
@@ -1000,10 +1096,19 @@ fn teardown(mut sess: Session) {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
     }
     let _ = sess.bwrap_child.wait();
-    if let Some(mut proxy) = sess.dbus_proxy_child.take() {
+    for mut proxy in std::mem::take(&mut sess.service_proxy_children) {
         let _ = proxy.kill();
         let _ = proxy.wait();
     }
+    use std::os::unix::fs::PermissionsExt;
+    for path in &sess.overlay_work_paths {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
     cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
@@ -1015,6 +1120,113 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     let dir = me.parent()?;
     let candidate = dir.join("kwin-viewer");
     if candidate.exists() { Some(candidate) } else { None }
+}
+
+/// Browser launch commands we know how to detect. The container mounts the host
+/// root read-only, so anything on the host's PATH is runnable inside the session
+/// by the same command. Ordered most- to least-common so the injected hint reads
+/// sensibly. `chromium` is called out separately by callers because it's the only
+/// one that exposes CDP on its default profile.
+const KNOWN_BROWSERS: &[&str] = &[
+    "google-chrome-stable",
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+    "brave",
+    "brave-browser",
+    "firefox",
+    "firefox-esr",
+    "vivaldi-stable",
+    "vivaldi",
+    "microsoft-edge-stable",
+    "microsoft-edge",
+    "opera",
+];
+
+/// Scan the host PATH for known browser commands. Returns the runnable command
+/// names in KNOWN_BROWSERS order. Deduplicates so a name reachable from two PATH
+/// entries is reported once. Runs once at server launch (see `main`).
+fn detect_browsers() -> Vec<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    KNOWN_BROWSERS
+        .iter()
+        .filter(|name| {
+            dirs.iter().any(|dir| {
+                let candidate = dir.join(name);
+                std::fs::metadata(&candidate).is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+            })
+        })
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Two-way clipboard bridge between the host compositor and the container's
+/// nested KWin, using host-side `wl-clipboard` (`wl-paste --watch` + `wl-copy`).
+/// Text only — that's what issue #29 asks for and it sidesteps binary/MIME edge
+/// cases. Each direction runs a watcher that fires on selection change and mirrors
+/// the new text to the other side, but only when the other side differs — that
+/// dedup is what stops the two watchers from ping-ponging an identical value
+/// forever. Non-fatal: if wl-clipboard is missing or a watcher won't spawn, the
+/// agent's tools still work; there's just no clipboard sync. Watchers run in their
+/// own process group so teardown can reap any `wl-copy` daemons they left holding
+/// a selection.
+fn spawn_clipboard_bridge(
+    host_runtime: &Path,
+    host_display: &std::ffi::OsStr,
+    container_xdg_dir: &Path,
+) -> Vec<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    if which_on_path("wl-paste").is_none() || which_on_path("wl-copy").is_none() {
+        eprintln!("clipboard bridge: wl-clipboard not found on PATH, skipping");
+        return Vec::new();
+    }
+    let host_runtime = host_runtime.display().to_string();
+    let host_display = host_display.to_string_lossy().to_string();
+    let container_xdg = container_xdg_dir.display().to_string();
+    // (watcher-side env, sink-side env) for each direction.
+    let host_env = [("XDG_RUNTIME_DIR", host_runtime.as_str()), ("WAYLAND_DISPLAY", host_display.as_str())];
+    let container_env = [("XDG_RUNTIME_DIR", container_xdg.as_str()), ("WAYLAND_DISPLAY", "wayland-0")];
+    let directions = [
+        ("host->container", host_env, container_env),
+        ("container->host", container_env, host_env),
+    ];
+    let mut children = Vec::new();
+    for (label, watch_env, sink_env) in directions {
+        let (sink_rt, sink_disp) = (sink_env[0].1, sink_env[1].1);
+        // `wl-paste -w` runs this shell on each change, feeding the new selection on
+        // stdin. Copy it to the sink only if the sink's current text differs.
+        let script = format!(
+            "v=$(cat); [ \"$v\" = \"$(XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-paste -n -t text 2>/dev/null)\" ] \
+             || printf %s \"$v\" | XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-copy -t text/plain"
+        );
+        let mut cmd = std::process::Command::new("wl-paste");
+        cmd.args(["-t", "text", "-w", "sh", "-c", &script]);
+        cmd.env("XDG_RUNTIME_DIR", watch_env[0].1);
+        cmd.env("WAYLAND_DISPLAY", watch_env[1].1);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.process_group(0);
+        terminate_with_parent(&mut cmd);
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("clipboard bridge: {label} watcher pid={}", child.id());
+                children.push(child);
+            }
+            Err(e) => eprintln!("clipboard bridge: {label} spawn failed: {e}"),
+        }
+    }
+    children
+}
+
+/// Minimal PATH lookup for an executable name (no external `which`).
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate).is_ok().then_some(candidate)
+    })
 }
 
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
@@ -1069,16 +1281,16 @@ async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -
     let (runtime, display) = host_wayland().await.map_err(|error| {
             let _ = std::io::Write::write_all(&mut log_file, format!("kwin-viewer: host Wayland resolution failed: {error:#}\n").as_bytes());
         }).ok()?;
-    match std::process::Command::new(&bin)
-        .arg(host_xdg_dir)
+    let mut command = std::process::Command::new(&bin);
+    command.arg(host_xdg_dir)
         .arg(width.to_string())
         .arg(height.to_string())
         .env("XDG_RUNTIME_DIR", runtime)
         .env("WAYLAND_DISPLAY", display)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-    {
+        .stderr(std::process::Stdio::from(log_file));
+    terminate_with_parent(&mut command);
+    match command.spawn() {
         Ok(child) => {
             eprintln!("session_start: spawned viewer pid={}", child.id());
             Some(child)
@@ -1091,25 +1303,26 @@ async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -
     }
 }
 
-async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
+async fn run_kwin_script(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &std::path::Path,
+    script_body: &str,
+) -> Result<String, KwinError> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
+        .as_nanos();
     let marker = format!("kwin-mcp-{ts}");
     let cb_path = format!("/KWinMCP/{ts}");
     let our_name = conn
         .unique_name()
         .ok_or(KwinError::Msg("no bus name".to_owned()))?
         .to_string();
+    let our_name_json = serde_json::to_string(&our_name)?;
+    let cb_path_json = serde_json::to_string(&cb_path)?;
     let script = format!(
-        "var w = workspace.activeWindow;\
-        var c = workspace.cursorPos;\
-        callDBus('{our_name}','{cb_path}','org.kde.KWinMCP','result',\
-        w ? JSON.stringify({{x:w.clientGeometry.x,y:w.clientGeometry.y,\
-        w:w.clientGeometry.width,h:w.clientGeometry.height,\
-        title:w.caption,id:w.internalId.toString(),\
-        resourceClass:w.resourceClass,resourceName:w.resourceName,\
-        pid:w.pid,cx:c.x,cy:c.y}}) : 'null');"
+        "{script_body}\n\
+        callDBus({our_name_json},{cb_path_json},'org.kde.KWinMCP','result',JSON.stringify(result));"
     );
     let script_name = format!("{marker}.js");
     let script_file = host_xdg_dir.join(&script_name);
@@ -1122,7 +1335,7 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     };
     let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str())?;
     let registered = conn.object_server().at(&obj_path, cb).await?;
-    eprintln!("active_window_info: our_name={our_name} path={cb_path} registered={registered}");
+    eprintln!("run_kwin_script: our_name={our_name} path={cb_path} registered={registered}");
     if !registered {
         return Err(KwinError::Msg(format!("failed to register callback at {cb_path}")));
     }
@@ -1147,15 +1360,36 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
         .interface("org.kde.kwin.Script")?
         .build()
         .await?;
-    script_proxy.call::<_, (), ()>("run", &()).await?;
+    if let Err(error) = script_proxy.call::<_, (), ()>("run", &()).await {
+        conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
+        let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
+        std::fs::remove_file(&script_file)?;
+        return Err(error.into());
+    }
     // Wait for callback, then cleanup regardless of result
-    let json_result = rx
+    let result = rx
         .await
         .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()));
     conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
     let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
     std::fs::remove_file(&script_file)?;
-    let json = json_result?;
+    result
+}
+
+async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
+    let json = run_kwin_script(
+        conn,
+        kwin_unique,
+        host_xdg_dir,
+        "var w = workspace.activeWindow;\
+         var c = workspace.cursorPos;\
+         var result = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
+         w:w.clientGeometry.width,h:w.clientGeometry.height,\
+         title:w.caption,id:w.internalId.toString(),\
+         resourceClass:w.resourceClass,resourceName:w.resourceName,\
+         pid:w.pid,cx:c.x,cy:c.y} : null;",
+    )
+    .await?;
     if json == "null" {
         return Err(KwinError::Msg("KWin script error: No active window".to_owned()));
     }
@@ -1163,6 +1397,149 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     #[expect(clippy::as_conversions)]
     let (x, y) = (info.x.round() as i32, info.y.round() as i32);
     Ok((x, y, info))
+}
+
+#[derive(Deserialize, Serialize)]
+struct WindowSnapshot {
+    id: String,
+    title: String,
+    #[serde(rename = "resourceClass")]
+    resource_class: String,
+    #[serde(rename = "resourceName")]
+    resource_name: String,
+    pid: i32,
+    active: bool,
+    minimized: bool,
+    modal: bool,
+    transient: bool,
+    dialog: bool,
+    popup: bool,
+    #[serde(rename = "transientFor")]
+    transient_for: Option<String>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    #[serde(rename = "stackingOrder")]
+    stacking_order: i32,
+}
+
+impl WindowSnapshot {
+    fn summary(&self) -> String {
+        let mut flags = Vec::new();
+        if self.active {
+            flags.push("active");
+        }
+        if self.minimized {
+            flags.push("minimized");
+        }
+        if self.modal {
+            flags.push("modal");
+        }
+        if self.transient {
+            flags.push("transient");
+        }
+        if self.dialog {
+            flags.push("dialog");
+        }
+        if self.popup {
+            flags.push("popup");
+        }
+        let flags = if flags.is_empty() {
+            "normal".to_owned()
+        } else {
+            flags.join(",")
+        };
+        let transient_for = self
+            .transient_for
+            .as_deref()
+            .map(|id| format!(" transient_for={id}"))
+            .unwrap_or_default();
+        format!(
+            "[{flags}] id={} title={:?} app={}/{} pid={} geometry=({:.0},{:.0} {:.0}x{:.0}) stack={}{}",
+            self.id,
+            self.title,
+            self.resource_class,
+            self.resource_name,
+            self.pid,
+            self.x,
+            self.y,
+            self.w,
+            self.h,
+            self.stacking_order,
+            transient_for,
+        )
+    }
+}
+
+async fn window_snapshots(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+) -> Result<Vec<WindowSnapshot>, KwinError> {
+    let json = run_kwin_script(
+        conn,
+        kwin_unique,
+        host_xdg_dir,
+        "var result = [];\
+         var windows = workspace.stackingOrder;\
+         for (var i = windows.length - 1; i >= 0; --i) {\
+           var w = windows[i];\
+           if (!w.managed || w.deleted || w.desktopWindow || w.dock || w.outline) continue;\
+           var g = w.clientGeometry;\
+           result.push({\
+             id:w.internalId.toString(),title:w.caption,\
+             resourceClass:w.resourceClass,resourceName:w.resourceName,pid:w.pid,\
+             active:w.active,minimized:w.minimized,modal:w.modal,transient:w.transient,\
+             dialog:w.dialog,popup:w.popupWindow,\
+             transientFor:w.transientFor ? w.transientFor.internalId.toString() : null,\
+             x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder\
+           });\
+         }",
+    )
+    .await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+async fn activate_window(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    window_id: &str,
+) -> Result<WindowSnapshot, KwinError> {
+    let window_id_json = serde_json::to_string(window_id)?;
+    let script = format!(
+        "var targetId = {window_id_json};\
+         var result = false;\
+         var windows = workspace.stackingOrder;\
+         for (var i = 0; i < windows.length; ++i) {{\
+           var w = windows[i];\
+           if (w.internalId.toString() !== targetId) continue;\
+           w.minimized = false;\
+           workspace.raiseWindow(w);\
+           workspace.activeWindow = w;\
+           result = true;\
+           break;\
+         }}"
+    );
+    let activated: bool = serde_json::from_str(
+        &run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?,
+    )?;
+    if !activated {
+        return Err(KwinError::Msg(format!("no window with id {window_id}")));
+    }
+    tokio::time::sleep(INPUT_EVENT_DELAY).await;
+    let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
+    let window = windows
+        .into_iter()
+        .find(|window| window.id == window_id)
+        .ok_or_else(|| KwinError::Msg(format!("window {window_id} disappeared")))?;
+    if !window.active {
+        return Err(KwinError::Msg(format!(
+            "KWin did not activate window {window_id}"
+        )));
+    }
+    Ok(window)
 }
 
 struct KWinCallback {
@@ -1183,260 +1560,6 @@ impl KWinCallback {
             Err(e) => eprintln!("callback lock poisoned: {e}"),
         }
     }
-}
-
-// ── KWallet emulator — serves snapshot of host kwallet inside container ──
-
-struct WalletData {
-    network_wallet: String,
-    // folder → key → password bytes
-    entries: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>>>,
-}
-
-struct KWalletEmulator {
-    data: Arc<WalletData>,
-}
-
-#[zbus::interface(name = "org.kde.KWallet")]
-impl KWalletEmulator {
-    #[zbus(name = "isEnabled")]
-    async fn is_enabled(&self) -> bool { true }
-
-    #[zbus(name = "networkWallet")]
-    async fn network_wallet(&self) -> String { self.data.network_wallet.clone() }
-
-    #[zbus(name = "localWallet")]
-    async fn local_wallet(&self) -> String { self.data.network_wallet.clone() }
-
-    #[zbus(name = "wallets")]
-    async fn wallets(&self) -> Vec<String> { vec![self.data.network_wallet.clone()] }
-
-    #[zbus(name = "isOpen")]
-    async fn is_open(&self, _wallet: String) -> bool { true }
-
-    #[zbus(name = "open")]
-    async fn open(&self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        wallet: String, _w_id: i64, _appid: String,
-    ) -> i32 {
-        let emitter = emitter.to_owned();
-        tokio::spawn(async move {
-            let _ = Self::wallet_opened(&emitter, &wallet).await;
-        });
-        1
-    }
-
-    #[zbus(name = "openPath")]
-    async fn open_path(&self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        path: String, _w_id: i64, _appid: String,
-    ) -> i32 {
-        let emitter = emitter.to_owned();
-        tokio::spawn(async move {
-            let _ = Self::wallet_opened(&emitter, &path).await;
-        });
-        1
-    }
-
-    #[zbus(name = "openAsync")]
-    async fn open_async(&self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        _wallet: String, _w_id: i64, _appid: String, _handle_session: bool,
-    ) -> i32 {
-        let emitter = emitter.to_owned();
-        // tId must be positive and match what we'll emit in the walletAsyncOpened signal.
-        let tid: i32 = 1;
-        let handle: i32 = 1;
-        tokio::spawn(async move {
-            let _ = Self::wallet_async_opened(&emitter, tid, handle).await;
-        });
-        tid
-    }
-
-    #[zbus(signal, name = "walletAsyncOpened")]
-    async fn wallet_async_opened(emitter: &zbus::object_server::SignalEmitter<'_>, t_id: i32, handle: i32) -> zbus::Result<()>;
-
-    #[zbus(signal, name = "walletOpened")]
-    async fn wallet_opened(emitter: &zbus::object_server::SignalEmitter<'_>, wallet: &str) -> zbus::Result<()>;
-
-    #[zbus(signal, name = "walletClosed")]
-    async fn wallet_closed(emitter: &zbus::object_server::SignalEmitter<'_>, wallet: &str) -> zbus::Result<()>;
-
-    #[zbus(name = "close")]
-    async fn close(&self, _handle: i32, _force: bool, _appid: String) -> i32 { 0 }
-
-    #[zbus(name = "closeWallet")]
-    async fn close_wallet(&self, _wallet: String, _force: bool) -> i32 { 0 }
-
-    #[zbus(name = "sync")]
-    async fn sync(&self, _handle: i32, _appid: String) {}
-
-    #[zbus(name = "disconnectApplication")]
-    async fn disconnect_application(&self, _wallet: String, _appid: String) -> bool { true }
-
-    #[zbus(name = "folderList")]
-    async fn folder_list(&self, _handle: i32, _appid: String) -> Vec<String> {
-        match self.data.entries.lock() {
-            Ok(e) => e.keys().cloned().collect(),
-            Err(_) => vec![],
-        }
-    }
-
-    #[zbus(name = "hasFolder")]
-    async fn has_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
-        match self.data.entries.lock() {
-            Ok(e) => e.contains_key(&folder),
-            Err(_) => false,
-        }
-    }
-
-    #[zbus(name = "createFolder")]
-    async fn create_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
-        if let Ok(mut e) = self.data.entries.lock() {
-            e.entry(folder).or_insert_with(std::collections::HashMap::new);
-            true
-        } else { false }
-    }
-
-    #[zbus(name = "entryList")]
-    async fn entry_list(&self, _handle: i32, folder: String, _appid: String) -> Vec<String> {
-        match self.data.entries.lock() {
-            Ok(e) => e.get(&folder).map(|f| f.keys().cloned().collect()).unwrap_or_default(),
-            Err(_) => vec![],
-        }
-    }
-
-    #[zbus(name = "hasEntry")]
-    async fn has_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> bool {
-        match self.data.entries.lock() {
-            Ok(e) => e.get(&folder).is_some_and(|f| f.contains_key(&key)),
-            Err(_) => false,
-        }
-    }
-
-    #[zbus(name = "entryType")]
-    async fn entry_type(&self, _handle: i32, folder: String, key: String, _appid: String) -> i32 {
-        match self.data.entries.lock() {
-            Ok(e) => if e.get(&folder).is_some_and(|f| f.contains_key(&key)) { 1 } else { 0 },
-            Err(_) => 0,
-        }
-    }
-
-    #[zbus(name = "readPassword")]
-    async fn read_password(&self, _handle: i32, folder: String, key: String, _appid: String) -> String {
-        match self.data.entries.lock() {
-            Ok(e) => e.get(&folder)
-                .and_then(|f| f.get(&key))
-                .and_then(|b| String::from_utf8(b.clone()).ok())
-                .unwrap_or_default(),
-            Err(_) => String::new(),
-        }
-    }
-
-    #[zbus(name = "readEntry")]
-    async fn read_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> Vec<u8> {
-        match self.data.entries.lock() {
-            Ok(e) => e.get(&folder).and_then(|f| f.get(&key)).cloned().unwrap_or_default(),
-            Err(_) => vec![],
-        }
-    }
-
-    #[zbus(name = "writePassword")]
-    async fn write_password(&self, _handle: i32, folder: String, key: String, value: String, _appid: String) -> i32 {
-        if let Ok(mut e) = self.data.entries.lock() {
-            e.entry(folder).or_insert_with(std::collections::HashMap::new).insert(key, value.into_bytes());
-        }
-        0
-    }
-
-    #[zbus(name = "writeEntry")]
-    async fn write_entry(&self, _handle: i32, folder: String, key: String, value: Vec<u8>, _entry_type: i32, _appid: String) -> i32 {
-        if let Ok(mut e) = self.data.entries.lock() {
-            e.entry(folder).or_insert_with(std::collections::HashMap::new).insert(key, value);
-        }
-        0
-    }
-
-    #[zbus(name = "removeEntry")]
-    async fn remove_entry(&self, _handle: i32, folder: String, key: String, _appid: String) -> i32 {
-        if let Ok(mut e) = self.data.entries.lock()
-            && let Some(f) = e.get_mut(&folder)
-        {
-            f.remove(&key);
-        }
-        0
-    }
-
-    #[zbus(name = "removeFolder")]
-    async fn remove_folder(&self, _handle: i32, folder: String, _appid: String) -> bool {
-        if let Ok(mut e) = self.data.entries.lock() {
-            e.remove(&folder);
-            true
-        } else { false }
-    }
-}
-
-async fn dump_host_wallet(host_conn: &zbus::Connection)
-    -> Result<(String, std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>>), String>
-{
-    let dest = "org.kde.kwalletd6";
-    let path = "/modules/kwalletd6";
-    let iface = "org.kde.KWallet";
-    let appid = "kwin-mcp";
-
-    let reply = host_conn.call_method(Some(dest), path, Some(iface), "networkWallet", &()).await
-        .map_err(|e| format!("networkWallet: {e}"))?;
-    let network_wallet: String = reply.body().deserialize()
-        .map_err(|e| format!("networkWallet decode: {e}"))?;
-
-    let reply = host_conn.call_method(Some(dest), path, Some(iface), "open",
-        &(network_wallet.as_str(), 0i64, appid)).await
-        .map_err(|e| format!("open: {e}"))?;
-    let handle: i32 = reply.body().deserialize()
-        .map_err(|e| format!("open decode: {e}"))?;
-    if handle < 0 {
-        return Err(format!("host kwallet open returned {handle} (user denied access)"));
-    }
-
-    let reply = host_conn.call_method(Some(dest), path, Some(iface), "folderList",
-        &(handle, appid)).await
-        .map_err(|e| format!("folderList: {e}"))?;
-    let folders: Vec<String> = reply.body().deserialize()
-        .map_err(|e| format!("folderList decode: {e}"))?;
-
-    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, Vec<u8>>> =
-        std::collections::HashMap::new();
-    for folder in folders {
-        let reply = match host_conn.call_method(Some(dest), path, Some(iface), "entryList",
-            &(handle, folder.as_str(), appid)).await
-        {
-            Ok(r) => r,
-            Err(e) => { eprintln!("entryList {folder}: {e}"); continue; }
-        };
-        let keys: Vec<String> = match reply.body().deserialize() {
-            Ok(k) => k,
-            Err(e) => { eprintln!("entryList {folder} decode: {e}"); continue; }
-        };
-        let mut f_entries: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        for key in keys {
-            let reply = match host_conn.call_method(Some(dest), path, Some(iface), "readEntry",
-                &(handle, folder.as_str(), key.as_str(), appid)).await
-            {
-                Ok(r) => r,
-                Err(e) => { eprintln!("readEntry {folder}/{key}: {e}"); continue; }
-            };
-            if let Ok(bytes) = reply.body().deserialize::<Vec<u8>>() {
-                f_entries.insert(key, bytes);
-            }
-        }
-        out.insert(folder, f_entries);
-    }
-
-    let _ = host_conn.call_method(Some(dest), path, Some(iface), "close",
-        &(handle, false, appid)).await;
-
-    Ok((network_wallet, out))
 }
 
 #[derive(Deserialize)]
@@ -1633,6 +1756,12 @@ struct SessionStartParams {
     height: Option<u32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WindowActivateParams {
+    /// Exact window ID returned by window_list.
+    window_id: String,
+}
+
 // ── Tool implementations ────────────────────────────────────────────────
 
 impl rmcp::ServerHandler for KwinMcp {
@@ -1643,6 +1772,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 "KDE Wayland desktop automation in an isolated container. \
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
+                If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
                 Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click.",
@@ -1659,7 +1789,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot an isolated KDE Wayland desktop. Required before every other tool — all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect. Container writes to $HOME land in a persistent overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/ — host-visible, RAM-only (host /tmp is tmpfs), never touches real host files. Writes survive session_stop until the MCP server exits."
+        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer."
     )]
     async fn session_start(
         &self,
@@ -1820,7 +1950,10 @@ impl KwinMcp {
             &mount_inventory,
         )
         .map_err(|e| ver_err(format!("prepare overlays: {e:#}")))?;
-        overlay_plan.expose_sockets(&overlay_target)
+        let host_runtime = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .map_err(|error| ver_err(format!("host runtime directory: {error}")))?;
+        overlay_plan.expose_sockets(&overlay_target, &host_runtime, &host_xdg_dir)
             .map_err(|e| ver_err(format!("expose host sockets: {e:#}")))?;
         eprintln!(
             "session_start: overlay plan={} overlays={} read-only-mounts={}",
@@ -1887,11 +2020,6 @@ impl KwinMcp {
             "set -u\n\
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
-            export XDG_CURRENT_DESKTOP=KDE\n\
-            export XDG_SESSION_DESKTOP=KDE\n\
-            export DESKTOP_SESSION=plasma\n\
-            export KDE_FULL_SESSION=true\n\
-            export KDE_SESSION_VERSION=6\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
             export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
             export GDK_SCALE={KDE_SCALE_FACTOR}\n\
@@ -1909,7 +2037,7 @@ impl KwinMcp {
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
             sleep 0.3\n\
-            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DESKTOP_SESSION KDE_FULL_SESSION KDE_SESSION_VERSION QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
+            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
             wireplumber &\n\
@@ -1924,28 +2052,56 @@ impl KwinMcp {
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
 
-        // Spawn xdg-dbus-proxy to expose ONLY NetworkManager from host system bus
-        // into the container. Chromium needs NM to detect online state and not hang page loads.
-        let proxy_sock = host_xdg_dir.join("system_bus_socket");
-        let proxy_sock_str = proxy_sock.display().to_string();
-        let mut dbus_proxy_cmd = std::process::Command::new("xdg-dbus-proxy");
-        dbus_proxy_cmd.args([
+        let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
+        let system_proxy_child = spawn_dbus_proxy(
             "unix:path=/run/dbus/system_bus_socket",
-            &proxy_sock_str,
-            "--filter",
-            "--talk=org.freedesktop.NetworkManager",
-        ]);
-        dbus_proxy_cmd.stdout(std::process::Stdio::null());
-        dbus_proxy_cmd.stderr(std::process::Stdio::inherit());
-        eprintln!("session_start: spawning xdg-dbus-proxy → {proxy_sock_str}");
-        let dbus_proxy_child = dbus_proxy_cmd.spawn().map_err(|e| ver_err(format!("xdg-dbus-proxy: {e}")))?;
-        let proxy_deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
-        while !proxy_sock.exists() && std::time::Instant::now() < proxy_deadline {
-            std::thread::sleep(DBUS_PROXY_POLL);
-        }
-        if !proxy_sock.exists() {
-            return Err(ver_err("xdg-dbus-proxy socket never appeared".to_owned()));
-        }
+            &system_proxy_socket,
+            &[
+                "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.Get@/*",
+                "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.GetAll@/*",
+                "--broadcast=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.PropertiesChanged@/*",
+            ],
+        ).map_err(|error| ver_err(format!("system D-Bus proxy: {error:#}")))?;
+        let host_session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .map_err(|error| ver_err(format!("host session D-Bus address: {error}")))?;
+        let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
+        let service_proxy_child = spawn_dbus_proxy(
+            &host_session_bus,
+            &service_proxy_socket,
+            &[
+                "--see=org.kde.kwalletd6",
+                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Introspectable.Introspect@/*",
+                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.GetMachineId@/*",
+                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.Ping@/*",
+                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Properties.Get@/*",
+                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Properties.GetAll@/*",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.isEnabled@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.networkWallet@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.localWallet@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.wallets@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.isOpen@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.open@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.openAsync@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.openPath@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.openPathAsync@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.folderList@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.hasFolder@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.entryList@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.entriesList@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.hasEntry@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.entryType@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.readEntry@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.readMap@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.readPassword@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.mapList@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.passwordList@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.users@/modules/kwalletd6",
+                "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
+                "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
+            ],
+        ).map_err(|error| ver_err(format!("session D-Bus proxy: {error:#}")))?;
+        let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
+        let proxy_sock_str = system_proxy_socket.display().to_string();
 
         let mut cmd = std::process::Command::new("bwrap");
         cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
@@ -1977,11 +2133,6 @@ impl KwinMcp {
             "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
             "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
             // Mask dbus service files so the container's dbus-daemon doesn't auto-activate
-            // the real kwalletd6/ksecretd — our emulator owns org.kde.kwalletd6 instead.
-            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.kwalletd6.service",
-            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.secretservicecompat.service",
-            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.kwallet.service",
-            "--ro-bind", "/dev/null", "/usr/share/dbus-1/services/org.kde.secretprompter.service",
             // $HOME config overrides (read-only — protects display settings from agent writes)
             "--ro-bind", &kwinrc_str, &home_kwinrc,
             "--ro-bind", &kdeglobals_str, &home_kdeglobals,
@@ -2003,6 +2154,9 @@ impl KwinMcp {
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::inherit());
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        terminate_with_parent(&mut cmd);
         eprintln!("session_start: spawning bwrap");
         let mut bwrap_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
         eprintln!("session_start: bwrap spawned pid={:?}", bwrap_child.id());
@@ -2014,10 +2168,10 @@ impl KwinMcp {
                 return Err(ver_err("bwrap stdin not available".to_owned()));
             }
         };
-        let dbus_proxy_pid = dbus_proxy_child.id();
         let cleanup_err = |message: String,
                            mut bwrap_child: std::process::Child,
-                           bwrap_stdin: std::process::ChildStdin| {
+                           bwrap_stdin: std::process::ChildStdin,
+                           service_proxy_children: Vec<std::process::Child>| {
             eprintln!("session_start: startup error: {message}");
             drop(bwrap_stdin);
             let pid = bwrap_child.id();
@@ -2025,8 +2179,9 @@ impl KwinMcp {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
             }
             let _ = bwrap_child.wait();
-            if let Ok(signed) = i32::try_from(dbus_proxy_pid) {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(signed), nix::sys::signal::Signal::SIGTERM);
+            for mut proxy in service_proxy_children {
+                let _ = proxy.kill();
+                let _ = proxy.wait();
             }
             Err(ver_err(message))
         };
@@ -2038,7 +2193,7 @@ impl KwinMcp {
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin);
+            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
         }
         eprintln!("session_start: dbus-ready");
         let bus_addr = format!("unix:path={xdg_dir_str}/bus");
@@ -2050,11 +2205,11 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin),
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
             };
         // Claim org.kde.KWin on proxy_conn (before KWin starts, so we get it first)
         if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
-            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin);
+            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
         }
         eprintln!("session_start: proxy_conn owns org.kde.KWin");
 
@@ -2072,7 +2227,7 @@ impl KwinMcp {
         let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
         let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
         if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
-            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin);
+            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
         }
         eprintln!("session_start: input devices registered on proxy_conn");
 
@@ -2086,7 +2241,7 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin),
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
             };
 
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
@@ -2097,7 +2252,7 @@ impl KwinMcp {
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin);
+            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
         }
         eprintln!("session_start: wayland-0 ready");
 
@@ -2146,7 +2301,7 @@ impl KwinMcp {
                 break;
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin);
+                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
@@ -2159,52 +2314,27 @@ impl KwinMcp {
             .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
         let eis_proxy = match eis_builder.build().await {
             Ok(p) => p,
-            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin),
+            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
         };
         let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await {
             Ok(r) => r,
-            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin),
+            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
         };
         eprintln!("session_start: EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
         let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
-            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin),
-            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin),
+            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
         };
         eprintln!("session_start: EIS ready");
 
-        // Forward host wallet/secret services into the container's D-Bus
-        let wallet_conn = match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await {
-            Ok(conn) => conn,
-            Err(e) => return cleanup_err(format!("wallet_conn: {e}"), bwrap_child, bwrap_stdin),
-        };
-        if let Ok(host_conn) = zbus::Connection::session().await {
-        // Carbon-copy host kwallet into container at startup. Once dumped, serve it
-        // locally from an in-container emulator — no runtime host round-trips, no password prompts.
-        let (network_wallet, wallet_entries) = match dump_host_wallet(&host_conn).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("session_start: host kwallet dump failed: {e}");
-                ("kdewallet".to_owned(), std::collections::HashMap::new())
-            }
-        };
-        let total_entries: usize = wallet_entries.values().map(|v| v.len()).sum();
-        eprintln!("session_start: kwallet dump: {} folders, {} entries", wallet_entries.len(), total_entries);
-        let wallet_data = Arc::new(WalletData {
-            network_wallet,
-            entries: std::sync::Mutex::new(wallet_entries),
-        });
-        let emulator = KWalletEmulator { data: wallet_data };
-        if let Err(e) = wallet_conn.object_server().at("/modules/kwalletd6", emulator).await {
-            eprintln!("session_start: register kwallet emulator failed: {e}");
-        }
-        if let Err(e) = wallet_conn.request_name("org.kde.kwalletd6").await {
-            eprintln!("session_start: claim org.kde.kwalletd6 failed: {e}");
-        }
-        } else {
-            eprintln!("session_start: host bus unavailable, skipping wallet forwarding");
-        }
+        let atspi_bus_address = atspi::proxy::bus::BusProxy::new(&kwin_conn)
+            .await
+            .map_err(KwinError::from)?
+            .get_address()
+            .await
+            .map_err(KwinError::from)?;
 
         let bus_name = kwin_conn
             .unique_name()
@@ -2212,14 +2342,32 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let viewer_child = spawn_viewer(&host_xdg_dir, screen_w, screen_h).await;
+        let viewer_child = if self.display.viewer_enabled {
+            spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
+        } else {
+            eprintln!("session_start: viewer disabled (--no-viewer)");
+            None
+        };
+        // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
+        // the same host Wayland resolution as the viewer.
+        let clipboard_children = match host_wayland().await {
+            Ok((runtime, display)) => spawn_clipboard_bridge(&runtime, &display, &host_xdg_dir),
+            Err(e) => {
+                eprintln!("session_start: clipboard bridge skipped (host Wayland: {e:#})");
+                Vec::new()
+            }
+        };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
+        let overlay_work_paths = overlay_plan.overlays.iter()
+            .map(|overlay| overlay.work.join("work"))
+            .collect();
         let mut guard = self.session.lock().await;
         *guard = Some(Session {
             kwin_conn,
             _proxy_conn: proxy_conn,
-            _wallet_conn: wallet_conn,
             kwin_unique_name: kwin_unique_name.clone(),
+            service_bus_address,
+            atspi_bus_address,
             eis,
             bwrap_child,
             bwrap_stdin,
@@ -2227,8 +2375,10 @@ impl KwinMcp {
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
-            dbus_proxy_child: Some(dbus_proxy_child),
+            service_proxy_children: vec![system_proxy_child, service_proxy_child],
             viewer_child,
+            clipboard_children,
+            overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
@@ -2259,6 +2409,59 @@ impl KwinMcp {
             }
             None => Ok(structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await),
         }
+    }
+
+    #[rmcp::tool(
+        name = "window_list",
+        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized state, and modal/transient relationships. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
+        annotations(read_only_hint = true)
+    )]
+    async fn window_list(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
+        let xdg = self.host_xdg_dir().await?;
+        let windows = window_snapshots(&conn, &kwin_unique, &xdg).await?;
+        let text = if windows.is_empty() {
+            "no managed windows".to_owned()
+        } else {
+            windows
+                .iter()
+                .map(WindowSnapshot::summary)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let count = windows.len();
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({"count": count, "windows": windows}),
+        )
+        .await)
+    }
+
+    #[rmcp::tool(
+        name = "window_activate",
+        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
+    )]
+    async fn window_activate(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<WindowActivateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
+        let xdg = self.host_xdg_dir().await?;
+        let window = activate_window(&conn, &kwin_unique, &xdg, &params.window_id).await?;
+        let text = format!("activated {}", window.summary());
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({"status": "activated", "window": window}),
+        )
+        .await)
     }
 
     // Alpha-blends the high-visibility cursor sprite onto an RGBA buffer so that
@@ -2977,7 +3180,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. Chromium-family browsers default to the session's KWallet emulator unless the command already specifies --password-store. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
+        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
     )]
     async fn launch_app(
         &self,
@@ -3008,38 +3211,44 @@ impl KwinMcp {
         };
 
         // Record current active window ID before launching
-        let (conn, kwin_unique, xdg) = {
+        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address) = {
             let guard = self.session.lock().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            (sess.kwin_conn.clone(), sess.kwin_unique_name.clone(), sess.host_xdg_dir.clone())
+            (
+                sess.kwin_conn.clone(),
+                sess.kwin_unique_name.clone(),
+                sess.host_xdg_dir.clone(),
+                sess.service_bus_address.clone(),
+                sess.atspi_bus_address.clone(),
+            )
         };
         let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        // Force Chromium/Chrome to use native Wayland so xdg_popup menus render
-        // (XWayland path produces focus ring only — menu surface never composites).
-        let needs_wayland_flag =
-            (cmd_chromium || cmd_lower.contains("google-chrome") || cmd_lower.contains("edge"))
-                && !cmd_lower.contains("--ozone-platform");
-        let needs_kwallet_flag = (cmd_lower.contains("google-chrome")
-            || cmd_lower.contains("chromium")
-            || cmd_lower.contains("edge")
-            || cmd_lower.contains("brave")
-            || cmd_lower.contains("vivaldi"))
-            && !cmd_lower.contains("--password-store");
-        let mut launch_cmd = match cdp_port {
-            Some(port) => format!("{} --remote-debugging-port={port}", params.command),
-            None => params.command.clone(),
+        let is_chromium_family = cmd_chromium
+            || cmd_lower.contains("google-chrome")
+            || cmd_lower.contains("chrome")
+            || cmd_lower.contains("edge");
+        let needs_wayland_flag = is_chromium_family && !cmd_lower.contains("--ozone-platform");
+        let needs_password_store = is_chromium_family && !cmd_lower.contains("--password-store");
+        let launch_cmd = {
+            let mut command = match cdp_port {
+                Some(port) => format!("{} --remote-debugging-port={port}", params.command),
+                None => params.command.clone(),
+            };
+            if needs_wayland_flag {
+                command.push_str(" --ozone-platform=wayland");
+            }
+            if needs_password_store {
+                command.push_str(" --password-store=kwallet6");
+            }
+            format!(
+                "env DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
+            )
         };
-        if needs_wayland_flag {
-            launch_cmd.push_str(" --ozone-platform=wayland");
-        }
-        if needs_kwallet_flag {
-            launch_cmd.push_str(" --password-store=kwallet6");
-        }
         {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
@@ -3108,6 +3317,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
+        viewer_enabled: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3115,9 +3325,10 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
+            "--no-viewer" => cfg.viewer_enabled = false,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}' — usage: kwin-mcp [--width N] [--height N] [--no-override]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer]"
                 ))
             }
         }
@@ -3141,14 +3352,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let display = parse_cli_args()?;
     eprintln!(
-        "kwin-mcp: display default {}x{}{}",
+        "kwin-mcp: display default {}x{}{}; viewer {}",
         display.width,
         display.height,
-        if display.locked { " (locked, --no-override)" } else { "" }
+        if display.locked { " (locked, --no-override)" } else { "" },
+        if display.viewer_enabled {
+            "enabled"
+        } else {
+            "disabled (--no-viewer)"
+        }
     );
     let kwin = KwinMcp::new(display);
+    // Inject the host's installed browsers into the launch_app description so the
+    // agent knows what it can actually run without guessing (issue #28).
+    let mut tool_router = KwinMcp::tool_router();
+    let browsers = detect_browsers();
+    eprintln!("kwin-mcp: detected browsers: {}", if browsers.is_empty() { "(none)".to_owned() } else { browsers.join(", ") });
+    if let Some(route) = tool_router.map.get_mut("launch_app") {
+        let hint = if browsers.is_empty() {
+            "\n\nNo known browser was found on this host's PATH.".to_owned()
+        } else {
+            format!(
+                "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
+                 Only 'chromium' exposes CDP DOM queries on its default profile; the others still \
+                 launch, screenshot, and accept input normally.",
+                browsers.join(", ")
+            )
+        };
+        let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
+        route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
+    }
     let router =
-        rmcp::handler::server::router::Router::new(kwin).with_tools(KwinMcp::tool_router());
+        rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
     service.waiting().await?;

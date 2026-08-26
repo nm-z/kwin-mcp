@@ -40,6 +40,10 @@ path = "src/main.rs"
 name = "kwin-viewer"
 path = "src/bin/kwin-viewer.rs"
 
+[[bin]]
+name = "kwin-mcp-strict"
+path = "src/bin/kwin-mcp-strict.rs"
+
 [lints.clippy]
 wildcard_enum_match_arm = "deny"
 unwrap_used = "deny"
