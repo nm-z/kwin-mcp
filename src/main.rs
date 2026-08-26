@@ -922,11 +922,16 @@ struct DisplayConfig {
 #[derive(Clone)]
 struct KwinMcp {
     session: Arc<tokio::sync::Mutex<Option<Session>>>,
-    /// Session workdir that --autoclean still owns and must delete. Set the
-    /// moment session_start creates the directory, so failed, cancelled, and
-    /// timed-out starts are covered too, and cleared only once the directory is
-    /// actually gone, so a failed delete stays retryable through session_stop.
-    autoclean_workdir: Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Cleanup ownership of the session workdir under --autoclean. Claimed
+    /// before session_start creates the directory and released only once the
+    /// directory is gone, so every terminal start, stop, and shutdown outcome
+    /// either removes it or leaves it owned with a reachable retry.
+    workdir: Arc<WorkdirOwnership>,
+    /// Held for the whole of session_start, which is the only writer that
+    /// populates the workdir. Shutdown takes it before its terminal cleanup, so
+    /// a start still running when the transport closes cannot repopulate a
+    /// directory that nothing is left to delete.
+    start_gate: Arc<tokio::sync::Mutex<()>>,
     display: DisplayConfig,
 }
 
@@ -934,7 +939,8 @@ impl KwinMcp {
     fn new(display: DisplayConfig) -> Self {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
-            autoclean_workdir: Arc::new(tokio::sync::Mutex::new(None)),
+            workdir: Arc::new(WorkdirOwnership::default()),
+            start_gate: Arc::new(tokio::sync::Mutex::new(())),
             display,
         }
     }
@@ -981,25 +987,21 @@ impl KwinMcp {
             )),
         }
     }
-    /// Autoclean an owned session workdir left behind by a session_start attempt
-    /// that published no Session, covering the failed paths and the cancelled
-    /// hard-timeout path. A published Session keeps its workdir for session_stop.
-    /// Ownership survives a failed delete, so session_stop can retry it.
+    /// Terminal cleanup for a session_start attempt that published no Session,
+    /// covering the failed paths, the cancelled hard-timeout path, and a start
+    /// that never created its directory. A start that did publish a Session
+    /// keeps its workdir, which session_stop then owns.
     async fn autoclean_unpublished_workdir(&self, error: McpError) -> McpError {
         if self.session.lock().await.is_some() {
             return error;
         }
-        let mut owned = self.autoclean_workdir.lock().await;
-        let Some(dir) = owned.clone() else {
-            return error;
-        };
-        match remove_session_workdir(&dir) {
-            Ok(()) => {
+        match self.workdir.remove() {
+            WorkdirCleanup::NothingOwned => error,
+            WorkdirCleanup::Removed(dir) => {
                 eprintln!("session_start: autoclean removed {}", dir.display());
-                *owned = None;
                 error
             }
-            Err(remove_error) => McpError::internal_error(
+            WorkdirCleanup::Retained { dir, error: remove_error } => McpError::internal_error(
                 format!(
                     "{}; session workdir {} not removed: {remove_error}. Cleanup is still owned, call session_stop to retry.",
                     error.message,
@@ -1007,6 +1009,28 @@ impl KwinMcp {
                 ),
                 None,
             ),
+        }
+    }
+    /// Final terminal transition when the stdio transport closes. Without it an
+    /// exiting server would strand an owned workdir with no reachable retry.
+    /// Nothing is owned unless --autoclean claimed it, so the default lifecycle
+    /// is untouched.
+    async fn shutdown_cleanup(&self) {
+        let Some(dir) = self.workdir.owned() else {
+            return;
+        };
+        eprintln!("shutdown: autoclean owns {}", dir.display());
+        let _start_gate = self.start_gate.lock().await;
+        let stopped = self.session.lock().await.take();
+        if let Some(sess) = stopped {
+            teardown(sess);
+        }
+        match self.workdir.remove() {
+            WorkdirCleanup::NothingOwned => {}
+            WorkdirCleanup::Removed(dir) => eprintln!("shutdown: autoclean removed {}", dir.display()),
+            WorkdirCleanup::Retained { dir, error } => {
+                eprintln!("shutdown: autoclean could not remove {}: {error}", dir.display())
+            }
         }
     }
 }
@@ -1106,44 +1130,165 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
     }
 }
 
-/// Restore owner read/write/traverse bits on every directory inside an owned
-/// session workdir so removal cannot be blocked by a mode-000 directory that a
-/// launched command created in the overlay upper layer. Symlinks are never
-/// followed and never chmod'd, so the walk stays inside `dir`.
-fn make_session_workdir_removable(dir: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    const OWNER_RWX: u32 = 0o700;
-    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+// ── Session workdir autoclean ────────────────────────────────────────────
+//
+// --autoclean owns exactly one directory, the session workdir of this server
+// process, and moves through one explicit state machine:
+//
+//   Idle  --claim (session_start, before the directory is created)--> Owned
+//   Owned --remove succeeded (workdir gone)--------------------------> Idle
+//   Owned --remove failed (workdir still there)---------------------> Owned
+//
+// `claim` and `remove` are synchronous and each runs under a single lock
+// acquisition, so no await, cancellation, or hard timeout can split a
+// transition and strand the directory. Every terminal outcome of session_start,
+// session_stop, and server shutdown ends in one of those two transitions, so an
+// owned workdir always keeps a reachable retry.
+
+/// Owner read, write, and traverse bits. A directory missing any of them cannot
+/// be emptied by its owner, which is what a mode-000 directory in the overlay
+/// does to the delete.
+const WORKDIR_OWNER_RWX: u32 = 0o700;
+
+/// Depth limit for the permission repair walk inside the owned workdir. Each
+/// level holds one open descriptor, so the bound stops a hostile deep tree from
+/// exhausting the descriptor limit. A subtree below the limit is left alone; the
+/// delete then fails and stays retryable instead of the walk breaking the server.
+const WORKDIR_REPAIR_MAX_DEPTH: u32 = 128;
+
+/// The one session workdir this server process owns. `session_start` creates it
+/// and cleanup validates against it, so both agree on a single definition.
+fn session_workdir_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("kwin-mcp-{}", std::process::id()))
+}
+
+/// Path naming the inode an open descriptor already refers to. Operating through
+/// it keeps chmod and directory reads pinned to the descriptor this walk opened
+/// and validated, so a name replaced underneath the walk cannot redirect the
+/// operation at a different file.
+fn proc_fd_path(fd: &std::os::fd::OwnedFd) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd;
+    std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// Grant owner rwx to `dir` and to every directory below it so the delete cannot
+/// be blocked by a mode-000 directory a launched command created in the overlay.
+///
+/// `dir` is a descriptor opened with O_PATH | O_NOFOLLOW, so it names the entry
+/// itself and never its symlink target. The walk chmods only after `fstat` on
+/// that descriptor proves it is a directory, which excludes symlinks, files, and
+/// devices, and it descends only through descriptors opened from the parent
+/// descriptor with the same flags. There is no path re-resolution and no
+/// check-then-use window, so nothing outside the owned workdir can be reached
+/// even while the tree is being rewritten concurrently.
+fn repair_workdir_directory_tree(dir: std::os::fd::OwnedFd, depth: u32) {
+    let Ok(status) = nix::sys::stat::fstat(&dir) else {
         return;
     };
-    if !metadata.is_dir() {
+    if status.st_mode & nix::libc::S_IFMT != nix::libc::S_IFDIR {
         return;
     }
-    let mut permissions = metadata.permissions();
-    if permissions.mode() & OWNER_RWX != OWNER_RWX {
-        permissions.set_mode(permissions.mode() | OWNER_RWX);
-        let _ = std::fs::set_permissions(dir, permissions);
+    let mode = status.st_mode & 0o7777;
+    if mode & WORKDIR_OWNER_RWX != WORKDIR_OWNER_RWX {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            proc_fd_path(&dir),
+            std::fs::Permissions::from_mode(mode | WORKDIR_OWNER_RWX),
+        );
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    if depth >= WORKDIR_REPAIR_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(proc_fd_path(&dir)) else {
         return;
     };
+    let flags = nix::fcntl::OFlag::O_PATH
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
     for entry in entries.flatten() {
-        make_session_workdir_removable(&entry.path());
+        let name = entry.file_name();
+        if let Ok(child) = nix::fcntl::openat(&dir, name.as_os_str(), flags, nix::sys::stat::Mode::empty()) {
+            repair_workdir_directory_tree(child, depth + 1);
+        }
     }
 }
 
-/// Delete an owned session workdir for --autoclean. Permissions inside the
-/// workdir are normalized first so container-created directories cannot block
-/// the delete. An already absent directory is the wanted end state, so a retry
-/// after a partial failure converges instead of reporting a new error.
+/// Delete the owned session workdir. The path is validated against this
+/// process's own workdir first, permissions inside that tree are repaired, and
+/// the delete itself never follows symlinks, so every effect stays inside the
+/// owned directory. An absent directory is the wanted end state, so a retry
+/// after a partial delete converges instead of inventing a new failure.
 fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
-    make_session_workdir_removable(dir);
+    let expected = session_workdir_path();
+    if dir != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not this server's session workdir {}", dir.display(), expected.display()),
+        ));
+    }
+    let flags = nix::fcntl::OFlag::O_PATH
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    if let Ok(root) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) {
+        repair_workdir_directory_tree(root, 0);
+    }
     if let Err(error) = std::fs::remove_dir_all(dir)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error);
     }
     Ok(())
+}
+
+/// Result of the one terminal cleanup transition.
+enum WorkdirCleanup {
+    /// Idle: --autoclean is off, or the workdir was already deleted.
+    NothingOwned,
+    /// Owned to Idle: the directory is gone and nothing is owned any more.
+    Removed(std::path::PathBuf),
+    /// Owned to Owned: the directory survived, so ownership and the retry stay.
+    Retained {
+        dir: std::path::PathBuf,
+        error: std::io::Error,
+    },
+}
+
+/// The single authoritative record of the session workdir --autoclean still owns.
+#[derive(Default)]
+struct WorkdirOwnership {
+    owned: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
+
+impl WorkdirOwnership {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<std::path::PathBuf>> {
+        self.owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Idle to Owned. Claiming before the directory exists means a start that
+    /// fails, is cancelled, or times out during creation is still owned.
+    fn claim(&self, dir: &std::path::Path) {
+        *self.lock() = Some(dir.to_path_buf());
+    }
+    /// The owned path, used by shutdown to decide whether it has work to do.
+    fn owned(&self) -> Option<std::path::PathBuf> {
+        self.lock().clone()
+    }
+    /// The terminal transition: delete the owned workdir and release ownership
+    /// only once it is actually gone. Both the delete and the release happen
+    /// under one lock acquisition, so concurrent callers cannot observe or lose
+    /// a half-finished transition.
+    fn remove(&self) -> WorkdirCleanup {
+        let mut owned = self.lock();
+        let Some(dir) = owned.clone() else {
+            return WorkdirCleanup::NothingOwned;
+        };
+        match remove_session_workdir(&dir) {
+            Ok(()) => {
+                *owned = None;
+                WorkdirCleanup::Removed(dir)
+            }
+            Err(error) => WorkdirCleanup::Retained { dir, error },
+        }
+    }
 }
 
 fn teardown(mut sess: Session) {
@@ -1871,6 +2016,10 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Held across the whole attempt, including the hard timeout, so shutdown
+        // cleanup never runs while this start is still writing the workdir.
+        let start_gate = self.start_gate.clone();
+        let _start_gate = start_gate.lock().await;
         let outcome = match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
             Ok(res) => res,
             Err(_) => Err(McpError::internal_error(
@@ -1947,14 +2096,15 @@ impl KwinMcp {
             (w, h)
         };
         eprintln!("session_start: virtual display {screen_w}x{screen_h}");
-        let pid = std::process::id();
-        let host_xdg_dir = std::env::temp_dir().join(format!("kwin-mcp-{pid}"));
-        std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
-        // Take cleanup ownership as soon as the workdir exists so every terminal
-        // outcome of this start, published Session or not, has an owner.
+        let host_xdg_dir = session_workdir_path();
+        // Claim cleanup ownership before the directory exists. The claim is
+        // synchronous, so no cancellation point sits between it and the create,
+        // and every terminal outcome of this start has an owner even if the
+        // create itself fails.
         if self.display.autoclean {
-            *self.autoclean_workdir.lock().await = Some(host_xdg_dir.clone());
+            self.workdir.claim(&host_xdg_dir);
         }
+        std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
         eprintln!(
@@ -2490,22 +2640,29 @@ impl KwinMcp {
         if let Some(sess) = stopped {
             teardown(sess);
         }
-        let mut owned = self.autoclean_workdir.lock().await;
-        let Some(dir) = owned.clone() else {
-            return Ok(if had_session {
-                structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await
-            } else {
-                structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await
-            });
+        let dir = match self.workdir.remove() {
+            WorkdirCleanup::NothingOwned => {
+                return Ok(if had_session {
+                    structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await
+                } else {
+                    structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await
+                });
+            }
+            WorkdirCleanup::Removed(dir) => dir,
+            WorkdirCleanup::Retained { dir, error } => {
+                // The Session is already torn down, so name that too: cleanup
+                // ownership is the only state left, and another session_stop is
+                // its retry.
+                let stopped_note = if had_session { "session stopped, but " } else { "" };
+                return Err(McpError::internal_error(
+                    format!(
+                        "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
+                        dir.display()
+                    ),
+                    None,
+                ));
+            }
         };
-        remove_session_workdir(&dir).map_err(|error| McpError::internal_error(
-            format!(
-                "session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
-                dir.display()
-            ),
-            None,
-        ))?;
-        *owned = None;
         let workdir = dir.display().to_string();
         let (status, message) = if had_session {
             ("stopped", format!("session stopped, workdir {workdir} removed"))
@@ -3472,6 +3629,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     let kwin = KwinMcp::new(display);
+    let shutdown = kwin.clone();
     // Inject the host's installed browsers into the launch_app description so the
     // agent knows what it can actually run without guessing (issue #28).
     let mut tool_router = KwinMcp::tool_router();
@@ -3495,6 +3653,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
-    service.waiting().await?;
+    let waited = service.waiting().await;
+    // The transport is closed, so session_stop can no longer be called. Run the
+    // final terminal transition here or an owned workdir would outlive every
+    // path that could still delete it.
+    shutdown.shutdown_cleanup().await;
+    waited?;
     Ok(())
 }
