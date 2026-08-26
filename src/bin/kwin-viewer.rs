@@ -23,9 +23,10 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols_plasma::fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
 use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate::{
     self as kde_keystate, OrgKdeKwinKeystate,
@@ -55,6 +56,10 @@ const BTN_MIDDLE: u32 = 0x112;
 // fake_input axis ids (matches wl_pointer axis): 0=vertical, 1=horizontal.
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
+
+// How long a Num Lock injection may take to show up as a stateChanged event
+// from the isolated compositor before we call the synchronization failed.
+const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Frame {
     width: u32,
@@ -128,9 +133,43 @@ wayland_client::delegate_noop!(WlState: ignore wl_output::WlOutput);
 wayland_client::delegate_noop!(WlState: ignore ZkdeScreencastUnstableV1);
 wayland_client::delegate_noop!(WlState: ignore OrgKdeKwinFakeInput);
 
+// Newest Num Lock state a compositor confirmed over org_kde_kwin_keystate,
+// shared between the watcher thread that dispatches the key-state queue and
+// the winit thread that synchronizes on focus.
+#[derive(Default)]
+struct NumLockWatch {
+    // None until the compositor reports Num Lock for the first time.
+    enabled: Option<bool>,
+    // Set when the watcher's queue stops dispatching, so a waiter fails at
+    // once instead of blocking on a connection that is already gone.
+    ended: bool,
+}
+
+#[derive(Default)]
+struct NumLockShared {
+    watch: Mutex<NumLockWatch>,
+    updated: Condvar,
+}
+
+impl NumLockShared {
+    fn publish(&self, enabled: bool) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.enabled = Some(enabled);
+            self.updated.notify_all();
+        }
+    }
+
+    fn end(&self) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.ended = true;
+            self.updated.notify_all();
+        }
+    }
+}
+
 struct NumLockState {
     proxy: Option<OrgKdeKwinKeystate>,
-    enabled: Option<bool>,
+    shared: Arc<NumLockShared>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for NumLockState {
@@ -169,48 +208,97 @@ impl Dispatch<OrgKdeKwinKeystate, ()> for NumLockState {
         } = event
             && key == kde_keystate::Key::Numlock as u32
         {
-            state.enabled = Some(key_state == kde_keystate::State::Locked as u32);
+            state
+                .shared
+                .publish(key_state == kde_keystate::State::Locked as u32);
         }
     }
 }
 
-struct NumLockMonitor {
+struct NumLockWatcher {
     source: &'static str,
-    queue: EventQueue<NumLockState>,
-    state: NumLockState,
+    shared: Arc<NumLockShared>,
 }
 
-impl NumLockMonitor {
-    fn new(conn: Connection, source: &'static str) -> anyhow::Result<Self> {
+impl NumLockWatcher {
+    // KWin republishes the whole key-state set to every bound
+    // org_kde_kwin_keystate resource on every LED or modifier change, so at
+    // version 5 plain Shift/Ctrl/Alt/Meta typing produces events too. A
+    // resource that is only read on demand therefore grows an unread backlog
+    // until the compositor tears the connection down. Each watcher owns a
+    // thread that dispatches its queue for the viewer's lifetime and keeps
+    // only the newest confirmed Num Lock state.
+    fn spawn(conn: Connection, source: &'static str) -> anyhow::Result<Self> {
         let mut queue = conn.new_event_queue::<NumLockState>();
         let _registry = conn.display().get_registry(&queue.handle(), ());
+        let shared = Arc::new(NumLockShared::default());
         let mut state = NumLockState {
             proxy: None,
-            enabled: None,
+            shared: Arc::clone(&shared),
         };
         queue.roundtrip(&mut state)?;
-        anyhow::ensure!(
-            state.proxy.is_some(),
-            "{source} compositor did not advertise org_kde_kwin_keystate"
-        );
-        Ok(Self {
-            source,
-            queue,
-            state,
+        let proxy = state.proxy.clone().ok_or_else(|| {
+            anyhow::anyhow!("{source} compositor did not advertise org_kde_kwin_keystate")
+        })?;
+        // The compositor only pushes changes, so ask once for the current set.
+        proxy.fetchStates();
+        queue.roundtrip(&mut state)?;
+        let watcher = Self { source, shared };
+        watcher.latest()?;
+        std::thread::Builder::new()
+            .name(format!("numlock-{source}"))
+            .spawn(move || {
+                while queue.blocking_dispatch(&mut state).is_ok() {}
+                state.shared.end();
+                eprintln!("kwin-viewer: {source} key-state watcher stopped");
+            })?;
+        Ok(watcher)
+    }
+
+    // Newest state the compositor confirmed, without asking it again.
+    fn latest(&self) -> anyhow::Result<bool> {
+        let watch = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} key-state mutex poisoned", self.source))?;
+        watch.enabled.ok_or_else(|| {
+            anyhow::anyhow!("{} compositor did not report Num Lock state", self.source)
         })
     }
 
-    fn read(&mut self) -> anyhow::Result<bool> {
-        self.state.enabled = None;
-        self.state
-            .proxy
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("{} key-state proxy disappeared", self.source))?
-            .fetchStates();
-        self.queue.roundtrip(&mut self.state)?;
-        self.state.enabled.ok_or_else(|| {
-            anyhow::anyhow!("{} compositor did not report Num Lock state", self.source)
-        })
+    // Block until the compositor confirms `expected`, so callers never assume
+    // an injected transition landed.
+    fn wait_for(&self, expected: bool, timeout: Duration) -> anyhow::Result<()> {
+        let wanted = if expected { "enabled" } else { "disabled" };
+        let deadline = Instant::now() + timeout;
+        let mut watch = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} key-state mutex poisoned", self.source))?;
+        loop {
+            if watch.enabled == Some(expected) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                !watch.ended,
+                "{} key-state watcher stopped before confirming Num Lock {wanted}",
+                self.source
+            );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "{} compositor did not confirm Num Lock {wanted} within {timeout:?}",
+                self.source
+            );
+            let (guard, _) = self
+                .shared
+                .updated
+                .wait_timeout(watch, remaining)
+                .map_err(|_| anyhow::anyhow!("{} key-state mutex poisoned", self.source))?;
+            watch = guard;
+        }
     }
 }
 
@@ -219,28 +307,25 @@ fn evdev_code(key: evdev::KeyCode) -> u32 {
 }
 
 struct NumLockSync {
-    host: NumLockMonitor,
-    isolated: NumLockMonitor,
+    host: NumLockWatcher,
+    isolated: NumLockWatcher,
 }
 
 impl NumLockSync {
-    fn apply(
-        &mut self,
-        fake_input: &OrgKdeKwinFakeInput,
-        conn: &Connection,
-    ) -> anyhow::Result<()> {
-        let host_enabled = self.host.read()?;
-        if host_enabled == self.isolated.read()? {
+    // Drive the isolated compositor to the host's newest confirmed Num Lock
+    // state. Both states come from the watchers, so this never stalls on a
+    // round trip and never races the modifier traffic they are draining.
+    fn apply(&self, fake_input: &OrgKdeKwinFakeInput, conn: &Connection) -> anyhow::Result<()> {
+        let host_enabled = self.host.latest()?;
+        if host_enabled == self.isolated.latest()? {
             return Ok(());
         }
         let code = evdev_code(evdev::KeyCode::KEY_NUMLOCK);
         fake_input.keyboard_key(code, 1);
         fake_input.keyboard_key(code, 0);
-        conn.roundtrip()?;
-        anyhow::ensure!(
-            self.isolated.read()? == host_enabled,
-            "isolated compositor did not apply the host Num Lock state"
-        );
+        conn.flush()?;
+        self.isolated
+            .wait_for(host_enabled, NUMLOCK_CONFIRM_TIMEOUT)?;
         eprintln!(
             "kwin-viewer: synchronized isolated Num Lock {}",
             if host_enabled { "enabled" } else { "disabled" }
@@ -278,14 +363,14 @@ fn main() -> anyhow::Result<()> {
 
     pipewire::init();
 
-    let host_numlock = NumLockMonitor::new(Connection::connect_to_env()?, "host")?;
+    let host_numlock = NumLockWatcher::spawn(Connection::connect_to_env()?, "host")?;
     let isolated_numlock_sock = UnixStream::connect(session_path.join("wayland-0"))?;
-    let isolated_numlock = NumLockMonitor::new(
+    let isolated_numlock = NumLockWatcher::spawn(
         Connection::from_socket(isolated_numlock_sock)
             .map_err(|e| anyhow::anyhow!("isolated key-state connect: {e:?}"))?,
         "isolated",
     )?;
-    let mut numlock = NumLockSync {
+    let numlock = NumLockSync {
         host: host_numlock,
         isolated: isolated_numlock,
     };
@@ -336,10 +421,11 @@ fn main() -> anyhow::Result<()> {
 
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
 
-    // Owning handle so the pipewire thread keeps working. We never touch the
-    // wayland connection after this from here — the pipewire thread spins its
-    // own loop, the main thread runs winit, fake_input requests flush
-    // synchronously when called.
+    // The join handle keeps the pipewire thread alive for the rest of main;
+    // it spins its own loop. The isolated wayland connection stays in use
+    // past this point: the dispatch thread below drains its events, the winit
+    // loop sends and flushes fake_input requests on it, and Num Lock
+    // synchronization injects key presses through it on focus.
     let pipewire_sock = session_path.join("pipewire-0");
     let _pw_thread = {
         let mailbox = Arc::clone(&mailbox);
@@ -379,7 +465,6 @@ fn main() -> anyhow::Result<()> {
     let fake_input_for_loop = fake_input.clone();
     let conn_for_loop = conn.clone();
     let mut input_state = InputState::default();
-    let mut numlock_for_loop = numlock;
 
     window.run(move |frame| {
         for event in frame.events {
@@ -390,7 +475,7 @@ fn main() -> anyhow::Result<()> {
                 (frame.width, frame.height),
                 (virt_w, virt_h),
                 &mut input_state,
-                &mut numlock_for_loop,
+                &numlock,
             );
         }
 
@@ -484,7 +569,7 @@ fn forward_input(
     window_size: (u32, u32),
     virt: (u32, u32),
     state: &mut InputState,
-    numlock: &mut NumLockSync,
+    numlock: &NumLockSync,
 ) {
     let Event::WindowEvent { event, .. } = event else { return };
     if let WindowEvent::Focused(true) = event
