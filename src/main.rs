@@ -723,14 +723,20 @@ fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
         let desktop_scope = cgroup.contains("/session.slice/")
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
         let descriptors: Vec<procfs::process::FDInfo> = process.fd().into_iter().flatten().flatten().collect();
-        let input_attached = descriptors.iter().any(|descriptor| match &descriptor.target {
-            procfs::process::FDTarget::Path(path) => path == Path::new("/dev/uinput") || path.starts_with("/dev/input"),
-            _ => false,
+        let input_attached = descriptors.iter().any(|descriptor| {
+            if let procfs::process::FDTarget::Path(path) = &descriptor.target {
+                path == Path::new("/dev/uinput") || path.starts_with("/dev/input")
+            } else {
+                false
+            }
         });
         if display_attached || desktop_scope || input_attached {
-            graphical.extend(descriptors.into_iter().filter_map(|descriptor| match descriptor.target {
-                procfs::process::FDTarget::Socket(inode) => Some(inode),
-                _ => None,
+            graphical.extend(descriptors.into_iter().filter_map(|descriptor| {
+                if let procfs::process::FDTarget::Socket(inode) = descriptor.target {
+                    Some(inode)
+                } else {
+                    None
+                }
             }));
         }
     }
