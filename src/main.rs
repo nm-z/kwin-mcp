@@ -723,14 +723,20 @@ fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
         let desktop_scope = cgroup.contains("/session.slice/")
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
         let descriptors: Vec<procfs::process::FDInfo> = process.fd().into_iter().flatten().flatten().collect();
-        let input_attached = descriptors.iter().any(|descriptor| match &descriptor.target {
-            procfs::process::FDTarget::Path(path) => path == Path::new("/dev/uinput") || path.starts_with("/dev/input"),
-            _ => false,
+        let input_attached = descriptors.iter().any(|descriptor| {
+            if let procfs::process::FDTarget::Path(path) = &descriptor.target {
+                path == Path::new("/dev/uinput") || path.starts_with("/dev/input")
+            } else {
+                false
+            }
         });
         if display_attached || desktop_scope || input_attached {
-            graphical.extend(descriptors.into_iter().filter_map(|descriptor| match descriptor.target {
-                procfs::process::FDTarget::Socket(inode) => Some(inode),
-                _ => None,
+            graphical.extend(descriptors.into_iter().filter_map(|descriptor| {
+                if let procfs::process::FDTarget::Socket(inode) = descriptor.target {
+                    Some(inode)
+                } else {
+                    None
+                }
             }));
         }
     }
@@ -2336,6 +2342,20 @@ impl KwinMcp {
             .await
             .map_err(KwinError::from)?;
 
+        // Chromium's ATK bridge stays dormant while org.a11y.Status reports
+        // accessibility disabled — Chrome then registers on the AT-SPI bus but
+        // exposes zero children. Non-fatal: Qt apps are unaffected either way
+        // (QT_LINUX_ACCESSIBILITY_ALWAYS_ON is exported in the entrypoint).
+        if let Err(e) = kwin_conn.call_method(
+            Some("org.a11y.Bus"),
+            "/org/a11y/bus",
+            Some("org.freedesktop.DBus.Properties"),
+            "Set",
+            &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)),
+        ).await {
+            eprintln!("session_start: enabling org.a11y.Status failed (Chromium AT-SPI trees will be empty): {e}");
+        }
+
         let bus_name = kwin_conn
             .unique_name()
             .map(|n| n.to_string())
@@ -3234,6 +3254,10 @@ impl KwinMcp {
             || cmd_lower.contains("edge");
         let needs_wayland_flag = is_chromium_family && !cmd_lower.contains("--ozone-platform");
         let needs_password_store = is_chromium_family && !cmd_lower.contains("--password-store");
+        // Web content never appears in the AT-SPI tree without this: renderer
+        // accessibility is off by default and CDP is unavailable for Google
+        // Chrome/Edge, so the a11y tools would only see the browser frame.
+        let needs_a11y_flag = is_chromium_family && !cmd_lower.contains("--force-renderer-accessibility");
         let launch_cmd = {
             let mut command = match cdp_port {
                 Some(port) => format!("{} --remote-debugging-port={port}", params.command),
@@ -3244,6 +3268,9 @@ impl KwinMcp {
             }
             if needs_password_store {
                 command.push_str(" --password-store=kwallet6");
+            }
+            if needs_a11y_flag {
+                command.push_str(" --force-renderer-accessibility");
             }
             format!(
                 "env DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
