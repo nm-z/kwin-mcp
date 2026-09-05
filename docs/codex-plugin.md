@@ -30,7 +30,7 @@ The plugin's purpose is the remote route.
 
 | Check | Result |
 | --- | --- |
-| `kwin-mcp` transport | `rmcp::transport::io::stdio()` only (`src/main.rs:3656`); `Cargo.toml` enables rmcp features `server`, `transport-io` and no HTTP transport |
+| `kwin-mcp` transport | `rmcp::transport::io::stdio()` only (`src/main.rs:3387`); `Cargo.toml` enables rmcp features `server`, `transport-io` and no HTTP transport |
 | `~/.cloudflared/config.yml` ingress | `canvas.nm-z.com`, `gmail.nm-z.com`, then catch-all `http_status:404` |
 | `~/.cloudflared/hp-mcp.yml` ingress | same two hostnames, same catch-all; no `kwin.nm-z.com` rule in either file |
 | `GET https://kwin.nm-z.com/mcp` | HTTP 404, `content-type: text/plain`, body `404 page not found`, `server: cloudflare` |
