@@ -45,6 +45,10 @@ target/release/kwin-mcp-strict --allow-host-gui --
 
 This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
 
+## Codex plugin
+
+`.codex-plugin/plugin.json` makes this repository a Codex plugin, but it carries metadata only. It declares no `mcpServers` because the server currently speaks MCP over stdio and no authorized HTTPS route or authentication contract for a remote endpoint exists: `https://kwin.nm-z.com/mcp` returns 404 and neither cloudflared ingress file routes that hostname. [docs/codex-plugin.md](docs/codex-plugin.md) records the evidence, the exact route/auth contract that must hold first, the manifest change to make once it does, and the `jq` validation to run.
+
 ## Session Architecture
 
 ```

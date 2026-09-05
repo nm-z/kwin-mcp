@@ -1,0 +1,20 @@
+{
+  "name": "kwin-mcp",
+  "version": "0.1.0",
+  "description": "KDE Plasma 6 Wayland GUI automation MCP server (kwin-mcp). Plugin scaffold only: no MCP endpoint is declared until an authorized remote route and auth contract exist. See docs/codex-plugin.md.",
+  "author": {
+    "name": "Nathaniel Phelps",
+    "url": "https://github.com/nm-z"
+  },
+  "homepage": "https://github.com/nm-z/kwin-mcp#readme",
+  "repository": "https://github.com/nm-z/kwin-mcp",
+  "keywords": ["kwin", "kde", "plasma", "wayland", "gui-automation", "mcp"],
+  "interface": {
+    "displayName": "KWin MCP",
+    "shortDescription": "KDE Plasma 6 Wayland GUI automation over MCP",
+    "longDescription": "kwin-mcp drives an isolated KDE Plasma 6 Wayland session: session_start/session_stop, launch_app, screenshot, window_list, window_activate, accessibility_tree, find_ui_elements, mouse_click/move/scroll/drag, keyboard_type/key. This plugin currently ships metadata only. The server speaks MCP over stdio, and no authorized HTTPS route or authentication contract for a remote endpoint exists yet, so mcpServers is intentionally omitted rather than pointing at a URL that returns 404. docs/codex-plugin.md records the required route/auth contract and the observed blocker.",
+    "developerName": "Nathaniel Phelps",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"]
+  }
+}
