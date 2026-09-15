@@ -2452,7 +2452,21 @@ impl KwinMcp {
                 "--broadcast=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.PropertiesChanged@/*",
             ],
         ) {
-            Ok(child) => startup.add_proxy(child),
+            Ok(child) => {
+                if cfg!(debug_assertions)
+                    && std::env::var("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY").ok().as_deref()
+                        == Some("1")
+                {
+                    eprintln!("session_start: test first proxy registered pid={}", child.id());
+                }
+                startup.add_proxy(child);
+                if cfg!(debug_assertions)
+                    && std::env::var("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY").ok().as_deref()
+                        == Some("1")
+                {
+                    return cleanup_err("test failure after first proxy".to_owned(), &mut startup);
+                }
+            }
             Err(error) => return cleanup_err(format!("system D-Bus proxy: {error:#}"), &mut startup),
         }
         let host_session_bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {

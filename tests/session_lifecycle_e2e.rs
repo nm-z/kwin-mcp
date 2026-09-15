@@ -23,13 +23,26 @@ impl RpcClient {
     }
 
     fn start_with_options(delay_stage: Option<&str>, viewer: bool) -> Self {
-        Self::start_with_options_and_stop(delay_stage, viewer, false)
+        Self::start_with_test_options(delay_stage, viewer, false, false)
     }
 
     fn start_with_options_and_stop(
         delay_stage: Option<&str>,
         viewer: bool,
         stop_bwrap: bool,
+    ) -> Self {
+        Self::start_with_test_options(delay_stage, viewer, stop_bwrap, false)
+    }
+
+    fn start_with_first_proxy_failure() -> Self {
+        Self::start_with_test_options(None, false, false, true)
+    }
+
+    fn start_with_test_options(
+        delay_stage: Option<&str>,
+        viewer: bool,
+        stop_bwrap: bool,
+        fail_after_first_proxy: bool,
     ) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -82,6 +95,9 @@ impl RpcClient {
         }
         if stop_bwrap {
             command.env("KWIN_MCP_TEST_STOP_BWRAP", "1");
+        }
+        if fail_after_first_proxy {
+            command.env("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY", "1");
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -197,32 +213,35 @@ fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> V
     client.response(id, Duration::from_secs(45))
 }
 
-fn process_children(pid: u32) -> Vec<String> {
-    std::process::Command::new("pgrep")
+fn process_children(pid: u32) -> std::io::Result<Vec<String>> {
+    let output = std::process::Command::new("pgrep")
         .args(["-P", &pid.to_string()])
-        .output()
-        .ok()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
-fn process_alive(pid: u32) -> bool {
-    std::fs::metadata(format!("/proc/{pid}")).is_ok()
+fn process_alive(pid: u32) -> std::io::Result<bool> {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-fn process_threads(pid: u32) -> Vec<String> {
-    std::fs::read_dir(format!("/proc/{pid}/task"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
-        .map(|name| name.trim().to_owned())
-        .collect()
+fn process_threads(pid: u32) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        let entry = entry?;
+        names.push(
+            std::fs::read_to_string(entry.path().join("comm"))?
+                .trim()
+                .to_owned(),
+        );
+    }
+    Ok(names)
 }
 
 fn workdir(response: &Value) -> PathBuf {
@@ -356,7 +375,7 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
             .and_then(|(_, value)| value.trim().parse::<u32>().ok())
             .unwrap_or_else(|| panic!("could not parse bwrap PID: {bwrap_line}"));
         assert!(
-            process_alive(bwrap_pid),
+            process_alive(bwrap_pid).unwrap_or_else(|error| panic!("inspect bwrap: {error}")),
             "bwrap was not alive before delayed stage {stage}"
         );
         if viewer {
@@ -367,7 +386,7 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
                 .and_then(|(_, value)| value.trim().parse::<u32>().ok())
                 .unwrap_or_else(|| panic!("could not parse viewer PID: {viewer_line}"));
             assert!(
-                process_alive(viewer_pid),
+                process_alive(viewer_pid).unwrap_or_else(|error| panic!("inspect viewer: {error}")),
                 "viewer was not alive before delayed stage {stage}"
             );
         }
@@ -381,6 +400,7 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
             );
             assert!(
                 process_threads(server_pid)
+                    .unwrap_or_else(|error| panic!("inspect endpoint threads: {error}"))
                     .iter()
                     .any(|name| name == "viewer-endpoint"),
                 "endpoint thread was not alive before timeout: {delay_line}"
@@ -398,19 +418,90 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
         );
         let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
         assert!(!workdir.exists(), "timeout left {}", workdir.display());
+        let children = process_children(server_pid)
+            .unwrap_or_else(|error| panic!("inspect child processes: {error}"));
         assert!(
-            process_children(server_pid).is_empty(),
+            children.is_empty(),
             "timeout left child processes for {stage}: {:?}",
-            process_children(server_pid)
+            children
         );
+        let threads = process_threads(server_pid)
+            .unwrap_or_else(|error| panic!("inspect server threads: {error}"));
         assert!(
-            !process_threads(server_pid)
-                .iter()
-                .any(|name| name == "viewer-endpoint"),
+            !threads.iter().any(|name| name == "viewer-endpoint"),
             "timeout left endpoint thread for {stage}"
         );
         client.stop_process();
     }
+}
+
+#[test]
+#[ignore = "requires a live D-Bus session and bubblewrap environment"]
+fn first_proxy_failure_reaps_registered_proxy() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut client = RpcClient::start_with_first_proxy_failure();
+    let server_pid = client.pid();
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"proxy-rollback-e2e","version":"1"}
+        }),
+    );
+    let initialize = client.response(1, Duration::from_secs(10));
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
+    client.notify("notifications/initialized", json!({}));
+    client.send(
+        2,
+        "tools/call",
+        json!({
+            "name":"session_start",
+            "arguments":{"width":800,"height":600}
+        }),
+    );
+    let proxy_line =
+        client.wait_for_stderr("test first proxy registered pid=", Duration::from_secs(20));
+    let proxy_pid = proxy_line
+        .split_once("pid=")
+        .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| panic!("could not parse proxy PID: {proxy_line}"));
+    assert!(
+        process_alive(proxy_pid).unwrap_or_else(|error| panic!("inspect proxy: {error}")),
+        "first proxy was not alive before forced failure"
+    );
+    let start = client.response(2, Duration::from_secs(20));
+    let error_message = start["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        error_message.contains("test failure after first proxy"),
+        "startup did not report the forced proxy failure: {start}"
+    );
+    let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
+    assert!(
+        !workdir.exists(),
+        "proxy failure left {}",
+        workdir.display()
+    );
+    assert!(
+        !process_alive(proxy_pid).unwrap_or_else(|error| panic!("inspect reaped proxy: {error}")),
+        "first proxy survived forced failure"
+    );
+    let children = process_children(server_pid)
+        .unwrap_or_else(|error| panic!("inspect proxy-failure children: {error}"));
+    assert!(
+        children.is_empty(),
+        "proxy failure left children: {children:?}"
+    );
+    client.stop_process();
 }
 
 #[test]
