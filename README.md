@@ -23,6 +23,15 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 
 Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
 
+Pass `--server` when `kwin-mcp` runs on a remote host. It keeps the isolated KWin session and MCP tools available but does not start a viewer on the server host. Each session creates `/tmp/kwin-mcp-<pid>/viewer.sock`, a local Unix endpoint that returns the session directory and negotiated display size to an independently launched `kwin-viewer`.
+
+The endpoint is intentionally a Unix socket with no network listener or authentication layer. Use it only on a trusted host or through an authenticated private transport; exposing the socket or the session directory to an untrusted network is outside this server mode's security boundary.
+
+```bash
+kwin-mcp --server
+kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
+```
+
 ## Strict host-GUI isolation
 
 Normal Codex shell commands inherit the host desktop's Wayland, X11, and session-bus environment, so an accidental command can open or control a real host window. Launch Codex through `kwin-mcp-strict` to remove those channels from Codex and its shell tools while forwarding the original values only to the configured `kwin-mcp` stdio server:
