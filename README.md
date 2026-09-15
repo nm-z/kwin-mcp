@@ -35,7 +35,7 @@ target/release/kwin-mcp-strict --
 target/release/kwin-mcp-strict -- --model gpt-5.6-terra
 ```
 
-The launcher uses Codex's one-run `--config` overrides for `mcp_servers.<id>.env`, so it does not rewrite `~/.codex/config.toml`. Use `--mcp-server NAME` if the configured server has a different name, and `--codex PATH` if `codex` is not on `PATH`. The KWin MCP process retains the host-session values needed by its viewer, clipboard bridge, and wallet integration; apps continue to receive the isolated session's replacements.
+The launcher uses Codex's one-run `--config` overrides for `mcp_servers.<id>.env`, so it does not rewrite `~/.codex/config.toml`. Use `--mcp-server NAME` if the configured server has a different name, and `--codex PATH` if `codex` is not on `PATH`. The KWin MCP process retains the host-session values needed by its viewer and clipboard bridge; apps continue to receive the isolated session's replacements.
 
 Strict mode is fail-closed for inherited values and profile-based shell reinjection. Restoring normal host-desktop access requires an explicit opt-out from a host terminal:
 
@@ -44,6 +44,10 @@ target/release/kwin-mcp-strict --allow-host-gui --
 ```
 
 This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
+
+## KWallet safety
+
+`session_start` does not open, enumerate, or snapshot the host KWallet. Host wallet state stays outside the isolated overlay, and the server does not retain a host KWallet handle across sessions. The D-Bus compatibility rules are for application-level service discovery only; they are not a host-wallet snapshot path.
 
 ## Session Architecture
 
