@@ -897,7 +897,6 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
-    clipboard_children: Vec<std::process::Child>,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -1073,16 +1072,6 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
-    // Reap the clipboard watchers and any wl-copy daemons they left holding a
-    // selection. They run in their own process group, so a negative-PID SIGTERM
-    // takes down the whole group.
-    for mut child in std::mem::take(&mut sess.clipboard_children) {
-        if let Ok(neg) = i32::try_from(child.id()).map(|p| -p) {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(mut viewer) = sess.viewer_child.take() {
@@ -1159,74 +1148,6 @@ fn detect_browsers() -> Vec<String> {
         })
         .map(|name| (*name).to_owned())
         .collect()
-}
-
-/// Two-way clipboard bridge between the host compositor and the container's
-/// nested KWin, using host-side `wl-clipboard` (`wl-paste --watch` + `wl-copy`).
-/// Text only — that's what issue #29 asks for and it sidesteps binary/MIME edge
-/// cases. Each direction runs a watcher that fires on selection change and mirrors
-/// the new text to the other side, but only when the other side differs — that
-/// dedup is what stops the two watchers from ping-ponging an identical value
-/// forever. Non-fatal: if wl-clipboard is missing or a watcher won't spawn, the
-/// agent's tools still work; there's just no clipboard sync. Watchers run in their
-/// own process group so teardown can reap any `wl-copy` daemons they left holding
-/// a selection.
-fn spawn_clipboard_bridge(
-    host_runtime: &Path,
-    host_display: &std::ffi::OsStr,
-    container_xdg_dir: &Path,
-) -> Vec<std::process::Child> {
-    use std::os::unix::process::CommandExt;
-    if which_on_path("wl-paste").is_none() || which_on_path("wl-copy").is_none() {
-        eprintln!("clipboard bridge: wl-clipboard not found on PATH, skipping");
-        return Vec::new();
-    }
-    let host_runtime = host_runtime.display().to_string();
-    let host_display = host_display.to_string_lossy().to_string();
-    let container_xdg = container_xdg_dir.display().to_string();
-    // (watcher-side env, sink-side env) for each direction.
-    let host_env = [("XDG_RUNTIME_DIR", host_runtime.as_str()), ("WAYLAND_DISPLAY", host_display.as_str())];
-    let container_env = [("XDG_RUNTIME_DIR", container_xdg.as_str()), ("WAYLAND_DISPLAY", "wayland-0")];
-    let directions = [
-        ("host->container", host_env, container_env),
-        ("container->host", container_env, host_env),
-    ];
-    let mut children = Vec::new();
-    for (label, watch_env, sink_env) in directions {
-        let (sink_rt, sink_disp) = (sink_env[0].1, sink_env[1].1);
-        // `wl-paste -w` runs this shell on each change, feeding the new selection on
-        // stdin. Copy it to the sink only if the sink's current text differs.
-        let script = format!(
-            "v=$(cat); [ \"$v\" = \"$(XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-paste -n -t text 2>/dev/null)\" ] \
-             || printf %s \"$v\" | XDG_RUNTIME_DIR='{sink_rt}' WAYLAND_DISPLAY='{sink_disp}' wl-copy -t text/plain"
-        );
-        let mut cmd = std::process::Command::new("wl-paste");
-        cmd.args(["-t", "text", "-w", "sh", "-c", &script]);
-        cmd.env("XDG_RUNTIME_DIR", watch_env[0].1);
-        cmd.env("WAYLAND_DISPLAY", watch_env[1].1);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.process_group(0);
-        terminate_with_parent(&mut cmd);
-        match cmd.spawn() {
-            Ok(child) => {
-                eprintln!("clipboard bridge: {label} watcher pid={}", child.id());
-                children.push(child);
-            }
-            Err(e) => eprintln!("clipboard bridge: {label} spawn failed: {e}"),
-        }
-    }
-    children
-}
-
-/// Minimal PATH lookup for an executable name (no external `which`).
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(name);
-        std::fs::metadata(&candidate).is_ok().then_some(candidate)
-    })
 }
 
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
@@ -2348,15 +2269,6 @@ impl KwinMcp {
             eprintln!("session_start: viewer disabled (--no-viewer)");
             None
         };
-        // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
-        // the same host Wayland resolution as the viewer.
-        let clipboard_children = match host_wayland().await {
-            Ok((runtime, display)) => spawn_clipboard_bridge(&runtime, &display, &host_xdg_dir),
-            Err(e) => {
-                eprintln!("session_start: clipboard bridge skipped (host Wayland: {e:#})");
-                Vec::new()
-            }
-        };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
@@ -2377,7 +2289,6 @@ impl KwinMcp {
             cdp_browser: None,
             service_proxy_children: vec![system_proxy_child, service_proxy_child],
             viewer_child,
-            clipboard_children,
             overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
