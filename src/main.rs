@@ -2123,6 +2123,9 @@ impl KwinMcp {
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
         cmd.args([
             "--dev", "/dev",
+            // AppImages need the FUSE device to mount their embedded filesystem.
+            // `--dev-bind-try` keeps sessions portable to hosts without FUSE.
+            "--dev-bind-try", "/dev/fuse", "/dev/fuse",
             "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
