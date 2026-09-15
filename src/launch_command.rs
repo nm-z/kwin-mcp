@@ -179,8 +179,14 @@ fn skip_leading_redirections(words: &[Token], mut index: usize) -> usize {
         {
             index += 1;
         }
-        let Some(operator) = words.get(index) else { break };
-        if !is_redirection_operator(operator) || words.get(index + 1).is_none_or(|target| target.kind != TokenKind::Word) {
+        let Some(operator) = words.get(index) else {
+            break;
+        };
+        if !is_redirection_operator(operator)
+            || words
+                .get(index + 1)
+                .is_none_or(|target| target.kind != TokenKind::Word)
+        {
             break;
         }
         index += 2;
@@ -604,8 +610,9 @@ mod tests {
 
     #[test]
     fn an_explicit_switch_on_the_browser_is_respected() {
-        let found =
-            browser("chromium --password-store=basic --ozone-platform=x11 --force-renderer-accessibility https://example.com");
+        let found = browser(
+            "chromium --password-store=basic --ozone-platform=x11 --force-renderer-accessibility https://example.com",
+        );
         assert!(found.has_password_store);
         assert!(found.has_ozone_platform);
         assert!(found.has_renderer_accessibility);
@@ -613,7 +620,7 @@ mod tests {
 
     #[test]
     fn quoted_and_escaped_substitution_delimiters_are_not_structure() {
-        let quoted = browser(r#"chromium "$(printf '%s' 'https://example.com/a(b')"#);
+        let quoted = browser("chromium \"$(printf '%s' 'https://example.com/a(b')\"");
         assert_eq!(quoted.program, "chromium");
         let escaped = browser(r#"chromium $(printf '%s' https://example.com/a\(b)"#);
         assert_eq!(escaped.program, "chromium");

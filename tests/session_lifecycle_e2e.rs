@@ -41,7 +41,13 @@ impl RpcClient {
                 let _ = stderr_tx.send(line);
             }
         });
-        Self { child, stdin, responses, stderr: stderr_rx, pending: HashMap::new() }
+        Self {
+            child,
+            stdin,
+            responses,
+            stderr: stderr_rx,
+            pending: HashMap::new(),
+        }
     }
 
     fn send(&mut self, id: u64, method: &str, params: Value) {
@@ -63,7 +69,10 @@ impl RpcClient {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let message = self.responses.recv_timeout(remaining).expect("JSON-RPC response");
+            let message = self
+                .responses
+                .recv_timeout(remaining)
+                .expect("JSON-RPC response");
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 return message;
             }
@@ -77,7 +86,10 @@ impl RpcClient {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let line = self.stderr.recv_timeout(remaining).expect("kwin-mcp startup log");
+            let line = self
+                .stderr
+                .recv_timeout(remaining)
+                .expect("kwin-mcp startup log");
             if line.contains(text) {
                 return;
             }
@@ -92,7 +104,11 @@ impl RpcClient {
 }
 
 fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> Value {
-    client.send(id, "tools/call", json!({"name":name, "arguments":arguments}));
+    client.send(
+        id,
+        "tools/call",
+        json!({"name":name, "arguments":arguments}),
+    );
     client.response(id, Duration::from_secs(45))
 }
 
@@ -106,37 +122,78 @@ fn workdir(response: &Value) -> PathBuf {
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
-    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"), "set KWIN_MCP_E2E=1 to run");
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
 
     let mut client = RpcClient::start();
-    client.send(1, "initialize", json!({
-        "protocolVersion":"2025-06-18",
-        "capabilities":{},
-        "clientInfo":{"name":"session-lifecycle-e2e","version":"1"}
-    }));
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"session-lifecycle-e2e","version":"1"}
+        }),
+    );
     let initialize = client.response(1, Duration::from_secs(10));
-    assert!(initialize["result"].is_object(), "initialize failed: {initialize}");
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
     client.notify("notifications/initialized", json!({}));
 
-    client.send(2, "tools/call", json!({
-        "name":"session_start",
-        "arguments":{"width":800,"height":600}
-    }));
+    client.send(
+        2,
+        "tools/call",
+        json!({
+            "name":"session_start",
+            "arguments":{"width":800,"height":600}
+        }),
+    );
     client.wait_for_stderr("host_xdg_dir ready", Duration::from_secs(20));
-    client.send(3, "tools/call", json!({"name":"session_stop","arguments":{}}));
+    client.send(
+        3,
+        "tools/call",
+        json!({"name":"session_stop","arguments":{}}),
+    );
 
     let stop = client.response(3, Duration::from_secs(45));
     let start = client.response(2, Duration::from_secs(45));
-    assert!(!stop["result"]["isError"].as_bool().unwrap_or(false), "concurrent stop failed: {stop}");
-    assert_ne!(stop["result"]["structuredContent"]["status"], "none", "stop raced ahead of startup: {stop}");
+    assert!(
+        !stop["result"]["isError"].as_bool().unwrap_or(false),
+        "concurrent stop failed: {stop}"
+    );
+    assert_ne!(
+        stop["result"]["structuredContent"]["status"], "none",
+        "stop raced ahead of startup: {stop}"
+    );
     let first_workdir = workdir(&start);
-    assert!(!first_workdir.exists(), "concurrent stop left {}", first_workdir.display());
+    assert!(
+        !first_workdir.exists(),
+        "concurrent stop left {}",
+        first_workdir.display()
+    );
 
-    let second_start = call_tool(&mut client, 4, "session_start", json!({"width":800,"height":600}));
+    let second_start = call_tool(
+        &mut client,
+        4,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
     let second_workdir = workdir(&second_start);
     let second_stop = call_tool(&mut client, 5, "session_stop", json!({}));
-    assert!(!second_stop["result"]["isError"].as_bool().unwrap_or(false), "restart stop failed: {second_stop}");
-    assert!(!second_workdir.exists(), "restart stop left {}", second_workdir.display());
+    assert!(
+        !second_stop["result"]["isError"].as_bool().unwrap_or(false),
+        "restart stop failed: {second_stop}"
+    );
+    assert!(
+        !second_workdir.exists(),
+        "restart stop left {}",
+        second_workdir.display()
+    );
 
     client.stop_process();
 }
