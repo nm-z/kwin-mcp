@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct RpcClient {
     child: Child,
@@ -17,8 +17,46 @@ struct RpcClient {
 
 impl RpcClient {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
+        for directory in [
+            home.join(".config"),
+            home.join(".local/share"),
+            home.join(".cache"),
+            home.join(".local/state"),
+            home.join(".kde"),
+        ] {
+            std::fs::create_dir_all(directory).expect("create private test HOME");
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
+        command
             .args(["--no-viewer", "--autoclean"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("KDEHOME", home.join(".kde"))
+            .env(
+                "XDG_RUNTIME_DIR",
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
+            )
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+                    .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus")),
+            )
+            .env(
+                "WAYLAND_DISPLAY",
+                std::env::var_os("WAYLAND_DISPLAY")
+                    .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
+            );
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -97,7 +135,23 @@ impl RpcClient {
     }
 
     fn stop_process(mut self) {
-        drop(self.stdin);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for RpcClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let request = json!({
+                "jsonrpc":"2.0",
+                "id":9999,
+                "method":"tools/call",
+                "params":{"name":"session_stop","arguments":{}}
+            });
+            let _ = writeln!(self.stdin, "{request}");
+            let _ = self.stdin.flush();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -195,5 +249,126 @@ fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
         second_workdir.display()
     );
 
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, browsers, input devices, and a live GPU session"]
+fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut client = RpcClient::start();
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"launch-app-e2e","version":"1"}
+        }),
+    );
+    let initialize = client.response(1, Duration::from_secs(10));
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
+    client.notify("notifications/initialized", json!({}));
+
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":1024,"height":768}),
+    );
+    let workdir = workdir(&started);
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"google-chrome-stable --no-first-run https://example.com && echo compound-done"}),
+    );
+    let window = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .unwrap_or("error");
+    assert_ne!(
+        window, "timeout",
+        "Chrome did not create a managed window: {launched}"
+    );
+
+    let tree_deadline = Instant::now() + Duration::from_secs(20);
+    let mut next_id = 4;
+    let _tree = loop {
+        let tree = call_tool(
+            &mut client,
+            next_id,
+            "accessibility_tree",
+            json!({"max_depth":16}),
+        );
+        next_id += 1;
+        let tree_text = serde_json::to_string(&tree)
+            .expect("serialize accessibility tree")
+            .to_lowercase();
+        if tree_text.contains("document web") && tree_text.contains("example domain") {
+            break tree;
+        }
+        assert!(
+            Instant::now() < tree_deadline,
+            "Chrome accessibility tree did not expose loaded page content: {tree}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
+
+    let argv_path = workdir.join("browser-argv.txt");
+    let probe = format!(
+        "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf '%s\\n' \"$cmd\" > '{}'; break;; esac; done; sleep 2",
+        argv_path.display()
+    );
+    let escaped_probe = probe.replace('\'', "'\\''");
+    let probe_result = call_tool(
+        &mut client,
+        next_id,
+        "launch_app",
+        json!({"command":format!("konsole --hold -e bash -lc '{}'", escaped_probe)}),
+    );
+    next_id += 1;
+    assert!(
+        !probe_result["result"]["isError"].as_bool().unwrap_or(false),
+        "argv probe failed: {probe_result}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let argv = loop {
+        if let Ok(value) = std::fs::read_to_string(&argv_path) {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "browser argv probe did not produce {}",
+            argv_path.display()
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        argv.contains("--ozone-platform=wayland"),
+        "Chrome argv lacks Wayland switch: {argv}"
+    );
+    assert!(
+        argv.contains("--password-store=kwallet6"),
+        "Chrome argv lacks KWallet switch: {argv}"
+    );
+    assert!(
+        argv.contains("--force-renderer-accessibility"),
+        "Chrome argv lacks renderer accessibility switch: {argv}"
+    );
+
+    let stopped = call_tool(&mut client, next_id, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "session_stop failed: {stopped}"
+    );
+    assert!(!workdir.exists(), "session_stop left {}", workdir.display());
     client.stop_process();
 }
