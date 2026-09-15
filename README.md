@@ -36,6 +36,14 @@ Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. C
 | Idle | `session_stop` | Idle | `status=stopped` or `status=none`, as without the flag |
 
 Before deleting, the server grants owner `rwx` to directories inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block the delete. The repair walks open descriptors with `O_PATH | O_NOFOLLOW` and chmods only what `fstat` proves is a directory, so symlinks are never followed or modified and nothing outside the validated workdir is touched, even while the tree is being rewritten concurrently. If a delete still fails, for example because a root-owned file sits inside, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag nothing is owned, and `session_stop` and server exit retain the existing workdir behavior.
+Pass `--server` to keep the isolated KWin session and MCP tools available without starting the local preview viewer. Each session creates `/tmp/kwin-mcp-<pid>/viewer.sock`, a local Unix endpoint that returns the session directory and negotiated display size to a separately launched `kwin-viewer` on the same host.
+
+The endpoint is local metadata discovery, not a cross-machine display or input transport. The viewer still opens the session's `wayland-0` and `pipewire-0` sockets from its own filesystem, so copying or forwarding `viewer.sock` to another machine does not make the viewer remote. Do not treat `--server` as a remote-session security boundary.
+
+```bash
+kwin-mcp --server
+kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
+```
 
 ## Strict host-GUI isolation
 
