@@ -82,6 +82,11 @@ const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
 
+// KWin can close a capture pipe before the advertised frame is complete while
+// several isolated sessions capture concurrently. Retry only that short-read
+// boundary instead of retrying arbitrary D-Bus or compositor failures.
+const SCREENSHOT_CAPTURE_ATTEMPTS: u32 = 3;
+
 // launch_app: CDP connect retry.
 const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
@@ -2538,32 +2543,54 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
-        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-        let mut opts = std::collections::HashMap::new();
-        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
-        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
-        opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
-        // CaptureScreen composites all surfaces including popups (xdg_popup menus);
-        // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
-        let meta = proxy
-            .capture_screen("Virtual-0", opts, pipe_fd)
-            .await
-            .map_err(KwinError::from)?;
         let _ = &win_id;
-        let get_u32 = |k: &str| -> Result<u32, McpError> {
-            let val = meta
-                .get(k)
-                .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
-            let n: u32 = val.try_into().map_err(KwinError::from)?;
-            Ok(n)
-        };
-        let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
-        let reader_file = std::fs::File::from(read_fd);
-        let total = usize::try_from(stride * height).map_err(KwinError::from)?;
-        let mut pixels = vec![0u8; total];
-        std::io::Read::read_exact(&mut std::io::BufReader::new(reader_file), &mut pixels)
-            .map_err(KwinError::from)?;
+        let mut capture = None;
+        let mut last_size = None;
+        for attempt in 1..=SCREENSHOT_CAPTURE_ATTEMPTS {
+            let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
+            let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+            let mut opts = std::collections::HashMap::new();
+            opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+            opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+            opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
+            // CaptureScreen composites all surfaces including popups (xdg_popup menus);
+            // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
+            let meta = proxy
+                .capture_screen("Virtual-0", opts, pipe_fd)
+                .await
+                .map_err(KwinError::from)?;
+            let get_u32 = |k: &str| -> Result<u32, McpError> {
+                let val = meta
+                    .get(k)
+                    .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
+                let n: u32 = val.try_into().map_err(KwinError::from)?;
+                Ok(n)
+            };
+            let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
+            let reader_file = std::fs::File::from(read_fd);
+            let expected = usize::try_from(stride * height).map_err(KwinError::from)?;
+            let mut pixels = Vec::with_capacity(expected);
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(reader_file), &mut pixels)
+                .map_err(KwinError::from)?;
+            let received = pixels.len();
+            if received == expected {
+                capture = Some((width, height, stride, pixels));
+                break;
+            }
+            last_size = Some((expected, received));
+            eprintln!(
+                "screenshot: incomplete pixel buffer on attempt {attempt}/{SCREENSHOT_CAPTURE_ATTEMPTS}: expected {expected} bytes, received {received}"
+            );
+        }
+        let (width, height, stride, pixels) = capture.ok_or_else(|| {
+            let (expected, received) = last_size.unwrap_or((0, 0));
+            McpError::internal_error(
+                format!(
+                    "screenshot: incomplete pixel buffer after {SCREENSHOT_CAPTURE_ATTEMPTS} attempts (expected {expected} bytes, received {received})"
+                ),
+                None,
+            )
+        })?;
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
