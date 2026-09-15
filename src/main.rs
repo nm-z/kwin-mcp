@@ -902,6 +902,8 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    viewer_socket: PathBuf,
+    viewer_endpoint: tokio::task::JoinHandle<()>,
     clipboard_children: Vec<std::process::Child>,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
@@ -921,6 +923,7 @@ struct DisplayConfig {
     height: u32,
     locked: bool,
     viewer_enabled: bool,
+    server: bool,
 }
 
 #[derive(Clone)]
@@ -1052,6 +1055,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "bridge-ready",
         "screenshot.png",
         "viewer.log",
+        "viewer.sock",
     ];
     const STALE_DIRS: &[&str] = &[
         "at-spi",
@@ -1094,6 +1098,8 @@ fn teardown(mut sess: Session) {
         let _ = viewer.kill();
         let _ = viewer.wait();
     }
+    sess.viewer_endpoint.abort();
+    let _ = std::fs::remove_file(&sess.viewer_socket);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -1164,6 +1170,29 @@ fn detect_browsers() -> Vec<String> {
         })
         .map(|name| (*name).to_owned())
         .collect()
+}
+
+fn start_viewer_endpoint(
+    host_xdg_dir: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(PathBuf, tokio::task::JoinHandle<()>), KwinError> {
+    use tokio::io::AsyncWriteExt;
+
+    let socket_path = host_xdg_dir.join("viewer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).map_err(KwinError::from)?;
+    let payload = serde_json::json!({
+        "session_dir": host_xdg_dir,
+        "width": width,
+        "height": height,
+    })
+    .to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream.write_all(payload.as_bytes()).await;
+        }
+    });
+    Ok((socket_path, task))
 }
 
 /// Two-way clipboard bridge between the host compositor and the container's
@@ -1279,7 +1308,8 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 /// if anything goes wrong the agent's MCP tools still work; the user just
 /// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
 /// crashes and input-forwarding diagnostics survive past the spawn.
-async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Option<std::process::Child> {
+async fn spawn_viewer(viewer_socket: &Path) -> Option<std::process::Child> {
+    let host_xdg_dir = viewer_socket.parent()?;
     let log_path = host_xdg_dir.join("viewer.log");
     let mut log_file = std::fs::File::create(&log_path).ok()?;
     let bin = resolve_viewer_binary().or_else(|| { let _ = std::io::Write::write_all(&mut log_file, b"kwin-viewer: binary not found\n"); None })?;
@@ -1287,9 +1317,7 @@ async fn spawn_viewer(host_xdg_dir: &std::path::Path, width: u32, height: u32) -
             let _ = std::io::Write::write_all(&mut log_file, format!("kwin-viewer: host Wayland resolution failed: {error:#}\n").as_bytes());
         }).ok()?;
     let mut command = std::process::Command::new(&bin);
-    command.arg(host_xdg_dir)
-        .arg(width.to_string())
-        .arg(height.to_string())
+    command.arg(viewer_socket)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("WAYLAND_DISPLAY", display)
         .stdout(std::process::Stdio::null())
@@ -2353,10 +2381,11 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let viewer_child = if self.display.viewer_enabled {
-            spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
+        let (viewer_socket, viewer_endpoint) = start_viewer_endpoint(&host_xdg_dir, screen_w, screen_h)?;
+        let viewer_child = if self.display.viewer_enabled && !self.display.server {
+            spawn_viewer(&viewer_socket).await
         } else {
-            eprintln!("session_start: viewer disabled (--no-viewer)");
+            eprintln!("session_start: viewer disabled (--no-viewer/--server)");
             None
         };
         // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
@@ -2388,6 +2417,8 @@ impl KwinMcp {
             cdp_browser: None,
             service_proxy_children: vec![system_proxy_child, service_proxy_child],
             viewer_child,
+            viewer_socket,
+            viewer_endpoint,
             clipboard_children,
             overlay_work_paths,
             _socket_links: socket_links,
@@ -3351,6 +3382,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
         viewer_enabled: true,
+        server: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3359,9 +3391,10 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
             "--no-viewer" => cfg.viewer_enabled = false,
+            "--server" => cfg.server = true,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--server]"
                 ))
             }
         }
@@ -3390,7 +3423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         display.height,
         if display.locked { " (locked, --no-override)" } else { "" },
         if display.viewer_enabled {
-            "enabled"
+            if display.server { "disabled (--server)" } else { "enabled" }
         } else {
             "disabled (--no-viewer)"
         }
