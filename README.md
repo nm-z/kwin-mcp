@@ -49,7 +49,7 @@ target/release/kwin-mcp-strict --
 target/release/kwin-mcp-strict -- --model gpt-5.6-terra
 ```
 
-The launcher uses Codex's one-run `--config` overrides for `mcp_servers.<id>.env`, so it does not rewrite `~/.codex/config.toml`. Use `--mcp-server NAME` if the configured server has a different name, and `--codex PATH` if `codex` is not on `PATH`. The KWin MCP process retains the host-session values needed by its viewer, clipboard bridge, and wallet integration; apps continue to receive the isolated session's replacements.
+The launcher uses Codex's one-run `--config` overrides for `mcp_servers.<id>.env`, so it does not rewrite `~/.codex/config.toml`. Use `--mcp-server NAME` if the configured server has a different name, and `--codex PATH` if `codex` is not on `PATH`. The KWin MCP process retains the host-session values needed by its viewer; apps continue to receive the isolated session's replacements.
 
 Strict mode is fail-closed for inherited values and profile-based shell reinjection. Restoring normal host-desktop access requires an explicit opt-out from a host terminal:
 
@@ -62,6 +62,10 @@ This guards against accidental host GUI control; it is not a security sandbox fo
 ## Clipboard isolation
 
 KWin MCP does not bridge clipboard contents between the host desktop and the isolated session. Each compositor keeps its own clipboard and primary selection; copying in one session does not overwrite or seed the other session.
+
+## KWallet safety
+
+`session_start` does not snapshot the host wallet or retain a server-owned wallet handle. Applications may access permitted host KWallet methods through the filtered D-Bus proxy.
 
 ## Session Architecture
 

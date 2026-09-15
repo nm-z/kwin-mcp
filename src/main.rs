@@ -2231,6 +2231,9 @@ impl KwinMcp {
             &host_session_bus,
             &service_proxy_socket,
             &[
+                // The server never opens, enumerates, or snapshots the host
+                // KWallet. These compatibility rules must not become a host
+                // wallet read path during session_start.
                 "--see=org.kde.kwalletd6",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Introspectable.Introspect@/*",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.GetMachineId@/*",
