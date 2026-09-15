@@ -904,8 +904,7 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
-    viewer_socket: PathBuf,
-    viewer_endpoint: tokio::task::JoinHandle<()>,
+    viewer_endpoint: ViewerEndpoint,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -926,6 +925,183 @@ struct DisplayConfig {
     viewer_enabled: bool,
     autoclean: bool,
     server: bool,
+}
+
+/// Resources created while session_start is still unpublished. The guard owns
+/// them until the Session takes them, so cancelling the startup future cannot
+/// detach a process or task that has no reachable cleanup path.
+struct StartupResources {
+    bwrap_child: Option<std::process::Child>,
+    bwrap_stdin: Option<std::process::ChildStdin>,
+    service_proxy_children: Vec<std::process::Child>,
+}
+
+impl StartupResources {
+    fn new(service_proxy_children: Vec<std::process::Child>) -> Self {
+        Self {
+            bwrap_child: None,
+            bwrap_stdin: None,
+            service_proxy_children,
+        }
+    }
+
+    fn cleanup(&mut self) {
+        drop(self.bwrap_stdin.take());
+        if let Some(mut bwrap) = self.bwrap_child.take() {
+            let pid = bwrap.id();
+            if let Ok(negative_pid) = i32::try_from(pid).map(|pid| -pid) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(negative_pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            let _ = bwrap.wait();
+        }
+        for mut proxy in self.service_proxy_children.drain(..) {
+            let _ = proxy.kill();
+            let _ = proxy.wait();
+        }
+    }
+
+    fn into_parts(mut self) -> (std::process::Child, std::process::ChildStdin, Vec<std::process::Child>) {
+        let Some(bwrap_child) = self.bwrap_child.take() else {
+            panic!("startup bwrap child missing at Session publication");
+        };
+        let Some(bwrap_stdin) = self.bwrap_stdin.take() else {
+            panic!("startup bwrap stdin missing at Session publication");
+        };
+        (
+            bwrap_child,
+            bwrap_stdin,
+            std::mem::take(&mut self.service_proxy_children),
+        )
+    }
+}
+
+impl Drop for StartupResources {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// A same-host metadata endpoint owned by the running Session. A dedicated
+/// nonblocking thread makes its shutdown synchronous, so a cancelled startup
+/// can stop and join it before the workdir is removed.
+struct ViewerEndpoint {
+    socket: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ViewerEndpoint {
+    fn start(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Result<Self, KwinError> {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let socket = host_xdg_dir.join("viewer.sock");
+        let listener = UnixListener::bind(&socket).map_err(KwinError::from)?;
+        listener.set_nonblocking(true).map_err(KwinError::from)?;
+        let payload = serde_json::json!({
+            "session_dir": host_xdg_dir,
+            "width": width,
+            "height": height,
+        })
+        .to_string();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let thread = match std::thread::Builder::new()
+            .name("viewer-endpoint".to_owned())
+            .spawn(move || {
+                while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.write_all(payload.as_bytes());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = std::fs::remove_file(&socket);
+                return Err(KwinError::from(error));
+            }
+        };
+        Ok(Self { socket, stop, thread: Some(thread) })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.socket
+    }
+}
+
+impl Drop for ViewerEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Viewer resources stay owned by startup until the Session is published.
+/// Dropping this value synchronously stops the endpoint thread and viewer
+/// process, covering timeout and error paths between endpoint creation and
+/// Session publication.
+struct StartupViewerResources {
+    endpoint: Option<ViewerEndpoint>,
+    viewer: Option<std::process::Child>,
+}
+
+impl StartupViewerResources {
+    fn new(endpoint: ViewerEndpoint) -> Self {
+        Self { endpoint: Some(endpoint), viewer: None }
+    }
+
+    fn endpoint_path(&self) -> Option<&std::path::Path> {
+        self.endpoint.as_ref().map(ViewerEndpoint::path)
+    }
+
+    fn into_parts(mut self) -> (ViewerEndpoint, Option<std::process::Child>) {
+        let Some(endpoint) = self.endpoint.take() else {
+            panic!("startup viewer endpoint missing at Session publication");
+        };
+        (endpoint, self.viewer.take())
+    }
+}
+
+impl Drop for StartupViewerResources {
+    fn drop(&mut self) {
+        if let Some(mut viewer) = self.viewer.take() {
+            let _ = viewer.kill();
+            let _ = viewer.wait();
+        }
+        let _ = self.endpoint.take();
+    }
+}
+
+/// Debug-only pause used by the production-stdio cancellation regression. It
+/// creates a real cancellation point after a selected startup resource exists,
+/// allowing the test to prove the owning guards clean it before workdir removal.
+async fn test_startup_delay(stage: &str) {
+    if !cfg!(debug_assertions)
+        || std::env::var("KWIN_MCP_TEST_STARTUP_DELAY_STAGE").ok().as_deref() != Some(stage)
+    {
+        return;
+    }
+    let millis = std::env::var("KWIN_MCP_TEST_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    if millis == 0 {
+        return;
+    }
+    eprintln!("session_start: test delay at {stage} for {millis}ms");
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
 #[derive(Clone)]
@@ -1309,8 +1485,7 @@ fn teardown(mut sess: Session) {
         let _ = viewer.kill();
         let _ = viewer.wait();
     }
-    sess.viewer_endpoint.abort();
-    let _ = std::fs::remove_file(&sess.viewer_socket);
+    drop(sess.viewer_endpoint);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -1387,23 +1562,8 @@ fn start_viewer_endpoint(
     host_xdg_dir: &Path,
     width: u32,
     height: u32,
-) -> Result<(PathBuf, tokio::task::JoinHandle<()>), KwinError> {
-    use tokio::io::AsyncWriteExt;
-
-    let socket_path = host_xdg_dir.join("viewer.sock");
-    let listener = tokio::net::UnixListener::bind(&socket_path).map_err(KwinError::from)?;
-    let payload = serde_json::json!({
-        "session_dir": host_xdg_dir,
-        "width": width,
-        "height": height,
-    })
-    .to_string();
-    let task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let _ = stream.write_all(payload.as_bytes()).await;
-        }
-    });
-    Ok((socket_path, task))
+) -> Result<ViewerEndpoint, KwinError> {
+    ViewerEndpoint::start(host_xdg_dir, width, height)
 }
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     use std::os::unix::fs::FileTypeExt;
@@ -2350,33 +2510,31 @@ impl KwinMcp {
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
         eprintln!("session_start: spawning bwrap");
-        let mut bwrap_child = cmd.spawn().map_err(|e| ver_err(e.to_string()))?;
-        eprintln!("session_start: bwrap spawned pid={:?}", bwrap_child.id());
-        let bwrap_stdin = match bwrap_child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = bwrap_child.kill();
-                let _ = bwrap_child.wait();
-                return Err(ver_err("bwrap stdin not available".to_owned()));
-            }
-        };
-        let cleanup_err = |message: String,
-                           mut bwrap_child: std::process::Child,
-                           bwrap_stdin: std::process::ChildStdin,
-                           service_proxy_children: Vec<std::process::Child>| {
+        let cleanup_err = |message: String, startup: &mut StartupResources| {
             eprintln!("session_start: startup error: {message}");
-            drop(bwrap_stdin);
-            let pid = bwrap_child.id();
-            if let Ok(neg) = i32::try_from(pid).map(|p| -p) {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
-            }
-            let _ = bwrap_child.wait();
-            for mut proxy in service_proxy_children {
-                let _ = proxy.kill();
-                let _ = proxy.wait();
-            }
+            startup.cleanup();
             Err(ver_err(message))
         };
+        // Take ownership before spawning bwrap. If the spawn or any later
+        // startup await is cancelled, Drop still terminates and reaps every
+        // process created by this attempt.
+        let mut startup = StartupResources::new(vec![system_proxy_child, service_proxy_child]);
+        let bwrap_child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => return cleanup_err(error.to_string(), &mut startup),
+        };
+        startup.bwrap_child = Some(bwrap_child);
+        let bwrap_pid = startup.bwrap_child.as_ref().map(std::process::Child::id).unwrap_or_default();
+        eprintln!("session_start: bwrap spawned pid={bwrap_pid:?}");
+        let bwrap_stdin = startup
+            .bwrap_child
+            .as_mut()
+            .and_then(|child| child.stdin.take());
+        match bwrap_stdin {
+            Some(stdin) => startup.bwrap_stdin = Some(stdin),
+            None => return cleanup_err("bwrap stdin not available".to_owned(), &mut startup),
+        }
+        test_startup_delay("after-bwrap").await;
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
         let dbus_ready_path = host_xdg_dir.join("dbus-ready");
         eprintln!("session_start: wait for dbus-ready at {}", dbus_ready_path.display());
@@ -2385,7 +2543,7 @@ impl KwinMcp {
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(e, &mut startup);
         }
         eprintln!("session_start: dbus-ready");
         let bus_addr = format!("unix:path={xdg_dir_str}/bus");
@@ -2397,11 +2555,11 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+                Err(e) => return cleanup_err(e, &mut startup),
             };
         // Claim org.kde.KWin on proxy_conn (before KWin starts, so we get it first)
         if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
-            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(format!("claim org.kde.KWin: {e}"), &mut startup);
         }
         eprintln!("session_start: proxy_conn owns org.kde.KWin");
 
@@ -2419,7 +2577,7 @@ impl KwinMcp {
         let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
         let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
         if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
-            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(format!("register input devices: {e}"), &mut startup);
         }
         eprintln!("session_start: input devices registered on proxy_conn");
 
@@ -2433,7 +2591,7 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+                Err(e) => return cleanup_err(e, &mut startup),
             };
 
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
@@ -2444,7 +2602,7 @@ impl KwinMcp {
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(e, &mut startup);
         }
         eprintln!("session_start: wayland-0 ready");
 
@@ -2493,7 +2651,7 @@ impl KwinMcp {
                 break;
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+                return cleanup_err("could not discover KWin unique name".to_owned(), &mut startup);
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
@@ -2506,18 +2664,18 @@ impl KwinMcp {
             .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
         let eis_proxy = match eis_builder.build().await {
             Ok(p) => p,
-            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), &mut startup),
         };
         let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await {
             Ok(r) => r,
-            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), &mut startup),
         };
         eprintln!("session_start: EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
         let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
-            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
-            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), &mut startup),
+            Err(e) => return cleanup_err(format!("EIS task: {e}"), &mut startup),
         };
         eprintln!("session_start: EIS ready");
 
@@ -2548,18 +2706,26 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let (viewer_socket, viewer_endpoint) = start_viewer_endpoint(&host_xdg_dir, screen_w, screen_h)?;
+        let endpoint = start_viewer_endpoint(&host_xdg_dir, screen_w, screen_h)?;
+        let mut viewer_resources = StartupViewerResources::new(endpoint);
         let viewer_child = if self.display.viewer_enabled && !self.display.server {
-            spawn_viewer(&viewer_socket).await
+            match viewer_resources.endpoint_path() {
+                Some(path) => spawn_viewer(path).await,
+                None => None,
+            }
         } else {
             eprintln!("session_start: viewer disabled (--no-viewer/--server)");
             None
         };
+        viewer_resources.viewer = viewer_child;
+        test_startup_delay("after-viewer-endpoint").await;
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
         let mut guard = self.session.lock().await;
+        let (viewer_endpoint, viewer_child) = viewer_resources.into_parts();
+        let (bwrap_child, bwrap_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
             kwin_conn,
             _proxy_conn: proxy_conn,
@@ -2573,9 +2739,8 @@ impl KwinMcp {
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
-            service_proxy_children: vec![system_proxy_child, service_proxy_child],
+            service_proxy_children,
             viewer_child,
-            viewer_socket,
             viewer_endpoint,
             overlay_work_paths,
             _socket_links: socket_links,

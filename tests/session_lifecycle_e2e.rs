@@ -19,6 +19,10 @@ struct RpcClient {
 
 impl RpcClient {
     fn start() -> Self {
+        Self::start_with_options(None, false)
+    }
+
+    fn start_with_options(delay_stage: Option<&str>, viewer: bool) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
@@ -35,8 +39,13 @@ impl RpcClient {
             std::fs::create_dir_all(directory).expect("create private test HOME");
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
+        let arguments = if viewer {
+            vec!["--autoclean"]
+        } else {
+            vec!["--no-viewer", "--autoclean"]
+        };
         command
-            .args(["--no-viewer", "--autoclean"])
+            .args(arguments)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -58,6 +67,11 @@ impl RpcClient {
                 std::env::var_os("WAYLAND_DISPLAY")
                     .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
             );
+        if let Some(stage) = delay_stage {
+            command
+                .env("KWIN_MCP_TEST_STARTUP_DELAY_STAGE", stage)
+                .env("KWIN_MCP_TEST_STARTUP_DELAY_MS", "30000");
+        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -140,6 +154,10 @@ impl RpcClient {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for RpcClient {
@@ -166,6 +184,30 @@ fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> V
         json!({"name":name, "arguments":arguments}),
     );
     client.response(id, Duration::from_secs(45))
+}
+
+fn process_children(pid: u32) -> Vec<String> {
+    std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn process_threads(pid: u32) -> Vec<String> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+        .map(|name| name.trim().to_owned())
+        .collect()
 }
 
 fn workdir(response: &Value) -> PathBuf {
@@ -252,6 +294,60 @@ fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
     );
 
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn startup_timeout_reclaims_children_endpoint_and_workdir() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    for (stage, viewer) in [("after-bwrap", false), ("after-viewer-endpoint", true)] {
+        let mut client = RpcClient::start_with_options(Some(stage), viewer);
+        let server_pid = client.pid();
+        client.send(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"startup-timeout-e2e","version":"1"}
+            }),
+        );
+        let initialize = client.response(1, Duration::from_secs(10));
+        assert!(
+            initialize["result"].is_object(),
+            "initialize failed: {initialize}"
+        );
+        client.notify("notifications/initialized", json!({}));
+        let start = call_tool(
+            &mut client,
+            2,
+            "session_start",
+            json!({"width":800,"height":600}),
+        );
+        assert!(
+            start["error"].is_object() || start["result"]["isError"].as_bool() == Some(true),
+            "delayed startup unexpectedly succeeded: {start}"
+        );
+        let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
+        assert!(!workdir.exists(), "timeout left {}", workdir.display());
+        assert!(
+            process_children(server_pid).is_empty(),
+            "timeout left child processes for {stage}: {:?}",
+            process_children(server_pid)
+        );
+        assert!(
+            !process_threads(server_pid)
+                .iter()
+                .any(|name| name == "viewer-endpoint"),
+            "timeout left endpoint thread for {stage}"
+        );
+        client.stop_process();
+    }
 }
 
 #[test]
