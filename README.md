@@ -97,7 +97,7 @@ Add your user to these groups:
 sudo usermod -aG input,uinput,video,render $USER
 ```
 
-Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor.
+Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor. When the host provides `/dev/fuse`, KWin MCP exposes it inside the session so AppImages can mount their embedded filesystem; on hosts without FUSE, launch AppImages with `--appimage-extract-and-run`.
 
 ## Screenshot dimensions
 
