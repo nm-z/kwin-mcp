@@ -130,6 +130,7 @@ fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
         index = skip_env_options(words, index + 1);
         index = skip_leading_redirections(words, index);
     }
+    index = skip_command_wrappers(words, index);
     let program_word = words.get(index)?;
     if program_word.kind != TokenKind::Word {
         return None;
@@ -200,6 +201,63 @@ fn is_redirection_operator(token: &Token) -> bool {
             token.value.as_str(),
             "<" | ">" | ">>" | "<<" | "<>" | ">&" | "<&" | ">|" | "&>"
         )
+}
+
+/// Skip wrappers whose first non-option argument is the command they execute.
+/// The wrapper itself must not receive browser switches or suppress browser
+/// detection for otherwise valid launches.
+fn skip_command_wrappers(words: &[Token], mut index: usize) -> usize {
+    loop {
+        index = skip_leading_redirections(words, index);
+        let Some(wrapper) = words.get(index) else {
+            break;
+        };
+        if wrapper.kind != TokenKind::Word {
+            break;
+        }
+        match program_name(&wrapper.value).as_str() {
+            "nohup" => {
+                index += 1;
+                if words
+                    .get(index)
+                    .is_some_and(|word| word.kind == TokenKind::Word && word.value == "--")
+                {
+                    index += 1;
+                }
+            }
+            "timeout" => {
+                index = skip_timeout_options(words, index + 1);
+                // GNU timeout takes one duration before the command.
+                if words
+                    .get(index)
+                    .is_some_and(|word| word.kind == TokenKind::Word)
+                {
+                    index += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+fn skip_timeout_options(words: &[Token], mut index: usize) -> usize {
+    while let Some(word) = words.get(index) {
+        if word.kind != TokenKind::Word {
+            break;
+        }
+        match word.value.as_str() {
+            "--" => return index + 1,
+            "-k" | "--kill-after" | "-s" | "--signal" => index += 2,
+            "--foreground" | "--preserve-status" => index += 1,
+            value if value.starts_with("--kill-after=") || value.starts_with("--signal=") => {
+                index += 1
+            }
+            value if value.starts_with('-') => index += 1,
+            _ => break,
+        }
+    }
+    index
 }
 
 /// Skip leading `NAME=value` environment assignments.
@@ -358,6 +416,12 @@ fn lex(command: &str) -> Result<Vec<Token>, CommandParseError> {
         let (offset, c) = chars[index];
         if c.is_whitespace() && c != '\n' {
             index += 1;
+            continue;
+        }
+        if c == '#' {
+            while index < chars.len() && chars[index].1 != '\n' {
+                index += 1;
+            }
             continue;
         }
         if let Some(len) = operator_len(&chars, index) {
@@ -637,6 +701,21 @@ mod tests {
             ),
             "2>/dev/null chromium --force-renderer-accessibility https://example.com"
         );
+    }
+
+    #[test]
+    fn comments_are_ignored_and_wrappers_reach_the_browser() {
+        no_browser("kate /tmp/note.txt # don't wait");
+        for command in [
+            "nohup chromium https://example.com >/tmp/chromium.log 2>&1",
+            "timeout 30s chromium https://example.com",
+        ] {
+            assert_eq!(browser(command).program, "chromium");
+            assert!(
+                rewritten(command, &["--force-renderer-accessibility"])
+                    .contains("chromium --force-renderer-accessibility")
+            );
+        }
     }
 
     #[test]

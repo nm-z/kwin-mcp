@@ -927,6 +927,40 @@ struct DisplayConfig {
     server: bool,
 }
 
+const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn signal_child(
+    child: &std::process::Child,
+    process_group: bool,
+    signal: nix::sys::signal::Signal,
+) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return;
+    };
+    let target = if process_group { -pid } else { pid };
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal);
+}
+
+/// Terminate a startup or session child without allowing a TERM-resistant
+/// process to hold the lifecycle gate forever. The final wait reaps the child
+/// after the bounded TERM grace period and SIGKILL escalation.
+fn terminate_child(mut child: std::process::Child, process_group: bool, label: &str) {
+    signal_child(&child, process_group, nix::sys::signal::Signal::SIGTERM);
+    let deadline = std::time::Instant::now() + STARTUP_CHILD_TERMINATION_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    eprintln!("{label} did not exit after SIGTERM; escalating to SIGKILL");
+    signal_child(&child, process_group, nix::sys::signal::Signal::SIGKILL);
+    let _ = child.wait();
+}
+
 /// Resources created while session_start is still unpublished. The guard owns
 /// them until the Session takes them, so cancelling the startup future cannot
 /// detach a process or task that has no reachable cleanup path.
@@ -937,29 +971,25 @@ struct StartupResources {
 }
 
 impl StartupResources {
-    fn new(service_proxy_children: Vec<std::process::Child>) -> Self {
+    fn new() -> Self {
         Self {
             bwrap_child: None,
             bwrap_stdin: None,
-            service_proxy_children,
+            service_proxy_children: Vec::new(),
         }
+    }
+
+    fn add_proxy(&mut self, child: std::process::Child) {
+        self.service_proxy_children.push(child);
     }
 
     fn cleanup(&mut self) {
         drop(self.bwrap_stdin.take());
-        if let Some(mut bwrap) = self.bwrap_child.take() {
-            let pid = bwrap.id();
-            if let Ok(negative_pid) = i32::try_from(pid).map(|pid| -pid) {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(negative_pid),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
-            let _ = bwrap.wait();
+        if let Some(bwrap) = self.bwrap_child.take() {
+            terminate_child(bwrap, true, "startup bwrap");
         }
-        for mut proxy in self.service_proxy_children.drain(..) {
-            let _ = proxy.kill();
-            let _ = proxy.wait();
+        for proxy in self.service_proxy_children.drain(..) {
+            terminate_child(proxy, false, "startup D-Bus proxy");
         }
     }
 
@@ -1076,9 +1106,8 @@ impl StartupViewerResources {
 
 impl Drop for StartupViewerResources {
     fn drop(&mut self) {
-        if let Some(mut viewer) = self.viewer.take() {
-            let _ = viewer.kill();
-            let _ = viewer.wait();
+        if let Some(viewer) = self.viewer.take() {
+            terminate_child(viewer, false, "startup viewer");
         }
         let _ = self.endpoint.take();
     }
@@ -1102,6 +1131,16 @@ async fn test_startup_delay(stage: &str) {
     }
     eprintln!("session_start: test delay at {stage} for {millis}ms");
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+fn test_stop_bwrap(child: &std::process::Child) {
+    if !cfg!(debug_assertions)
+        || std::env::var("KWIN_MCP_TEST_STOP_BWRAP").ok().as_deref() != Some("1")
+    {
+        return;
+    }
+    signal_child(child, false, nix::sys::signal::Signal::SIGSTOP);
+    eprintln!("session_start: test stopped bwrap pid={}", child.id());
 }
 
 #[derive(Clone)]
@@ -1481,21 +1520,15 @@ fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
-    if let Some(mut viewer) = sess.viewer_child.take() {
-        let _ = viewer.kill();
-        let _ = viewer.wait();
+    if let Some(viewer) = sess.viewer_child.take() {
+        terminate_child(viewer, false, "viewer");
     }
     drop(sess.viewer_endpoint);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
-    let pid = sess.bwrap_child.id();
-    if let Ok(neg) = i32::try_from(pid).map(|p| -p) {
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
-    }
-    let _ = sess.bwrap_child.wait();
-    for mut proxy in std::mem::take(&mut sess.service_proxy_children) {
-        let _ = proxy.kill();
-        let _ = proxy.wait();
+    terminate_child(sess.bwrap_child, true, "bwrap");
+    for proxy in std::mem::take(&mut sess.service_proxy_children) {
+        terminate_child(proxy, false, "session D-Bus proxy");
     }
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
@@ -2401,8 +2434,16 @@ impl KwinMcp {
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
 
+        let cleanup_err = |message: String, startup: &mut StartupResources| {
+            eprintln!("session_start: startup error: {message}");
+            startup.cleanup();
+            Err(ver_err(message))
+        };
+        // Begin ownership before the first proxy is spawned. Any failure or
+        // cancellation between proxy acquisitions is therefore still covered.
+        let mut startup = StartupResources::new();
         let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
-        let system_proxy_child = spawn_dbus_proxy(
+        match spawn_dbus_proxy(
             "unix:path=/run/dbus/system_bus_socket",
             &system_proxy_socket,
             &[
@@ -2410,11 +2451,16 @@ impl KwinMcp {
                 "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.GetAll@/*",
                 "--broadcast=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.PropertiesChanged@/*",
             ],
-        ).map_err(|error| ver_err(format!("system D-Bus proxy: {error:#}")))?;
-        let host_session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
-            .map_err(|error| ver_err(format!("host session D-Bus address: {error}")))?;
+        ) {
+            Ok(child) => startup.add_proxy(child),
+            Err(error) => return cleanup_err(format!("system D-Bus proxy: {error:#}"), &mut startup),
+        }
+        let host_session_bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(address) => address,
+            Err(error) => return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup),
+        };
         let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
-        let service_proxy_child = spawn_dbus_proxy(
+        match spawn_dbus_proxy(
             &host_session_bus,
             &service_proxy_socket,
             &[
@@ -2451,7 +2497,10 @@ impl KwinMcp {
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
             ],
-        ).map_err(|error| ver_err(format!("session D-Bus proxy: {error:#}")))?;
+        ) {
+            Ok(child) => startup.add_proxy(child),
+            Err(error) => return cleanup_err(format!("session D-Bus proxy: {error:#}"), &mut startup),
+        }
         let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
         let proxy_sock_str = system_proxy_socket.display().to_string();
 
@@ -2510,15 +2559,6 @@ impl KwinMcp {
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
         eprintln!("session_start: spawning bwrap");
-        let cleanup_err = |message: String, startup: &mut StartupResources| {
-            eprintln!("session_start: startup error: {message}");
-            startup.cleanup();
-            Err(ver_err(message))
-        };
-        // Take ownership before spawning bwrap. If the spawn or any later
-        // startup await is cancelled, Drop still terminates and reaps every
-        // process created by this attempt.
-        let mut startup = StartupResources::new(vec![system_proxy_child, service_proxy_child]);
         let bwrap_child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => return cleanup_err(error.to_string(), &mut startup),
@@ -2526,6 +2566,9 @@ impl KwinMcp {
         startup.bwrap_child = Some(bwrap_child);
         let bwrap_pid = startup.bwrap_child.as_ref().map(std::process::Child::id).unwrap_or_default();
         eprintln!("session_start: bwrap spawned pid={bwrap_pid:?}");
+        if let Some(child) = startup.bwrap_child.as_ref() {
+            test_stop_bwrap(child);
+        }
         let bwrap_stdin = startup
             .bwrap_child
             .as_mut()
