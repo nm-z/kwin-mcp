@@ -58,6 +58,7 @@ const CDP_CAPABLE_STEMS: &[&str] = &[
 /// arguments so an explicit user value is never duplicated or overridden.
 const OZONE_PLATFORM_SWITCH: &str = "--ozone-platform";
 const PASSWORD_STORE_SWITCH: &str = "--password-store";
+const RENDERER_ACCESSIBILITY_SWITCH: &str = "--force-renderer-accessibility";
 
 /// A Chromium-family browser found inside a launch command line.
 #[derive(Debug, Clone)]
@@ -71,6 +72,8 @@ pub(crate) struct BrowserInvocation {
     pub(crate) has_ozone_platform: bool,
     /// The browser's own argv already sets `--password-store`.
     pub(crate) has_password_store: bool,
+    /// The browser's own argv already enables renderer accessibility.
+    pub(crate) has_renderer_accessibility: bool,
 }
 
 impl BrowserInvocation {
@@ -122,8 +125,10 @@ pub(crate) fn find_browser_invocation(
 /// runs, if any.
 fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
     let mut index = skip_assignments(words, 0);
+    index = skip_leading_redirections(words, index);
     if program_name(&words.get(index)?.value) == "env" {
         index = skip_env_options(words, index + 1);
+        index = skip_leading_redirections(words, index);
     }
     let program_word = words.get(index)?;
     if program_word.kind != TokenKind::Word {
@@ -134,6 +139,7 @@ fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
 
     let mut has_ozone_platform = false;
     let mut has_password_store = false;
+    let mut has_renderer_accessibility = false;
     let mut redirect_target = false;
     for word in words.iter().skip(index + 1) {
         if word.kind == TokenKind::Operator {
@@ -146,6 +152,7 @@ fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
         }
         has_ozone_platform |= sets_switch(&word.value, OZONE_PLATFORM_SWITCH);
         has_password_store |= sets_switch(&word.value, PASSWORD_STORE_SWITCH);
+        has_renderer_accessibility |= sets_switch(&word.value, RENDERER_ACCESSIBILITY_SWITCH);
     }
 
     Some(BrowserInvocation {
@@ -154,7 +161,39 @@ fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
         insert_at: program_word.end,
         has_ozone_platform,
         has_password_store,
+        has_renderer_accessibility,
     })
+}
+
+/// Skip shell redirections that appear before the executable. A numeric word
+/// immediately adjacent to the operator is an optional file descriptor, as in
+/// `2>/dev/null`; a separated numeric word remains a command name.
+fn skip_leading_redirections(words: &[Token], mut index: usize) -> usize {
+    loop {
+        if let (Some(fd), Some(operator)) = (words.get(index), words.get(index + 1))
+            && fd.kind == TokenKind::Word
+            && !fd.value.is_empty()
+            && fd.value.chars().all(|c| c.is_ascii_digit())
+            && fd.end == operator.start
+            && is_redirection_operator(operator)
+        {
+            index += 1;
+        }
+        let Some(operator) = words.get(index) else { break };
+        if !is_redirection_operator(operator) || words.get(index + 1).is_none_or(|target| target.kind != TokenKind::Word) {
+            break;
+        }
+        index += 2;
+    }
+    index
+}
+
+fn is_redirection_operator(token: &Token) -> bool {
+    token.kind == TokenKind::Operator
+        && matches!(
+            token.value.as_str(),
+            "<" | ">" | ">>" | "<<" | "<>" | ">&" | "<&" | ">|" | "&>"
+        )
 }
 
 /// Skip leading `NAME=value` environment assignments.
@@ -258,6 +297,7 @@ enum TokenKind {
 #[derive(Debug, Clone)]
 struct Token {
     kind: TokenKind,
+    start: usize,
     end: usize,
     value: String,
 }
@@ -318,6 +358,7 @@ fn lex(command: &str) -> Result<Vec<Token>, CommandParseError> {
             let end = char_end(&chars, command, index + len - 1);
             tokens.push(Token {
                 kind: TokenKind::Operator,
+                start: offset,
                 end,
                 value: command[offset..end].to_owned(),
             });
@@ -353,6 +394,7 @@ fn lex(command: &str) -> Result<Vec<Token>, CommandParseError> {
         };
         tokens.push(Token {
             kind: TokenKind::Word,
+            start: offset,
             end,
             value,
         });
@@ -463,15 +505,31 @@ fn read_nested(
 ) -> Result<usize, CommandParseError> {
     value.push_str(opener);
     let mut depth = 1_usize;
+    let mut quote = None;
+    let mut escaped = false;
     let mut index = start + 1;
     while let Some((_, c)) = chars.get(index) {
         value.push(*c);
-        if *c == open {
-            depth += 1;
-        } else if *c == close {
-            depth -= 1;
-            if depth == 0 {
-                return Ok(index + 1);
+        if escaped {
+            escaped = false;
+        } else if let Some(current_quote) = quote {
+            if *c == '\\' && current_quote != '\'' {
+                escaped = true;
+            } else if *c == current_quote {
+                quote = None;
+            }
+        } else {
+            match *c {
+                '\\' => escaped = true,
+                '\'' | '"' | '`' => quote = Some(*c),
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(index + 1);
+                    }
+                }
+                _ => {}
             }
         }
         index += 1;
@@ -547,9 +605,31 @@ mod tests {
     #[test]
     fn an_explicit_switch_on_the_browser_is_respected() {
         let found =
-            browser("chromium --password-store=basic --ozone-platform=x11 https://example.com");
+            browser("chromium --password-store=basic --ozone-platform=x11 --force-renderer-accessibility https://example.com");
         assert!(found.has_password_store);
         assert!(found.has_ozone_platform);
+        assert!(found.has_renderer_accessibility);
+    }
+
+    #[test]
+    fn quoted_and_escaped_substitution_delimiters_are_not_structure() {
+        let quoted = browser(r#"chromium "$(printf '%s' 'https://example.com/a(b')"#);
+        assert_eq!(quoted.program, "chromium");
+        let escaped = browser(r#"chromium $(printf '%s' https://example.com/a\(b)"#);
+        assert_eq!(escaped.program, "chromium");
+    }
+
+    #[test]
+    fn leading_redirection_does_not_hide_the_browser() {
+        let found = browser("2>/dev/null chromium https://example.com");
+        assert_eq!(found.program, "chromium");
+        assert_eq!(
+            rewritten(
+                "2>/dev/null chromium https://example.com",
+                &["--force-renderer-accessibility"]
+            ),
+            "2>/dev/null chromium --force-renderer-accessibility https://example.com"
+        );
     }
 
     #[test]
