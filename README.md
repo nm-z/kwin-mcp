@@ -34,7 +34,6 @@ kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
 
 Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. The server takes cleanup ownership of the workdir as soon as `session_start` creates it, so a start that fails, is cancelled, or hits the hard timeout removes it too. Removal first normalizes permissions inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block it. If removal still fails, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag, `session_stop` retains the existing workdir behavior.
 
-AppImage launches receive `APPIMAGE_EXTRACT_AND_RUN=1` in addition to the `/dev/fuse` bind when the host provides FUSE. This keeps AppImage launches working in rootless bubblewrap environments where the setuid `fusermount` helper cannot mount from the nested user namespace.
 Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. Cleanup ownership is claimed before `session_start` creates the directory and released only once the directory is gone, so it covers every terminal outcome: a successful stop, a start that fails, is cancelled, or hits the 20s hard limit, and the server exiting when the client never called `session_stop`.
 
 | From | Event | To | Result |
