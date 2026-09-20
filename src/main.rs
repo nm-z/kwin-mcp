@@ -3613,7 +3613,7 @@ impl KwinMcp {
                 None => params.command.clone(),
             };
             format!(
-                "env DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
+                "env APPIMAGE_EXTRACT_AND_RUN=1 DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
             )
         };
         {
