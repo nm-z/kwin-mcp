@@ -2399,6 +2399,7 @@ impl KwinMcp {
             export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             if command -v ip >/dev/null 2>&1; then ip link set lo up 2>/dev/null || true; fi\n\
+            mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n\
             mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
