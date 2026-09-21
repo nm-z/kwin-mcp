@@ -32,9 +32,11 @@ kwin-mcp --server
 kwin-viewer /tmp/kwin-mcp-<pid>/viewer.sock
 ```
 
-Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. The server takes cleanup ownership of the workdir as soon as `session_start` creates it, so a start that fails, is cancelled, or hits the hard timeout removes it too. Removal first normalizes permissions inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block it. If removal still fails, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag, `session_stop` retains the existing workdir behavior.
-
 Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. Cleanup ownership is claimed before `session_start` creates the directory and released only once the directory is gone, so it covers every terminal outcome: a successful stop, a start that fails, is cancelled, or hits the 20s hard limit, and the server exiting when the client never called `session_stop`.
+
+With `--autoclean`, startup also sweeps same-user `/tmp/kwin-mcp-<pid>` directories whose recorded PID is no longer a live `kwin-mcp` process. SIGTERM, SIGINT, and SIGHUP run the same session teardown and workdir removal path before the server exits. A process killed with SIGKILL can still leave a directory, but the next `--autoclean` server removes it.
+
+Pass `--ttl MINUTES` to tear down an idle session after the given number of minutes. Every MCP tool call refreshes the timer. The server remains alive and accepts a later `session_start`; the default is off.
 
 | From | Event | To | Result |
 | --- | --- | --- | --- |
@@ -87,7 +89,7 @@ kwin-mcp (host process)
   │         (KCMs see virtual mouse/keyboard here)
   ├── kwin_conn (talks to KWin via unique name)
   │     └── EIS, ScreenShot2, Scripting
-  └── bwrap container (bubblewrap, overlayfs on $HOME)
+  └── pasta network namespace + bwrap container (overlayfs on $HOME)
         ├── dbus-daemon        (isolated session bus, anonymous auth)
         ├── kwin_wayland       (virtual display 1000x1000, XWayland)
         ├── pipewire + wireplumber
@@ -115,6 +117,8 @@ All coordinates are window-relative — window position is added internally via 
 
 At `session_start`, active pathname sockets beneath `$HOME` and non-graphical user-runtime sockets are exposed automatically. Sockets owned by processes attached to the host display, desktop application scopes, input devices, or the desktop session slice remain isolated. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each exposed socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths. Socket replacements at discovered names remain live; new socket names require a new session.
 
+Each session runs inside a private rootless network namespace provided by `pasta` from the `passt` package. Its `127.0.0.1` is private, so identical applications can bind the same loopback port in concurrent sessions, while outbound traffic continues through the host's active uplink. `pasta` is required on `PATH`.
+
 ## Build
 
 ```bash
@@ -130,7 +134,7 @@ Add your user to these groups:
 sudo usermod -aG input,uinput,video,render $USER
 ```
 
-Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor. When the host provides `/dev/fuse`, KWin MCP exposes it inside the session so AppImages can mount their embedded filesystem; on hosts without FUSE, launch AppImages with `--appimage-extract-and-run`.
+Requires: `bubblewrap` (bwrap), `pasta` from `passt`, and KWin running as a Wayland compositor. When the host provides `/dev/fuse`, KWin MCP exposes it inside the session so AppImages can mount their embedded filesystem; the server also sets `APPIMAGE_EXTRACT_AND_RUN=1` for AppImage launches so they do not require a setuid `fusermount` helper.
 
 ## Screenshot dimensions
 

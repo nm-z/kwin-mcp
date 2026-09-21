@@ -561,6 +561,11 @@ fn terminate_with_parent(command: &mut std::process::Command) {
     }
 }
 
+fn reserve_loopback_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
 // ── uinput virtual devices ──────────────────────────────────────────────
 
 fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::PathBuf, evdev::uinput::VirtualDevice, std::path::PathBuf), KwinError> {
@@ -912,6 +917,7 @@ struct Session {
     viewer_socket: PathBuf,
     viewer_endpoint: tokio::task::JoinHandle<()>,
     clipboard_children: Vec<std::process::Child>,
+    cdp_forward_port: u16,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -932,6 +938,7 @@ struct DisplayConfig {
     viewer_enabled: bool,
     server: bool,
     autoclean: bool,
+    ttl: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -947,6 +954,10 @@ struct KwinMcp {
     /// a start still running when the transport closes cannot repopulate a
     /// directory that nothing is left to delete.
     start_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Last MCP tool call observed while a session is active. The optional
+    /// timestamp is set by session_start and cleared when the idle reaper
+    /// tears the session down.
+    activity: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     display: DisplayConfig,
 }
 
@@ -956,8 +967,12 @@ impl KwinMcp {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
+            activity: Arc::new(tokio::sync::Mutex::new(None)),
             display,
         }
+    }
+    async fn touch_activity(&self) {
+        *self.activity.lock().await = Some(std::time::Instant::now());
     }
     async fn with_session<R>(
         &self,
@@ -1028,23 +1043,54 @@ impl KwinMcp {
     }
     /// Final terminal transition when the stdio transport closes. Without it an
     /// exiting server would strand an owned workdir with no reachable retry.
-    /// Nothing is owned unless --autoclean claimed it, so the default lifecycle
-    /// is untouched.
+    /// The session is always torn down; workdir removal is conditional on
+    /// --autoclean.
     async fn shutdown_cleanup(&self) {
-        let Some(dir) = self.workdir.owned() else {
-            return;
-        };
-        eprintln!("shutdown: autoclean owns {}", dir.display());
         let _start_gate = self.start_gate.lock().await;
+        *self.activity.lock().await = None;
         let stopped = self.session.lock().await.take();
         if let Some(sess) = stopped {
             teardown(sess);
         }
+        let Some(dir) = self.workdir.owned() else {
+            return;
+        };
+        eprintln!("shutdown: autoclean owns {}", dir.display());
         match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {}
             WorkdirCleanup::Removed(dir) => eprintln!("shutdown: autoclean removed {}", dir.display()),
             WorkdirCleanup::Retained { dir, error } => {
                 eprintln!("shutdown: autoclean could not remove {}: {error}", dir.display())
+            }
+        }
+    }
+
+    /// Reap an idle session without terminating the MCP server. The activity
+    /// mutex is held while the timestamp and authoritative session slot are
+    /// checked, so a tool call cannot refresh a session after the expiry
+    /// decision has been made.
+    async fn idle_reaper(self) {
+        let Some(ttl) = self.display.ttl else { return };
+        let tick = ttl.min(Duration::from_secs(1)).max(Duration::from_millis(50));
+        loop {
+            tokio::time::sleep(tick).await;
+            let _start_gate = self.start_gate.lock().await;
+            let mut activity = self.activity.lock().await;
+            let expired = activity.is_some_and(|last| last.elapsed() >= ttl);
+            if !expired { continue; }
+            *activity = None;
+            let stopped = self.session.lock().await.take();
+            drop(activity);
+            if let Some(sess) = stopped {
+                eprintln!("ttl: idle session expired after {} minutes", ttl.as_secs() / 60);
+                teardown(sess);
+                if self.display.autoclean {
+                    match self.workdir.remove() {
+                        WorkdirCleanup::NothingOwned => {}
+                        WorkdirCleanup::Removed(dir) => eprintln!("ttl: removed {}", dir.display()),
+                        WorkdirCleanup::Retained { dir, error } => eprintln!("ttl: could not remove {}: {error}", dir.display()),
+                    }
+                }
             }
         }
     }
@@ -1242,6 +1288,10 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             format!("{} is not this server's session workdir {}", dir.display(), expected.display()),
         ));
     }
+    remove_session_workdir_tree(dir)
+}
+
+fn remove_session_workdir_tree(dir: &std::path::Path) -> std::io::Result<()> {
     let flags = nix::fcntl::OFlag::O_PATH
         | nix::fcntl::OFlag::O_NOFOLLOW
         | nix::fcntl::OFlag::O_CLOEXEC;
@@ -1254,6 +1304,45 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+fn session_workdir_pid(path: &std::path::Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("kwin-mcp-")?.parse().ok()
+}
+
+fn is_live_kwin_mcp_process(pid: u32) -> bool {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let name = exe.as_deref().and_then(Path::file_name).and_then(|name| name.to_str());
+    name.is_some_and(|name| name == "kwin-mcp" || name == "kwin-mcp-strict")
+}
+
+/// Remove abandoned session trees owned by this user. The PID in the name is
+/// checked against `/proc/<pid>/exe` before deletion, so a reused PID whose
+/// process is still a kwin-mcp server remains protected. Unknown names,
+/// non-directories, and trees owned by another UID are left untouched.
+fn cleanup_orphaned_session_workdirs() {
+    use std::os::unix::fs::MetadataExt;
+    let root = std::env::temp_dir();
+    let uid = match procfs::process::Process::myself().and_then(|process| process.uid()) {
+        Ok(uid) => uid,
+        Err(error) => {
+            eprintln!("autoclean: cannot determine current UID for orphan sweep: {error}");
+            return;
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = session_workdir_pid(&path) else { continue };
+        if is_live_kwin_mcp_process(pid) { continue; }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
+        if !metadata.is_dir() || metadata.uid() != uid { continue; }
+        match remove_session_workdir_tree(&path) {
+            Ok(()) => eprintln!("autoclean: removed orphaned {}", path.display()),
+            Err(error) => eprintln!("autoclean: could not remove orphaned {}: {error}", path.display()),
+        }
+    }
 }
 
 /// Result of the one terminal cleanup transition.
@@ -2020,6 +2109,10 @@ struct WindowActivateParams {
 
 impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
+        let ttl_line = self.display.ttl.map_or_else(
+            || "Idle session teardown is disabled unless the server was launched with --ttl MINUTES.".to_owned(),
+            |ttl| format!("Idle sessions are torn down after {} minutes without a tool call.", ttl.as_secs() / 60),
+        );
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
@@ -2029,12 +2122,14 @@ impl rmcp::ServerHandler for KwinMcp {
                 If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
+                {ttl_line} \
                 Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
                     format!("The virtual display defaults to {}x{}; session_start accepts optional width/height to override it for that session.", self.display.width, self.display.height)
                 },
+                ttl_line = ttl_line,
             ))
     }
 }
@@ -2050,6 +2145,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // Held across the whole attempt, including the hard timeout, so shutdown
         // cleanup never runs while this start is still writing the workdir.
         let start_gate = self.start_gate.clone();
@@ -2145,6 +2241,9 @@ impl KwinMcp {
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
         );
+        if which_on_path("pasta").is_none() {
+            return Err(ver_err("private session networking requires pasta (the passt package) on PATH".to_owned()));
+        }
         let xdg_dir_str = host_xdg_dir.display().to_string();
         // Write AT-SPI dbus config with ANONYMOUS auth for cross-namespace access
         let atspi_conf_path = host_xdg_dir.join("accessibility.conf");
@@ -2299,6 +2398,7 @@ impl KwinMcp {
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
             export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
+            if command -v ip >/dev/null 2>&1; then ip link set lo up 2>/dev/null || true; fi\n\
             mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
@@ -2378,9 +2478,27 @@ impl KwinMcp {
         ).map_err(|error| ver_err(format!("session D-Bus proxy: {error:#}")))?;
         let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
         let proxy_sock_str = system_proxy_socket.display().to_string();
+        let cdp_forward_port = reserve_loopback_port()
+            .map_err(|error| ver_err(format!("reserve CDP forwarding port: {error}")))?;
 
-        let mut cmd = std::process::Command::new("bwrap");
-        cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+        let current_process = procfs::process::Process::myself()
+            .map_err(|error| ver_err(format!("read current process identity: {error}")))?;
+        let uid = current_process.uid()
+            .map_err(|error| ver_err(format!("read current UID: {error}")))?
+            .to_string();
+        use std::os::unix::fs::MetadataExt;
+        let gid = std::fs::metadata("/proc/self")
+            .map_err(|error| ver_err(format!("read current GID: {error}")))?
+            .gid()
+            .to_string();
+        // pasta owns the private network namespace and forwards outbound
+        // traffic without exposing the host loopback. bwrap then creates the
+        // PID/IPC/UTS sandbox inside that namespace while restoring the host
+        // user's UID/GID mapping for applications.
+        let mut cmd = std::process::Command::new("pasta");
+        let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
+        cmd.args(["--quiet", "--config-net", "--tcp-ports", &cdp_forward_spec, "--", "bwrap"]);
+        cmd.args(["--die-with-parent", "--unshare-user", "--uid", &uid, "--gid", &gid, "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
         overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
@@ -2388,6 +2506,12 @@ impl KwinMcp {
         let kscreenlockerrc_str = kscreenlockerrc_path.display().to_string();
         let kcmfonts_str = kcmfonts_path.display().to_string();
         let fonts_conf_str = fonts_conf_path.display().to_string();
+        let fc_hinting_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/10-hinting-slight.conf")
+            .map_err(|error| ver_err(format!("resolve fontconfig hinting destination: {error}")))?;
+        let fc_lcd_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf")
+            .map_err(|error| ver_err(format!("resolve fontconfig LCD destination: {error}")))?;
+        let fc_hinting_dest_str = fc_hinting_dest.display().to_string();
+        let fc_lcd_dest_str = fc_lcd_dest.display().to_string();
         let home_kwinrc = format!("{home}/.config/kwinrc");
         let home_kdeglobals = format!("{home}/.config/kdeglobals");
         let home_kwinrulesrc = format!("{home}/.config/kwinrulesrc");
@@ -2409,8 +2533,8 @@ impl KwinMcp {
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
-            "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
-            "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
+            "--ro-bind", &fc_hinting_str, &fc_hinting_dest_str,
+            "--ro-bind", &fc_lcd_str, &fc_lcd_dest_str,
             // Mask dbus service files so the container's dbus-daemon doesn't auto-activate
             // $HOME config overrides (read-only — protects display settings from agent writes)
             "--ro-bind", &kwinrc_str, &home_kwinrc,
@@ -2464,6 +2588,7 @@ impl KwinMcp {
             }
             Err(ver_err(message))
         };
+        let mut host_children = vec![system_proxy_child, service_proxy_child];
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
         let dbus_ready_path = host_xdg_dir.join("dbus-ready");
         eprintln!("session_start: wait for dbus-ready at {}", dbus_ready_path.display());
@@ -2472,7 +2597,7 @@ impl KwinMcp {
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(e, bwrap_child, bwrap_stdin, std::mem::take(&mut host_children));
         }
         eprintln!("session_start: dbus-ready");
         let bus_addr = format!("unix:path={xdg_dir_str}/bus");
@@ -2484,11 +2609,11 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
             };
         // Claim org.kde.KWin on proxy_conn (before KWin starts, so we get it first)
         if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
-            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(format!("claim org.kde.KWin: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children));
         }
         eprintln!("session_start: proxy_conn owns org.kde.KWin");
 
@@ -2506,7 +2631,7 @@ impl KwinMcp {
         let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
         let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
         if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
-            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(format!("register input devices: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children));
         }
         eprintln!("session_start: input devices registered on proxy_conn");
 
@@ -2520,7 +2645,7 @@ impl KwinMcp {
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
                 Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+                Err(e) => return cleanup_err(e, bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
             };
 
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
@@ -2531,7 +2656,7 @@ impl KwinMcp {
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
         ).await {
-            return cleanup_err(e, bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+            return cleanup_err(e, bwrap_child, bwrap_stdin, std::mem::take(&mut host_children));
         }
         eprintln!("session_start: wayland-0 ready");
 
@@ -2580,7 +2705,7 @@ impl KwinMcp {
                 break;
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]);
+                return cleanup_err("could not discover KWin unique name".to_owned(), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children));
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
@@ -2593,18 +2718,18 @@ impl KwinMcp {
             .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
         let eis_proxy = match eis_builder.build().await {
             Ok(p) => p,
-            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Err(e) => return cleanup_err(format!("KWin EIS proxy: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
         };
         let (eis_fd, _cookie) = match eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await {
             Ok(r) => r,
-            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Err(e) => return cleanup_err(format!("connectToEIS: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
         };
         eprintln!("session_start: EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
         let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
-            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
-            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin, vec![system_proxy_child, service_proxy_child]),
+            Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
+            Err(e) => return cleanup_err(format!("EIS task: {e}"), bwrap_child, bwrap_stdin, std::mem::take(&mut host_children)),
         };
         eprintln!("session_start: EIS ready");
 
@@ -2669,16 +2794,18 @@ impl KwinMcp {
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
-            service_proxy_children: vec![system_proxy_child, service_proxy_child],
+            service_proxy_children: host_children,
             viewer_child,
             viewer_socket,
             viewer_endpoint,
             clipboard_children,
+            cdp_forward_port,
             overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
         });
+        self.touch_activity().await;
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
@@ -2697,6 +2824,7 @@ impl KwinMcp {
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+        *self.activity.lock().await = None;
         let stopped = self.session.lock().await.take();
         let had_session = stopped.is_some();
         if let Some(sess) = stopped {
@@ -2746,6 +2874,7 @@ impl KwinMcp {
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -2777,6 +2906,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<WindowActivateParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -2838,6 +2968,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -3013,6 +3144,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // CDP path for Chromium/Electron apps
         let cdp_browser = self.session.lock().await
             .as_ref()
@@ -3155,6 +3287,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
 
@@ -3287,6 +3420,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
@@ -3326,6 +3460,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
@@ -3349,6 +3484,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let delta = params.delta;
@@ -3382,6 +3518,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let from_x = params.from_x;
         let from_y = params.from_y;
         let to_x = params.to_x;
@@ -3417,6 +3554,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardTypeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3442,6 +3580,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3478,6 +3617,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3506,6 +3646,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3535,6 +3676,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         use std::io::Write;
         use futures::StreamExt;
 
@@ -3551,10 +3693,10 @@ impl KwinMcp {
             .is_some_and(|found| found.kind == launch_command::BrowserKind::CdpCapable);
 
         let cdp_port = if cmd_chromium {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-            let port = listener.local_addr().map_err(KwinError::from)?.port();
-            drop(listener);
-            Some(port)
+            let guard = self.session.lock().await;
+            Some(guard.as_ref().ok_or_else(|| {
+                McpError::internal_error("no session — call session_start first", None)
+            })?.cdp_forward_port)
         } else {
             None
         };
@@ -3587,6 +3729,7 @@ impl KwinMcp {
                     let mut switches = Vec::new();
                     if let Some(port) = cdp_port {
                         switches.push(format!("--remote-debugging-port={port}"));
+                        switches.push("--remote-debugging-address=0.0.0.0".to_owned());
                     }
                     if !found.has_ozone_platform {
                         switches.push("--ozone-platform=wayland".to_owned());
@@ -3681,6 +3824,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         viewer_enabled: true,
         server: false,
         autoclean: false,
+        ttl: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3691,14 +3835,25 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--no-viewer" => cfg.viewer_enabled = false,
             "--server" => cfg.server = true,
             "--autoclean" => cfg.autoclean = true,
+            "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--server] [--autoclean]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--server] [--autoclean] [--ttl MINUTES]"
                 ))
             }
         }
     }
     Ok(cfg)
+}
+
+fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
+    let value = args.next().ok_or_else(|| "--ttl requires a value in minutes".to_owned())?;
+    let minutes: u64 = value.parse().map_err(|error| format!("--ttl '{value}': {error}"))?;
+    if minutes == 0 {
+        return Err("--ttl must be greater than zero minutes".to_owned());
+    }
+    let seconds = minutes.checked_mul(60).ok_or_else(|| "--ttl is too large".to_owned())?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u32, String> {
@@ -3716,8 +3871,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
     let display = parse_cli_args()?;
+    if display.autoclean {
+        cleanup_orphaned_session_workdirs();
+    }
     eprintln!(
-        "kwin-mcp: display default {}x{}{}; viewer {}",
+        "kwin-mcp: display default {}x{}{}; viewer {}; network private; ttl {}",
         display.width,
         display.height,
         if display.locked { " (locked, --no-override)" } else { "" },
@@ -3725,7 +3883,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if display.server { "disabled (--server)" } else { "enabled" }
         } else {
             "disabled (--no-viewer)"
-        }
+        },
+        display.ttl.map_or_else(|| "off".to_owned(), |ttl| format!("{}m", ttl.as_secs() / 60))
     );
     let kwin = KwinMcp::new(display);
     let shutdown = kwin.clone();
@@ -3749,14 +3908,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
     let router =
-        rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
+        rmcp::handler::server::router::Router::new(kwin.clone()).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
-    let waited = service.waiting().await;
+    let ttl_reaper = tokio::spawn(kwin.clone().idle_reaper());
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let service_cancellation = service.cancellation_token();
+    let wait_future = service.waiting();
+    tokio::pin!(wait_future);
+    let waited = tokio::select! {
+        result = &mut wait_future => result,
+        Some(()) = sigterm.recv() => {
+            eprintln!("shutdown: received SIGTERM");
+            service_cancellation.cancel();
+            ttl_reaper.abort();
+            shutdown.shutdown_cleanup().await;
+            std::process::exit(0);
+        }
+        Some(()) = sigint.recv() => {
+            eprintln!("shutdown: received SIGINT");
+            service_cancellation.cancel();
+            ttl_reaper.abort();
+            shutdown.shutdown_cleanup().await;
+            std::process::exit(0);
+        }
+        Some(()) = sighup.recv() => {
+            eprintln!("shutdown: received SIGHUP");
+            service_cancellation.cancel();
+            ttl_reaper.abort();
+            shutdown.shutdown_cleanup().await;
+            std::process::exit(0);
+        }
+    };
     // The transport is closed, so session_stop can no longer be called. Run the
     // final terminal transition here or an owned workdir would outlive every
     // path that could still delete it.
+    ttl_reaper.abort();
     shutdown.shutdown_cleanup().await;
     waited?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_parser_uses_minutes_and_rejects_zero() {
+        let mut args = vec!["2".to_owned()].into_iter();
+        assert_eq!(parse_ttl_arg(&mut args), Ok(Duration::from_secs(120)));
+
+        let mut zero = vec!["0".to_owned()].into_iter();
+        assert!(parse_ttl_arg(&mut zero).is_err());
+    }
+
+    #[test]
+    fn ttl_parser_rejects_overflow() {
+        let mut args = vec![u64::MAX.to_string()].into_iter();
+        assert!(parse_ttl_arg(&mut args).is_err());
+    }
 }
