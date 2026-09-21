@@ -1309,16 +1309,6 @@ impl WorkdirOwnership {
 
 fn teardown(mut sess: Session) {
     drop(sess.cdp_browser);
-    // Reap the clipboard watchers and any wl-copy daemons they left holding a
-    // selection. They run in their own process group, so a negative-PID SIGTERM
-    // takes down the whole group.
-    for mut child in std::mem::take(&mut sess.clipboard_children) {
-        if let Ok(neg) = i32::try_from(child.id()).map(|p| -p) {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(neg), nix::sys::signal::Signal::SIGTERM);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(mut viewer) = sess.viewer_child.take() {
@@ -2647,15 +2637,6 @@ impl KwinMcp {
         } else {
             eprintln!("session_start: viewer disabled (--no-viewer/--server)");
             None
-        };
-        // Two-way host<->container text clipboard sync (issue #29). Non-fatal; uses
-        // the same host Wayland resolution as the viewer.
-        let clipboard_children = match host_wayland().await {
-            Ok((runtime, display)) => spawn_clipboard_bridge(&runtime, &display, &host_xdg_dir),
-            Err(e) => {
-                eprintln!("session_start: clipboard bridge skipped (host Wayland: {e:#})");
-                Vec::new()
-            }
         };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()

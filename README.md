@@ -74,6 +74,10 @@ This guards against accidental host GUI control; it is not a security sandbox fo
 
 `session_start` does not open, enumerate, or snapshot the host KWallet. Host wallet state stays outside the isolated overlay, and the server does not retain a host KWallet handle across sessions. The D-Bus compatibility rules are for application-level service discovery only; they are not a host-wallet snapshot path.
 
+## Clipboard isolation
+
+KWin MCP does not bridge clipboard contents between the host desktop and the isolated session. Each compositor keeps its own clipboard and primary selection; copying in one session does not overwrite or seed the other session.
+
 ## Session Architecture
 
 ```
