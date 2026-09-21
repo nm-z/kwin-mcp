@@ -1317,6 +1317,10 @@ fn teardown(mut sess: Session) {
     }
     sess.viewer_endpoint.abort();
     let _ = std::fs::remove_file(&sess.viewer_socket);
+    for mut clipboard in std::mem::take(&mut sess.clipboard_children) {
+        let _ = clipboard.kill();
+        let _ = clipboard.wait();
+    }
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     let pid = sess.bwrap_child.id();
@@ -2637,6 +2641,15 @@ impl KwinMcp {
         } else {
             eprintln!("session_start: viewer disabled (--no-viewer/--server)");
             None
+        };
+        // Two-way host<->container text clipboard sync. Non-fatal; it uses the
+        // same host Wayland resolution as the viewer.
+        let clipboard_children = match host_wayland().await {
+            Ok((runtime, display)) => spawn_clipboard_bridge(&runtime, &display, &host_xdg_dir),
+            Err(e) => {
+                eprintln!("session_start: clipboard bridge skipped (host Wayland: {e:#})");
+                Vec::new()
+            }
         };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
