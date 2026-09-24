@@ -231,19 +231,6 @@ fn process_alive(pid: u32) -> std::io::Result<bool> {
     }
 }
 
-fn process_threads(pid: u32) -> std::io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))? {
-        let entry = entry?;
-        names.push(
-            std::fs::read_to_string(entry.path().join("comm"))?
-                .trim()
-                .to_owned(),
-        );
-    }
-    Ok(names)
-}
-
 fn workdir(response: &Value) -> PathBuf {
     response["result"]["structuredContent"]["workdir"]
         .as_str()
@@ -332,7 +319,7 @@ fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
-fn startup_timeout_reclaims_children_endpoint_and_workdir() {
+fn startup_timeout_reclaims_children_and_workdir() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
         Ok("1"),
@@ -341,7 +328,7 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
 
     for (stage, viewer, stop_bwrap) in [
         ("after-bwrap", false, false),
-        ("after-viewer-endpoint", true, false),
+        ("after-viewer", true, false),
         ("after-bwrap", false, true),
     ] {
         let mut client = RpcClient::start_with_options_and_stop(Some(stage), viewer, stop_bwrap);
@@ -390,22 +377,7 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
                 "viewer was not alive before delayed stage {stage}"
             );
         }
-        let delay_line =
-            client.wait_for_stderr(&format!("test delay at {stage}"), Duration::from_secs(20));
-        if stage == "after-viewer-endpoint" {
-            let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
-            assert!(
-                workdir.join("viewer.sock").exists(),
-                "endpoint socket was not created"
-            );
-            assert!(
-                process_threads(server_pid)
-                    .unwrap_or_else(|error| panic!("inspect endpoint threads: {error}"))
-                    .iter()
-                    .any(|name| name == "viewer-endpoint"),
-                "endpoint thread was not alive before timeout: {delay_line}"
-            );
-        }
+        client.wait_for_stderr(&format!("test delay at {stage}"), Duration::from_secs(20));
         let start = client.response(2, Duration::from_secs(45));
         assert!(
             start["error"].is_object() || start["result"]["isError"].as_bool() == Some(true),
@@ -424,12 +396,6 @@ fn startup_timeout_reclaims_children_endpoint_and_workdir() {
             children.is_empty(),
             "timeout left child processes for {stage}: {:?}",
             children
-        );
-        let threads = process_threads(server_pid)
-            .unwrap_or_else(|error| panic!("inspect server threads: {error}"));
-        assert!(
-            !threads.iter().any(|name| name == "viewer-endpoint"),
-            "timeout left endpoint thread for {stage}"
         );
         client.stop_process();
     }

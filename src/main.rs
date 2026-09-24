@@ -904,7 +904,6 @@ struct Session {
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
-    viewer_endpoint: ViewerEndpoint,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -924,7 +923,6 @@ struct DisplayConfig {
     locked: bool,
     viewer_enabled: bool,
     autoclean: bool,
-    server: bool,
 }
 
 const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1014,93 +1012,19 @@ impl Drop for StartupResources {
     }
 }
 
-/// A same-host metadata endpoint owned by the running Session. A dedicated
-/// nonblocking thread makes its shutdown synchronous, so a cancelled startup
-/// can stop and join it before the workdir is removed.
-struct ViewerEndpoint {
-    socket: PathBuf,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ViewerEndpoint {
-    fn start(host_xdg_dir: &std::path::Path, width: u32, height: u32) -> Result<Self, KwinError> {
-        use std::io::Write;
-        use std::os::unix::net::UnixListener;
-
-        let socket = host_xdg_dir.join("viewer.sock");
-        let listener = UnixListener::bind(&socket).map_err(KwinError::from)?;
-        listener.set_nonblocking(true).map_err(KwinError::from)?;
-        let payload = serde_json::json!({
-            "session_dir": host_xdg_dir,
-            "width": width,
-            "height": height,
-        })
-        .to_string();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let thread_stop = std::sync::Arc::clone(&stop);
-        let thread = match std::thread::Builder::new()
-            .name("viewer-endpoint".to_owned())
-            .spawn(move || {
-                while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream.write_all(payload.as_bytes());
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                let _ = std::fs::remove_file(&socket);
-                return Err(KwinError::from(error));
-            }
-        };
-        Ok(Self { socket, stop, thread: Some(thread) })
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.socket
-    }
-}
-
-impl Drop for ViewerEndpoint {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-/// Viewer resources stay owned by startup until the Session is published.
-/// Dropping this value synchronously stops the endpoint thread and viewer
-/// process, covering timeout and error paths between endpoint creation and
-/// Session publication.
+/// Own a spawned viewer until the Session is published. A cancelled startup
+/// drops this guard and reaps the viewer before removing the workdir.
 struct StartupViewerResources {
-    endpoint: Option<ViewerEndpoint>,
     viewer: Option<std::process::Child>,
 }
 
 impl StartupViewerResources {
-    fn new(endpoint: ViewerEndpoint) -> Self {
-        Self { endpoint: Some(endpoint), viewer: None }
+    fn new() -> Self {
+        Self { viewer: None }
     }
 
-    fn endpoint_path(&self) -> Option<&std::path::Path> {
-        self.endpoint.as_ref().map(ViewerEndpoint::path)
-    }
-
-    fn into_parts(mut self) -> (ViewerEndpoint, Option<std::process::Child>) {
-        let Some(endpoint) = self.endpoint.take() else {
-            panic!("startup viewer endpoint missing at Session publication");
-        };
-        (endpoint, self.viewer.take())
+    fn into_child(mut self) -> Option<std::process::Child> {
+        self.viewer.take()
     }
 }
 
@@ -1109,7 +1033,6 @@ impl Drop for StartupViewerResources {
         if let Some(viewer) = self.viewer.take() {
             terminate_child(viewer, false, "startup viewer");
         }
-        let _ = self.endpoint.take();
     }
 }
 
@@ -1330,7 +1253,6 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "bridge-ready",
         "screenshot.png",
         "viewer.log",
-        "viewer.sock",
     ];
     const STALE_DIRS: &[&str] = &[
         "at-spi",
@@ -1523,7 +1445,6 @@ fn teardown(mut sess: Session) {
     if let Some(viewer) = sess.viewer_child.take() {
         terminate_child(viewer, false, "viewer");
     }
-    drop(sess.viewer_endpoint);
     drop(sess.bwrap_stdin);
     // Kill the bwrap process group (negative PID = entire group)
     terminate_child(sess.bwrap_child, true, "bwrap");
@@ -1591,13 +1512,6 @@ fn detect_browsers() -> Vec<String> {
         .collect()
 }
 
-fn start_viewer_endpoint(
-    host_xdg_dir: &Path,
-    width: u32,
-    height: u32,
-) -> Result<ViewerEndpoint, KwinError> {
-    ViewerEndpoint::start(host_xdg_dir, width, height)
-}
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     use std::os::unix::fs::FileTypeExt;
     let (inherited_display, inherited_runtime) = (std::env::var_os("WAYLAND_DISPLAY"), std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
@@ -1643,8 +1557,7 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 /// if anything goes wrong the agent's MCP tools still work; the user just
 /// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
 /// crashes and input-forwarding diagnostics survive past the spawn.
-async fn spawn_viewer(viewer_socket: &Path) -> Option<std::process::Child> {
-    let host_xdg_dir = viewer_socket.parent()?;
+async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Option<std::process::Child> {
     let log_path = host_xdg_dir.join("viewer.log");
     let mut log_file = std::fs::File::create(&log_path).ok()?;
     let bin = resolve_viewer_binary().or_else(|| { let _ = std::io::Write::write_all(&mut log_file, b"kwin-viewer: binary not found\n"); None })?;
@@ -1652,7 +1565,9 @@ async fn spawn_viewer(viewer_socket: &Path) -> Option<std::process::Child> {
             let _ = std::io::Write::write_all(&mut log_file, format!("kwin-viewer: host Wayland resolution failed: {error:#}\n").as_bytes());
         }).ok()?;
     let mut command = std::process::Command::new(&bin);
-    command.arg(viewer_socket)
+    command.arg(host_xdg_dir)
+        .arg(width.to_string())
+        .arg(height.to_string())
         .env("XDG_RUNTIME_DIR", runtime)
         .env("WAYLAND_DISPLAY", display)
         .stdout(std::process::Stdio::null())
@@ -2763,25 +2678,20 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        let endpoint = start_viewer_endpoint(&host_xdg_dir, screen_w, screen_h)?;
-        let mut viewer_resources = StartupViewerResources::new(endpoint);
-        let viewer_child = if self.display.viewer_enabled && !self.display.server {
-            match viewer_resources.endpoint_path() {
-                Some(path) => spawn_viewer(path).await,
-                None => None,
-            }
+        let mut viewer_resources = StartupViewerResources::new();
+        viewer_resources.viewer = if self.display.viewer_enabled {
+            spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
         } else {
-            eprintln!("session_start: viewer disabled (--no-viewer/--server)");
+            eprintln!("session_start: viewer disabled (--no-viewer)");
             None
         };
-        viewer_resources.viewer = viewer_child;
-        test_startup_delay("after-viewer-endpoint").await;
+        test_startup_delay("after-viewer").await;
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
         let mut guard = self.session.lock().await;
-        let (viewer_endpoint, viewer_child) = viewer_resources.into_parts();
+        let viewer_child = viewer_resources.into_child();
         let (bwrap_child, bwrap_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
             kwin_conn,
@@ -2798,7 +2708,6 @@ impl KwinMcp {
             cdp_browser: None,
             service_proxy_children,
             viewer_child,
-            viewer_endpoint,
             overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -2818,7 +2727,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and kill every process in the container. When the server was launched with --autoclean, also remove the session workdir, including a workdir left behind by a failed session_start; if that removal fails the call errors and keeps the workdir owned, so calling session_stop again retries it. Call when finished; sessions do not auto-clean on disconnect. No-op if no session is running and nothing is left to clean.",
+        description = "Tear down the current session and its container processes. With --autoclean, remove the session workdir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
@@ -3788,7 +3697,6 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         locked: false,
         viewer_enabled: true,
         autoclean: false,
-        server: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3798,10 +3706,9 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--no-override" => cfg.locked = true,
             "--no-viewer" => cfg.viewer_enabled = false,
             "--autoclean" => cfg.autoclean = true,
-            "--server" => cfg.server = true,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--server]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean]"
                 ))
             }
         }
@@ -3829,9 +3736,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         display.width,
         display.height,
         if display.locked { " (locked, --no-override)" } else { "" },
-        if display.viewer_enabled {
-            if display.server { "disabled (--server)" } else { "enabled" }
-        } else {
+        if display.viewer_enabled { "enabled" } else {
             "disabled (--no-viewer)"
         }
     );
