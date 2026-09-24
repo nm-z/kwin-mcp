@@ -913,6 +913,7 @@ struct Session {
     _socket_links: SocketLinks,
     screen_width: u32,
     screen_height: u32,
+    last_activity: std::time::Instant,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -928,6 +929,7 @@ struct DisplayConfig {
     locked: bool,
     viewer_enabled: bool,
     autoclean: bool,
+    ttl: Option<Duration>,
 }
 
 const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1096,6 +1098,11 @@ impl KwinMcp {
             display,
         }
     }
+    async fn touch_activity(&self) {
+        if let Some(session) = self.session.lock().await.as_mut() {
+            session.last_activity = std::time::Instant::now();
+        }
+    }
     async fn with_session<R>(
         &self,
         f: impl FnOnce(&Session) -> Result<R, McpError>,
@@ -1182,6 +1189,32 @@ impl KwinMcp {
             WorkdirCleanup::Removed(dir) => eprintln!("shutdown: autoclean removed {}", dir.display()),
             WorkdirCleanup::Retained { dir, error } => {
                 eprintln!("shutdown: autoclean could not remove {}: {error}", dir.display())
+            }
+        }
+    }
+    async fn idle_reaper(self) {
+        let Some(ttl) = self.display.ttl else { return };
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _start_gate = self.start_gate.lock().await;
+            let stopped = {
+                let mut session = self.session.lock().await;
+                if session.as_ref().is_some_and(|s| s.last_activity.elapsed() >= ttl) {
+                    session.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(sess) = stopped {
+                eprintln!("ttl: session idle for {} minutes; tearing down", ttl.as_secs() / 60);
+                teardown(sess);
+                match self.workdir.remove() {
+                    WorkdirCleanup::NothingOwned => {}
+                    WorkdirCleanup::Removed(dir) => eprintln!("ttl: removed {}", dir.display()),
+                    WorkdirCleanup::Retained { dir, error } => {
+                        eprintln!("ttl: could not remove {}: {error}", dir.display())
+                    }
+                }
             }
         }
     }
@@ -2137,6 +2170,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // Held across the whole attempt, including the hard timeout, so shutdown
         // cleanup never runs while this start is still writing the workdir.
         let start_gate = self.start_gate.clone();
@@ -2772,6 +2806,7 @@ impl KwinMcp {
             _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
+            last_activity: std::time::Instant::now(),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -2787,10 +2822,11 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and its container processes. With --autoclean, remove the session workdir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
+        description = "Tear down the current session and its container processes. With --autoclean or --ttl, remove the session workdir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // Serialize stop with the entire start attempt, including workdir
         // creation and failed-start cleanup. Without this gate, stop can see no
         // published Session, delete a workdir that startup is still using, and
@@ -2845,6 +2881,7 @@ impl KwinMcp {
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -2876,6 +2913,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<WindowActivateParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -2937,6 +2975,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -3112,6 +3151,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // CDP path for Chromium/Electron apps
         let cdp_browser = self.session.lock().await
             .as_ref()
@@ -3254,6 +3294,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
 
@@ -3386,6 +3427,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
@@ -3425,6 +3467,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
@@ -3448,6 +3491,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let x = params.x;
         let y = params.y;
         let delta = params.delta;
@@ -3481,6 +3525,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let from_x = params.from_x;
         let from_y = params.from_y;
         let to_x = params.to_x;
@@ -3516,6 +3561,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardTypeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3541,6 +3587,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3577,6 +3624,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3605,6 +3653,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -3634,6 +3683,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         use std::io::Write;
         use futures::StreamExt;
 
@@ -3735,6 +3785,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         locked: false,
         viewer_enabled: true,
         autoclean: false,
+        ttl: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3744,14 +3795,25 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--no-override" => cfg.locked = true,
             "--no-viewer" => cfg.viewer_enabled = false,
             "--autoclean" => cfg.autoclean = true,
+            "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES]"
                 ))
             }
         }
     }
+    // Expiry owns the same workdir terminal transition as --autoclean.
+    cfg.autoclean |= cfg.ttl.is_some();
     Ok(cfg)
+}
+
+fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
+    let value = args.next().ok_or_else(|| "--ttl requires minutes".to_owned())?;
+    let minutes: u64 = value.parse().map_err(|error| format!("--ttl '{value}': {error}"))?;
+    if minutes == 0 { return Err("--ttl must be positive".to_owned()); }
+    let seconds = minutes.checked_mul(60).ok_or_else(|| "--ttl is too large".to_owned())?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u32, String> {
@@ -3803,7 +3865,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
+    let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper());
     let waited = service.waiting().await;
+    ttl_reaper.abort();
+    let _ = ttl_reaper.await;
     // The transport is closed, so session_stop can no longer be called. Run the
     // final terminal transition here or an owned workdir would outlive every
     // path that could still delete it.
