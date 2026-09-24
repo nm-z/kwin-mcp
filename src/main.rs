@@ -2223,7 +2223,7 @@ impl rmcp::ServerHandler for KwinMcp {
             .with_instructions(format!(
                 "KDE Wayland desktop automation in an isolated container. \
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
-                Typical flow: session_start → launch_app → find_ui_elements or accessibility_tree → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. \
+                Typical flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. Use find_ui_elements for a specific named control; use a filtered accessibility_tree only when structure helps. If the tree is empty or costly, continue with screenshots and input. \
                 If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
@@ -3256,7 +3256,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the full widget hierarchy of the active app — roles, names, states, bounds — indented by depth. Use this when you need structural context (what exists, what contains what, what state things are in). Prefer find_ui_elements when you already know the name/role of one specific widget. app_name filters to matching top-level apps; max_depth caps traversal (default 8); role filters to matching role names. show_elements=true keeps zero-rect and unnamed nodes — default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. app_name filters top-level apps; max_depth caps traversal (default 8); role filters role names. show_elements=true keeps zero-rect and unnamed nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -3399,7 +3399,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text, and bounding box — feed those coordinates into mouse_click/mouse_move. Use this when you know what you're looking for ('Submit', 'button', 'password'); use accessibility_tree instead when you need to explore structure first.",
+        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text, and bounding box for mouse_click/mouse_move. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
