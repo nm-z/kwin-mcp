@@ -2,6 +2,8 @@
 
 MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
 
+The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose between this server's isolated desktop and the user's current desktop. It requires a separately configured KWin MCP server.
+
 ## Tools
 
 | Tool | Description |
@@ -47,7 +49,11 @@ This guards against accidental host GUI control; it is not a security sandbox fo
 
 ## Codex plugin
 
-`.codex-plugin/plugin.json` makes this repository a Codex plugin, but it carries metadata only. It declares no `mcpServers` because the server currently speaks MCP over stdio and no authorized HTTPS route or authentication contract for a remote endpoint exists: `https://kwin.nm-z.com/mcp` returns 404 and neither cloudflared ingress file routes that hostname. [docs/codex-plugin.md](docs/codex-plugin.md) records the evidence, the exact route/auth contract that must hold first, the manifest change to make once it does, and the `jq` validation to run.
+The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Configure the MCP server separately; the plugin does not install a binary or declare an endpoint.
+
+## Clipboard isolation
+
+KWin MCP does not bridge clipboard contents between the host desktop and the isolated session. Each compositor keeps its own clipboard and primary selection; copying in one session does not overwrite or seed the other session.
 
 ## Session Architecture
 
