@@ -901,12 +901,13 @@ struct Session {
     service_bus_address: String,
     atspi_bus_address: String,
     eis: Eis,
-    bwrap_child: std::process::Child,
-    bwrap_stdin: std::process::ChildStdin,
+    sandbox_child: std::process::Child,
+    sandbox_stdin: std::process::ChildStdin,
     host_xdg_dir: std::path::PathBuf,
     _uinput_mouse: evdev::uinput::VirtualDevice,
     _uinput_keyboard: evdev::uinput::VirtualDevice,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
+    cdp_forward_port: u16,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
     overlay_work_paths: Vec<PathBuf>,
@@ -970,16 +971,16 @@ fn terminate_child(mut child: std::process::Child, process_group: bool, label: &
 /// them until the Session takes them, so cancelling the startup future cannot
 /// detach a process or task that has no reachable cleanup path.
 struct StartupResources {
-    bwrap_child: Option<std::process::Child>,
-    bwrap_stdin: Option<std::process::ChildStdin>,
+    sandbox_child: Option<std::process::Child>,
+    sandbox_stdin: Option<std::process::ChildStdin>,
     service_proxy_children: Vec<std::process::Child>,
 }
 
 impl StartupResources {
     fn new() -> Self {
         Self {
-            bwrap_child: None,
-            bwrap_stdin: None,
+            sandbox_child: None,
+            sandbox_stdin: None,
             service_proxy_children: Vec::new(),
         }
     }
@@ -989,9 +990,9 @@ impl StartupResources {
     }
 
     fn cleanup(&mut self) {
-        drop(self.bwrap_stdin.take());
-        if let Some(bwrap) = self.bwrap_child.take() {
-            terminate_child(bwrap, true, "startup bwrap");
+        drop(self.sandbox_stdin.take());
+        if let Some(sandbox) = self.sandbox_child.take() {
+            terminate_child(sandbox, true, "startup sandbox");
         }
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
@@ -999,15 +1000,15 @@ impl StartupResources {
     }
 
     fn into_parts(mut self) -> (std::process::Child, std::process::ChildStdin, Vec<std::process::Child>) {
-        let Some(bwrap_child) = self.bwrap_child.take() else {
-            panic!("startup bwrap child missing at Session publication");
+        let Some(sandbox_child) = self.sandbox_child.take() else {
+            panic!("startup sandbox child missing at Session publication");
         };
-        let Some(bwrap_stdin) = self.bwrap_stdin.take() else {
-            panic!("startup bwrap stdin missing at Session publication");
+        let Some(sandbox_stdin) = self.sandbox_stdin.take() else {
+            panic!("startup sandbox stdin missing at Session publication");
         };
         (
-            bwrap_child,
-            bwrap_stdin,
+            sandbox_child,
+            sandbox_stdin,
             std::mem::take(&mut self.service_proxy_children),
         )
     }
@@ -1480,9 +1481,9 @@ fn teardown(mut sess: Session) {
     if let Some(viewer) = sess.viewer_child.take() {
         terminate_child(viewer, false, "viewer");
     }
-    drop(sess.bwrap_stdin);
-    // Kill the bwrap process group (negative PID = entire group)
-    terminate_child(sess.bwrap_child, true, "bwrap");
+    drop(sess.sandbox_stdin);
+    // Kill the pasta and bwrap process group (negative PID = entire group).
+    terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
@@ -2529,8 +2530,33 @@ impl KwinMcp {
         let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
         let proxy_sock_str = system_proxy_socket.display().to_string();
 
-        let mut cmd = std::process::Command::new("bwrap");
-        cmd.args(["--die-with-parent", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+        let cdp_forward_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr().map(|address| address.port()))
+            .map_err(|error| ver_err(format!("reserve CDP forwarding port: {error}")))?;
+        let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map_err(|error| ver_err(format!("read host name: {error}")))?;
+        let host_name = host_name.trim();
+        if host_name.is_empty() {
+            return Err(ver_err("host name is empty".to_owned()));
+        }
+        use std::os::unix::fs::MetadataExt;
+        let identity = std::fs::metadata("/proc/self")
+            .map_err(|error| ver_err(format!("read current UID and GID: {error}")))?;
+        let uid = identity.uid().to_string();
+        let gid = identity.gid().to_string();
+        // pasta creates private loopback and forwards only the session's CDP
+        // port to host loopback. Disable its automatic port and gateway maps.
+        let mut cmd = std::process::Command::new("pasta");
+        let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
+        cmd.args([
+            "--quiet", "--config-net", "--no-map-gw", "--host-lo-to-ns-lo",
+            "--tcp-ports", &cdp_forward_spec, "--udp-ports", "none",
+            "--tcp-ns", "none", "--udp-ns", "none", "--", "bwrap",
+        ]);
+        cmd.args([
+            "--die-with-parent", "--unshare-user", "--uid", &uid, "--gid", &gid,
+            "--unshare-pid", "--unshare-uts", "--hostname", host_name, "--unshare-ipc",
+        ]);
         overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
@@ -2583,24 +2609,24 @@ impl KwinMcp {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
-        eprintln!("session_start: spawning bwrap");
-        let bwrap_child = match cmd.spawn() {
+        eprintln!("session_start: spawning pasta and bwrap");
+        let sandbox_child = match cmd.spawn() {
             Ok(child) => child,
-            Err(error) => return cleanup_err(error.to_string(), &mut startup),
+            Err(error) => return cleanup_err(format!("start pasta: {error} (install passt)"), &mut startup),
         };
-        startup.bwrap_child = Some(bwrap_child);
-        let bwrap_pid = startup.bwrap_child.as_ref().map(std::process::Child::id).unwrap_or_default();
-        eprintln!("session_start: bwrap spawned pid={bwrap_pid:?}");
-        if let Some(child) = startup.bwrap_child.as_ref() {
+        startup.sandbox_child = Some(sandbox_child);
+        let sandbox_pid = startup.sandbox_child.as_ref().map(std::process::Child::id).unwrap_or_default();
+        eprintln!("session_start: pasta spawned pid={sandbox_pid:?}");
+        if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
         }
-        let bwrap_stdin = startup
-            .bwrap_child
+        let sandbox_stdin = startup
+            .sandbox_child
             .as_mut()
             .and_then(|child| child.stdin.take());
-        match bwrap_stdin {
-            Some(stdin) => startup.bwrap_stdin = Some(stdin),
-            None => return cleanup_err("bwrap stdin not available".to_owned(), &mut startup),
+        match sandbox_stdin {
+            Some(stdin) => startup.sandbox_stdin = Some(stdin),
+            None => return cleanup_err("sandbox stdin not available".to_owned(), &mut startup),
         }
         test_startup_delay("after-bwrap").await;
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
@@ -2788,7 +2814,7 @@ impl KwinMcp {
             .collect();
         let mut guard = self.session.lock().await;
         let viewer_child = viewer_resources.into_child();
-        let (bwrap_child, bwrap_stdin, service_proxy_children) = startup.into_parts();
+        let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
             kwin_conn,
             _proxy_conn: proxy_conn,
@@ -2796,12 +2822,13 @@ impl KwinMcp {
             service_bus_address,
             atspi_bus_address,
             eis,
-            bwrap_child,
-            bwrap_stdin,
+            sandbox_child,
+            sandbox_stdin,
             host_xdg_dir,
             _uinput_mouse: uinput_mouse,
             _uinput_keyboard: uinput_keyboard,
             cdp_browser: None,
+            cdp_forward_port,
             service_proxy_children,
             viewer_child,
             overlay_work_paths,
@@ -3689,12 +3716,8 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-        let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
-        drop(listener);
-
         // Record current active window ID before launching
-        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address) = {
+        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port) = {
             let guard = self.session.lock().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -3705,6 +3728,7 @@ impl KwinMcp {
                 sess.host_xdg_dir.clone(),
                 sess.service_bus_address.clone(),
                 sess.atspi_bus_address.clone(),
+                sess.cdp_forward_port,
             )
         };
         let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
@@ -3728,8 +3752,8 @@ impl KwinMcp {
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.bwrap_stdin, "{launch_cmd}").map_err(KwinError::from)?;
-            sess.bwrap_stdin.flush().map_err(KwinError::from)?;
+            writeln!(sess.sandbox_stdin, "{launch_cmd}").map_err(KwinError::from)?;
+            sess.sandbox_stdin.flush().map_err(KwinError::from)?;
         }
 
         // Poll until a NEW window appears (different ID from before launch)
