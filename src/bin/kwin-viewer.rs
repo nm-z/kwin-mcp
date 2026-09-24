@@ -60,10 +60,8 @@ const BTN_MIDDLE: u32 = 0x112;
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
 
-// NUMLOCK_CONFIRM_TIMEOUT and DISPATCH_POLL_INTERVAL come from the
-// [viewer.keystate] table of kwin-mcp.toml, which build.rs deserializes,
-// validates, and emits as these constants. They are defined nowhere else.
-include!(concat!(env!("OUT_DIR"), "/viewer_settings.rs"));
+const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct Frame {
     width: u32,

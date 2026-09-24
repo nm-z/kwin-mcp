@@ -32,12 +32,6 @@ wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 pipewire = "0.9"
 
-# build.rs reads kwin-mcp.toml through these, so the settings are typed and
-# validated before anything compiles against them.
-[build-dependencies]
-serde = { version = "1", features = ["derive"] }
-toml = "1"
-
 [[bin]]
 name = "kwin-mcp"
 path = "src/main.rs"
