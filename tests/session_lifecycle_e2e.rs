@@ -239,6 +239,87 @@ fn workdir(response: &Value) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, input devices, and a live GPU session"]
+fn autoclean_sweeps_only_a_crashed_owned_session() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let initialize = |client: &mut RpcClient| {
+        client.send(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"orphan-sweep-e2e","version":"1"}
+            }),
+        );
+        let response = client.response(1, Duration::from_secs(10));
+        assert!(
+            response["result"].is_object(),
+            "initialize failed: {response}"
+        );
+        client.notify("notifications/initialized", json!({}));
+    };
+
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let dir = workdir(&started);
+    let launched = call_tool(&mut owner, 3, "launch_app", json!({"command":"konsole"}));
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "{launched}"
+    );
+    let marker =
+        std::fs::read_to_string(dir.join(".kwin-mcp-autoclean")).expect("read autoclean lease");
+    let group: i32 = marker
+        .split_whitespace()
+        .nth(2)
+        .expect("sandbox process group in lease")
+        .parse()
+        .expect("sandbox group number");
+
+    let mut other = RpcClient::start();
+    initialize(&mut other);
+    assert!(dir.exists(), "another server swept a live session");
+    other.stop_process();
+
+    owner.child.kill().expect("crash test-owned server");
+    owner.child.wait().expect("wait for crashed server");
+    assert!(dir.exists(), "crash left no orphan to test");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { nix::libc::kill(-group, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "sandbox group survived its owner"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(owner);
+
+    let mut reaper = RpcClient::start();
+    initialize(&mut reaper);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dir.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "orphan workdir was not swept: {}",
+            dir.display()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    reaper.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Python, input devices, and a live GPU session"]
 fn concurrent_sessions_bind_same_private_loopback_port() {
     assert_eq!(

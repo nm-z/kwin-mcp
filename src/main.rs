@@ -1338,6 +1338,8 @@ const WORKDIR_OWNER_RWX: u32 = 0o700;
 /// exhausting the descriptor limit. A subtree below the limit is left alone; the
 /// delete then fails and stays retryable instead of the walk breaking the server.
 const WORKDIR_REPAIR_MAX_DEPTH: u32 = 128;
+const WORKDIR_LEASE_FILE: &str = ".kwin-mcp-autoclean";
+const WORKDIR_LEASE_VERSION: &str = "kwin-mcp-autoclean-v1";
 
 /// The one session workdir this server process owns. `session_start` creates it
 /// and cleanup validates against it, so both agree on a single definition.
@@ -1409,6 +1411,12 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             format!("{} is not this server's session workdir {}", dir.display(), expected.display()),
         ));
     }
+    remove_verified_workdir(dir)
+}
+
+/// Remove a directory after the caller has proved its ownership. This helper
+/// never follows a symlink while repairing nested permissions.
+fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
     let flags = nix::fcntl::OFlag::O_PATH
         | nix::fcntl::OFlag::O_NOFOLLOW
         | nix::fcntl::OFlag::O_CLOEXEC;
@@ -1419,6 +1427,54 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error);
+    }
+    Ok(())
+}
+
+/// A previous --autoclean server explicitly marked this workdir and held its
+/// lease until exit. The marker records the sandbox process group so a crash
+/// cannot cause a later server to delete a still-running container.
+fn sweep_orphaned_workdirs() -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let temp = std::env::temp_dir();
+    let uid = std::fs::metadata("/proc/self")?.uid();
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    for entry in std::fs::read_dir(&temp)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
+        if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
+        let dir = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
+        let marker_path = dir.join(WORKDIR_LEASE_FILE);
+        let Ok(mut marker) = std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&marker_path) else { continue };
+        let Ok(marker_metadata) = marker.metadata() else { continue };
+        if !marker_metadata.file_type().is_file() || marker_metadata.uid() != uid
+            || marker_metadata.len() > 128 || marker.try_lock().is_err() { continue }
+        let mut contents = String::new();
+        if marker.read_to_string(&mut contents).is_err() { continue }
+        let mut fields = contents.split_whitespace();
+        let (Some(version), Some(owner), Some(group), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
+        let Ok(group) = group.parse::<i32>() else { continue };
+        if version != WORKDIR_LEASE_VERSION || owner != pid_text || group <= 1 { continue }
+        // kill(..., 0) only queries process-group existence. EPERM also means
+        // a live group, so only ESRCH authorizes an orphan transition.
+        if unsafe { nix::libc::kill(-group, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ESRCH) { continue }
+        let dir_text = dir.to_string_lossy();
+        let mount_prefix = format!("{dir_text}/");
+        if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
+            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
+        match remove_verified_workdir(&dir) {
+            Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
+            Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
+        }
     }
     Ok(())
 }
@@ -1437,23 +1493,48 @@ enum WorkdirCleanup {
 }
 
 /// The single authoritative record of the session workdir --autoclean still owns.
+struct WorkdirClaim {
+    dir: std::path::PathBuf,
+    lease: Option<std::fs::File>,
+}
+
 #[derive(Default)]
 struct WorkdirOwnership {
-    owned: std::sync::Mutex<Option<std::path::PathBuf>>,
+    owned: std::sync::Mutex<Option<WorkdirClaim>>,
 }
 
 impl WorkdirOwnership {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<std::path::PathBuf>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<WorkdirClaim>> {
         self.owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    /// Idle to Owned. Claiming before the directory exists means a start that
-    /// fails, is cancelled, or times out during creation is still owned.
+    /// Idle to Owned. The caller creates the directory just before this call,
+    /// with no cancellation point between creation and the claim.
     fn claim(&self, dir: &std::path::Path) {
-        *self.lock() = Some(dir.to_path_buf());
+        *self.lock() = Some(WorkdirClaim { dir: dir.to_path_buf(), lease: None });
+    }
+    fn create_lease(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut owned = self.lock();
+        let claim = owned.as_mut().ok_or_else(|| std::io::Error::other("no claimed workdir"))?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .mode(0o600).open(claim.dir.join(WORKDIR_LEASE_FILE))?;
+        file.try_lock()?;
+        claim.lease = Some(file);
+        Ok(())
+    }
+    fn mark_sandbox(&self, group: u32) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        let mut owned = self.lock();
+        let file = owned.as_mut().and_then(|claim| claim.lease.as_mut())
+            .ok_or_else(|| std::io::Error::other("no workdir lease"))?;
+        file.set_len(0)?;
+        file.rewind()?;
+        writeln!(file, "{WORKDIR_LEASE_VERSION} {} {group}", std::process::id())?;
+        file.sync_data()
     }
     /// The owned path, used by shutdown to decide whether it has work to do.
     fn owned(&self) -> Option<std::path::PathBuf> {
-        self.lock().clone()
+        self.lock().as_ref().map(|claim| claim.dir.clone())
     }
     /// The terminal transition: delete the owned workdir and release ownership
     /// only once it is actually gone. Both the delete and the release happen
@@ -1461,7 +1542,7 @@ impl WorkdirOwnership {
     /// a half-finished transition.
     fn remove(&self) -> WorkdirCleanup {
         let mut owned = self.lock();
-        let Some(dir) = owned.clone() else {
+        let Some(dir) = owned.as_ref().map(|claim| claim.dir.clone()) else {
             return WorkdirCleanup::NothingOwned;
         };
         match remove_session_workdir(&dir) {
@@ -2249,14 +2330,13 @@ impl KwinMcp {
         };
         eprintln!("session_start: virtual display {screen_w}x{screen_h}");
         let host_xdg_dir = session_workdir_path();
-        // Claim cleanup ownership before the directory exists. The claim is
-        // synchronous, so no cancellation point sits between it and the create,
-        // and every terminal outcome of this start has an owner even if the
-        // create itself fails.
+        // Creation and the ownership claim are synchronous with no cancellation
+        // point between them. Never claim an existing path from another run.
+        std::fs::create_dir(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         if self.display.autoclean {
             self.workdir.claim(&host_xdg_dir);
+            self.workdir.create_lease().map_err(|e| ver_err(format!("create workdir lease: {e}")))?;
         }
-        std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
         create_browser_wrappers(&host_xdg_dir).map_err(|e| ver_err(format!("browser wrappers: {e}")))?;
@@ -2616,6 +2696,10 @@ impl KwinMcp {
         };
         startup.sandbox_child = Some(sandbox_child);
         let sandbox_pid = startup.sandbox_child.as_ref().map(std::process::Child::id).unwrap_or_default();
+        if self.display.autoclean
+            && let Err(error) = self.workdir.mark_sandbox(sandbox_pid) {
+                return cleanup_err(format!("record sandbox owner: {error}"), &mut startup);
+            }
         eprintln!("session_start: pasta spawned pid={sandbox_pid:?}");
         if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
@@ -3866,6 +3950,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
     let display = parse_cli_args()?;
+    if display.autoclean
+        && let Err(error) = sweep_orphaned_workdirs() {
+            eprintln!("autoclean: orphan sweep skipped: {error}");
+    }
     eprintln!(
         "kwin-mcp: display default {}x{}{}; viewer {}",
         display.width,
