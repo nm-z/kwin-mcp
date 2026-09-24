@@ -1,0 +1,22 @@
+{
+  "name": "kwin-mcp",
+  "version": "0.1.0",
+  "description": "Use a configured KWin MCP server for isolated KDE desktop work.",
+  "author": {
+    "name": "Nathaniel Phelps",
+    "url": "https://github.com/nm-z"
+  },
+  "homepage": "https://github.com/nm-z/kwin-mcp#readme",
+  "repository": "https://github.com/nm-z/kwin-mcp",
+  "keywords": ["kwin", "kde", "plasma", "wayland", "gui-automation", "mcp"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "KWin MCP",
+    "shortDescription": "KDE Plasma 6 Wayland GUI automation over MCP",
+    "longDescription": "The included skill helps Codex choose between a configured KWin MCP session and the user's current desktop, and verify GUI work without disturbing the user's windows. Configure the MCP server separately.",
+    "developerName": "Nathaniel Phelps",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["Use KWin MCP to inspect this desktop app without moving my windows."]
+  }
+}
