@@ -1,0 +1,705 @@
+#![allow(clippy::expect_used)]
+
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+struct RpcClient {
+    child: Child,
+    stdin: ChildStdin,
+    responses: Receiver<Value>,
+    stderr: Receiver<String>,
+    pending: HashMap<u64, Value>,
+}
+
+impl RpcClient {
+    fn start() -> Self {
+        Self::start_with_options(None, false)
+    }
+
+    fn start_with_options(delay_stage: Option<&str>, viewer: bool) -> Self {
+        Self::start_with_test_options(delay_stage, viewer, false, false)
+    }
+
+    fn start_with_options_and_stop(
+        delay_stage: Option<&str>,
+        viewer: bool,
+        stop_bwrap: bool,
+    ) -> Self {
+        Self::start_with_test_options(delay_stage, viewer, stop_bwrap, false)
+    }
+
+    fn start_with_first_proxy_failure() -> Self {
+        Self::start_with_test_options(None, false, false, true)
+    }
+
+    fn start_with_test_options(
+        delay_stage: Option<&str>,
+        viewer: bool,
+        stop_bwrap: bool,
+        fail_after_first_proxy: bool,
+    ) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
+        for directory in [
+            home.join(".config"),
+            home.join(".local/share"),
+            home.join(".cache"),
+            home.join(".local/state"),
+            home.join(".kde"),
+        ] {
+            std::fs::create_dir_all(directory).expect("create private test HOME");
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
+        let arguments = if viewer {
+            vec!["--autoclean"]
+        } else {
+            vec!["--no-viewer", "--autoclean"]
+        };
+        command
+            .args(arguments)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("KDEHOME", home.join(".kde"))
+            .env(
+                "XDG_RUNTIME_DIR",
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
+            )
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+                    .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus")),
+            )
+            .env(
+                "WAYLAND_DISPLAY",
+                std::env::var_os("WAYLAND_DISPLAY")
+                    .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
+            );
+        if let Some(stage) = delay_stage {
+            command
+                .env("KWIN_MCP_TEST_STARTUP_DELAY_STAGE", stage)
+                .env("KWIN_MCP_TEST_STARTUP_DELAY_MS", "30000");
+        }
+        if stop_bwrap {
+            command.env("KWIN_MCP_TEST_STOP_BWRAP", "1");
+        }
+        if fail_after_first_proxy {
+            command.env("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY", "1");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kwin-mcp");
+        let stdin = child.stdin.take().expect("kwin-mcp stdin");
+        let stdout = child.stdout.take().expect("kwin-mcp stdout");
+        let stderr = child.stderr.take().expect("kwin-mcp stderr");
+        let (response_tx, responses) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(message) = serde_json::from_str::<Value>(&line) {
+                    let _ = response_tx.send(message);
+                }
+            }
+        });
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = stderr_tx.send(line);
+            }
+        });
+        Self {
+            child,
+            stdin,
+            responses,
+            stderr: stderr_rx,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn send(&mut self, id: u64, method: &str, params: Value) {
+        let request = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+        writeln!(self.stdin, "{request}").expect("write JSON-RPC request");
+        self.stdin.flush().expect("flush JSON-RPC request");
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        let request = json!({"jsonrpc":"2.0", "method":method, "params":params});
+        writeln!(self.stdin, "{request}").expect("write JSON-RPC notification");
+        self.stdin.flush().expect("flush JSON-RPC notification");
+    }
+
+    fn response(&mut self, id: u64, timeout: Duration) -> Value {
+        if let Some(message) = self.pending.remove(&id) {
+            return message;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = self
+                .responses
+                .recv_timeout(remaining)
+                .expect("JSON-RPC response");
+            if message.get("id").and_then(Value::as_u64) == Some(id) {
+                return message;
+            }
+            if let Some(other_id) = message.get("id").and_then(Value::as_u64) {
+                self.pending.insert(other_id, message);
+            }
+        }
+    }
+
+    fn wait_for_stderr(&self, text: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .stderr
+                .recv_timeout(remaining)
+                .expect("kwin-mcp startup log");
+            if line.contains(text) {
+                return line;
+            }
+        }
+    }
+
+    fn stop_process(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RpcClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let request = json!({
+                "jsonrpc":"2.0",
+                "id":9999,
+                "method":"tools/call",
+                "params":{"name":"session_stop","arguments":{}}
+            });
+            let _ = writeln!(self.stdin, "{request}");
+            let _ = self.stdin.flush();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> Value {
+    client.send(
+        id,
+        "tools/call",
+        json!({"name":name, "arguments":arguments}),
+    );
+    client.response(id, Duration::from_secs(45))
+}
+
+fn process_children(pid: u32) -> std::io::Result<Vec<String>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn process_alive(pid: u32) -> std::io::Result<bool> {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn workdir(response: &Value) -> PathBuf {
+    response["result"]["structuredContent"]["workdir"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("session_start did not return a workdir: {response}"))
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut client = RpcClient::start();
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"session-lifecycle-e2e","version":"1"}
+        }),
+    );
+    let initialize = client.response(1, Duration::from_secs(10));
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
+    client.notify("notifications/initialized", json!({}));
+
+    client.send(
+        2,
+        "tools/call",
+        json!({
+            "name":"session_start",
+            "arguments":{"width":800,"height":600}
+        }),
+    );
+    client.wait_for_stderr("host_xdg_dir ready", Duration::from_secs(20));
+    client.send(
+        3,
+        "tools/call",
+        json!({"name":"session_stop","arguments":{}}),
+    );
+
+    let stop = client.response(3, Duration::from_secs(45));
+    let start = client.response(2, Duration::from_secs(45));
+    assert!(
+        !stop["result"]["isError"].as_bool().unwrap_or(false),
+        "concurrent stop failed: {stop}"
+    );
+    assert_ne!(
+        stop["result"]["structuredContent"]["status"], "none",
+        "stop raced ahead of startup: {stop}"
+    );
+    let first_workdir = workdir(&start);
+    assert!(
+        !first_workdir.exists(),
+        "concurrent stop left {}",
+        first_workdir.display()
+    );
+
+    let second_start = call_tool(
+        &mut client,
+        4,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let second_workdir = workdir(&second_start);
+    let second_stop = call_tool(&mut client, 5, "session_stop", json!({}));
+    assert!(
+        !second_stop["result"]["isError"].as_bool().unwrap_or(false),
+        "restart stop failed: {second_stop}"
+    );
+    assert!(
+        !second_workdir.exists(),
+        "restart stop left {}",
+        second_workdir.display()
+    );
+
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn startup_timeout_reclaims_children_and_workdir() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    for (stage, viewer, stop_bwrap) in [
+        ("after-bwrap", false, false),
+        ("after-viewer", true, false),
+        ("after-bwrap", false, true),
+    ] {
+        let mut client = RpcClient::start_with_options_and_stop(Some(stage), viewer, stop_bwrap);
+        let server_pid = client.pid();
+        client.send(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"startup-timeout-e2e","version":"1"}
+            }),
+        );
+        let initialize = client.response(1, Duration::from_secs(10));
+        assert!(
+            initialize["result"].is_object(),
+            "initialize failed: {initialize}"
+        );
+        client.notify("notifications/initialized", json!({}));
+        client.send(
+            2,
+            "tools/call",
+            json!({
+                "name":"session_start",
+                "arguments":{"width":800,"height":600}
+            }),
+        );
+        let bwrap_line = client.wait_for_stderr("bwrap spawned pid=", Duration::from_secs(20));
+        let bwrap_pid = bwrap_line
+            .split_once("pid=")
+            .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("could not parse bwrap PID: {bwrap_line}"));
+        assert!(
+            process_alive(bwrap_pid).unwrap_or_else(|error| panic!("inspect bwrap: {error}")),
+            "bwrap was not alive before delayed stage {stage}"
+        );
+        if viewer {
+            let viewer_line =
+                client.wait_for_stderr("spawned viewer pid=", Duration::from_secs(20));
+            let viewer_pid = viewer_line
+                .split_once("pid=")
+                .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+                .unwrap_or_else(|| panic!("could not parse viewer PID: {viewer_line}"));
+            assert!(
+                process_alive(viewer_pid).unwrap_or_else(|error| panic!("inspect viewer: {error}")),
+                "viewer was not alive before delayed stage {stage}"
+            );
+        }
+        client.wait_for_stderr(&format!("test delay at {stage}"), Duration::from_secs(20));
+        let start = client.response(2, Duration::from_secs(45));
+        assert!(
+            start["error"].is_object() || start["result"]["isError"].as_bool() == Some(true),
+            "delayed startup unexpectedly succeeded: {start}"
+        );
+        let error_message = start["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            error_message.contains("exceeded 20s hard limit"),
+            "delayed startup did not hit the hard timeout: {start}"
+        );
+        let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
+        assert!(!workdir.exists(), "timeout left {}", workdir.display());
+        let children = process_children(server_pid)
+            .unwrap_or_else(|error| panic!("inspect child processes: {error}"));
+        assert!(
+            children.is_empty(),
+            "timeout left child processes for {stage}: {:?}",
+            children
+        );
+        client.stop_process();
+    }
+}
+
+#[test]
+#[ignore = "requires a live D-Bus session and bubblewrap environment"]
+fn first_proxy_failure_reaps_registered_proxy() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut client = RpcClient::start_with_first_proxy_failure();
+    let server_pid = client.pid();
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"proxy-rollback-e2e","version":"1"}
+        }),
+    );
+    let initialize = client.response(1, Duration::from_secs(10));
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
+    client.notify("notifications/initialized", json!({}));
+    client.send(
+        2,
+        "tools/call",
+        json!({
+            "name":"session_start",
+            "arguments":{"width":800,"height":600}
+        }),
+    );
+    let proxy_line =
+        client.wait_for_stderr("test first proxy registered pid=", Duration::from_secs(20));
+    let proxy_pid = proxy_line
+        .split_once("pid=")
+        .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| panic!("could not parse proxy PID: {proxy_line}"));
+    assert!(
+        process_alive(proxy_pid).unwrap_or_else(|error| panic!("inspect proxy: {error}")),
+        "first proxy was not alive before forced failure"
+    );
+    let start = client.response(2, Duration::from_secs(20));
+    let error_message = start["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        error_message.contains("test failure after first proxy"),
+        "startup did not report the forced proxy failure: {start}"
+    );
+    let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
+    assert!(
+        !workdir.exists(),
+        "proxy failure left {}",
+        workdir.display()
+    );
+    assert!(
+        !process_alive(proxy_pid).unwrap_or_else(|error| panic!("inspect reaped proxy: {error}")),
+        "first proxy survived forced failure"
+    );
+    let children = process_children(server_pid)
+        .unwrap_or_else(|error| panic!("inspect proxy-failure children: {error}"));
+    assert!(
+        children.is_empty(),
+        "proxy failure left children: {children:?}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, browsers, input devices, and a live GPU session"]
+fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut client = RpcClient::start();
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"launch-app-e2e","version":"1"}
+        }),
+    );
+    let initialize = client.response(1, Duration::from_secs(10));
+    assert!(
+        initialize["result"].is_object(),
+        "initialize failed: {initialize}"
+    );
+    client.notify("notifications/initialized", json!({}));
+
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":1024,"height":768}),
+    );
+    let workdir = workdir(&started);
+    let env_path = workdir.join("browser-env.txt");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "echo preparing; env | grep -E '^(DBUS_SESSION_BUS_ADDRESS|AT_SPI_BUS_ADDRESS)=' > '{}'; google-chrome-stable --no-first-run https://example.com",
+            env_path.display()
+        )}),
+    );
+    let window = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .unwrap_or("error");
+    assert!(
+        launched["error"].is_null()
+            && launched["result"]["isError"].as_bool() != Some(true)
+            && window.starts_with('{')
+            && window.ends_with('}'),
+        "Chrome did not create a managed window: {launched}"
+    );
+    let launch_env = std::fs::read_to_string(&env_path).expect("compound command environment");
+    assert!(
+        launch_env.contains(&format!(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path={}/service_bus_socket",
+            workdir.display()
+        )) && launch_env.contains("AT_SPI_BUS_ADDRESS="),
+        "Chrome launch shell did not inherit the filtered buses: {launch_env}"
+    );
+
+    let tree_deadline = Instant::now() + Duration::from_secs(20);
+    let mut next_id = 4;
+    let _tree = loop {
+        let tree = call_tool(
+            &mut client,
+            next_id,
+            "accessibility_tree",
+            json!({"max_depth":16}),
+        );
+        next_id += 1;
+        let tree_text = serde_json::to_string(&tree)
+            .expect("serialize accessibility tree")
+            .to_lowercase();
+        if tree_text.contains("document web") && tree_text.contains("example domain") {
+            break tree;
+        }
+        assert!(
+            Instant::now() < tree_deadline,
+            "Chrome accessibility tree did not expose loaded page content: {tree}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
+
+    let argv_path = workdir.join("browser-argv.txt");
+    let probe = format!(
+        "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; exe=$(readlink \"$d/exe\" 2>/dev/null) || continue; case \"$exe\" in */chrome|*/google-chrome|*/google-chrome-stable) cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf 'pid=%s\\ncmd=%s\\n' \"${{d##*/}}\" \"$cmd\" > '{}'; break;; esac;; esac; done; sleep 2",
+        argv_path.display()
+    );
+    let escaped_probe = probe.replace('\'', "'\\''");
+    let probe_result = call_tool(
+        &mut client,
+        next_id,
+        "launch_app",
+        json!({"command":format!("konsole --hold -e bash -lc '{}'", escaped_probe)}),
+    );
+    next_id += 1;
+    assert!(
+        !probe_result["result"]["isError"].as_bool().unwrap_or(false),
+        "argv probe failed: {probe_result}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let argv = loop {
+        if let Ok(value) = std::fs::read_to_string(&argv_path) {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "browser argv probe did not produce {}",
+            argv_path.display()
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        argv.starts_with("pid="),
+        "probe did not identify a browser PID: {argv}"
+    );
+    assert!(
+        argv.contains("--ozone-platform=wayland"),
+        "Chrome argv lacks Wayland switch: {argv}"
+    );
+    assert!(
+        argv.contains("--password-store=kwallet6"),
+        "Chrome argv lacks KWallet switch: {argv}"
+    );
+    assert!(
+        argv.contains("--force-renderer-accessibility"),
+        "Chrome argv lacks renderer accessibility switch: {argv}"
+    );
+    let stopped = call_tool(&mut client, next_id, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "session_stop failed: {stopped}"
+    );
+    assert!(!workdir.exists(), "session_stop left {}", workdir.display());
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, browsers, input devices, and a live GPU session"]
+fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    for command in [
+        "nohup google-chrome-stable --no-first-run https://example.com >/tmp/chromium.log 2>&1",
+        "timeout 30s google-chrome-stable --no-first-run https://example.com",
+        "nohup env LANG=C google-chrome-stable --no-first-run https://example.com",
+        "timeout 30s env LANG=C google-chrome-stable --no-first-run https://example.com",
+    ] {
+        let mut client = RpcClient::start();
+        client.send(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"wrapped-launch-e2e","version":"1"}
+            }),
+        );
+        let initialize = client.response(1, Duration::from_secs(10));
+        assert!(
+            initialize["result"].is_object(),
+            "initialize failed for {command}: {initialize}"
+        );
+        client.notify("notifications/initialized", json!({}));
+        let started = call_tool(
+            &mut client,
+            2,
+            "session_start",
+            json!({"width":1024,"height":768}),
+        );
+        let workdir = workdir(&started);
+        let launched = call_tool(&mut client, 3, "launch_app", json!({"command":command}));
+        let window = launched["result"]["structuredContent"]["window"]
+            .as_str()
+            .unwrap_or("error");
+        assert!(
+            launched["error"].is_null()
+                && launched["result"]["isError"].as_bool() != Some(true)
+                && window.starts_with('{')
+                && window.ends_with('}'),
+            "wrapped Chrome did not create a managed window for {command}: {launched}"
+        );
+
+        let argv_path = workdir.join("browser-argv.txt");
+        let probe = format!(
+            "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; exe=$(readlink \"$d/exe\" 2>/dev/null) || continue; case \"$exe\" in */chrome|*/google-chrome|*/google-chrome-stable) cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf 'pid=%s\\ncmd=%s\\n' \"${{d##*/}}\" \"$cmd\" > '{}'; break;; esac;; esac; done; sleep 2",
+            argv_path.display()
+        );
+        let escaped_probe = probe.replace('\'', "'\\''");
+        let probe_result = call_tool(
+            &mut client,
+            4,
+            "launch_app",
+            json!({"command":format!("konsole --hold -e bash -lc '{}'", escaped_probe)}),
+        );
+        assert!(
+            !probe_result["result"]["isError"].as_bool().unwrap_or(false),
+            "argv probe failed for {command}: {probe_result}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let argv = loop {
+            if let Ok(value) = std::fs::read_to_string(&argv_path) {
+                break value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "browser argv probe did not produce {} for {command}",
+                argv_path.display()
+            );
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert!(
+            argv.starts_with("pid=")
+                && argv.contains("--ozone-platform=wayland")
+                && argv.contains("--password-store=kwallet6")
+                && argv.contains("--force-renderer-accessibility"),
+            "wrapped Chrome argv missed injected switches for {command}: {argv}"
+        );
+        let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "session_stop failed for {command}: {stopped}"
+        );
+        assert!(!workdir.exists(), "session_stop left {}", workdir.display());
+        client.stop_process();
+    }
+}
