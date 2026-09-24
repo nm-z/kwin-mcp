@@ -1,6 +1,6 @@
 # kwin-mcp
 
-MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
+MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap and pasta.
 
 The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose between this server's isolated desktop and the user's current desktop. It requires a separately configured KWin MCP server.
 
@@ -28,7 +28,7 @@ Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview wi
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
 Pass `--ttl MINUTES` to tear down an idle session and its viewer after that many minutes without a tool call. The server stays available for the next `session_start`; `--ttl` implies `--autoclean`, so expiry also removes the workdir.
-To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp --no-viewer`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin and device dependencies as a local session.
+To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp --no-viewer`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin, pasta, and device dependencies as a local session.
 
 ## Strict host-GUI isolation
 
@@ -73,12 +73,13 @@ kwin-mcp (host process)
   │         (KCMs see virtual mouse/keyboard here)
   ├── kwin_conn (talks to KWin via unique name)
   │     └── EIS, ScreenShot2, Scripting
-  └── bwrap container (bubblewrap, overlayfs on $HOME)
-        ├── dbus-daemon        (isolated session bus, anonymous auth)
-        ├── kwin_wayland       (virtual display 1000x1000, XWayland)
-        ├── pipewire + wireplumber
-        ├── at-spi-bus-launcher
-        └── uinput devices     (virtual mouse + keyboard, bind-mounted)
+  └── pasta private network namespace
+        └── bwrap container (bubblewrap, overlayfs on $HOME)
+              ├── dbus-daemon        (isolated session bus, anonymous auth)
+              ├── kwin_wayland       (virtual display 1000x1000, XWayland)
+              ├── pipewire + wireplumber
+              ├── at-spi-bus-launcher
+              └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
 ### Two-phase D-Bus startup
@@ -116,7 +117,7 @@ Add your user to these groups:
 sudo usermod -aG input,uinput,video,render $USER
 ```
 
-Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor. `launch_app` sets `APPIMAGE_EXTRACT_AND_RUN=1` so compatible AppImages run without FUSE, and selects the session's Xwayland display for X11 apps.
+Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland compositor. Each session has private loopback, with only its CDP port forwarded to host loopback. The sandbox keeps the host hostname so copied HOME profile locks do not look as if they belong to another computer. `launch_app` sets `APPIMAGE_EXTRACT_AND_RUN=1` so compatible AppImages run without FUSE, and selects the session's Xwayland display for X11 apps.
 
 ## Screenshot dimensions
 

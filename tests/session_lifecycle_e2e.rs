@@ -239,6 +239,92 @@ fn workdir(response: &Value) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Python, input devices, and a live GPU session"]
+fn concurrent_sessions_bind_same_private_loopback_port() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let host_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve host port");
+    let port = host_listener
+        .local_addr()
+        .expect("host listener address")
+        .port();
+    let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("read host name");
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let mut client = RpcClient::start();
+        client.send(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"private-loopback-e2e","version":"1"}
+            }),
+        );
+        let initialized = client.response(1, Duration::from_secs(10));
+        assert!(
+            initialized["result"].is_object(),
+            "initialize failed: {initialized}"
+        );
+        client.notify("notifications/initialized", json!({}));
+        let started = call_tool(
+            &mut client,
+            2,
+            "session_start",
+            json!({"width":800,"height":600}),
+        );
+        assert_eq!(
+            started["result"]["structuredContent"]["status"], "started",
+            "{started}"
+        );
+        let dir = workdir(&started);
+        let command = format!(
+            "konsole -e bash -lc 'python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & listener=$!; sleep 1; if kill -0 \"$listener\" 2>/dev/null; then hostname > \"$XDG_RUNTIME_DIR/loopback-ready\"; fi; wait \"$listener\"'"
+        );
+        let launched = call_tool(&mut client, 3, "launch_app", json!({"command":command}));
+        assert!(
+            !launched["result"]["isError"].as_bool().unwrap_or(false),
+            "{launched}"
+        );
+        sessions.push((client, dir));
+    }
+    for (_, dir) in &sessions {
+        let marker = dir.join("loopback-ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let seen_host_name = loop {
+            if let Ok(value) = std::fs::read_to_string(&marker) {
+                break value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "listener did not bind in {}",
+                dir.display()
+            );
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert_eq!(
+            seen_host_name.trim(),
+            host_name.trim(),
+            "sandbox hostname changed"
+        );
+    }
+    drop(host_listener);
+    for (mut client, dir) in sessions {
+        let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+        assert!(!dir.exists(), "session_stop left {}", dir.display());
+        client.stop_process();
+    }
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
     assert_eq!(
