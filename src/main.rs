@@ -223,6 +223,7 @@ fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
         "down" => Some(108),                   // KEY_DOWN
         "left" => Some(105),                   // KEY_LEFT
         "right" => Some(106),                  // KEY_RIGHT
+        "numlock" | "num_lock" => Some(69),   // KEY_NUMLOCK
         "f1" => Some(59), "f2" => Some(60), "f3" => Some(61), "f4" => Some(62),
         "f5" => Some(63), "f6" => Some(64), "f7" => Some(65), "f8" => Some(66),
         "f9" => Some(67), "f10" => Some(68), "f11" => Some(87), "f12" => Some(88),
@@ -3533,7 +3534,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a single key or modifier combo — sent to whatever has focus. Syntax: bare names for standalone keys ('Return', 'Escape', 'Tab', 'Backspace', 'Delete', arrow keys, F1-F12, Home/End/PageUp/PageDown) or 'mod+mod+key' for combos ('ctrl+c', 'alt+F4', 'shift+Tab', 'ctrl+shift+t'). Use keyboard_type for literal text input instead."
+        description = "Press a key or combo in the focused window. Standalone names include Return, Escape, arrows, F1-F12, and NumLock; combos use ctrl+shift+t syntax. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
