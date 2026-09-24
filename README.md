@@ -27,6 +27,8 @@ Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview wi
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
+On startup, `--autoclean` also removes a workdir left by a crashed server when this version's lease marker proves it opted into cleanup, its lock is free, its sandbox process group has exited, and no mount remains inside it. Older workdirs without a lease marker remain for individual review.
+
 Pass `--ttl MINUTES` to tear down an idle session and its viewer after that many minutes without a tool call. The server stays available for the next `session_start`; `--ttl` implies `--autoclean`, so expiry also removes the workdir.
 To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp --no-viewer`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin, pasta, and device dependencies as a local session.
 
