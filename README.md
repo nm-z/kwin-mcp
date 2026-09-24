@@ -47,6 +47,10 @@ target/release/kwin-mcp-strict --allow-host-gui --
 
 This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
 
+## Codex plugin
+
+The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Configure the MCP server separately; the plugin does not install a binary or declare an endpoint.
+
 ## Clipboard isolation
 
 KWin MCP does not bridge clipboard contents between the host desktop and the isolated session. Each compositor keeps its own clipboard and primary selection; copying in one session does not overwrite or seed the other session.
