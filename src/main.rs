@@ -3821,8 +3821,17 @@ fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<
     Ok(n)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = runtime.block_on(run_server());
+    // Tokio's stdio reader uses a blocking thread. A signal leaves stdin open,
+    // so waiting indefinitely for that thread would keep the server alive
+    // after its session and workdir have already been cleaned up.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
