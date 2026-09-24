@@ -25,19 +25,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 
 Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
 
-Pass `--autoclean` to remove the entire `/tmp/kwin-mcp-<pid>` session workdir. Cleanup ownership is claimed before `session_start` creates the directory and released only once the directory is gone, so it covers every terminal outcome: a successful stop, a start that fails, is cancelled, or hits the 20s hard limit, and the server exiting when the client never called `session_stop`.
-
-| From | Event | To | Result |
-| --- | --- | --- | --- |
-| Idle | `session_start` claims the path | Owned | directory created under an owner |
-| Owned | `session_start` succeeds | Owned | session runs, `session_stop` owns the delete |
-| Owned | start fails, times out, or is cancelled with no session | Idle or Owned | deleted, or kept with a retry in the error |
-| Owned | `session_stop` deletes the directory | Idle | `status=stopped` or `status=cleaned` with `workdir_removed` |
-| Owned | `session_stop` cannot delete the directory | Owned | error naming the cause and the `session_stop` retry |
-| Owned | transport closes | Idle or Owned | shutdown tears the session down and deletes |
-| Idle | `session_stop` | Idle | `status=stopped` or `status=none`, as without the flag |
-
-Before deleting, the server grants owner `rwx` to directories inside the owned workdir, so a mode-000 directory that a launched command created in the overlay cannot block the delete. The repair walks open descriptors with `O_PATH | O_NOFOLLOW` and chmods only what `fstat` proves is a directory, so symlinks are never followed or modified and nothing outside the validated workdir is touched, even while the tree is being rewritten concurrently. If a delete still fails, for example because a root-owned file sits inside, `session_stop` reports the error and keeps the workdir owned; call `session_stop` again to retry, and it reports `status=cleaned` once the directory is gone. Without the flag nothing is owned, and `session_stop` and server exit retain the existing workdir behavior.
+Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, or transport close. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp --no-viewer`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin and device dependencies as a local session.
 
 ## Strict host-GUI isolation
