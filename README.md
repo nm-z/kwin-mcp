@@ -2,6 +2,8 @@
 
 MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap.
 
+The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose between this server's isolated desktop and the user's current desktop. It requires a separately configured KWin MCP server.
+
 ## Tools
 
 | Tool | Description |
@@ -59,6 +61,10 @@ target/release/kwin-mcp-strict --allow-host-gui --
 ```
 
 This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
+
+## Codex plugin
+
+The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Configure the MCP server separately; the plugin does not install a binary or declare an endpoint.
 
 ## Clipboard isolation
 
