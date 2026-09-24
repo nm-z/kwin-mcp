@@ -2381,6 +2381,7 @@ impl KwinMcp {
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
             export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
+            mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n\
             mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
@@ -2508,9 +2509,6 @@ impl KwinMcp {
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
         cmd.args([
             "--dev", "/dev",
-            // AppImages need the FUSE device to mount their embedded filesystem.
-            // `--dev-bind-try` keeps sessions portable to hosts without FUSE.
-            "--dev-bind-try", "/dev/fuse", "/dev/fuse",
             "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
@@ -3665,7 +3663,7 @@ impl KwinMcp {
             NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let launch_cmd = format!(
-            "env PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
+            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env APPIMAGE_EXTRACT_AND_RUN=1 PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
             shell_quote(&xdg.join("browser-bin").display().to_string()),
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
