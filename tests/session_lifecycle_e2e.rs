@@ -503,18 +503,33 @@ fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
         json!({"width":1024,"height":768}),
     );
     let workdir = workdir(&started);
+    let env_path = workdir.join("browser-env.txt");
     let launched = call_tool(
         &mut client,
         3,
         "launch_app",
-        json!({"command":"google-chrome-stable --no-first-run https://example.com && echo compound-done"}),
+        json!({"command":format!(
+            "echo preparing; env | grep -E '^(DBUS_SESSION_BUS_ADDRESS|AT_SPI_BUS_ADDRESS)=' > '{}'; google-chrome-stable --no-first-run https://example.com",
+            env_path.display()
+        )}),
     );
     let window = launched["result"]["structuredContent"]["window"]
         .as_str()
         .unwrap_or("error");
-    assert_ne!(
-        window, "timeout",
+    assert!(
+        launched["error"].is_null()
+            && launched["result"]["isError"].as_bool() != Some(true)
+            && window.starts_with('{')
+            && window.ends_with('}'),
         "Chrome did not create a managed window: {launched}"
+    );
+    let launch_env = std::fs::read_to_string(&env_path).expect("compound command environment");
+    assert!(
+        launch_env.contains(&format!(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path={}/service_bus_socket",
+            workdir.display()
+        )) && launch_env.contains("AT_SPI_BUS_ADDRESS="),
+        "Chrome launch shell did not inherit the filtered buses: {launch_env}"
     );
 
     let tree_deadline = Instant::now() + Duration::from_secs(20);
@@ -542,7 +557,7 @@ fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
 
     let argv_path = workdir.join("browser-argv.txt");
     let probe = format!(
-        "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf '%s\\n' \"$cmd\" > '{}'; break;; esac; done; sleep 2",
+        "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; exe=$(readlink \"$d/exe\" 2>/dev/null) || continue; case \"$exe\" in */chrome|*/google-chrome|*/google-chrome-stable) cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf 'pid=%s\\ncmd=%s\\n' \"${{d##*/}}\" \"$cmd\" > '{}'; break;; esac;; esac; done; sleep 2",
         argv_path.display()
     );
     let escaped_probe = probe.replace('\'', "'\\''");
@@ -570,6 +585,10 @@ fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
         thread::sleep(Duration::from_millis(200));
     };
     assert!(
+        argv.starts_with("pid="),
+        "probe did not identify a browser PID: {argv}"
+    );
+    assert!(
         argv.contains("--ozone-platform=wayland"),
         "Chrome argv lacks Wayland switch: {argv}"
     );
@@ -581,7 +600,6 @@ fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
         argv.contains("--force-renderer-accessibility"),
         "Chrome argv lacks renderer accessibility switch: {argv}"
     );
-
     let stopped = call_tool(&mut client, next_id, "session_stop", json!({}));
     assert!(
         !stopped["result"]["isError"].as_bool().unwrap_or(false),
@@ -603,6 +621,8 @@ fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
     for command in [
         "nohup google-chrome-stable --no-first-run https://example.com >/tmp/chromium.log 2>&1",
         "timeout 30s google-chrome-stable --no-first-run https://example.com",
+        "nohup env LANG=C google-chrome-stable --no-first-run https://example.com",
+        "timeout 30s env LANG=C google-chrome-stable --no-first-run https://example.com",
     ] {
         let mut client = RpcClient::start();
         client.send(
@@ -631,14 +651,17 @@ fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
         let window = launched["result"]["structuredContent"]["window"]
             .as_str()
             .unwrap_or("error");
-        assert_ne!(
-            window, "timeout",
+        assert!(
+            launched["error"].is_null()
+                && launched["result"]["isError"].as_bool() != Some(true)
+                && window.starts_with('{')
+                && window.ends_with('}'),
             "wrapped Chrome did not create a managed window for {command}: {launched}"
         );
 
         let argv_path = workdir.join("browser-argv.txt");
         let probe = format!(
-            "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf '%s\\n' \"$cmd\" > '{}'; break;; esac; done; sleep 2",
+            "needle=--force-renderer-$(printf accessibility); for d in /proc/[0-9]*; do p=\"$d/cmdline\"; exe=$(readlink \"$d/exe\" 2>/dev/null) || continue; case \"$exe\" in */chrome|*/google-chrome|*/google-chrome-stable) cmd=$(tr '\\0' ' ' <\"$p\" 2>/dev/null) || continue; case \"$cmd\" in *\"$needle\"*) printf 'pid=%s\\ncmd=%s\\n' \"${{d##*/}}\" \"$cmd\" > '{}'; break;; esac;; esac; done; sleep 2",
             argv_path.display()
         );
         let escaped_probe = probe.replace('\'', "'\\''");
@@ -665,7 +688,8 @@ fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
             thread::sleep(Duration::from_millis(200));
         };
         assert!(
-            argv.contains("--ozone-platform=wayland")
+            argv.starts_with("pid=")
+                && argv.contains("--ozone-platform=wayland")
                 && argv.contains("--password-store=kwallet6")
                 && argv.contains("--force-renderer-accessibility"),
             "wrapped Chrome argv missed injected switches for {command}: {argv}"

@@ -125,12 +125,7 @@ pub(crate) fn find_browser_invocation(
 /// runs, if any.
 fn analyze_command(words: &[Token]) -> Option<BrowserInvocation> {
     let mut index = skip_assignments(words, 0);
-    index = skip_leading_redirections(words, index);
-    if program_name(&words.get(index)?.value) == "env" {
-        index = skip_env_options(words, index + 1);
-        index = skip_leading_redirections(words, index);
-    }
-    index = skip_command_wrappers(words, index);
+    index = skip_command_prefixes(words, index);
     let program_word = words.get(index)?;
     if program_word.kind != TokenKind::Word {
         return None;
@@ -203,10 +198,10 @@ fn is_redirection_operator(token: &Token) -> bool {
         )
 }
 
-/// Skip wrappers whose first non-option argument is the command they execute.
-/// The wrapper itself must not receive browser switches or suppress browser
-/// detection for otherwise valid launches.
-fn skip_command_wrappers(words: &[Token], mut index: usize) -> usize {
+/// Skip composable command prefixes whose first non-option argument is the
+/// command they execute. Prefixes can be nested, as in `nohup env LANG=C
+/// chromium` or `timeout 30s env LANG=C chromium`.
+fn skip_command_prefixes(words: &[Token], mut index: usize) -> usize {
     loop {
         index = skip_leading_redirections(words, index);
         let Some(wrapper) = words.get(index) else {
@@ -216,6 +211,9 @@ fn skip_command_wrappers(words: &[Token], mut index: usize) -> usize {
             break;
         }
         match program_name(&wrapper.value).as_str() {
+            "env" => {
+                index = skip_env_options(words, index + 1);
+            }
             "nohup" => {
                 index += 1;
                 if words
@@ -709,6 +707,8 @@ mod tests {
         for command in [
             "nohup chromium https://example.com >/tmp/chromium.log 2>&1",
             "timeout 30s chromium https://example.com",
+            "nohup env LANG=C chromium https://example.com",
+            "timeout 30s env LANG=C chromium https://example.com",
         ] {
             assert_eq!(browser(command).program, "chromium");
             assert!(

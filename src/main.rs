@@ -1473,6 +1473,13 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     if candidate.exists() { Some(candidate) } else { None }
 }
 
+/// Quote one complete shell expression as a single argument to `bash -c`.
+/// This keeps control operators inside the child shell so the required
+/// environment reaches every simple command in the expression.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 /// Browser launch commands we know how to detect. The container mounts the host
 /// root read-only, so anything on the host's PATH is runnable inside the session
 /// by the same command. Ordered most- to least-common so the injected hint reads
@@ -3624,7 +3631,10 @@ impl KwinMcp {
                 None => params.command.clone(),
             };
             format!(
-                "env DBUS_SESSION_BUS_ADDRESS='{service_bus_address}' AT_SPI_BUS_ADDRESS='{atspi_bus_address}' {command}"
+                "env DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} bash -c {}",
+                shell_quote(&service_bus_address),
+                shell_quote(&atspi_bus_address),
+                shell_quote(&command),
             )
         };
         {
