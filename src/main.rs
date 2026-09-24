@@ -2405,6 +2405,12 @@ impl KwinMcp {
         )).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
         let fc_hinting_str = fc_hinting_path.display().to_string();
         let fc_lcd_str = fc_lcd_path.display().to_string();
+        let fc_hinting_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/10-hinting-slight.conf")
+            .map_err(|e| ver_err(format!("resolve fontconfig hinting destination: {e}")))?;
+        let fc_lcd_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf")
+            .map_err(|e| ver_err(format!("resolve fontconfig LCD destination: {e}")))?;
+        let fc_hinting_dest_str = fc_hinting_dest.display().to_string();
+        let fc_lcd_dest_str = fc_lcd_dest.display().to_string();
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
         let entrypoint = format!(
             "set -u\n\
@@ -2554,8 +2560,8 @@ impl KwinMcp {
             "--bind", &xdg_dir_str, &xdg_dir_str,
             // System config overrides (read-only)
             "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
-            "--ro-bind", &fc_hinting_str, "/usr/share/fontconfig/conf.default/10-hinting-slight.conf",
-            "--ro-bind", &fc_lcd_str, "/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf",
+            "--ro-bind", &fc_hinting_str, &fc_hinting_dest_str,
+            "--ro-bind", &fc_lcd_str, &fc_lcd_dest_str,
             // Mask dbus service files so the container's dbus-daemon doesn't auto-activate
             // $HOME config overrides (read-only — protects display settings from agent writes)
             "--ro-bind", &kwinrc_str, &home_kwinrc,
