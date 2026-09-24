@@ -1170,16 +1170,12 @@ impl KwinMcp {
             ),
         }
     }
-    /// Final terminal transition when the stdio transport closes. Without it an
-    /// exiting server would strand an owned workdir with no reachable retry.
-    /// Nothing is owned unless --autoclean claimed it, so the default lifecycle
-    /// is untouched.
+    /// Final terminal transition for transport close or a handled signal.
     async fn shutdown_cleanup(&self) {
         let _start_gate = self.start_gate.lock().await;
-        let Some(dir) = self.workdir.owned() else {
-            return;
-        };
-        eprintln!("shutdown: autoclean owns {}", dir.display());
+        if let Some(dir) = self.workdir.owned() {
+            eprintln!("shutdown: autoclean owns {}", dir.display());
+        }
         let stopped = self.session.lock().await.take();
         if let Some(sess) = stopped {
             teardown(sess);
@@ -3866,13 +3862,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
     let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper());
-    let waited = service.waiting().await;
+    let cancellation = service.cancellation_token();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let waited = {
+        let wait_future = service.waiting();
+        tokio::pin!(wait_future);
+        tokio::select! {
+            result = &mut wait_future => Some(result),
+            _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); None },
+            _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); None },
+            _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); None },
+        }
+    };
+    if waited.is_none() { cancellation.cancel(); }
     ttl_reaper.abort();
     let _ = ttl_reaper.await;
-    // The transport is closed, so session_stop can no longer be called. Run the
-    // final terminal transition here or an owned workdir would outlive every
-    // path that could still delete it.
     shutdown.shutdown_cleanup().await;
-    waited?;
+    if let Some(result) = waited { result?; }
     Ok(())
 }
