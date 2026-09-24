@@ -114,7 +114,7 @@ Add your user to these groups:
 sudo usermod -aG input,uinput,video,render $USER
 ```
 
-Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor.
+Requires: `bubblewrap` (bwrap) and KWin running as a Wayland compositor. `launch_app` sets `APPIMAGE_EXTRACT_AND_RUN=1` so compatible AppImages run without FUSE, and selects the session's Xwayland display for X11 apps.
 
 ## Screenshot dimensions
 
