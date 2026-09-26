@@ -98,7 +98,7 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 
 Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
 
-All coordinates are window-relative — window position is added internally via KWin scripting.
+All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
 ### Host socket exposure
 
