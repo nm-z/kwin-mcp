@@ -1,5 +1,6 @@
 mod fuse_bridge;
 mod input_bridge;
+mod wallet_mediator;
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1138,6 +1139,8 @@ struct Session {
     last_activity: std::time::Instant,
     /// When an input tool last sent events, for screenshot settling.
     last_input: Option<std::time::Instant>,
+    /// Mediator between session apps and the host KWallet.
+    wallet: Option<wallet_mediator::WalletMediator>,
     /// Whether the sandbox has the FUSE bridge; without it launch_app runs
     /// AppImages in extract-and-run mode.
     fuse_enabled: bool,
@@ -1584,6 +1587,8 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "pipewire-0-manager.lock",
         "system_bus_socket",
         "service_bus_socket",
+        "kwallet_bus",
+        "kwallet-bus.conf",
         "dbus-ready",
         "bridge-ready",
         "screenshot.png",
@@ -1857,8 +1862,12 @@ impl WorkdirOwnership {
 }
 
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests.
-async fn teardown_blocking(sess: Session) {
+/// async workers that answer other MCP requests. Host KWallet handles the
+/// session opened are released first, while the host bus is still reachable.
+async fn teardown_blocking(mut sess: Session) {
+    if let Some(wallet) = sess.wallet.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
+    }
     let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
 }
 
@@ -3271,14 +3280,60 @@ impl KwinMcp {
             Ok(address) => address,
             Err(error) => return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup),
         };
+        // Session apps reach KWallet through a mediator on a private bus (see
+        // wallet_mediator): it fails closed on an unhealthy host wallet and
+        // releases every host handle the session opens.
+        self.set_start_stage("starting the KWallet mediator");
+        let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
+        let wallet_bus_config = host_xdg_dir.join("kwallet-bus.conf");
+        if let Err(error) = std::fs::write(&wallet_bus_config, format!(
+            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
+             \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+             <busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth>\
+             <policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/>\
+             <allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>\n",
+            wallet_bus_socket.display()
+        )) {
+            return cleanup_err(format!("write KWallet bus config: {error}"), &mut startup);
+        }
+        let mut wallet_bus = std::process::Command::new("dbus-daemon");
+        wallet_bus
+            .arg(format!("--config-file={}", wallet_bus_config.display()))
+            .args(["--nofork", "--nopidfile"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        terminate_with_parent(&mut wallet_bus);
+        match wallet_bus.spawn() {
+            Ok(child) => startup.add_proxy(child),
+            Err(error) => return cleanup_err(format!("start KWallet bus: {error}"), &mut startup),
+        }
+        if let Err(error) = wait_for_socket(&wallet_bus_socket, "KWallet bus socket", std::time::Instant::now() + DBUS_PROXY_TIMEOUT).await {
+            return cleanup_err(error, &mut startup);
+        }
+        let wallet_bus_address = format!("unix:path={}", wallet_bus_socket.display());
+        let host_bus = match zbus::connection::Builder::address(host_session_bus.as_str()) {
+            Ok(builder) => builder.build().await,
+            Err(error) => Err(error),
+        };
+        let (wallet_preflight, wallet) = match host_bus {
+            Ok(host_bus) => {
+                let preflight = wallet_mediator::preflight(&host_bus).await;
+                eprintln!("session_start: KWallet: {}", preflight.reason);
+                match wallet_mediator::WalletMediator::start(&wallet_bus_address, host_bus, preflight.wallet.clone()).await {
+                    Ok(mediator) => (preflight, mediator),
+                    Err(error) => return cleanup_err(format!("KWallet mediator: {error}"), &mut startup),
+                }
+            }
+            Err(error) => return cleanup_err(format!("host session bus: {error}"), &mut startup),
+        };
         let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
         match spawn_dbus_proxy(
-            &host_session_bus,
+            &wallet_bus_address,
             &service_proxy_socket,
             &[
-                // The server never opens, enumerates, or snapshots the host
-                // KWallet. These compatibility rules must not become a host
-                // wallet read path during session_start.
+                // Upstream is the KWallet mediator's private bus, which does
+                // the real filtering (wallet_mediator); these rules only keep
+                // the session to KWallet calls on that bus.
                 "--see=org.kde.kwalletd6",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Introspectable.Introspect@/*",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.GetMachineId@/*",
@@ -3306,6 +3361,7 @@ impl KwinMcp {
                 "--call=org.kde.kwalletd6=org.kde.KWallet.mapList@/modules/kwalletd6",
                 "--call=org.kde.kwalletd6=org.kde.KWallet.passwordList@/modules/kwalletd6",
                 "--call=org.kde.kwalletd6=org.kde.KWallet.users@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.close@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
             ],
@@ -3678,6 +3734,7 @@ impl KwinMcp {
             last_activity: std::time::Instant::now(),
             last_input: None,
             fuse_enabled: fuse.is_some(),
+            wallet: Some(wallet),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -3689,6 +3746,10 @@ impl KwinMcp {
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
+            "wallet": {
+                "forwarding": wallet_preflight.wallet.is_some(),
+                "reason": wallet_preflight.reason,
+            },
         })).await)
     }
 

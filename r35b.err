@@ -1,0 +1,72 @@
+kwin-mcp: display default 3840x2160; viewer disabled (--no-viewer)
+kwin-mcp: detected browsers: google-chrome-stable
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.72 (0b7dc37) session_start
+session_start: virtual display 800x600
+session_start: host_xdg_dir ready path=/tmp/kwin-mcp-502943
+session_start: stage: scanning host mounts, sockets, and processes
+session_start: mount inventory=26 overlay-exclusions=0
+session_start: overlay plan=whole overlays=1 read-only-mounts=0
+session_start: snapshotted live SQLite database /home/nate/.codex/logs_2.sqlite
+session_start: snapshotted live SQLite database /home/nate/.codex/queue_1.sqlite
+session_start: snapshotted live SQLite database /home/nate/.codex/state_5.sqlite
+session_start: snapshotted live SQLite database /home/nate/.config/libaccounts-glib/accounts.db
+session_start: snapshotted live SQLite database /home/nate/.local/share/kactivitymanagerd/resources/database
+session_start: snapshotted live SQLite database /home/nate/.local/share/klipper/history3.sqlite
+session_start: uinput mouse=/dev/input/event22 keyboard=/dev/input/event23
+session_start: stage: starting host D-Bus proxies
+session_start: stage: starting the KWallet mediator
+session_start: KWallet: forwarding host wallet 'kdewallet' read-only
+session_start: FUSE bridge enabled (fusermount, fusermount3)
+session_start: stage: spawning the pasta and bwrap sandbox
+session_start: pasta spawned pid=502978
+session_start: stage: waiting for the container D-Bus daemon
+session_start: dbus-ready
+session_start: creating proxy_conn
+session_start: proxy_conn owns org.kde.KWin
+session_start: input devices registered on proxy_conn
+session_start: bridge-ready signaled, KWin starting
+session_start: stage: waiting for KWin's Wayland socket
+/tmp/kwin-mcp-502943/entrypoint.sh: line 22: at-spi-bus-launcher: command not found
+[W][19:15:39.905866] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][19:15:39.905916] mod.rt       | [     module-rt.c:  995 do_rtkit_setup()] RTKit does not give us MaxRealtimePriority, using 1
+[W][19:15:39.905987] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][19:15:39.905991] mod.rt       | [     module-rt.c: 1000 do_rtkit_setup()] RTKit does not give us MinNiceLevel, using 0
+[W][19:15:39.906054] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][19:15:39.906057] mod.rt       | [     module-rt.c: 1005 do_rtkit_setup()] RTKit does not give us RTTimeUSecMax, using -1
+W 19:15:39.907419             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.907444             mod.rt ../pipewire/src/modules/module-rt.c:995:do_rtkit_setup: RTKit does not give us MaxRealtimePriority, using 1
+W 19:15:39.907504             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.907507             mod.rt ../pipewire/src/modules/module-rt.c:1000:do_rtkit_setup: RTKit does not give us MinNiceLevel, using 0
+W 19:15:39.907560             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.907563             mod.rt ../pipewire/src/modules/module-rt.c:1005:do_rtkit_setup: RTKit does not give us RTTimeUSecMax, using -1
+W 19:15:39.924941             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.924957             mod.rt ../pipewire/src/modules/module-rt.c:995:do_rtkit_setup: RTKit does not give us MaxRealtimePriority, using 1
+W 19:15:39.925063             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.925073             mod.rt ../pipewire/src/modules/module-rt.c:1000:do_rtkit_setup: RTKit does not give us MinNiceLevel, using 0
+W 19:15:39.925133             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 19:15:39.925144             mod.rt ../pipewire/src/modules/module-rt.c:1005:do_rtkit_setup: RTKit does not give us RTTimeUSecMax, using -1
+N 19:15:39.932479 wp-internal-comp-l ../wireplumber/lib/wp/private/internal-comp-loader.c:589:on_component_loaded: <WpCore:0x56252941ced0> optional component 'support.logind [module: libwireplumber-module-logind]' failed to load: failed to start systemd logind monitor: -2 (No such file or directory)
+N 19:15:39.932497 wp-internal-comp-l ../wireplumber/lib/wp/private/internal-comp-loader.c:641:wp_component_array_load_task_execute_step: <WpCore:0x56252941ced0> skipping component 'monitor.bluez.seat-monitoring [virtual]' because some of its dependencies were not loaded
+E 19:15:39.935669            default ../pipewire/spa/plugins/bluez5/upower.c:54:upower_get_percentage_properties_reply: Failed to get percentage from UPower: org.freedesktop.DBus.Error.NameHasNoOwner
+W 19:15:39.936268         spa.bluez5 ../pipewire/spa/plugins/bluez5/bluez5-dbus.c:6590:get_managed_objects_reply: BlueZ system service is not available
+N 19:15:39.939723          wp-device ../wireplumber/lib/wp/device.c:1002:wp_spa_device_new_from_spa_factory: SPA handle 'api.libcamera.enum.manager' could not be loaded; is it installed?
+N 19:15:39.939745 s-monitors-libcame enumerate-device.lua:30:chunk: PipeWire's libcamera SPA plugin is missing or broken. Some camera types may not be supported.
+session_start: wayland-0 ready
+session_start: discovering KWin unique name
+session_start: KWin unique name = :1.8
+session_start: stage: connecting to KWin EIS input
+session_start: EIS fd received, negotiating
+session_start: EIS ready
+dbus-daemon[8]: [session uid=1000 pid=8 pidfd=4] Activating service name='org.a11y.Bus' requested by ':1.1' ()
+dbus-daemon[8]: [session uid=1000 pid=8 pidfd=4] Successfully activated service 'org.a11y.Bus'
+dbus-daemon[8]: [session uid=1000 pid=8 pidfd=4] Activating service name='ca.desrt.dconf' requested by ':1.10' (uid=1000 pid=66 comm="/usr/lib/at-spi-bus-launcher")
+dbus-daemon[72]: Activating service name='org.a11y.atspi.Registry' requested by ':1.0' (uid=1000 pid=13 comm="kwin_wayland --virtual --xwayland --no-lockscreen")
+dbus-daemon[8]: [session uid=1000 pid=8 pidfd=4] Successfully activated service 'ca.desrt.dconf'
+session_start: stage: starting the host viewer
+session_start: viewer disabled (--no-viewer)
+dbus-daemon[72]: Successfully activated service 'org.a11y.atspi.Registry'
+run_kwin_script: our_name=:1.1 path=/KWinMCP/1790388940504375709 registered=true
+wallet mediator: refused open(kwin-mcp-e2e-nonexistent) for kwin-mcp-e2e-probe: session may only open host wallet 'kdewallet'
+run_kwin_script: our_name=:1.1 path=/KWinMCP/1790388940708023436 registered=true
+wallet mediator: released host handle for kwin-mcp-e2e-probe
