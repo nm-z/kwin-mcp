@@ -1662,3 +1662,69 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
     call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
+
+fn host_kwallet(method: &str, body: &(impl serde::Serialize + zbus::zvariant::DynamicType)) -> Option<zbus::Message> {
+    let connection = zbus::blocking::Connection::session().ok()?;
+    connection
+        .call_method(Some("org.kde.kwalletd6"), "/modules/kwalletd6", Some("org.kde.KWallet"), method, body)
+        .ok()
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, qdbus6, an unlocked host KWallet, and a live GPU session"]
+fn session_kwallet_access_fails_closed_and_releases_host_handles() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let users = || -> Vec<String> {
+        host_kwallet("users", &("kdewallet",)).and_then(|reply| reply.body().deserialize().ok()).unwrap_or_default()
+    };
+    let wallets = || -> Vec<String> {
+        host_kwallet("wallets", &()).and_then(|reply| reply.body().deserialize().ok()).unwrap_or_default()
+    };
+    if !wallets().iter().any(|wallet| wallet == "kdewallet") || !std::path::Path::new("/usr/bin/qdbus6").exists() {
+        eprintln!("no host kdewallet or qdbus6; skipping");
+        return;
+    }
+    let (users_before, wallets_before) = (users(), wallets());
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["wallet"]["forwarding"], json!(true), "{started}");
+    let workdir = workdir(&started);
+    let q = "qdbus6 org.kde.kwalletd6 /modules/kwalletd6 org.kde.KWallet.";
+    let script = format!(
+        "exec > '{w}/wallet.part' 2>&1\n\
+         h=$({q}open kdewallet 0 kwin-mcp-e2e-kept); echo kept=$h\n\
+         h2=$({q}open kdewallet 0 kwin-mcp-e2e-closed); echo close=$({q}close $h2 false kwin-mcp-e2e-closed)\n\
+         echo missing=$({q}open kwin-mcp-e2e-missing-wallet 0 kwin-mcp-e2e-kept)\n\
+         {q}writePassword $h kwin-mcp-e2e k v kwin-mcp-e2e-kept >/dev/null 2>&1 || echo write=denied\n\
+         {q}close kdewallet true >/dev/null 2>&1 || echo close-wallet=denied\n\
+         mv '{w}/wallet.part' '{w}/wallet.txt'\n",
+        w = workdir.display()
+    );
+    std::fs::write(workdir.join("wallet.sh"), script).expect("write wallet script");
+    call_tool(&mut client, 3, "launch_app", json!({"command":format!("bash '{}'; konsole", workdir.join("wallet.sh").display())}));
+    let report = workdir.join("wallet.txt");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let result = loop {
+        if let Ok(text) = std::fs::read_to_string(&report) {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "wallet script did not finish");
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(result.lines().any(|line| line.starts_with("kept=") && line.len() > "kept=".len()), "{result}");
+    for expected in ["close=0", "missing=-1", "write=denied", "close-wallet=denied"] {
+        assert!(result.lines().any(|line| line == expected), "missing {expected:?} in:\n{result}");
+    }
+    let during = users();
+    assert!(during.iter().any(|user| user == "kwin-mcp-e2e-kept"), "{during:?}");
+    assert!(!during.iter().any(|user| user == "kwin-mcp-e2e-closed"), "session close did not release: {during:?}");
+    call_tool(&mut client, 4, "session_stop", json!({}));
+    client.stop_process();
+    assert_eq!(users(), users_before, "session left host KWallet handles");
+    assert_eq!(wallets(), wallets_before, "session changed the host wallet list");
+}
