@@ -54,6 +54,14 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
 
+// Leave time for sandbox startup after host-live SQLite snapshots. A locked
+// database must not keep the host scan running past session_start's limit.
+const SQLITE_SNAPSHOT_STARTUP_RESERVE: Duration = Duration::from_secs(5);
+const SQLITE_SNAPSHOT_PER_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
+const SQLITE_SNAPSHOT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const SQLITE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(25);
+const SQLITE_SNAPSHOT_PAGES_PER_STEP: i32 = 1024;
+
 // EIS (Emulated Input Sender) negotiation.
 const EIS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 const EIS_NEGOTIATION_POLL: Duration = Duration::from_millis(50);
@@ -1017,8 +1025,18 @@ const SQLITE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// intact. SQLite's online backup takes a consistent snapshot through the
 /// host's own locking; it lands in the upper layer with an empty WAL and
 /// shared-memory index, so the session owns a self-consistent database.
-fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
+fn snapshot_live_sqlite(
+    plan: &OverlayPlan,
+    database: &Path,
+    startup_deadline: std::time::Instant,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    use rusqlite::backup::StepResult;
+    let deadline = std::cmp::min(
+        startup_deadline,
+        std::time::Instant::now() + SQLITE_SNAPSHOT_PER_DATABASE_TIMEOUT,
+    );
+    anyhow::ensure!(std::time::Instant::now() < deadline, "snapshot deadline exceeded");
     let (upper, overlay) = plan.upper_path(database).ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
     let size = std::fs::metadata(database)?.len();
     anyhow::ensure!(size <= SQLITE_SNAPSHOT_MAX_BYTES, "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit");
@@ -1044,9 +1062,24 @@ fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<(
     ));
     let result = (|| -> anyhow::Result<()> {
         let source = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        source.busy_timeout(Duration::from_secs(2))?;
+        source.busy_timeout(SQLITE_SNAPSHOT_BUSY_TIMEOUT)?;
         let mut copy = rusqlite::Connection::open(&temporary)?;
-        rusqlite::backup::Backup::new(&source, &mut copy)?.run_to_completion(1024, Duration::ZERO, None)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut copy)?;
+        loop {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "snapshot deadline exceeded");
+            match backup.step(SQLITE_SNAPSHOT_PAGES_PER_STEP)? {
+                StepResult::Done => break,
+                StepResult::More => {}
+                StepResult::Busy | StepResult::Locked => {
+                    std::thread::sleep(std::cmp::min(
+                        SQLITE_SNAPSHOT_RETRY_DELAY,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    ));
+                }
+                _ => anyhow::bail!("unexpected SQLite backup state"),
+            }
+        }
+        drop(backup);
         drop(copy);
         let mode = std::fs::metadata(database)?.permissions().mode();
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
@@ -1076,7 +1109,12 @@ struct HostView {
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
 /// host socket exposure, and the host kdeglobals.
-fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) -> anyhow::Result<HostView> {
+fn prepare_host_view(
+    target: &Path,
+    host_xdg_dir: &Path,
+    host_runtime: &Path,
+    snapshot_deadline: std::time::Instant,
+) -> anyhow::Result<HostView> {
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
         .and_then(|process| process.mountinfo())
@@ -1103,7 +1141,7 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
         overlay_plan.read_only_binds.len()
     );
     for database in live_sqlite_databases(target) {
-        match snapshot_live_sqlite(&overlay_plan, &database) {
+        match snapshot_live_sqlite(&overlay_plan, &database, snapshot_deadline) {
             Ok(()) => eprintln!("session_start: snapshotted live SQLite database {}", database.display()),
             Err(error) => eprintln!("session_start: live SQLite database {} left shared: {error:#}", database.display()),
         }
@@ -2938,10 +2976,12 @@ impl KwinMcp {
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
         let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        let snapshot_deadline = std::time::Instant::now()
+            + (SESSION_START_HARD_TIMEOUT - SQLITE_SNAPSHOT_STARTUP_RESERVE);
         let gate = self.lifecycle_gate(deadline, "session_start").await?;
         self.set_start_stage("preparing the session workdir");
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
-        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone())).await {
+        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone(), snapshot_deadline)).await {
             Ok(res) => res,
             Err(_) => {
                 let stage = self.start_stage();
@@ -2986,6 +3026,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: SessionStartParams,
         host_work: HostWork,
+        snapshot_deadline: std::time::Instant,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -3131,7 +3172,7 @@ impl KwinMcp {
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime));
+            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime, snapshot_deadline));
         });
         if let Ok(mut slot) = host_work.lock() {
             *slot = Some(handle);

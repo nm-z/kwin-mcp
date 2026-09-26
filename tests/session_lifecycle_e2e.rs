@@ -1309,6 +1309,93 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn locked_host_sqlite_backup_does_not_block_session_start() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // Keep the test HOME outside /tmp, which the sandbox replaces with tmpfs.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let home = PathBuf::from(std::env::var("HOME").expect("HOME"))
+        .join(format!("codex/kwin-mcp-e2e-sqlite-lock-{}-{nonce}", std::process::id()));
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDir(home.clone());
+    for directory in [".config", ".local/share", ".cache", ".local/state", ".kde"] {
+        std::fs::create_dir_all(home.join(directory)).expect("create test HOME");
+    }
+    let database = home.join(".cache/locked.sqlite");
+    let setup = rusqlite::Connection::open(&database).expect("create database");
+    setup.execute_batch(
+        "pragma journal_mode=wal;
+         create table entries(value text);
+         insert into entries values ('committed');",
+    ).expect("seed WAL database");
+    drop(setup);
+
+    let holder = rusqlite::Connection::open(&database).expect("open lock holder");
+    holder.execute_batch(
+        "pragma locking_mode=exclusive;
+         begin exclusive;
+         insert into entries values ('uncommitted');",
+    ).expect("hold exclusive WAL lock");
+    let wal = home.join(".cache/locked.sqlite-wal");
+    assert!(wal.exists(), "lock holder did not open the WAL");
+    let wal_open = std::fs::read_dir("/proc/self/fd")
+        .expect("inspect test process descriptors")
+        .flatten()
+        .any(|entry| std::fs::read_link(entry.path()).ok().as_deref() == Some(wal.as_path()));
+    assert!(wal_open, "host scan cannot discover the locked WAL database");
+    let reader = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).expect("open competing reader");
+    reader.busy_timeout(Duration::from_millis(100)).expect("reader busy timeout");
+    let read_result: rusqlite::Result<i64> = reader.query_row(
+        "select count(*) from entries",
+        [],
+        |row| row.get(0),
+    );
+    assert!(read_result.is_err(), "test database is not locked: {read_result:?}");
+    drop(reader);
+
+    let home_str = home.display().to_string();
+    let mut client = RpcClient::start_with_env(&[
+        ("HOME", home_str.as_str()),
+        ("XDG_CONFIG_HOME", &format!("{home_str}/.config")),
+        ("XDG_DATA_HOME", &format!("{home_str}/.local/share")),
+        ("XDG_CACHE_HOME", &format!("{home_str}/.cache")),
+        ("XDG_STATE_HOME", &format!("{home_str}/.local/state")),
+        ("KDEHOME", &format!("{home_str}/.kde")),
+    ]);
+    initialize(&mut client);
+    let started_at = Instant::now();
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert!(started_at.elapsed() < Duration::from_secs(20), "start exceeded hard limit: {started}");
+    assert!(started["error"].is_null(), "locked database blocked startup: {started}");
+    let workdir = workdir(&started);
+    let fallback = client.wait_for_stderr("left shared: snapshot deadline exceeded", Duration::from_secs(5));
+    assert!(fallback.contains("locked.sqlite"), "unexpected fallback: {fallback}");
+    let snapshot = workdir.join("tmp/overlay-upper/.cache/.locked.sqlite.kwin-mcp-snapshot");
+    assert!(!snapshot.exists(), "partial SQLite snapshot remains at {}", snapshot.display());
+
+    let stopped = call_tool(&mut client, 3, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "session_stop was blocked: {stopped}");
+    assert!(!workdir.exists(), "session_stop left {}", workdir.display());
+    client.stop_process();
+    drop(holder);
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, python3, input devices, and a live GPU session"]
 fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
     assert_eq!(
