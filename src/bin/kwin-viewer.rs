@@ -63,6 +63,20 @@ const AXIS_HORIZONTAL: u32 = 1;
 const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Status file kwin-mcp reads to report the viewer outcome; the name is shared
+/// with src/main.rs.
+const VIEWER_STATUS_FILE: &str = "viewer-status.json";
+
+/// Atomically publish the viewer's lifecycle state: starting, streaming,
+/// ready (a frame is on the host window), closed, or failed.
+fn write_status(session: &std::path::Path, state: &str, detail: &str) {
+    let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
+    let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id()});
+    if std::fs::write(&temporary, body.to_string()).is_ok() {
+        let _ = std::fs::rename(&temporary, session.join(VIEWER_STATUS_FILE));
+    }
+}
+
 struct Frame {
     width: u32,
     height: u32,
@@ -509,6 +523,17 @@ fn main() -> anyhow::Result<()> {
     let session_dir = argv
         .next()
         .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]"))?;
+    let session_path = std::path::PathBuf::from(&session_dir);
+    write_status(&session_path, "starting", "");
+    let result = run(session_dir, argv);
+    match &result {
+        Ok(()) => write_status(&session_path, "closed", "viewer exited: window closed or session ended"),
+        Err(error) => write_status(&session_path, "failed", &format!("{error:#}")),
+    }
+    result
+}
+
+fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     // Virtual display size, passed by kwin-mcp at spawn. Defaults match the
     // server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
     let virt_w: u32 = match argv.next() {
@@ -595,6 +620,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
     eprintln!("kwin-viewer: connected to pipewire node {node_id}");
+    write_status(&session_path, "streaming", &format!("pipewire node {node_id}"));
 
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
 
@@ -642,6 +668,7 @@ fn main() -> anyhow::Result<()> {
     let mut src_dims: (u32, u32) = (0, 0);
 
     let mut input_state = InputState::default();
+    let mut ready_reported = false;
 
     let run_result = window.run(|mut frame| {
         // Leave as soon as anything the viewer depends on has ended, so the
@@ -705,6 +732,11 @@ fn main() -> anyhow::Result<()> {
             frame
                 .render_graph
                 .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
+            if !ready_reported {
+                ready_reported = true;
+                eprintln!("kwin-viewer: first frame presented");
+                write_status(&session_path, "ready", "host window is showing the session");
+            }
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
         }

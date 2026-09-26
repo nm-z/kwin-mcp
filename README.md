@@ -10,6 +10,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 |---|---|
 | `session_start` | Start an isolated KDE Wayland session. Must be called first. |
 | `session_stop` | Tear down the session and all container processes. |
+| `viewer_open` | Open the live host viewer for the current session (reports ready, starting, or unavailable with the reason). |
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
@@ -23,7 +24,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
 
-Pass `--no-viewer` when starting `kwin-mcp` to suppress only the host preview window. The isolated session and all MCP tools remain available; without the flag, the viewer still opens normally.
+Pass `--no-viewer` when starting `kwin-mcp` to suppress only the automatic host preview window. The isolated session and all MCP tools remain available, and `viewer_open` still opens the viewer on request; without the flag, the viewer opens at `session_start`. `session_start` reports the viewer outcome separately from the session: `ready` once a host window shows the session, `starting`, `unavailable` with the reason (for example no active host Wayland session when serving over SSH), or `disabled`.
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 

@@ -1182,3 +1182,51 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
     call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, a live GPU session, and a host Wayland session"]
+fn session_start_reports_viewer_outcome_and_viewer_open_opens_it() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // Viewer enabled with a working host Wayland session: ready, and running.
+    let mut client = RpcClient::start_with_options(None, true);
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let viewer = &started["result"]["structuredContent"]["viewer"];
+    assert_eq!(viewer["state"], json!("ready"), "{started}");
+    let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
+    assert!(process_alive(pid).unwrap_or(false), "reported viewer is not running");
+    let again = call_tool(&mut client, 3, "viewer_open", json!({}));
+    assert_eq!(again["result"]["structuredContent"]["status"], json!("already_open"), "{again}");
+    call_tool(&mut client, 4, "session_stop", json!({}));
+    client.stop_process();
+
+    // --no-viewer: disabled at start, and viewer_open shows it on request.
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["viewer"]["state"], json!("disabled"), "{started}");
+    let opened = call_tool(&mut client, 3, "viewer_open", json!({}));
+    assert_eq!(opened["result"]["structuredContent"]["status"], json!("opened"), "{opened}");
+    assert_eq!(opened["result"]["structuredContent"]["viewer"]["state"], json!("ready"), "{opened}");
+    call_tool(&mut client, 4, "session_stop", json!({}));
+    client.stop_process();
+
+    // No usable host Wayland display: the session still starts, and the
+    // viewer outcome says why there is no viewer.
+    let mut client = RpcClient::start_with_test_options(None, true, false, false, &[("WAYLAND_DISPLAY", "kwin-mcp-no-such-display")]);
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let content = &started["result"]["structuredContent"];
+    assert_eq!(content["status"], json!("started"), "{started}");
+    assert_eq!(content["viewer"]["state"], json!("unavailable"), "{started}");
+    assert!(
+        content["viewer"]["reason"].as_str().unwrap_or_default().contains("host Wayland resolution failed"),
+        "{started}"
+    );
+    call_tool(&mut client, 3, "session_stop", json!({}));
+    client.stop_process();
+}
