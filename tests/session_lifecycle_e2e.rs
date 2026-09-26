@@ -23,7 +23,7 @@ impl RpcClient {
     }
 
     fn start_with_options(delay_stage: Option<&str>, viewer: bool) -> Self {
-        Self::start_with_test_options(delay_stage, viewer, false, false)
+        Self::start_with_test_options(delay_stage, viewer, false, false, &[])
     }
 
     fn start_with_options_and_stop(
@@ -31,11 +31,15 @@ impl RpcClient {
         viewer: bool,
         stop_bwrap: bool,
     ) -> Self {
-        Self::start_with_test_options(delay_stage, viewer, stop_bwrap, false)
+        Self::start_with_test_options(delay_stage, viewer, stop_bwrap, false, &[])
     }
 
     fn start_with_first_proxy_failure() -> Self {
-        Self::start_with_test_options(None, false, false, true)
+        Self::start_with_test_options(None, false, false, true, &[])
+    }
+
+    fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
+        Self::start_with_test_options(None, false, false, false, extra_env)
     }
 
     fn start_with_test_options(
@@ -43,6 +47,7 @@ impl RpcClient {
         viewer: bool,
         stop_bwrap: bool,
         fail_after_first_proxy: bool,
+        extra_env: &[(&str, &str)],
     ) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -99,6 +104,7 @@ impl RpcClient {
         if fail_after_first_proxy {
             command.env("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY", "1");
         }
+        command.envs(extra_env.iter().copied());
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -202,6 +208,21 @@ impl Drop for RpcClient {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn initialize(client: &mut RpcClient) {
+    client.send(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":"kwin-mcp-e2e","version":"1"}
+        }),
+    );
+    let response = client.response(1, Duration::from_secs(10));
+    assert!(response["result"].is_object(), "initialize failed: {response}");
+    client.notify("notifications/initialized", json!({}));
 }
 
 fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> Value {
@@ -523,7 +544,7 @@ fn startup_timeout_reclaims_children_and_workdir() {
                 "arguments":{"width":800,"height":600}
             }),
         );
-        let bwrap_line = client.wait_for_stderr("bwrap spawned pid=", Duration::from_secs(20));
+        let bwrap_line = client.wait_for_stderr("pasta spawned pid=", Duration::from_secs(20));
         let bwrap_pid = bwrap_line
             .split_once("pid=")
             .and_then(|(_, value)| value.trim().parse::<u32>().ok())
@@ -869,4 +890,43 @@ fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
         assert!(!workdir.exists(), "session_stop left {}", workdir.display());
         client.stop_process();
     }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn blocked_host_scan_answers_within_hard_limit_and_cleans_later() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // A thread sleep stands in for a stat blocked on a hung FUSE mount: no
+    // async timeout can preempt it, so only the blocking-thread handoff keeps
+    // session_start inside its hard limit.
+    let mut client = RpcClient::start_with_env(&[("KWIN_MCP_TEST_BLOCK_HOST_SCAN_MS", "50000")]);
+    let server_pid = client.pid();
+    initialize(&mut client);
+    let started = Instant::now();
+    let first = call_tool(&mut client, 2, "session_start", json!({}));
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(22), "first start took {elapsed:?}: {first}");
+    let message = first["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("exceeded 20s hard limit while scanning host mounts"), "{first}");
+    assert_eq!(first["error"]["data"]["host_call_blocked"], json!(true), "{first}");
+
+    // The blocked scan still owns the gate and the workdir, so the next
+    // lifecycle call reports busy within the limit rather than hanging.
+    let started = Instant::now();
+    let second = call_tool(&mut client, 3, "session_start", json!({}));
+    assert!(started.elapsed() < Duration::from_secs(22), "second start: {second}");
+    assert_eq!(second["error"]["data"]["reason"], json!("lifecycle_busy"), "{second}");
+
+    let workdir = PathBuf::from(format!("/tmp/kwin-mcp-{server_pid}"));
+    client.wait_for_stderr("blocked host scan returned", Duration::from_secs(30));
+    assert!(!workdir.exists(), "deferred cleanup left {}", workdir.display());
+    assert!(
+        process_children(server_pid).unwrap_or_else(|error| panic!("inspect children: {error}")).is_empty(),
+        "deferred cleanup left child processes"
+    );
+    client.stop_process();
 }

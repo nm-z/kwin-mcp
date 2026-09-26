@@ -526,7 +526,7 @@ async fn connect_session_bus(
     }
 }
 
-fn spawn_dbus_proxy(
+async fn spawn_dbus_proxy(
     address: &str,
     socket: &Path,
     rules: &[&str],
@@ -546,7 +546,7 @@ fn spawn_dbus_proxy(
             let _ = child.wait();
             anyhow::bail!("D-Bus proxy socket did not appear at {}", socket.display());
         }
-        std::thread::sleep(DBUS_PROXY_POLL);
+        tokio::time::sleep(DBUS_PROXY_POLL).await;
     }
     Ok(child)
 }
@@ -791,8 +791,11 @@ fn prepare_split_overlay_directory(
         let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
 
         if context.mounts.iter().any(|mount| mount.mount_point == source) {
+            // Only a stub for bwrap's bind: the mount shadows its mode. Never
+            // stat the mount itself; a hung FUSE or network mount would block
+            // session_start in the kernel.
             if file_type.is_dir() {
-                create_staging_directory(&source, &staged, context.initialize)?;
+                std::fs::create_dir_all(&staged)?;
             }
             continue;
         }
@@ -892,6 +895,47 @@ fn prepare_overlay_plan(
     })
 }
 
+/// Blocking host scan still owned by an in-flight session_start.
+type HostWork = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+/// Host state session_start reads before it spawns the sandbox.
+struct HostView {
+    overlay_plan: OverlayPlan,
+    kdeglobals: String,
+}
+
+/// Blocking host scan for session_start: mount inventory, HOME overlay plan,
+/// host socket exposure, and the host kdeglobals.
+fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) -> anyhow::Result<HostView> {
+    test_block_host_scan();
+    let mount_inventory = procfs::process::Process::myself()
+        .and_then(|process| process.mountinfo())
+        .map(|mounts| mounts.0)
+        .map_err(|e| anyhow::anyhow!("read mount inventory: {e:#}"))?;
+    let overlay_exclusions = mount_descendants(&mount_inventory, target);
+    eprintln!(
+        "session_start: mount inventory={} overlay-exclusions={}",
+        mount_inventory.len(),
+        overlay_exclusions.len()
+    );
+    for mount in &overlay_exclusions {
+        eprintln!("session_start: excluding mount from overlay: {}", mount.display());
+    }
+    let mut overlay_plan = prepare_overlay_plan(target, &host_xdg_dir.join("tmp"), &mount_inventory)
+        .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
+    overlay_plan
+        .expose_sockets(target, host_runtime, host_xdg_dir)
+        .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
+    eprintln!(
+        "session_start: overlay plan={} overlays={} read-only-mounts={}",
+        if overlay_plan.staging_root.is_some() { "split" } else { "whole" },
+        overlay_plan.overlays.len(),
+        overlay_plan.read_only_binds.len()
+    );
+    let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
+    Ok(HostView { overlay_plan, kdeglobals })
+}
+
 // ── Session ──────────────────────────────────────────────────────────────
 
 struct Session {
@@ -964,7 +1008,19 @@ fn terminate_child(mut child: std::process::Child, process_group: bool, label: &
     }
     eprintln!("{label} did not exit after SIGTERM; escalating to SIGKILL");
     signal_child(&child, process_group, nix::sys::signal::Signal::SIGKILL);
-    let _ = child.wait();
+    let deadline = std::time::Instant::now() + STARTUP_CHILD_TERMINATION_GRACE;
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // SIGKILL is pending, but the child is blocked in the kernel (D state).
+    // Reap it off the lifecycle path so stop and start stay bounded.
+    eprintln!("{label} still blocked after SIGKILL; reaping in the background");
+    let _ = std::thread::Builder::new()
+        .name("kwin-mcp-reaper".to_owned())
+        .spawn(move || { let _ = child.wait(); });
 }
 
 /// Resources created while session_start is still unpublished. The guard owns
@@ -1064,6 +1120,22 @@ async fn test_startup_delay(stage: &str) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
+/// Debug-only stand-in for a host scan blocked in the kernel, such as a stat
+/// on a hung FUSE mount: a thread sleep that no async timeout can preempt.
+fn test_block_host_scan() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(millis) = std::env::var("KWIN_MCP_TEST_BLOCK_HOST_SCAN_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    eprintln!("session_start: test host scan blocked for {millis}ms");
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+}
+
 fn test_stop_bwrap(child: &std::process::Child) {
     if !cfg!(debug_assertions)
         || std::env::var("KWIN_MCP_TEST_STOP_BWRAP").ok().as_deref() != Some("1")
@@ -1087,6 +1159,8 @@ struct KwinMcp {
     /// a start still running when the transport closes cannot repopulate a
     /// directory that nothing is left to delete.
     start_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Last startup checkpoint reached, named in the hard-limit error.
+    start_stage: Arc<std::sync::Mutex<&'static str>>,
     display: DisplayConfig,
 }
 
@@ -1096,8 +1170,37 @@ impl KwinMcp {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
+            start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
             display,
         }
+    }
+    fn set_start_stage(&self, stage: &'static str) {
+        eprintln!("session_start: stage: {stage}");
+        if let Ok(mut current) = self.start_stage.lock() {
+            *current = stage;
+        }
+    }
+    fn start_stage(&self) -> &'static str {
+        self.start_stage.lock().map(|stage| *stage).unwrap_or("unknown")
+    }
+    /// Wait for the lifecycle gate, bounded so a start, stop, or reaper stuck
+    /// behind a blocked host call answers with an error instead of hanging.
+    async fn lifecycle_gate(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, McpError> {
+        tokio::time::timeout_at(deadline, self.start_gate.clone().lock_owned())
+            .await
+            .map_err(|_| {
+                McpError::internal_error(
+                    format!(
+                        "{operation} could not start: another session lifecycle operation is still running (last startup stage: {}). Retry shortly.",
+                        self.start_stage()
+                    ),
+                    Some(serde_json::json!({"reason": "lifecycle_busy", "stage": self.start_stage()})),
+                )
+            })
     }
     async fn touch_activity(&self) {
         if let Some(session) = self.session.lock().await.as_mut() {
@@ -1173,13 +1276,16 @@ impl KwinMcp {
     }
     /// Final terminal transition for transport close or a handled signal.
     async fn shutdown_cleanup(&self) {
-        let _start_gate = self.start_gate.lock().await;
+        let gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "shutdown cleanup").await;
+        if let Err(error) = &gate {
+            eprintln!("shutdown: {}; cleaning up without it", error.message);
+        }
         if let Some(dir) = self.workdir.owned() {
             eprintln!("shutdown: autoclean owns {}", dir.display());
         }
         let stopped = self.session.lock().await.take();
         if let Some(sess) = stopped {
-            teardown(sess);
+            teardown_blocking(sess).await;
         }
         match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {}
@@ -1193,7 +1299,11 @@ impl KwinMcp {
         let Some(ttl) = self.display.ttl else { return };
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let _start_gate = self.start_gate.lock().await;
+            let idle = self.session.lock().await.as_ref().is_some_and(|s| s.last_activity.elapsed() >= ttl);
+            if !idle {
+                continue;
+            }
+            let Ok(_start_gate) = self.start_gate.try_lock() else { continue };
             let stopped = {
                 let mut session = self.session.lock().await;
                 if session.as_ref().is_some_and(|s| s.last_activity.elapsed() >= ttl) {
@@ -1204,7 +1314,7 @@ impl KwinMcp {
             };
             if let Some(sess) = stopped {
                 eprintln!("ttl: session idle for {} minutes; tearing down", ttl.as_secs() / 60);
-                teardown(sess);
+                teardown_blocking(sess).await;
                 match self.workdir.remove() {
                     WorkdirCleanup::NothingOwned => {}
                     WorkdirCleanup::Removed(dir) => eprintln!("ttl: removed {}", dir.display()),
@@ -1553,6 +1663,12 @@ impl WorkdirOwnership {
             Err(error) => WorkdirCleanup::Retained { dir, error },
         }
     }
+}
+
+/// Teardown signals and reaps processes with bounded sleeps; keep that off the
+/// async workers that answer other MCP requests.
+async fn teardown_blocking(sess: Session) {
+    let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
 }
 
 fn teardown(mut sess: Session) {
@@ -2249,27 +2365,57 @@ impl KwinMcp {
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        // Held across the whole attempt, including the hard timeout, so shutdown
-        // cleanup never runs while this start is still writing the workdir.
-        let start_gate = self.start_gate.clone();
-        let _start_gate = start_gate.lock().await;
-        let outcome = match tokio::time::timeout(SESSION_START_HARD_TIMEOUT, self.session_start_inner(peer, params)).await {
+        // The hard limit covers the gate wait too, so a start queued behind a
+        // blocked lifecycle operation still answers within it.
+        let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        let gate = self.lifecycle_gate(deadline, "session_start").await?;
+        self.set_start_stage("preparing the session workdir");
+        let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
+        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone())).await {
             Ok(res) => res,
-            Err(_) => Err(McpError::internal_error(
-                format!("session_start exceeded {}s hard limit", SESSION_START_HARD_TIMEOUT.as_secs()),
-                None,
-            )),
+            Err(_) => {
+                let stage = self.start_stage();
+                let message = format!(
+                    "session_start exceeded {}s hard limit while {stage}",
+                    SESSION_START_HARD_TIMEOUT.as_secs()
+                );
+                eprintln!("session_start: {message}");
+                let blocked = host_work.lock().ok().and_then(|mut slot| slot.take()).filter(|handle| !handle.is_finished());
+                if let Some(handle) = blocked {
+                    // A host call is still blocked in the kernel and may yet
+                    // write into the workdir. Keep the gate and the workdir
+                    // until it returns, then run the usual failed-start cleanup.
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        let _ = handle.await;
+                        let error = this.autoclean_unpublished_workdir(McpError::internal_error("deferred startup cleanup", None)).await;
+                        eprintln!("session_start: blocked host scan returned; {}", error.message);
+                        drop(gate);
+                    });
+                    return Err(McpError::internal_error(
+                        format!("{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."),
+                        Some(serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true})),
+                    ));
+                }
+                Err(McpError::internal_error(
+                    message,
+                    Some(serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": false})),
+                ))
+            }
         };
-        match outcome {
+        let result = match outcome {
             Ok(result) => Ok(result),
             Err(error) => Err(self.autoclean_unpublished_workdir(error).await),
-        }
+        };
+        drop(gate);
+        result
     }
 
     async fn session_start_inner(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: SessionStartParams,
+        host_work: HostWork,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -2400,36 +2546,32 @@ impl KwinMcp {
         if !overlay_target.is_absolute() {
             return Err(ver_err(format!("overlay target must be absolute: {}", overlay_target.display())));
         }
-        let mount_inventory = procfs::process::Process::myself().and_then(|process| process.mountinfo()).map(|mounts| mounts.0)
-            .map_err(|e| ver_err(format!("read mount inventory: {e:#}")))?;
-        let overlay_exclusions = mount_descendants(&mount_inventory, &overlay_target);
-        eprintln!(
-            "session_start: mount inventory={} overlay-exclusions={}",
-            mount_inventory.len(),
-            overlay_exclusions.len()
-        );
-        for mount in &overlay_exclusions {
-            eprintln!("session_start: excluding mount from overlay: {}", mount.display());
-        }
-        let mut overlay_plan = prepare_overlay_plan(
-            &overlay_target,
-            &host_xdg_dir.join("tmp"),
-            &mount_inventory,
-        )
-        .map_err(|e| ver_err(format!("prepare overlays: {e:#}")))?;
         let host_runtime = std::env::var("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .map_err(|error| ver_err(format!("host runtime directory: {error}")))?;
-        overlay_plan.expose_sockets(&overlay_target, &host_runtime, &host_xdg_dir)
-            .map_err(|e| ver_err(format!("expose host sockets: {e:#}")))?;
-        eprintln!(
-            "session_start: overlay plan={} overlays={} read-only-mounts={}",
-            if overlay_plan.staging_root.is_some() { "split" } else { "whole" },
-            overlay_plan.overlays.len(),
-            overlay_plan.read_only_binds.len()
-        );
-        let real_kdeglobals = overlay_target.join(".config/kdeglobals");
-        let mut kdeglobals_content = std::fs::read_to_string(&real_kdeglobals).unwrap_or_default();
+        // Mount, socket, and /proc scans can block in the kernel on a hung
+        // FUSE or network mount, or on a process stuck in D state. Run them on
+        // a blocking thread so the hard limit can still answer; the handle
+        // stays in `host_work` so a timed-out start defers workdir cleanup
+        // until this thread has stopped writing into it.
+        self.set_start_stage("scanning host mounts, sockets, and processes");
+        let (view_tx, view_rx) = tokio::sync::oneshot::channel();
+        let view_target = overlay_target.clone();
+        let view_xdg = host_xdg_dir.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime));
+        });
+        if let Ok(mut slot) = host_work.lock() {
+            *slot = Some(handle);
+        }
+        let host_view = view_rx
+            .await
+            .map_err(|error| ver_err(format!("host scan thread: {error}")))?
+            .map_err(|error| ver_err(format!("{error:#}")))?;
+        if let Ok(mut slot) = host_work.lock() {
+            slot.take();
+        }
+        let HostView { mut overlay_plan, kdeglobals: mut kdeglobals_content } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE_SMALL, FONT_WEIGHT_REGULAR, false);
         let ui_bold = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_BOLD, true);
@@ -2534,6 +2676,7 @@ impl KwinMcp {
         // Begin ownership before the first proxy is spawned. Any failure or
         // cancellation between proxy acquisitions is therefore still covered.
         let mut startup = StartupResources::new();
+        self.set_start_stage("starting host D-Bus proxies");
         let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
         match spawn_dbus_proxy(
             "unix:path=/run/dbus/system_bus_socket",
@@ -2543,7 +2686,7 @@ impl KwinMcp {
                 "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.GetAll@/*",
                 "--broadcast=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.PropertiesChanged@/*",
             ],
-        ) {
+        ).await {
             Ok(child) => {
                 if cfg!(debug_assertions)
                     && std::env::var("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY").ok().as_deref()
@@ -2603,7 +2746,7 @@ impl KwinMcp {
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
             ],
-        ) {
+        ).await {
             Ok(child) => startup.add_proxy(child),
             Err(error) => return cleanup_err(format!("session D-Bus proxy: {error:#}"), &mut startup),
         }
@@ -2689,7 +2832,7 @@ impl KwinMcp {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
-        eprintln!("session_start: spawning pasta and bwrap");
+        self.set_start_stage("spawning the pasta and bwrap sandbox");
         let sandbox_child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => return cleanup_err(format!("start pasta: {error} (install passt)"), &mut startup),
@@ -2715,7 +2858,7 @@ impl KwinMcp {
         test_startup_delay("after-bwrap").await;
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
         let dbus_ready_path = host_xdg_dir.join("dbus-ready");
-        eprintln!("session_start: wait for dbus-ready at {}", dbus_ready_path.display());
+        self.set_start_stage("waiting for the container D-Bus daemon");
         if let Err(e) = wait_for_socket(
             &dbus_ready_path,
             "dbus-ready marker",
@@ -2774,7 +2917,7 @@ impl KwinMcp {
 
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
         let wayland_socket = host_xdg_dir.join("wayland-0");
-        eprintln!("session_start: wait for wayland-0");
+        self.set_start_stage("waiting for KWin's Wayland socket");
         if let Err(e) = wait_for_socket(
             &wayland_socket,
             "wayland-0 socket",
@@ -2836,7 +2979,7 @@ impl KwinMcp {
         eprintln!("session_start: KWin unique name = {kwin_unique_name}");
 
         // Connect to KWin EIS using its unique name
-        eprintln!("session_start: connect to KWin EIS");
+        self.set_start_stage("connecting to KWin EIS input");
         let eis_builder = KWinEisProxy::builder(&kwin_conn)
             .destination(kwin_unique_name.as_str())
             .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
@@ -2884,6 +3027,7 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
+        self.set_start_stage("starting the host viewer");
         let mut viewer_resources = StartupViewerResources::new();
         viewer_resources.viewer = if self.display.viewer_enabled {
             spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
@@ -2944,11 +3088,13 @@ impl KwinMcp {
         // creation and failed-start cleanup. Without this gate, stop can see no
         // published Session, delete a workdir that startup is still using, and
         // release cleanup ownership while start continues against the path.
-        let _start_gate = self.start_gate.lock().await;
+        let _start_gate = self
+            .lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "session_stop")
+            .await?;
         let stopped = self.session.lock().await.take();
         let had_session = stopped.is_some();
         if let Some(sess) = stopped {
-            teardown(sess);
+            teardown_blocking(sess).await;
         }
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
