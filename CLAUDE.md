@@ -10,6 +10,8 @@ Bubblewrap mounts the host root read-only and gives the container an overlay for
 
 The container reaches permitted host KWallet methods through a filtered live D-Bus proxy. The server does not dump or snapshot wallet entries. `session_start` enables `org.a11y.Status.IsEnabled`; renderer accessibility exposes Chrome web content to AT-SPI even when CDP is unavailable.
 
+The HOME overlay's lower layer is the live host HOME. SQLite databases a host process holds open in WAL mode (found through `/proc/*/fd` `-wal` descriptors) are snapshotted into the upper layer at `session_start` with SQLite's online backup and empty `-wal`/`-shm`, because a host-live WAL database read across the overlay reads as malformed.
+
 The workdir and HOME overlay live on `/tmp`, which systemd mounts as tmpfs with a per-user quota (about 80% of its size), so EDQUOT can occur while `df` shows free space. `screenshot` writes atomically, never leaves a partial or stale PNG, returns the image inline when the file cannot be saved, and names the quota numbers in its error.
 
 The optional host viewer writes `viewer-status.json` in the workdir; `session_start` and `viewer_open` report its outcome (ready, starting, unavailable with a reason, disabled) without failing the session.
