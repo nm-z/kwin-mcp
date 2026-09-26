@@ -14,6 +14,8 @@ The HOME overlay's lower layer is the live host HOME. SQLite databases a host pr
 
 The workdir and HOME overlay live on `/tmp`, which systemd mounts as tmpfs with a per-user quota (about 80% of its size), so EDQUOT can occur while `df` shows free space. `screenshot` writes atomically, never leaves a partial or stale PNG, returns the image inline when the file cannot be saved, and names the quota numbers in its error.
 
+Session writes never reach the host on their own. `export_file` reads a session path through `/proc/<bwrap child>/root` (so both HOME overlay files and the private `/tmp` work), copies it to a host path via a temporary file and rename, and compares it byte for byte; it refuses to overwrite unless asked and reports downloads still in progress.
+
 The optional host viewer writes `viewer-status.json` in the workdir; `session_start` and `viewer_open` report its outcome (ready, starting, unavailable with a reason, disabled) without failing the session.
 
 For remote MCP use, set the client's stdio command to SSH and run `kwin-mcp --no-viewer` on the remote host. SSH carries MCP messages; there is no network listener or remote viewer transport. The remote host needs KDE, bubblewrap, render and input devices, and an active user D-Bus.

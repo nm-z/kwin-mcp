@@ -1415,3 +1415,77 @@ fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
     call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, input devices, and a live GPU session"]
+fn export_file_hands_session_files_to_the_host_and_verifies_them() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let home = PathBuf::from(std::env::var("HOME").expect("HOME"))
+        .join(format!(".cache/kwin-mcp-e2e-export-{}", std::process::id()));
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDir(home.clone());
+    for directory in ["Downloads", "out", ".config", ".local/share", ".cache", ".local/state", ".kde"] {
+        std::fs::create_dir_all(home.join(directory)).expect("create test HOME");
+    }
+    let home_str = home.display().to_string();
+    let mut client = RpcClient::start_with_env(&[
+        ("HOME", home_str.as_str()),
+        ("XDG_CONFIG_HOME", &format!("{home_str}/.config")),
+        ("XDG_DATA_HOME", &format!("{home_str}/.local/share")),
+        ("XDG_CACHE_HOME", &format!("{home_str}/.cache")),
+        ("XDG_STATE_HOME", &format!("{home_str}/.local/state")),
+        ("KDEHOME", &format!("{home_str}/.kde")),
+    ]);
+    initialize(&mut client);
+    call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    // A "download" in the session HOME, a file in the session's private /tmp,
+    // and a download still in progress.
+    let download = home.join("Downloads/report.bin");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "head -c 300000 /dev/urandom > '{d}'; printf scratch > /tmp/session-note.txt; : > '{d}.crdownload.part'; : > '{home}/Downloads/partial.zip.crdownload'; konsole",
+            d = download.display(), home = home_str
+        )}),
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(!download.exists(), "session write leaked to the host without export");
+
+    let exported = call_tool(&mut client, 4, "export_file", json!({"session_path": download, "host_path": home.join("out")}));
+    let content = &exported["result"]["structuredContent"];
+    assert_eq!(content["status"], json!("exported"), "{exported}");
+    assert_eq!(content["bytes"], json!(300_000), "{exported}");
+    let host_copy = home.join("out/report.bin");
+    assert_eq!(std::fs::metadata(&host_copy).map(|meta| meta.len()).unwrap_or(0), 300_000);
+
+    let refused = call_tool(&mut client, 5, "export_file", json!({"session_path": download, "host_path": home.join("out")}));
+    assert!(refused["error"]["message"].as_str().unwrap_or_default().contains("already exists"), "{refused}");
+    let replaced = call_tool(&mut client, 6, "export_file", json!({"session_path": download, "host_path": host_copy, "overwrite": true}));
+    assert_eq!(replaced["result"]["structuredContent"]["status"], json!("exported"), "{replaced}");
+
+    // Default destination: the same path on the host (the directory the user named).
+    let default = call_tool(&mut client, 7, "export_file", json!({"session_path": download}));
+    assert_eq!(default["result"]["structuredContent"]["host_path"], json!(download.display().to_string()), "{default}");
+    assert!(download.exists());
+
+    let note = call_tool(&mut client, 8, "export_file", json!({"session_path": "/tmp/session-note.txt", "host_path": home.join("out")}));
+    assert_eq!(note["result"]["structuredContent"]["status"], json!("exported"), "{note}");
+    assert_eq!(std::fs::read_to_string(home.join("out/session-note.txt")).unwrap_or_default(), "scratch");
+
+    let partial = call_tool(&mut client, 9, "export_file", json!({"session_path": home.join("Downloads/partial.zip"), "host_path": home.join("out")}));
+    assert!(partial["error"]["message"].as_str().unwrap_or_default().contains("still downloading"), "{partial}");
+    assert!(!home.join("out/partial.zip").exists());
+    call_tool(&mut client, 10, "session_stop", json!({}));
+    client.stop_process();
+}

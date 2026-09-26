@@ -23,6 +23,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_type` | Type a string of text. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
+| `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 
 Pass `--no-viewer` when starting `kwin-mcp` to suppress only the automatic host preview window. The isolated session and all MCP tools remain available, and `viewer_open` still opens the viewer on request; without the flag, the viewer opens at `session_start`. `session_start` reports the viewer outcome separately from the session: `ready` once a host window shows the session, `starting`, `unavailable` with the reason (for example no active host Wayland session when serving over SSH), or `disabled`.
 

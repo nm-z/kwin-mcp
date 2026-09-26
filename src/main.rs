@@ -1946,7 +1946,7 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
         }
     }
     if let Ok(stat) = nix::sys::statvfs::statvfs(directory) {
-        let free = u64::from(stat.blocks_available()).saturating_mul(stat.fragment_size());
+        let free = stat.blocks_available().saturating_mul(stat.fragment_size());
         message.push_str(&format!(
             "; the filesystem itself has {} free. The session workdir, including its HOME overlay upper layer, counts against this limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
             gib(free)
@@ -1964,6 +1964,81 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     written
+}
+
+/// Root directory of the sandbox's mount namespace as seen from the host:
+/// /proc/<pid>/root of bwrap's inner child, two levels below pasta.
+fn sandbox_root(sandbox_pid: u32) -> Option<PathBuf> {
+    let children = |parent: i32| -> Vec<i32> {
+        procfs::process::all_processes()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|process| process.stat().is_ok_and(|stat| stat.ppid == parent))
+            .map(|process| process.pid)
+            .collect()
+    };
+    let pasta = i32::try_from(sandbox_pid).ok()?;
+    let outer = *children(pasta).first()?;
+    let inner = *children(outer).first()?;
+    let root = PathBuf::from(format!("/proc/{inner}/root"));
+    std::fs::read_dir(&root).ok().map(|_| root)
+}
+
+/// Stream-compare two files byte for byte.
+fn same_contents(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut a, mut b) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut left_buf, mut right_buf) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let read = a.read(&mut left_buf)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut right_buf[..read])?;
+        if left_buf[..read] != right_buf[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Copy a session file (read through the sandbox root) to a host path with a
+/// temporary file and rename, then verify the host copy byte for byte.
+fn export_session_file(source: &Path, destination: &Path, overwrite: bool) -> Result<u64, String> {
+    let metadata = std::fs::metadata(source).map_err(|error| format!("read {}: {error}", source.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", source.display()));
+    }
+    if !overwrite && std::fs::symlink_metadata(destination).is_ok() {
+        return Err(format!("{} already exists on the host; pass overwrite=true to replace it", destination.display()));
+    }
+    let parent = destination.parent().ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
+    if !parent.is_dir() {
+        return Err(format!("host directory {} does not exist", parent.display()));
+    }
+    let temporary = parent.join(format!(
+        ".{}.kwin-mcp-export",
+        destination.file_name().and_then(|name| name.to_str()).unwrap_or("file")
+    ));
+    let copied = std::fs::copy(source, &temporary)
+        .map_err(|error| describe_write_failure(&temporary, &error))
+        .and_then(|bytes| match same_contents(source, &temporary) {
+            Ok(true) => Ok(bytes),
+            Ok(false) => Err("host copy differs from the session file (was it still being written?)".to_owned()),
+            Err(error) => Err(format!("verify host copy: {error}")),
+        })
+        .and_then(|bytes| {
+            std::fs::rename(&temporary, destination)
+                .map(|()| bytes)
+                .map_err(|error| format!("rename into {}: {error}", destination.display()))
+        });
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    copied
 }
 
 /// Screenshot settling after recent input; None when no input was recent.
@@ -2736,6 +2811,21 @@ struct KeyboardKeyParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ExportFileParams {
+    /// Absolute path of the file as the session sees it, e.g. the path Chrome
+    /// reported for a finished download (/home/<user>/Downloads/report.pdf).
+    session_path: String,
+    /// Absolute host path to write, or an existing host directory to write
+    /// into under the same file name. Omit to use session_path itself, which
+    /// hands a download over to the real directory it names.
+    host_path: Option<String>,
+    /// Replace an existing host file. Default false: an existing file is left
+    /// alone and the export fails.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
 }
@@ -2796,7 +2886,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect, and a separate viewer outcome (ready, starting, unavailable with the reason, or disabled); a missing viewer never fails the session, and viewer_open can retry it. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer."
+        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect, and a separate viewer outcome (ready, starting, unavailable with the reason, or disabled); a missing viewer never fails the session, and viewer_open can retry it. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -4451,8 +4541,67 @@ impl KwinMcp {
     }
 
     #[rmcp::tool(
+        name = "export_file",
+        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
+    )]
+    async fn export_file(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<ExportFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
+        let sandbox_pid = self.with_session(|sess| Ok(sess.sandbox_child.id())).await?;
+        let session_path = PathBuf::from(&params.session_path);
+        if !session_path.is_absolute() {
+            return Err(McpError::invalid_params(format!("session_path must be absolute: {}", params.session_path), None));
+        }
+        let mut destination = PathBuf::from(params.host_path.as_deref().unwrap_or(&params.session_path));
+        if !destination.is_absolute() {
+            return Err(McpError::invalid_params(format!("host_path must be absolute: {}", destination.display()), None));
+        }
+        if destination.is_dir() {
+            let name = session_path.file_name().ok_or_else(|| McpError::invalid_params("session_path has no file name", None))?;
+            destination = destination.join(name);
+        }
+        let overwrite = params.overwrite;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let root = sandbox_root(sandbox_pid).ok_or_else(|| "cannot reach the session filesystem (sandbox not running)".to_owned())?;
+            let relative = session_path.strip_prefix("/").map_err(|error| error.to_string())?;
+            let source = root.join(relative);
+            if !source.exists() {
+                for partial in ["crdownload", "part", "download"] {
+                    let name = format!("{}.{partial}", session_path.file_name().and_then(|name| name.to_str()).unwrap_or_default());
+                    if source.with_file_name(&name).exists() {
+                        return Err(format!("{} is still downloading ({name} exists); wait for the download to finish", session_path.display()));
+                    }
+                }
+                return Err(format!("{} does not exist in the session", session_path.display()));
+            }
+            export_session_file(&source, &destination, overwrite).map(|bytes| (destination, bytes))
+        })
+        .await
+        .map_err(|error| McpError::internal_error(format!("export task: {error}"), None))?;
+        match outcome {
+            Ok((destination, bytes)) => {
+                let text = format!("exported {} -> {} ({bytes} bytes, verified)", params.session_path, destination.display());
+                Ok(structured_result(&peer, text, serde_json::json!({
+                    "status": "exported",
+                    "session_path": params.session_path,
+                    "host_path": destination.display().to_string(),
+                    "bytes": bytes,
+                    "verified": true,
+                })).await)
+            }
+            Err(reason) => Err(McpError::internal_error(
+                format!("export_file wrote nothing: {reason}"),
+                Some(serde_json::json!({"status": "not_exported", "reason": reason})),
+            )),
+        }
+    }
+
+    #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay."
+        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host."
     )]
     async fn launch_app(
         &self,
