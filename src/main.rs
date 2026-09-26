@@ -708,6 +708,19 @@ struct OverlayPlan {
 }
 
 impl OverlayPlan {
+    /// Overlay upper-layer path that shadows `path` (under `target`), or None
+    /// when the path is not under a writable overlay (read-only bind or a
+    /// file copied into the split-overlay staging root).
+    fn upper_path(&self, path: &Path) -> Option<(PathBuf, &OverlayMount)> {
+        if self.read_only_binds.iter().any(|mount| path.starts_with(mount)) {
+            return None;
+        }
+        let overlay = self.overlays.iter()
+            .filter(|overlay| path.starts_with(&overlay.destination))
+            .max_by_key(|overlay| overlay.destination.components().count())?;
+        Some((overlay.upper.join(path.strip_prefix(&overlay.destination).ok()?), overlay))
+    }
+
     fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
         if let Some(staging_root) = &self.staging_root {
@@ -962,6 +975,97 @@ fn prepare_overlay_plan(
 /// Blocking host scan still owned by an in-flight session_start.
 type HostWork = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
+/// SQLite databases a host process is writing in WAL mode under `target`,
+/// found by their open `-wal` files. Largest-first order is not needed; the
+/// list is sorted for stable logs.
+fn live_sqlite_databases(target: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(canonical_target) = std::fs::canonicalize(target) else { return Vec::new() };
+    let uid = std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or(u32::MAX);
+    let mut databases = Vec::new();
+    for process in procfs::process::all_processes().into_iter().flatten().flatten() {
+        if process.uid().ok() != Some(uid) {
+            continue;
+        }
+        for descriptor in process.fd().into_iter().flatten().flatten() {
+            let procfs::process::FDTarget::Path(path) = descriptor.target else { continue };
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            let Some(database) = name.strip_suffix("-wal") else { continue };
+            let Ok(relative) = path.with_file_name(database).strip_prefix(&canonical_target).map(Path::to_path_buf) else { continue };
+            databases.push(target.join(relative));
+        }
+    }
+    databases.sort();
+    databases.dedup();
+    databases.retain(|database| database.is_file());
+    databases
+}
+
+/// Largest live database session_start snapshots; bigger ones stay shared
+/// with the host (and may read as malformed while the host writes them).
+const SQLITE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Give the session a consistent copy of a host-live SQLite WAL database.
+///
+/// The HOME overlay's lower layer is the live host HOME. When a host app keeps
+/// writing a WAL database, the session sees the database, -wal, and -shm files
+/// change underneath it (or copied up at different moments), and SQLite
+/// locking does not coordinate across the overlay, so reads in the session
+/// fail with "database disk image is malformed" although the host copy is
+/// intact. SQLite's online backup takes a consistent snapshot through the
+/// host's own locking; it lands in the upper layer with an empty WAL and
+/// shared-memory index, so the session owns a self-consistent database.
+fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (upper, overlay) = plan.upper_path(database).ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
+    let size = std::fs::metadata(database)?.len();
+    anyhow::ensure!(size <= SQLITE_SNAPSHOT_MAX_BYTES, "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit");
+    // Recreate missing upper parents with the lower directories' modes, since
+    // a merged directory shows its upper attributes.
+    let parent = upper.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+    let mut missing = Vec::new();
+    let mut cursor = parent.to_path_buf();
+    while !cursor.exists() && cursor.starts_with(&overlay.upper) && cursor != overlay.upper {
+        missing.push(cursor.clone());
+        cursor = cursor.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?.to_path_buf();
+    }
+    for directory in missing.iter().rev() {
+        std::fs::create_dir(directory)?;
+        let lower = overlay.destination.join(directory.strip_prefix(&overlay.upper)?);
+        if let Ok(meta) = std::fs::metadata(&lower) {
+            std::fs::set_permissions(directory, meta.permissions())?;
+        }
+    }
+    let temporary = upper.with_file_name(format!(
+        ".{}.kwin-mcp-snapshot",
+        upper.file_name().and_then(|name| name.to_str()).unwrap_or("db")
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let source = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.busy_timeout(Duration::from_secs(2))?;
+        let mut copy = rusqlite::Connection::open(&temporary)?;
+        rusqlite::backup::Backup::new(&source, &mut copy)?.run_to_completion(1024, Duration::ZERO, None)?;
+        drop(copy);
+        let mode = std::fs::metadata(database)?.permissions().mode();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&temporary, &upper)?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = upper.with_file_name(format!("{}{suffix}", upper.file_name().and_then(|name| name.to_str()).unwrap_or_default()));
+            std::fs::write(&sidecar, b"")?;
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(temporary.with_file_name(format!(
+            "{}-journal",
+            temporary.file_name().and_then(|name| name.to_str()).unwrap_or_default()
+        )));
+    }
+    result
+}
+
 /// Host state session_start reads before it spawns the sandbox.
 struct HostView {
     overlay_plan: OverlayPlan,
@@ -996,6 +1100,12 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
+    for database in live_sqlite_databases(target) {
+        match snapshot_live_sqlite(&overlay_plan, &database) {
+            Ok(()) => eprintln!("session_start: snapshotted live SQLite database {}", database.display()),
+            Err(error) => eprintln!("session_start: live SQLite database {} left shared: {error:#}", database.display()),
+        }
+    }
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView { overlay_plan, kdeglobals })
 }

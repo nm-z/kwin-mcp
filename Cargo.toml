@@ -31,6 +31,7 @@ winit = "0.30"
 wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 pipewire = "0.9"
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 
 [[bin]]
 name = "kwin-mcp"

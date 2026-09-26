@@ -1244,7 +1244,7 @@ fn user_quota_headroom(dir: &std::path::Path) -> Option<u64> {
         nix::libc::syscall(
             nix::libc::SYS_quotactl_fd,
             handle.as_raw_fd(),
-            (0x0080_0007 << 8) | 0,
+            0x0080_0007 << 8, // QCMD(Q_GETQUOTA, USRQUOTA)
             uid,
             quota.as_mut_ptr(),
         )
@@ -1305,5 +1305,113 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
     let recovered = call_tool(&mut client, 7, "screenshot", json!({}));
     assert!(recovered["error"].is_null() && screenshot.exists(), "{recovered}");
     call_tool(&mut client, 8, "session_stop", json!({}));
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, python3, input devices, and a live GPU session"]
+fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The test HOME lives outside /tmp, which the sandbox replaces with tmpfs.
+    let home = PathBuf::from(std::env::var("HOME").expect("HOME"))
+        .join(format!(".cache/kwin-mcp-e2e-sqlite-{}", std::process::id()));
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDir(home.clone());
+    for directory in [".codex", ".config", ".local/share", ".cache", ".local/state", ".kde"] {
+        std::fs::create_dir_all(home.join(directory)).expect("create test HOME");
+    }
+    let database = home.join(".codex/state.sqlite");
+    let setup = rusqlite::Connection::open(&database).expect("create database");
+    setup
+        .execute_batch(
+            "pragma journal_mode=wal; create table threads(id integer primary key, body blob);
+             with recursive n(i) as (select 1 union all select i+1 from n where i < 2000)
+             insert into threads(body) select randomblob(2048) from n;",
+        )
+        .expect("seed database");
+    drop(setup);
+
+    // A host app keeps writing its thread store for the whole session.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (stop, database) = (stop.clone(), database.clone());
+        thread::spawn(move || {
+            let host = rusqlite::Connection::open(&database).expect("host connection");
+            host.execute_batch("pragma journal_mode=wal; pragma wal_autocheckpoint=100;").expect("host pragmas");
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                host.execute("insert into threads(body) values (randomblob(2048))", []).expect("host insert");
+                host.execute("delete from threads where id = (select min(id) from threads)", []).expect("host delete");
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(300));
+
+    let home_str = home.display().to_string();
+    let mut client = RpcClient::start_with_env(&[
+        ("HOME", home_str.as_str()),
+        ("XDG_CONFIG_HOME", &format!("{home_str}/.config")),
+        ("XDG_DATA_HOME", &format!("{home_str}/.local/share")),
+        ("XDG_CACHE_HOME", &format!("{home_str}/.cache")),
+        ("XDG_STATE_HOME", &format!("{home_str}/.local/state")),
+        ("KDEHOME", &format!("{home_str}/.kde")),
+    ]);
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let workdir = workdir(&started);
+    let report = workdir.join("sqlite-check.txt");
+    // Read-only and long-lived read-write connections, then a session write.
+    let script = format!(
+        "import sqlite3,time\n\
+         db='{db}'; out=open('{out}','w'); bad=0\n\
+         for i in range(20):\n\
+         \x20   c=sqlite3.connect('file:'+db+'?mode=ro',uri=True)\n\
+         \x20   c.execute('select count(*),sum(length(body)) from threads').fetchone()\n\
+         \x20   bad+=c.execute('pragma quick_check').fetchone()[0]!='ok'; c.close(); time.sleep(0.05)\n\
+         w=sqlite3.connect(db)\n\
+         for i in range(20):\n\
+         \x20   bad+=w.execute('pragma quick_check').fetchone()[0]!='ok'; time.sleep(0.05)\n\
+         w.execute(\"insert into threads(body) values (x'73657373696f6e')\"); w.commit()\n\
+         out.write('bad=%d\\n' % bad); out.close()\n",
+        db = database.display(),
+        out = report.display()
+    );
+    std::fs::write(workdir.join("sqlite-check.py"), script).expect("write check script");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("python3 '{}'; konsole", workdir.join("sqlite-check.py").display())}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let result = loop {
+        if let Ok(text) = std::fs::read_to_string(&report)
+            && text.ends_with('\n')
+        {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "session SQLite check did not finish");
+        thread::sleep(Duration::from_millis(200));
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().expect("host writer");
+    assert_eq!(result.trim(), "bad=0", "session saw a malformed database");
+
+    let host = rusqlite::Connection::open(&database).expect("reopen host database");
+    let check: String = host.query_row("pragma integrity_check", [], |row| row.get(0)).expect("host integrity");
+    assert_eq!(check, "ok");
+    let leaked: i64 = host
+        .query_row("select count(*) from threads where body = x'73657373696f6e'", [], |row| row.get(0))
+        .expect("host query");
+    assert_eq!(leaked, 0, "session write reached the host database");
+    call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
