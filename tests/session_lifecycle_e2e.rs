@@ -1014,3 +1014,79 @@ fn keyboard_key_resolves_punctuation_combos_and_rejects_unparseable_ones() {
     call_tool(&mut client, id, "session_stop", json!({}));
     client.stop_process();
 }
+
+fn inline_png(response: &Value) -> String {
+    response["result"]["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|item| item["type"] == "image"))
+        .and_then(|image| image["data"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
+fn screenshot_right_after_input_shows_the_input() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":1024,"height":768}));
+    let workdir = workdir(&started);
+    let page = workdir.join("typed.html");
+    std::fs::write(
+        &page,
+        "<html><title>T:ready</title><body style='margin:0'>\
+         <input id=i autofocus style='font-size:100px;width:100%;caret-color:transparent'>\
+         <div id=d style='font-size:100px'></div>\
+         <script>i.oninput=()=>d.textContent=i.value.length</script></body></html>",
+    )
+    .expect("write typing page");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --no-first-run --new-window 'file://{}'", page.display())}),
+    );
+    let mut id = 4;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(&mut client, id, "T:ready").is_none() {
+        id += 1;
+        assert!(Instant::now() < deadline, "typing page did not load");
+        thread::sleep(Duration::from_millis(300));
+    }
+    id += 1;
+    call_tool(&mut client, id, "mouse_click", json!({"x":300,"y":150}));
+    thread::sleep(Duration::from_millis(500));
+    for round in 0..8 {
+        id += 1;
+        call_tool(&mut client, id, "keyboard_type", json!({"text":"x"}));
+        id += 1;
+        let immediate = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        thread::sleep(Duration::from_millis(800));
+        id += 1;
+        let later = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        if inline_png(&immediate) != inline_png(&later) {
+            use base64::Engine;
+            for (name, shot) in [("immediate", &immediate), ("later", &later)] {
+                let _ = std::fs::write(
+                    std::env::temp_dir().join(format!("kwin-mcp-e2e-{name}.png")),
+                    base64::engine::general_purpose::STANDARD.decode(inline_png(shot)).unwrap_or_default(),
+                );
+            }
+            eprintln!("immediate: {}", immediate["result"]["content"][1]);
+        }
+        assert!(
+            inline_png(&immediate) == inline_png(&later) && !inline_png(&later).is_empty(),
+            "round {round}: screenshot right after keyboard_type predates the input"
+        );
+        let settle = immediate["result"]["content"][1]["text"].as_str().unwrap_or_default();
+        assert!(settle.contains("\"settled\":true"), "round {round}: {settle}");
+    }
+    id += 1;
+    call_tool(&mut client, id, "session_stop", json!({}));
+    client.stop_process();
+}
