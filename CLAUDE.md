@@ -20,6 +20,6 @@ Chrome's file chooser is its own in-process GTK4 dialog, not the portal. Enter i
 
 Session writes never reach the host on their own. `export_file` reads a session path through `/proc/<bwrap child>/root` (so both HOME overlay files and the private `/tmp` work), copies it to a host path via a temporary file and rename, and compares it byte for byte; it refuses to overwrite unless asked and reports downloads still in progress.
 
-The optional host viewer writes `viewer-status.json` in the workdir; `session_start` and `viewer_open` report its outcome (ready, starting, unavailable with a reason, disabled) without failing the session.
+The optional host viewer writes `viewer-status.json` in the workdir; `session_start` and `viewer_open` report its outcome (ready, starting, unavailable with a reason, disabled) without failing the session. The session clipboard belongs to the agent and the host clipboard to the viewer's user: the viewer watches both through `ext_data_control_v1`, sends a copy or cut made with a viewer shortcut to the host, pastes the host clipboard for a viewer paste shortcut, and then restores the agent's selection.
 
 For remote MCP use, set the client's stdio command to SSH and run `kwin-mcp --no-viewer` on the remote host. SSH carries MCP messages; there is no network listener or remote viewer transport. The remote host needs KDE, bubblewrap, render and input devices, and an active user D-Bus.
