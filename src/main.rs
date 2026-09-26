@@ -1773,6 +1773,89 @@ fn teardown(mut sess: Session) {
     cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
+/// Linux quotactl command for reading one user's quota (Q_GETQUOTA) and the
+/// quota block unit of `struct if_dqblk` (QIF_DQBLKSIZE).
+const Q_GETQUOTA: i32 = 0x0080_0007;
+const USRQUOTA: i32 = 0;
+const QUOTA_BLOCK_BYTES: u64 = 1024;
+const GIB: f64 = 1_073_741_824.0;
+
+#[repr(C)]
+#[derive(Default)]
+struct IfDqblk {
+    dqb_bhardlimit: u64,
+    dqb_bsoftlimit: u64,
+    dqb_curspace: u64,
+    dqb_ihardlimit: u64,
+    dqb_isoftlimit: u64,
+    dqb_curinodes: u64,
+    dqb_btime: u64,
+    dqb_itime: u64,
+    dqb_valid: u32,
+}
+
+fn gib(bytes: u64) -> String {
+    #[expect(clippy::as_conversions)]
+    let value = bytes as f64 / GIB;
+    format!("{value:.2} GiB")
+}
+
+/// Explain a failed write: for EDQUOT/ENOSPC, name the per-user quota (systemd
+/// mounts /tmp as tmpfs with usrquota, so a user can hit its limit while df
+/// still shows free space) and the filesystem's own free space.
+fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
+    let mut message = format!("writing {} failed: {error}", path.display());
+    let Some(code) = error.raw_os_error() else { return message };
+    if code != nix::libc::EDQUOT && code != nix::libc::ENOSPC {
+        return message;
+    }
+    let directory = path.parent().unwrap_or(path);
+    if let Ok(dir) = std::fs::File::open(directory) {
+        use std::os::fd::AsRawFd;
+        let mut quota = IfDqblk::default();
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or_default();
+        // SAFETY: quotactl_fd writes one struct if_dqblk into `quota`, which is
+        // repr(C) with the kernel layout and outlives the call.
+        let result = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_quotactl_fd,
+                dir.as_raw_fd(),
+                (Q_GETQUOTA << 8) | USRQUOTA,
+                uid,
+                std::ptr::from_mut(&mut quota),
+            )
+        };
+        if result == 0 && quota.dqb_bhardlimit > 0 {
+            let limit = quota.dqb_bhardlimit.saturating_mul(QUOTA_BLOCK_BYTES);
+            message.push_str(&format!(
+                ". Per-user disk quota for uid {uid} on this filesystem: {} used of a {} limit",
+                gib(quota.dqb_curspace),
+                gib(limit)
+            ));
+        }
+    }
+    if let Ok(stat) = nix::sys::statvfs::statvfs(directory) {
+        let free = u64::from(stat.blocks_available()).saturating_mul(stat.fragment_size());
+        message.push_str(&format!(
+            "; the filesystem itself has {} free. The session workdir, including its HOME overlay upper layer, counts against this limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
+            gib(free)
+        ));
+    }
+    message
+}
+
+/// Write `bytes` to `path` via a sibling temporary file and rename, so a
+/// failed write never leaves a truncated file at `path`.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("partial");
+    let written = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// Screenshot settling after recent input; None when no input was recent.
 struct SettleReport {
     settled: bool,
@@ -3646,10 +3729,24 @@ impl KwinMcp {
             let mut writer = enc.write_header().map_err(KwinError::from)?;
             writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
         }
-        std::fs::write(&path, &png_bytes).map_err(KwinError::from)?;
+        // Never leave a partial or stale capture at the path: on failure the
+        // previous screenshot is removed too, so the file is always this call's.
+        let write_error = write_atomically(&path, &png_bytes).err().map(|error| {
+            let _ = std::fs::remove_file(&path);
+            describe_write_failure(&path, &error)
+        });
+        if let Some(error) = &write_error {
+            eprintln!("screenshot: {error}");
+            if !params.inline {
+                return Err(McpError::internal_error(
+                    format!("screenshot captured but not saved: {error}. Pass inline=true to receive the image without writing it."),
+                    Some(serde_json::json!({"reason": "write_failed"})),
+                ));
+            }
+        }
         let path_str = path.to_string_lossy().to_string();
         let mut payload = serde_json::json!({
-            "path": path_str,
+            "path": if write_error.is_some() { serde_json::Value::Null } else { serde_json::json!(path_str) },
             "width": out_w,
             "height": out_h,
             // Window-relative rectangle the image covers: image pixel (px,py)
@@ -3670,7 +3767,13 @@ impl KwinMcp {
                 "waited_ms": u64::try_from(settle.waited.as_millis()).unwrap_or(u64::MAX),
             });
         }
-        let text = format!("{path_str} size={out_w}x{out_h}");
+        if let Some(error) = &write_error {
+            payload["write_error"] = serde_json::json!(error);
+        }
+        let text = match &write_error {
+            None => format!("{path_str} size={out_w}x{out_h}"),
+            Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
+        };
         if params.inline {
             // Claude Code's MCP client hides content[] when structured_content is also
             // set, so we can't return both the image AND a structured field at the
