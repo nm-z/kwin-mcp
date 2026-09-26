@@ -1018,6 +1018,8 @@ struct Session {
     cdp_forward_port: u16,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
+    /// Why no viewer is running when viewer_child is None.
+    viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -1472,6 +1474,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "bridge-ready",
         "screenshot.png",
         "viewer.log",
+        VIEWER_STATUS_FILE,
     ];
     const STALE_DIRS: &[&str] = &[
         "at-spi",
@@ -2011,17 +2014,34 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     Ok((runtime, display))
 }
 
+/// Status file the viewer writes (see src/bin/kwin-viewer.rs).
+const VIEWER_STATUS_FILE: &str = "viewer-status.json";
+/// How long session_start and viewer_open wait for the viewer to show a frame
+/// before reporting it as still starting.
+const VIEWER_READY_WAIT: Duration = Duration::from_secs(4);
+const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
+
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
-/// if anything goes wrong the agent's MCP tools still work; the user just
-/// doesn't see a live preview. Stderr lands in {session_dir}/viewer.log so
-/// crashes and input-forwarding diagnostics survive past the spawn.
-async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Option<std::process::Child> {
+/// if anything goes wrong the agent's MCP tools still work, and the error is
+/// the reason reported in the viewer outcome. Stderr lands in
+/// {session_dir}/viewer.log so crashes and input-forwarding diagnostics
+/// survive past the spawn.
+async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<std::process::Child, String> {
     let log_path = host_xdg_dir.join("viewer.log");
-    let mut log_file = std::fs::File::create(&log_path).ok()?;
-    let bin = resolve_viewer_binary().or_else(|| { let _ = std::io::Write::write_all(&mut log_file, b"kwin-viewer: binary not found\n"); None })?;
-    let (runtime, display) = host_wayland().await.map_err(|error| {
-            let _ = std::io::Write::write_all(&mut log_file, format!("kwin-viewer: host Wayland resolution failed: {error:#}\n").as_bytes());
-        }).ok()?;
+    let _ = std::fs::remove_file(host_xdg_dir.join(VIEWER_STATUS_FILE));
+    let mut log_file = std::fs::File::create(&log_path).map_err(|error| format!("create {}: {error}", log_path.display()))?;
+    let note = |log_file: &mut std::fs::File, reason: String| {
+        let _ = std::io::Write::write_all(log_file, format!("kwin-viewer: {reason}\n").as_bytes());
+        eprintln!("session viewer unavailable: {reason}");
+        reason
+    };
+    let Some(bin) = resolve_viewer_binary() else {
+        return Err(note(&mut log_file, "kwin-viewer binary not found next to kwin-mcp".to_owned()));
+    };
+    let (runtime, display) = match host_wayland().await {
+        Ok(found) => found,
+        Err(error) => return Err(note(&mut log_file, format!("host Wayland resolution failed: {error:#}"))),
+    };
     let mut command = std::process::Command::new(&bin);
     command.arg(host_xdg_dir)
         .arg(width.to_string())
@@ -2034,13 +2054,65 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Option<st
     match command.spawn() {
         Ok(child) => {
             eprintln!("session_start: spawned viewer pid={}", child.id());
-            Some(child)
+            Ok(child)
         }
         Err(e) => {
-            let _ = std::fs::write(&log_path, format!("kwin-viewer: spawn failed: {e}\n"));
-            eprintln!("session_start: viewer spawn failed ({e}), continuing without preview");
-            None
+            let reason = format!("spawn failed: {e}");
+            let _ = std::fs::write(&log_path, format!("kwin-viewer: {reason}\n"));
+            eprintln!("session viewer unavailable: {reason}");
+            Err(reason)
         }
+    }
+}
+
+/// The viewer outcome: ready (a frame is showing in a host window), starting,
+/// unavailable with a reason, or disabled.
+fn viewer_report(host_xdg_dir: &Path, child: Option<&mut std::process::Child>, unavailable: Option<&str>) -> serde_json::Value {
+    let log = host_xdg_dir.join("viewer.log").display().to_string();
+    let status: Option<serde_json::Value> = std::fs::read_to_string(host_xdg_dir.join(VIEWER_STATUS_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let field = |name: &str| status.as_ref().and_then(|value| value[name].as_str()).unwrap_or_default().to_owned();
+    let Some(child) = child else {
+        let reason = unavailable.unwrap_or("viewer not running");
+        let state = if reason.contains("--no-viewer") { "disabled" } else { "unavailable" };
+        return serde_json::json!({"state": state, "reason": reason, "log": log});
+    };
+    if let Ok(Some(exit)) = child.try_wait() {
+        let detail = field("detail");
+        let reason = if detail.is_empty() { format!("viewer exited ({exit})") } else { format!("viewer exited ({exit}): {detail}") };
+        return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
+    }
+    match field("state").as_str() {
+        "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
+        "failed" | "closed" => serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log}),
+        phase => serde_json::json!({
+            "state": "starting",
+            "phase": if phase.is_empty() { "launching" } else { phase },
+            "pid": child.id(),
+            "log": log,
+        }),
+    }
+}
+
+/// Poll the viewer until it is ready, has failed, or VIEWER_READY_WAIT passes.
+async fn wait_for_viewer(host_xdg_dir: &Path, child: &mut std::process::Child) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + VIEWER_READY_WAIT;
+    loop {
+        let report = viewer_report(host_xdg_dir, Some(child), None);
+        if report["state"] != "starting" || std::time::Instant::now() >= deadline {
+            return report;
+        }
+        tokio::time::sleep(VIEWER_READY_POLL).await;
+    }
+}
+
+/// One-line summary of a viewer report for tool text output.
+fn viewer_summary(report: &serde_json::Value) -> String {
+    match report["state"].as_str().unwrap_or_default() {
+        "ready" => "viewer=ready".to_owned(),
+        "starting" => format!("viewer=starting ({})", report["phase"].as_str().unwrap_or_default()),
+        state => format!("viewer={state}: {}", report["reason"].as_str().unwrap_or_default()),
     }
 }
 
@@ -2531,7 +2603,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer."
+        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect, and a separate viewer outcome (ready, starting, unavailable with the reason, or disabled); a missing viewer never fails the session, and viewer_open can retry it. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer."
     )]
     async fn session_start(
         &self,
@@ -2605,10 +2677,11 @@ impl KwinMcp {
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
         {
-            let guard = self.session.lock().await;
-            if let Some(existing) = guard.as_ref() {
+            let mut guard = self.session.lock().await;
+            if let Some(existing) = guard.as_mut() {
                 let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
                 let workdir = existing.host_xdg_dir.display().to_string();
+                let viewer = viewer_report(&existing.host_xdg_dir, existing.viewer_child.as_mut(), existing.viewer_unavailable.as_deref());
                 let msg = format!(
                     "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
                     existing.kwin_unique_name, existing.screen_width, existing.screen_height,
@@ -2622,6 +2695,7 @@ impl KwinMcp {
                     "workdir": workdir,
                     "width": existing.screen_width,
                     "height": existing.screen_height,
+                    "viewer": viewer,
                 })).await);
             }
         }
@@ -3203,13 +3277,22 @@ impl KwinMcp {
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
         self.set_start_stage("starting the host viewer");
         let mut viewer_resources = StartupViewerResources::new();
-        viewer_resources.viewer = if self.display.viewer_enabled {
-            spawn_viewer(&host_xdg_dir, screen_w, screen_h).await
+        let mut viewer_unavailable = None;
+        if self.display.viewer_enabled {
+            match spawn_viewer(&host_xdg_dir, screen_w, screen_h).await {
+                Ok(child) => viewer_resources.viewer = Some(child),
+                Err(reason) => viewer_unavailable = Some(reason),
+            }
         } else {
             eprintln!("session_start: viewer disabled (--no-viewer)");
-            None
-        };
+            viewer_unavailable = Some("disabled by --no-viewer; call viewer_open to show it".to_owned());
+        }
         test_startup_delay("after-viewer").await;
+        let viewer = match viewer_resources.viewer.as_mut() {
+            Some(child) => wait_for_viewer(&host_xdg_dir, child).await,
+            None => viewer_report(&host_xdg_dir, None, viewer_unavailable.as_deref()),
+        };
+        let msg = format!("{msg} {}", viewer_summary(&viewer));
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
@@ -3233,6 +3316,7 @@ impl KwinMcp {
             cdp_forward_port,
             service_proxy_children,
             viewer_child,
+            viewer_unavailable,
             overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -3249,7 +3333,70 @@ impl KwinMcp {
             "workdir": workdir,
             "width": screen_w,
             "height": screen_h,
+            "viewer": viewer,
         })).await)
+    }
+
+    #[rmcp::tool(
+        name = "viewer_open",
+        description = "Open the live viewer window for the current session on the user's desktop, so the user can watch or review what the session shows. Reuses the viewer that session_start opens; if one is already running it is left as is. Returns the viewer outcome: ready (a host window is showing the session), starting, or unavailable with the reason (for example no host Wayland session on a remote host). Works even when the server runs with --no-viewer."
+    )]
+    async fn viewer_open(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
+        let (host_xdg_dir, width, height) = {
+            let mut guard = self.session.lock().await;
+            let sess = guard.as_mut().ok_or_else(|| {
+                McpError::internal_error("no session — call session_start first", None)
+            })?;
+            let running = match sess.viewer_child.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            };
+            if running {
+                let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
+                let message = format!("viewer already open: {}", viewer_summary(&viewer));
+                drop(guard);
+                return Ok(structured_result(&peer, message, serde_json::json!({"status": "already_open", "viewer": viewer})).await);
+            }
+            (sess.host_xdg_dir.clone(), sess.screen_width, sess.screen_height)
+        };
+        let spawned = spawn_viewer(&host_xdg_dir, width, height).await;
+        let mut guard = self.session.lock().await;
+        let Some(sess) = guard.as_mut().filter(|sess| sess.host_xdg_dir == host_xdg_dir) else {
+            // The session stopped while the viewer was starting.
+            if let Ok(child) = spawned {
+                terminate_child(child, false, "orphaned viewer");
+            }
+            return Err(McpError::internal_error("session stopped while opening the viewer", None));
+        };
+        match spawned {
+            Ok(child) => {
+                if let Some(old) = sess.viewer_child.replace(child) {
+                    terminate_child(old, false, "exited viewer");
+                }
+                sess.viewer_unavailable = None;
+            }
+            Err(reason) => sess.viewer_unavailable = Some(reason),
+        }
+        let mut child = sess.viewer_child.take();
+        let unavailable = sess.viewer_unavailable.clone();
+        drop(guard);
+        let viewer = match child.as_mut() {
+            Some(child) if unavailable.is_none() => wait_for_viewer(&host_xdg_dir, child).await,
+            _ => viewer_report(&host_xdg_dir, None, unavailable.as_deref()),
+        };
+        let mut guard = self.session.lock().await;
+        match guard.as_mut().filter(|sess| sess.host_xdg_dir == host_xdg_dir) {
+            Some(sess) => sess.viewer_child = child,
+            None => {
+                if let Some(child) = child {
+                    terminate_child(child, false, "orphaned viewer");
+                }
+            }
+        }
+        drop(guard);
+        let status = if viewer["state"] == "unavailable" { "unavailable" } else { "opened" };
+        Ok(structured_result(&peer, format!("viewer {status}: {}", viewer_summary(&viewer)), serde_json::json!({"status": status, "viewer": viewer})).await)
     }
 
     #[rmcp::tool(
