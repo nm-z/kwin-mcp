@@ -130,7 +130,7 @@ fn qt_font_spec(family: &str, size: u32, weight: u32, bold_suffix: bool) -> Stri
 
 // ── Evdev keycodes ───────────────────────────────────────────────────────
 
-use keyboard_codes::{KeyCodeMapper, Platform};
+use keyboard_codes::Platform;
 
 fn char_key(ch: char) -> Result<(u32, bool), McpError> {
     let (raw, shifted) = match ch {
@@ -205,62 +205,119 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
     Ok((code, shifted))
 }
 
-fn parse_combo(key: &str) -> Result<(Vec<u32>, Option<u32>), McpError> {
-    // Standalone key names that keyboard-codes can't parse (it requires modifier+key)
-    let standalone = match key.to_lowercase().as_str() {
+/// Linux evdev codes for the modifiers a combo may name.
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTALT: u32 = 56;
+const KEY_LEFTMETA: u32 = 125;
+
+const COMBO_SYNTAX: &str = "use modifier+key, e.g. ctrl+shift+t, ctrl+minus, alt+F4; modifiers: ctrl, shift, alt, super; keys: a single character, or a name such as Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right, F1-F12, NumLock, minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright";
+
+fn modifier_code(token: &str) -> Option<u32> {
+    match token.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" | "ctl" => Some(KEY_LEFTCTRL),
+        "shift" => Some(LINUX_KEY_LEFTSHIFT),
+        "alt" | "option" => Some(KEY_LEFTALT),
+        "super" | "meta" | "win" | "windows" | "cmd" | "command" | "logo" => Some(KEY_LEFTMETA),
+        _ => None,
+    }
+}
+
+/// Resolve one non-modifier key token to its evdev code and whether it needs
+/// Shift, or None when the token names no key.
+fn named_key(token: &str) -> Option<(u32, bool)> {
+    let named = match token.to_ascii_lowercase().as_str() {
         "return" | "enter" => Some(28_u32),    // KEY_ENTER
         "backspace" => Some(14),               // KEY_BACKSPACE
         "tab" => Some(15),                     // KEY_TAB
         "escape" | "esc" => Some(1),           // KEY_ESC
         "space" => Some(57),                   // KEY_SPACE
         "delete" | "del" => Some(111),         // KEY_DELETE
-        "insert" => Some(110),                 // KEY_INSERT
+        "insert" | "ins" => Some(110),         // KEY_INSERT
         "home" => Some(102),                   // KEY_HOME
         "end" => Some(107),                    // KEY_END
-        "pageup" | "page_up" => Some(104),     // KEY_PAGEUP
-        "pagedown" | "page_down" => Some(109), // KEY_PAGEDOWN
+        "pageup" | "page_up" | "pgup" => Some(104), // KEY_PAGEUP
+        "pagedown" | "page_down" | "pgdn" => Some(109), // KEY_PAGEDOWN
         "up" => Some(103),                     // KEY_UP
         "down" => Some(108),                   // KEY_DOWN
         "left" => Some(105),                   // KEY_LEFT
         "right" => Some(106),                  // KEY_RIGHT
-        "numlock" | "num_lock" => Some(69),   // KEY_NUMLOCK
+        "numlock" | "num_lock" => Some(69),    // KEY_NUMLOCK
+        "capslock" | "caps_lock" => Some(58),  // KEY_CAPSLOCK
+        "menu" => Some(127),                   // KEY_COMPOSE
+        "print" | "printscreen" => Some(99),   // KEY_SYSRQ
+        "minus" | "hyphen" | "dash" => Some(12), // KEY_MINUS
+        "equal" | "equals" => Some(13),        // KEY_EQUAL
+        "comma" => Some(51),                   // KEY_COMMA
+        "period" | "dot" => Some(52),          // KEY_DOT
+        "slash" => Some(53),                   // KEY_SLASH
+        "backslash" => Some(43),               // KEY_BACKSLASH
+        "semicolon" => Some(39),               // KEY_SEMICOLON
+        "apostrophe" | "quote" => Some(40),    // KEY_APOSTROPHE
+        "grave" | "backtick" => Some(41),      // KEY_GRAVE
+        "bracketleft" | "leftbracket" => Some(26), // KEY_LEFTBRACE
+        "bracketright" | "rightbracket" => Some(27), // KEY_RIGHTBRACE
         "f1" => Some(59), "f2" => Some(60), "f3" => Some(61), "f4" => Some(62),
         "f5" => Some(63), "f6" => Some(64), "f7" => Some(65), "f8" => Some(66),
         "f9" => Some(67), "f10" => Some(68), "f11" => Some(87), "f12" => Some(88),
         _ => None,
     };
-    if let Some(code) = standalone {
-        return Ok((Vec::new(), Some(code)));
+    if let Some(code) = named {
+        return Some((code, false));
     }
-    match keyboard_codes::parser::parse_shortcut_with_aliases(key) {
-        Ok(shortcut) => {
-            let mods: Vec<u32> = shortcut
-                .modifiers
-                .iter()
-                .map(|m| {
-                    u32::try_from(
-                        keyboard_codes::KeyboardInput::Modifier(*m).to_code(Platform::Linux),
-                    )
-                    .map_err(|e| McpError::invalid_params(format!("modifier overflow: {e}"), None))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let main = Some(
-                u32::try_from(shortcut.key.to_code(Platform::Linux))
-                    .map_err(|e| McpError::invalid_params(format!("key overflow: {e}"), None))?,
-            );
-            Ok((mods, main))
+    if token.eq_ignore_ascii_case("plus") {
+        return Some((13, true)); // Shift+KEY_EQUAL
+    }
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        // A bare letter in a combo names the key, not an uppercase character.
+        (Some(ch), None) => char_key(ch.to_ascii_lowercase()).ok(),
+        _ => None,
+    }
+}
+
+/// Parse a key or combo into modifier codes plus one main key. Every token
+/// must resolve; an unparseable combo fails before any input is sent.
+fn parse_combo(key: &str) -> Result<(Vec<u32>, u32), McpError> {
+    let invalid = |detail: String| McpError::invalid_params(format!("{detail} in key combo '{key}'; {COMBO_SYNTAX}"), None);
+    if key.is_empty() {
+        return Err(invalid("empty key".to_owned()));
+    }
+    // A single character (including '+') is always that key.
+    let mut chars = key.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        let (code, shifted) = char_key(ch).map_err(|_| invalid(format!("unsupported key '{ch}'")))?;
+        return Ok((if shifted { vec![LINUX_KEY_LEFTSHIFT] } else { Vec::new() }, code));
+    }
+    // "ctrl++" names the '+' key: a trailing empty token after '+'.
+    let mut tokens: Vec<&str> = key.split('+').collect();
+    if key.ends_with("++") {
+        tokens.truncate(tokens.len().saturating_sub(2));
+        tokens.push("+");
+    }
+    let Some((last, prefix)) = tokens.split_last() else {
+        return Err(invalid("empty key".to_owned()));
+    };
+    let mut mods = Vec::new();
+    for token in prefix {
+        let token = token.trim();
+        let code = modifier_code(token).ok_or_else(|| invalid(format!("'{token}' is not a modifier")))?;
+        if !mods.contains(&code) {
+            mods.push(code);
         }
-        Err(_parse_err) => match key.chars().next() {
-            Some(ch) => {
-                let (k, _shifted) = char_key(ch)?;
-                Ok((Vec::new(), Some(k)))
-            }
-            None => Err(McpError::invalid_params(
-                format!("empty key combo '{key}'"),
-                None,
-            )),
-        },
     }
+    let last = last.trim();
+    if last.is_empty() {
+        return Err(invalid("missing key after '+'".to_owned()));
+    }
+    if let Some(code) = modifier_code(last) {
+        // A lone modifier, or a chord of modifiers, presses the last one.
+        return Ok((mods, code));
+    }
+    let (code, shifted) = named_key(last).ok_or_else(|| invalid(format!("unknown key '{last}'")))?;
+    if shifted && !mods.contains(&LINUX_KEY_LEFTSHIFT) {
+        mods.push(LINUX_KEY_LEFTSHIFT);
+    }
+    Ok((mods, code))
 }
 
 fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
@@ -3839,7 +3896,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Standalone names include Return, Escape, arrows, F1-F12, and NumLock; combos use ctrl+shift+t syntax. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. A combo that does not fully resolve fails with invalid_params and sends nothing. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -3858,9 +3915,7 @@ impl KwinMcp {
         if !mods.is_empty() {
             tokio::time::sleep(INPUT_EVENT_DELAY).await;
         }
-        let k = main.ok_or_else(|| {
-            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
-        })?;
+        let k = main;
         sess.eis.key(k, true).map_err(KwinError::from)?;
         tokio::time::sleep(INPUT_EVENT_DELAY).await;
         sess.eis.key(k, false).map_err(KwinError::from)?;
@@ -3895,9 +3950,7 @@ impl KwinMcp {
         if !mods.is_empty() {
             tokio::time::sleep(INPUT_EVENT_DELAY).await;
         }
-        let k = main.ok_or_else(|| {
-            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
-        })?;
+        let k = main;
         sess.eis.key(k, true).map_err(KwinError::from)?;
         Ok(structured_result(&peer, format!("press: {}", params.key), serde_json::json!({
             "action": "press", "key": params.key,
@@ -3918,9 +3971,7 @@ impl KwinMcp {
             McpError::internal_error("no session — call session_start first", None)
         })?;
         let (mods, main) = parse_combo(&params.key)?;
-        let k = main.ok_or_else(|| {
-            McpError::invalid_params(format!("unknown key in combo '{}'", params.key), None)
-        })?;
+        let k = main;
         sess.eis.key(k, false).map_err(KwinError::from)?;
         if !mods.is_empty() {
             tokio::time::sleep(INPUT_EVENT_DELAY).await;

@@ -930,3 +930,87 @@ fn blocked_host_scan_answers_within_hard_limit_and_cleans_later() {
     );
     client.stop_process();
 }
+
+/// Title of the first window whose title starts with `prefix`, from window_list.
+fn window_title(client: &mut RpcClient, id: u64, prefix: &str) -> Option<String> {
+    let listed = call_tool(client, id, "window_list", json!({}));
+    let text = listed["result"]["content"][0]["text"].as_str()?.to_owned();
+    let marker = format!("title=\"{prefix}");
+    let start = text.find(&marker)? + "title=\"".len();
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_owned())
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
+fn keyboard_key_resolves_punctuation_combos_and_rejects_unparseable_ones() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":1024,"height":768}));
+    let workdir = workdir(&started);
+    // The page titles itself with the last non-modifier keydown it saw.
+    let page = workdir.join("keys.html");
+    std::fs::write(
+        &page,
+        "<html><head><title>K:ready</title></head><body><script>\
+         addEventListener('keydown',e=>{if(['Control','Shift','Alt','Meta'].includes(e.key))return;\
+         document.title='K:'+e.code+(e.ctrlKey?'+C':'')+(e.shiftKey?'+S':'');e.preventDefault();},true);\
+         </script></body></html>",
+    )
+    .expect("write key page");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --no-first-run --new-window 'file://{}'", page.display())}),
+    );
+    assert!(launched["error"].is_null(), "launch failed: {launched}");
+    let mut id = 4;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(&mut client, id, "K:ready").is_none() {
+        id += 1;
+        assert!(Instant::now() < deadline, "key page did not load");
+        thread::sleep(Duration::from_millis(300));
+    }
+    for (combo, expected) in [
+        ("ctrl+minus", "K:Minus+C"),
+        ("ctrl+-", "K:Minus+C"),
+        ("ctrl+equal", "K:Equal+C"),
+        ("ctrl+plus", "K:Equal+C+S"),
+        ("ctrl++", "K:Equal+C+S"),
+        ("ctrl+Home", "K:Home+C"),
+        ("ctrl+L", "K:KeyL+C"),
+        ("Return", "K:Enter"),
+    ] {
+        id += 1;
+        let pressed = call_tool(&mut client, id, "keyboard_key", json!({"key":combo}));
+        assert!(pressed["error"].is_null(), "{combo} failed: {pressed}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            id += 1;
+            let title = window_title(&mut client, id, "K:").unwrap_or_default();
+            if title.starts_with(expected) && title[expected.len()..].starts_with(' ') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{combo}: page saw {title}, expected {expected}");
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    for combo in ["ctrl+bogus", "foo+a", "ctrl+", ""] {
+        id += 1;
+        let rejected = call_tool(&mut client, id, "keyboard_key", json!({"key":combo}));
+        assert_eq!(rejected["error"]["code"], json!(-32602), "{combo:?} was not rejected: {rejected}");
+        thread::sleep(Duration::from_millis(500));
+        id += 1;
+        let title = window_title(&mut client, id, "K:").unwrap_or_default();
+        assert!(title.starts_with("K:Enter "), "{combo:?} still sent input: {title}");
+    }
+    id += 1;
+    call_tool(&mut client, id, "session_stop", json!({}));
+    client.stop_process();
+}
