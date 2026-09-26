@@ -1044,9 +1044,13 @@ fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<(
     ));
     let result = (|| -> anyhow::Result<()> {
         let source = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        source.busy_timeout(Duration::from_secs(2))?;
+        source.busy_timeout(Duration::ZERO)?;
         let mut copy = rusqlite::Connection::open(&temporary)?;
-        rusqlite::backup::Backup::new(&source, &mut copy)?.run_to_completion(1024, Duration::ZERO, None)?;
+        // One step copies every page under a single read lock. A WAL reader is
+        // refused only while the host holds the database exclusively, as
+        // Chromium-based apps do for as long as they run, so waiting cannot help.
+        let step = rusqlite::backup::Backup::new(&source, &mut copy)?.step(-1)?;
+        anyhow::ensure!(step == rusqlite::backup::StepResult::Done, "the host process holds it exclusively ({step:?})");
         drop(copy);
         let mode = std::fs::metadata(database)?.permissions().mode();
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
