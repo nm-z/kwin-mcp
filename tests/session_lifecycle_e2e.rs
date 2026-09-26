@@ -1065,10 +1065,12 @@ fn screenshot_right_after_input_shows_the_input() {
         id += 1;
         call_tool(&mut client, id, "keyboard_type", json!({"text":"x"}));
         id += 1;
-        let immediate = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        // Only the page body: Chrome's toolbar changes on its own as
+        // extension icons load, which is not input staleness.
+        let immediate = call_tool(&mut client, id, "screenshot", json!({"inline":true, "region":[0,120,1024,768]}));
         thread::sleep(Duration::from_millis(800));
         id += 1;
-        let later = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        let later = call_tool(&mut client, id, "screenshot", json!({"inline":true, "region":[0,120,1024,768]}));
         if inline_png(&immediate) != inline_png(&later) {
             use base64::Engine;
             for (name, shot) in [("immediate", &immediate), ("later", &later)] {
@@ -1088,5 +1090,95 @@ fn screenshot_right_after_input_shows_the_input() {
     }
     id += 1;
     call_tool(&mut client, id, "session_stop", json!({}));
+    client.stop_process();
+}
+
+fn decode_rgba(response: &Value) -> (u32, Vec<u8>) {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(inline_png(response))
+        .expect("inline screenshot base64");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("screenshot PNG header");
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut pixels).expect("screenshot PNG frame");
+    (info.width, pixels)
+}
+
+fn pixel(image: &(u32, Vec<u8>), x: u32, y: u32) -> [u8; 4] {
+    let index = usize::try_from((y * image.0 + x) * 4).expect("pixel index");
+    [image.1[index], image.1[index + 1], image.1[index + 2], image.1[index + 3]]
+}
+
+fn screenshot_meta(response: &Value) -> Value {
+    let text = response["result"]["content"][1]["text"].as_str().expect("screenshot metadata");
+    serde_json::from_str(text).expect("screenshot metadata JSON")
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, kdialog, konsole, input devices, and a live GPU session"]
+fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windows() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":1920,"height":1080}));
+    let workdir = workdir(&started);
+    let result_path = workdir.join("kdialog.rc");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("kdialog --yesno 'Unlock profile?' --yes-label Relaunch --no-label Cancel; echo $? > '{}'", result_path.display())}),
+    );
+    thread::sleep(Duration::from_millis(1000));
+
+    // Non-maximized dialog at a nonzero origin: the default image is the dialog.
+    let full = call_tool(&mut client, 4, "screenshot", json!({"inline":true}));
+    let meta = screenshot_meta(&full);
+    let (win_w, win_h) = (meta["window"]["width"].as_i64().expect("w"), meta["window"]["height"].as_i64().expect("h"));
+    assert!(meta["window"]["x"].as_i64() > Some(0) && meta["window"]["y"].as_i64() > Some(0), "{meta}");
+    assert_eq!(meta["region"], json!([0, 0, win_w, win_h]), "{meta}");
+    assert_eq!((meta["width"].as_i64(), meta["height"].as_i64()), (Some(win_w), Some(win_h)), "{meta}");
+
+    // A crop past the window edges keeps window-relative coordinates: the
+    // dialog's own pixel (5,5) sits at image (45,45) under region origin -40.
+    let wide = call_tool(&mut client, 5, "screenshot", json!({"inline":true, "region":[-40,-40,win_w + 40,win_h + 40]}));
+    assert_eq!(screenshot_meta(&wide)["region"], json!([-40, -40, win_w + 40, win_h + 40]));
+    let (full_image, wide_image) = (decode_rgba(&full), decode_rgba(&wide));
+    assert_eq!(pixel(&full_image, 5, 5), pixel(&wide_image, 45, 45));
+    assert_ne!(pixel(&wide_image, 45, 45), pixel(&wide_image, 5, 5), "crop did not include the surroundings");
+
+    // Click the button where it appears in the crop, translated by the
+    // documented contract: input = image pixel + region origin.
+    let found = call_tool(&mut client, 6, "find_ui_elements", json!({"query":"Relaunch"}));
+    let listing = found["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+    let numbers: Vec<i64> = listing
+        .rsplit_once('(')
+        .map(|(_, rest)| rest.trim_end_matches([')', '\n']).replace('x', ","))
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    assert_eq!(numbers.len(), 4, "button geometry: {listing}");
+    let (image_x, image_y) = (numbers[0] + numbers[2] / 2 + 40, numbers[1] + numbers[3] / 2 + 40);
+    call_tool(&mut client, 7, "mouse_click", json!({"x": image_x - 40, "y": image_y - 40}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !result_path.exists() {
+        assert!(Instant::now() < deadline, "click at screenshot coordinates missed the dialog button");
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read_to_string(&result_path).unwrap_or_default().trim(), "0");
+
+    // Maximized window at the origin: image equals the display.
+    call_tool(&mut client, 8, "launch_app", json!({"command":"konsole"}));
+    let maximized = call_tool(&mut client, 9, "screenshot", json!({}));
+    let meta = &maximized["result"]["structuredContent"];
+    assert_eq!((meta["window"]["x"].as_i64(), meta["window"]["y"].as_i64()), (Some(0), Some(0)), "{meta}");
+    assert_eq!((meta["width"].as_i64(), meta["height"].as_i64()), (Some(1920), Some(1080)), "{meta}");
+    call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
 }

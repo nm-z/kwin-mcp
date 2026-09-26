@@ -2307,6 +2307,12 @@ struct WindowGeometry {
     x: f64,
     y: f64,
     #[serde(default)]
+    w: f64,
+    #[serde(default)]
+    h: f64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
     id: String,
     #[serde(default)]
     cx: f64,
@@ -2392,8 +2398,10 @@ async fn atspi_node(
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 struct ScreenshotParams {
-    /// Crop region [x1, y1, x2, y2] for pixel-level detail on a specific area.
-    /// Coordinates are window-relative pixels. Omit for full screenshot.
+    /// Crop region [x1, y1, x2, y2] in window-relative pixels (the same space
+    /// as mouse input). It may extend past the window edges, e.g. negative
+    /// values to include a popup; it is clamped to the screen. Omit to capture
+    /// the whole active window.
     #[serde(default)]
     region: Option<[i32; 4]>,
     /// When true, return a 10x-upscaled crop centered on the current cursor
@@ -2509,7 +2517,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
                 {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
-                Screenshots are returned 1:1 with the display — no DPI scaling, no resampling — so a pixel coordinate you read off the PNG is the same pixel coordinate you pass to mouse_click.",
+                Screenshots are 1:1 pixels (no DPI scaling, no resampling) of the active window, so a pixel you read off a default screenshot is the coordinate you pass to mouse_click, even for a small dialog away from the display origin. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse_click (px+x1, py+y1).",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -3394,7 +3402,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. The returned image is 1:1 with the display — every pixel in the PNG corresponds to exactly one pixel on the virtual screen, so coordinates you read off the image feed directly into mouse_click/mouse_move with no scaling. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -3410,18 +3418,23 @@ impl KwinMcp {
             return Err(McpError::invalid_params("region and cursor are mutually exclusive", None));
         }
         let (win_x, win_y, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
-        let win_id = win_geo.id.clone();
+        #[expect(clippy::as_conversions)]
+        let (win_w, win_h) = (win_geo.w.round() as i32, win_geo.h.round() as i32);
+        // Every coordinate here is window-relative, matching mouse input: by
+        // default the image is the active window itself, so image pixel (x,y)
+        // is mouse_click (x,y). A region or cursor crop may extend past the
+        // window edges (e.g. to include a popup) and is clamped to the screen.
         let region = if params.cursor {
             #[expect(clippy::as_conversions)]
             let (cx, cy) = (win_geo.cx.round() as i32 - win_x, win_geo.cy.round() as i32 - win_y);
-            Some([
+            [
                 cx - CURSOR_ZOOM_HALF_EDGE,
                 cy - CURSOR_ZOOM_HALF_EDGE,
                 cx + CURSOR_ZOOM_HALF_EDGE,
                 cy + CURSOR_ZOOM_HALF_EDGE,
-            ])
+            ]
         } else {
-            params.region
+            params.region.unwrap_or([0, 0, win_w, win_h])
         };
         let proxy = KWinScreenShot2Proxy::builder(&conn)
             .destination(kwin_unique.as_str())
@@ -3429,7 +3442,6 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let _ = &win_id;
         let (width, height, stride, pixels, settle) = capture_settled_frame(&proxy, self.last_input().await).await?;
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
@@ -3444,40 +3456,39 @@ impl KwinMcp {
                 rgba[di + 3] = pixels[si + 3];
             }
         }
-        // Crop if region specified
-        let (out_rgba, out_w, out_h, out_region) = if let Some([x1, y1, x2, y2]) = region {
-            let cx1 = u32::try_from(x1.max(0)).map_err(KwinError::from)?.min(width);
-            let cy1 = u32::try_from(y1.max(0)).map_err(KwinError::from)?.min(height);
-            let cx2 = u32::try_from(x2.max(0)).map_err(KwinError::from)?.min(width);
-            let cy2 = u32::try_from(y2.max(0)).map_err(KwinError::from)?.min(height);
-            let cw = cx2.saturating_sub(cx1);
-            let ch = cy2.saturating_sub(cy1);
-            if cw == 0 || ch == 0 {
-                return Err(McpError::invalid_params("region has zero area", None));
-            }
-            let mut cropped = vec![0u8; usize::try_from(cw * ch * 4).map_err(KwinError::from)?];
-            for row in 0..ch {
-                let src = usize::try_from((cy1 + row) * width * 4 + cx1 * 4).map_err(KwinError::from)?;
-                let dst = usize::try_from(row * cw * 4).map_err(KwinError::from)?;
-                let len = usize::try_from(cw * 4).map_err(KwinError::from)?;
-                cropped[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
-            }
-            (cropped, cw, ch, Some([cx1, cy1, cx2, cy2]))
-        } else {
-            (rgba, width, height, None)
-        };
-        // Overlay the high-visibility cursor onto the output buffer. Cursor position
-        // is absolute in the captured screen frame; if we cropped, shift into the
-        // output frame by the crop's top-left. Sprite hotspot (top-left tip of the
-        // arrow) lands exactly on the cursor pixel.
-        let (crop_ox, crop_oy) = out_region.map(|r| (r[0], r[1])).unwrap_or((0, 0));
+        // Window-relative region -> clamped display rectangle.
+        let [x1, y1, x2, y2] = region;
+        let clamp_x = |v: i32| u32::try_from(v.saturating_add(win_x).max(0)).unwrap_or(0).min(width);
+        let clamp_y = |v: i32| u32::try_from(v.saturating_add(win_y).max(0)).unwrap_or(0).min(height);
+        let (cx1, cy1, cx2, cy2) = (clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2));
+        let cw = cx2.saturating_sub(cx1);
+        let ch = cy2.saturating_sub(cy1);
+        if cw == 0 || ch == 0 {
+            return Err(McpError::invalid_params(
+                format!("region [{x1},{y1},{x2},{y2}] (window-relative) has zero area on screen"),
+                None,
+            ));
+        }
+        let mut out_rgba = vec![0u8; usize::try_from(cw * ch * 4).map_err(KwinError::from)?];
+        for row in 0..ch {
+            let src = usize::try_from((cy1 + row) * width * 4 + cx1 * 4).map_err(KwinError::from)?;
+            let dst = usize::try_from(row * cw * 4).map_err(KwinError::from)?;
+            let len = usize::try_from(cw * 4).map_err(KwinError::from)?;
+            out_rgba[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
+        }
+        let (out_w, out_h) = (cw, ch);
+        // Image pixel (0,0) in window-relative input coordinates.
+        let origin_x = i32::try_from(cx1).map_err(KwinError::from)? - win_x;
+        let origin_y = i32::try_from(cy1).map_err(KwinError::from)? - win_y;
+        let out_region = [origin_x, origin_y, origin_x + i32::try_from(cw).map_err(KwinError::from)?, origin_y + i32::try_from(ch).map_err(KwinError::from)?];
+        // Overlay the high-visibility cursor; its position is absolute on the
+        // screen, so shift it into the output frame by the crop's display origin.
         #[expect(clippy::as_conversions)]
         let cursor_abs_x = win_geo.cx.round() as i32;
         #[expect(clippy::as_conversions)]
         let cursor_abs_y = win_geo.cy.round() as i32;
-        let crop_ox_i = i32::try_from(crop_ox).unwrap_or(0);
-        let crop_oy_i = i32::try_from(crop_oy).unwrap_or(0);
-        let mut out_rgba = out_rgba;
+        let crop_ox_i = i32::try_from(cx1).unwrap_or(0);
+        let crop_oy_i = i32::try_from(cy1).unwrap_or(0);
         Self::overlay_cursor(&mut out_rgba, out_w, out_h, cursor_abs_x - crop_ox_i, cursor_abs_y - crop_oy_i);
         let path = xdg.join("screenshot.png");
         let mut png_bytes: Vec<u8> = Vec::new();
@@ -3494,10 +3505,18 @@ impl KwinMcp {
             "path": path_str,
             "width": out_w,
             "height": out_h,
+            // Window-relative rectangle the image covers: image pixel (px,py)
+            // is mouse_click (px + region[0], py + region[1]).
+            "region": out_region,
+            "window": {
+                "id": win_geo.id,
+                "title": win_geo.title,
+                "x": win_x,
+                "y": win_y,
+                "width": win_w,
+                "height": win_h,
+            },
         });
-        if let Some([rx1, ry1, rx2, ry2]) = out_region {
-            payload["region"] = serde_json::json!([rx1, ry1, rx2, ry2]);
-        }
         if let Some(settle) = &settle {
             payload["settle"] = serde_json::json!({
                 "settled": settle.settled,
