@@ -1230,3 +1230,80 @@ fn session_start_reports_viewer_outcome_and_viewer_open_opens_it() {
     call_tool(&mut client, 3, "session_stop", json!({}));
     client.stop_process();
 }
+
+/// Remaining bytes of this user's disk quota on the filesystem holding `dir`,
+/// or None when it has no user quota.
+fn user_quota_headroom(dir: &std::path::Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let handle = std::fs::File::open(dir).ok()?;
+    let uid = std::fs::metadata("/proc/self").ok()?.uid();
+    let mut quota = [0u64; 9];
+    // SAFETY: Q_GETQUOTA writes one 72-byte struct if_dqblk into `quota`.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_quotactl_fd,
+            handle.as_raw_fd(),
+            (0x0080_0007 << 8) | 0,
+            uid,
+            quota.as_mut_ptr(),
+        )
+    };
+    (result == 0 && quota[0] > 0).then(|| (quota[0] * 1024).saturating_sub(quota[2]))
+}
+
+struct FillFile(PathBuf);
+impl Drop for FillFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, a /tmp tmpfs with usrquota, and enough RAM to fill that quota"]
+fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let Some(_) = user_quota_headroom(std::path::Path::new("/tmp")) else {
+        eprintln!("/tmp has no user quota; skipping");
+        return;
+    };
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let workdir = workdir(&started);
+    call_tool(&mut client, 3, "launch_app", json!({"command":"konsole"}));
+    let first = call_tool(&mut client, 4, "screenshot", json!({}));
+    assert!(first["error"].is_null(), "{first}");
+    let screenshot = workdir.join("screenshot.png");
+    assert!(screenshot.exists());
+
+    // Use up the quota, leaving less than one screenshot of headroom, while
+    // the filesystem itself keeps free space: the situation behind EDQUOT.
+    let fill = FillFile(std::env::temp_dir().join(format!("kwin-mcp-e2e-quota-fill-{}", std::process::id())));
+    std::fs::remove_file(&screenshot).expect("remove first screenshot");
+    let headroom = user_quota_headroom(std::path::Path::new("/tmp")).expect("quota headroom");
+    let file = std::fs::File::create(&fill.0).expect("create fill file");
+    nix::fcntl::posix_fallocate(&file, 0, i64::try_from(headroom - 16 * 1024).expect("fill size")).expect("fill quota");
+
+    let failed = call_tool(&mut client, 5, "screenshot", json!({}));
+    let message = failed["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("Disk quota exceeded") && message.contains("Per-user disk quota"), "{failed}");
+    assert!(!screenshot.exists(), "failed write left a partial screenshot");
+
+    let inline = call_tool(&mut client, 6, "screenshot", json!({"inline":true}));
+    assert!(!inline_png(&inline).is_empty(), "inline screenshot missing at quota: {inline}");
+    assert!(inline["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("file not saved"), "{inline}");
+    assert!(!screenshot.exists(), "inline screenshot at quota left a partial file");
+
+    // An open descriptor keeps the space charged, so close it before removing.
+    drop(file);
+    drop(fill);
+    let recovered = call_tool(&mut client, 7, "screenshot", json!({}));
+    assert!(recovered["error"].is_null() && screenshot.exists(), "{recovered}");
+    call_tool(&mut client, 8, "session_stop", json!({}));
+    client.stop_process();
+}
