@@ -1489,3 +1489,110 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
     call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
+fn chrome_file_chooser_attaches_host_and_session_files_with_the_documented_keys() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The session HOME must hold the files: outside it, the host root is
+    // read-only in the sandbox. It lives outside /tmp, which the sandbox
+    // replaces with its own tmpfs.
+    let home = PathBuf::from(std::env::var("HOME").expect("HOME"))
+        .join(format!(".cache/kwin-mcp-e2e-upload-{}", std::process::id()));
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDir(home.clone());
+    for sub in ["Uploads", ".config", ".local/share", ".cache", ".local/state", ".kde"] {
+        std::fs::create_dir_all(home.join(sub)).expect("create test HOME");
+    }
+    let directory = home.join("Uploads");
+    std::fs::write(directory.join("host-created.pdf"), b"%PDF-1.4 host\n").expect("host file");
+    let home_str = home.display().to_string();
+    let mut client = RpcClient::start_with_env(&[
+        ("HOME", home_str.as_str()),
+        ("XDG_CONFIG_HOME", &format!("{home_str}/.config")),
+        ("XDG_DATA_HOME", &format!("{home_str}/.local/share")),
+        ("XDG_CACHE_HOME", &format!("{home_str}/.cache")),
+        ("XDG_STATE_HOME", &format!("{home_str}/.local/state")),
+        ("KDEHOME", &format!("{home_str}/.kde")),
+    ]);
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":1280,"height":800}));
+    let workdir = workdir(&started);
+    let page = workdir.join("upload.html");
+    std::fs::write(
+        &page,
+        "<html><title>F:none</title><body><input type=file id=f style='font-size:40px'><script>\
+         f.onchange=()=>document.title='F:'+(f.files[0]?f.files[0].name+':'+f.files[0].size:'none');\
+         f.oncancel=()=>document.title='F:cancelled'</script></body></html>",
+    )
+    .expect("write upload page");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "printf session-created-data > '{}'; google-chrome-stable --no-first-run --new-window 'file://{}'",
+            directory.join("session-created.pdf").display(),
+            page.display()
+        )}),
+    );
+    let mut id = 4;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(&mut client, id, "F:none").is_none() {
+        id += 1;
+        assert!(Instant::now() < deadline, "upload page did not load");
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert!(!directory.join("session-created.pdf").exists(), "session file leaked to the host");
+    for (file, bytes) in [("host-created.pdf", 14), ("session-created.pdf", 20)] {
+        id += 1;
+        call_tool(&mut client, id, "keyboard_key", json!({"key":"F5"}));
+        thread::sleep(Duration::from_millis(1500));
+        let found = call_tool(&mut client, id + 1, "find_ui_elements", json!({"query":"Choose File"}));
+        id += 1;
+        assert!(found["result"]["structuredContent"]["matches"].as_u64() >= Some(1), "{found}");
+        id += 1;
+        call_tool(&mut client, id, "mouse_click", json!({"x":100,"y":120}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            id += 1;
+            if window_title(&mut client, id, "Open File").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "file chooser did not open");
+            thread::sleep(Duration::from_millis(200));
+        }
+        for (tool, arguments) in [
+            ("keyboard_key", json!({"key":"ctrl+l"})),
+            ("keyboard_type", json!({"text": directory.join(file).display().to_string()})),
+            ("keyboard_key", json!({"key":"alt+o"})),
+        ] {
+            id += 1;
+            call_tool(&mut client, id, tool, arguments);
+            thread::sleep(Duration::from_millis(300));
+        }
+        let expected = format!("F:{file}:{bytes}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            id += 1;
+            let title = window_title(&mut client, id, "F:").unwrap_or_default();
+            if title.starts_with(&expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{file}: page shows {title}, expected {expected}");
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    id += 1;
+    call_tool(&mut client, id, "session_stop", json!({}));
+    client.stop_process();
+}

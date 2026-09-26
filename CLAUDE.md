@@ -14,6 +14,8 @@ The HOME overlay's lower layer is the live host HOME. SQLite databases a host pr
 
 The workdir and HOME overlay live on `/tmp`, which systemd mounts as tmpfs with a per-user quota (about 80% of its size), so EDQUOT can occur while `df` shows free space. `screenshot` writes atomically, never leaves a partial or stale PNG, returns the image inline when the file cannot be saved, and names the quota numbers in its error.
 
+Chrome's file chooser is its own in-process GTK4 dialog, not the portal. Enter in its location bar cancels the dialog (the input's `cancel` event fires, nothing attaches) while zenity's GTK4 chooser accepts the same injected keys, so the documented sequence is Ctrl+L, path, Alt+O (the Open mnemonic).
+
 Session writes never reach the host on their own. `export_file` reads a session path through `/proc/<bwrap child>/root` (so both HOME overlay files and the private `/tmp` work), copies it to a host path via a temporary file and rename, and compares it byte for byte; it refuses to overwrite unless asked and reports downloads still in progress.
 
 The optional host viewer writes `viewer-status.json` in the workdir; `session_start` and `viewer_open` report its outcome (ready, starting, unavailable with a reason, disabled) without failing the session.
