@@ -87,6 +87,13 @@ const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
 // boundary instead of retrying arbitrary D-Bus or compositor failures.
 const SCREENSHOT_CAPTURE_ATTEMPTS: u32 = 3;
 
+// A screenshot shortly after input waits for the app to handle it and repaint:
+// it polls frames until the screen has been unchanged for SCREENSHOT_SETTLE_QUIET,
+// giving up SCREENSHOT_SETTLE_LIMIT after the last input event.
+const SCREENSHOT_SETTLE_QUIET: Duration = Duration::from_millis(200);
+const SCREENSHOT_SETTLE_POLL: Duration = Duration::from_millis(40);
+const SCREENSHOT_SETTLE_LIMIT: Duration = Duration::from_millis(1500);
+
 // launch_app: CDP connect retry.
 const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
@@ -1016,6 +1023,8 @@ struct Session {
     screen_width: u32,
     screen_height: u32,
     last_activity: std::time::Instant,
+    /// When an input tool last sent events, for screenshot settling.
+    last_input: Option<std::time::Instant>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -1258,6 +1267,14 @@ impl KwinMcp {
                     Some(serde_json::json!({"reason": "lifecycle_busy", "stage": self.start_stage()})),
                 )
             })
+    }
+    async fn mark_input(&self) {
+        if let Some(session) = self.session.lock().await.as_mut() {
+            session.last_input = Some(std::time::Instant::now());
+        }
+    }
+    async fn last_input(&self) -> Option<std::time::Instant> {
+        self.session.lock().await.as_ref().and_then(|session| session.last_input)
     }
     async fn touch_activity(&self) {
         if let Some(session) = self.session.lock().await.as_mut() {
@@ -1751,6 +1768,98 @@ fn teardown(mut sess: Session) {
     }
     let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
     cleanup_stale_session_files(&sess.host_xdg_dir);
+}
+
+/// Screenshot settling after recent input; None when no input was recent.
+struct SettleReport {
+    settled: bool,
+    waited: Duration,
+}
+
+type Frame = (u32, u32, u32, Vec<u8>);
+
+/// One complete CaptureScreen frame, retrying short pipe reads.
+async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
+    let mut last_size = None;
+    for attempt in 1..=SCREENSHOT_CAPTURE_ATTEMPTS {
+        let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
+        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+        opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
+        // CaptureScreen composites all surfaces including popups (xdg_popup menus);
+        // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
+        let meta = proxy
+            .capture_screen("Virtual-0", opts, pipe_fd)
+            .await
+            .map_err(KwinError::from)?;
+        let get_u32 = |k: &str| -> Result<u32, McpError> {
+            let val = meta
+                .get(k)
+                .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
+            let n: u32 = val.try_into().map_err(KwinError::from)?;
+            Ok(n)
+        };
+        let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
+        let reader_file = std::fs::File::from(read_fd);
+        let expected = usize::try_from(stride * height).map_err(KwinError::from)?;
+        let mut pixels = Vec::with_capacity(expected);
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(reader_file), &mut pixels)
+            .map_err(KwinError::from)?;
+        let received = pixels.len();
+        if received == expected {
+            return Ok((width, height, stride, pixels));
+        }
+        last_size = Some((expected, received));
+        eprintln!(
+            "screenshot: incomplete pixel buffer on attempt {attempt}/{SCREENSHOT_CAPTURE_ATTEMPTS}: expected {expected} bytes, received {received}"
+        );
+    }
+    let (expected, received) = last_size.unwrap_or((0, 0));
+    Err(McpError::internal_error(
+        format!(
+            "screenshot: incomplete pixel buffer after {SCREENSHOT_CAPTURE_ATTEMPTS} attempts (expected {expected} bytes, received {received})"
+        ),
+        None,
+    ))
+}
+
+/// Capture a frame that reflects recent input. Input tools return once their
+/// events are flushed, before the app has handled them and repainted, so a
+/// capture shortly after input polls until the screen has been unchanged for
+/// SCREENSHOT_SETTLE_QUIET, bounded by SCREENSHOT_SETTLE_LIMIT after the input.
+async fn capture_settled_frame(
+    proxy: &KWinScreenShot2Proxy<'_>,
+    last_input: Option<std::time::Instant>,
+) -> Result<(u32, u32, u32, Vec<u8>, Option<SettleReport>), McpError> {
+    let started = std::time::Instant::now();
+    let mut frame = capture_frame(proxy).await?;
+    let Some(input_at) = last_input.filter(|at| at.elapsed() < SCREENSHOT_SETTLE_LIMIT) else {
+        let (width, height, stride, pixels) = frame;
+        return Ok((width, height, stride, pixels, None));
+    };
+    let deadline = input_at + SCREENSHOT_SETTLE_LIMIT;
+    let mut unchanged_since = std::time::Instant::now();
+    let settled = loop {
+        let now = std::time::Instant::now();
+        if now.duration_since(unchanged_since) >= SCREENSHOT_SETTLE_QUIET
+            && now.duration_since(input_at) >= SCREENSHOT_SETTLE_QUIET
+        {
+            break true;
+        }
+        if now >= deadline {
+            break false;
+        }
+        tokio::time::sleep(SCREENSHOT_SETTLE_POLL).await;
+        let next = capture_frame(proxy).await?;
+        if next.3 != frame.3 {
+            unchanged_since = std::time::Instant::now();
+        }
+        frame = next;
+    };
+    let (width, height, stride, pixels) = frame;
+    Ok((width, height, stride, pixels, Some(SettleReport { settled, waited: started.elapsed() })))
 }
 
 /// Resolve the kwin-viewer binary by replacing the basename of our own
@@ -3121,6 +3230,7 @@ impl KwinMcp {
             screen_width: screen_w,
             screen_height: screen_h,
             last_activity: std::time::Instant::now(),
+            last_input: None,
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -3234,6 +3344,7 @@ impl KwinMcp {
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
         let window = activate_window(&conn, &kwin_unique, &xdg, &params.window_id).await?;
+        self.mark_input().await;
         let text = format!("activated {}", window.summary());
         Ok(structured_result(
             &peer,
@@ -3283,7 +3394,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. The returned image is 1:1 with the display — every pixel in the PNG corresponds to exactly one pixel on the virtual screen, so coordinates you read off the image feed directly into mouse_click/mouse_move with no scaling. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed. Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. The returned image is 1:1 with the display — every pixel in the PNG corresponds to exactly one pixel on the virtual screen, so coordinates you read off the image feed directly into mouse_click/mouse_move with no scaling. Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -3319,53 +3430,7 @@ impl KwinMcp {
             .await
             .map_err(KwinError::from)?;
         let _ = &win_id;
-        let mut capture = None;
-        let mut last_size = None;
-        for attempt in 1..=SCREENSHOT_CAPTURE_ATTEMPTS {
-            let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
-            let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-            let mut opts = std::collections::HashMap::new();
-            opts.insert("include-cursor", zbus::zvariant::Value::from(true));
-            opts.insert("include-decoration", zbus::zvariant::Value::from(true));
-            opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
-            // CaptureScreen composites all surfaces including popups (xdg_popup menus);
-            // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
-            let meta = proxy
-                .capture_screen("Virtual-0", opts, pipe_fd)
-                .await
-                .map_err(KwinError::from)?;
-            let get_u32 = |k: &str| -> Result<u32, McpError> {
-                let val = meta
-                    .get(k)
-                    .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
-                let n: u32 = val.try_into().map_err(KwinError::from)?;
-                Ok(n)
-            };
-            let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
-            let reader_file = std::fs::File::from(read_fd);
-            let expected = usize::try_from(stride * height).map_err(KwinError::from)?;
-            let mut pixels = Vec::with_capacity(expected);
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(reader_file), &mut pixels)
-                .map_err(KwinError::from)?;
-            let received = pixels.len();
-            if received == expected {
-                capture = Some((width, height, stride, pixels));
-                break;
-            }
-            last_size = Some((expected, received));
-            eprintln!(
-                "screenshot: incomplete pixel buffer on attempt {attempt}/{SCREENSHOT_CAPTURE_ATTEMPTS}: expected {expected} bytes, received {received}"
-            );
-        }
-        let (width, height, stride, pixels) = capture.ok_or_else(|| {
-            let (expected, received) = last_size.unwrap_or((0, 0));
-            McpError::internal_error(
-                format!(
-                    "screenshot: incomplete pixel buffer after {SCREENSHOT_CAPTURE_ATTEMPTS} attempts (expected {expected} bytes, received {received})"
-                ),
-                None,
-            )
-        })?;
+        let (width, height, stride, pixels, settle) = capture_settled_frame(&proxy, self.last_input().await).await?;
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
@@ -3432,6 +3497,12 @@ impl KwinMcp {
         });
         if let Some([rx1, ry1, rx2, ry2]) = out_region {
             payload["region"] = serde_json::json!([rx1, ry1, rx2, ry2]);
+        }
+        if let Some(settle) = &settle {
+            payload["settle"] = serde_json::json!({
+                "settled": settle.settled,
+                "waited_ms": u64::try_from(settle.waited.as_millis()).unwrap_or(u64::MAX),
+            });
         }
         let text = format!("{path_str} size={out_w}x{out_h}");
         if params.inline {
@@ -3768,6 +3839,8 @@ impl KwinMcp {
             tokio::time::sleep(INPUT_EVENT_DELAY).await;
             sess.eis.button(code, false).map_err(KwinError::from)?;
         }
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("clicked ({x},{y}) x{count}"), serde_json::json!({
             "action": "click", "x": x, "y": y, "count": count,
         })).await)
@@ -3793,6 +3866,8 @@ impl KwinMcp {
         })?;
         let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("moved ({x},{y})"), serde_json::json!({
             "action": "move", "x": x, "y": y,
         })).await)
@@ -3827,6 +3902,8 @@ impl KwinMcp {
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
         }
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("scrolled {delta} at ({x},{y})"), serde_json::json!({
             "action": "scroll", "x": x, "y": y, "delta": delta,
         })).await)
@@ -3863,6 +3940,8 @@ impl KwinMcp {
             tokio::time::sleep(INPUT_EVENT_DELAY).await;
         }
         sess.eis.button(code, false).map_err(KwinError::from)?;
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("dragged ({from_x},{from_y})->({to_x},{to_y})"), serde_json::json!({
             "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
         })).await)
@@ -3889,6 +3968,8 @@ impl KwinMcp {
             sess.eis.key(code, false).map_err(KwinError::from)?;
             if needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, false).map_err(KwinError::from)?; }
         }
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
             "action": "type", "text": params.text,
         })).await)
@@ -3925,6 +4006,8 @@ impl KwinMcp {
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(KwinError::from)?;
         }
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("key: {}", params.key), serde_json::json!({
             "action": "key", "key": params.key,
         })).await)
@@ -3952,6 +4035,8 @@ impl KwinMcp {
         }
         let k = main;
         sess.eis.key(k, true).map_err(KwinError::from)?;
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("press: {}", params.key), serde_json::json!({
             "action": "press", "key": params.key,
         })).await)
@@ -3979,6 +4064,8 @@ impl KwinMcp {
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(KwinError::from)?;
         }
+        drop(guard);
+        self.mark_input().await;
         Ok(structured_result(&peer, format!("release: {}", params.key), serde_json::json!({
             "action": "release", "key": params.key,
         })).await)
