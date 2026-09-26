@@ -1,3 +1,4 @@
+mod fuse_bridge;
 mod input_bridge;
 
 use rmcp::ServiceExt;
@@ -1137,6 +1138,9 @@ struct Session {
     last_activity: std::time::Instant,
     /// When an input tool last sent events, for screenshot settling.
     last_input: Option<std::time::Instant>,
+    /// Whether the sandbox has the FUSE bridge; without it launch_app runs
+    /// AppImages in extract-and-run mode.
+    fuse_enabled: bool,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
@@ -2131,6 +2135,33 @@ async fn capture_settled_frame(
     };
     let (width, height, stride, pixels) = frame;
     Ok((width, height, stride, pixels, Some(SettleReport { settled, waited: started.elapsed() })))
+}
+
+/// FUSE support for the sandbox, when the host allows it: /dev/fuse exists,
+/// bwrap is not setuid (so it may grant capabilities in its user namespace),
+/// setpriv can drop them for everything but the helper, and at least one real
+/// fusermount binary exists. Returns (host binary, program name) pairs.
+fn fuse_support() -> Option<Vec<(PathBuf, &'static str)>> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::FileTypeExt;
+    let find = |name: &str| {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file())
+        })
+    };
+    if !std::fs::metadata("/dev/fuse").is_ok_and(|meta| meta.file_type().is_char_device()) {
+        return None;
+    }
+    let bwrap = find("bwrap")?;
+    if std::fs::metadata(&bwrap).ok()?.permissions().mode() & 0o4000 != 0 {
+        return None;
+    }
+    find("setpriv")?;
+    let binaries: Vec<(PathBuf, &'static str)> = fuse_bridge::PROGRAMS
+        .into_iter()
+        .filter_map(|program| Some((std::fs::canonicalize(find(program)?).ok()?, program)))
+        .collect();
+    (!binaries.is_empty()).then_some(binaries)
 }
 
 /// Resolve the kwin-viewer binary by replacing the basename of our own
@@ -3308,8 +3339,16 @@ impl KwinMcp {
             "--tcp-ports", &cdp_forward_spec, "--udp-ports", "none",
             "--tcp-ns", "none", "--udp-ns", "none", "--", "bwrap",
         ]);
+        // FUSE needs a process holding CAP_SYS_ADMIN in the user namespace that
+        // owns the sandbox's mount namespace. With --uid other than 0, bwrap
+        // (needing root for devpts) nests a second user namespace, where the
+        // capability cannot mount. So with FUSE, bwrap stays at uid 0 in one
+        // namespace for the helper, and the entrypoint nests the namespace
+        // that maps the real uid for everything else.
+        let fuse = fuse_support().zip(std::env::current_exe().ok());
+        let (sandbox_uid, sandbox_gid) = if fuse.is_some() { ("0", "0") } else { (uid.as_str(), gid.as_str()) };
         cmd.args([
-            "--die-with-parent", "--unshare-user", "--uid", &uid, "--gid", &gid,
+            "--die-with-parent", "--unshare-user", "--uid", sandbox_uid, "--gid", sandbox_gid,
             "--unshare-pid", "--unshare-uts", "--hostname", host_name, "--unshare-ipc",
         ]);
         overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
@@ -3357,7 +3396,38 @@ impl KwinMcp {
         for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
             cmd.arg("--dev-bind-try").arg(&path).arg(&path);
         }
-        cmd.args(["--", "bash", "-c", &entrypoint]);
+        // FUSE: /dev/fuse, CAP_SYS_ADMIN in the sandbox's user namespace for
+        // the helper only, and fusermount shims over the real binaries.
+        let sandbox_command = match &fuse {
+            Some((binaries, exe)) => {
+                cmd.args(["--dev-bind", "/dev/fuse", "/dev/fuse", "--cap-add", "CAP_SYS_ADMIN"]);
+                for (real, program) in binaries {
+                    let hidden = format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR);
+                    cmd.arg("--ro-bind").arg(real).arg(&hidden);
+                    cmd.arg("--ro-bind").arg(exe).arg(real);
+                }
+                let entrypoint_path = host_xdg_dir.join("entrypoint.sh");
+                std::fs::write(&entrypoint_path, &entrypoint).map_err(|e| ver_err(format!("write entrypoint: {e}")))?;
+                eprintln!("session_start: FUSE bridge enabled ({})", binaries.iter().map(|(_, program)| *program).collect::<Vec<_>>().join(", "));
+                // The AppImage runtime only accepts a setuid-root fusermount
+                // from PATH, which no binary is inside a user namespace; it
+                // takes FUSERMOUNT_PROG as given.
+                let prog = binaries.iter().find(|(_, program)| *program == "fusermount3")
+                    .map(|(real, _)| format!("export FUSERMOUNT_PROG={}\n", shell_quote(&real.display().to_string())))
+                    .unwrap_or_default();
+                format!(
+                    "{prog}{} --fuse-helper {} </dev/null >/dev/null &\nexec unshare --user --map-user={uid} --map-group={gid} setpriv --inh-caps=-all --ambient-caps=-all bash {}",
+                    shell_quote(&exe.display().to_string()),
+                    fuse_bridge::HELPER_SOCKET,
+                    shell_quote(&entrypoint_path.display().to_string()),
+                )
+            }
+            None => {
+                eprintln!("session_start: FUSE unavailable on this host (needs /dev/fuse, non-setuid bwrap, setpriv, fusermount)");
+                entrypoint.clone()
+            }
+        };
+        cmd.args(["--", "bash", "-c", &sandbox_command]);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::inherit());
@@ -3607,6 +3677,7 @@ impl KwinMcp {
             screen_height: screen_h,
             last_activity: std::time::Instant::now(),
             last_input: None,
+            fuse_enabled: fuse.is_some(),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -4614,7 +4685,7 @@ impl KwinMcp {
         use futures::StreamExt;
 
         // Record current active window ID before launching
-        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port) = {
+        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port, fuse_enabled) = {
             let guard = self.session.lock().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -4626,6 +4697,7 @@ impl KwinMcp {
                 sess.service_bus_address.clone(),
                 sess.atspi_bus_address.clone(),
                 sess.cdp_forward_port,
+                sess.fuse_enabled,
             )
         };
         let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
@@ -4637,7 +4709,8 @@ impl KwinMcp {
             NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let launch_cmd = format!(
-            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env APPIMAGE_EXTRACT_AND_RUN=1 PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
+            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
+            if fuse_enabled { "" } else { "APPIMAGE_EXTRACT_AND_RUN=1 " },
             shell_quote(&xdg.join("browser-bin").display().to_string()),
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
@@ -4749,6 +4822,16 @@ fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Inside the sandbox this binary also serves FUSE (see fuse_bridge).
+    let mut argv = std::env::args();
+    if let Some(program) = argv.next().as_deref().and_then(fuse_bridge::shim_program) {
+        std::process::exit(fuse_bridge::run_client(program));
+    }
+    if argv.next().as_deref() == Some("--fuse-helper") {
+        let socket = argv.next().unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
+        fuse_bridge::run_helper(Path::new(&socket))?;
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(run_server());
     // Tokio's stdio reader uses a blocking thread. A signal leaves stdin open,

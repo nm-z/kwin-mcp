@@ -1596,3 +1596,69 @@ fn chrome_file_chooser_attaches_host_and_session_files_with_the_documented_keys(
     call_tool(&mut client, id, "session_stop", json!({}));
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, /dev/fuse, sshfs, sftp-server, konsole, and a live GPU session"]
+fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let sftp_server = ["/usr/lib/ssh/sftp-server", "/usr/libexec/openssh/sftp-server", "/usr/lib/openssh/sftp-server"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists());
+    let (Some(sftp_server), true) = (sftp_server, std::path::Path::new("/usr/bin/sshfs").exists()) else {
+        eprintln!("sshfs or sftp-server missing; skipping");
+        return;
+    };
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let workdir = workdir(&started);
+    std::fs::create_dir_all(workdir.join("src")).expect("source dir");
+    std::fs::write(workdir.join("src/hello.txt"), "over fuse\n").expect("source file");
+    // sshfs over a local sftp-server: a real libfuse3 client going through
+    // fusermount3, with no network involved.
+    std::fs::write(workdir.join("fake-ssh"), format!("#!/bin/sh\nexec {sftp_server}\n")).expect("fake ssh");
+    let report = workdir.join("fuse-report.txt");
+    let script = format!(
+        "set -u; w='{w}'; m=\"$HOME/fuse-mnt\"; mkdir -p \"$m\"; chmod +x \"$w/fake-ssh\"\n\
+         exec > \"$w/fuse-report.part\" 2>&1\n\
+         sshfs -o ssh_command=\"$w/fake-ssh\" \"x:$w/src\" \"$m\" && echo \"read=$(cat \"$m/hello.txt\")\"\n\
+         fusermount3 -u \"$m\" && echo unmounted\n\
+         fusermount3 -u \"$HOME\" 2>/dev/null || echo refused-unmount-home\n\
+         sshfs -o ssh_command=\"$w/fake-ssh\" \"x:$w/src\" /usr/share 2>/dev/null || echo refused-system-mountpoint\n\
+         echo \"caps=$(awk '/^CapEff/{{print $2}}' /proc/self/status)\"\n\
+         touch /usr/kwin-mcp-probe 2>/dev/null || echo root-read-only\n\
+         mv \"$w/fuse-report.part\" \"$w/fuse-report.txt\"\n",
+        w = workdir.display()
+    );
+    std::fs::write(workdir.join("fuse-check.sh"), script).expect("write fuse script");
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("bash '{}'; konsole", workdir.join("fuse-check.sh").display())}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let result = loop {
+        if let Ok(text) = std::fs::read_to_string(&report) {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "FUSE check did not finish");
+        thread::sleep(Duration::from_millis(200));
+    };
+    for expected in [
+        "read=over fuse",
+        "unmounted",
+        "refused-unmount-home",
+        "refused-system-mountpoint",
+        "caps=0000000000000000",
+        "root-read-only",
+    ] {
+        assert!(result.lines().any(|line| line == expected), "missing {expected:?} in:\n{result}");
+    }
+    call_tool(&mut client, 4, "session_stop", json!({}));
+    client.stop_process();
+}
