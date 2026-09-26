@@ -30,6 +30,7 @@ screen-13-window = { git = "https://github.com/attackgoat/screen-13", rev = "d9f
 winit = "0.30"
 wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 pipewire = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 

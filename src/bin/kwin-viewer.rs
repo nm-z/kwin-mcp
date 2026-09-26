@@ -20,16 +20,24 @@ use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
 use screen_13_window::WindowBuilder;
-use std::collections::HashSet;
-use std::io::Cursor;
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::backend::ObjectId;
+use wayland_client::protocol::{wl_callback, wl_output, wl_registry, wl_seat};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1::{self as data_device, ExtDataControlDeviceV1},
+    ext_data_control_manager_v1::ExtDataControlManagerV1,
+    ext_data_control_offer_v1::{self as data_offer, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self as data_source, ExtDataControlSourceV1},
+};
 use wayland_protocols_plasma::fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
 use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate::{
     self as kde_keystate, OrgKdeKwinKeystate,
@@ -50,6 +58,8 @@ const FAKE_INPUT_VERSION: u32 = 5;
 const KEYSTATE_VERSION: u32 = 5;
 const SCREENCAST_VERSION: u32 = 4;
 const WL_OUTPUT_VERSION: u32 = 4;
+const WL_SEAT_VERSION: u32 = 1;
+const DATA_CONTROL_VERSION: u32 = 1;
 
 // Linux input event codes — evdev BTN_* constants (see linux/input-event-codes.h).
 const BTN_LEFT: u32 = 0x110;
@@ -62,6 +72,17 @@ const AXIS_HORIZONTAL: u32 = 1;
 
 const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+// Bound on a clipboard owner answering one read, and on the compositor
+// applying a selection.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(1);
+// How long after a viewer copy chord the session's next selection change is
+// taken as that copy.
+const COPY_TIMEOUT: Duration = Duration::from_secs(1);
+// A viewer paste hands the agent's selection back after the pasting app has
+// been quiet this long, or after PASTE_TIMEOUT if it never reads.
+const PASTE_SETTLE: Duration = Duration::from_millis(200);
+const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Status file kwin-mcp reads to report the viewer outcome; the name is shared
 /// with src/main.rs.
@@ -518,6 +539,441 @@ impl NumLockSync {
     }
 }
 
+// Clipboard contents as (MIME type, bytes) pairs in offer order. Empty means
+// no selection.
+type ClipContents = Arc<Vec<(String, Vec<u8>)>>;
+
+#[derive(Default)]
+struct ClipWatch {
+    selection: Option<(ExtDataControlOfferV1, Vec<String>)>,
+    // Counts selection changes, including the ones this viewer makes.
+    generation: u64,
+    // When a compositor last asked a source this viewer set for its data.
+    served: Option<Instant>,
+    synced: u64,
+    ended: bool,
+}
+
+#[derive(Default)]
+struct ClipShared {
+    watch: Mutex<ClipWatch>,
+    changed: Condvar,
+}
+
+impl ClipShared {
+    fn update(&self, change: impl FnOnce(&mut ClipWatch)) {
+        if let Ok(mut watch) = self.watch.lock() {
+            change(&mut watch);
+            self.changed.notify_all();
+        }
+    }
+}
+
+struct ClipState {
+    seat: Option<wl_seat::WlSeat>,
+    manager: Option<ExtDataControlManagerV1>,
+    // MIME types of offers that are not the selection yet.
+    offered: HashMap<ObjectId, Vec<String>>,
+    shared: Arc<ClipShared>,
+}
+
+impl Drop for ClipState {
+    fn drop(&mut self) {
+        self.shared.update(|watch| watch.ended = true);
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name, interface, ..
+        } = event
+        {
+            match interface.as_str() {
+                "wl_seat" if state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, WL_SEAT_VERSION, qh, ()));
+                }
+                "ext_data_control_manager_v1" => {
+                    state.manager = Some(registry.bind(name, DATA_CONTROL_VERSION, qh, ()));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlDeviceV1, ()> for ClipState {
+    fn event(
+        state: &mut Self,
+        _: &ExtDataControlDeviceV1,
+        event: data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            data_device::Event::DataOffer { id } => {
+                state.offered.insert(id.id(), Vec::new());
+            }
+            data_device::Event::Selection { id } => {
+                let selection = id.map(|offer| {
+                    let mimes = state.offered.remove(&offer.id()).unwrap_or_default();
+                    (offer, mimes)
+                });
+                state.shared.update(|watch| {
+                    if let Some((old, _)) = std::mem::replace(&mut watch.selection, selection) {
+                        old.destroy();
+                    }
+                    watch.generation += 1;
+                });
+            }
+            data_device::Event::PrimarySelection { id: Some(offer) } => {
+                state.offered.remove(&offer.id());
+                offer.destroy();
+            }
+            data_device::Event::Finished => state.shared.update(|watch| watch.ended = true),
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(ClipState, ExtDataControlDeviceV1, [
+        data_device::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtDataControlOfferV1, ()> for ClipState {
+    fn event(
+        state: &mut Self,
+        offer: &ExtDataControlOfferV1,
+        event: data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let data_offer::Event::Offer { mime_type } = event
+            && let Some(mimes) = state.offered.get_mut(&offer.id())
+        {
+            mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlSourceV1, ClipContents> for ClipState {
+    fn event(
+        state: &mut Self,
+        source: &ExtDataControlSourceV1,
+        event: data_source::Event,
+        contents: &ClipContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            data_source::Event::Send { mime_type, fd } => {
+                state
+                    .shared
+                    .update(|watch| watch.served = Some(Instant::now()));
+                let contents = Arc::clone(contents);
+                // A slow reader must not stall this connection's dispatch.
+                std::thread::spawn(move || {
+                    let bytes = contents.iter().find(|(mime, _)| *mime == mime_type);
+                    if let Some((_, bytes)) = bytes
+                        && let Err(error) = std::fs::File::from(fd).write_all(bytes)
+                    {
+                        eprintln!("kwin-viewer: clipboard send {mime_type}: {error}");
+                    }
+                });
+            }
+            data_source::Event::Cancelled => source.destroy(),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, u64> for ClipState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        serial: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state
+                .shared
+                .update(|watch| watch.synced = watch.synced.max(*serial));
+        }
+    }
+}
+
+wayland_client::delegate_noop!(ClipState: ignore wl_seat::WlSeat);
+wayland_client::delegate_noop!(ClipState: ignore ExtDataControlManagerV1);
+
+// One compositor's clipboard, read and written through ext_data_control_v1,
+// which works without keyboard focus.
+struct Clipboard {
+    label: &'static str,
+    manager: ExtDataControlManagerV1,
+    device: ExtDataControlDeviceV1,
+    qh: QueueHandle<ClipState>,
+    shared: Arc<ClipShared>,
+    next_sync: AtomicU64,
+    dispatch: DispatchThread,
+}
+
+impl Clipboard {
+    fn spawn(conn: Connection, label: &'static str, shutdown: &Shutdown) -> anyhow::Result<Self> {
+        let mut queue = conn.new_event_queue::<ClipState>();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let shared = Arc::new(ClipShared::default());
+        let mut state = ClipState {
+            seat: None,
+            manager: None,
+            offered: HashMap::new(),
+            shared: Arc::clone(&shared),
+        };
+        queue.roundtrip(&mut state)?;
+        let manager = state.manager.clone().ok_or_else(|| {
+            anyhow::anyhow!("{label} compositor did not advertise ext_data_control_manager_v1")
+        })?;
+        let seat = state
+            .seat
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{label} compositor did not advertise wl_seat"))?;
+        let device = manager.get_data_device(&seat, &qh, ());
+        queue.roundtrip(&mut state)?;
+        Ok(Self {
+            label,
+            manager,
+            device,
+            qh,
+            shared,
+            next_sync: AtomicU64::new(0),
+            dispatch: DispatchThread::spawn(
+                format!("clipboard-{label}"),
+                conn,
+                queue,
+                state,
+                shutdown,
+            )?,
+        })
+    }
+
+    // Wait until `done` holds or `timeout` passes, and report which. Fails if
+    // the connection ends first.
+    fn wait_until(
+        &self,
+        timeout: Duration,
+        done: impl Fn(&ClipWatch) -> bool,
+    ) -> anyhow::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut watch = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?;
+        loop {
+            if done(&watch) {
+                return Ok(true);
+            }
+            anyhow::ensure!(!watch.ended, "{} clipboard connection ended", self.label);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let (guard, _) = self
+                .shared
+                .changed
+                .wait_timeout(watch, remaining.min(DISPATCH_POLL_INTERVAL))
+                .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?;
+            watch = guard;
+        }
+    }
+
+    fn generation(&self) -> anyhow::Result<u64> {
+        let watch = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?;
+        Ok(watch.generation)
+    }
+
+    // Read every MIME type of the current selection.
+    fn read(&self) -> anyhow::Result<ClipContents> {
+        let selection = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?
+            .selection
+            .clone();
+        let Some((offer, mimes)) = selection else {
+            return Ok(Arc::default());
+        };
+        let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
+        let mut contents = Vec::with_capacity(mimes.len());
+        for mime in mimes {
+            let (mut reader, writer) = std::io::pipe()?;
+            offer.receive(mime.clone(), writer.as_fd());
+            self.dispatch.connection().flush()?;
+            drop(writer);
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 65536];
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                anyhow::ensure!(
+                    !remaining.is_zero(),
+                    "{} clipboard owner did not send {mime} within {CLIPBOARD_TIMEOUT:?}",
+                    self.label
+                );
+                let timeout = PollTimeout::try_from(remaining)
+                    .map_err(|error| anyhow::anyhow!("clipboard poll timeout: {error}"))?;
+                match nix::poll::poll(
+                    &mut [PollFd::new(reader.as_fd(), PollFlags::POLLIN)],
+                    timeout,
+                ) {
+                    Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                    Err(error) => anyhow::bail!("poll {} clipboard pipe: {error}", self.label),
+                }
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            contents.push((mime, bytes));
+        }
+        Ok(Arc::new(contents))
+    }
+
+    // Make `contents` the selection, and return once the compositor applied it.
+    fn write(&self, contents: ClipContents) -> anyhow::Result<()> {
+        if contents.is_empty() {
+            self.device.set_selection(None);
+        } else {
+            let source = self
+                .manager
+                .create_data_source(&self.qh, Arc::clone(&contents));
+            for (mime, _) in contents.iter() {
+                source.offer(mime.clone());
+            }
+            self.device.set_selection(Some(&source));
+        }
+        let serial = self.next_sync.fetch_add(1, Ordering::Relaxed) + 1;
+        self.dispatch.connection().display().sync(&self.qh, serial);
+        self.dispatch.connection().flush()?;
+        anyhow::ensure!(
+            self.wait_until(CLIPBOARD_TIMEOUT, |watch| watch.synced >= serial)?,
+            "{} compositor did not apply the selection within {CLIPBOARD_TIMEOUT:?}",
+            self.label
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClipChord {
+    Copy,
+    Paste,
+}
+
+// The chord the user pressed, if it is a standard copy, cut, or paste
+// shortcut. `held` already includes `code`.
+fn clipboard_chord(code: u32, held: &HashSet<u32>) -> Option<ClipChord> {
+    use evdev::KeyCode as K;
+    let any = |keys: &[K]| keys.iter().any(|key| held.contains(&evdev_code(*key)));
+    if any(&[
+        K::KEY_LEFTALT,
+        K::KEY_RIGHTALT,
+        K::KEY_LEFTMETA,
+        K::KEY_RIGHTMETA,
+    ]) {
+        return None;
+    }
+    let ctrl = any(&[K::KEY_LEFTCTRL, K::KEY_RIGHTCTRL]);
+    let shift = any(&[K::KEY_LEFTSHIFT, K::KEY_RIGHTSHIFT]);
+    let is = |key: K| code == evdev_code(key);
+    if ctrl && (is(K::KEY_C) || is(K::KEY_X) || is(K::KEY_INSERT))
+        || !ctrl && shift && is(K::KEY_DELETE)
+    {
+        Some(ClipChord::Copy)
+    } else if ctrl && is(K::KEY_V) || !ctrl && shift && is(K::KEY_INSERT) {
+        Some(ClipChord::Paste)
+    } else {
+        None
+    }
+}
+
+// Keeps the viewer user's clipboard on the host. The agent owns the isolated
+// session's clipboard, so a copy made through the viewer moves to the host
+// and a paste made through the viewer reads the host; the agent's selection
+// is put back afterwards either way.
+struct ClipboardBridge {
+    host: Arc<Clipboard>,
+    isolated: Arc<Clipboard>,
+    restore: Option<JoinHandle<()>>,
+}
+
+impl ClipboardBridge {
+    // Runs before the chord's key press reaches the session.
+    fn before(&mut self, chord: ClipChord) -> anyhow::Result<()> {
+        if let Some(restore) = self.restore.take()
+            && restore.join().is_err()
+        {
+            eprintln!("kwin-viewer: clipboard restore thread panicked");
+        }
+        let agent = self.isolated.read()?;
+        let isolated = Arc::clone(&self.isolated);
+        let restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send> = match chord {
+            ClipChord::Copy => {
+                let host = Arc::clone(&self.host);
+                let before = isolated.generation()?;
+                Box::new(move || {
+                    if isolated.wait_until(COPY_TIMEOUT, |watch| watch.generation > before)? {
+                        host.write(isolated.read()?)?;
+                        isolated.write(agent)?;
+                    }
+                    Ok(())
+                })
+            }
+            ClipChord::Paste => {
+                isolated.write(self.host.read()?)?;
+                let pasted = Instant::now();
+                // Hand the agent's selection back once the pasting app stops
+                // reading the user's.
+                Box::new(move || {
+                    isolated.wait_until(PASTE_TIMEOUT, |watch| {
+                        watch.served.is_some_and(|served| {
+                            served >= pasted && served.elapsed() >= PASTE_SETTLE
+                        })
+                    })?;
+                    isolated.write(agent)
+                })
+            }
+        };
+        self.restore = Some(
+            std::thread::Builder::new()
+                .name("clipboard-restore".to_owned())
+                .spawn(move || {
+                    if let Err(error) = restore() {
+                        eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
+                    }
+                })?,
+        );
+        Ok(())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     let session_dir = argv
@@ -574,6 +1030,21 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         host: host_numlock,
         isolated: isolated_numlock,
         shutdown: shutdown.clone(),
+    };
+
+    let clipboard = ClipboardBridge {
+        host: Arc::new(Clipboard::spawn(
+            Connection::connect_to_env()?,
+            "host",
+            &shutdown,
+        )?),
+        isolated: Arc::new(Clipboard::spawn(
+            Connection::from_socket(UnixStream::connect(session_path.join("wayland-0"))?)
+                .map_err(|e| anyhow::anyhow!("isolated clipboard connect: {e:?}"))?,
+            "isolated",
+            &shutdown,
+        )?),
+        restore: None,
     };
 
     let wayland_sock = UnixStream::connect(session_path.join("wayland-0"))?;
@@ -667,7 +1138,12 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
 
-    let mut input_state = InputState::default();
+    let mut input_state = InputState {
+        last_pos: None,
+        held_buttons: 0,
+        held_keys: HashSet::new(),
+        clipboard,
+    };
     let mut ready_reported = false;
 
     let run_result = window.run(|mut frame| {
@@ -766,7 +1242,6 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     Ok(())
 }
 
-#[derive(Default)]
 struct InputState {
     // Last cursor position in window pixel coords, updated on every
     // CursorMoved regardless of whether the move is forwarded. Needed so a
@@ -782,6 +1257,7 @@ struct InputState {
     // stuck inside the container, and every subsequent letter the user
     // types arrives shifted — looks exactly like "I cant type."
     held_keys: HashSet<u32>,
+    clipboard: ClipboardBridge,
 }
 
 fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {
@@ -878,6 +1354,12 @@ fn forward_input(
             let pressed = matches!(key.state, ElementState::Pressed);
             if pressed {
                 state.held_keys.insert(evdev);
+                if !key.repeat
+                    && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
+                    && let Err(error) = state.clipboard.before(chord)
+                {
+                    eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
+                }
             } else {
                 state.held_keys.remove(&evdev);
             }
