@@ -18,7 +18,8 @@ Prefer a purpose-built connector when the task needs application data or operati
 1. Call `session_start` before other KWin MCP tools. It is idempotent and returns information about an already running session.
 2. Launch the application and perform the requested visible workflow through KWin MCP tools.
 3. Use `screenshot` to see the rendered window, then use keyboard and mouse input. If you need a specific named control, try the compact `find_ui_elements` result. Call `accessibility_tree` only when you need structure, and filter by app, role, or depth. If the tree is empty or larger than the visual task warrants, continue with screenshots and input. KWin MCP mouse and screenshot coordinates are relative to the active window.
-4. Distinguish an isolated result from a persistent host change. Application writes under the isolated `$HOME` go to the session overlay; make authorized persistent file changes through an appropriate host path.
+4. Distinguish an isolated result from a persistent host change. Application writes under the isolated `$HOME` go to the session overlay; use `export_file` to hand a session file (such as a finished download) to a real host path, or make authorized persistent file changes through an appropriate host path.
+5. To attach a file in Chrome's file chooser, click the page's file input, press `ctrl+l`, type the absolute path, and press `alt+o` (or click Open at the top right). Enter in the location bar cancels Chrome's chooser without attaching anything. Confirm the page shows the chosen file name before submitting.
 
 `session_stop` tears down the whole isolated session and its applications. Check ownership and the user's requested continued state before stopping it. Do not stop a session that another task owns.
 
