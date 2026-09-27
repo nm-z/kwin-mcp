@@ -1276,6 +1276,8 @@ struct DisplayConfig {
     viewer_enabled: bool,
     autoclean: bool,
     ttl: Option<Duration>,
+    /// cgroup MemoryHigh for each session's sandbox in bytes; None disables it.
+    memory_high: Option<u64>,
 }
 
 const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -3558,7 +3560,7 @@ impl KwinMcp {
         // the host does not hold stay private, so concurrent sessions still bind
         // the same port without colliding (#50). The CDP port is excluded so the
         // session's own browser can always bind it.
-        let mut cmd = std::process::Command::new("pasta");
+        let mut cmd = sandbox_launcher(self.display.memory_high);
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
         cmd.args([
@@ -5040,6 +5042,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         viewer_enabled: true,
         autoclean: false,
         ttl: None,
+        memory_high: default_memory_high(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -5050,9 +5053,10 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--no-viewer" => cfg.viewer_enabled = false,
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
+            "--memory-high" => cfg.memory_high = parse_memory_high_arg(&mut args)?,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB]"
                 ))
             }
         }
@@ -5060,6 +5064,46 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
     // Expiry owns the same workdir terminal transition as --autoclean.
     cfg.autoclean |= cfg.ttl.is_some();
     Ok(cfg)
+}
+
+/// Default per-session memory cap: a quarter of the host's RAM, so a session
+/// whose browser balloons is throttled and reclaimed before it starves the
+/// host desktop and the other sessions.
+fn default_memory_high() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo.lines().find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim().trim_end_matches("kB").trim().parse().ok()?;
+    kib.checked_mul(1024).map(|bytes| bytes / 4)
+}
+
+fn parse_memory_high_arg(args: &mut impl Iterator<Item = String>) -> Result<Option<u64>, String> {
+    let value = args.next().ok_or_else(|| "--memory-high requires GiB (0 disables the cap)".to_owned())?;
+    let gib: u64 = value.parse().map_err(|error| format!("--memory-high '{value}': {error}"))?;
+    if gib == 0 { return Ok(None); }
+    gib.checked_mul(1 << 30).map(Some).ok_or_else(|| "--memory-high is too large".to_owned())
+}
+
+/// The command that starts the session's pasta + bwrap tree. With a memory
+/// cap it runs in its own systemd user scope with MemoryHigh, so the kernel
+/// throttles and reclaims that session alone; systemd-run execs pasta in
+/// place, so the child PID and process group are unchanged. Without a usable
+/// user manager the session starts uncapped.
+fn sandbox_launcher(memory_high: Option<u64>) -> std::process::Command {
+    let Some(bytes) = memory_high else { return std::process::Command::new("pasta") };
+    let usable = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().is_ok_and(|status| status.success());
+    if !usable {
+        eprintln!("session_start: systemd user scope unavailable; the session runs without a memory cap");
+        return std::process::Command::new("pasta");
+    }
+    eprintln!("session_start: session memory capped at MemoryHigh={} MiB", bytes >> 20);
+    let mut command = std::process::Command::new("systemd-run");
+    command.args(["--user", "--scope", "--quiet", "--collect", "-p"])
+        .arg(format!("MemoryHigh={bytes}"))
+        .args(["--", "pasta"]);
+    command
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
