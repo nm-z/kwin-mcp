@@ -2206,19 +2206,26 @@ const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
 set -e
 name=${0##*/}
 real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
-ozone=0 wallet=0 a11y=0 debug_port=0
+ozone=0 wallet=0 a11y=0 debug_port=0 silent_debugger=0
 for arg in "$@"; do
   case "$arg" in
     --ozone-platform|--ozone-platform=*) ozone=1 ;;
     --password-store|--password-store=*) wallet=1 ;;
     --force-renderer-accessibility|--force-renderer-accessibility=*) a11y=1 ;;
     --remote-debugging-port|--remote-debugging-port=*) debug_port=1 ;;
+    --silent-debugger-extension-api) silent_debugger=1 ;;
   esac
 done
 flags=()
 (( ozone )) || flags+=(--ozone-platform=wayland)
 (( wallet )) || flags+=(--password-store=kwallet6)
 (( a11y )) || flags+=(--force-renderer-accessibility)
+# Extensions using chrome.debugger (Claude in Chrome, bridges) otherwise pin a
+# "started debugging this browser" infobar on every window.
+case "$name" in
+  code|codium|vscodium|electron) ;;
+  *) (( silent_debugger )) || flags+=(--silent-debugger-extension-api) ;;
+esac
 case "$name" in
   google-chrome*|chrome|microsoft-edge*|msedge*) ;;
   *)
