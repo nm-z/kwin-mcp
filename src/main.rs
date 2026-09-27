@@ -3478,7 +3478,7 @@ impl KwinMcp {
         // capability cannot mount. So with FUSE, bwrap stays at uid 0 in one
         // namespace for the helper, and the entrypoint nests the namespace
         // that maps the real uid for everything else.
-        let fuse = fuse_support().zip(std::env::current_exe().ok());
+        let fuse = fuse_support();
         let (sandbox_uid, sandbox_gid) = if fuse.is_some() { ("0", "0") } else { (uid.as_str(), gid.as_str()) };
         cmd.args([
             "--die-with-parent", "--unshare-user", "--uid", sandbox_uid, "--gid", sandbox_gid,
@@ -3532,7 +3532,16 @@ impl KwinMcp {
         // FUSE: /dev/fuse, CAP_SYS_ADMIN in the sandbox's user namespace for
         // the helper only, and fusermount shims over the real binaries.
         let sandbox_command = match &fuse {
-            Some((binaries, exe)) => {
+            Some(binaries) => {
+                // Bind a copy of the running image, never the path it was
+                // started from: once the binary is rebuilt that path names a
+                // different or missing file ("<path> (deleted)"), bwrap cannot
+                // bind it, and the sandbox died before D-Bus came up.
+                // /proc/self/exe stays readable after deletion; bwrap will not
+                // bind it directly, so it is copied into the session dir.
+                let exe = host_xdg_dir.join("kwin-mcp-exe");
+                std::fs::copy("/proc/self/exe", &exe).map_err(|e| ver_err(format!("copy running binary for the FUSE bridge: {e}")))?;
+                let exe = &exe;
                 cmd.args(["--dev-bind", "/dev/fuse", "/dev/fuse", "--cap-add", "CAP_SYS_ADMIN"]);
                 for (real, program) in binaries {
                     let hidden = format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR);
