@@ -3463,14 +3463,21 @@ impl KwinMcp {
             .map_err(|error| ver_err(format!("read current UID and GID: {error}")))?;
         let uid = identity.uid().to_string();
         let gid = identity.gid().to_string();
-        // pasta creates private loopback and forwards only the session's CDP
-        // port to host loopback. Disable its automatic port and gateway maps.
+        // pasta gives the session its own loopback. Into the host it forwards
+        // only the session's CDP port. Out of the session, every port the host
+        // listens on is forwarded to the host ("auto", rescanned as host
+        // services come and go), so session apps reach the user's real local
+        // services (ollama, dev servers, provider relays) at 127.0.0.1. Ports
+        // the host does not hold stay private, so concurrent sessions still bind
+        // the same port without colliding (#50). The CDP port is excluded so the
+        // session's own browser can always bind it.
         let mut cmd = std::process::Command::new("pasta");
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
+        let host_ports_spec = format!("auto,~{cdp_forward_port}");
         cmd.args([
             "--quiet", "--config-net", "--no-map-gw", "--host-lo-to-ns-lo",
             "--tcp-ports", &cdp_forward_spec, "--udp-ports", "none",
-            "--tcp-ns", "none", "--udp-ns", "none", "--", "bwrap",
+            "--tcp-ns", &host_ports_spec, "--udp-ns", &host_ports_spec, "--", "bwrap",
         ]);
         // FUSE needs a process holding CAP_SYS_ADMIN in the user namespace that
         // owns the sandbox's mount namespace. With --uid other than 0, bwrap
