@@ -35,6 +35,9 @@ impl From<KwinError> for McpError {
 
 // ── Kernel / protocol constants ──────────────────────────────────────────
 
+// Linux /proc/net/route RTF_UP bit.
+const IPV4_ROUTE_UP: u32 = 0x1;
+
 // Linux evdev keycode for LeftShift (include/uapi/linux/input-event-codes.h).
 const LINUX_KEY_LEFTSHIFT: u32 = 42;
 
@@ -3568,6 +3571,13 @@ impl KwinMcp {
         let mut cmd = sandbox_launcher(self.display.memory_high);
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
+        let host_ipv4 = host_default_ipv4()
+            .map_err(|error| ver_err(format!("read host IPv4 configuration: {error:#}")))?;
+        // A host address marked noprefixroute leaves pasta without a connected
+        // route. Assign the default-route interface's IPv4 address and prefix explicitly.
+        if let Some((address, prefix)) = &host_ipv4 {
+            cmd.args(["--address", &address.to_string(), "--netmask", &prefix.to_string()]);
+        }
         cmd.args([
             "--quiet", "--config-net", "--no-map-gw", "--host-lo-to-ns-lo",
             "--tcp-ports", &cdp_forward_spec, "--udp-ports", "none",
@@ -5086,6 +5096,39 @@ fn parse_memory_high_arg(args: &mut impl Iterator<Item = String>) -> Result<Opti
     let gib: u64 = value.parse().map_err(|error| format!("--memory-high '{value}': {error}"))?;
     if gib == 0 { return Ok(None); }
     gib.checked_mul(1 << 30).map(Some).ok_or_else(|| "--memory-high is too large".to_owned())
+}
+
+/// IPv4 address and prefix on the host interface with the preferred default route.
+/// Leave pasta's address selection unchanged when the host has no IPv4 default.
+fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
+    let routes = std::fs::read_to_string("/proc/net/route")?;
+    let mut default: Option<(&str, u32)> = None;
+    for line in routes.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+            continue;
+        }
+        let (Ok(flags), Ok(metric)) = (
+            u32::from_str_radix(fields[3], 16), fields[6].parse::<u32>()
+        ) else { continue };
+        if flags & IPV4_ROUTE_UP != 0 && default.is_none_or(|(_, best)| metric < best) {
+            default = Some((fields[0], metric));
+        }
+    }
+    let Some((interface, _)) = default else { return Ok(None) };
+    let (address, mask) = nix::ifaddrs::getifaddrs()?
+        .find_map(|entry| {
+            if entry.interface_name != interface { return None; }
+            Some((
+                entry.address.as_ref()?.as_sockaddr_in()?.ip(),
+                entry.netmask.as_ref()?.as_sockaddr_in()?.ip(),
+            ))
+        })
+        .ok_or_else(|| anyhow::anyhow!("default-route interface {interface} has no IPv4 address and netmask"))?;
+    let mask_bits = u32::from(mask);
+    let prefix = mask_bits.count_ones();
+    anyhow::ensure!(mask_bits.leading_ones() == prefix, "non-contiguous IPv4 netmask {mask} on {interface}");
+    Ok(Some((address, prefix)))
 }
 
 /// The command that starts the session's pasta + bwrap tree. With a memory
