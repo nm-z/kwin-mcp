@@ -21,32 +21,30 @@ struct RpcClient {
 
 impl RpcClient {
     fn start() -> Self {
-        Self::start_with_options(None, false)
+        Self::start_with_options(None)
     }
 
-    fn start_with_options(delay_stage: Option<&str>, viewer: bool) -> Self {
-        Self::start_with_test_options(delay_stage, viewer, false, false, &[])
+    fn start_with_options(delay_stage: Option<&str>) -> Self {
+        Self::start_with_test_options(delay_stage, false, false, &[])
     }
 
     fn start_with_options_and_stop(
         delay_stage: Option<&str>,
-        viewer: bool,
         stop_bwrap: bool,
     ) -> Self {
-        Self::start_with_test_options(delay_stage, viewer, stop_bwrap, false, &[])
+        Self::start_with_test_options(delay_stage, stop_bwrap, false, &[])
     }
 
     fn start_with_first_proxy_failure() -> Self {
-        Self::start_with_test_options(None, false, false, true, &[])
+        Self::start_with_test_options(None, false, true, &[])
     }
 
     fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
-        Self::start_with_test_options(None, false, false, false, extra_env)
+        Self::start_with_test_options(None, false, false, extra_env)
     }
 
     fn start_with_test_options(
         delay_stage: Option<&str>,
-        viewer: bool,
         stop_bwrap: bool,
         fail_after_first_proxy: bool,
         extra_env: &[(&str, &str)],
@@ -67,13 +65,8 @@ impl RpcClient {
             std::fs::create_dir_all(directory).expect("create private test HOME");
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
-        let arguments = if viewer {
-            vec!["--autoclean"]
-        } else {
-            vec!["--no-viewer", "--autoclean"]
-        };
         command
-            .args(arguments)
+            .args(["--autoclean"])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -253,6 +246,28 @@ fn process_alive(pid: u32) -> std::io::Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+fn viewer_windows(pid: u32) -> Vec<String> {
+    let output = Command::new("kdotool")
+        .args(["search", "--all", "--pid", &pid.to_string(), "--title", "^kwin-viewer$"])
+        .output()
+        .expect("query host KWin windows");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn wait_for_viewer_windows(pid: u32, expected: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = viewer_windows(pid);
+        if windows.len() == expected || Instant::now() >= deadline {
+            return windows;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -518,12 +533,11 @@ fn startup_timeout_reclaims_children_and_workdir() {
         "set KWIN_MCP_E2E=1 to run"
     );
 
-    for (stage, viewer, stop_bwrap) in [
-        ("after-bwrap", false, false),
-        ("after-viewer", true, false),
-        ("after-bwrap", false, true),
+    for (stage, stop_bwrap) in [
+        ("after-bwrap", false),
+        ("after-bwrap", true),
     ] {
-        let mut client = RpcClient::start_with_options_and_stop(Some(stage), viewer, stop_bwrap);
+        let mut client = RpcClient::start_with_options_and_stop(Some(stage), stop_bwrap);
         let server_pid = client.pid();
         client.send(
             1,
@@ -557,18 +571,6 @@ fn startup_timeout_reclaims_children_and_workdir() {
             process_alive(bwrap_pid).unwrap_or_else(|error| panic!("inspect bwrap: {error}")),
             "bwrap was not alive before delayed stage {stage}"
         );
-        if viewer {
-            let viewer_line =
-                client.wait_for_stderr("spawned viewer pid=", Duration::from_secs(20));
-            let viewer_pid = viewer_line
-                .split_once("pid=")
-                .and_then(|(_, value)| value.trim().parse::<u32>().ok())
-                .unwrap_or_else(|| panic!("could not parse viewer PID: {viewer_line}"));
-            assert!(
-                process_alive(viewer_pid).unwrap_or_else(|error| panic!("inspect viewer: {error}")),
-                "viewer was not alive before delayed stage {stage}"
-            );
-        }
         client.wait_for_stderr(&format!("test delay at {stage}"), Duration::from_secs(20));
         let start = client.response(2, Duration::from_secs(45));
         assert!(
@@ -1188,50 +1190,55 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
 }
 
 #[test]
-#[ignore = "requires KDE, KWin, bubblewrap, input devices, a live GPU session, and a host Wayland session"]
-fn session_start_reports_viewer_outcome_and_viewer_open_opens_it() {
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, kdotool, a live GPU session, and a host Wayland session"]
+fn viewer_opens_on_demand_and_closes_without_stopping_session() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
-    // Viewer enabled with a working host Wayland session: ready, and running.
-    let mut client = RpcClient::start_with_options(None, true);
-    initialize(&mut client);
-    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
-    let viewer = &started["result"]["structuredContent"]["viewer"];
-    assert_eq!(viewer["state"], json!("ready"), "{started}");
-    let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
-    assert!(process_alive(pid).unwrap_or(false), "reported viewer is not running");
-    let again = call_tool(&mut client, 3, "viewer_open", json!({}));
-    assert_eq!(again["result"]["structuredContent"]["status"], json!("already_open"), "{again}");
-    call_tool(&mut client, 4, "session_stop", json!({}));
-    client.stop_process();
-
-    // --no-viewer: disabled at start, and viewer_open shows it on request.
+    // The default starts without a host viewer.
     let mut client = RpcClient::start();
     initialize(&mut client);
     let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
-    assert_eq!(started["result"]["structuredContent"]["viewer"]["state"], json!("disabled"), "{started}");
+    let viewer = &started["result"]["structuredContent"]["viewer"];
+    assert_eq!(viewer["state"], json!("closed"), "{started}");
+    assert!(!workdir(&started).join("viewer.log").exists(), "session_start launched a viewer");
     let opened = call_tool(&mut client, 3, "viewer_open", json!({}));
     assert_eq!(opened["result"]["structuredContent"]["status"], json!("opened"), "{opened}");
-    assert_eq!(opened["result"]["structuredContent"]["viewer"]["state"], json!("ready"), "{opened}");
-    call_tool(&mut client, 4, "session_stop", json!({}));
+    let viewer = &opened["result"]["structuredContent"]["viewer"];
+    assert!(viewer["state"] == "ready" || viewer["state"] == "starting", "{opened}");
+    let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
+    assert!(process_alive(pid).unwrap_or(false), "reported viewer is not running");
+    assert_eq!(wait_for_viewer_windows(pid, 1).len(), 1, "viewer_open did not create exactly one host window: pid={pid} opened={opened}");
+    let again = call_tool(&mut client, 4, "viewer_open", json!({}));
+    assert_eq!(again["result"]["structuredContent"]["status"], json!("already_open"), "{again}");
+    let closed = call_tool(&mut client, 5, "viewer_close", json!({}));
+    assert_eq!(closed["result"]["structuredContent"]["status"], json!("closed"), "{closed}");
+    assert_eq!(closed["result"]["structuredContent"]["viewer"]["state"], json!("closed"), "{closed}");
+    assert!(!process_alive(pid).unwrap_or(true), "viewer remained alive after viewer_close");
+    assert!(wait_for_viewer_windows(pid, 0).is_empty(), "viewer_close left a host window");
+    let running = call_tool(&mut client, 6, "session_start", json!({}));
+    assert_eq!(running["result"]["structuredContent"]["status"], json!("already_running"), "{running}");
+    call_tool(&mut client, 7, "session_stop", json!({}));
     client.stop_process();
 
-    // No usable host Wayland display: the session still starts, and the
-    // viewer outcome says why there is no viewer.
-    let mut client = RpcClient::start_with_test_options(None, true, false, false, &[("WAYLAND_DISPLAY", "kwin-mcp-no-such-display")]);
+    // A missing host Wayland display affects viewer_open, not session_start.
+    let mut client = RpcClient::start_with_test_options(None, false, false, &[("WAYLAND_DISPLAY", "kwin-mcp-no-such-display")]);
     initialize(&mut client);
     let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
     let content = &started["result"]["structuredContent"];
     assert_eq!(content["status"], json!("started"), "{started}");
-    assert_eq!(content["viewer"]["state"], json!("unavailable"), "{started}");
+    assert_eq!(content["viewer"]["state"], json!("closed"), "{started}");
+    let opened = call_tool(&mut client, 3, "viewer_open", json!({}));
+    let content = &opened["result"]["structuredContent"];
+    assert_eq!(content["status"], json!("unavailable"), "{opened}");
+    assert_eq!(content["viewer"]["state"], json!("unavailable"), "{opened}");
     assert!(
         content["viewer"]["reason"].as_str().unwrap_or_default().contains("host Wayland resolution failed"),
-        "{started}"
+        "{opened}"
     );
-    call_tool(&mut client, 3, "session_stop", json!({}));
+    call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
 

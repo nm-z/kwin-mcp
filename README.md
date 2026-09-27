@@ -8,9 +8,10 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 
 | Tool | Description |
 |---|---|
-| `session_start` | Start an isolated KDE Wayland session. Must be called first. |
+| `session_start` | Start an isolated KDE Wayland session without opening a host viewer. Must be called first. |
 | `session_stop` | Tear down the session and all container processes. |
 | `viewer_open` | Open the live host viewer for the current session (reports ready, starting, or unavailable with the reason). |
+| `viewer_close` | Close the host viewer without stopping the isolated session. |
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
@@ -25,14 +26,14 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `launch_app` | Launch an application and wait for its window. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 
-Pass `--no-viewer` when starting `kwin-mcp` to suppress only the automatic host preview window. The isolated session and all MCP tools remain available, and `viewer_open` still opens the viewer on request; without the flag, the viewer opens at `session_start`. `session_start` reports the viewer outcome separately from the session: `ready` once a host window shows the session, `starting`, `unavailable` with the reason (for example no active host Wayland session when serving over SSH), or `disabled`.
+`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Call `viewer_open` for that step, keep the page open while polling with screenshots, and call `viewer_close` when the step is done. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready`, `starting`, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). The old `--no-viewer` argument remains accepted for existing server commands.
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
 On startup, `--autoclean` also removes a workdir left by a crashed server when this version's lease marker proves it opted into cleanup, its lock is free, its sandbox process group has exited, and no mount remains inside it. Older workdirs without a lease marker remain for individual review.
 
 Pass `--ttl MINUTES` to tear down an idle session and its viewer after that many minutes without a tool call. The server stays available for the next `session_start`; `--ttl` implies `--autoclean`, so expiry also removes the workdir.
-To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp --no-viewer`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin, pasta, and device dependencies as a local session.
+To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin, pasta, and device dependencies as a local session.
 
 ## Strict host-GUI isolation
 
