@@ -43,9 +43,20 @@ const OPEN_ASYNC_METHODS: &[&str] = &["openAsync", "openPathAsync"];
 struct State {
     /// Host handles opened for the session, with the app id they belong to.
     handles: HashSet<(i32, String)>,
-    /// openAsync transactions awaiting walletAsyncOpened, by transaction id.
-    pending: HashMap<i32, String>,
+    /// openAsync transactions awaiting walletAsyncOpened, by transaction id,
+    /// with whether the session has already been sent the transaction id.
+    pending: HashMap<i32, (String, bool)>,
+    /// walletAsyncOpened results (handle, arrival) that came from the host
+    /// before the session had its transaction id. kwalletd sends the signal
+    /// right after the openAsync reply, so it can overtake the mediator's own
+    /// bookkeeping; a dropped or early signal leaves the app (Chrome's cookie
+    /// store) waiting forever.
+    early: HashMap<i32, (i32, std::time::Instant)>,
 }
+
+/// How long an unmatched walletAsyncOpened is kept for a transaction whose
+/// openAsync reply is still on its way.
+const EARLY_SIGNAL_TTL: Duration = Duration::from_secs(30);
 
 /// Outcome of the host wallet checks, reported by session_start.
 pub struct Preflight {
@@ -173,13 +184,24 @@ impl WalletMediator {
                         && let Ok((transaction, handle)) = message.body().deserialize::<(i32, i32)>()
                     {
                         let Ok(mut state) = state.lock() else { continue };
-                        match state.pending.remove(&transaction) {
-                            Some(app) if handle >= 0 => {
-                                state.handles.insert((handle, app));
+                        match state.pending.get(&transaction).cloned() {
+                            // The session already has the transaction id: deliver.
+                            Some((app, true)) => {
+                                state.pending.remove(&transaction);
+                                if handle >= 0 {
+                                    state.handles.insert((handle, app));
+                                }
                             }
-                            // Another client's transaction: not the session's to see.
-                            None => continue,
-                            Some(_) => {}
+                            // Either the session's reply has not been sent yet, or the
+                            // mediator has not recorded the transaction: hold the result
+                            // for handle_call to deliver after its reply. A transaction
+                            // that never claims it (another client's) expires unseen.
+                            Some((_, false)) | None => {
+                                let now = std::time::Instant::now();
+                                state.early.retain(|_, (_, at)| now.duration_since(*at) < EARLY_SIGNAL_TTL);
+                                state.early.insert(transaction, (handle, now));
+                                continue;
+                            }
                         }
                     }
                     if member != "walletAsyncOpened" && member != "walletOpened" {
@@ -312,16 +334,43 @@ async fn handle_call(
         let reply = call(host, &member, &body.deserialize::<Structure<'_>>()?).await?;
         let value: i32 = reply.body().deserialize()?;
         eprintln!("wallet mediator: {member}({requested}) for {app} -> {}", if value >= 0 { "ok" } else { "refused by host" });
+        let asynchronous = OPEN_ASYNC_METHODS.contains(&member.as_str());
         if value >= 0
             && let Ok(mut state) = state.lock()
         {
-            if OPEN_METHODS.contains(&member.as_str()) {
-                state.handles.insert((value, app));
+            if asynchronous {
+                state.pending.insert(value, (app.clone(), false));
             } else {
-                state.pending.insert(value, app);
+                state.handles.insert((value, app.clone()));
             }
         }
-        return session.reply(&header, &value).await;
+        session.reply(&header, &value).await?;
+        if !asynchronous || value < 0 {
+            return Ok(());
+        }
+        // The app now knows its transaction id. Deliver a result the host sent
+        // before this point; a later one is delivered by the signal task.
+        let early = state.lock().ok().and_then(|mut state| {
+            let handle = state.early.remove(&value).map(|(handle, _)| handle);
+            match handle {
+                Some(handle) => {
+                    state.pending.remove(&value);
+                    if handle >= 0 {
+                        state.handles.insert((handle, app.clone()));
+                    }
+                }
+                None => {
+                    if let Some(entry) = state.pending.get_mut(&value) {
+                        entry.1 = true;
+                    }
+                }
+            }
+            handle
+        });
+        if let Some(handle) = early {
+            session.emit_signal(None::<&str>, PATH, INTERFACE, "walletAsyncOpened", &(value, handle)).await?;
+        }
+        return Ok(());
     }
 
     if member == "close"
