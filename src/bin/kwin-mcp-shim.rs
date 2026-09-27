@@ -14,6 +14,10 @@
 //!   a `session_start` made while a build is pending waits for it, and every
 //!   start checks the binary on disk rather than trusting the warm child.
 //!   No client reconnect is needed.
+//! - Self-upgrade. When the shim binary itself is rebuilt, the shim re-executes
+//!   it in place (same pid, same client pipes) as soon as no session is live
+//!   and no call is in flight. The client's initialize params and any client
+//!   input not yet handled carry over; the client sees tools/list_changed.
 //! - Supervision. A child that exits or stops answering pings is replaced; its
 //!   leftover processes are killed, orphans reparented to the shim (it is a
 //!   child subreaper) are reaped, and leaked session workdirs are swept.
@@ -56,6 +60,8 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 /// Prefix of every JSON-RPC id the shim itself owns on a child connection.
 const SHIM_ID: &str = "__kwin_shim:";
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
+/// Carries the client connection state across a self-upgrade exec.
+const RESUME_ENV: &str = "KWIN_MCP_SHIM_RESUME";
 
 // ── Small helpers ────────────────────────────────────────────────────────
 
@@ -191,6 +197,16 @@ struct Shim {
     dead_sids: HashSet<i32>,
     orphans: HashMap<i32, Instant>,
     closing: bool,
+    /// This shim's own executable, and its identity when it started and at
+    /// the last tick; a rebuilt shim re-executes itself once idle.
+    self_path: PathBuf,
+    self_stamp: Option<Stamp>,
+    self_seen: Option<Stamp>,
+    /// Set once the shim has decided to re-execute: the client reader is
+    /// frozen and client messages are carried over instead of handled.
+    upgrading: bool,
+    freeze: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    carried: Vec<Value>,
 }
 
 impl Shim {
@@ -660,6 +676,8 @@ impl Shim {
             child.stdin = None;
         }
         self.write(&message);
+        // Right after a session_stop, before the next session_start is read.
+        self.maybe_upgrade(false);
     }
 
     fn client_init_result(&self) -> Option<Value> {
@@ -850,6 +868,7 @@ impl Shim {
             }
         }
         self.reap_leftovers(now);
+        self.maybe_upgrade(true);
     }
 
     /// Kill what dead children left behind and reap orphaned zombies. Only
@@ -892,6 +911,26 @@ impl Shim {
         // its sid cannot be reused while any member is alive.
         let live_sids: HashSet<i32> = present.iter().filter_map(|pid| procfs::process::Process::new(*pid).ok()?.stat().ok().map(|stat| stat.session)).collect();
         self.dead_sids.retain(|sid| live_sids.contains(sid));
+    }
+
+    /// Re-execute a rebuilt shim once nothing is live: no session, no call in
+    /// flight, nothing waiting. The client connection carries over.
+    /// Stability is judged across ticks; other callers only look.
+    fn maybe_upgrade(&mut self, tick: bool) {
+        let current = stamp(&self.self_path);
+        let stable = current.is_some() && current == self.self_seen;
+        if tick {
+            self.self_seen = current;
+        }
+        let quiet = self.sessions.is_empty() && self.inflight.is_empty() && self.reverse.is_empty()
+            && self.held_starts.is_empty() && self.pending_init.is_none() && self.pending_lists.is_empty();
+        if !stable || current == self.self_stamp || self.building || self.closing || !self.client_ready || !quiet {
+            return;
+        }
+        log("kwin-mcp-shim was rebuilt; re-executing it (no live sessions, the client stays connected)");
+        self.freeze.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.upgrading = true;
+        self.begin_shutdown();
     }
 
     fn begin_shutdown(&mut self) {
@@ -1017,9 +1056,59 @@ async fn sweeper(binary: PathBuf, mut trigger: mpsc::UnboundedReceiver<()>) {
     }
 }
 
+// ── Client input ─────────────────────────────────────────────────────────
+
+/// Read client lines from stdin until EOF or until `freeze` is set. Returns
+/// the bytes of an unfinished line, so a re-executed shim can pick them up.
+fn read_client(events: &mpsc::UnboundedSender<Event>, freeze: &std::sync::atomic::AtomicBool, mut pending: Vec<u8>) -> Vec<u8> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+    let stdin = std::io::stdin();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            let text = line.get(..end).unwrap_or_default();
+            if text.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            match serde_json::from_slice::<Value>(text) {
+                Ok(value) => { let _ = events.send(Event::Client(value)); }
+                Err(error) => log(&format!("ignoring malformed client line: {error}")),
+            }
+        }
+        if freeze.load(std::sync::atomic::Ordering::SeqCst) {
+            return pending;
+        }
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(100u8)) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        match nix::unistd::read(stdin.as_fd(), &mut buf) {
+            Ok(0) => break,
+            Ok(read) => pending.extend_from_slice(buf.get(..read).unwrap_or_default()),
+            Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = events.send(Event::ClientClosed);
+    Vec::new()
+}
+
+/// Replace this process with the rebuilt shim, handing it the client's
+/// initialize params and every client byte not yet handled. Only returns on
+/// failure.
+fn reexec(path: &Path, args: &[String], client_params: Option<Value>, ended: &HashMap<String, String>, input: Vec<u8>) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let state = json!({ "client_params": client_params, "ended": ended, "input": input });
+    std::process::Command::new(path).args(args).env(RESUME_ENV, state.to_string()).exec()
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────
 
-fn locate() -> Result<(PathBuf, Option<PathBuf>, bool), String> {
+fn locate() -> Result<(PathBuf, PathBuf, Option<PathBuf>, bool), String> {
     let exe = std::env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
     let dir = exe.parent().ok_or("shim executable has no directory")?.to_path_buf();
     let binary = std::env::var_os("KWIN_MCP_BINARY").map(PathBuf::from).unwrap_or_else(|| dir.join("kwin-mcp"));
@@ -1027,26 +1116,46 @@ fn locate() -> Result<(PathBuf, Option<PathBuf>, bool), String> {
     let repo = std::env::var_os("KWIN_MCP_REPO").map(PathBuf::from)
         .or_else(|| dir.parent()?.parent().map(Path::to_path_buf))
         .filter(|repo| repo.join("Cargo.toml").is_file() && repo.join("src").is_dir());
-    Ok((binary, repo, release))
+    Ok((exe, binary, repo, release))
+}
+
+/// Connection state handed over by the shim that re-executed into this one.
+struct Resume {
+    client_params: Value,
+    ended: HashMap<String, String>,
+    input: Vec<u8>,
+}
+
+fn take_resume() -> Option<Resume> {
+    let text = std::env::var(RESUME_ENV).ok()?;
+    // Single-threaded here: the runtime starts after this.
+    unsafe { std::env::remove_var(RESUME_ENV) };
+    let mut state: Value = serde_json::from_str(&text).ok()?;
+    let client_params = state.get_mut("client_params").map(Value::take).filter(|params| !params.is_null())?;
+    let ended = state.get_mut("ended").map(Value::take).and_then(|ended| serde_json::from_value(ended).ok()).unwrap_or_default();
+    let input = state.get_mut("input").map(Value::take).and_then(|input| serde_json::from_value(input).ok()).unwrap_or_default();
+    Some(Resume { client_params, ended, input })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let resume = take_resume();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(resume));
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
         // Orphans of dead children reparent to the shim so it can reap them.
         nix::libc::prctl(nix::libc::PR_SET_CHILD_SUBREAPER, 1);
     }
-    let (binary, repo, release) = locate()?;
+    let (self_path, binary, repo, release) = locate()?;
     log(&format!(
-        "v{} relaying to {}; hot reload {}",
+        "v{} {}relaying to {}; hot reload {}",
         env!("CARGO_PKG_VERSION"),
+        if resume.is_some() { "(re-executed after a rebuild) " } else { "" },
         binary.display(),
         match &repo { Some(repo) => format!("watching {}", repo.display()), None => "watching the binary only".to_owned() },
     ));
@@ -1065,17 +1174,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let reader_events = event_tx.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            match serde_json::from_str::<Value>(&line) {
-                Ok(value) => { let _ = reader_events.send(Event::Client(value)); }
-                Err(error) => log(&format!("ignoring malformed client line: {error}")),
-            }
-        }
-        let _ = reader_events.send(Event::ClientClosed);
-    });
+    let freeze = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let events = event_tx.clone();
+        let freeze = freeze.clone();
+        let input = resume.as_ref().map(|resume| resume.input.clone()).unwrap_or_default();
+        std::thread::spawn(move || read_client(&events, &freeze, input))
+    };
     let tick_events = event_tx.clone();
     tokio::spawn(async move {
         loop {
@@ -1087,6 +1192,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(sweeper(binary.clone(), sweep_rx));
     let _ = sweep_tx.send(());
 
+    let self_stamp = stamp(&self_path);
     let mut shim = Shim {
         out: out_tx, events: event_tx, sweep: sweep_tx,
         child_bin: binary, child_args: std::env::args().skip(1).collect(),
@@ -1096,13 +1202,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_lists: Vec::new(), init_result: None, tools: None, base_tools: Vec::new(), client_ready: false,
         latest: None, building: false, held_starts: Vec::new(), crashes: VecDeque::new(), respawn_after: None,
         dead_sids: HashSet::new(), orphans: HashMap::new(), closing: false,
+        self_path, self_stamp, self_seen: self_stamp, upgrading: false, freeze: freeze.clone(), carried: Vec::new(),
     };
     shim.latest = stamp(&shim.child_bin);
+    if let Some(resume) = resume {
+        // The client already initialized; the first tool list the new idle
+        // child reports goes out as tools/list_changed.
+        shim.client_params = Some(resume.client_params);
+        shim.client_ready = true;
+        shim.ended = resume.ended;
+        shim.ensure_idle();
+    }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut deadline: Option<Instant> = None;
+    let mut client_closed = false;
     loop {
         let event = tokio::select! {
             event = event_rx.recv() => event,
@@ -1112,10 +1228,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let Some(event) = event else { break };
         match event {
+            Event::Client(message) if shim.upgrading => shim.carried.push(message),
             Event::Client(message) => shim.on_client(message),
             Event::ClientClosed => {
-                if deadline.is_none() {
+                client_closed = true;
+                if deadline.is_none() || shim.upgrading {
                     log("client closed; stopping children");
+                    shim.upgrading = false;
                     shim.begin_shutdown();
                     deadline = Some(Instant::now() + SHUTDOWN_WAIT);
                 }
@@ -1125,6 +1244,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Event::BinaryChanged(build) => shim.on_binary_changed(build),
             Event::Building(active) => shim.on_building(active),
             Event::Tick => shim.on_tick(),
+        }
+        if shim.upgrading && deadline.is_none() {
+            deadline = Some(Instant::now() + SHUTDOWN_WAIT);
         }
         if let Some(at) = deadline {
             if shim.children.is_empty() {
@@ -1138,8 +1260,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if shim.upgrading && !client_closed {
+        // Everything the client sent but this shim did not handle goes to the
+        // new one, in order: queued messages, then unread bytes.
+        let partial = tokio::task::spawn_blocking(move || reader.join().unwrap_or_default()).await.unwrap_or_default();
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::Client(message) = event {
+                shim.carried.push(message);
+            }
+        }
+        let mut input = Vec::new();
+        for message in &shim.carried {
+            input.extend_from_slice(message.to_string().as_bytes());
+            input.push(b'\n');
+        }
+        input.extend_from_slice(&partial);
+        let (path, args, params, ended) = (shim.self_path.clone(), shim.child_args.clone(), shim.client_params.clone(), shim.ended.clone());
+        drop(shim);
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        let error = reexec(&path, &args, params, &ended, input);
+        log(&format!("re-executing {} failed: {error}", path.display()));
+        return Err(error.into());
+    }
     drop(shim);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
     Ok(())
 }
-
