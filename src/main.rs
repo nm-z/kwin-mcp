@@ -4887,7 +4887,7 @@ impl KwinMcp {
     }
 }
 
-fn parse_cli_args() -> Result<(DisplayConfig, Option<PathBuf>), String> {
+fn parse_cli_args() -> Result<DisplayConfig, String> {
     let mut cfg = DisplayConfig {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
@@ -4896,7 +4896,6 @@ fn parse_cli_args() -> Result<(DisplayConfig, Option<PathBuf>), String> {
         autoclean: false,
         ttl: None,
     };
-    let mut listen = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4906,17 +4905,16 @@ fn parse_cli_args() -> Result<(DisplayConfig, Option<PathBuf>), String> {
             "--no-viewer" => cfg.viewer_enabled = false,
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
-            "--listen" => listen = Some(PathBuf::from(args.next().ok_or_else(|| "--listen requires a socket path".to_owned())?)),
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--listen SOCKET] | kwin-mcp --connect SOCKET"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES]"
                 ))
             }
         }
     }
     // Expiry owns the same workdir terminal transition as --autoclean.
     cfg.autoclean |= cfg.ttl.is_some();
-    Ok((cfg, listen))
+    Ok(cfg)
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
@@ -4955,13 +4953,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sweep_dead_owner_workdirs()?;
             return Ok(());
         }
-        Some("--connect") => {
-            let socket = argv.next().ok_or("--connect requires a socket path")?;
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            let result = runtime.block_on(connect_bridge(Path::new(&socket)));
-            runtime.shutdown_timeout(Duration::from_secs(1));
-            return result;
-        }
         _ => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -4977,7 +4968,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
-    let (display, listen) = parse_cli_args()?;
+    let display = parse_cli_args()?;
     if display.autoclean
         && let Err(error) = sweep_orphaned_workdirs() {
             eprintln!("autoclean: orphan sweep skipped: {error}");
@@ -4993,12 +4984,27 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     );
     let kwin = KwinMcp::new(display);
     let shutdown = kwin.clone();
+    // Inject the host's installed browsers into the launch_app description so the
+    // agent knows what it can actually run without guessing (issue #28).
+    let mut tool_router = KwinMcp::tool_router();
     let browsers = detect_browsers();
     eprintln!("kwin-mcp: detected browsers: {}", if browsers.is_empty() { "(none)".to_owned() } else { browsers.join(", ") });
-    if let Some(path) = listen {
-        return serve_listener(kwin, &browsers, &path).await;
+    if let Some(route) = tool_router.map.get_mut("launch_app") {
+        let hint = if browsers.is_empty() {
+            "\n\nNo known browser was found on this host's PATH.".to_owned()
+        } else {
+            format!(
+                "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
+                 Only 'chromium' exposes CDP DOM queries on its default profile; the others still \
+                 launch, screenshot, and accept input normally.",
+                browsers.join(", ")
+            )
+        };
+        let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
+        route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
-    let router = build_router(kwin, &browsers);
+    let router =
+        rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
     let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper());
@@ -5021,106 +5027,5 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let _ = ttl_reaper.await;
     shutdown.shutdown_cleanup().await;
     if let Some(result) = waited { result?; }
-    Ok(())
-}
-
-/// The MCP router for one client connection. The host's installed browsers are
-/// injected into the launch_app description so the agent knows what it can
-/// actually run without guessing (issue #28).
-fn build_router(kwin: KwinMcp, browsers: &[String]) -> rmcp::handler::server::router::Router<KwinMcp> {
-    let mut tool_router = KwinMcp::tool_router();
-    if let Some(route) = tool_router.map.get_mut("launch_app") {
-        let hint = if browsers.is_empty() {
-            "\n\nNo known browser was found on this host's PATH.".to_owned()
-        } else {
-            format!(
-                "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
-                 Only 'chromium' exposes CDP DOM queries on its default profile; the others still \
-                 launch, screenshot, and accept input normally.",
-                browsers.join(", ")
-            )
-        };
-        let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
-        route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
-    }
-    rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router)
-}
-
-/// --listen: a long-lived server with no MCP client parent (issue #99). Clients
-/// connect to the Unix socket, directly or through `kwin-mcp --connect`, and
-/// all of them drive the one session. A disconnect never tears the session
-/// down; only SIGTERM/SIGINT/SIGHUP or --ttl expiry do. Servers started this way
-/// are long-lived by design, so reapers and deploy tooling must leave them alone.
-async fn serve_listener(kwin: KwinMcp, browsers: &[String], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // A live listener owns its path; only a stale socket file is replaced.
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        return Err(format!("{} already has a live kwin-mcp listener", path.display()).into());
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)
-        .map_err(|error| format!("listen on {}: {error}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    eprintln!("kwin-mcp: listening on {} (pid {}); the session persists across client connections", path.display(), std::process::id());
-    let ttl_reaper = tokio::spawn(kwin.clone().idle_reaper());
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    let router = build_router(kwin.clone(), browsers);
-                    tokio::spawn(async move {
-                        match router.serve(stream).await {
-                            Ok(service) => {
-                                eprintln!("kwin-mcp: client connected");
-                                let _ = service.waiting().await;
-                                eprintln!("kwin-mcp: client disconnected; session kept");
-                            }
-                            Err(error) => eprintln!("kwin-mcp: client handshake failed: {error}"),
-                        }
-                    });
-                }
-                Err(error) => {
-                    eprintln!("kwin-mcp: accept failed: {error}");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            },
-            _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
-            _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
-            _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
-        }
-    }
-    drop(listener);
-    let _ = std::fs::remove_file(path);
-    ttl_reaper.abort();
-    let _ = ttl_reaper.await;
-    kwin.shutdown_cleanup().await;
-    Ok(())
-}
-
-/// --connect: relay this process's stdio to a --listen server, so any stdio MCP
-/// client config can attach to the long-lived session. Exits when either side
-/// closes; the session itself keeps running.
-async fn connect_bridge(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::AsyncWriteExt;
-    let stream = tokio::net::UnixStream::connect(path).await
-        .map_err(|error| format!("connect {}: {error}", path.display()))?;
-    let (mut from_server, mut to_server) = stream.into_split();
-    let upstream = async {
-        let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut to_server).await;
-        let _ = to_server.shutdown().await;
-    };
-    let downstream = async {
-        let _ = tokio::io::copy(&mut from_server, &mut tokio::io::stdout()).await;
-    };
-    tokio::select! {
-        () = upstream => {},
-        () = downstream => {},
-    }
     Ok(())
 }
