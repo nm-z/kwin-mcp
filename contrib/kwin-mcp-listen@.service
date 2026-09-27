@@ -1,0 +1,16 @@
+# Long-lived kwin-mcp session with no MCP client parent (issue #99).
+# Install: cp contrib/kwin-mcp-listen@.service ~/.config/systemd/user/
+#          systemctl --user enable --now kwin-mcp-listen@gateway
+# Attach an MCP client with: kwin-mcp --connect %t/kwin-mcp/gateway.sock
+[Unit]
+Description=kwin-mcp long-lived session %i
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/kwin-mcp/target/release/kwin-mcp --listen %t/kwin-mcp/%i.sock --width 1920 --height 1080
+Restart=on-failure
+TimeoutStopSec=60
+
+[Install]
+WantedBy=graphical-session.target
