@@ -1789,6 +1789,47 @@ fn sweep_orphaned_workdirs() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Workdirs without an autoclean lease live until their server exits. Once the
+/// owning server is gone they are leaked: remove them, unless a live kwin-mcp
+/// still has that pid, something is mounted inside, or any process still names
+/// the directory on its command line (a surviving sandbox binds it by path).
+fn sweep_dead_owner_workdirs() -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let temp = std::env::temp_dir();
+    let uid = std::fs::metadata("/proc/self")?.uid();
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let cmdlines: Vec<String> = procfs::process::all_processes()
+        .map_err(std::io::Error::other)?
+        .flatten()
+        .filter_map(|process| process.cmdline().ok().map(|args| args.join(" ")))
+        .collect();
+    for entry in std::fs::read_dir(&temp)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
+        if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
+        let dir = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
+        if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() { continue }
+        let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe")).ok()
+            .and_then(|exe| exe.file_name().map(|file| file.to_string_lossy().starts_with("kwin-mcp")))
+            .unwrap_or(false);
+        if owner_alive { continue }
+        let dir_text = dir.to_string_lossy();
+        let mount_prefix = format!("{dir_text}/");
+        if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
+            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
+        if cmdlines.iter().any(|args| args.split(' ').any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))) { continue }
+        match remove_verified_workdir(&dir) {
+            Ok(()) => eprintln!("sweep: removed leaked {}", dir.display()),
+            Err(error) => eprintln!("sweep: retained leaked {}: {error}", dir.display()),
+        }
+    }
+    Ok(())
+}
+
 /// Result of the one terminal cleanup transition.
 enum WorkdirCleanup {
     /// Idle: --autoclean is off, or the workdir was already deleted.
@@ -4892,10 +4933,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(program) = argv.next().as_deref().and_then(fuse_bridge::shim_program) {
         std::process::exit(fuse_bridge::run_client(program));
     }
-    if argv.next().as_deref() == Some("--fuse-helper") {
-        let socket = argv.next().unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
-        fuse_bridge::run_helper(Path::new(&socket))?;
-        return Ok(());
+    match argv.next().as_deref() {
+        Some("--fuse-helper") => {
+            let socket = argv.next().unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
+            fuse_bridge::run_helper(Path::new(&socket))?;
+            return Ok(());
+        }
+        // One orphan sweep, then exit: kwin-mcp-shim runs this on a timer so
+        // leaked workdirs are reaped even while no new server starts.
+        Some("--sweep-workdirs") => {
+            sweep_orphaned_workdirs()?;
+            sweep_dead_owner_workdirs()?;
+            return Ok(());
+        }
+        _ => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(run_server());

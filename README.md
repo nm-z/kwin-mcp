@@ -114,6 +114,16 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## Shim: hot reload and one session per agent
+
+Point your MCP client at `target/release/kwin-mcp-shim` instead of `kwin-mcp`, with the same arguments. The shim is launched once and never restarts. It runs each real `kwin-mcp` server as a child and relays MCP:
+
+- **One session per agent.** Every `session_start` without a `session_id` gets its own child process, so each session has its own display, windows, keyboard focus and mouse. The result includes a `session_id` (for example `s12345`, matching `/tmp/kwin-mcp-12345`). Every tool accepts `session_id`. It may be omitted only while exactly one session is live; otherwise the call fails and lists the live ids. `session_list` shows every session. Parallel subagents that share one MCP connection each call `session_start` and use their own id.
+- **Hot reload, no reconnect.** The shim watches `src/`, `Cargo.toml`, `Cargo.lock` and `build.rs` next to its own binary and runs `cargo build` when they change (log: `~/.cache/kwin-mcp-shim/build.log`). When the `kwin-mcp` binary changes, from its build or anyone else's, it swaps in a fresh idle child and sends `notifications/tools/list_changed`. New sessions get the new build. Live sessions keep running on their original child until they stop, and tools they still serve stay published. Calling a tool newer than a session's build fails with a clear message.
+- **Supervision.** A child that exits, or does not answer a ping for 90 seconds, is replaced. Its in-flight calls fail with a clear error, and processes left in its process session are killed. The shim is a child subreaper, so orphans are reaped. Every 5 minutes, and after each child exit, it runs `kwin-mcp --sweep-workdirs`. That removes leased autoclean workdirs whose sandbox is gone, and unleased `/tmp/kwin-mcp-<pid>` workdirs whose server has exited. Servers the shim did not start are never touched.
+
+Changes to the shim itself still need a client reconnect. Keep it thin.
+
 ## Setup
 
 Add your user to these groups:
