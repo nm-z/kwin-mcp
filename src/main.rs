@@ -755,7 +755,10 @@ impl OverlayPlan {
         if let Some(staging_root) = &self.staging_root {
             command.arg("--bind").arg(staging_root).arg(target);
         }
-        for overlay in &self.overlays {
+        // The plan is made seconds before bwrap runs. HOME entries that vanished
+        // since (lock directories such as ~/.claude.json.lock) would make bwrap
+        // fail, so skip them; their staging stub stays an empty directory.
+        for overlay in self.overlays.iter().filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok()) {
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -765,7 +768,7 @@ impl OverlayPlan {
                 .arg(&overlay.destination);
         }
         for path in &self.read_only_binds {
-            command.arg("--ro-bind").arg(path).arg(path);
+            command.arg("--ro-bind-try").arg(path).arg(path);
         }
         for path in &self.empty_dirs {
             command.arg("--tmpfs").arg(path);
@@ -864,8 +867,9 @@ fn create_staging_directory(
     initialize: bool,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(destination)?;
-    if initialize {
-        std::fs::set_permissions(destination, std::fs::metadata(source)?.permissions())?;
+    // A source that vanished meanwhile keeps the default mode.
+    if initialize && let Ok(meta) = std::fs::metadata(source) {
+        std::fs::set_permissions(destination, meta.permissions())?;
     }
     Ok(())
 }
@@ -936,6 +940,7 @@ fn prepare_split_overlay_directory(
             if context.initialize && !staged_exists {
                 match std::fs::copy(&source, &staged) {
                     Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                         let _ = std::fs::remove_file(&staged);
                         read_only_binds.push(source);
