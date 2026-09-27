@@ -732,6 +732,8 @@ struct OverlayPlan {
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>, socket_links: SocketLinks,
+    /// Directories the session sees as empty tmpfs; the host copies stay hidden.
+    empty_dirs: Vec<PathBuf>,
 }
 
 impl OverlayPlan {
@@ -764,6 +766,9 @@ impl OverlayPlan {
         }
         for path in &self.read_only_binds {
             command.arg("--ro-bind").arg(path).arg(path);
+        }
+        for path in &self.empty_dirs {
+            command.arg("--tmpfs").arg(path);
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
@@ -958,7 +963,7 @@ fn prepare_overlay_plan(
         std::fs::create_dir_all(&work)?;
         let overlay = OverlayMount { lower: target.to_path_buf(), upper, work, destination: target.to_path_buf() };
         return Ok(OverlayPlan { staging_root: None, overlays: vec![overlay], read_only_binds: Vec::new(),
-            socket_binds: Vec::new(), socket_links: SocketLinks::default() });
+            socket_binds: Vec::new(), socket_links: SocketLinks::default(), empty_dirs: Vec::new() });
     }
 
     let staging_root = session_tmp.join("overlay-root");
@@ -995,7 +1000,7 @@ fn prepare_overlay_plan(
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
-        socket_binds: Vec::new(), socket_links: SocketLinks::default(),
+        socket_binds: Vec::new(), socket_links: SocketLinks::default(), empty_dirs: Vec::new(),
     })
 }
 
@@ -1077,6 +1082,24 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 /// browser offers "Restore pages? Chrome didn't shut down correctly". Mark each
 /// profile's copy in the session's upper layer as a clean exit. The host
 /// Preferences files are only read.
+/// Session browsers start on a new tab instead of reopening every tab the user
+/// has open on the host: each profile's `Sessions` directory (the saved
+/// windows and tabs) is shown to the session as an empty tmpfs. The restore
+/// setting itself is left alone, because switching Chrome off "continue where
+/// you left off" makes it delete session-only cookies at startup and would
+/// drop logins that live in them.
+fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
+    for config in BROWSER_CONFIG_DIRS {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
+        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+            let sessions = profile.path().join("Sessions");
+            if sessions.is_dir() {
+                plan.empty_dirs.push(sessions);
+            }
+        }
+    }
+}
+
 fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
     use std::os::unix::fs::PermissionsExt;
     let mut marked = 0;
@@ -1199,7 +1222,8 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
         }
     }
     let marked = mark_browser_exits_clean(&overlay_plan, target);
-    eprintln!("session_start: marked {marked} browser profile(s) as cleanly exited in the session copy");
+    hide_browser_sessions(&mut overlay_plan, target);
+    eprintln!("session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty", overlay_plan.empty_dirs.len());
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView { overlay_plan, kdeglobals })
 }
