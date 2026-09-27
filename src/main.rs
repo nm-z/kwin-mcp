@@ -1042,13 +1042,12 @@ const SQLITE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// intact. SQLite's online backup takes a consistent snapshot through the
 /// host's own locking; it lands in the upper layer with an empty WAL and
 /// shared-memory index, so the session owns a self-consistent database.
-fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let (upper, overlay) = plan.upper_path(database).ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
-    let size = std::fs::metadata(database)?.len();
-    anyhow::ensure!(size <= SQLITE_SNAPSHOT_MAX_BYTES, "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit");
-    // Recreate missing upper parents with the lower directories' modes, since
-    // a merged directory shows its upper attributes.
+/// The upper-layer path that shadows `path` in the HOME overlay, with any
+/// missing upper parents recreated using the lower directories' modes (a merged
+/// directory shows its upper attributes). Writes there land in the session's
+/// tmpfs, never on the host file.
+fn upper_file(plan: &OverlayPlan, path: &Path) -> anyhow::Result<PathBuf> {
+    let (upper, overlay) = plan.upper_path(path).ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
     let parent = upper.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
     let mut missing = Vec::new();
     let mut cursor = parent.to_path_buf();
@@ -1063,6 +1062,68 @@ fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<(
             std::fs::set_permissions(directory, meta.permissions())?;
         }
     }
+    Ok(upper)
+}
+
+/// Chromium-family config directories whose profiles are copied into sessions.
+const BROWSER_CONFIG_DIRS: &[&str] = &[
+    ".config/google-chrome", ".config/google-chrome-beta", ".config/google-chrome-unstable",
+    ".config/chromium", ".config/BraveSoftware/Brave-Browser", ".config/microsoft-edge",
+    ".config/vivaldi",
+];
+
+/// The session sees the user's browser profiles while the host browser is
+/// still running, so their Preferences record an unclean exit and the session
+/// browser offers "Restore pages? Chrome didn't shut down correctly". Mark each
+/// profile's copy in the session's upper layer as a clean exit. The host
+/// Preferences files are only read.
+fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+    let mut marked = 0;
+    for config in BROWSER_CONFIG_DIRS {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
+        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+            let preferences = profile.path().join("Preferences");
+            let result = (|| -> anyhow::Result<bool> {
+                let text = match std::fs::read(&preferences) {
+                    Ok(text) => text,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
+                let mut json: serde_json::Value = serde_json::from_slice(&text)?;
+                let profile_prefs = json.as_object_mut().ok_or_else(|| anyhow::anyhow!("not a JSON object"))?
+                    .entry("profile").or_insert_with(|| serde_json::json!({}));
+                let profile_prefs = profile_prefs.as_object_mut().ok_or_else(|| anyhow::anyhow!("profile is not an object"))?;
+                if profile_prefs.get("exit_type").and_then(serde_json::Value::as_str) == Some("Normal")
+                    && profile_prefs.get("exited_cleanly").and_then(serde_json::Value::as_bool) == Some(true)
+                {
+                    return Ok(false);
+                }
+                profile_prefs.insert("exit_type".to_owned(), serde_json::Value::String("Normal".to_owned()));
+                profile_prefs.insert("exited_cleanly".to_owned(), serde_json::Value::Bool(true));
+                let upper = upper_file(plan, &preferences)?;
+                let temporary = upper.with_file_name(".Preferences.kwin-mcp");
+                std::fs::write(&temporary, serde_json::to_vec(&json)?)?;
+                let mode = std::fs::metadata(&preferences)?.permissions().mode();
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
+                std::fs::rename(&temporary, &upper)?;
+                Ok(true)
+            })();
+            match result {
+                Ok(true) => marked += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!("session_start: left {} as is: {error:#}", preferences.display()),
+            }
+        }
+    }
+    marked
+}
+
+fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let size = std::fs::metadata(database)?.len();
+    anyhow::ensure!(size <= SQLITE_SNAPSHOT_MAX_BYTES, "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit");
+    let upper = upper_file(plan, database)?;
     let temporary = upper.with_file_name(format!(
         ".{}.kwin-mcp-snapshot",
         upper.file_name().and_then(|name| name.to_str()).unwrap_or("db")
@@ -1137,6 +1198,8 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
             Err(error) => eprintln!("session_start: live SQLite database {} left shared: {error:#}", database.display()),
         }
     }
+    let marked = mark_browser_exits_clean(&overlay_plan, target);
+    eprintln!("session_start: marked {marked} browser profile(s) as cleanly exited in the session copy");
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView { overlay_plan, kdeglobals })
 }
