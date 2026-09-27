@@ -124,6 +124,18 @@ Point your MCP client at `target/release/kwin-mcp-shim` instead of `kwin-mcp`, w
 
 Changes to the shim itself still need a client reconnect. Keep it thin.
 
+## Long-lived sessions: --listen and --connect
+
+`kwin-mcp --listen SOCKET [flags]` runs a server with no MCP client parent. MCP clients connect to the Unix socket (mode 0600), and all of them drive the one session. A client disconnect never tears the session down. SIGTERM, SIGINT, SIGHUP or `--ttl` expiry do. A second `--listen` on a live socket is refused.
+
+`kwin-mcp --connect SOCKET` relays stdio to that socket, so any stdio MCP config can attach, detach and reattach:
+
+```json
+{ "command": "/home/you/kwin-mcp/target/release/kwin-mcp", "args": ["--connect", "/run/user/1000/kwin-mcp/gateway.sock"] }
+```
+
+`contrib/kwin-mcp-listen@.service` runs one under systemd: `systemctl --user enable --now kwin-mcp-listen@gateway`. Listener servers are long-lived by design. `kwin-mcp-shim` never touches them, because it only supervises children it started, and deploy tooling must leave them alone too.
+
 ## Setup
 
 Add your user to these groups:
