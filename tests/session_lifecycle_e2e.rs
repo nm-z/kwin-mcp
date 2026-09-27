@@ -15,6 +15,8 @@ struct RpcClient {
     responses: Receiver<Value>,
     stderr: Receiver<String>,
     pending: HashMap<u64, Value>,
+    /// Private HOME for this run, removed on drop.
+    home: PathBuf,
 }
 
 impl RpcClient {
@@ -134,6 +136,7 @@ impl RpcClient {
             responses,
             stderr: stderr_rx,
             pending: HashMap::new(),
+            home,
         }
     }
 
@@ -207,6 +210,7 @@ impl Drop for RpcClient {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.home);
     }
 }
 
