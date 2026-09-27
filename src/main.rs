@@ -70,6 +70,8 @@ const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Input-event pacing (clicks, drag steps, key hold).
 const INPUT_EVENT_DELAY: Duration = Duration::from_millis(50);
+/// How long an input send may wait for KWin to drain a full EIS socket.
+const EIS_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Settle time between cursor move and button press in mouse_click.
 const MOVE_TO_CLICK_DELAY: Duration = Duration::from_millis(200);
@@ -511,10 +513,33 @@ impl Eis {
         })
     }
 
+    /// Send the queued EIS requests. The socket is non-blocking, so when input
+    /// outruns KWin (a long keyboard_type) the kernel buffer fills and the send
+    /// fails with EAGAIN while reis keeps the unsent bytes queued. Wait for the
+    /// socket to drain and continue, so no input is cut off mid-stream.
+    fn flush(&self) -> anyhow::Result<()> {
+        use std::os::fd::AsFd;
+        let deadline = std::time::Instant::now() + EIS_FLUSH_TIMEOUT;
+        loop {
+            match self.context.flush() {
+                Ok(()) => return Ok(()),
+                Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                anyhow::bail!("KWin stopped reading input: the EIS socket stayed full for {}s", EIS_FLUSH_TIMEOUT.as_secs());
+            }
+            let mut fds = [nix::poll::PollFd::new(self.context.as_fd(), nix::poll::PollFlags::POLLOUT)];
+            let wait = u16::try_from(left.as_millis()).unwrap_or(u16::MAX);
+            let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(wait));
+        }
+    }
+
     fn move_abs(&self, x: f32, y: f32) -> anyhow::Result<()> {
         self.abs_ptr.motion_absolute(x, y);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        Ok(self.context.flush()?)
+        self.flush()
     }
 
     fn button(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
@@ -524,21 +549,21 @@ impl Eis {
         };
         self.btn.button(code, st);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        Ok(self.context.flush()?)
+        self.flush()
     }
 
     fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
         self.scroll.scroll_discrete(dx, dy);
         self.scroll.scroll_stop(0, 0, 0);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        Ok(self.context.flush()?)
+        self.flush()
     }
 
     fn scroll_smooth(&self, dx: f32, dy: f32) -> anyhow::Result<()> {
         self.scroll.scroll(dx, dy);
         self.scroll.scroll_stop(0, 0, 0);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        Ok(self.context.flush()?)
+        self.flush()
     }
 
     fn key(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
@@ -548,7 +573,7 @@ impl Eis {
         };
         self.kbd.key(code, st);
         self.kbd_dev.frame(self.next_serial(), self.now_us());
-        Ok(self.context.flush()?)
+        self.flush()
     }
 }
 
@@ -4615,12 +4640,29 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        for ch in params.text.chars() {
-            let (code, needs_shift) = char_key(ch)?;
-            if needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, true).map_err(KwinError::from)?; }
-            sess.eis.key(code, true).map_err(KwinError::from)?;
-            sess.eis.key(code, false).map_err(KwinError::from)?;
-            if needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, false).map_err(KwinError::from)?; }
+        // Resolve every character before sending anything, so an unsupported
+        // character never leaves half the text typed.
+        let keys = params.text.chars().map(char_key).collect::<Result<Vec<_>, _>>()?;
+        for (typed, (code, needs_shift)) in keys.iter().enumerate() {
+            let sent = (|| {
+                if *needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, true)?; }
+                sess.eis.key(*code, true)?;
+                sess.eis.key(*code, false)?;
+                if *needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, false)?; }
+                anyhow::Ok(())
+            })();
+            if let Err(error) = sent {
+                // Never leave a key or Shift held down after a failure.
+                let _ = sess.eis.key(*code, false);
+                let _ = sess.eis.key(LINUX_KEY_LEFTSHIFT, false);
+                let done: String = params.text.chars().take(typed).collect();
+                let rest: String = params.text.chars().skip(typed).collect();
+                return Err(McpError::internal_error(format!(
+                    "keyboard_type stopped after {typed} of {} characters: {error}. \
+                     Typed so far: {done:?}. Not typed (character {} may be partly sent): {rest:?}",
+                    keys.len(), typed + 1,
+                ), None));
+            }
         }
         drop(guard);
         self.mark_input().await;
