@@ -10,7 +10,9 @@
 //! - Hot reload. When the source tree changes the shim runs `cargo build`;
 //!   when the kwin-mcp binary changes it swaps in a new idle child and sends
 //!   `notifications/tools/list_changed`. Live sessions keep running on the
-//!   child they started on until they stop; new sessions get the new build.
+//!   child they started on until they stop; new sessions get the new build:
+//!   a `session_start` made while a build is pending waits for it, and every
+//!   start checks the binary on disk rather than trusting the warm child.
 //!   No client reconnect is needed.
 //! - Supervision. A child that exits or stops answering pings is replaced; its
 //!   leftover processes are killed, orphans reparented to the shim (it is a
@@ -31,6 +33,9 @@ const WATCH_POLL: Duration = Duration::from_secs(2);
 /// A source change must be quiet this long before a build starts, so an
 /// editor or `git pull` writing many files triggers one build.
 const BUILD_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Longest a session_start waits for a pending build before it runs on the
+/// binary that is there.
+const BUILD_WAIT: Duration = Duration::from_secs(600);
 /// Supervisor tick: pings, wedge checks, respawn and orphan reaping.
 const TICK: Duration = Duration::from_secs(1);
 /// How often each ready child is pinged.
@@ -94,6 +99,8 @@ enum Event {
     Child(u64, Value),
     ChildExited(u64, String),
     BinaryChanged(Stamp),
+    /// The watcher saw a source change (true) or finished building it (false).
+    Building(bool),
     Tick,
 }
 
@@ -173,6 +180,10 @@ struct Shim {
     base_tools: Vec<Value>,
     client_ready: bool,
     latest: Option<Stamp>,
+    /// A source change is waiting for, or running, its cargo build.
+    building: bool,
+    /// session_start calls held until that build finishes.
+    held_starts: Vec<(Value, Value, Instant)>,
     crashes: VecDeque<Instant>,
     respawn_after: Option<Instant>,
     /// Session ids (= pids) of children that exited; leftover processes in
@@ -395,18 +406,7 @@ impl Shim {
             return;
         }
         if name == "session_start" && session.is_none() {
-            // Every new session gets a fresh child of its own.
-            let key = match self.idle.take().filter(|key| self.children.contains_key(key)) {
-                Some(key) => Some(key),
-                None => self.spawn_child(),
-            };
-            self.ensure_idle();
-            let Some(key) = key else {
-                self.reply(id, tool_error("kwin-mcp could not start a server process; see the MCP server log".to_owned()));
-                return;
-            };
-            let session_id = self.children.get(&key).map(|child| format!("s{}", child.pid)).unwrap_or_default();
-            self.forward(key, id, true, FlightKind::Start(session_id), &message);
+            self.start_session(id, message);
             return;
         }
         let key = match self.resolve(session.as_deref()) {
@@ -431,6 +431,55 @@ impl Shim {
             _ => FlightKind::Plain,
         };
         self.forward(key, id, true, kind, &message);
+    }
+
+    /// Start a new session on a fresh child running the binary on disk now.
+    /// While a source change is still building, the call waits for it.
+    fn start_session(&mut self, id: Value, message: Value) {
+        if self.building {
+            log("session_start waits for the kwin-mcp build in progress");
+            self.held_starts.push((id, message, Instant::now()));
+            return;
+        }
+        // The watcher reports a new binary a few seconds late; look now.
+        let current = stamp(&self.child_bin);
+        if let Some(build) = current {
+            self.on_binary_changed(build);
+        }
+        if let Some(key) = self.idle
+            && self.children.get(&key).is_some_and(|child| Some(child.build) != current)
+        {
+            self.retire(key);
+        }
+        // Every new session gets a fresh child of its own.
+        let key = match self.idle.take().filter(|key| self.children.contains_key(key)) {
+            Some(key) => Some(key),
+            None => self.spawn_child(),
+        };
+        self.ensure_idle();
+        let Some(key) = key else {
+            self.reply(id, tool_error("kwin-mcp could not start a server process; see the MCP server log".to_owned()));
+            return;
+        };
+        let session_id = self.children.get(&key).map(|child| format!("s{}", child.pid)).unwrap_or_default();
+        self.forward(key, id, true, FlightKind::Start(session_id), &message);
+    }
+
+    fn on_building(&mut self, active: bool) {
+        self.building = active;
+        if !active {
+            self.release_held_starts();
+        }
+    }
+
+    fn release_held_starts(&mut self) {
+        let held = std::mem::take(&mut self.held_starts);
+        let waiting = self.building;
+        self.building = false;
+        for (id, message, _) in held {
+            self.start_session(id, message);
+        }
+        self.building = waiting;
     }
 
     fn session_listing(&self) -> String {
@@ -765,6 +814,10 @@ impl Shim {
             }
             self.ensure_idle();
         }
+        if self.held_starts.first().is_some_and(|(_, _, at)| now.duration_since(*at) > BUILD_WAIT) {
+            log("kwin-mcp build is taking too long; starting held sessions on the current binary");
+            self.release_held_starts();
+        }
         let mut wedged = Vec::new();
         for (key, child) in &mut self.children {
             if let Some(killed) = child.killed_at {
@@ -908,15 +961,30 @@ async fn watch(repo: Option<PathBuf>, release: bool, binary: PathBuf, events: mp
     };
     let mut source_changed = Instant::now();
     let mut last_binary = None;
+    let mut building = false;
     loop {
         if let Some(repo) = &repo {
             let current = source_mtime(repo);
+            // Hold new sessions from the first sight of a change until its
+            // build is done, so none start on the binary about to be replaced.
+            let pending = current.is_some() && current != built_source;
+            if pending != building {
+                building = pending;
+                let _ = events.send(Event::Building(pending));
+            }
             if current != seen_source {
                 seen_source = current;
                 source_changed = Instant::now();
-            } else if current.is_some() && current != built_source && source_changed.elapsed() >= BUILD_DEBOUNCE {
+            } else if pending && source_changed.elapsed() >= BUILD_DEBOUNCE {
                 built_source = current;
                 cargo_build(repo, release).await;
+                if let Some(found) = stamp(&binary) {
+                    let _ = events.send(Event::BinaryChanged(found));
+                }
+                if source_mtime(repo) == built_source {
+                    building = false;
+                    let _ = events.send(Event::Building(false));
+                }
             }
         }
         // Only report a binary that has been stable for a full poll.
@@ -1026,7 +1094,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sessions: BTreeMap::new(), ended: HashMap::new(), inflight: HashMap::new(),
         reverse: HashMap::new(), next_reverse: 0, client_params: None, pending_init: None,
         pending_lists: Vec::new(), init_result: None, tools: None, base_tools: Vec::new(), client_ready: false,
-        latest: None, crashes: VecDeque::new(), respawn_after: None,
+        latest: None, building: false, held_starts: Vec::new(), crashes: VecDeque::new(), respawn_after: None,
         dead_sids: HashSet::new(), orphans: HashMap::new(), closing: false,
     };
     shim.latest = stamp(&shim.child_bin);
@@ -1055,6 +1123,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Event::Child(key, message) => shim.on_child(key, message),
             Event::ChildExited(key, status) => shim.on_child_exit(key, &status),
             Event::BinaryChanged(build) => shim.on_binary_changed(build),
+            Event::Building(active) => shim.on_building(active),
             Event::Tick => shim.on_tick(),
         }
         if let Some(at) = deadline {
