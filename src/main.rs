@@ -7,6 +7,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use serde::{Deserialize, Serialize};
 use serde_aux::field_attributes::deserialize_number_from_string;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -56,6 +57,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_STATS_SECONDS: u64 = 3600;
 
 // EIS (Emulated Input Sender) negotiation.
 const EIS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3051,6 +3053,119 @@ struct WindowActivateParams {
 
 // ── Tool implementations ────────────────────────────────────────────────
 
+fn session_start_log_path() -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if runtime.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(runtime).join("kwin-mcp/session-starts.log"))
+}
+
+fn append_session_start_outcome(started: std::time::Instant, error: Option<&str>) -> std::io::Result<()> {
+    let Some(path) = session_start_log_path() else { return Ok(()) };
+    let Some(parent) = path.parent() else { return Ok(()) };
+    std::fs::create_dir_all(parent)?;
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let status = if error.is_some() { "fail" } else { "ok" };
+    let reason = error.unwrap_or_default().replace(['\t', '\n', '\r'], " ");
+    let line = format!(
+        "{seconds}\t{status}\t{}\t{}\t{}\t{reason}\n",
+        started.elapsed().as_millis(),
+        std::process::id(),
+        env!("GIT_HASH"),
+    );
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    // One O_APPEND write keeps records from concurrent server processes together.
+    if file.write(line.as_bytes())? != line.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short session-start log write"));
+    }
+    Ok(())
+}
+
+struct SessionStartAttempt {
+    started: std::time::Instant,
+    recorded: bool,
+}
+
+impl SessionStartAttempt {
+    fn new() -> Self {
+        Self { started: std::time::Instant::now(), recorded: false }
+    }
+
+    fn finish(&mut self, error: Option<&str>) {
+        self.recorded = true;
+        let _ = append_session_start_outcome(self.started, error);
+    }
+
+    fn skip(&mut self) {
+        self.recorded = true;
+    }
+}
+
+impl Drop for SessionStartAttempt {
+    fn drop(&mut self) {
+        if !self.recorded {
+            let _ = append_session_start_outcome(self.started, Some("cancelled"));
+        }
+    }
+}
+
+fn print_session_start_stats(seconds: u64) -> std::io::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut successes = 0_u64;
+    let mut attempts = 0_u64;
+    let mut reasons = std::collections::HashMap::<String, u64>::new();
+    if let Some(path) = session_start_log_path() {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(file) = file {
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line?;
+                let mut fields = line.splitn(6, '\t');
+                let (Some(timestamp), Some(status), Some(_duration), Some(_pid), Some(_commit), Some(error)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+                else { continue };
+                let Ok(timestamp) = timestamp.parse::<u64>() else { continue };
+                if timestamp < now.saturating_sub(seconds) || timestamp > now {
+                    continue;
+                }
+                match status {
+                    "ok" => {
+                        successes += 1;
+                        attempts += 1;
+                    }
+                    "fail" => {
+                        attempts += 1;
+                        *reasons.entry(error.to_owned()).or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    print!("session_start {successes}/{attempts} last {seconds}s");
+    if !reasons.is_empty() {
+        let top = reasons.into_iter().take(5)
+            .map(|(reason, count)| format!("{count}x {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        print!("; failures: {top}");
+    }
+    println!();
+    Ok(())
+}
+
 impl rmcp::ServerHandler for KwinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
@@ -3088,8 +3203,53 @@ impl KwinMcp {
         self.touch_activity().await;
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
+        let mut attempt = SessionStartAttempt::new();
         let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
-        let gate = self.lifecycle_gate(deadline, "session_start").await?;
+        let gate = match self.lifecycle_gate(deadline, "session_start").await {
+            Ok(gate) => gate,
+            Err(error) => {
+                attempt.finish(Some(&error.message));
+                return Err(error);
+            }
+        };
+        {
+            let mut guard = match tokio::time::timeout_at(deadline, self.session.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let error = McpError::internal_error(
+                        format!("session_start exceeded {}s hard limit while checking for an existing session", SESSION_START_HARD_TIMEOUT.as_secs()),
+                        None,
+                    );
+                    attempt.finish(Some(&error.message));
+                    return Err(error);
+                }
+            };
+            if let Some(existing) = guard.as_mut() {
+                let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
+                let workdir = existing.host_xdg_dir.display().to_string();
+                let viewer = viewer_report(&existing.host_xdg_dir, existing.viewer_child.as_mut(), existing.viewer_unavailable.as_deref());
+                let version_stamp = format!(
+                    "kwin-mcp v{}.{} ({})",
+                    env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"), env!("GIT_HASH")
+                );
+                let msg = format!(
+                    "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
+                    existing.kwin_unique_name, existing.screen_width, existing.screen_height,
+                );
+                attempt.skip();
+                return Ok(structured_result(&peer, msg, serde_json::json!({
+                    "status": "already_running",
+                    "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
+                    "commit": env!("GIT_HASH"),
+                    "bus": bus_name,
+                    "kwin_unique": existing.kwin_unique_name,
+                    "workdir": workdir,
+                    "width": existing.screen_width,
+                    "height": existing.screen_height,
+                    "viewer": viewer,
+                })).await);
+            }
+        }
         self.set_start_stage("preparing the session workdir");
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
         let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone())).await {
@@ -3113,10 +3273,12 @@ impl KwinMcp {
                         eprintln!("session_start: blocked host scan returned; {}", error.message);
                         drop(gate);
                     });
-                    return Err(McpError::internal_error(
+                    let error = McpError::internal_error(
                         format!("{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."),
                         Some(serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true})),
-                    ));
+                    );
+                    attempt.finish(Some(&error.message));
+                    return Err(error);
                 }
                 Err(McpError::internal_error(
                     message,
@@ -3129,6 +3291,7 @@ impl KwinMcp {
             Err(error) => Err(self.autoclean_unpublished_workdir(error).await),
         };
         drop(gate);
+        attempt.finish(result.as_ref().err().map(|error| error.message.as_ref()));
         result
     }
 
@@ -3151,29 +3314,6 @@ impl KwinMcp {
             env!("GIT_HASH")
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
-        {
-            let mut guard = self.session.lock().await;
-            if let Some(existing) = guard.as_mut() {
-                let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-                let workdir = existing.host_xdg_dir.display().to_string();
-                let viewer = viewer_report(&existing.host_xdg_dir, existing.viewer_child.as_mut(), existing.viewer_unavailable.as_deref());
-                let msg = format!(
-                    "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
-                    existing.kwin_unique_name, existing.screen_width, existing.screen_height,
-                );
-                return Ok(structured_result(&peer, msg, serde_json::json!({
-                    "status": "already_running",
-                    "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
-                    "commit": env!("GIT_HASH"),
-                    "bus": bus_name,
-                    "kwin_unique": existing.kwin_unique_name,
-                    "workdir": workdir,
-                    "width": existing.screen_width,
-                    "height": existing.screen_height,
-                    "viewer": viewer,
-                })).await);
-            }
-        }
         // Resolve the virtual display size: tool params > CLI flags > compiled
         // defaults — unless --no-override locked it at the CLI/compiled value.
         let (screen_w, screen_h) = if self.display.locked {
@@ -5059,7 +5199,7 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--memory-high" => cfg.memory_high = parse_memory_high_arg(&mut args)?,
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB]"
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] | kwin-mcp --stats [SECONDS]"
                 ))
             }
         }
@@ -5166,6 +5306,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(fuse_bridge::run_client(program));
     }
     match argv.next().as_deref() {
+        Some("--stats") => {
+            let seconds = match argv.next() {
+                Some(value) => value.parse::<u64>().map_err(|error| format!("--stats '{value}': {error}"))?,
+                None => DEFAULT_STATS_SECONDS,
+            };
+            if let Some(extra) = argv.next() {
+                return Err(format!("--stats accepts only [SECONDS], got '{extra}'").into());
+            }
+            print_session_start_stats(seconds)?;
+            return Ok(());
+        }
         Some("--fuse-helper") => {
             let socket = argv.next().unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
             fuse_bridge::run_helper(Path::new(&socket))?;
