@@ -3571,8 +3571,10 @@ impl KwinMcp {
         let mut cmd = sandbox_launcher(self.display.memory_high);
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
-        let host_ipv4 = host_default_ipv4()
-            .map_err(|error| ver_err(format!("read host IPv4 configuration: {error:#}")))?;
+        let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
+            eprintln!("session_start: host IPv4 lookup failed ({error:#}); pasta picks the address itself");
+            None
+        });
         // A host address marked noprefixroute leaves pasta without a connected
         // route. Assign the default-route interface's IPv4 address and prefix explicitly.
         if let Some((address, prefix)) = &host_ipv4 {
