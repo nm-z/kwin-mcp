@@ -1254,7 +1254,7 @@ struct Session {
     cdp_forward_port: u16,
     service_proxy_children: Vec<std::process::Child>,
     viewer_child: Option<std::process::Child>,
-    /// Why no viewer is running when viewer_child is None.
+    /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
     _socket_links: SocketLinks,
@@ -1281,7 +1281,6 @@ struct DisplayConfig {
     width: u32,
     height: u32,
     locked: bool,
-    viewer_enabled: bool,
     autoclean: bool,
     ttl: Option<Duration>,
     /// cgroup MemoryHigh for each session's sandbox in bytes; None disables it.
@@ -1384,30 +1383,6 @@ impl StartupResources {
 impl Drop for StartupResources {
     fn drop(&mut self) {
         self.cleanup();
-    }
-}
-
-/// Own a spawned viewer until the Session is published. A cancelled startup
-/// drops this guard and reaps the viewer before removing the workdir.
-struct StartupViewerResources {
-    viewer: Option<std::process::Child>,
-}
-
-impl StartupViewerResources {
-    fn new() -> Self {
-        Self { viewer: None }
-    }
-
-    fn into_child(mut self) -> Option<std::process::Child> {
-        self.viewer.take()
-    }
-}
-
-impl Drop for StartupViewerResources {
-    fn drop(&mut self) {
-        if let Some(viewer) = self.viewer.take() {
-            terminate_child(viewer, false, "startup viewer");
-        }
     }
 }
 
@@ -2498,7 +2473,7 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
-/// How long session_start and viewer_open wait for the viewer to show a frame
+/// How long viewer_open waits for the viewer to show a frame
 /// before reporting it as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(4);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
@@ -2535,7 +2510,7 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
     terminate_with_parent(&mut command);
     match command.spawn() {
         Ok(child) => {
-            eprintln!("session_start: spawned viewer pid={}", child.id());
+            eprintln!("viewer_open: spawned viewer pid={}", child.id());
             Ok(child)
         }
         Err(e) => {
@@ -2548,7 +2523,7 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
 }
 
 /// The viewer outcome: ready (a frame is showing in a host window), starting,
-/// unavailable with a reason, or disabled.
+/// unavailable with a reason, or closed.
 fn viewer_report(host_xdg_dir: &Path, child: Option<&mut std::process::Child>, unavailable: Option<&str>) -> serde_json::Value {
     let log = host_xdg_dir.join("viewer.log").display().to_string();
     let status: Option<serde_json::Value> = std::fs::read_to_string(host_xdg_dir.join(VIEWER_STATUS_FILE))
@@ -2556,8 +2531,8 @@ fn viewer_report(host_xdg_dir: &Path, child: Option<&mut std::process::Child>, u
         .and_then(|text| serde_json::from_str(&text).ok());
     let field = |name: &str| status.as_ref().and_then(|value| value[name].as_str()).unwrap_or_default().to_owned();
     let Some(child) = child else {
-        let reason = unavailable.unwrap_or("viewer not running");
-        let state = if reason.contains("--no-viewer") { "disabled" } else { "unavailable" };
+        let reason = unavailable.unwrap_or("viewer not open");
+        let state = if unavailable.is_some() { "unavailable" } else { "closed" };
         return serde_json::json!({"state": state, "reason": reason, "log": log});
     };
     if let Ok(Some(exit)) = child.try_wait() {
@@ -2593,6 +2568,7 @@ async fn wait_for_viewer(host_xdg_dir: &Path, child: &mut std::process::Child) -
 fn viewer_summary(report: &serde_json::Value) -> String {
     match report["state"].as_str().unwrap_or_default() {
         "ready" => "viewer=ready".to_owned(),
+        "closed" => "viewer=closed".to_owned(),
         "starting" => format!("viewer=starting ({})", report["phase"].as_str().unwrap_or_default()),
         state => format!("viewer={state}: {}", report["reason"].as_str().unwrap_or_default()),
     }
@@ -3083,6 +3059,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 "KDE Wayland desktop automation in an isolated container. \
                 Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
                 Typical flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. Use find_ui_elements for a specific named control; use a filtered accessibility_tree only when structure helps. If the tree is empty or costly, continue with screenshots and input. \
+                Work without a host viewer by default. Call viewer_open only when the user must act on the session (Duo push, OTP, CAPTCHA, or approval) or asks to watch. While waiting for the user, keep the page open and poll with screenshots. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. \
                 If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
                 To attach a file in Chrome's file chooser: click the page's file input, press ctrl+l, type the absolute path, then press alt+o (or click Open at the top right); Enter in the location bar cancels Chrome's chooser and attaches nothing. \
                 All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
@@ -3101,7 +3078,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height in effect, and a separate viewer outcome (ready, starting, unavailable with the reason, or disabled); a missing viewer never fails the session, and viewer_open can retry it. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless unless the user must act on Duo, OTP, CAPTCHA, or approval, or asks to watch; then call viewer_open and later viewer_close. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -3884,30 +3861,13 @@ impl KwinMcp {
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
-        self.set_start_stage("starting the host viewer");
-        let mut viewer_resources = StartupViewerResources::new();
-        let mut viewer_unavailable = None;
-        if self.display.viewer_enabled {
-            match spawn_viewer(&host_xdg_dir, screen_w, screen_h).await {
-                Ok(child) => viewer_resources.viewer = Some(child),
-                Err(reason) => viewer_unavailable = Some(reason),
-            }
-        } else {
-            eprintln!("session_start: viewer disabled (--no-viewer)");
-            viewer_unavailable = Some("disabled by --no-viewer; call viewer_open to show it".to_owned());
-        }
-        test_startup_delay("after-viewer").await;
-        let viewer = match viewer_resources.viewer.as_mut() {
-            Some(child) => wait_for_viewer(&host_xdg_dir, child).await,
-            None => viewer_report(&host_xdg_dir, None, viewer_unavailable.as_deref()),
-        };
+        let viewer = viewer_report(&host_xdg_dir, None, None);
         let msg = format!("{msg} {}", viewer_summary(&viewer));
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
         let mut guard = self.session.lock().await;
-        let viewer_child = viewer_resources.into_child();
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
             kwin_conn,
@@ -3924,8 +3884,8 @@ impl KwinMcp {
             cdp_browser: None,
             cdp_forward_port,
             service_proxy_children,
-            viewer_child,
-            viewer_unavailable,
+            viewer_child: None,
+            viewer_unavailable: None,
             overlay_work_paths,
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -3954,10 +3914,11 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop, so the user can watch or review what the session shows. Reuses the viewer that session_start opens; if one is already running it is left as is. Returns the viewer outcome: ready (a host window is showing the session), starting, or unavailable with the reason (for example no host Wayland session on a remote host). Works even when the server runs with --no-viewer."
+        description = "Open the live viewer window for the current session on the user's desktop only when the user must act (Duo push, OTP, CAPTCHA, or approval) or asks to watch. Reuses an already open viewer. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. Works even when the server runs with --no-viewer."
     )]
     async fn viewer_open(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        let _gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "viewer_open").await?;
         let (host_xdg_dir, width, height) = {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
@@ -4012,6 +3973,31 @@ impl KwinMcp {
         drop(guard);
         let status = if viewer["state"] == "unavailable" { "unavailable" } else { "opened" };
         Ok(structured_result(&peer, format!("viewer {status}: {}", viewer_summary(&viewer)), serde_json::json!({"status": status, "viewer": viewer})).await)
+    }
+
+    #[rmcp::tool(
+        name = "viewer_close",
+        description = "Close the host viewer window after the user-facing step is done, without stopping the isolated session. No-op if the viewer is already closed. Call viewer_open again if the user needs to act or asks to watch later."
+    )]
+    async fn viewer_close(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
+        let _gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "viewer_close").await?;
+        let mut guard = self.session.lock().await;
+        let sess = guard.as_mut().ok_or_else(|| {
+            McpError::internal_error("no session — call session_start first", None)
+        })?;
+        let child = sess.viewer_child.take();
+        sess.viewer_unavailable = None;
+        let host_xdg_dir = sess.host_xdg_dir.clone();
+        drop(guard);
+        let status = if let Some(child) = child {
+            terminate_child(child, false, "viewer");
+            "closed"
+        } else {
+            "already_closed"
+        };
+        let viewer = viewer_report(&host_xdg_dir, None, None);
+        Ok(structured_result(&peer, format!("viewer {status}"), serde_json::json!({"status": status, "viewer": viewer})).await)
     }
 
     #[rmcp::tool(
@@ -5056,7 +5042,6 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
-        viewer_enabled: true,
         autoclean: false,
         ttl: None,
         memory_high: default_memory_high(),
@@ -5067,7 +5052,8 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
             "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
-            "--no-viewer" => cfg.viewer_enabled = false,
+            // Kept for callers that used it before viewer startup became opt-in.
+            "--no-viewer" => {},
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
             "--memory-high" => cfg.memory_high = parse_memory_high_arg(&mut args)?,
@@ -5213,13 +5199,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("autoclean: orphan sweep skipped: {error}");
     }
     eprintln!(
-        "kwin-mcp: display default {}x{}{}; viewer {}",
+        "kwin-mcp: display default {}x{}{}; viewer on demand",
         display.width,
         display.height,
         if display.locked { " (locked, --no-override)" } else { "" },
-        if display.viewer_enabled { "enabled" } else {
-            "disabled (--no-viewer)"
-        }
     );
     let kwin = KwinMcp::new(display);
     let shutdown = kwin.clone();
