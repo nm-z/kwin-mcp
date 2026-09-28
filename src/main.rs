@@ -73,6 +73,11 @@ const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 // AT-SPI tree traversal hard timeout (find_ui_elements).
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Largest accessibility_tree reply, in characters. Longer trees are cut at a
+// line boundary with a note to narrow the query, so one call cannot blow an
+// agent's context window.
+const A11Y_TREE_MAX_CHARS: usize = 30_000;
+
 // Input-event pacing (clicks, drag steps, key hold).
 const INPUT_EVENT_DELAY: Duration = Duration::from_millis(50);
 /// How long an input send may wait for KWin to drain a full EIS socket.
@@ -2875,6 +2880,14 @@ impl AtspiNode {
         let (x, y, w, h) = self.bounds;
         w > 1 && h > 1 && x > -1000000 && y > -1000000 && !self.name.is_empty()
     }
+
+    /// Whether any part of the node lies on the virtual screen. Pages expose
+    /// every offscreen element too (a long article is thousands of nodes).
+    fn on_screen(&self, width: u32, height: u32) -> bool {
+        let (x, y, w, h) = self.bounds;
+        let (x, y, w, h) = (i64::from(x), i64::from(y), i64::from(w), i64::from(h));
+        x + w > 0 && y + h > 0 && x < i64::from(width) && y < i64::from(height)
+    }
 }
 
 fn state_labels(states: &[String]) -> Vec<String> {
@@ -2924,6 +2937,28 @@ async fn atspi_node(
         states,
         bounds,
     })
+}
+
+/// Join tree lines into one reply of at most A11Y_TREE_MAX_CHARS characters,
+/// ending in a note when lines were cut.
+fn capped_tree(lines: &[String]) -> (String, serde_json::Value) {
+    let mut tree = String::new();
+    let mut kept = 0usize;
+    for line in lines {
+        if tree.len() + line.len() + 1 > A11Y_TREE_MAX_CHARS {
+            break;
+        }
+        if kept > 0 {
+            tree.push('\n');
+        }
+        tree.push_str(line);
+        kept += 1;
+    }
+    let omitted = lines.len() - kept;
+    if omitted > 0 {
+        tree.push_str(&format!("\n… {omitted} more lines omitted; narrow with app_name, role or max_depth"));
+    }
+    (tree, serde_json::json!({"lines": kept, "omitted_lines": omitted}))
 }
 
 // ── Tool parameter structs ──────────────────────────────────────────────
@@ -4457,7 +4492,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. app_name filters top-level apps; max_depth caps traversal (default 8); role filters role names. show_elements=true keeps zero-rect and unnamed nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. app_name filters top-level apps; max_depth caps traversal (default 8); role filters role names. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. Replies stop at 30,000 characters with a note saying how many lines were cut.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -4530,15 +4565,16 @@ impl KwinMcp {
                                 }
                             }
                         }
-                        let tree = out.join("\n");
-                        return Ok(structured_result(&peer, tree.clone(), serde_json::json!({"tree": tree, "source": "cdp"})).await);
+                        let (tree, mut info) = capped_tree(&out);
+                        info["source"] = serde_json::json!("cdp");
+                        return Ok(structured_result(&peer, tree, info).await);
                     }
                 }
             }
         // AT-SPI path for native apps
         use atspi::proxy::accessible::ObjectRefExt;
-        let zbus_conn = self.with_session(|s| {
-            Ok(s.kwin_conn.clone())
+        let (zbus_conn, screen) = self.with_session(|s| {
+            Ok((s.kwin_conn.clone(), (s.screen_width, s.screen_height)))
         }).await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
@@ -4567,9 +4603,9 @@ impl KwinMcp {
             .map_err(KwinError::from)?
             .into_iter()
             .rev()
-            .map(|obj| (obj, 0usize))
+            .map(|obj| (obj, 0usize, true))
             .collect::<Vec<_>>();
-        while let Some((obj, depth)) = stack.pop() {
+        while let Some((obj, depth, top)) = stack.pop() {
             let acc = match obj.as_accessible_proxy(&a11y_bus).await {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -4578,24 +4614,24 @@ impl KwinMcp {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if depth == 0 && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) {
+            if top && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) {
                 continue;
             }
             let dominated = role
                 .as_ref()
                 .map(|needle| node.role.to_lowercase().contains(needle))
                 .unwrap_or(true)
-                && (show_elements || node.is_useful());
+                && (show_elements || (node.is_useful() && node.on_screen(screen.0, screen.1)));
             if dominated { out.push(node.line(depth)); }
             let child_depth = if dominated { depth + 1 } else { depth };
             if child_depth <= limit {
                 for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
-                    stack.push((child, child_depth));
+                    stack.push((child, child_depth, false));
                 }
             }
         }
-        let tree = out.join("\n");
-        Ok(structured_result(&peer, tree.clone(), serde_json::json!({"tree": tree})).await)
+        let (tree, info) = capped_tree(&out);
+        Ok(structured_result(&peer, tree, info).await)
     }
 
     #[rmcp::tool(
