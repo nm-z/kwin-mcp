@@ -2485,6 +2485,42 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
+/// FIFO in the session workdir that the viewer reads tool-call starts ("B")
+/// and ends ("E") from, so it holds the user's input while a call runs (see
+/// src/bin/kwin-viewer.rs ToolGate).
+const TOOL_CALLS_FIFO: &str = "tool-calls";
+
+/// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
+/// Non-blocking and best effort: with no viewer reading the FIFO the open
+/// fails with ENXIO and nothing is sent, so tool calls never wait on it.
+fn signal_tool_call(mark: u8) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = session_workdir_path().join(TOOL_CALLS_FIFO);
+    if let Ok(mut fifo) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut fifo, &[mark]);
+    }
+}
+
+/// Marks one tool call in flight for the viewer; the end is sent on drop, so
+/// it goes out whether the call returns, errors or is cancelled.
+struct ToolCallMark;
+
+impl ToolCallMark {
+    fn begin() -> Self {
+        signal_tool_call(b'B');
+        Self
+    }
+}
+
+impl Drop for ToolCallMark {
+    fn drop(&mut self) {
+        signal_tool_call(b'E');
+    }
+}
 /// How long viewer_open waits for the viewer to show a frame
 /// before reporting it as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(4);
@@ -5416,6 +5452,17 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         };
         let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
+    }
+    // Every tool call is bracketed for the viewer's input gate.
+    for route in tool_router.map.values_mut() {
+        let inner = std::sync::Arc::clone(&route.call);
+        route.call = std::sync::Arc::new(move |context| {
+            let inner = std::sync::Arc::clone(&inner);
+            Box::pin(async move {
+                let _mark = ToolCallMark::begin();
+                inner(context).await
+            })
+        });
     }
     let router =
         rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
