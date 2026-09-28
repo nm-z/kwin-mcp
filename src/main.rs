@@ -1656,7 +1656,7 @@ fn cursor_sprite() -> Option<&'static CursorSprite> {
             png::ColorType::Rgba => raw.to_vec(),
             png::ColorType::Rgb => {
                 let mut out = Vec::with_capacity(raw.len() / 3 * 4);
-                for chunk in raw.chunks_exact(3) {
+                for chunk in raw.as_chunks::<3>().0 {
                     out.extend_from_slice(chunk);
                     out.push(255);
                 }
