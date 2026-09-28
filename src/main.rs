@@ -5250,14 +5250,14 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
     Ok(cfg)
 }
 
-/// Default per-session memory cap: a quarter of the host's RAM, so a session
-/// whose browser balloons is throttled and reclaimed before it starves the
-/// host desktop and the other sessions.
+/// Default per-session memory cap: three quarters of the host's RAM. It is a
+/// failsafe for a runaway session, not a working limit: at a quarter, busy
+/// browser sessions were throttled at the cap (7.7 GiB on a 31 GiB host).
 fn default_memory_high() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kib: u64 = meminfo.lines().find_map(|line| line.strip_prefix("MemTotal:"))?
         .trim().trim_end_matches("kB").trim().parse().ok()?;
-    kib.checked_mul(1024).map(|bytes| bytes / 4)
+    kib.checked_mul(1024).map(|bytes| bytes / 4 * 3)
 }
 
 fn parse_memory_high_arg(args: &mut impl Iterator<Item = String>) -> Result<Option<u64>, String> {
