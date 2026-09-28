@@ -97,6 +97,19 @@ fn signal(pid: u32, sig: nix::sys::signal::Signal) {
     }
 }
 
+/// Wait for killed children to exit and reap them, giving up at `deadline`
+/// (a child stuck in the kernel stays a zombie rather than blocking the shim).
+fn reap(pids: &[u32], deadline: Instant) {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    let mut left: Vec<nix::unistd::Pid> = pids.iter()
+        .filter_map(|&pid| i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw))
+        .collect();
+    while !left.is_empty() && Instant::now() < deadline {
+        left.retain(|&pid| matches!(waitpid(pid, Some(WaitPidFlag::WNOHANG)), Ok(WaitStatus::StillAlive)));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ── Events ───────────────────────────────────────────────────────────────
 
 enum Event {
@@ -1130,6 +1143,14 @@ fn take_resume() -> Option<Resume> {
     let text = std::env::var(RESUME_ENV).ok()?;
     // Single-threaded here: the runtime starts after this.
     unsafe { std::env::remove_var(RESUME_ENV) };
+    // Children the old image never reaped (older shims killed slow children
+    // and re-executed without waiting) are zombies of this pid; no process is
+    // spawned yet, so every exited child here is one of them.
+    while let Ok(status) = nix::sys::wait::waitpid(None, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+        if status == nix::sys::wait::WaitStatus::StillAlive {
+            break;
+        }
+    }
     let mut state: Value = serde_json::from_str(&text).ok()?;
     let client_params = state.get_mut("client_params").map(Value::take).filter(|params| !params.is_null())?;
     let ended = state.get_mut("ended").map(Value::take).and_then(|ended| serde_json::from_value(ended).ok()).unwrap_or_default();
@@ -1256,6 +1277,10 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
                 for child in shim.children.values() {
                     signal(child.pid, nix::sys::signal::Signal::SIGKILL);
                 }
+                // A re-exec drops the tasks that would wait on these children,
+                // so reap them here or they stay zombies under the new shim.
+                let pids: Vec<u32> = shim.children.values().map(|child| child.pid).collect();
+                reap(&pids, Instant::now() + SHUTDOWN_WAIT);
                 break;
             }
         }
