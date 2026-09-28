@@ -1138,16 +1138,11 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
 
-    let pacer = InputPacer::spawn(fake_input.clone(), conn.clone(), numlock, clipboard)?;
-    let mut last_frame = Instant::now();
     let mut input_state = InputState {
         last_pos: None,
-        sent_pos: None,
         held_buttons: 0,
-        focused: false,
-        inside: false,
-        pending: Vec::new(),
         held_keys: HashSet::new(),
+        clipboard,
     };
     let mut ready_reported = false;
 
@@ -1158,17 +1153,18 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
             frame.exit();
             return;
         }
+
         for event in frame.events {
             forward_input(
                 event,
+                &fake_input,
+                conn,
                 (frame.width, frame.height),
                 (virt_w, virt_h),
                 &mut input_state,
+                &numlock,
             );
         }
-        let now = Instant::now();
-        pacer.send(now.saturating_duration_since(last_frame), std::mem::take(&mut input_state.pending));
-        last_frame = now;
 
         // Consume the latest frame if one arrived; upload into src_image.
         // Retain src_image across frames so when the mailbox is momentarily
@@ -1233,8 +1229,8 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     // is why the run result is held instead of propagated straight away.
     // Requesting shutdown lets every dispatch thread leave its poll within
     // DISPATCH_POLL_INTERVAL; the pipewire loop is quit through its channel and
-    // joined here, and dropping the input pacer (which owns numlock) and
-    // wl_dispatch joins the remaining threads and closes their sockets.
+    // joined here, and dropping wl_dispatch and numlock joins the remaining
+    // threads and closes their sockets.
     shutdown.request();
     if pw_quit.send(()).is_err() {
         eprintln!("kwin-viewer: pipewire loop already gone");
@@ -1246,138 +1242,22 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     Ok(())
 }
 
-// Longest span one frame's input batch is spread over. Frames normally
-// arrive every ~16 ms; the cap keeps a stalled frame from slowing replay.
-const PACE_MAX_SPAN: Duration = Duration::from_millis(50);
-
-enum InputOp {
-    Motion(f64, f64),
-    Button(u32, u32),
-    Axis(u32, f64),
-    Key(u32, u32),
-    // Hand the clipboard over before the chord's key that follows it.
-    Clipboard(ClipChord),
-    // Match the session's Num Lock to the host's (on focus gain).
-    NumLock,
-}
-
-// All forwarded input is replayed, in the order it happened, from one thread.
-// screen-13-window hands the window's events over once per redraw, so every
-// event of a frame would otherwise reach KWin in the same instant. KWin
-// stamps fake_input events on arrival, and pages (slider CAPTCHAs) read that
-// burst as a bot. The pacer spreads each batch over the span it was collected
-// in with jittered gaps, at the cost of one frame of latency. Keys share the
-// queue so a key never overtakes an earlier click, and the clipboard and Num
-// Lock waits run here so they never stall the frame loop.
-struct InputPacer {
-    sender: Option<std::sync::mpsc::Sender<(Duration, Vec<InputOp>)>>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl InputPacer {
-    fn spawn(
-        fake_input: OrgKdeKwinFakeInput,
-        conn: Connection,
-        numlock: NumLockSync,
-        mut clipboard: ClipboardBridge,
-    ) -> anyhow::Result<Self> {
-        let (sender, receiver) = std::sync::mpsc::channel::<(Duration, Vec<InputOp>)>();
-        let handle = std::thread::Builder::new()
-            .name("input-pacer".to_owned())
-            .spawn(move || {
-                // xorshift64: gap jitter only, seeded from the clock.
-                let mut seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0x9E37_79B9_7F4A_7C15, |d| u64::from(d.subsec_nanos()) | 1);
-                for (span, ops) in receiver {
-                    // Each gap gets a random weight in 1..=3; the offsets are
-                    // the running sums scaled to the span.
-                    let weights: Vec<u32> = ops.iter().map(|_| {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 7;
-                        seed ^= seed << 17;
-                        1 + u32::try_from(seed % 3).unwrap_or(0)
-                    }).collect();
-                    let total: u32 = weights.iter().sum::<u32>().max(1);
-                    let start = Instant::now();
-                    let mut offset = 0u32;
-                    for (op, weight) in ops.into_iter().zip(weights) {
-                        let due = start + span * offset / total;
-                        offset += weight;
-                        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                            std::thread::sleep(wait);
-                        }
-                        match op {
-                            InputOp::Motion(x, y) => fake_input.pointer_motion_absolute(x, y),
-                            InputOp::Button(code, state) => fake_input.button(code, state),
-                            InputOp::Axis(axis, value) => fake_input.axis(axis, value),
-                            InputOp::Key(code, state) => fake_input.keyboard_key(code, state),
-                            InputOp::Clipboard(chord) => {
-                                if let Err(error) = clipboard.before(chord) {
-                                    eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
-                                }
-                            }
-                            InputOp::NumLock => {
-                                if let Err(error) = numlock.apply(&fake_input, &conn) {
-                                    eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
-                                }
-                            }
-                        }
-                        let _ = conn.flush();
-                    }
-                }
-            })?;
-        Ok(Self { sender: Some(sender), handle: Some(handle) })
-    }
-
-    // Queue one frame's input, collected over `span`.
-    fn send(&self, span: Duration, ops: Vec<InputOp>) {
-        if ops.is_empty() { return }
-        if let Some(sender) = &self.sender
-            && sender.send((span.min(PACE_MAX_SPAN), ops)).is_err()
-        {
-            eprintln!("kwin-viewer: input pacer is gone");
-        }
-    }
-}
-
-impl Drop for InputPacer {
-    fn drop(&mut self) {
-        // Closing the channel ends the thread once it has replayed the queue.
-        self.sender.take();
-        if let Some(handle) = self.handle.take()
-            && handle.join().is_err()
-        {
-            eprintln!("kwin-viewer: input pacer panicked");
-        }
-    }
-}
-
 struct InputState {
     // Last cursor position in window pixel coords, updated on every
-    // CursorMoved regardless of whether the move is forwarded.
+    // CursorMoved regardless of whether the move is forwarded. Needed so a
+    // fresh click can snap the container's cursor to the click position
+    // before the button press, without ever leaking intervening moves.
     last_pos: Option<(f64, f64)>,
-    // Last window position sent to the container. A press snaps the
-    // container's cursor only when this differs from last_pos, so a hovered
-    // press lands where the cursor already is instead of teleporting.
-    sent_pos: Option<(f64, f64)>,
     // Currently-held mouse buttons. Non-empty means we're in a drag and
     // pointer motions should be forwarded so the drag actually drags.
     held_buttons: u32,
-    // The viewer has keyboard focus and the cursor is over it: the user is
-    // working in the session, so hover is forwarded too. Pages need the
-    // approach path before a press (slider CAPTCHAs fail without it); an
-    // unfocused viewer never moves the agent's cursor.
-    focused: bool,
-    inside: bool,
-    // Input collected this frame, handed to the InputPacer in order.
-    pending: Vec<InputOp>,
     // Evdev keycodes currently held inside the container. We forcibly
     // release them on focus loss; otherwise a missed Released event (e.g.
     // user releases Shift outside the viewer window) leaves a modifier
     // stuck inside the container, and every subsequent letter the user
     // types arrives shifted — looks exactly like "I cant type."
     held_keys: HashSet<u32>,
+    clipboard: ClipboardBridge,
 }
 
 fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {
@@ -1390,20 +1270,25 @@ fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u3
 
 fn forward_input(
     event: &Event<()>,
+    fake_input: &OrgKdeKwinFakeInput,
+    conn: &Connection,
     window_size: (u32, u32),
     virt: (u32, u32),
     state: &mut InputState,
+    numlock: &NumLockSync,
 ) {
     let Event::WindowEvent { event, .. } = event else { return };
-    if let WindowEvent::Focused(true) = event {
-        state.pending.push(InputOp::NumLock);
+    if let WindowEvent::Focused(true) = event
+        && let Err(error) = numlock.apply(fake_input, conn)
+    {
+        eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
     }
     if let WindowEvent::Focused(false) = event {
         // Drain any keys that were forwarded as pressed but whose Released
         // event we may not see — release them all so no modifier stays
         // stuck inside the container while the user is elsewhere on host.
         for &code in &state.held_keys {
-            state.pending.push(InputOp::Key(code, 0));
+            fake_input.keyboard_key(code, 0);
         }
         if !state.held_keys.is_empty() {
             eprintln!(
@@ -1411,22 +1296,22 @@ fn forward_input(
                 state.held_keys.len()
             );
             state.held_keys.clear();
+            let _ = conn.flush();
         }
     }
     match event {
-        WindowEvent::Focused(focused) => state.focused = *focused,
-        WindowEvent::CursorEntered { .. } => state.inside = true,
-        WindowEvent::CursorLeft { .. } => state.inside = false,
         WindowEvent::CursorMoved { position, .. } => {
             // Always record the latest cursor position locally so a subsequent
-            // click can snap the container's cursor to it. Forward it while
-            // dragging, or while the user is working in the focused viewer.
-            let pos = (position.x, position.y);
-            state.last_pos = Some(pos);
-            if state.held_buttons == 0 && !(state.focused && state.inside) { return }
-            if let Some((x, y)) = map_window_to_virtual(pos, window_size.0, window_size.1, virt) {
-                state.pending.push(InputOp::Motion(x, y));
-                state.sent_pos = Some(pos);
+            // click can snap the container's cursor to it. Only forward the
+            // motion over the wire when the user is actively clicking/dragging
+            // — idle hover must not touch the agent's session.
+            state.last_pos = Some((position.x, position.y));
+            if state.held_buttons == 0 { return }
+            if let Some((x, y)) =
+                map_window_to_virtual((position.x, position.y), window_size.0, window_size.1, virt)
+            {
+                fake_input.pointer_motion_absolute(x, y);
+                let _ = conn.flush();
             }
         }
         WindowEvent::MouseInput { state: btn_state, button, .. } => {
@@ -1440,29 +1325,28 @@ fn forward_input(
             if pressed {
                 // Snap the container's cursor to the window position first
                 // so the press lands where the user's eyes are, not wherever
-                // the container cursor happened to stop. Skipped when hover
-                // already put it there (see sent_pos).
-                if state.sent_pos != state.last_pos
-                    && let Some(pos) = state.last_pos
+                // the container cursor happened to stop last session.
+                if let Some(pos) = state.last_pos
                     && let Some((x, y)) =
                         map_window_to_virtual(pos, window_size.0, window_size.1, virt)
                 {
-                    state.pending.push(InputOp::Motion(x, y));
-                    state.sent_pos = Some(pos);
+                    fake_input.pointer_motion_absolute(x, y);
                 }
                 state.held_buttons = state.held_buttons.saturating_add(1);
             } else {
                 state.held_buttons = state.held_buttons.saturating_sub(1);
             }
-            state.pending.push(InputOp::Button(code, if pressed { 1 } else { 0 }));
+            fake_input.button(code, if pressed { 1 } else { 0 });
+            let _ = conn.flush();
         }
         WindowEvent::MouseWheel { delta, .. } => {
             let (dx, dy) = match delta {
                 MouseScrollDelta::LineDelta(x, y) => (f64::from(*x) * 15.0, f64::from(*y) * 15.0),
                 MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
             };
-            if dy != 0.0 { state.pending.push(InputOp::Axis(AXIS_VERTICAL, -dy)); }
-            if dx != 0.0 { state.pending.push(InputOp::Axis(AXIS_HORIZONTAL, -dx)); }
+            if dy != 0.0 { fake_input.axis(AXIS_VERTICAL, -dy); }
+            if dx != 0.0 { fake_input.axis(AXIS_HORIZONTAL, -dx); }
+            let _ = conn.flush();
         }
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
@@ -1472,13 +1356,15 @@ fn forward_input(
                 state.held_keys.insert(evdev);
                 if !key.repeat
                     && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
+                    && let Err(error) = state.clipboard.before(chord)
                 {
-                    state.pending.push(InputOp::Clipboard(chord));
+                    eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
                 }
             } else {
                 state.held_keys.remove(&evdev);
             }
-            state.pending.push(InputOp::Key(evdev, if pressed { 1 } else { 0 }));
+            fake_input.keyboard_key(evdev, if pressed { 1 } else { 0 });
+            let _ = conn.flush();
         }
         _ => {}
     }
