@@ -1138,7 +1138,10 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
 
+    let gate = ToolGate::new(fake_input.clone(), conn.clone());
+    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
     let mut input_state = InputState {
+        gate,
         last_pos: None,
         held_buttons: 0,
         held_keys: HashSet::new(),
@@ -1238,11 +1241,206 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     if pw_thread.join().is_err() {
         eprintln!("kwin-viewer: pipewire thread panicked");
     }
+    if gate_thread.join().is_err() {
+        eprintln!("kwin-viewer: tool-gate thread panicked");
+    }
     run_result?;
     Ok(())
 }
 
+// FIFO in the session dir the server writes tool-call starts ("B") and ends
+// ("E") to (see TOOL_CALLS_FIFO in src/main.rs).
+const TOOL_CALLS_FIFO: &str = "tool-calls";
+// Upper and lower bound of the flush window after a tool call returns.
+const GATE_WINDOW_MAX: Duration = Duration::from_millis(300);
+const GATE_WINDOW_MIN: Duration = Duration::from_millis(50);
+// With no tool call for this long, the user's input goes through live.
+const GATE_IDLE: Duration = Duration::from_secs(2);
+// Recent gaps between one call's end and the next call's start.
+const GATE_GAP_SAMPLES: usize = 64;
+
+#[derive(Clone, Copy)]
+enum Op {
+    Motion(f64, f64),
+    Button(u32, u32),
+    Axis(u32, f64),
+    Key(u32, u32),
+}
+
+impl Op {
+    // A release of a key or button whose press already reached the session.
+    fn releases(self, down: &HashSet<(bool, u32)>) -> bool {
+        match self {
+            Op::Button(code, 0) => down.contains(&(false, code)),
+            Op::Key(code, 0) => down.contains(&(true, code)),
+            Op::Button(..) | Op::Key(..) | Op::Motion(..) | Op::Axis(..) => false,
+        }
+    }
+
+    fn emit(self, fake_input: &OrgKdeKwinFakeInput, down: &mut HashSet<(bool, u32)>) {
+        match self {
+            Op::Button(code, 1) => { down.insert((false, code)); }
+            Op::Button(code, _) => { down.remove(&(false, code)); }
+            Op::Key(code, 1) => { down.insert((true, code)); }
+            Op::Key(code, _) => { down.remove(&(true, code)); }
+            Op::Motion(..) | Op::Axis(..) => {}
+        }
+        match self {
+            Op::Motion(x, y) => fake_input.pointer_motion_absolute(x, y),
+            Op::Button(code, state) => fake_input.button(code, state),
+            Op::Axis(axis, value) => fake_input.axis(axis, value),
+            Op::Key(code, state) => fake_input.keyboard_key(code, state),
+        }
+    }
+}
+
+// When the user's input may reach the session. The agent and the user share
+// one session, so input the user makes while an agent tool call runs would
+// land in the middle of it. It is held instead, and goes out in order right
+// after the call returns, inside the gap before the agent's next call. After
+// that window it is held again until the next call returns, and once no call
+// has come for GATE_IDLE it goes through live.
+struct GateState {
+    busy: bool,
+    last_end: Option<Instant>,
+    window: Duration,
+    gaps: std::collections::VecDeque<Duration>,
+    held: Vec<Op>,
+    // Keys and buttons whose press reached the session and whose release has
+    // not. Their release is never held: holding it would keep the key down
+    // through the call, and the session would auto-repeat it.
+    down: HashSet<(bool, u32)>,
+    calls: u64,
+}
+
+impl GateState {
+    fn holding(&self, now: Instant) -> bool {
+        if self.busy { return true }
+        match self.last_end {
+            None => false,
+            Some(end) => {
+                let since = now.saturating_duration_since(end);
+                since >= self.window && since < GATE_IDLE
+            }
+        }
+    }
+
+    // The window is a margin under the shortest gaps this session's agent
+    // leaves between calls, so a flush never runs into its next call.
+    fn record_gap(&mut self, gap: Duration) {
+        if self.gaps.len() == GATE_GAP_SAMPLES { self.gaps.pop_front(); }
+        self.gaps.push_back(gap);
+        let mut sorted: Vec<Duration> = self.gaps.iter().copied().collect();
+        sorted.sort();
+        let low = sorted[sorted.len() * 5 / 100];
+        self.window = (low * 3 / 4).clamp(GATE_WINDOW_MIN, GATE_WINDOW_MAX);
+    }
+}
+
+#[derive(Clone)]
+struct ToolGate {
+    state: Arc<Mutex<GateState>>,
+    fake_input: OrgKdeKwinFakeInput,
+    conn: Connection,
+}
+
+impl ToolGate {
+    fn new(fake_input: OrgKdeKwinFakeInput, conn: Connection) -> Self {
+        let state = GateState {
+            busy: false, last_end: None, window: GATE_WINDOW_MAX,
+            gaps: std::collections::VecDeque::new(), held: Vec::new(), down: HashSet::new(), calls: 0,
+        };
+        Self { state: Arc::new(Mutex::new(state)), fake_input, conn }
+    }
+
+    // Forward one input op now, or hold it while a tool call runs.
+    fn send(&self, op: Op) {
+        let Ok(mut state) = self.state.lock() else { return };
+        // A release of a key already down goes out at once when nothing is held
+        // ahead of it; with held input ahead it waits its turn to keep order.
+        let completes = op.releases(&state.down) && state.held.is_empty();
+        if state.holding(Instant::now()) && !completes {
+            state.held.push(op);
+            return;
+        }
+        self.release(&mut state);
+        op.emit(&self.fake_input, &mut state.down);
+        let _ = self.conn.flush();
+    }
+
+    // Send everything held, in the order it was made.
+    fn release(&self, state: &mut GateState) {
+        if state.held.is_empty() { return }
+        for op in std::mem::take(&mut state.held) {
+            op.emit(&self.fake_input, &mut state.down);
+        }
+        let _ = self.conn.flush();
+    }
+
+    // Follow the server's tool-call marks until shutdown. Reads block in
+    // poll, waking only for a mark or for the idle deadline that releases
+    // held input.
+    fn spawn(&self, session: &std::path::Path, shutdown: Shutdown) -> anyhow::Result<JoinHandle<()>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = session.join(TOOL_CALLS_FIFO);
+        match nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR) {
+            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+            Err(error) => anyhow::bail!("mkfifo {}: {error}", path.display()),
+        }
+        // Opened read-write so the FIFO never reads end-of-file between calls.
+        let mut fifo = std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits()).open(&path)?;
+        let gate = self.clone();
+        Ok(std::thread::Builder::new().name("tool-gate".to_owned()).spawn(move || {
+            let mut buffer = [0u8; 64];
+            while !shutdown.requested() {
+                let wait = gate.next_deadline().unwrap_or(DISPATCH_POLL_INTERVAL).min(DISPATCH_POLL_INTERVAL);
+                let timeout = PollTimeout::try_from(wait).unwrap_or(PollTimeout::ZERO);
+                let mut fds = [PollFd::new(fifo.as_fd(), PollFlags::POLLIN)];
+                if nix::poll::poll(&mut fds, timeout).unwrap_or(0) > 0 {
+                    let count = Read::read(&mut fifo, &mut buffer).unwrap_or(0);
+                    for &mark in &buffer[..count] { gate.mark(mark); }
+                }
+                let Ok(mut state) = gate.state.lock() else { return };
+                if !state.holding(Instant::now()) { gate.release(&mut state); }
+            }
+        })?)
+    }
+
+    fn next_deadline(&self) -> Option<Duration> {
+        let state = self.state.lock().ok()?;
+        let end = state.last_end?;
+        (!state.busy).then(|| (end + GATE_IDLE).saturating_duration_since(Instant::now()))
+    }
+
+    fn mark(&self, mark: u8) {
+        let Ok(mut state) = self.state.lock() else { return };
+        let now = Instant::now();
+        match mark {
+            b'B' => {
+                if let Some(end) = state.last_end && !state.busy {
+                    state.record_gap(now.saturating_duration_since(end));
+                }
+                state.busy = true;
+                state.calls += 1;
+            }
+            b'E' => {
+                let held = state.held.len();
+                state.busy = false;
+                state.last_end = Some(now);
+                self.release(&mut state);
+                if held > 0 {
+                    eprintln!("kwin-viewer: tool call {} returned; released {held} held input op(s), window {} ms",
+                        state.calls, state.window.as_millis());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct InputState {
+    gate: ToolGate,
     // Last cursor position in window pixel coords, updated on every
     // CursorMoved regardless of whether the move is forwarded. Needed so a
     // fresh click can snap the container's cursor to the click position
@@ -1288,7 +1486,7 @@ fn forward_input(
         // event we may not see — release them all so no modifier stays
         // stuck inside the container while the user is elsewhere on host.
         for &code in &state.held_keys {
-            fake_input.keyboard_key(code, 0);
+            state.gate.send(Op::Key(code, 0));
         }
         if !state.held_keys.is_empty() {
             eprintln!(
@@ -1296,7 +1494,6 @@ fn forward_input(
                 state.held_keys.len()
             );
             state.held_keys.clear();
-            let _ = conn.flush();
         }
     }
     match event {
@@ -1310,8 +1507,7 @@ fn forward_input(
             if let Some((x, y)) =
                 map_window_to_virtual((position.x, position.y), window_size.0, window_size.1, virt)
             {
-                fake_input.pointer_motion_absolute(x, y);
-                let _ = conn.flush();
+                state.gate.send(Op::Motion(x, y));
             }
         }
         WindowEvent::MouseInput { state: btn_state, button, .. } => {
@@ -1330,23 +1526,21 @@ fn forward_input(
                     && let Some((x, y)) =
                         map_window_to_virtual(pos, window_size.0, window_size.1, virt)
                 {
-                    fake_input.pointer_motion_absolute(x, y);
+                    state.gate.send(Op::Motion(x, y));
                 }
                 state.held_buttons = state.held_buttons.saturating_add(1);
             } else {
                 state.held_buttons = state.held_buttons.saturating_sub(1);
             }
-            fake_input.button(code, if pressed { 1 } else { 0 });
-            let _ = conn.flush();
+            state.gate.send(Op::Button(code, if pressed { 1 } else { 0 }));
         }
         WindowEvent::MouseWheel { delta, .. } => {
             let (dx, dy) = match delta {
                 MouseScrollDelta::LineDelta(x, y) => (f64::from(*x) * 15.0, f64::from(*y) * 15.0),
                 MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
             };
-            if dy != 0.0 { fake_input.axis(AXIS_VERTICAL, -dy); }
-            if dx != 0.0 { fake_input.axis(AXIS_HORIZONTAL, -dx); }
-            let _ = conn.flush();
+            if dy != 0.0 { state.gate.send(Op::Axis(AXIS_VERTICAL, -dy)); }
+            if dx != 0.0 { state.gate.send(Op::Axis(AXIS_HORIZONTAL, -dx)); }
         }
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
@@ -1363,8 +1557,7 @@ fn forward_input(
             } else {
                 state.held_keys.remove(&evdev);
             }
-            fake_input.keyboard_key(evdev, if pressed { 1 } else { 0 });
-            let _ = conn.flush();
+            state.gate.send(Op::Key(evdev, if pressed { 1 } else { 0 }));
         }
         _ => {}
     }
