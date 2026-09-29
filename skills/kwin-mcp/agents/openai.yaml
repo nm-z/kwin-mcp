@@ -1,4 +1,4 @@
 interface:
   display_name: "KWin MCP"
-  short_description: "Use an isolated KDE desktop for GUI work"
+  short_description: "Use an isolated KDE desktop for GUI/CUA work"
   default_prompt: "Use $kwin-mcp to complete and verify this GUI task in the appropriate desktop."

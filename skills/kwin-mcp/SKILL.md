@@ -7,7 +7,7 @@ description: Use a configured KWin MCP server for local desktop interaction and 
 
 KWin MCP starts a separate KDE desktop on the same host. Its windows and input are separate from the user's current desktop. Applications in that session can still reach host services that the server forwards, and actions against websites or external accounts are real.
 
-Use the KWin MCP session for GUI workflows that you can complete and verify in that separate desktop. This includes launching applications, navigating websites, testing dialogs, and capturing rendered results. A screenshot of the user's desktop is evidence for a task; it does not by itself require control of the window that produced it.
+Use the KWin MCP session for GUI/CUA workflows that you can complete and verify in that separate desktop. This includes launching applications, navigating websites, testing dialogs, and capturing rendered results. A screenshot of the user's desktop is evidence for a task; it does not by itself require control of the window that produced it.
 
 Use the user's current desktop when the requested result must remain there. Examples include opening a file in a named application for the user, inspecting their currently open windows, or changing a specific window they identified. Follow the user's chosen destination if they specify one.
 
