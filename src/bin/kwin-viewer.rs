@@ -1545,11 +1545,12 @@ fn forward_input(
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
             let Some(evdev) = key_code_to_evdev(kc) else { return };
+            // The session repeats held keys itself from wl_keyboard.repeat_info.
+            if key.repeat { return }
             let pressed = matches!(key.state, ElementState::Pressed);
             if pressed {
                 state.held_keys.insert(evdev);
-                if !key.repeat
-                    && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
+                if let Some(chord) = clipboard_chord(evdev, &state.held_keys)
                     && let Err(error) = state.clipboard.before(chord)
                 {
                     eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
