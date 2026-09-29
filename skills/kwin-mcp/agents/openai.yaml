@@ -1,4 +1,7 @@
 interface:
-  display_name: "KWin MCP"
-  short_description: "Use an isolated KDE desktop for GUI/CUA work"
-  default_prompt: "Use $kwin-mcp to complete and verify this GUI task in the appropriate desktop."
+  display_name: "KWin MCP Desktop"
+  short_description: "Control the agent's carbon-copy live desktop"
+  default_prompt: "Use $kwin-mcp to complete this GUI task yourself in the black-box carbon-copy live desktop. It carries the user's copied session and login capabilities, but its windows and input do not affect the user's active desktop."
+
+policy:
+  allow_implicit_invocation: true
