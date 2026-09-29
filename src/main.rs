@@ -1290,8 +1290,10 @@ struct DisplayConfig {
     locked: bool,
     autoclean: bool,
     ttl: Option<Duration>,
-    /// cgroup MemoryHigh for each session's sandbox in bytes; None disables it.
+    /// cgroup MemoryHigh for each session's sandbox in bytes; None disables throttling.
     memory_high: Option<u64>,
+    memory_max: u64,
+    memory_swap_max: u64,
 }
 
 const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -3761,7 +3763,10 @@ impl KwinMcp {
         // the host does not hold stay private, so concurrent sessions still bind
         // the same port without colliding (#50). The CDP port is excluded so the
         // session's own browser can always bind it.
-        let mut cmd = sandbox_launcher(self.display.memory_high);
+        let mut cmd = match sandbox_launcher(self.display) {
+            Ok(command) => command,
+            Err(error) => return cleanup_err(error, &mut startup),
+        };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
         let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
@@ -5255,52 +5260,71 @@ impl KwinMcp {
 }
 
 fn parse_cli_args() -> Result<DisplayConfig, String> {
+    parse_cli_args_from(std::env::args().skip(1))
+}
+
+const GIB_BYTES: u64 = 1 << 30;
+const DEFAULT_MEMORY_HIGH: u64 = 3 * GIB_BYTES;
+const DEFAULT_MEMORY_MAX: u64 = 4 * GIB_BYTES;
+const DEFAULT_MEMORY_SWAP_MAX: u64 = GIB_BYTES;
+
+fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<DisplayConfig, String> {
     let mut cfg = DisplayConfig {
         width: VIRTUAL_SCREEN_WIDTH,
         height: VIRTUAL_SCREEN_HEIGHT,
         locked: false,
         autoclean: false,
         ttl: None,
-        memory_high: default_memory_high(),
+        memory_high: Some(DEFAULT_MEMORY_HIGH),
+        memory_max: DEFAULT_MEMORY_MAX,
+        memory_swap_max: DEFAULT_MEMORY_SWAP_MAX,
     };
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--width" => cfg.width = parse_dim_arg(&mut args, "--width")?,
             "--height" => cfg.height = parse_dim_arg(&mut args, "--height")?,
             "--no-override" => cfg.locked = true,
             // Kept for callers that used it before viewer startup became opt-in.
-            "--no-viewer" => {},
+            "--no-viewer" => {}
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
-            "--memory-high" => cfg.memory_high = parse_memory_high_arg(&mut args)?,
+            "--memory-high" => {
+                cfg.memory_high = match parse_memory_arg(&mut args, "--memory-high")? {
+                    0 => None,
+                    bytes => Some(bytes),
+                }
+            }
+            "--memory-max" => cfg.memory_max = parse_memory_arg(&mut args, "--memory-max")?,
+            "--memory-swap-max" => {
+                cfg.memory_swap_max = parse_memory_arg(&mut args, "--memory-swap-max")?
+            }
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] | kwin-mcp --stats [SECONDS]"
-                ))
+                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] [--memory-max GIB] [--memory-swap-max GIB] | kwin-mcp --stats [SECONDS]"
+                ));
             }
         }
+    }
+    if cfg.memory_max == 0 {
+        return Err("--memory-max must be positive".to_owned());
+    }
+    if cfg.memory_high.is_some_and(|high| high > cfg.memory_max) {
+        return Err(
+            "--memory-high must not exceed --memory-max; set both for a larger session".to_owned(),
+        );
     }
     // Expiry owns the same workdir terminal transition as --autoclean.
     cfg.autoclean |= cfg.ttl.is_some();
     Ok(cfg)
 }
 
-/// Default per-session memory cap: three quarters of the host's RAM. It is a
-/// failsafe for a runaway session, not a working limit: at a quarter, busy
-/// browser sessions were throttled at the cap (7.7 GiB on a 31 GiB host).
-fn default_memory_high() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kib: u64 = meminfo.lines().find_map(|line| line.strip_prefix("MemTotal:"))?
-        .trim().trim_end_matches("kB").trim().parse().ok()?;
-    kib.checked_mul(1024).map(|bytes| bytes / 4 * 3)
-}
-
-fn parse_memory_high_arg(args: &mut impl Iterator<Item = String>) -> Result<Option<u64>, String> {
-    let value = args.next().ok_or_else(|| "--memory-high requires GiB (0 disables the cap)".to_owned())?;
-    let gib: u64 = value.parse().map_err(|error| format!("--memory-high '{value}': {error}"))?;
-    if gib == 0 { return Ok(None); }
-    gib.checked_mul(1 << 30).map(Some).ok_or_else(|| "--memory-high is too large".to_owned())
+fn parse_memory_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, String> {
+    let value = args.next().ok_or_else(|| format!("{flag} requires GiB"))?;
+    let gib: u64 = value
+        .parse()
+        .map_err(|error| format!("{flag} '{value}': {error}"))?;
+    gib.checked_mul(GIB_BYTES)
+        .ok_or_else(|| format!("{flag} is too large"))
 }
 
 /// IPv4 address and prefix on the host interface with the preferred default route.
@@ -5336,27 +5360,38 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
     Ok(Some((address, prefix)))
 }
 
-/// The command that starts the session's pasta + bwrap tree. With a memory
-/// cap it runs in its own systemd user scope with MemoryHigh, so the kernel
-/// throttles and reclaims that session alone; systemd-run execs pasta in
-/// place, so the child PID and process group are unchanged. Without a usable
-/// user manager the session starts uncapped.
-fn sandbox_launcher(memory_high: Option<u64>) -> std::process::Command {
-    let Some(bytes) = memory_high else { return std::process::Command::new("pasta") };
+/// Start the pasta and bwrap tree in a bounded systemd user scope.
+/// Refuse startup when the scope is unavailable instead of running uncapped.
+fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, String> {
     let usable = std::process::Command::new("systemd-run")
         .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().is_ok_and(|status| status.success());
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
     if !usable {
-        eprintln!("session_start: systemd user scope unavailable; the session runs without a memory cap");
-        return std::process::Command::new("pasta");
+        return Err(
+            "systemd user scope unavailable; refusing to start an unbounded session".to_owned(),
+        );
     }
-    eprintln!("session_start: session memory capped at MemoryHigh={} MiB", bytes >> 20);
+    let high = config
+        .memory_high
+        .map_or_else(|| "infinity".to_owned(), |bytes| bytes.to_string());
+    eprintln!(
+        "session_start: MemoryHigh={high} MemoryMax={} MemorySwapMax={} bytes",
+        config.memory_max, config.memory_swap_max
+    );
     let mut command = std::process::Command::new("systemd-run");
-    command.args(["--user", "--scope", "--quiet", "--collect", "-p"])
-        .arg(format!("MemoryHigh={bytes}"))
-        .args(["--", "pasta"]);
     command
+        .args(["--user", "--scope", "--quiet", "--collect", "-p"])
+        .arg(format!("MemoryHigh={high}"))
+        .arg("-p")
+        .arg(format!("MemoryMax={}", config.memory_max))
+        .arg("-p")
+        .arg(format!("MemorySwapMax={}", config.memory_swap_max))
+        .args(["--", "pasta"]);
+    Ok(command)
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
@@ -5489,4 +5524,103 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     shutdown.shutdown_cleanup().await;
     if let Some(result) = waited { result?; }
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_limit_tests {
+    use super::{GIB_BYTES, parse_cli_args_from, sandbox_launcher};
+
+    #[test]
+    fn default_session_retains_hard_limits_when_throttling_is_disabled() -> Result<(), String> {
+        let default = parse_cli_args_from(std::iter::empty())?;
+        assert_eq!(default.memory_high, Some(3 * GIB_BYTES));
+        assert_eq!(default.memory_max, 4 * GIB_BYTES);
+        assert_eq!(default.memory_swap_max, GIB_BYTES);
+        let disabled = parse_cli_args_from(
+            ["--memory-high", "0", "--memory-swap-max", "0"]
+                .map(str::to_owned)
+                .into_iter(),
+        )?;
+        assert_eq!(disabled.memory_high, None);
+        assert_eq!(disabled.memory_max, 4 * GIB_BYTES);
+        assert_eq!(disabled.memory_swap_max, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn larger_gateway_requires_an_explicit_hard_limit() -> Result<(), String> {
+        assert!(
+            parse_cli_args_from(["--memory-high", "8"].map(str::to_owned).into_iter()).is_err()
+        );
+        let gateway = parse_cli_args_from(
+            [
+                "--memory-high",
+                "8",
+                "--memory-max",
+                "10",
+                "--memory-swap-max",
+                "6",
+            ]
+            .map(str::to_owned)
+            .into_iter(),
+        )?;
+        assert_eq!(gateway.memory_high, Some(8 * GIB_BYTES));
+        assert_eq!(gateway.memory_max, 10 * GIB_BYTES);
+        assert_eq!(gateway.memory_swap_max, 6 * GIB_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_limits_reject_zero_hard_limit_missing_values_and_overflow() {
+        for values in [
+            vec!["--memory-max", "0"],
+            vec!["--memory-max"],
+            vec!["--memory-swap-max", "18446744073709551615"],
+            vec!["--memory-high", "-1"],
+        ] {
+            assert!(parse_cli_args_from(values.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a systemd user manager; starts a headless scope, no GUI"]
+    fn real_scope_reports_the_configured_ram_and_swap_limits() -> Result<(), String> {
+        for values in [
+            vec![],
+            vec![
+                "--memory-high",
+                "8",
+                "--memory-max",
+                "10",
+                "--memory-swap-max",
+                "6",
+            ],
+        ] {
+            let config = parse_cli_args_from(values.into_iter().map(str::to_owned))?;
+            let launcher = sandbox_launcher(config)?;
+            let mut args: Vec<_> = launcher.get_args().map(std::ffi::OsStr::to_owned).collect();
+            assert_eq!(args.pop().as_deref(), Some(std::ffi::OsStr::new("pasta")));
+            // Exercise the same scope properties with a readback process
+            // instead of starting a compositor or application.
+            let output = std::process::Command::new(launcher.get_program())
+                .args(args)
+                .args(["sh", "-c", "cg=$(cut -d: -f3 /proc/self/cgroup); for name in memory.high memory.max memory.swap.max; do cat \"/sys/fs/cgroup$cg/$name\"; done"])
+                .output().map_err(|error| error.to_string())?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual = String::from_utf8_lossy(&output.stdout);
+            let expected = format!(
+                "{}\n{}\n{}\n",
+                config.memory_high.unwrap_or_default(),
+                config.memory_max,
+                config.memory_swap_max
+            );
+            eprintln!("scope limits readback: {actual}");
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
 }
