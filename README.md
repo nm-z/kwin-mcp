@@ -72,6 +72,26 @@ KWin MCP does not bridge clipboard contents between the host desktop and the iso
 
 ## Session Architecture
 
+### Session memory limits
+
+Each new sandbox runs in a systemd user scope with `MemoryHigh=3G`,
+`MemoryMax=4G`, and `MemorySwapMax=1G`. Startup fails if the user manager
+cannot create a scope. The limits cover the sandbox and its applications;
+the host viewer and MCP server remain outside that scope.
+
+For a gateway that needs more memory, set all three limits explicitly when
+launching its server or shim:
+
+```bash
+kwin-mcp-shim --memory-high 8 --memory-max 10 --memory-swap-max 6
+```
+
+Values are whole GiB. `--memory-high 0` disables throttling while retaining
+the RAM and swap limits. `--memory-swap-max 0` prevents new swap use.
+`--memory-max` must be positive and at least `--memory-high`.
+Existing sessions retain their current limits until their owner restarts them
+or changes their scope properties.
+
 ```
 kwin-mcp (host process)
   ├── proxy_conn (owns org.kde.KWin on container D-Bus)
