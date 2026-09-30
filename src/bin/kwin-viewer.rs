@@ -1410,7 +1410,8 @@ impl ToolGate {
     fn next_deadline(&self) -> Option<Duration> {
         let state = self.state.lock().ok()?;
         let end = state.last_end?;
-        (!state.busy).then(|| (end + GATE_IDLE).saturating_duration_since(Instant::now()))
+        let remaining = (end + GATE_IDLE).checked_duration_since(Instant::now())?;
+        (!state.busy).then_some(remaining)
     }
 
     fn mark(&self, mark: u8) {
