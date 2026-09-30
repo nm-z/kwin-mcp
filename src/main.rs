@@ -1631,6 +1631,19 @@ impl KwinMcp {
             }
         }
     }
+
+    /// Collect a viewer that exited on its own (the user closed its window, or
+    /// the stream ended) so it never lingers as a zombie under this server.
+    /// Child::try_wait reaps it and keeps the status for viewer_report.
+    async fn viewer_reaper(self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(child) = self.session.lock().await.as_mut().and_then(|s| s.viewer_child.as_mut()) {
+                let _ = child.try_wait();
+            }
+        }
+    }
+
     async fn idle_reaper(self) {
         let Some(ttl) = self.display.ttl else { return };
         loop {
@@ -5748,6 +5761,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
     let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper());
+    let viewer_reaper = tokio::spawn(shutdown.clone().viewer_reaper());
     let cancellation = service.cancellation_token();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -5764,7 +5778,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
     if waited.is_none() { cancellation.cancel(); }
     ttl_reaper.abort();
+    viewer_reaper.abort();
     let _ = ttl_reaper.await;
+    let _ = viewer_reaper.await;
     shutdown.shutdown_cleanup().await;
     if let Some(result) = waited { result?; }
     Ok(())
