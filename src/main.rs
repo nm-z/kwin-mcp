@@ -73,9 +73,9 @@ const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 // AT-SPI tree traversal hard timeout (find_ui_elements).
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Largest accessibility_tree reply, in characters. Longer trees are cut at a
-// line boundary with a note to narrow the query, so one call cannot blow an
-// agent's context window.
+// Largest accessibility_tree reply, in characters. The tree is returned as the
+// deepest run of whole levels that fits, so one call cannot blow an agent's
+// context window.
 const A11Y_TREE_MAX_CHARS: usize = 30_000;
 
 // Input-event pacing (clicks, drag steps, key hold).
@@ -2908,12 +2908,11 @@ struct AtspiNode {
 }
 
 impl AtspiNode {
-    fn line(&self, depth: usize) -> String {
+    fn text(&self) -> String {
         format!(
-            "{}{}\t{}\t{}\t{:?}",
-            "  ".repeat(depth),
-            self.role,
-            self.name,
+            "{}\t{}\t{}\t{:?}",
+            tree_field(&self.role),
+            tree_field(&self.name),
             self.states.join("|"),
             self.bounds
         )
@@ -2982,26 +2981,118 @@ async fn atspi_node(
     })
 }
 
-/// Join tree lines into one reply of at most A11Y_TREE_MAX_CHARS characters,
-/// ending in a note when lines were cut.
-fn capped_tree(lines: &[String]) -> (String, serde_json::Value) {
-    let mut tree = String::new();
-    let mut kept = 0usize;
-    for line in lines {
-        if tree.len() + line.len() + 1 > A11Y_TREE_MAX_CHARS {
-            break;
+fn tree_field(value: &str) -> String {
+    value
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+/// An accessibility tree gathered breadth-first, rendered as whole levels.
+#[derive(Default)]
+struct LevelTree {
+    nodes: Vec<LevelNode>,
+}
+
+struct LevelNode {
+    text: String,
+    id: String,
+    depth: usize,
+    children: Vec<usize>,
+}
+
+impl LevelTree {
+    fn push(&mut self, text: String, id: String, parent: Option<usize>) -> usize {
+        let at = self.nodes.len();
+        let depth = parent
+            .and_then(|p| self.nodes.get(p))
+            .map_or(0, |p| p.depth + 1);
+        self.nodes.push(LevelNode {
+            text,
+            id,
+            depth,
+            children: Vec::new(),
+        });
+        if let Some(parent) = parent.and_then(|p| self.nodes.get_mut(p)) {
+            parent.children.push(at);
         }
-        if kept > 0 {
-            tree.push('\n');
+        at
+    }
+
+    fn levels(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.depth + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn line_cost(node: &LevelNode) -> usize {
+        node.depth + node.text.chars().count() + 1
+    }
+
+    fn suffix(node: &LevelNode) -> String {
+        format!("\t+{} children\troot={}", node.children.len(), node.id)
+    }
+
+    /// How many whole levels fit in A11Y_TREE_MAX_CHARS, counting the child
+    /// notes the last one carries. An oversized root level does not fit.
+    fn fitting_levels(&self, max_levels: usize) -> usize {
+        let mut cost = vec![0usize; self.levels()];
+        let mut notes = vec![0usize; self.levels()];
+        for node in &self.nodes {
+            cost[node.depth] += Self::line_cost(node);
+            if !node.children.is_empty() {
+                notes[node.depth] += Self::suffix(node).chars().count();
+            }
         }
-        tree.push_str(line);
-        kept += 1;
+        let mut total = 0;
+        let mut fit = 0;
+        for level in 0..cost.len().min(max_levels) {
+            total += cost[level];
+            if total + notes[level] > A11Y_TREE_MAX_CHARS {
+                break;
+            }
+            fit = level + 1;
+        }
+        fit
     }
-    let omitted = lines.len() - kept;
-    if omitted > 0 {
-        tree.push_str(&format!("\n… {omitted} more lines omitted; narrow with app_name, role or max_depth"));
+
+    /// Whether every level gathered so far still fits, so one more is worth
+    /// reading (it either fits too or gives the last level its child counts).
+    fn open_level(&self) -> bool {
+        self.fitting_levels(usize::MAX) == self.levels()
     }
-    (tree, serde_json::json!({"lines": kept, "omitted_lines": omitted}))
+
+    fn render(&self, max_levels: usize) -> (String, serde_json::Value) {
+        let fit = self.fitting_levels(max_levels);
+        let mut out = String::new();
+        let mut shown = 0usize;
+        let roots: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].depth == 0)
+            .collect();
+        let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+        while let Some(at) = stack.pop() {
+            let node = &self.nodes[at];
+            if node.depth >= fit {
+                continue;
+            }
+            out.push_str(&"\t".repeat(node.depth));
+            out.push_str(&node.text);
+            if node.depth + 1 == fit && !node.children.is_empty() {
+                out.push_str(&Self::suffix(node));
+            }
+            out.push('\n');
+            shown += 1;
+            stack.extend(node.children.iter().rev());
+        }
+        let deeper = self.levels() > fit;
+        let chars = out.chars().count();
+        (
+            out,
+            serde_json::json!({"levels": fit, "nodes": shown, "chars": chars, "more_below": deeper}),
+        )
+    }
 }
 
 // ── Tool parameter structs ──────────────────────────────────────────────
@@ -3106,6 +3197,9 @@ struct AccessibilityTreeParams {
     max_depth: Option<u32>,
     role: Option<String>,
     show_elements: Option<bool>,
+    /// Node id from a previous reply's "+N children root=ID" note; the tree
+    /// starts at that node.
+    root: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -4535,10 +4629,9 @@ impl KwinMcp {
             Ok(structured_result(&peer, text, payload).await)
         }
     }
-
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. app_name filters top-level apps; max_depth caps traversal (default 8); role filters role names. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. Replies stop at 30,000 characters with a note saying how many lines were cut.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The tree is read breadth-first and returned as whole levels, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -4547,81 +4640,133 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
+            usize::try_from(depth)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        });
+        let show_elements = params.show_elements.unwrap_or(false);
+        let role = params.role.map(|s| s.to_lowercase());
+        let role_ok = |name: &str| {
+            role.as_ref()
+                .is_none_or(|needle| name.to_lowercase().contains(needle))
+        };
         // CDP path for Chromium/Electron apps
-        let cdp_browser = self.session.lock().await
+        let cdp_browser = self
+            .session
+            .lock()
+            .await
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
         if let Some(browser) = cdp_browser
-            && let Ok(pages) = browser.pages().await {
-                for page in &pages {
-                    let url = page.url().await.ok().flatten().unwrap_or_default();
-                    if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
-                        continue;
+            && let Ok(pages) = browser.pages().await
+        {
+            for page in &pages {
+                let url = page.url().await.ok().flatten().unwrap_or_default();
+                if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
+                    continue;
+                }
+                use chromiumoxide::cdp::browser_protocol::accessibility::{
+                    GetFullAxTreeParams, GetFullAxTreeReturns,
+                };
+                let Ok(result) = page.execute(GetFullAxTreeParams::builder().build()).await else {
+                    continue;
+                };
+                let returns: &GetFullAxTreeReturns = &result;
+                let index: std::collections::HashMap<String, usize> = returns
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, node)| (node.node_id.inner().to_string(), i))
+                    .collect();
+                let text = |i: usize| -> Option<String> {
+                    let node = &returns.nodes[i];
+                    let value =
+                        |v: &Option<chromiumoxide::cdp::browser_protocol::accessibility::AxValue>| {
+                            v.as_ref()
+                                .and_then(|v| v.value.as_ref())
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_owned()
+                        };
+                    let (role, name) = (value(&node.role), value(&node.name));
+                    let shown = (!node.ignored || show_elements)
+                        && (!name.is_empty() || show_elements)
+                        && role_ok(&role);
+                    shown.then(|| {
+                        format!(
+                            "{}\t{}",
+                            tree_field(if role.is_empty() { "none" } else { &role }),
+                            tree_field(&name)
+                        )
+                    })
+                };
+                // Map the AX tree onto shown nodes; hidden ones pass their children up.
+                let mut tree = LevelTree::default();
+                let starts: Vec<usize> = match &params.root {
+                    Some(root) if !root.contains('/') => {
+                        let Some(&at) = index.get(root) else { continue };
+                        vec![at]
                     }
-                    use chromiumoxide::cdp::browser_protocol::accessibility::{
-                        GetFullAxTreeParams, GetFullAxTreeReturns,
-                    };
-                    let depth = params.max_depth.map(i64::from);
-                    let mut cmd = GetFullAxTreeParams::builder();
-                    if let Some(d) = depth { cmd = cmd.depth(d); }
-                    if let Ok(result) = page.execute(cmd.build()).await {
-                        let returns: &GetFullAxTreeReturns = &result;
-                        // Build parent→children index
-                        let mut children_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-                        let mut node_map: std::collections::HashMap<String, &chromiumoxide::cdp::browser_protocol::accessibility::AxNode> = std::collections::HashMap::new();
-                        let mut root_ids = Vec::new();
-                        for node in &returns.nodes {
-                            let id = node.node_id.inner().to_string();
-                            node_map.insert(id.clone(), node);
-                            if let Some(ref pid) = node.parent_id {
-                                children_map.entry(pid.inner().to_string()).or_default().push(id);
-                            } else {
-                                root_ids.push(id);
-                            }
+                    Some(_) => continue,
+                    None => returns
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.parent_id.is_none())
+                        .map(|(i, _)| i)
+                        .collect(),
+                };
+                let mut pending: Vec<(usize, Option<usize>)> =
+                    starts.iter().rev().map(|&i| (i, None)).collect();
+                let mut visited = std::collections::HashSet::new();
+                loop {
+                    let mut level = Vec::new();
+                    while let Some((i, parent)) = pending.pop() {
+                        if !visited.insert(i) {
+                            continue;
                         }
-                        // Walk tree depth-first
-                        let show = params.show_elements.unwrap_or(false);
-                        let role_filter = params.role.as_ref().map(|s| s.to_lowercase());
-                        let mut out = Vec::new();
-                        let mut stack: Vec<(String, usize)> = root_ids.into_iter().rev().map(|id| (id, 0_usize)).collect();
-                        while let Some((id, depth_level)) = stack.pop() {
-                            if let Some(node) = node_map.get(&id) {
-                                if node.ignored && !show { /* skip */ } else {
-                                    let role = node.role.as_ref()
-                                        .and_then(|v| v.value.as_ref())
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("none");
-                                    let name = node.name.as_ref()
-                                        .and_then(|v| v.value.as_ref())
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if !name.is_empty() || show {
-                                        let dominated = role_filter.as_ref()
-                                            .map(|f| role.to_lowercase().contains(f))
-                                            .unwrap_or(true);
-                                        if dominated {
-                                            out.push(format!("{}{}\t{}", "  ".repeat(depth_level), role, name));
-                                        }
-                                    }
-                                }
-                                if let Some(kids) = children_map.get(&id) {
-                                    for kid in kids.iter().rev() {
-                                        stack.push((kid.clone(), depth_level + 1));
-                                    }
+                        let forced = params.root.is_some() && parent.is_none();
+                        if let Some(line) = text(i).or_else(|| forced.then(|| "root".to_owned())) {
+                            let at =
+                                tree.push(line, returns.nodes[i].node_id.inner().to_string(), parent);
+                            level.push((i, at));
+                        } else {
+                            for child in returns.nodes[i].child_ids.iter().flatten().rev() {
+                                if let Some(&c) = index.get(child.inner()) {
+                                    pending.push((c, parent));
                                 }
                             }
                         }
-                        let (tree, mut info) = capped_tree(&out);
-                        info["source"] = serde_json::json!("cdp");
-                        return Ok(structured_result(&peer, tree, info).await);
+                    }
+                    if level.is_empty() || !tree.open_level() || tree.levels() > max_levels {
+                        break;
+                    }
+                    for (i, at) in level.into_iter().rev() {
+                        for child in returns.nodes[i].child_ids.iter().flatten().rev() {
+                            if let Some(&c) = index.get(child.inner()) {
+                                pending.push((c, Some(at)));
+                            }
+                        }
                     }
                 }
+                let (tree, mut info) = tree.render(max_levels);
+                info["source"] = serde_json::json!("cdp");
+                return Ok(structured_result(&peer, tree, info).await);
             }
+        }
         // AT-SPI path for native apps
-        use atspi::proxy::accessible::ObjectRefExt;
-        let (zbus_conn, screen) = self.with_session(|s| {
-            Ok((s.kwin_conn.clone(), (s.screen_width, s.screen_height)))
-        }).await?;
+        if let Some(root) = &params.root
+            && !root.contains('/')
+        {
+            return Err(McpError::invalid_params(
+                format!("root '{root}' is not present in the browser accessibility tree"),
+                None,
+            ));
+        }
+        let (zbus_conn, screen) = self
+            .with_session(|s| Ok((s.kwin_conn.clone(), (s.screen_width, s.screen_height))))
+            .await?;
         let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
             .await
             .map_err(KwinError::from)?
@@ -4631,52 +4776,118 @@ impl KwinMcp {
         let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
             .await
             .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
-        let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
-            .destination("org.a11y.atspi.Registry")
-            .map_err(KwinError::from)?
-            .cache_properties(zbus::proxy::CacheProperties::No)
-            .build()
-            .await
-            .map_err(KwinError::from)?;
-        let limit = usize::try_from(params.max_depth.unwrap_or(8)).map_err(KwinError::from)?;
-        let app_name = params.app_name.map(|s| s.to_lowercase());
-        let role = params.role.map(|s| s.to_lowercase());
-        let show_elements = params.show_elements.unwrap_or(false);
-        let mut out = Vec::new();
-        let mut stack = root
-            .get_children()
-            .await
-            .map_err(KwinError::from)?
-            .into_iter()
-            .rev()
-            .map(|obj| (obj, 0usize, true))
-            .collect::<Vec<_>>();
-        while let Some((obj, depth, top)) = stack.pop() {
-            let acc = match obj.as_accessible_proxy(&a11y_bus).await {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let node = match atspi_node(&acc).await {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if top && !app_name.as_ref().map(|needle| node.name.to_lowercase().contains(needle)).unwrap_or(true) {
-                continue;
+        let proxy_at = |dest: String, path: String| {
+            let bus = a11y_bus.clone();
+            async move {
+                atspi::proxy::accessible::AccessibleProxy::builder(&bus)
+                    .destination(dest)
+                    .map_err(KwinError::from)?
+                    .path(path)
+                    .map_err(KwinError::from)?
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await
+                    .map_err(KwinError::from)
             }
-            let dominated = role
-                .as_ref()
-                .map(|needle| node.role.to_lowercase().contains(needle))
-                .unwrap_or(true)
-                && (show_elements || (node.is_useful() && node.on_screen(screen.0, screen.1)));
-            if dominated { out.push(node.line(depth)); }
-            let child_depth = if dominated { depth + 1 } else { depth };
-            if child_depth <= limit {
-                for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
-                    stack.push((child, child_depth, false));
+        };
+        let app_name = params.app_name.map(|s| s.to_lowercase());
+        let shown = |node: &AtspiNode| {
+            role_ok(&node.role)
+                && (show_elements || (node.is_useful() && node.on_screen(screen.0, screen.1)))
+        };
+        let mut tree = LevelTree::default();
+        // Level 0: the requested root, or the first shown nodes of each matching app.
+        let mut level: Vec<(usize, atspi::proxy::accessible::AccessibleProxy<'static>)> = Vec::new();
+        let mut pending: Vec<(
+            atspi::proxy::accessible::AccessibleProxy<'static>,
+            Option<usize>,
+        )> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        match &params.root {
+            Some(root) => {
+                let (dest, path) = root.find('/').map(|at| root.split_at(at)).ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("root '{root}' is not a node id from a previous reply"),
+                        None,
+                    )
+                })?;
+                let acc = proxy_at(dest.to_owned(), path.to_owned()).await?;
+                let node = atspi_node(&acc)
+                    .await
+                    .map_err(|e| McpError::invalid_params(format!("root '{root}': {e}"), None))?;
+                visited.insert(root.clone());
+                let id = tree.push(node.text(), root.clone(), None);
+                level.push((id, acc));
+            }
+            None => {
+                let root = proxy_at(
+                    "org.a11y.atspi.Registry".to_owned(),
+                    "/org/a11y/atspi/accessible/root".to_owned(),
+                )
+                .await?;
+                for app in root.get_children().await.map_err(KwinError::from)? {
+                    let Some(dest) = app.name() else { continue };
+                    let Ok(acc) = proxy_at(dest.to_string(), app.path().to_string()).await else {
+                        continue;
+                    };
+                    let name = acc.name().await.unwrap_or_default().to_lowercase();
+                    if app_name.as_ref().is_none_or(|needle| name.contains(needle)) {
+                        pending.push((acc, None));
+                    }
                 }
             }
         }
-        let (tree, info) = capped_tree(&out);
+        // Expand breadth-first: each round collects the next level's shown
+        // nodes, passing through hidden ones, until the levels run out.
+        loop {
+            while let Some((acc, parent)) = pending.pop() {
+                let identity = format!("{}{}", acc.inner().destination(), acc.inner().path());
+                if !visited.insert(identity.clone()) {
+                    continue;
+                }
+                let Ok(node) = atspi_node(&acc).await else {
+                    continue;
+                };
+                if shown(&node) {
+                    let at = tree.push(node.text(), identity, parent);
+                    level.push((at, acc));
+                } else {
+                    for child in acc
+                        .get_children()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .rev()
+                    {
+                        if let Some(dest) = child.name()
+                            && let Ok(child) =
+                                proxy_at(dest.to_string(), child.path().to_string()).await
+                        {
+                            pending.push((child, parent));
+                        }
+                    }
+                }
+            }
+            if level.is_empty() || !tree.open_level() || tree.levels() > max_levels {
+                break;
+            }
+            for (at, acc) in std::mem::take(&mut level).into_iter().rev() {
+                for child in acc
+                    .get_children()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                {
+                    if let Some(dest) = child.name()
+                        && let Ok(child) = proxy_at(dest.to_string(), child.path().to_string()).await
+                    {
+                        pending.push((child, Some(at)));
+                    }
+                }
+            }
+        }
+        let (tree, info) = tree.render(max_levels);
         Ok(structured_result(&peer, tree, info).await)
     }
 
@@ -5622,5 +5833,50 @@ mod memory_limit_tests {
             assert_eq!(actual, expected);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod level_tree_tests {
+    use super::{A11Y_TREE_MAX_CHARS, LevelTree, tree_field};
+
+    #[test]
+    fn budget_excludes_an_entire_wide_level_and_counts_its_children() {
+        let mut tree = LevelTree::default();
+        let root = tree.push("root".to_owned(), "root-id".to_owned(), None);
+        tree.push("a".repeat(16_000), "a".to_owned(), Some(root));
+        tree.push("b".repeat(16_000), "b".to_owned(), Some(root));
+        let (text, info) = tree.render(usize::MAX);
+        assert_eq!(info["levels"], 1);
+        assert_eq!(info["nodes"], 1);
+        assert_eq!(text, "root\t+2 children\troot=root-id\n");
+        assert!(text.chars().count() <= A11Y_TREE_MAX_CHARS);
+    }
+
+    #[test]
+    fn budget_counts_unicode_characters_and_indents_with_one_tab() {
+        let mut tree = LevelTree::default();
+        let root = tree.push("é".repeat(15_000), "root-id".to_owned(), None);
+        tree.push("界".repeat(14_000), "child-id".to_owned(), Some(root));
+        let (text, info) = tree.render(usize::MAX);
+        assert_eq!(info["levels"], 2);
+        assert_eq!(info["chars"], 29_003);
+        assert!(text.len() > A11Y_TREE_MAX_CHARS);
+        assert!(text.contains("\n\t界"));
+    }
+
+    #[test]
+    fn oversized_root_level_is_not_cut_in_the_middle() {
+        let mut tree = LevelTree::default();
+        tree.push("x".repeat(A11Y_TREE_MAX_CHARS), "root-id".to_owned(), None);
+        let (text, info) = tree.render(usize::MAX);
+        assert!(text.is_empty());
+        assert_eq!(info["levels"], 0);
+        assert_eq!(info["more_below"], true);
+    }
+
+    #[test]
+    fn labels_cannot_create_extra_lines_or_indentation() {
+        assert_eq!(tree_field("a\nb\rc\td"), "a\\nb\\rc\\td");
     }
 }
