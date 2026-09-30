@@ -72,6 +72,8 @@ const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 // AT-SPI tree traversal hard timeout (find_ui_elements).
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
+const SCREENSHOT_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 
 // Largest accessibility_tree reply, in characters. The tree is returned as the
 // deepest run of whole levels that fits, so one call cannot blow an agent's
@@ -2261,6 +2263,44 @@ type Frame = (u32, u32, u32, Vec<u8>);
 
 /// One complete CaptureScreen frame, retrying short pipe reads.
 async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
+    tokio::time::timeout(SCREENSHOT_FRAME_TIMEOUT, capture_frame_inner(proxy))
+        .await
+        .map_err(|_| {
+            McpError::internal_error(
+                "screenshot: compositor did not finish a frame within 10 seconds",
+                None,
+            )
+        })?
+}
+
+async fn read_frame_pixels(
+    read_fd: std::os::fd::OwnedFd,
+    expected: usize,
+) -> Result<Vec<u8>, McpError> {
+    nix::fcntl::fcntl(
+        &read_fd,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(KwinError::from)?;
+    let reader = tokio::io::unix::AsyncFd::new(read_fd).map_err(KwinError::from)?;
+    let mut pixels = vec![0; expected];
+    let mut received = 0;
+    while received < expected {
+        let mut ready = reader.readable().await.map_err(KwinError::from)?;
+        match ready.try_io(|fd| {
+            nix::unistd::read(fd.get_ref(), &mut pixels[received..]).map_err(std::io::Error::from)
+        }) {
+            Ok(Ok(0)) => break,
+            Ok(Ok(size)) => received += size,
+            Ok(Err(error)) => return Err(KwinError::from(error).into()),
+            Err(_) => continue,
+        }
+    }
+    pixels.truncate(received);
+    Ok(pixels)
+}
+
+async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
     let mut last_size = None;
     for attempt in 1..=SCREENSHOT_CAPTURE_ATTEMPTS {
         let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
@@ -2283,11 +2323,9 @@ async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpErr
             Ok(n)
         };
         let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
-        let reader_file = std::fs::File::from(read_fd);
-        let expected = usize::try_from(stride * height).map_err(KwinError::from)?;
-        let mut pixels = Vec::with_capacity(expected);
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(reader_file), &mut pixels)
-            .map_err(KwinError::from)?;
+        let expected =
+            usize::try_from(u64::from(stride) * u64::from(height)).map_err(KwinError::from)?;
+        let pixels = read_frame_pixels(read_fd, expected).await?;
         let received = pixels.len();
         if received == expected {
             return Ok((width, height, stride, pixels));
@@ -4519,6 +4557,16 @@ impl KwinMcp {
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        tokio::time::timeout(SCREENSHOT_TOOL_TIMEOUT, self.screenshot_result(peer, params))
+            .await
+            .map_err(|_| McpError::internal_error("screenshot: capture exceeded 20 seconds; the session remains open", None))?
+    }
+
+    async fn screenshot_result(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        params: ScreenshotParams,
+    ) -> Result<CallToolResult, McpError> {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
@@ -4685,6 +4733,16 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, self.accessibility_tree_result(peer, params))
+            .await
+            .map_err(|_| McpError::internal_error("accessibility_tree: traversal exceeded 5 seconds; the session remains open", None))?
+    }
+
+    async fn accessibility_tree_result(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        params: AccessibilityTreeParams,
+    ) -> Result<CallToolResult, McpError> {
         let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
             usize::try_from(depth)
                 .unwrap_or(usize::MAX)
@@ -5953,5 +6011,48 @@ mod instructions_tests {
             assert!(!text.is_empty());
             assert!(text.chars().count() <= 2048, "{} characters", text.chars().count());
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_pipe_tests {
+    use super::read_frame_pixels;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn complete_frame_returns_while_the_writer_remains_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (reader, writer) = nix::unistd::pipe()?;
+        nix::unistd::write(&writer, b"frame")?;
+        let frame = tokio::time::timeout(Duration::from_millis(200), read_frame_pixels(reader, 5))
+            .await??;
+        assert_eq!(frame, b"frame");
+        drop(writer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_closed_pipe_reports_only_the_received_pixels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (reader, writer) = nix::unistd::pipe()?;
+        nix::unistd::write(&writer, b"abc")?;
+        drop(writer);
+        assert_eq!(read_frame_pixels(reader, 5).await?, b"abc");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_frame_allows_other_tasks_and_cancels_with_a_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (reader, writer) = nix::unistd::pipe()?;
+        let other_task = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            "responsive"
+        });
+        let read = tokio::time::timeout(Duration::from_millis(30), read_frame_pixels(reader, 5));
+        assert!(read.await.is_err());
+        assert_eq!(other_task.await?, "responsive");
+        drop(writer);
+        Ok(())
     }
 }

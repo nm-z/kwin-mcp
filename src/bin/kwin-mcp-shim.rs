@@ -81,6 +81,27 @@ fn stamp(path: &Path) -> Option<Stamp> {
 
 fn log(message: &str) {
     eprintln!("kwin-mcp-shim: {message}");
+    use std::io::Write;
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const LOG_LIMIT: u64 = 256 * 1024;
+    let Ok(_guard) = LOG_LOCK.lock() else { return };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| {
+        // The effective uid identifies the host user runtime directory.
+        let uid = unsafe { nix::libc::geteuid() };
+        PathBuf::from(format!("/run/user/{uid}"))
+    });
+    let directory = runtime.join("kwin-mcp");
+    if std::fs::create_dir_all(&directory).is_err() { return }
+    let path = directory.join(format!("shim-{}.jsonl", std::process::id()));
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= LOG_LIMIT) {
+        let previous = path.with_extension("previous.jsonl");
+        let _ = std::fs::rename(&path, previous);
+    }
+    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+    let record = json!({"unix_s": time, "pid": std::process::id(), "message": message});
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{record}");
+    }
 }
 
 fn id_key(id: &Value) -> String {
@@ -775,6 +796,9 @@ impl Shim {
 
     fn on_child_exit(&mut self, key: u64, status: &str) {
         let Some(child) = self.children.remove(&key) else { return };
+        let status = if child.killed_at.is_some() {
+            format!("{status}; supervisor watchdog received no ping response for {} seconds", WEDGE_TIMEOUT.as_secs())
+        } else { status.to_owned() };
         let expected = child.retiring || self.closing;
         log(&format!("child {} exited ({status}){}", child.pid, if expected { "" } else { " unexpectedly" }));
         if let Some(session) = &child.session
