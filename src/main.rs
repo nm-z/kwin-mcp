@@ -3377,14 +3377,13 @@ impl rmcp::ServerHandler for KwinMcp {
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
                 "KDE Wayland desktop automation in an isolated container. \
-                Required first step: call session_start — every other tool fails until it succeeds. It is idempotent; if a session is already up you get its info back without restarting it (call session_stop + session_start to restart). \
-                Typical flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop when done. Use find_ui_elements for a specific named control; use a filtered accessibility_tree only when structure helps. If the tree is empty or costly, continue with screenshots and input. \
-                Work without a host viewer by default. Call viewer_open whenever the user needs to see something in the session or do something the agent cannot or must not do itself, for example typing a password or OTP, approving a Duo push, solving a CAPTCHA, making a choice, or looking at a result. Never stop the session or send the user to do the step somewhere else when the viewer can bridge it. At a login or credential field in a session browser, click the field first and pick the browser's saved-credential suggestion: the session browser has the user's saved passwords, and autofill fills the value without the agent reading or typing it. If no suggestion appears or it fails, open the viewer for the user. While waiting for the user, keep the page open and poll with screenshots. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. \
-                If an expected prompt or app is missing, call window_list before concluding it is absent; use window_activate with its ID, then screenshot and interact normally. \
-                To attach a file in Chrome's file chooser: click the page's file input, press ctrl+l, type the absolute path, then press alt+o (or click Open at the top right); Enter in the location bar cancels Chrome's chooser and attaches nothing. \
-                All mouse/screenshot coordinates are pixels relative to the active window's top-left (not the virtual display). \
-                {size_line} Windows are auto-maximized; a window-relative click at (100,100) lands 100px from the window's top-left corner. \
-                Screenshots are 1:1 pixels (no DPI scaling, no resampling) of the active window, so a pixel you read off a default screenshot is the coordinate you pass to mouse_click, even for a small dialog away from the display origin. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse_click (px+x1, py+y1).",
+                First call session_start: every other tool fails until it succeeds. It is idempotent (session_stop then session_start to restart). \
+                Flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop. Prefer find_ui_elements for a named control; use accessibility_tree only when structure helps, and fall back to screenshots if it is empty or costly. If a prompt or app seems missing, call window_list, then window_activate with its ID. \
+                Work without a viewer by default. Call viewer_open whenever the user needs to see something or do something you cannot or must not do (a password, OTP, Duo push, CAPTCHA, a choice, a result); never stop the session or send the user elsewhere for it. Poll with screenshots while they act, continue when the page advances, then call viewer_close. \
+                At a login field in a session browser, click it and pick the saved-credential suggestion: autofill fills it without you reading or typing the value. If none appears, open the viewer. \
+                Chrome file chooser: click the file input, press ctrl+l, type the absolute path, press alt+o (Enter in the location bar cancels it). \
+                Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1 with screenshots (no scaling), so a pixel read off a screenshot is the mouse_click coordinate. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is (px+x1, py+y1). \
+                {size_line} Windows are auto-maximized.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -5911,5 +5910,32 @@ mod level_tree_tests {
     #[test]
     fn labels_cannot_create_extra_lines_or_indentation() {
         assert_eq!(tree_field("a\nb\rc\td"), "a\\nb\\rc\\td");
+    }
+}
+
+#[cfg(test)]
+mod instructions_tests {
+    use super::{DisplayConfig, KwinMcp};
+    use rmcp::ServerHandler;
+
+    /// Claude Code cuts server instructions at 2048 characters; anything past
+    /// it (the coordinate rules were last) never reaches the agent.
+    #[test]
+    fn server_instructions_fit_the_client_limit() {
+        for locked in [false, true] {
+            let server = KwinMcp::new(DisplayConfig {
+                width: 3840,
+                height: 2160,
+                locked,
+                autoclean: false,
+                ttl: None,
+                memory_high: None,
+                memory_max: 0,
+                memory_swap_max: 0,
+            });
+            let text = server.get_info().instructions.unwrap_or_default();
+            assert!(!text.is_empty());
+            assert!(text.chars().count() <= 2048, "{} characters", text.chars().count());
+        }
     }
 }
