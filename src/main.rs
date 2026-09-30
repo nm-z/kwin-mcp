@@ -1092,6 +1092,35 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
     ".config/vivaldi",
 ];
 
+const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
+
+fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![target.join(".codex/state_5.sqlite")];
+    for config in BROWSER_CONFIG_DIRS {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
+        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+            for name in EMPTY_BROWSER_DATABASES {
+                let path = profile.path().join(name);
+                if path.is_file() { paths.push(path); }
+            }
+        }
+    }
+    paths
+}
+
+fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow::Result<()> {
+    for database in databases {
+        if !database.parent().is_some_and(Path::is_dir) { continue }
+        for suffix in ["", "-wal", "-shm"] {
+            let name = database.file_name().ok_or_else(|| anyhow::anyhow!("database has no name"))?;
+            let path = database.with_file_name(format!("{}{suffix}", name.to_string_lossy()));
+            let upper = upper_file(plan, &path)?;
+            std::fs::write(upper, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// The session sees the user's browser profiles while the host browser is
 /// still running, so their Preferences record an unclean exit and the session
 /// browser offers "Restore pages? Chrome didn't shut down correctly". Mark each
@@ -1230,12 +1259,16 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
-    for database in live_sqlite_databases(target) {
+    let discarded = discarded_session_databases(target);
+    for database in live_sqlite_databases(target).into_iter().filter(|database| !discarded.contains(database)) {
         match snapshot_live_sqlite(&overlay_plan, &database) {
             Ok(()) => eprintln!("session_start: snapshotted live SQLite database {}", database.display()),
             Err(error) => eprintln!("session_start: live SQLite database {} left shared: {error:#}", database.display()),
         }
     }
+    empty_session_databases(&overlay_plan, &discarded)?;
+    let browser_cache = target.join(".cache/google-chrome");
+    if browser_cache.is_dir() { overlay_plan.empty_dirs.push(browser_cache); }
     let marked = mark_browser_exits_clean(&overlay_plan, target);
     hide_browser_sessions(&mut overlay_plan, target);
     eprintln!("session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty", overlay_plan.empty_dirs.len());
