@@ -974,32 +974,156 @@ impl ClipboardBridge {
     }
 }
 
+const USAGE: &str = "usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --remote HOST /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --serve /tmp/kwin-mcp-<pid> [width height]";
+
 fn main() -> anyhow::Result<()> {
-    let mut argv = std::env::args().skip(1);
-    let session_dir = argv
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]"))?;
-    let session_path = std::path::PathBuf::from(&session_dir);
-    write_status(&session_path, "starting", "");
-    let result = run(session_dir, argv);
-    match &result {
-        Ok(()) => write_status(&session_path, "closed", "viewer exited: window closed or session ended"),
-        Err(error) => write_status(&session_path, "failed", &format!("{error:#}")),
+    let mut argv = std::env::args().skip(1).peekable();
+    match argv.peek().map(String::as_str) {
+        Some("--serve") => {
+            argv.next();
+            serve(argv)
+        }
+        Some("--remote") => {
+            argv.next();
+            run_remote(argv)
+        }
+        _ => {
+            let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+            let session_path = std::path::PathBuf::from(&session_dir);
+            write_status(&session_path, "starting", "");
+            let result = run(session_dir, argv);
+            match &result {
+                Ok(()) => write_status(&session_path, "closed", "viewer exited: window closed or session ended"),
+                Err(error) => write_status(&session_path, "failed", &format!("{error:#}")),
+            }
+            result
+        }
     }
-    result
+}
+
+// Virtual display size, passed by kwin-mcp at spawn. Defaults match the
+// server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
+fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u32)> {
+    let mut next = |default: u32, name: &str| -> anyhow::Result<u32> {
+        match argv.next() {
+            Some(v) => v.parse().map_err(|e| anyhow::anyhow!("{name} '{v}': {e}")),
+            None => Ok(default),
+        }
+    };
+    Ok((next(3840, "width")?, next(2160, "height")?))
+}
+
+// The link to a session's compositor: its fake_input, the PipeWire loop that
+// feeds the frame mailbox, and the dispatch thread that ends the viewer when
+// the screencast stream closes.
+struct SessionLink {
+    fake_input: OrgKdeKwinFakeInput,
+    conn: Connection,
+    _wl_dispatch: DispatchThread,
+    pw_quit: pipewire::channel::Sender<()>,
+    pw_thread: JoinHandle<()>,
+}
+
+impl SessionLink {
+    fn connect(
+        session_path: &std::path::Path,
+        virt: (u32, u32),
+        shutdown: &Shutdown,
+        mailbox: &FrameMailbox,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            session_path.join("wayland-0").exists(),
+            "wayland-0 socket missing in {} — is the session running?",
+            session_path.display()
+        );
+        let wayland_sock = UnixStream::connect(session_path.join("wayland-0"))?;
+        let conn = Connection::from_socket(wayland_sock)
+            .map_err(|e| anyhow::anyhow!("wayland connect: {e:?}"))?;
+        let mut event_queue = conn.new_event_queue::<WlState>();
+        let qh = event_queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+
+        let mut state = WlState {
+            output: None,
+            screencast: None,
+            fake_input: None,
+            stream: None,
+            node_id: None,
+            failed: None,
+            closed: false,
+            shutdown: shutdown.clone(),
+        };
+
+        event_queue.roundtrip(&mut state)?;
+
+        let output = state.output.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise wl_output"))?;
+        let screencast = state.screencast.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise zkde_screencast_unstable_v1"))?;
+        let fake_input = state.fake_input.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise org_kde_kwin_fake_input"))?;
+
+        // KWin silently drops input from unauthenticated fake_input clients — no
+        // error event, just nothing happens. Must be the first request on the
+        // proxy, before any pointer/button/key call.
+        fake_input.authenticate("kwin-viewer".into(), "live viewer input forwarding".into());
+
+        let stream = screencast.stream_output(&output, ScPointer::Embedded.into(), &qh, ());
+        state.stream = Some(stream);
+
+        // Drive the queue until the stream either succeeds or reports failure.
+        let node_id: u32 = loop {
+            event_queue.blocking_dispatch(&mut state)?;
+            if let Some(err) = state.failed.as_deref() {
+                anyhow::bail!("zkde_screencast stream failed: {err}");
+            }
+            if let Some(id) = state.node_id {
+                break id;
+            }
+        };
+        eprintln!("kwin-viewer: connected to pipewire node {node_id}");
+        write_status(session_path, "streaming", &format!("pipewire node {node_id}"));
+
+        // The pipewire loop runs on its own thread and is stopped through this
+        // channel, so main can join it instead of leaving it behind on exit.
+        let pipewire_sock = session_path.join("pipewire-0");
+        let (pw_quit, pw_quit_rx) = pipewire::channel::channel::<()>();
+        let pw_thread = {
+            let mailbox = Arc::clone(mailbox);
+            let shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name("pipewire".to_owned())
+                .spawn(move || {
+                    if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx) {
+                        eprintln!("kwin-viewer: pipewire loop exited: {e}");
+                    }
+                    // Losing the video feed ends the viewer the same way a dead
+                    // wayland connection does.
+                    shutdown.request();
+                })?
+        };
+
+        // The screencast connection keeps serving the queue that carries the
+        // stream's Closed and Failed events, and it stays the connection the
+        // fake_input requests are sent on. Moving the real state here, instead
+        // of dispatching a throwaway copy, is what lets a closed stream end the
+        // viewer.
+        let wl_dispatch = DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, shutdown)?;
+        let conn = wl_dispatch.connection().clone();
+        Ok(Self { fake_input, conn, _wl_dispatch: wl_dispatch, pw_quit, pw_thread })
+    }
+
+    // Stop the PipeWire loop and wait for it. The caller has already requested
+    // shutdown.
+    fn close(self) {
+        if self.pw_quit.send(()).is_err() {
+            eprintln!("kwin-viewer: pipewire loop already gone");
+        }
+        if self.pw_thread.join().is_err() {
+            eprintln!("kwin-viewer: pipewire thread panicked");
+        }
+    }
 }
 
 fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
-    // Virtual display size, passed by kwin-mcp at spawn. Defaults match the
-    // server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
-    let virt_w: u32 = match argv.next() {
-        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("width '{v}': {e}"))?,
-        None => 3840,
-    };
-    let virt_h: u32 = match argv.next() {
-        Some(v) => v.parse().map_err(|e| anyhow::anyhow!("height '{v}': {e}"))?,
-        None => 2160,
-    };
+    let virt = parse_size(&mut argv)?;
     let session_path = std::path::PathBuf::from(&session_dir);
     anyhow::ensure!(
         session_path.join("wayland-0").exists(),
@@ -1047,89 +1171,58 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         restore: None,
     };
 
-    let wayland_sock = UnixStream::connect(session_path.join("wayland-0"))?;
-    let conn = Connection::from_socket(wayland_sock)
-        .map_err(|e| anyhow::anyhow!("wayland connect: {e:?}"))?;
-    let mut event_queue = conn.new_event_queue::<WlState>();
-    let qh = event_queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-
-    let mut state = WlState {
-        output: None,
-        screencast: None,
-        fake_input: None,
-        stream: None,
-        node_id: None,
-        failed: None,
-        closed: false,
-        shutdown: shutdown.clone(),
-    };
-
-    event_queue.roundtrip(&mut state)?;
-
-    let output = state.output.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise wl_output"))?;
-    let screencast = state.screencast.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise zkde_screencast_unstable_v1"))?;
-    let fake_input = state.fake_input.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise org_kde_kwin_fake_input"))?;
-
-    // KWin silently drops input from unauthenticated fake_input clients — no
-    // error event, just nothing happens. Must be the first request on the
-    // proxy, before any pointer/button/key call.
-    fake_input.authenticate("kwin-viewer".into(), "live viewer input forwarding".into());
-    numlock.apply(&fake_input, &conn)?;
-
-    let stream = screencast.stream_output(&output, ScPointer::Embedded.into(), &qh, ());
-    state.stream = Some(stream);
-
-    // Drive the queue until the stream either succeeds or reports failure.
-    let node_id: u32 = loop {
-        event_queue.blocking_dispatch(&mut state)?;
-        if let Some(err) = state.failed.as_deref() {
-            anyhow::bail!("zkde_screencast stream failed: {err}");
-        }
-        if let Some(id) = state.node_id {
-            break id;
-        }
-    };
-    eprintln!("kwin-viewer: connected to pipewire node {node_id}");
-    write_status(&session_path, "streaming", &format!("pipewire node {node_id}"));
-
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
+    numlock.apply(&link.fake_input, &link.conn)?;
 
-    // The pipewire loop runs on its own thread and is stopped through this
-    // channel, so main can join it instead of leaving it behind on exit.
-    let pipewire_sock = session_path.join("pipewire-0");
-    let (pw_quit, pw_quit_rx) = pipewire::channel::channel::<()>();
-    let pw_thread = {
-        let mailbox = Arc::clone(&mailbox);
-        let shutdown = shutdown.clone();
-        std::thread::Builder::new()
-            .name("pipewire".to_owned())
-            .spawn(move || {
-                if let Err(e) = run_pipewire(
-                    pipewire_sock,
-                    node_id,
-                    mailbox,
-                    (virt_w, virt_h),
-                    pw_quit_rx,
-                ) {
-                    eprintln!("kwin-viewer: pipewire loop exited: {e}");
-                }
-                // Losing the video feed ends the viewer the same way a dead
-                // wayland connection does.
-                shutdown.request();
-            })?
+    let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
+    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
+    let mut input_state = InputState {
+        out: InputOut::Local(gate),
+        last_pos: None,
+        held_buttons: 0,
+        held_keys: HashSet::new(),
+        clipboard: Some(clipboard),
     };
 
-    // The screencast connection keeps serving the queue that carries the
-    // stream's Closed and Failed events, and it stays the connection the winit
-    // loop sends fake_input requests on. Moving the real state here, instead of
-    // dispatching a throwaway copy, is what lets a closed stream end the viewer.
-    let wl_dispatch =
-        DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, &shutdown)?;
-    let conn = wl_dispatch.connection();
+    let run_result = window_loop(
+        "kwin-viewer",
+        &mailbox,
+        &shutdown,
+        Some(&session_path),
+        virt,
+        &mut input_state,
+        Some((&numlock, &link.fake_input, &link.conn)),
+    );
 
+    // Ordered teardown, reached on every exit including a window error, which
+    // is why the run result is held instead of propagated straight away.
+    // Requesting shutdown lets every dispatch thread leave its poll within
+    // DISPATCH_POLL_INTERVAL; the pipewire loop is quit through its channel and
+    // joined here, and dropping the link and numlock joins the remaining
+    // threads and closes their sockets.
+    shutdown.request();
+    link.close();
+    if gate_thread.join().is_err() {
+        eprintln!("kwin-viewer: tool-gate thread panicked");
+    }
+    run_result
+}
+
+// The viewer window: shows the latest frame from the mailbox and forwards the
+// window's input through `input_state`. `status_dir` is where the local viewer
+// reports readiness; a remote viewer has none.
+fn window_loop(
+    title: &str,
+    mailbox: &FrameMailbox,
+    shutdown: &Shutdown,
+    status_dir: Option<&std::path::Path>,
+    virt: (u32, u32),
+    input_state: &mut InputState,
+    numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
+) -> anyhow::Result<()> {
     let window = WindowBuilder::default()
-        .window(|wa| wa.with_title("kwin-viewer").with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
+        .window(|wa| wa.with_title(title).with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -1137,19 +1230,9 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     // Starting as None so the first frame triggers allocation.
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
-
-    let gate = ToolGate::new(fake_input.clone(), conn.clone());
-    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
-    let mut input_state = InputState {
-        gate,
-        last_pos: None,
-        held_buttons: 0,
-        held_keys: HashSet::new(),
-        clipboard,
-    };
     let mut ready_reported = false;
 
-    let run_result = window.run(|mut frame| {
+    window.run(|mut frame| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
         if shutdown.requested() {
@@ -1158,15 +1241,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         }
 
         for event in frame.events {
-            forward_input(
-                event,
-                &fake_input,
-                conn,
-                (frame.width, frame.height),
-                (virt_w, virt_h),
-                &mut input_state,
-                &numlock,
-            );
+            forward_input(event, (frame.width, frame.height), virt, input_state, numlock);
         }
 
         // Consume the latest frame if one arrived; upload into src_image.
@@ -1214,7 +1289,9 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
             if !ready_reported {
                 ready_reported = true;
                 eprintln!("kwin-viewer: first frame presented");
-                write_status(&session_path, "ready", "host window is showing the session");
+                if let Some(dir) = status_dir {
+                    write_status(dir, "ready", "host window is showing the session");
+                }
             }
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
@@ -1226,26 +1303,176 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         // are arriving. Explicitly requesting a redraw each frame guarantees
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
-    });
+    })?;
+    Ok(())
+}
 
-    // Ordered teardown, reached on every exit including a window error, which
-    // is why the run result is held instead of propagated straight away.
-    // Requesting shutdown lets every dispatch thread leave its poll within
-    // DISPATCH_POLL_INTERVAL; the pipewire loop is quit through its channel and
-    // joined here, and dropping wl_dispatch and numlock joins the remaining
-    // threads and closes their sockets.
+// Wire format between `--serve` (on the host that runs the session) and
+// `--remote` (on the host with the screen), carried over one ssh stdio pipe.
+// Server to client: WIRE_FRAME, a u32 little-endian length, then a PNG of the
+// frame. Client to server: fixed 17-byte input records (see Op::encode).
+const WIRE_FRAME: u8 = 1;
+// Frames are sent at most this often; the mailbox keeps only the newest.
+const SERVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const SERVE_IDLE_POLL: Duration = Duration::from_millis(20);
+
+fn write_frame(out: &mut impl Write, frame: &Frame) -> anyhow::Result<()> {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, frame.width, frame.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::FilterType::Sub);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&frame.rgba)?;
+    }
+    out.write_all(&[WIRE_FRAME])?;
+    out.write_all(&u32::try_from(png_bytes.len())?.to_le_bytes())?;
+    out.write_all(&png_bytes)?;
+    out.flush()?;
+    Ok(())
+}
+
+// Read one frame; None when the stream ends.
+fn read_frame(input: &mut impl Read) -> anyhow::Result<Option<Frame>> {
+    let mut head = [0u8; 5];
+    match input.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    anyhow::ensure!(head[0] == WIRE_FRAME, "unknown message type {}", head[0]);
+    let length = usize::try_from(u32::from_le_bytes([head[1], head[2], head[3], head[4]]))?;
+    anyhow::ensure!(length <= 64 << 20, "frame of {length} bytes is too large");
+    let mut payload = vec![0u8; length];
+    input.read_exact(&mut payload)?;
+    let mut reader = png::Decoder::new(Cursor::new(payload)).read_info()?;
+    let mut rgba = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut rgba)?;
+    rgba.truncate(info.buffer_size());
+    Ok(Some(Frame { width: info.width, height: info.height, rgba }))
+}
+
+// Run on the host that owns the session: no window. Streams the session's
+// frames to stdout and applies the input records read from stdin, through the
+// same tool-call gate a local viewer uses.
+fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let virt = parse_size(&mut argv)?;
+    let session_path = std::path::PathBuf::from(&session_dir);
+    write_status(&session_path, "starting", "remote viewer");
+    pipewire::init();
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
+    let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
+    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
+
+    // Input records come in until the client's ssh pipe closes. The thread
+    // blocks in read, so it is left to end with the process.
+    {
+        let (gate, shutdown) = (gate.clone(), shutdown.clone());
+        std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            while let Ok(Some(op)) = Op::decode(&mut stdin) {
+                gate.send(op);
+            }
+            shutdown.request();
+        })?;
+    }
+
+    write_status(&session_path, "ready", "remote viewer is streaming");
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut result = Ok(());
+    while !shutdown.requested() {
+        let latest = mailbox.lock().ok().and_then(|mut g| g.take());
+        match latest {
+            Some(frame) => {
+                if let Err(error) = write_frame(&mut stdout, &frame) {
+                    result = Err(error);
+                    break;
+                }
+                std::thread::sleep(SERVE_FRAME_INTERVAL);
+            }
+            None => std::thread::sleep(SERVE_IDLE_POLL),
+        }
+    }
     shutdown.request();
-    if pw_quit.send(()).is_err() {
-        eprintln!("kwin-viewer: pipewire loop already gone");
-    }
-    if pw_thread.join().is_err() {
-        eprintln!("kwin-viewer: pipewire thread panicked");
-    }
+    link.close();
     if gate_thread.join().is_err() {
         eprintln!("kwin-viewer: tool-gate thread panicked");
     }
-    run_result?;
-    Ok(())
+    write_status(&session_path, "closed", "remote viewer disconnected");
+    result
+}
+
+// Run on the host with the screen: opens the window and starts `--serve` on
+// HOST over ssh. The session keeps running where it is.
+fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let host = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let virt = parse_size(&mut argv)?;
+    let plain = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "-_./@:".contains(c));
+    anyhow::ensure!(plain(&host) && plain(&session_dir), "host and session directory must be plain names");
+    let remote_bin = std::env::var("KWIN_VIEWER_REMOTE_BIN")
+        .ok()
+        .or_else(|| std::env::current_exe().ok().map(|path| path.display().to_string()))
+        .ok_or_else(|| anyhow::anyhow!("cannot locate the remote kwin-viewer; set KWIN_VIEWER_REMOTE_BIN"))?;
+    anyhow::ensure!(plain(&remote_bin), "remote kwin-viewer path must be a plain name");
+    let mut child = std::process::Command::new("ssh")
+        .args(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
+        .arg(&host)
+        .arg(&remote_bin)
+        .args(["--serve", &session_dir, &virt.0.to_string(), &virt.1.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+    let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("ssh stdin missing"))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("ssh stdout missing"))?;
+
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let reader = {
+        let (mailbox, shutdown) = (Arc::clone(&mailbox), shutdown.clone());
+        std::thread::Builder::new().name("remote-frames".to_owned()).spawn(move || {
+            loop {
+                match read_frame(&mut stdout) {
+                    Ok(Some(frame)) => {
+                        if let Ok(mut slot) = mailbox.lock() {
+                            *slot = Some(frame);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("kwin-viewer: remote stream ended: {error:#}");
+                        break;
+                    }
+                }
+            }
+            shutdown.request();
+        })?
+    };
+
+    let mut input_state = InputState {
+        out: InputOut::Remote(Arc::new(Mutex::new(stdin))),
+        last_pos: None,
+        held_buttons: 0,
+        held_keys: HashSet::new(),
+        clipboard: None,
+    };
+    let title = format!("kwin-viewer ({host})");
+    let result = window_loop(&title, &mailbox, &shutdown, None, virt, &mut input_state, None);
+    shutdown.request();
+    // Closing the pipe ends `--serve` on the far side; ssh then exits.
+    drop(input_state);
+    let _ = child.kill();
+    let _ = child.wait();
+    if reader.join().is_err() {
+        eprintln!("kwin-viewer: remote frame thread panicked");
+    }
+    result
 }
 
 // FIFO in the session dir the server writes tool-call starts ("B") and ends
@@ -1268,6 +1495,46 @@ enum Op {
 }
 
 impl Op {
+    // One input record on the remote pipe: a tag and two 8-byte little-endian
+    // words (coordinates as f64 bits, codes and states as u64).
+    fn encode(self) -> [u8; 17] {
+        let (tag, a, b) = match self {
+            Op::Motion(x, y) => (1u8, x.to_bits(), y.to_bits()),
+            Op::Button(code, state) => (2, u64::from(code), u64::from(state)),
+            Op::Axis(axis, value) => (3, u64::from(axis), value.to_bits()),
+            Op::Key(code, state) => (4, u64::from(code), u64::from(state)),
+        };
+        let mut record = [0u8; 17];
+        record[0] = tag;
+        record[1..9].copy_from_slice(&a.to_le_bytes());
+        record[9..17].copy_from_slice(&b.to_le_bytes());
+        record
+    }
+
+    // Read one record; None when the pipe closed or the record is not valid.
+    fn decode(input: &mut impl Read) -> std::io::Result<Option<Op>> {
+        let mut record = [0u8; 17];
+        match input.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let word = |at: usize| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&record[at..at + 8]);
+            u64::from_le_bytes(bytes)
+        };
+        let (a, b) = (word(1), word(9));
+        let narrow = |value: u64| u32::try_from(value).ok();
+        Ok(match record[0] {
+            1 => Some(Op::Motion(f64::from_bits(a), f64::from_bits(b))),
+            2 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Button(code, state)),
+            3 => narrow(a).map(|axis| Op::Axis(axis, f64::from_bits(b))),
+            4 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Key(code, state)),
+            _ => None,
+        })
+    }
+
     // A release of a key or button whose press already reached the session.
     fn releases(self, down: &HashSet<(bool, u32)>) -> bool {
         match self {
@@ -1440,8 +1707,29 @@ impl ToolGate {
     }
 }
 
+// Where forwarded input goes: the local tool gate, or the ssh pipe to a `--serve`
+// on the host that owns the session (whose own gate then applies).
+enum InputOut {
+    Local(ToolGate),
+    Remote(Arc<Mutex<std::process::ChildStdin>>),
+}
+
+impl InputOut {
+    fn send(&self, op: Op) {
+        match self {
+            InputOut::Local(gate) => gate.send(op),
+            InputOut::Remote(pipe) => {
+                let Ok(mut pipe) = pipe.lock() else { return };
+                if pipe.write_all(&op.encode()).and_then(|()| pipe.flush()).is_err() {
+                    eprintln!("kwin-viewer: remote input pipe closed");
+                }
+            }
+        }
+    }
+}
+
 struct InputState {
-    gate: ToolGate,
+    out: InputOut,
     // Last cursor position in window pixel coords, updated on every
     // CursorMoved regardless of whether the move is forwarded. Needed so a
     // fresh click can snap the container's cursor to the click position
@@ -1456,7 +1744,9 @@ struct InputState {
     // stuck inside the container, and every subsequent letter the user
     // types arrives shifted — looks exactly like "I cant type."
     held_keys: HashSet<u32>,
-    clipboard: ClipboardBridge,
+    // Copy/paste handoff between the host and the session clipboards; a remote
+    // viewer has none yet.
+    clipboard: Option<ClipboardBridge>,
 }
 
 fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {
@@ -1469,15 +1759,14 @@ fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u3
 
 fn forward_input(
     event: &Event<()>,
-    fake_input: &OrgKdeKwinFakeInput,
-    conn: &Connection,
     window_size: (u32, u32),
     virt: (u32, u32),
     state: &mut InputState,
-    numlock: &NumLockSync,
+    numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
 ) {
     let Event::WindowEvent { event, .. } = event else { return };
     if let WindowEvent::Focused(true) = event
+        && let Some((numlock, fake_input, conn)) = numlock
         && let Err(error) = numlock.apply(fake_input, conn)
     {
         eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
@@ -1487,7 +1776,7 @@ fn forward_input(
         // event we may not see — release them all so no modifier stays
         // stuck inside the container while the user is elsewhere on host.
         for &code in &state.held_keys {
-            state.gate.send(Op::Key(code, 0));
+            state.out.send(Op::Key(code, 0));
         }
         if !state.held_keys.is_empty() {
             eprintln!(
@@ -1508,7 +1797,7 @@ fn forward_input(
             if let Some((x, y)) =
                 map_window_to_virtual((position.x, position.y), window_size.0, window_size.1, virt)
             {
-                state.gate.send(Op::Motion(x, y));
+                state.out.send(Op::Motion(x, y));
             }
         }
         WindowEvent::MouseInput { state: btn_state, button, .. } => {
@@ -1527,21 +1816,21 @@ fn forward_input(
                     && let Some((x, y)) =
                         map_window_to_virtual(pos, window_size.0, window_size.1, virt)
                 {
-                    state.gate.send(Op::Motion(x, y));
+                    state.out.send(Op::Motion(x, y));
                 }
                 state.held_buttons = state.held_buttons.saturating_add(1);
             } else {
                 state.held_buttons = state.held_buttons.saturating_sub(1);
             }
-            state.gate.send(Op::Button(code, if pressed { 1 } else { 0 }));
+            state.out.send(Op::Button(code, if pressed { 1 } else { 0 }));
         }
         WindowEvent::MouseWheel { delta, .. } => {
             let (dx, dy) = match delta {
                 MouseScrollDelta::LineDelta(x, y) => (f64::from(*x) * 15.0, f64::from(*y) * 15.0),
                 MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
             };
-            if dy != 0.0 { state.gate.send(Op::Axis(AXIS_VERTICAL, -dy)); }
-            if dx != 0.0 { state.gate.send(Op::Axis(AXIS_HORIZONTAL, -dx)); }
+            if dy != 0.0 { state.out.send(Op::Axis(AXIS_VERTICAL, -dy)); }
+            if dx != 0.0 { state.out.send(Op::Axis(AXIS_HORIZONTAL, -dx)); }
         }
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
@@ -1551,14 +1840,15 @@ fn forward_input(
                 state.held_keys.insert(evdev);
                 if !key.repeat
                     && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
-                    && let Err(error) = state.clipboard.before(chord)
+                    && let Some(bridge) = state.clipboard.as_mut()
+                    && let Err(error) = bridge.before(chord)
                 {
                     eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
                 }
             } else {
                 state.held_keys.remove(&evdev);
             }
-            state.gate.send(Op::Key(evdev, if pressed { 1 } else { 0 }));
+            state.out.send(Op::Key(evdev, if pressed { 1 } else { 0 }));
         }
         _ => {}
     }
@@ -1801,5 +2091,55 @@ fn convert_to_rgba(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn same(a: Op, b: Op) -> bool {
+        a.encode() == b.encode()
+    }
+
+    #[test]
+    fn input_records_round_trip() -> std::io::Result<()> {
+        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0)];
+        let bytes: Vec<u8> = ops.iter().flat_map(|op| op.encode()).collect();
+        let mut input = Cursor::new(bytes);
+        for op in ops {
+            let decoded = Op::decode(&mut input)?.ok_or(std::io::ErrorKind::InvalidData)?;
+            assert!(same(op, decoded));
+        }
+        assert!(Op::decode(&mut input)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_or_out_of_range_records_end_the_stream() -> std::io::Result<()> {
+        let mut record = Op::Key(30, 1).encode();
+        record[0] = 99;
+        assert!(Op::decode(&mut Cursor::new(record))?.is_none());
+        let mut record = Op::Key(30, 1).encode();
+        record[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Op::decode(&mut Cursor::new(record))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn frames_keep_their_pixels_across_the_wire() -> anyhow::Result<()> {
+        let rgba: Vec<u8> = (0..4 * 6 * 3).map(|i| u8::try_from(i * 7 % 256).unwrap_or(0)).collect();
+        let frame = Frame { width: 6, height: 3, rgba: rgba.clone() };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &frame)?;
+        write_frame(&mut wire, &frame)?;
+        let mut input = Cursor::new(wire);
+        for _ in 0..2 {
+            let got = read_frame(&mut input)?.ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
+            assert_eq!((got.width, got.height), (6, 3));
+            assert_eq!(got.rgba, rgba);
+        }
+        assert!(read_frame(&mut input)?.is_none());
+        Ok(())
     }
 }

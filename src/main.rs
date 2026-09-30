@@ -2631,7 +2631,19 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
     };
     let (runtime, display) = match host_wayland().await {
         Ok(found) => found,
-        Err(error) => return Err(note(&mut log_file, format!("host Wayland resolution failed: {error:#}"))),
+        Err(error) => {
+            // No desktop here (a headless host): the session can still be shown
+            // on another machine's screen. The command runs there, and starts
+            // `kwin-viewer --serve` on this host over ssh.
+            let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+            let remote = format!(
+                "run on the machine with the screen: KWIN_VIEWER_REMOTE_BIN={bin} {bin} --remote {host} {dir} {width} {height}",
+                bin = bin.display(),
+                host = host.trim(),
+                dir = host_xdg_dir.display(),
+            );
+            return Err(note(&mut log_file, format!("host Wayland resolution failed: {error:#}; {remote}")));
+        }
     };
     let mut command = std::process::Command::new(&bin);
     command.arg(host_xdg_dir)
@@ -4312,7 +4324,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Reuses an already open viewer. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. Works even when the server runs with --no-viewer."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Reuses an already open viewer. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
     )]
     async fn viewer_open(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
