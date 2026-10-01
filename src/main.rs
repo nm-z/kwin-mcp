@@ -719,6 +719,13 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 
+/// Entries of the host user runtime directory that a session must never reach:
+/// the host session D-Bus (and with it the Secret Service and KWallet),
+/// gnome-keyring's control and PKCS#11 sockets, and p11-kit's. Sockets from
+/// them are never exposed, and the parent bind that carries sibling sockets
+/// masks them.
+const HOST_SECRET_ENTRIES: &[&str] = &["bus", "keyring", "p11-kit"];
+
 fn mount_descendants(mounts: &[procfs::process::MountInfo], path: &Path) -> Vec<PathBuf> {
     let mut descendants: Vec<PathBuf> = mounts.iter()
         .filter(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
@@ -744,6 +751,9 @@ struct OverlayPlan {
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>, socket_links: SocketLinks,
+    /// The host user runtime directory, when sockets from it are exposed. Its
+    /// secret-bearing entries (HOST_SECRET_ENTRIES) are masked in the session.
+    host_runtime: Option<PathBuf>,
     /// Directories the session sees as empty tmpfs; the host copies stay hidden.
     empty_dirs: Vec<PathBuf>,
 }
@@ -787,7 +797,17 @@ impl OverlayPlan {
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
-            command.arg("--dir").arg(&destination).arg("--ro-bind").arg(source).arg(destination);
+            command.arg("--dir").arg(&destination).arg("--ro-bind").arg(source).arg(&destination);
+            if self.host_runtime.as_ref().is_some_and(|runtime| runtime == source) {
+                for name in HOST_SECRET_ENTRIES {
+                    let Ok(metadata) = std::fs::symlink_metadata(source.join(name)) else { continue };
+                    if metadata.is_dir() {
+                        command.arg("--tmpfs").arg(destination.join(name));
+                    } else {
+                        command.arg("--ro-bind").arg("/dev/null").arg(destination.join(name));
+                    }
+                }
+            }
         }
     }
 
@@ -802,6 +822,7 @@ impl OverlayPlan {
         let canonical_runtime = std::fs::canonicalize(host_runtime)?;
         let current_uid = procfs::process::Process::myself()?.uid()?;
         let graphical_inodes = graphical_socket_inodes()?;
+        self.host_runtime = Some(canonical_runtime.clone());
         let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?.into_iter().filter_map(|entry| {
             if entry.state != procfs::net::UnixState::UNCONNECTED { return None; }
             let path = entry.path?; let parent = std::fs::canonicalize(path.parent()?).ok()?;
@@ -810,7 +831,9 @@ impl OverlayPlan {
                 || graphical_inodes.contains(&entry.inode) { return None; }
             if path.starts_with(target) && parent.starts_with(&canonical_target) {
                 Some((path.clone(), parent, path))
-            } else if path.starts_with(host_runtime) && parent.starts_with(&canonical_runtime) {
+            } else if path.starts_with(host_runtime) && parent.starts_with(&canonical_runtime)
+                && !path.strip_prefix(host_runtime).ok().and_then(|relative| relative.components().next())
+                    .is_some_and(|first| HOST_SECRET_ENTRIES.iter().any(|name| first.as_os_str() == std::ffi::OsStr::new(name))) {
                 Some((path.clone(), parent, isolated_runtime.join(path.strip_prefix(host_runtime).ok()?)))
             } else {
                 None
@@ -980,7 +1003,7 @@ fn prepare_overlay_plan(
         std::fs::create_dir_all(&work)?;
         let overlay = OverlayMount { lower: target.to_path_buf(), upper, work, destination: target.to_path_buf() };
         return Ok(OverlayPlan { staging_root: None, overlays: vec![overlay], read_only_binds: Vec::new(),
-            socket_binds: Vec::new(), socket_links: SocketLinks::default(), empty_dirs: Vec::new() });
+            socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new() });
     }
 
     let staging_root = session_tmp.join("overlay-root");
@@ -1017,7 +1040,7 @@ fn prepare_overlay_plan(
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
-        socket_binds: Vec::new(), socket_links: SocketLinks::default(), empty_dirs: Vec::new(),
+        socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new(),
     })
 }
 
@@ -1307,6 +1330,10 @@ struct Session {
     last_input: Option<std::time::Instant>,
     /// Mediator between session apps and the host KWallet.
     wallet: Option<wallet_mediator::WalletMediator>,
+    /// Why the session has no wallet (host wallet unavailable, locked, ...), or
+    /// None when the session-local wallet holds the host copy. launch_app tells
+    /// the agent when a browser starts without it.
+    wallet_note: Option<String>,
     /// Whether the sandbox has the FUSE bridge; without it launch_app runs
     /// AppImages in extract-and-run mode.
     fuse_enabled: bool,
@@ -2061,8 +2088,8 @@ impl WorkdirOwnership {
 }
 
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests. Host KWallet handles the
-/// session opened are released first, while the host bus is still reachable.
+/// async workers that answer other MCP requests. The session-local wallet is
+/// dropped first; nothing on the host is touched.
 async fn teardown_blocking(mut sess: Session) {
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
@@ -2423,6 +2450,17 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
 /// environment reaches every simple command in the expression.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Whether `command` starts a Chromium-family browser (leading VAR=value words
+/// skipped); editors built on Electron do not count.
+fn launches_chromium(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .find(|word| !word.contains('='))
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| BROWSER_COMMANDS.contains(&name) && !matches!(name, "code" | "codium" | "vscodium" | "electron"))
 }
 
 const BROWSER_COMMANDS: &[&str] = &[
@@ -3838,9 +3876,9 @@ impl KwinMcp {
             Ok(address) => address,
             Err(error) => return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup),
         };
-        // Session apps reach KWallet through a mediator on a private bus (see
-        // wallet_mediator): it fails closed on an unhealthy host wallet and
-        // releases every host handle the session opens.
+        // Session apps reach KWallet through a session-local service on a private
+        // bus (see wallet_mediator): a one-time guarded snapshot of the host
+        // wallet, then answers from memory; the host is never contacted again.
         self.set_start_stage("starting the KWallet mediator");
         let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
         let wallet_bus_config = host_xdg_dir.join("kwallet-bus.conf");
@@ -3873,25 +3911,25 @@ impl KwinMcp {
             Ok(builder) => builder.build().await,
             Err(error) => Err(error),
         };
-        let (wallet_preflight, wallet) = match host_bus {
-            Ok(host_bus) => {
-                let preflight = wallet_mediator::preflight(&host_bus).await;
-                eprintln!("session_start: KWallet: {}", preflight.reason);
-                match wallet_mediator::WalletMediator::start(&wallet_bus_address, host_bus, preflight.wallet.clone()).await {
-                    Ok(mediator) => (preflight, mediator),
-                    Err(error) => return cleanup_err(format!("KWallet mediator: {error}"), &mut startup),
-                }
-            }
-            Err(error) => return cleanup_err(format!("host session bus: {error}"), &mut startup),
+        // The one and only host contact: a guarded read-only snapshot. The
+        // session is then served from memory and never reaches the host wallet.
+        let wallet_snapshot = match host_bus {
+            Ok(host_bus) => wallet_mediator::snapshot(&host_bus).await,
+            Err(error) => wallet_mediator::Snapshot { wallet: None, reason: format!("host session bus unavailable: {error}") },
+        };
+        eprintln!("session_start: KWallet: {}", wallet_snapshot.reason);
+        let wallet = match wallet_mediator::WalletMediator::start(&wallet_bus_address, wallet_snapshot.wallet.clone()).await {
+            Ok(mediator) => mediator,
+            Err(error) => return cleanup_err(format!("KWallet service: {error}"), &mut startup),
         };
         let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
         match spawn_dbus_proxy(
             &wallet_bus_address,
             &service_proxy_socket,
             &[
-                // Upstream is the KWallet mediator's private bus, which does
-                // the real filtering (wallet_mediator); these rules only keep
-                // the session to KWallet calls on that bus.
+                // Upstream is the session-local wallet service on a private bus
+                // (wallet_mediator); these rules keep the session to KWallet
+                // calls on that bus.
                 "--see=org.kde.kwalletd6",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Introspectable.Introspect@/*",
                 "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.GetMachineId@/*",
@@ -3920,6 +3958,12 @@ impl KwinMcp {
                 "--call=org.kde.kwalletd6=org.kde.KWallet.passwordList@/modules/kwalletd6",
                 "--call=org.kde.kwalletd6=org.kde.KWallet.users@/modules/kwalletd6",
                 "--call=org.kde.kwalletd6=org.kde.KWallet.close@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.createFolder@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.removeFolder@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.writePassword@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.writeEntry@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.writeMap@/modules/kwalletd6",
+                "--call=org.kde.kwalletd6=org.kde.KWallet.removeEntry@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
                 "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
             ],
@@ -4304,6 +4348,7 @@ impl KwinMcp {
             last_input: None,
             fuse_enabled: fuse.is_some(),
             wallet: Some(wallet),
+            wallet_note: wallet_snapshot.wallet.is_none().then(|| wallet_snapshot.reason.clone()),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -4316,8 +4361,9 @@ impl KwinMcp {
             "height": screen_h,
             "viewer": viewer,
             "wallet": {
-                "forwarding": wallet_preflight.wallet.is_some(),
-                "reason": wallet_preflight.reason,
+                "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
+                "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
+                "reason": wallet_snapshot.reason,
             },
         })).await)
     }
@@ -5496,7 +5542,7 @@ impl KwinMcp {
         use futures::StreamExt;
 
         // Record current active window ID before launching
-        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port, fuse_enabled) = {
+        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port, fuse_enabled, wallet_note) = {
             let guard = self.session.lock().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -5509,6 +5555,7 @@ impl KwinMcp {
                 sess.atspi_bus_address.clone(),
                 sess.cdp_forward_port,
                 sess.fuse_enabled,
+                sess.wallet_note.clone(),
             )
         };
         let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
@@ -5572,14 +5619,20 @@ impl KwinMcp {
             }
         }
 
+        // A Chromium-family browser without the wallet cannot decrypt the copied
+        // profile's cookies and saved logins, so its sites show signed out.
+        let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
+            format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
+        });
+        let suffix = warning.as_deref().map(|text| format!(". {text}")).unwrap_or_default();
         match win_geo {
-            Some(geo) => Ok(structured_result(&peer, format!("launched: {} window: {}", params.command, geo.id), serde_json::json!({
+            Some(geo) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
                 "action": "launch", "command": params.command, "window": geo.id,
-                "cdp": cdp_connected,
+                "cdp": cdp_connected, "warning": warning,
             })).await),
-            None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s)", params.command), serde_json::json!({
+            None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s){suffix}", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
-                "cdp": false,
+                "cdp": false, "warning": warning,
             })).await),
         }
     }
@@ -5686,6 +5739,14 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
     Ok(Some((address, prefix)))
 }
 
+/// Descriptor limit (soft:hard) for every process in a session. A scope cannot
+/// carry rlimits, so prlimit applies it to pasta, which the whole tree inherits.
+const SESSION_NOFILE: &str = "--nofile=1024:65536";
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
 /// Start the pasta and bwrap tree in a bounded systemd user scope.
 /// Refuse startup when the scope is unavailable instead of running uncapped.
 fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, String> {
@@ -5716,7 +5777,15 @@ fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, Stri
         .arg(format!("MemoryMax={}", config.memory_max))
         .arg("-p")
         .arg(format!("MemorySwapMax={}", config.memory_swap_max))
-        .args(["--", "pasta"]);
+        .arg("--");
+    // Per process: a runaway session process hits EMFILE at 65536 descriptors
+    // instead of the host's 524288; the soft limit keeps the user default.
+    if on_path("prlimit") {
+        command.args(["prlimit", SESSION_NOFILE]);
+    } else {
+        eprintln!("session_start: prlimit not found; the session keeps the default descriptor limit");
+    }
+    command.arg("pasta");
     Ok(command)
 }
 
@@ -6066,5 +6135,19 @@ mod capture_pipe_tests {
         assert_eq!(other_task.await?, "responsive");
         drop(writer);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_warning_tests {
+    use super::launches_chromium;
+
+    #[test]
+    fn chromium_family_commands_are_recognized() {
+        assert!(launches_chromium("google-chrome-stable --test-type https://claude.ai"));
+        assert!(launches_chromium("FOO=1 /usr/bin/chromium --app=file:///x"));
+        assert!(!launches_chromium("code ."));
+        assert!(!launches_chromium("kate notes.txt"));
+        assert!(!launches_chromium(""));
     }
 }
