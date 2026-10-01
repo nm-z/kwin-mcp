@@ -1,20 +1,71 @@
-fn main() {
-    let hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+use std::path::{Path, PathBuf};
+
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
+}
+
+fn watch(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn watch_git_identity() {
+    if Path::new(".git").is_file() {
+        watch(Path::new(".git"));
+    }
+    if let Some(path) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        let path = Path::new(&path);
+        if path.exists() {
+            watch(path);
+        }
+    }
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git(&["rev-parse", "--git-path", &reference])
+    {
+        let mut path = PathBuf::from(path);
+        if !path.exists()
+            && let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"])
+            && Path::new(&packed).exists()
+        {
+            watch(Path::new(&packed));
+        }
+        while !path.exists() {
+            if !path.pop() {
+                return;
+            }
+        }
+        watch(&path);
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    for path in ["build.rs", "Cargo.toml", "Cargo.lock", "src"] {
+        watch(Path::new(path));
+    }
+    watch_git_identity();
+    println!("cargo:rerun-if-env-changed=KWIN_MCP_BUILD_NUMBER");
+    let hash = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
 
     let build_file = ".build_number";
-    let n: u32 = std::fs::read_to_string(build_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = std::fs::write(build_file, n.to_string());
+    let n = match std::env::var("KWIN_MCP_BUILD_NUMBER") {
+        Ok(value) => value.parse::<u32>()?,
+        Err(std::env::VarError::NotPresent) => {
+            let previous: u32 = std::fs::read_to_string(build_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            let next = previous.checked_add(1).ok_or("build number overflow")?;
+            std::fs::write(build_file, next.to_string())?;
+            next
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     println!("cargo:rustc-env=GIT_HASH={hash}");
     println!("cargo:rustc-env=BUILD_NUMBER={n}");
@@ -35,6 +86,5 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={svg_path}");
 
-    // Run build.rs every build so GIT_HASH and BUILD_NUMBER are always fresh.
-    println!("cargo:rerun-if-changed=NONEXISTENT_FILE_FORCE_RERUN");
+    Ok(())
 }
