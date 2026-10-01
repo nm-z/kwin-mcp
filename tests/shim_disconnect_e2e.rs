@@ -5,7 +5,7 @@ use nix::unistd::Pid;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::error::Error;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
@@ -23,11 +23,15 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const POLL_PAUSE: Duration = Duration::from_millis(20);
 const POST_EXIT_OBSERVE: Duration = Duration::from_secs(4);
 const PROOF_INTERVAL: Duration = Duration::from_millis(500);
+const TTL_WAIT: Duration = Duration::from_secs(90);
+const TTL_POLL_PAUSE: Duration = Duration::from_millis(500);
+const TTL_MINUTES: &str = "1";
 const FIXTURE_HOME: &str = "KWIN_MCP_DISCONNECT_FIXTURE_HOME";
 const PROOF_DIR_ENV: &str = "KWIN_MCP_PROOF_DIR";
 const LIVE_SOCKET_ROOT: &str = "/tmp";
 const SERVER_INVOCATIONS: &str = "server-invocations.log";
 const RESISTANT_PID: &str = "term-resistant.pid";
+const TTL_RECEIPTS: &str = "ttl-receipts.jsonl";
 
 struct PrivateHome(PathBuf, PathBuf);
 
@@ -67,6 +71,7 @@ impl PrivateHome {
             "startup-response.json",
             SERVER_INVOCATIONS,
             RESISTANT_PID,
+            TTL_RECEIPTS,
         ] {
             copy_diagnostic(&self.0.join(name), &proof.join(name))?;
         }
@@ -114,12 +119,14 @@ fn copy_diagnostic(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
-fn shim_command(home: &Path) -> Command {
-    let binary = std::env::var_os("KWIN_MCP_E2E_SHIM")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_kwin-mcp-shim").into());
-    let mut command = Command::new(binary);
+fn shim_binary() -> PathBuf {
+    std::env::var_os("KWIN_MCP_E2E_SHIM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp-shim")))
+}
+
+fn configure_private_home(command: &mut Command, home: &Path) {
     command
-        .args(["--autoclean", "--no-viewer"])
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -130,7 +137,14 @@ fn shim_command(home: &Path) -> Command {
         // temporary root independently of the isolated CLI sweep fixture.
         .env("TMPDIR", LIVE_SOCKET_ROOT)
         .env("KWIN_MCP_REPO", home.join("no-repository"))
+        .env_remove("KWIN_MCP_RETIRE_ON_TTL")
         .env_remove("KWIN_MCP_SHIM_RESUME");
+}
+
+fn shim_command(home: &Path) -> Command {
+    let mut command = Command::new(shim_binary());
+    command.args(["--autoclean", "--no-viewer"]);
+    configure_private_home(&mut command, home);
     if let Some(binary) = std::env::var_os("KWIN_MCP_E2E_SERVER") {
         command.env("KWIN_MCP_BINARY", binary);
     }
@@ -356,13 +370,22 @@ struct Connection {
     output: Option<ChildStdout>,
     buffered: Vec<u8>,
     shim: i32,
+    endpoint: Endpoint,
     home: PrivateHome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Endpoint {
+    Shim,
+    StandaloneServer,
+}
+
 struct HeadlessSession {
+    session_id: Option<String>,
     server: OwnedProcess,
     workdir: PathBuf,
     disk: PathBuf,
+    ttl_expirations_before: usize,
 }
 
 fn assert_absent(path: &Path) -> TestResult {
@@ -403,6 +426,39 @@ impl Connection {
             );
             command.env("KWIN_MCP_BINARY", recording_server(&home.0)?);
         }
+        Self::connect(home, command, launcher, Endpoint::Shim)
+    }
+
+    fn start_ttl(endpoint: Endpoint) -> TestResult<Self> {
+        assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+        for name in ["KWIN_MCP_E2E_SHIM", "KWIN_MCP_E2E_SERVER", PROOF_DIR_ENV] {
+            assert!(
+                std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+                "TTL proof requires {name}"
+            );
+        }
+        let home = PrivateHome::create()?;
+        let mut command = match endpoint {
+            Endpoint::Shim => shim_command(&home.0),
+            Endpoint::StandaloneServer => {
+                let mut command = Command::new(real_server_binary());
+                command.args(["--autoclean", "--no-viewer"]);
+                configure_private_home(&mut command, &home.0);
+                command
+            }
+        };
+        command.args(["--ttl", TTL_MINUTES]);
+        let connection = Self::connect(home, command, false, endpoint)?;
+        connection.record_ttl_receipt("initialized", None, json!({}))?;
+        Ok(connection)
+    }
+
+    fn connect(
+        home: PrivateHome,
+        mut command: Command,
+        launcher: bool,
+        endpoint: Endpoint,
+    ) -> TestResult<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -416,6 +472,7 @@ impl Connection {
             input,
             output,
             buffered: Vec::new(),
+            endpoint,
             home,
         };
         if launcher {
@@ -450,6 +507,7 @@ impl Connection {
     }
 
     fn start_headless(&mut self) -> TestResult<HeadlessSession> {
+        let ttl_expirations_before = self.ttl_expirations();
         let started = self.rpc(
             2,
             "tools/call",
@@ -464,11 +522,15 @@ impl Connection {
         let session = &started["result"]["structuredContent"];
         assert_eq!(session["status"], "started", "{started}");
         assert_eq!(session["viewer"]["state"], "closed", "{started}");
-        let pid: i32 = session["session_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix('s'))
-            .ok_or_else(|| io::Error::other("session_start returned no shim session_id"))?
-            .parse()?;
+        let session_id = session["session_id"].as_str().map(str::to_owned);
+        let pid: i32 = match self.endpoint {
+            Endpoint::Shim => session_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix('s'))
+                .ok_or_else(|| io::Error::other("session_start returned no shim session_id"))?
+                .parse()?,
+            Endpoint::StandaloneServer => self.processes.root,
+        };
         let server = self
             .processes
             .owned
@@ -478,8 +540,10 @@ impl Connection {
         let stat = server
             .stat()
             .ok_or_else(|| io::Error::other("owned server exited during session_start"))?;
-        assert_eq!(stat.ppid, self.shim, "shim directly owns the real server");
-        assert_eq!(stat.session, pid, "server owns its process session");
+        if self.endpoint == Endpoint::Shim {
+            assert_eq!(stat.ppid, self.shim, "shim directly owns the real server");
+            assert_eq!(stat.session, pid, "server owns its process session");
+        }
         assert!(
             self.processes
                 .owned
@@ -502,13 +566,169 @@ impl Connection {
             .0
             .join(".cache/kwin-mcp")
             .join(format!("kwin-mcp-{pid}"));
-        assert!(workdir.is_dir(), "socket workdir exists before disconnect");
-        assert!(disk.is_dir(), "overlay directory exists before disconnect");
+        assert!(workdir.is_dir(), "socket workdir exists after startup");
+        assert!(disk.is_dir(), "overlay directory exists after startup");
         Ok(HeadlessSession {
+            session_id,
             server,
             workdir,
             disk,
+            ttl_expirations_before,
         })
+    }
+
+    fn ttl_expirations(&self) -> usize {
+        self.log()
+            .lines()
+            .filter(|line| line.starts_with("ttl: session idle"))
+            .count()
+    }
+
+    fn record_ttl_receipt(
+        &self,
+        event: &str,
+        session: Option<&HeadlessSession>,
+        details: Value,
+    ) -> TestResult {
+        let session = session.map(|session| {
+            json!({
+                "session_id": session.session_id,
+                "server_pid": session.server.pid,
+                "server_starttime": session.server.starttime,
+                "server_state": session.server.stat().map(|stat| stat.state.to_string()),
+                "workdir": session.workdir,
+                "workdir_exists": session.workdir.try_exists().ok(),
+                "disk_workdir": session.disk,
+                "disk_workdir_exists": session.disk.try_exists().ok(),
+            })
+        });
+        let mut receipt = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.home.0.join(TTL_RECEIPTS))?;
+        writeln!(
+            receipt,
+            "{}",
+            json!({
+                "event": event,
+                "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                "endpoint": format!("{:?}", self.endpoint),
+                "connection_pid": self.processes.root,
+                "shim_binary": shim_binary(),
+                "server_binary": real_server_binary(),
+                "ttl_minutes": TTL_MINUTES,
+                "ttl_wait_ms": TTL_WAIT.as_millis(),
+                "private_home": self.home.0,
+                "live_tmpdir": LIVE_SOCKET_ROOT,
+                "session": session,
+                "processes": self.process_receipts(),
+                "details": details,
+            })
+        )?;
+        receipt.flush()?;
+        self.retain_proof()
+    }
+
+    fn only_connection_remains(&mut self) -> TestResult<bool> {
+        self.processes.capture_tree()?;
+        let remaining = self.processes.remaining();
+        assert!(
+            remaining
+                .iter()
+                .any(|process| process.pid == self.processes.root),
+            "stdio endpoint exited while the connection was retained: {remaining:?}\n{}",
+            self.log()
+        );
+        Ok(remaining.len() == 1)
+    }
+
+    fn ping_until(&mut self, deadline: Instant) -> TestResult<Value> {
+        let response = self.rpc_until(3, "ping", json!({}), deadline)?;
+        assert_eq!(response["result"], json!({}), "{response}");
+        assert!(response.get("error").is_none(), "{response}");
+        Ok(response)
+    }
+
+    fn session_listing_until(&mut self, deadline: Instant) -> TestResult<(Value, String)> {
+        assert_eq!(self.endpoint, Endpoint::Shim);
+        let response = self.rpc_until(
+            4,
+            "tools/call",
+            json!({"name":"session_list","arguments":{}}),
+            deadline,
+        )?;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let listing = response["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or_else(|| io::Error::other(format!("session_list returned no text: {response}")))?
+            .to_owned();
+        Ok((response, listing))
+    }
+
+    fn wait_for_ttl(&mut self, session: &HeadlessSession) -> TestResult {
+        let waiting = Instant::now();
+        let deadline = waiting + TTL_WAIT;
+        loop {
+            // These requests terminate at the shim or MCP transport and do
+            // not call a tool that refreshes the real session's activity.
+            let (listing_response, no_live_sessions) = match self.endpoint {
+                Endpoint::Shim => {
+                    let (response, listing) = self.session_listing_until(deadline)?;
+                    let id = session
+                        .session_id
+                        .as_deref()
+                        .ok_or_else(|| io::Error::other("shim TTL fixture has no session_id"))?;
+                    let no_live_id = !listing
+                        .lines()
+                        .any(|line| line.starts_with(&format!("{id}:")));
+                    (
+                        Some(response),
+                        no_live_id && listing.starts_with("No live sessions."),
+                    )
+                }
+                Endpoint::StandaloneServer => (None, true),
+            };
+            let ping = self.ping_until(deadline)?;
+            let root_only = self.only_connection_remains()?;
+            let workdir_removed = !session.workdir.try_exists()?;
+            let disk_removed = !session.disk.try_exists()?;
+            let ttl_observed = self.ttl_expirations() > session.ttl_expirations_before;
+            let expired =
+                no_live_sessions && root_only && workdir_removed && disk_removed && ttl_observed;
+            self.record_ttl_receipt(
+                if expired { "ttl-expired" } else { "ttl-poll" },
+                Some(session),
+                json!({
+                    "elapsed_ms": waiting.elapsed().as_millis(),
+                    "session_list": listing_response,
+                    "ping": ping,
+                    "no_live_sessions": no_live_sessions,
+                    "only_connection_remains": root_only,
+                    "ttl_observed": ttl_observed,
+                    "stdin_retained": self.input.is_some(),
+                    "stdout_retained": self.output.is_some(),
+                }),
+            )?;
+            assert!(
+                waiting.elapsed() < TTL_WAIT,
+                "TTL exceeded 90 seconds: {}",
+                self.log()
+            );
+            if expired {
+                assert_absent(&session.workdir)?;
+                assert_absent(&session.disk)?;
+                assert!(self.input.is_some(), "TTL must retain stdin");
+                assert!(self.output.is_some(), "TTL must retain stdout");
+                if self.endpoint == Endpoint::Shim {
+                    assert!(session.server.stat().is_none(), "full server survived TTL");
+                } else {
+                    assert!(session.server.stat().is_some(), "standalone server exited");
+                }
+                return Ok(());
+            }
+            thread::sleep(TTL_POLL_PAUSE.min(deadline.saturating_duration_since(Instant::now())));
+        }
     }
 
     fn resistant_descendant(&mut self, session: &HeadlessSession) -> TestResult<OwnedProcess> {
@@ -568,12 +788,8 @@ impl Connection {
         recorded
     }
 
-    fn retain_proof(&self) -> TestResult {
-        let Some(proof) = self.home.retain_diagnostics()? else {
-            return Ok(());
-        };
-        let recorded: Vec<_> = self
-            .recorded_tree()
+    fn process_receipts(&self) -> Vec<Value> {
+        self.recorded_tree()
             .iter()
             .map(|process| {
                 json!({
@@ -583,7 +799,13 @@ impl Connection {
                     "state": process.stat().map(|stat| stat.state.to_string()),
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    fn retain_proof(&self) -> TestResult {
+        let Some(proof) = self.home.retain_diagnostics()? else {
+            return Ok(());
+        };
         std::fs::write(
             proof.join("owned-tree.json"),
             serde_json::to_vec_pretty(&json!({
@@ -592,7 +814,8 @@ impl Connection {
                 "live_tmpdir": LIVE_SOCKET_ROOT,
                 "private_cli_tmpdir": self.home.1,
                 "server_binary": real_server_binary(),
-                "processes": recorded,
+                "shim_binary": shim_binary(),
+                "processes": self.process_receipts(),
             }))?,
         )?;
         for process in self.processes.owned.values() {
@@ -664,8 +887,18 @@ impl Connection {
     }
 
     fn rpc(&mut self, id: u64, method: &str, params: Value) -> TestResult<Value> {
+        self.rpc_until(id, method, params, Instant::now() + RESPONSE_WAIT)
+    }
+
+    fn rpc_until(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> TestResult<Value> {
+        let deadline = deadline.min(Instant::now() + RESPONSE_WAIT);
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        let deadline = Instant::now() + RESPONSE_WAIT;
         let mut next_proof = Instant::now();
         loop {
             if std::env::var_os(PROOF_DIR_ENV).is_some() && Instant::now() >= next_proof {
@@ -675,6 +908,11 @@ impl Connection {
                 self.retain_proof()?;
                 next_proof = Instant::now() + PROOF_INTERVAL;
             }
+            assert!(
+                Instant::now() < deadline,
+                "response {id} timed out: {}",
+                self.log()
+            );
             while let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.buffered.drain(..=end).collect();
                 // The launching fixture also emits libtest progress lines.
@@ -684,11 +922,6 @@ impl Connection {
                     return Ok(value);
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "response {id} timed out: {}",
-                self.log()
-            );
             let output = self.output.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "test output is closed")
             })?;
@@ -751,6 +984,160 @@ impl Drop for Connection {
         self.output.take();
         // Field order drops the process guard before the private HOME.
     }
+}
+
+#[test]
+#[ignore = "requires KWin, bubblewrap, input devices, a GPU session, both binary overrides, and proof receipts; no host viewer"]
+fn shim_ttl_retires_two_headless_servers_on_one_connection() -> TestResult {
+    let mut connection = Connection::start_ttl(Endpoint::Shim)?;
+    let original_shim = connection
+        .processes
+        .owned
+        .get(&connection.shim)
+        .cloned()
+        .ok_or_else(|| io::Error::other("TTL fixture did not record its shim"))?;
+    let mut previous_id: Option<String> = None;
+    let mut retired = Vec::with_capacity(2);
+    for cycle in 1..=2 {
+        let session = connection.start_headless()?;
+        let id = session
+            .session_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("TTL fixture has no shim session_id"))?;
+        assert_ne!(
+            previous_id.as_deref(),
+            Some(id),
+            "shim reused an expired ID"
+        );
+        connection.record_ttl_receipt(
+            "session-started",
+            Some(&session),
+            json!({"cycle":cycle,"status":"started","viewer_state":"closed"}),
+        )?;
+        let (response, listing) =
+            connection.session_listing_until(Instant::now() + RESPONSE_WAIT)?;
+        assert!(
+            listing
+                .lines()
+                .any(|line| line.starts_with(&format!("{id}:"))),
+            "new session is absent from session_list: {response}"
+        );
+        connection.record_ttl_receipt(
+            "session-listed",
+            Some(&session),
+            json!({"cycle":cycle,"session_list":response}),
+        )?;
+        connection.wait_for_ttl(&session)?;
+        assert!(
+            original_shim.stat().is_some(),
+            "TTL replaced the original shim"
+        );
+        assert!(connection.processes.child.try_wait()?.is_none());
+        previous_id = Some(id.to_owned());
+        retired.push(session);
+    }
+    let ping = connection.ping_until(Instant::now() + RESPONSE_WAIT)?;
+    assert!(connection.only_connection_remains()?);
+    for session in &retired {
+        assert!(session.server.stat().is_none(), "full server survived TTL");
+        assert_absent(&session.workdir)?;
+        assert_absent(&session.disk)?;
+    }
+    assert!(
+        original_shim.stat().is_some(),
+        "final ping used a replacement shim"
+    );
+    connection.record_ttl_receipt(
+        "final-ping",
+        None,
+        json!({
+            "cycles_completed":2,
+            "original_shim_starttime":original_shim.starttime,
+            "ping":ping,
+            "stdin_retained":connection.input.is_some(),
+            "stdout_retained":connection.output.is_some(),
+        }),
+    )?;
+    connection.disconnect_input();
+    assert!(connection.processes.wait_for_child(EXIT_WAIT)?.success());
+    eprintln!(
+        "shim_ttl: shim={original_shim:?} expired_cycles=2 live_sessions=0 full_servers=0 owned_workdirs=0 final_ping=true"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires KWin, bubblewrap, input devices, a GPU session, both binary overrides, and proof receipts; no host viewer"]
+fn standalone_ttl_retains_stdio_and_accepts_a_new_headless_session() -> TestResult {
+    let mut connection = Connection::start_ttl(Endpoint::StandaloneServer)?;
+    let first = connection.start_headless()?;
+    connection.record_ttl_receipt(
+        "session-started",
+        Some(&first),
+        json!({"cycle":1,"status":"started","viewer_state":"closed"}),
+    )?;
+    connection.wait_for_ttl(&first)?;
+    assert!(connection.processes.child.try_wait()?.is_none());
+    let second = connection.start_headless()?;
+    assert_eq!(second.server.pid, first.server.pid, "server PID changed");
+    assert_eq!(
+        second.server.starttime, first.server.starttime,
+        "session_start used a replacement server"
+    );
+    connection.record_ttl_receipt(
+        "session-started",
+        Some(&second),
+        json!({"cycle":2,"status":"started","viewer_state":"closed"}),
+    )?;
+    // Stop the restarted session immediately, without another idle wait.
+    let stopped = connection.rpc(
+        5,
+        "tools/call",
+        json!({"name":"session_stop","arguments":{}}),
+    )?;
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    let deadline = Instant::now() + EXIT_WAIT;
+    while !connection.only_connection_remains()? {
+        assert!(
+            Instant::now() < deadline,
+            "restarted session left owned descendants"
+        );
+        thread::sleep(POLL_PAUSE);
+    }
+    assert_absent(&second.workdir)?;
+    assert_absent(&second.disk)?;
+    connection.record_ttl_receipt(
+        "session-stopped",
+        Some(&second),
+        json!({"response":stopped}),
+    )?;
+    let ping = connection.ping_until(Instant::now() + RESPONSE_WAIT)?;
+    assert!(
+        first.server.stat().is_some(),
+        "standalone stdio endpoint exited"
+    );
+    connection.record_ttl_receipt(
+        "final-ping",
+        Some(&second),
+        json!({
+            "sessions_started":2,
+            "ttl_expirations":1,
+            "second_session_stopped":true,
+            "ping":ping,
+            "stdin_retained":connection.input.is_some(),
+            "stdout_retained":connection.output.is_some(),
+        }),
+    )?;
+    connection.disconnect_input();
+    assert!(connection.processes.wait_for_child(EXIT_WAIT)?.success());
+    eprintln!(
+        "standalone_ttl: server={:?} expired=true stdio_retained=true restarted=true second_session_stopped=true final_ping=true",
+        first.server
+    );
+    Ok(())
 }
 
 #[test]
