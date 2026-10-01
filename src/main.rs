@@ -57,6 +57,10 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+
+// Session overlay layers live on disk under ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp
+// (/tmp is RAM with a per-user quota); session_start needs this much free there.
+const SESSION_DISK_MIN_FREE: u64 = 2 << 30;
 const DEFAULT_STATS_SECONDS: u64 = 3600;
 
 // EIS (Emulated Input Sender) negotiation.
@@ -1273,8 +1277,28 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
     for mount in &overlay_exclusions {
         eprintln!("session_start: excluding mount from overlay: {}", mount.display());
     }
-    let mut overlay_plan = prepare_overlay_plan(target, &host_xdg_dir.join("tmp"), &mount_inventory)
+    // A leftover twin (a crash, or this pid's run before a reboot) never leaks
+    // into the new session.
+    let disk = session_disk_path(host_xdg_dir);
+    remove_verified_workdir(&disk).map_err(|e| anyhow::anyhow!("clear {}: {e}", disk.display()))?;
+    std::fs::create_dir_all(&disk).map_err(|e| anyhow::anyhow!("create {}: {e}", disk.display()))?;
+    let stat = nix::sys::statvfs::statvfs(&disk).map_err(|e| anyhow::anyhow!("statvfs {}: {e}", disk.display()))?;
+    let free = stat.blocks_available().saturating_mul(stat.fragment_size());
+    if free < SESSION_DISK_MIN_FREE {
+        let _ = std::fs::remove_dir(&disk);
+        anyhow::bail!(
+            "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free",
+            disk.display(), gib(SESSION_DISK_MIN_FREE), gib(free)
+        );
+    }
+    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory)
         .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
+    // Inside the overlay the layers' own path would loop (ELOOP); the session
+    // sees an empty directory there instead.
+    let disk_root = session_disk_root();
+    if disk_root.starts_with(target) {
+        overlay_plan.empty_dirs.push(disk_root);
+    }
     overlay_plan
         .expose_sockets(target, host_runtime, host_xdg_dir)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
@@ -1838,6 +1862,22 @@ fn session_workdir_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("kwin-mcp-{}", std::process::id()))
 }
 
+/// Disk-backed root for session overlay layers.
+fn session_disk_root() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("kwin-mcp")
+}
+
+/// The disk-backed twin of a session workdir: its overlay upper, work and
+/// staging layers.
+fn session_disk_path(workdir: &Path) -> std::path::PathBuf {
+    session_disk_root().join(workdir.file_name().unwrap_or_default())
+}
+
 /// Path naming the inode an open descriptor already refers to. Operating through
 /// it keeps chmod and directory reads pinned to the descriptor this walk opened
 /// and validated, so a name replaced underneath the walk cannot redirect the
@@ -1984,28 +2024,34 @@ fn sweep_dead_owner_workdirs() -> std::io::Result<()> {
         .flatten()
         .filter_map(|process| process.cmdline().ok().map(|args| args.join(" ")))
         .collect();
-    for entry in std::fs::read_dir(&temp)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
-        if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
-        let dir = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
-        if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
-        if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() { continue }
-        let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe")).ok()
-            .and_then(|exe| exe.file_name().map(|file| file.to_string_lossy().starts_with("kwin-mcp")))
-            .unwrap_or(false);
-        if owner_alive { continue }
-        let dir_text = dir.to_string_lossy();
-        let mount_prefix = format!("{dir_text}/");
-        if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
-            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
-        if cmdlines.iter().any(|args| args.split(' ').any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))) { continue }
-        match remove_verified_workdir(&dir) {
-            Ok(()) => eprintln!("sweep: removed leaked {}", dir.display()),
-            Err(error) => eprintln!("sweep: retained leaked {}: {error}", dir.display()),
+    // Disk twins (session_disk_root) count too: a twin whose workdir is gone,
+    // removed above or cleared from /tmp by a reboot, is leaked the same way.
+    for root in [temp.clone(), session_disk_root()] {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
+            if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
+            if root != temp && std::fs::symlink_metadata(temp.join(name)).is_ok() { continue }
+            let dir = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
+            if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
+            if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() { continue }
+            let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe")).ok()
+                .and_then(|exe| exe.file_name().map(|file| file.to_string_lossy().starts_with("kwin-mcp")))
+                .unwrap_or(false);
+            if owner_alive { continue }
+            let dir_text = dir.to_string_lossy();
+            let mount_prefix = format!("{dir_text}/");
+            if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
+                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
+            if cmdlines.iter().any(|args| args.split(' ').any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))) { continue }
+            match remove_verified_workdir(&dir) {
+                Ok(()) => eprintln!("sweep: removed leaked {}", dir.display()),
+                Err(error) => eprintln!("sweep: retained leaked {}: {error}", dir.display()),
+            }
         }
     }
     Ok(())
@@ -2119,6 +2165,10 @@ fn teardown(mut sess: Session) {
         }
     }
     let _ = std::fs::remove_dir_all(sess.host_xdg_dir.join("tmp"));
+    let disk = session_disk_path(&sess.host_xdg_dir);
+    if let Err(error) = remove_verified_workdir(&disk) {
+        eprintln!("teardown: retained {}: {error}", disk.display());
+    }
     cleanup_stale_session_files(&sess.host_xdg_dir);
 }
 
@@ -3469,7 +3519,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay at /tmp/kwin-mcp-<pid>/tmp/overlay-upper/. The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -3646,7 +3696,7 @@ impl KwinMcp {
             </busconfig>"
         )).map_err(|e| ver_err(format!("write atspi config: {e}")))?;
         // Write kwin-mcp display config files to host_xdg_dir for --ro-bind mounting.
-        // Protected from agent writes: the ro-bind shadows the overlay-upper entry.
+        // Protected from agent writes: the ro-bind shadows the overlay entry.
         let kwinrc_path = host_xdg_dir.join("kwinrc");
         std::fs::write(&kwinrc_path,
             "[org.kde.kdecoration2]\nBorderSize=None\nShadowSize=0\n\n\

@@ -65,7 +65,7 @@ impl RpcClient {
             .expect("system clock")
             .as_nanos();
         let home =
-            std::env::temp_dir().join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
         for directory in [
             home.join(".config"),
             home.join(".local/share"),
@@ -1990,4 +1990,50 @@ fn shim_keeps_the_client_connected_when_another_process_sends_sigterm() {
         assert!(Instant::now() < deadline, "the shim ignored SIGTERM from its client");
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn session_overlay_lives_on_disk_and_is_removed_at_stop() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+    let dir = workdir(&started);
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(dir.file_name().expect("workdir name"));
+    assert!(disk.join("overlay-upper").is_dir(), "no overlay upper in {}", disk.display());
+    assert!(!dir.join("tmp/overlay-upper").exists(), "overlay upper still in {}", dir.display());
+
+    let seen = dir.join("disk-root-listing");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "echo on-disk > \"$HOME/kwin-mcp-disk-probe\" && test -d \"$HOME/.cache/kwin-mcp\" && ls -A \"$HOME/.cache/kwin-mcp\" > '{}'; exit 3",
+            seen.display()
+        )}),
+    );
+    assert_eq!(launched["result"]["structuredContent"]["exit_status"], 3, "{launched}");
+    let listing = std::fs::read_to_string(&seen).expect("listing from the session");
+    assert!(listing.trim().is_empty(), "the session sees overlay layers: {listing}");
+    let probe = ["overlay-upper", "overlay-root"]
+        .iter()
+        .map(|layer| disk.join(layer).join("kwin-mcp-disk-probe"))
+        .find(|path| path.is_file())
+        .expect("session write in a disk layer");
+    assert_eq!(std::fs::read_to_string(probe).expect("probe").trim(), "on-disk");
+
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(!disk.exists(), "session_stop left {}", disk.display());
+    client.stop_process();
 }
