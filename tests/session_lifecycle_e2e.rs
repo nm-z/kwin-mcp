@@ -28,6 +28,7 @@ impl RpcClient {
         Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), delay_stage, false, false, &[])
     }
 
+    #[cfg(debug_assertions)]
     fn start_with_options_and_stop(
         delay_stage: Option<&str>,
         stop_bwrap: bool,
@@ -35,6 +36,7 @@ impl RpcClient {
         Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), delay_stage, stop_bwrap, false, &[])
     }
 
+    #[cfg(debug_assertions)]
     fn start_with_first_proxy_failure() -> Self {
         Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), None, false, true, &[])
     }
@@ -195,6 +197,7 @@ impl RpcClient {
         let _ = self.child.wait();
     }
 
+    #[cfg(debug_assertions)]
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -242,6 +245,7 @@ fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> V
     client.response(id, Duration::from_secs(45))
 }
 
+#[cfg(debug_assertions)]
 fn process_children(pid: u32) -> std::io::Result<Vec<String>> {
     let output = std::process::Command::new("pgrep")
         .args(["-P", &pid.to_string()])
@@ -538,6 +542,8 @@ fn concurrent_stop_waits_for_start_and_restart_cleans_workdir() {
     client.stop_process();
 }
 
+// Needs the debug-only KWIN_MCP_TEST_* hooks in kwin-mcp.
+#[cfg(debug_assertions)]
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn startup_timeout_reclaims_children_and_workdir() {
@@ -546,9 +552,6 @@ fn startup_timeout_reclaims_children_and_workdir() {
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
-    if !cfg!(debug_assertions) {
-        panic!("run in a debug build (no --release): kwin-mcp test hooks are debug-only");
-    }
 
     for (stage, stop_bwrap) in [
         ("after-bwrap", false),
@@ -612,6 +615,8 @@ fn startup_timeout_reclaims_children_and_workdir() {
     }
 }
 
+// Needs the debug-only KWIN_MCP_TEST_* hooks in kwin-mcp.
+#[cfg(debug_assertions)]
 #[test]
 #[ignore = "requires a live D-Bus session and bubblewrap environment"]
 fn first_proxy_failure_reaps_registered_proxy() {
@@ -620,9 +625,6 @@ fn first_proxy_failure_reaps_registered_proxy() {
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
-    if !cfg!(debug_assertions) {
-        panic!("run in a debug build (no --release): kwin-mcp test hooks are debug-only");
-    }
 
     let mut client = RpcClient::start_with_first_proxy_failure();
     let server_pid = client.pid();
@@ -918,6 +920,8 @@ fn wrapped_chrome_gets_browser_switches_in_actual_argv() {
     }
 }
 
+// Needs the debug-only KWIN_MCP_TEST_* hooks in kwin-mcp.
+#[cfg(debug_assertions)]
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn blocked_host_scan_answers_within_hard_limit_and_cleans_later() {
@@ -926,9 +930,6 @@ fn blocked_host_scan_answers_within_hard_limit_and_cleans_later() {
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
-    if !cfg!(debug_assertions) {
-        panic!("run in a debug build (no --release): kwin-mcp test hooks are debug-only");
-    }
     // A thread sleep stands in for a stat blocked on a hung FUSE mount: no
     // async timeout can preempt it, so only the blocking-thread handoff keeps
     // session_start inside its hard limit.
@@ -1140,7 +1141,7 @@ fn pixel(image: &(u32, Vec<u8>), x: u32, y: u32) -> [u8; 4] {
 }
 
 fn screenshot_meta(response: &Value) -> Value {
-    let text = response["result"]["content"][1]["text"].as_str().expect("screenshot metadata");
+    let text = response["result"]["content"][1]["text"].as_str().unwrap_or_else(|| panic!("no screenshot metadata in {response}"));
     serde_json::from_str(text).expect("screenshot metadata JSON")
 }
 
@@ -1220,6 +1221,13 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
+    let host_display = std::env::var_os("XDG_RUNTIME_DIR")
+        .zip(std::env::var_os("WAYLAND_DISPLAY"))
+        .map(|(runtime, display)| PathBuf::from(runtime).join(display));
+    if !host_display.as_deref().is_some_and(std::path::Path::exists) {
+        eprintln!("no host Wayland display; skipping");
+        return;
+    }
     // The default starts without a host viewer.
     let mut client = RpcClient::start();
     initialize(&mut client);
