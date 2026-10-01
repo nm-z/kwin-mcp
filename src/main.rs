@@ -1972,7 +1972,7 @@ fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// A previous --autoclean server explicitly marked this workdir and held its
 /// lease until exit. The marker records the sandbox process group so a crash
 /// cannot cause a later server to delete a still-running container.
-fn sweep_orphaned_workdirs() -> std::io::Result<()> {
+fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> std::io::Result<()> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let temp = std::env::temp_dir();
@@ -1984,6 +1984,7 @@ fn sweep_orphaned_workdirs() -> std::io::Result<()> {
         let Some(name) = name.to_str() else { continue };
         let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
         if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
+        if owners.is_some_and(|owners| pid_text.parse::<u32>().map_or(true, |pid| !owners.contains(&pid))) { continue }
         let dir = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
         if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
@@ -2021,7 +2022,7 @@ fn sweep_orphaned_workdirs() -> std::io::Result<()> {
 /// owning server is gone they are leaked: remove them, unless a live kwin-mcp
 /// still has that pid, something is mounted inside, or any process still names
 /// the directory on its command line (a surviving sandbox binds it by path).
-fn sweep_dead_owner_workdirs() -> std::io::Result<()> {
+fn sweep_dead_owner_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let temp = std::env::temp_dir();
     let uid = std::fs::metadata("/proc/self")?.uid();
@@ -2041,6 +2042,7 @@ fn sweep_dead_owner_workdirs() -> std::io::Result<()> {
             let Some(name) = name.to_str() else { continue };
             let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
             if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
+            if owners.is_some_and(|owners| pid_text.parse::<u32>().map_or(true, |pid| !owners.contains(&pid))) { continue }
             if root != temp && std::fs::symlink_metadata(temp.join(name)).is_ok() { continue }
             let dir = entry.path();
             let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
@@ -5948,8 +5950,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // One orphan sweep, then exit: kwin-mcp-shim runs this on a timer so
         // leaked workdirs are reaped even while no new server starts.
         Some("--sweep-workdirs") => {
-            sweep_orphaned_workdirs()?;
-            sweep_dead_owner_workdirs()?;
+            let owners: std::collections::HashSet<u32> = argv.map(|value| {
+                value.parse::<u32>().ok().filter(|pid| *pid > 1)
+                    .ok_or_else(|| format!("--sweep-workdirs requires owner PIDs greater than 1, got '{value}'"))
+            }).collect::<Result<_, _>>()?;
+            let owners = (!owners.is_empty()).then_some(&owners);
+            sweep_orphaned_workdirs(owners)?;
+            sweep_dead_owner_workdirs(owners)?;
+            if let Some(owners) = owners {
+                for owner in owners {
+                    for root in [std::env::temp_dir(), session_disk_root()] {
+                        let dir = root.join(format!("kwin-mcp-{owner}"));
+                        match std::fs::symlink_metadata(&dir) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                            Ok(_) => return Err(format!("workdir sweep retained {}", dir.display()).into()),
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
         _ => {}
@@ -6003,7 +6022,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     }
     let display = parse_cli_args()?;
     if display.autoclean
-        && let Err(error) = sweep_orphaned_workdirs() {
+        && let Err(error) = sweep_orphaned_workdirs(None) {
             eprintln!("autoclean: orphan sweep skipped: {error}");
     }
     eprintln!(
