@@ -1895,3 +1895,35 @@ fn parallel_sessions_hold_no_host_user_bus_connections() {
         "broker fds {fds_after} after stop, {fds_before} before"
     );
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_reports_commands_that_exit_without_a_window() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+
+    let begun = Instant::now();
+    let missing = call_tool(&mut client, 3, "launch_app", json!({"command":"kwin-mcp-e2e-no-such-command"}));
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
+    assert_eq!(missing["result"]["structuredContent"]["exit_status"], 127, "{missing}");
+    assert!(begun.elapsed() < Duration::from_secs(5), "missing command took {:?}", begun.elapsed());
+
+    let failed = call_tool(&mut client, 4, "launch_app", json!({"command":"exit 3"}));
+    assert_eq!(failed["result"]["isError"], true, "{failed}");
+    assert_eq!(failed["result"]["structuredContent"]["exit_status"], 3, "{failed}");
+
+    let finished = call_tool(&mut client, 5, "launch_app", json!({"command":"true"}));
+    assert_ne!(finished["result"]["isError"], true, "{finished}");
+    assert_eq!(finished["result"]["structuredContent"]["exit_status"], 0, "{finished}");
+
+    let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
+    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    client.stop_process();
+}

@@ -5533,18 +5533,20 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        let browser_marker = xdg.join(format!(
-            "browser-launch-{}",
-            NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
+        // The command's exit status, written when it exits: a launch that ends
+        // before a window appears is reported instead of waited out.
+        let exit_file = xdg.join(format!("launch-{launch_id}.status"));
         let launch_cmd = format!(
-            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
+            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}; echo $? > {}",
             if fuse_enabled { "" } else { "APPIMAGE_EXTRACT_AND_RUN=1 " },
             shell_quote(&xdg.join("browser-bin").display().to_string()),
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
             shell_quote(&browser_marker.display().to_string()),
             shell_quote(&params.command),
+            shell_quote(&exit_file.display().to_string()),
         );
         {
             let mut guard = self.session.lock().await;
@@ -5557,6 +5559,7 @@ impl KwinMcp {
 
         // Poll until a NEW window appears (different ID from before launch)
         let mut win_geo = None;
+        let mut exit_status = None;
         for _ in 0..LAUNCH_WINDOW_POLLS {
             tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
             if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await
@@ -5564,7 +5567,16 @@ impl KwinMcp {
                 win_geo = Some(geo);
                 break;
             }
+            if exit_status.is_none() {
+                exit_status = std::fs::read_to_string(&exit_file).ok().and_then(|text| text.trim().parse::<i32>().ok());
+            }
+            // A single-instance app exits 0 while another process opens its
+            // window, so only a failure ends the wait.
+            if exit_status.is_some_and(|status| status != 0) {
+                break;
+            }
         }
+        let _ = std::fs::remove_file(&exit_file);
 
         // The browser wrapper records CDP intent only when it actually ran.
         let cdp_requested = std::fs::read(&browser_marker).is_ok_and(|value| value == b"cdp");
@@ -5596,12 +5608,25 @@ impl KwinMcp {
             format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
         });
         let suffix = warning.as_deref().map(|text| format!(". {text}")).unwrap_or_default();
-        match win_geo {
-            Some(geo) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
+        match (win_geo, exit_status) {
+            (Some(geo), _) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
                 "action": "launch", "command": params.command, "window": geo.id,
                 "cdp": cdp_connected, "warning": warning,
             })).await),
-            None => Ok(structured_result(&peer, format!("launched: {} (no window after 15s){suffix}", params.command), serde_json::json!({
+            (None, Some(status)) => {
+                let text = match status {
+                    0 => format!("launched: {} (exited with status 0; no window after 15s){suffix}", params.command),
+                    127 => format!("{} failed: command not found (exit status 127)", params.command),
+                    _ => format!("{} exited with status {status} without opening a window", params.command),
+                };
+                let mut result = structured_result(&peer, text, serde_json::json!({
+                    "action": "launch", "command": params.command, "window": "exited",
+                    "exit_status": status, "cdp": false, "warning": warning,
+                })).await;
+                result.is_error = Some(status != 0);
+                Ok(result)
+            }
+            (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after 15s){suffix}", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
                 "cdp": false, "warning": warning,
             })).await),
