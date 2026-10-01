@@ -1414,15 +1414,16 @@ fn take_resume() -> Option<Resume> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let started_under = std::os::unix::process::parent_id();
     owner();
     let resume = take_resume();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run(resume));
+    let result = runtime.block_on(run(resume, started_under));
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
-async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
         // Orphans of dead children reparent to the shim so it can reap them.
@@ -1440,6 +1441,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     let (sweep_tx, sweep_rx) = mpsc::unbounded_channel::<()>();
 
+    let writer_events = event_tx.clone();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(line) = out_rx.recv().await {
@@ -1447,6 +1449,8 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
                 || stdout.write_all(b"\n").await.is_err()
                 || stdout.flush().await.is_err()
             {
+                log("client output closed; stopping children");
+                let _ = writer_events.send(Event::ClientClosed);
                 break;
             }
         }
@@ -1491,7 +1495,6 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         shim.describe();
     }
 
-    let started_under = std::os::unix::process::parent_id();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut deadline: Option<Instant> = None;
@@ -1505,7 +1508,13 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         let Some(event) = event else { break };
         // SIGTERM from the client, or once the client is gone, ends the shim;
         // from anyone else it only stops the sessions.
-        let event = if let Event::Terminated(sender) = event {
+        let event = if matches!(event, Event::Tick)
+            && !client_closed
+            && std::os::unix::process::parent_id() != started_under
+        {
+            log("launching client exited; stopping children");
+            Event::ClientClosed
+        } else if let Event::Terminated(sender) = event {
             let parent = std::os::unix::process::parent_id();
             if parent != started_under || u32::try_from(sender).is_ok_and(|sender| sender == parent) {
                 Event::ClientClosed
