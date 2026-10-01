@@ -1,5 +1,7 @@
 mod fuse_bridge;
 mod input_bridge;
+mod kwin_script;
+use kwin_script::run_kwin_script;
 mod wallet_mediator;
 
 use rmcp::ServiceExt;
@@ -104,7 +106,8 @@ const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
 
 // launch_app: window-appear polling.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
+const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCH_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 // KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
 // it when a non-blocking pipe is full at close. Frames are captured into a
@@ -2783,79 +2786,6 @@ fn viewer_summary(report: &serde_json::Value) -> String {
     }
 }
 
-async fn run_kwin_script(
-    conn: &zbus::Connection,
-    kwin_unique: &str,
-    host_xdg_dir: &std::path::Path,
-    script_body: &str,
-) -> Result<String, KwinError> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let marker = format!("kwin-mcp-{ts}");
-    let cb_path = format!("/KWinMCP/{ts}");
-    let our_name = conn
-        .unique_name()
-        .ok_or(KwinError::Msg("no bus name".to_owned()))?
-        .to_string();
-    let our_name_json = serde_json::to_string(&our_name)?;
-    let cb_path_json = serde_json::to_string(&cb_path)?;
-    let script = format!(
-        "{script_body}\n\
-        callDBus({our_name_json},{cb_path_json},'org.kde.KWinMCP','result',JSON.stringify(result));"
-    );
-    let script_name = format!("{marker}.js");
-    let script_file = host_xdg_dir.join(&script_name);
-    std::fs::write(&script_file, &script)?;
-    // host_xdg_dir is bind-mounted at the same path inside bwrap
-    let container_script_path = script_file.to_string_lossy().to_string();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let cb = KWinCallback {
-        tx: std::sync::Mutex::new(Some(tx)),
-    };
-    let obj_path = zbus::zvariant::ObjectPath::try_from(cb_path.as_str())?;
-    let registered = conn.object_server().at(&obj_path, cb).await?;
-    eprintln!("run_kwin_script: our_name={our_name} path={cb_path} registered={registered}");
-    if !registered {
-        return Err(KwinError::Msg(format!("failed to register callback at {cb_path}")));
-    }
-    // Load and run the script — target KWin's unique name, not org.kde.KWin (we own that)
-    let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination(kwin_unique)?
-        .path("/Scripting")?
-        .interface("org.kde.kwin.Scripting")?
-        .build()
-        .await?;
-    let (script_id,): (i32,) = scripting
-        .call("loadScript", &(&container_script_path, &marker))
-        .await?;
-    if script_id < 0 {
-        conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
-        std::fs::remove_file(&script_file)?;
-        return Err(KwinError::Msg(format!("KWin loadScript failed, id={script_id}")));
-    }
-    let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
-        .destination(kwin_unique)?
-        .path(format!("/Scripting/Script{script_id}"))?
-        .interface("org.kde.kwin.Script")?
-        .build()
-        .await?;
-    if let Err(error) = script_proxy.call::<_, (), ()>("run", &()).await {
-        conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
-        let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
-        std::fs::remove_file(&script_file)?;
-        return Err(error.into());
-    }
-    // Wait for callback, then cleanup regardless of result
-    let result = rx
-        .await
-        .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()));
-    conn.object_server().remove::<KWinCallback, _>(&obj_path).await?;
-    let (_,): (bool,) = scripting.call("unloadScript", &(&marker,)).await?;
-    std::fs::remove_file(&script_file)?;
-    result
-}
-
 async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
     let json = run_kwin_script(
         conn,
@@ -3019,26 +2949,6 @@ async fn activate_window(
         )));
     }
     Ok(window)
-}
-
-struct KWinCallback {
-    tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
-}
-
-#[zbus::interface(name = "org.kde.KWinMCP")]
-impl KWinCallback {
-    #[zbus(name = "result")]
-    fn result(&self, payload: String) {
-        match self.tx.lock() {
-            Ok(mut g) => {
-                if let Some(tx) = g.take()
-                    && let Err(e) = tx.send(payload) {
-                    eprintln!("callback send failed: {e}");
-                }
-            }
-            Err(e) => eprintln!("callback lock poisoned: {e}"),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -3409,6 +3319,38 @@ struct ExportFileParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
+}
+
+struct LaunchProgress {
+    stage: &'static str,
+    command_submitted: bool,
+}
+
+struct PendingLaunchFile {
+    path: PathBuf,
+    submitted: bool,
+}
+
+impl Drop for PendingLaunchFile {
+    fn drop(&mut self) {
+        if !self.submitted {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn launch_timeout(progress: &LaunchProgress, timeout: Duration) -> McpError {
+    McpError::internal_error(
+        format!(
+            "launch_app exceeded {} seconds while {}. Command submitted: {}. The session remains open; use window_list before retrying.",
+            timeout.as_secs(), progress.stage, progress.command_submitted,
+        ),
+        Some(serde_json::json!({
+            "reason": "launch_timeout", "stage": progress.stage,
+            "command_submitted": progress.command_submitted,
+            "timeout_seconds": timeout.as_secs(),
+        })),
+    )
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -5629,15 +5571,29 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. The whole call has a 20s deadline; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
+        let mut progress = LaunchProgress { stage: "waiting for the session", command_submitted: false };
+        match tokio::time::timeout(LAUNCH_CALL_TIMEOUT, self.launch_app_inner(peer, params, &mut progress)).await {
+            Ok(result) => result,
+            Err(_) => Err(launch_timeout(&progress, LAUNCH_CALL_TIMEOUT)),
+        }
+    }
+
+    async fn launch_app_inner(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        params: LaunchAppParams,
+        progress: &mut LaunchProgress,
+    ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        use std::io::Write;
+        use std::os::fd::AsFd;
+        use tokio::io::AsyncWriteExt;
         use futures::StreamExt;
 
         // Record current active window ID before launching
@@ -5657,6 +5613,7 @@ impl KwinMcp {
                 sess.wallet_note.clone(),
             )
         };
+        progress.stage = "reading the active window before launch";
         let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
             .map(|(_, _, geo)| geo.id)
             .ok();
@@ -5676,21 +5633,43 @@ impl KwinMcp {
             shell_quote(&params.command),
             shell_quote(&exit_file.display().to_string()),
         );
+        progress.stage = "submitting the command to the session shell";
+        let command_path = xdg.join(format!("launch-{launch_id}.sh"));
+        let mut script = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(&command_path).map_err(KwinError::from)?;
+        let mut command_file = PendingLaunchFile { path: command_path, submitted: false };
+        let quoted_path = shell_quote(&command_file.path.display().to_string());
+        let script_body = format!("unlink -- {quoted_path}\n{launch_cmd}");
+        script.write_all(script_body.as_bytes()).map_err(KwinError::from)?;
+        drop(script);
+        let dispatch = format!("bash {quoted_path}\n");
+        // A short pipe write is atomic, so cancellation cannot leave half a
+        // shell command that the next launch would complete accidentally.
+        if dispatch.len() > nix::libc::PIPE_BUF {
+            return Err(McpError::internal_error("launch command path exceeds the atomic pipe-write limit", None));
+        }
         {
-            let mut guard = self.session.lock().await;
-            let sess = guard.as_mut().ok_or_else(|| {
+            let guard = self.session.lock().await;
+            let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            writeln!(sess.sandbox_stdin, "{launch_cmd}").map_err(KwinError::from)?;
-            sess.sandbox_stdin.flush().map_err(KwinError::from)?;
+            let fd = sess.sandbox_stdin.as_fd().try_clone_to_owned().map_err(KwinError::from)?;
+            let mut pipe = tokio::net::unix::pipe::Sender::from_owned_fd(fd).map_err(KwinError::from)?;
+            pipe.write_all(dispatch.as_bytes()).await.map_err(KwinError::from)?;
+            progress.command_submitted = true;
+            command_file.submitted = true;
         }
 
         // Poll until a NEW window appears (different ID from before launch)
         let mut win_geo = None;
         let mut exit_status = None;
-        for _ in 0..LAUNCH_WINDOW_POLLS {
+        progress.stage = "waiting for a new window";
+        let window_deadline = tokio::time::Instant::now() + LAUNCH_WINDOW_TIMEOUT;
+        while tokio::time::Instant::now() < window_deadline {
             tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
-            if let Ok((_, _, geo)) = active_window_info(&conn, &kwin_unique, &xdg).await
+            if tokio::time::Instant::now() >= window_deadline { break }
+            let Ok(window) = tokio::time::timeout_at(window_deadline, active_window_info(&conn, &kwin_unique, &xdg)).await else { break };
+            if let Ok((_, _, geo)) = window
                 && prev_window_id.as_deref() != Some(&geo.id) {
                 win_geo = Some(geo);
                 break;
@@ -5711,6 +5690,7 @@ impl KwinMcp {
         let _ = std::fs::remove_file(&browser_marker);
         let mut cdp_connected = false;
         if cdp_requested && win_geo.is_some() {
+            progress.stage = "connecting to browser accessibility";
             let cdp_url = format!("http://127.0.0.1:{cdp_port}");
             for _ in 0..CDP_CONNECT_POLLS {
                 match chromiumoxide::Browser::connect(&cdp_url).await {
@@ -5756,7 +5736,7 @@ impl KwinMcp {
             }
             (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after 15s){suffix}", params.command), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
-                "cdp": false, "warning": warning,
+                "cdp": false, "warning": warning, "stage": "waiting for a new window", "command_submitted": true,
             })).await),
         }
     }
