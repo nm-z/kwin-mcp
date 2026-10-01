@@ -4,7 +4,12 @@ case "$(hostname -s)" in archy|sentry) ;; *) printf 'Run build verification on a
 source_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 proof_root=${KWIN_MCP_PROOF_DIR:?set a disk-backed proof directory}
 mkdir -p "$proof_root"
-proof_root=$(realpath "$proof_root")
+proof_root=$(mktemp -d "$(realpath "$proof_root")/run-XXXXXX")
+printf 'proof_run=%s\n' "$proof_root"
+while IFS= read -r variable; do
+  if [[ $variable == GIT_* ]]; then unset "$variable"; fi
+done < <(compgen -e)
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 fixture=$(mktemp -d "$proof_root/metadata-XXXXXX")
 cp "$source_root/build.rs" "$source_root/cursor_v6_fixed.svg" "$fixture/"
 mkdir "$fixture/src" "$fixture/tests"
@@ -22,7 +27,7 @@ unset CARGO_TARGET_DIR KWIN_MCP_BUILD_NUMBER
 build() {
   local directory=$1 label=$2
   shift 2
-  (cd "$directory" && nice -n19 ionice -c3 cargo "$@") > "$proof_root/$label.log" 2>&1
+  (cd "$directory" && nice -n19 ionice -c3 cargo "$@" --target-dir "$directory/target") > "$proof_root/$label.log" 2>&1
 }
 stamp() { "$1/target/release/metadata-proof"; }
 assert_commit() {
@@ -70,8 +75,14 @@ git -C "$fixture" commit --allow-empty -qm 'Update packed branch'
 build "$fixture" packed-update build --release
 assert_commit "$fixture"
 worktree="$fixture-worktree"
-git -C "$fixture" worktree add -q --detach "$worktree" HEAD
+git -C "$fixture" worktree add -q -b linked-proof "$worktree" HEAD
 build "$worktree" worktree build --release
+assert_commit "$worktree"
+git -C "$worktree" commit --allow-empty -qm 'Linked branch release identity'
+build "$worktree" linked-branch-update build --release
+assert_commit "$worktree"
+git -C "$worktree" checkout -q --detach
+build "$worktree" detach build --release
 assert_commit "$worktree"
 snapshot "$worktree" > "$proof_root/detached-before.txt"
 git -C "$fixture" update-ref refs/tags/detached-unrelated HEAD
@@ -94,5 +105,5 @@ if build "$worktree" invalid-number build --release; then
   printf 'Invalid release number was accepted.\n' >&2
   exit 1
 fi
-printf 'unchanged=PASS\nunrelated_packed_ref=PASS\ntest_only=PASS\nsource_change=PASS\nbranch_commit=PASS\npacked_ref=PASS\npacked_unchanged=PASS\npacked_update=PASS\nworktree=PASS\ndetached_unrelated_ref=PASS\ndetached_update=PASS\nexplicit_number=PASS\nexplicit_unchanged=PASS\ninvalid_number=PASS\nfixture=%s\nworktree=%s\n' "$fixture" "$worktree" > "$proof_root/results.txt"
+printf 'unchanged=PASS\nunrelated_packed_ref=PASS\ntest_only=PASS\nsource_change=PASS\nbranch_commit=PASS\npacked_ref=PASS\npacked_unchanged=PASS\npacked_update=PASS\nworktree=PASS\nlinked_branch_update=PASS\ndetach=PASS\ndetached_unrelated_ref=PASS\ndetached_update=PASS\nexplicit_number=PASS\nexplicit_unchanged=PASS\ninvalid_number=PASS\nfixture=%s\nworktree=%s\n' "$fixture" "$worktree" > "$proof_root/results.txt"
 cat "$proof_root/results.txt"
