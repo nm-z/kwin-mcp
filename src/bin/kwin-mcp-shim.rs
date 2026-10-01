@@ -888,11 +888,12 @@ impl Shim {
             child.inflight = child.inflight.saturating_sub(1);
             child.last_used = Instant::now();
         }
+        let succeeded = message.get("error").is_none()
+            && message.get("result").is_some_and(|result| result.get("isError").and_then(Value::as_bool) != Some(true));
         match flight.kind {
             FlightKind::Plain => {}
             FlightKind::Start(session) => {
-                let ok = message.get("result").is_some_and(|result| result.get("isError").and_then(Value::as_bool) != Some(true));
-                if ok {
+                if succeeded {
                     self.sessions.insert(session.clone(), key);
                     if let Some(child) = self.children.get_mut(&key) {
                         child.session = Some(session.clone());
@@ -914,7 +915,7 @@ impl Shim {
                     self.retire(key);
                 }
             }
-            FlightKind::Stop(session) => {
+            FlightKind::Stop(session) if succeeded => {
                 self.sessions.remove(&session);
                 self.ended.insert(session.clone(), "it was stopped with session_stop".to_owned());
                 log(&format!("session {session} stopped"));
@@ -924,6 +925,7 @@ impl Shim {
                 self.retire(key);
                 self.publish_tools();
             }
+            FlightKind::Stop(_) => {}
         }
         if let Some(child) = self.children.get_mut(&key)
             && child.retiring && child.inflight == 0
