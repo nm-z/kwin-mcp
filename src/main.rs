@@ -76,6 +76,10 @@ const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 // AT-SPI tree traversal hard timeout (find_ui_elements).
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
+// keyboard_key checks a browser page's focus over AT-SPI (#180) within this
+// time and node count; past either it makes no claim.
+const KEY_FOCUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+const KEY_FOCUS_CHECK_NODES: usize = 5000;
 const SCREENSHOT_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -3136,6 +3140,67 @@ async fn atspi_node(
     })
 }
 
+/// AT-SPI application names of Chromium-family browsers.
+const CHROMIUM_APP_NAMES: [&str; 4] = ["chrom", "edge", "brave", "vivaldi"];
+
+/// True when the active window (KWin caption `active_title`) is a
+/// Chromium-family browser whose page has no keyboard focus: the browser UI
+/// around the showing page (DocumentWeb) of that window's frame holds a Focused
+/// object, or the page holds none. Such a browser can move focus to its own UI
+/// while its window stays active, and keys then never reach the page (#176).
+/// False when the page has focus, the window is not such a browser, or it
+/// cannot be told within KEY_FOCUS_CHECK_TIMEOUT and KEY_FOCUS_CHECK_NODES.
+async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> bool {
+    if active_title.is_empty() {
+        return false;
+    }
+    let check = async {
+        use atspi::proxy::accessible::ObjectRefExt;
+        let address = atspi::proxy::bus::BusProxy::new(conn).await.ok()?.get_address().await.ok()?;
+        let bus = connect_session_bus(&address, std::time::Instant::now() + KEY_FOCUS_CHECK_TIMEOUT).await.ok()?;
+        let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
+            .destination("org.a11y.atspi.Registry").ok()?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build().await.ok()?;
+        let mut visited = 0usize;
+        for app in root.get_children().await.ok()? {
+            let Ok(app) = app.as_accessible_proxy(&bus).await else { continue };
+            let name = app.name().await.unwrap_or_default().to_lowercase();
+            if !CHROMIUM_APP_NAMES.iter().any(|browser| name.contains(browser)) { continue }
+            for frame in app.get_children().await.unwrap_or_default() {
+                let Ok(frame) = frame.as_accessible_proxy(&bus).await else { continue };
+                // Chromium sets no Active state on its frames; the KWin caption of the
+                // active window starts its frame name (which adds the profile name).
+                if !frame.name().await.unwrap_or_default().starts_with(active_title) { continue }
+                let mut stack: Vec<(atspi::ObjectRefOwned, bool)> =
+                    frame.get_children().await.unwrap_or_default().into_iter().map(|child| (child, false)).collect();
+                let (mut page_seen, mut focused_in_page, mut focused_outside) = (false, false, false);
+                while let Some((object, in_page)) = stack.pop() {
+                    visited += 1;
+                    if visited > KEY_FOCUS_CHECK_NODES { return None }
+                    let Ok(node) = object.as_accessible_proxy(&bus).await else { continue };
+                    let states = node.get_state().await.unwrap_or_default();
+                    let page = node.get_role().await.is_ok_and(|role| role == atspi::Role::DocumentWeb)
+                        && states.contains(atspi::State::Showing);
+                    let in_page = in_page || page;
+                    page_seen |= page;
+                    if states.contains(atspi::State::Focused) {
+                        if in_page { focused_in_page = true } else { focused_outside = true }
+                    }
+                    for child in node.get_children().await.unwrap_or_default() {
+                        stack.push((child, in_page));
+                    }
+                }
+                // Chromium leaves Focused on the page while its own UI (the address bar)
+                // holds focus, so focus outside the page wins.
+                return Some(page_seen && (focused_outside || !focused_in_page));
+            }
+        }
+        Some(false)
+    };
+    matches!(tokio::time::timeout(KEY_FOCUS_CHECK_TIMEOUT, check).await, Ok(Some(true)))
+}
+
 fn tree_field(value: &str) -> String {
     value
         .replace('\r', "\\r")
@@ -5396,7 +5461,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. A combo that does not fully resolve fails with invalid_params and sends nothing. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. A combo that does not fully resolve fails with invalid_params and sends nothing. When the active window is a Chromium-family browser whose page lacks keyboard focus, the result carries a warning: the key went to the browser UI. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -5404,11 +5469,20 @@ impl KwinMcp {
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        let (mods, main) = parse_combo(&params.key)?;
+        let (conn, kwin_unique, xdg) = self
+            .with_session(|s| Ok((s.kwin_conn.clone(), s.kwin_unique_name.clone(), s.host_xdg_dir.clone())))
+            .await?;
+        let active_title = active_window_info(&conn, &kwin_unique, &xdg).await.map(|(_, _, geo)| geo.title).unwrap_or_default();
+        let warning = browser_page_unfocused(&conn, &active_title).await.then_some(
+            "the browser page did not have keyboard focus when the key was sent (its window was active), \
+             so the key went to the browser's own UI, such as the address bar, not to the page; \
+             to reach the page, click inside it and send the key again",
+        );
         let guard = self.session.lock().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (mods, main) = parse_combo(&params.key)?;
         for m in &mods {
             sess.eis.key(*m, true).map_err(KwinError::from)?;
         }
@@ -5427,8 +5501,12 @@ impl KwinMcp {
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("key: {}", params.key), serde_json::json!({
-            "action": "key", "key": params.key,
+        let text = match warning {
+            Some(warning) => format!("key: {}. warning: {warning}", params.key),
+            None => format!("key: {}", params.key),
+        };
+        Ok(structured_result(&peer, text, serde_json::json!({
+            "action": "key", "key": params.key, "warning": warning,
         })).await)
     }
 
