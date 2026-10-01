@@ -38,13 +38,17 @@ const SECRET_BACKEND: &str = "org.kde.ksecretd";
 /// App id the snapshot's own handle is opened under.
 const SNAPSHOT_APP: &str = "kwin-mcp-snapshot";
 /// Bound for each host call during the snapshot.
-const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound for the whole snapshot, lock wait excluded.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to wait for another server's snapshot to finish.
-const LOCK_WAIT: Duration = Duration::from_secs(40);
+const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound for each way of reading the wallet.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(6);
+/// Bound for the whole snapshot, lock wait included, inside session_start's
+/// 20 s hard limit.
+const SNAPSHOT_BUDGET: Duration = Duration::from_secs(12);
 /// Minimum gap between two snapshots on this host.
-const SNAPSHOT_SPACING: Duration = Duration::from_secs(5);
+const SNAPSHOT_SPACING: Duration = Duration::from_millis(100);
+/// After kwalletd6 fails to answer, snapshots read ksecretd directly for this
+/// long instead of each waiting out HOST_CALL_TIMEOUT.
+const KWALLETD_BACKOFF: Duration = Duration::from_secs(60);
 /// Limits that keep a runaway wallet from filling the server's memory.
 const MAX_ENTRIES: usize = 20_000;
 const MAX_BYTES: usize = 64 << 20;
@@ -142,6 +146,8 @@ async fn name_has_owner(host: &zbus::Connection, name: &str) -> bool {
 /// directory, and spaces them SNAPSHOT_SPACING apart.
 struct HostSlot {
     file: nix::fcntl::Flock<std::fs::File>,
+    /// Touched when kwalletd6 does not answer; see KWALLETD_BACKOFF.
+    kwalletd_unreachable: std::path::PathBuf,
 }
 
 impl HostSlot {
@@ -152,7 +158,6 @@ impl HostSlot {
             .join("kwin-mcp");
         std::fs::create_dir_all(&directory).map_err(|error| format!("create {}: {error}", directory.display()))?;
         let path = directory.join("wallet-snapshot.lock");
-        let deadline = std::time::Instant::now() + LOCK_WAIT;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -162,7 +167,7 @@ impl HostSlot {
         loop {
             match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
                 Ok(locked) => {
-                    let slot = Self { file: locked };
+                    let slot = Self { file: locked, kwalletd_unreachable: directory.join("kwalletd-unreachable") };
                     let since = slot.file.metadata().and_then(|meta| meta.modified()).ok()
                         .and_then(|time| time.elapsed().ok());
                     if let Some(wait) = since.and_then(|elapsed| SNAPSHOT_SPACING.checked_sub(elapsed)) {
@@ -171,14 +176,27 @@ impl HostSlot {
                     return Ok(slot);
                 }
                 Err((returned, nix::errno::Errno::EWOULDBLOCK)) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err("another kwin-mcp server held the wallet snapshot slot too long".to_owned());
-                    }
                     file = returned;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(SNAPSHOT_SPACING).await;
                 }
                 Err((_, error)) => return Err(format!("lock {}: {error}", path.display())),
             }
+        }
+    }
+
+    fn kwalletd_recently_unreachable(&self) -> bool {
+        std::fs::metadata(&self.kwalletd_unreachable)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|elapsed| elapsed < KWALLETD_BACKOFF)
+    }
+
+    fn mark_kwalletd(&self, unreachable: bool) {
+        if unreachable {
+            let _ = std::fs::write(&self.kwalletd_unreachable, b"");
+        } else {
+            let _ = std::fs::remove_file(&self.kwalletd_unreachable);
         }
     }
 }
@@ -213,27 +231,38 @@ fn unreachable_error(what: &str) -> impl FnOnce(zbus::Error) -> Failure + '_ {
 
 /// Take the one read-only snapshot of the host wallet, or say why not.
 pub async fn snapshot(host: &zbus::Connection) -> Snapshot {
-    let slot = match HostSlot::take().await {
-        Ok(slot) => slot,
-        Err(reason) => return refused(reason),
+    let guarded = async {
+        let slot = HostSlot::take().await?;
+        let outcome = snapshot_locked(host, &slot).await;
+        drop(slot);
+        Ok::<_, String>(outcome)
     };
-    let outcome = snapshot_locked(host).await;
-    drop(slot);
-    outcome
+    match tokio::time::timeout(SNAPSHOT_BUDGET, guarded).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(reason)) => refused(reason),
+        Err(_) => refused(format!("host wallet snapshot did not finish within {} s", SNAPSHOT_BUDGET.as_secs())),
+    }
 }
 
-async fn snapshot_locked(host: &zbus::Connection) -> Snapshot {
+async fn snapshot_locked(host: &zbus::Connection, slot: &HostSlot) -> Snapshot {
     // Diagnostic switch: read from ksecretd even while kwalletd6 answers, to
     // exercise the fallback.
     let why = if std::env::var_os(FROM_SECRET_SERVICE_ENV).is_some() {
         format!("{FROM_SECRET_SERVICE_ENV} is set")
+    } else if slot.kwalletd_recently_unreachable() {
+        format!("host kwalletd6 did not answer within the last {} s", KWALLETD_BACKOFF.as_secs())
     } else {
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, read_via_kwalletd(host)).await {
-            Ok(Ok(snapshot)) => return snapshot,
+        let why = match tokio::time::timeout(SNAPSHOT_TIMEOUT, read_via_kwalletd(host)).await {
+            Ok(Ok(snapshot)) => {
+                slot.mark_kwalletd(false);
+                return snapshot;
+            }
             Ok(Err(Failure::Refused(reason))) => return refused(reason),
             Ok(Err(Failure::Unreachable(reason))) => reason,
             Err(_) => "host kwalletd6 snapshot timed out".to_owned(),
-        }
+        };
+        slot.mark_kwalletd(true);
+        why
     };
     match tokio::time::timeout(SNAPSHOT_TIMEOUT, read_via_secret_service(host, &why)).await {
         Ok(Ok(snapshot)) => snapshot,

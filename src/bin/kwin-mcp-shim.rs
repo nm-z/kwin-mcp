@@ -131,6 +131,54 @@ fn reap(pids: &[u32], deadline: Instant) {
     }
 }
 
+/// Process ids of every peer on the host user bus, from dbus-broker's peer
+/// accounting. None when the bus is not dbus-broker or does not answer within
+/// three seconds, so session_list never waits on a wedged bus.
+fn host_bus_peer_pids() -> Option<Vec<u32>> {
+    let output = std::process::Command::new("timeout")
+        .args(["3", "busctl", "--user", "--json=short", "call", "org.freedesktop.DBus",
+            "/org/freedesktop/DBus", "org.freedesktop.DBus.Debug.Stats", "GetStats"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() { return None }
+    peer_pids(&serde_json::from_slice(&output.stdout).ok()?)
+}
+
+fn peer_pids(stats: &Value) -> Option<Vec<u32>> {
+    let peers = stats.pointer("/data/0/org.bus1.DBus.Debug.Stats.PeerAccounting/data")?.as_array()?;
+    Some(peers.iter()
+        .filter_map(|peer| peer.pointer("/1/ProcessID/data")?.as_u64())
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .collect())
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 4, after the parenthesized command name, which may hold spaces.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// How many of `peers` run inside the process tree of each of `roots`.
+fn peers_under(peers: &[u32], roots: &[u32], parent: impl Fn(u32) -> Option<u32>) -> HashMap<u32, usize> {
+    let mut counts = HashMap::new();
+    for &peer in peers {
+        let mut pid = peer;
+        for _ in 0..64 {
+            if roots.contains(&pid) {
+                *counts.entry(pid).or_insert(0) += 1;
+                break;
+            }
+            match parent(pid) {
+                Some(next) if next > 1 && next != pid => pid = next,
+                _ => break,
+            }
+        }
+    }
+    counts
+}
+
 // ── Events ───────────────────────────────────────────────────────────────
 
 enum Event {
@@ -537,12 +585,18 @@ impl Shim {
             return "No live sessions. session_start creates one and returns its session_id.".to_owned();
         }
         let now = Instant::now();
+        let roots: Vec<u32> = self.children.values().map(|child| child.pid).collect();
+        let bus_peers = host_bus_peer_pids().map(|peers| peers_under(&peers, &roots, parent_pid));
         let mut lines = Vec::new();
         for (session, key) in &self.sessions {
             let Some(child) = self.children.get(key) else { continue };
             let current = if Some(child.build) == self.latest { "current build" } else { "older build (restart the session to update)" };
+            let bus = bus_peers.as_ref().map_or_else(
+                || "unknown".to_owned(),
+                |counts| counts.get(&child.pid).copied().unwrap_or(0).to_string(),
+            );
             lines.push(format!(
-                "{session}: server pid {}, workdir /tmp/kwin-mcp-{}, age {}s, idle {}s, {current}",
+                "{session}: server pid {}, workdir /tmp/kwin-mcp-{}, age {}s, idle {}s, host user-bus connections {bus}, {current}",
                 child.pid, child.pid,
                 now.duration_since(child.spawned).as_secs(),
                 now.duration_since(child.last_used).as_secs(),
@@ -1334,4 +1388,32 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
     drop(shim);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod host_bus_tests {
+    use super::{peer_pids, peers_under};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn broker_stats_yield_every_peer_pid() {
+        let stats = json!({"type":"a{sv}","data":[{"org.bus1.DBus.Debug.Stats.PeerAccounting":{"type":"a(sa{sv}a{su})","data":[
+            [":1.0",{"ProcessID":{"type":"u","data":1082}},{"IncomingFds":0}],
+            [":1.7",{"UnixUserID":{"type":"u","data":1000}},{"IncomingFds":0}],
+            [":1.9",{"ProcessID":{"type":"u","data":4242}},{"IncomingFds":0}]
+        ]}}]});
+        assert_eq!(peer_pids(&stats), Some(vec![1082, 4242]));
+        assert_eq!(peer_pids(&json!({"data":[{}]})), None);
+    }
+
+    #[test]
+    fn peers_count_toward_the_session_whose_tree_holds_them() {
+        let parents = HashMap::from([(30, 20), (20, 10), (21, 10), (10, 1), (40, 1), (50, 11), (11, 1)]);
+        let parent = |pid: u32| parents.get(&pid).copied();
+        let counts = peers_under(&[30, 21, 40, 50, 11], &[10, 11], parent);
+        assert_eq!(counts.get(&10), Some(&2));
+        assert_eq!(counts.get(&11), Some(&2));
+        assert_eq!(counts.len(), 2);
+    }
 }
