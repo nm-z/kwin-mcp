@@ -203,12 +203,49 @@ fn owner() -> &'static str {
 enum Event {
     Client(Value),
     ClientClosed,
+    /// SIGTERM arrived from this process id (0 when the kernel did not say).
+    Terminated(i32),
     Child(u64, Value),
     ChildExited(u64, String),
     BinaryChanged(Stamp),
     /// The watcher saw a source change (true) or finished building it (false).
     Building(bool),
     Tick,
+}
+
+/// Write end of the self-pipe the SIGTERM handler reports senders on.
+static TERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_sigterm(_: nix::libc::c_int, info: *mut nix::libc::siginfo_t, _: *mut nix::libc::c_void) {
+    // Async-signal-safe: one write of the sender's pid.
+    let sender = if info.is_null() { 0 } else { unsafe { (*info).si_pid() } };
+    let fd = TERM_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let bytes = sender.to_ne_bytes();
+        unsafe { nix::libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    }
+}
+
+/// Report every SIGTERM with its sender as Event::Terminated.
+fn watch_sigterm(events: mpsc::UnboundedSender<Event>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::IntoRawFd;
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)?;
+    TERM_PIPE.store(write.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+    let action = nix::sys::signal::SigAction::new(
+        nix::sys::signal::SigHandler::SigAction(on_sigterm),
+        nix::sys::signal::SaFlags::SA_SIGINFO | nix::sys::signal::SaFlags::SA_RESTART,
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &action)? };
+    let mut receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(read)?;
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = [0u8; 4];
+        while receiver.read_exact(&mut bytes).await.is_ok() {
+            if events.send(Event::Terminated(i32::from_ne_bytes(bytes))).is_err() { break }
+        }
+    });
+    Ok(())
 }
 
 // ── Children ─────────────────────────────────────────────────────────────
@@ -1056,6 +1093,23 @@ impl Shim {
         }
         self.idle = None;
     }
+
+    /// SIGTERM from a process other than the client: a cleanup that matched
+    /// this shim. Its sessions are stopped, as the cleanup asked, but the
+    /// client stays connected and can start new ones.
+    fn on_foreign_term(&mut self, sender: i32) {
+        let comm = std::fs::read_to_string(format!("/proc/{sender}/comm")).unwrap_or_default();
+        let reason = format!("pid {sender} ({}) sent SIGTERM; the session was stopped and the connection kept", comm.trim());
+        log(&reason);
+        for (session, key) in std::mem::take(&mut self.sessions) {
+            self.ended.insert(session, reason.clone());
+            self.retire(key);
+            if let Some(child) = self.children.get(&key) {
+                signal(child.pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+        self.publish_tools();
+    }
 }
 
 // ── Hot reload and sweeping ──────────────────────────────────────────────
@@ -1310,6 +1364,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tokio::spawn(watch(repo, release, binary.clone(), event_tx.clone()));
+    watch_sigterm(event_tx.clone())?;
     tokio::spawn(sweeper(binary.clone(), sweep_rx));
     let _ = sweep_tx.send(());
 
@@ -1335,7 +1390,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         shim.ensure_idle();
     }
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let started_under = std::os::unix::process::parent_id();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut deadline: Option<Instant> = None;
@@ -1343,11 +1398,23 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = tokio::select! {
             event = event_rx.recv() => event,
-            _ = sigterm.recv() => Some(Event::ClientClosed),
             _ = sigint.recv() => Some(Event::ClientClosed),
             _ = sighup.recv() => Some(Event::ClientClosed),
         };
         let Some(event) = event else { break };
+        // SIGTERM from the client, or once the client is gone, ends the shim;
+        // from anyone else it only stops the sessions.
+        let event = if let Event::Terminated(sender) = event {
+            let parent = std::os::unix::process::parent_id();
+            if parent != started_under || u32::try_from(sender).is_ok_and(|sender| sender == parent) {
+                Event::ClientClosed
+            } else {
+                shim.on_foreign_term(sender);
+                continue;
+            }
+        } else {
+            event
+        };
         match event {
             Event::Client(message) if shim.upgrading => shim.carried.push(message),
             Event::Client(message) => shim.on_client(message),
@@ -1365,6 +1432,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
             Event::BinaryChanged(build) => shim.on_binary_changed(build),
             Event::Building(active) => shim.on_building(active),
             Event::Tick => shim.on_tick(),
+            Event::Terminated(sender) => shim.on_foreign_term(sender),
         }
         if shim.upgrading && deadline.is_none() {
             deadline = Some(Instant::now() + SHUTDOWN_WAIT);

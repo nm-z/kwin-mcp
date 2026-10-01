@@ -25,25 +25,36 @@ impl RpcClient {
     }
 
     fn start_with_options(delay_stage: Option<&str>) -> Self {
-        Self::start_with_test_options(delay_stage, false, false, &[])
+        Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), delay_stage, false, false, &[])
     }
 
     fn start_with_options_and_stop(
         delay_stage: Option<&str>,
         stop_bwrap: bool,
     ) -> Self {
-        Self::start_with_test_options(delay_stage, stop_bwrap, false, &[])
+        Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), delay_stage, stop_bwrap, false, &[])
     }
 
     fn start_with_first_proxy_failure() -> Self {
-        Self::start_with_test_options(None, false, true, &[])
+        Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), None, false, true, &[])
     }
 
     fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
-        Self::start_with_test_options(None, false, false, extra_env)
+        Self::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), None, false, false, extra_env)
     }
 
-    fn start_with_test_options(
+    fn start_shim() -> Self {
+        Self::start_program(
+            env!("CARGO_BIN_EXE_kwin-mcp-shim"),
+            None,
+            false,
+            false,
+            &[("KWIN_MCP_REPO", "/nonexistent")],
+        )
+    }
+
+    fn start_program(
+        program: &str,
         delay_stage: Option<&str>,
         stop_bwrap: bool,
         fail_after_first_proxy: bool,
@@ -64,7 +75,7 @@ impl RpcClient {
         ] {
             std::fs::create_dir_all(directory).expect("create private test HOME");
         }
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
+        let mut command = Command::new(program);
         command
             .args(["--autoclean"])
             .env("HOME", &home)
@@ -1224,7 +1235,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
     client.stop_process();
 
     // A missing host Wayland display affects viewer_open, not session_start.
-    let mut client = RpcClient::start_with_test_options(None, false, false, &[("WAYLAND_DISPLAY", "kwin-mcp-no-such-display")]);
+    let mut client = RpcClient::start_program(env!("CARGO_BIN_EXE_kwin-mcp"), None, false, false, &[("WAYLAND_DISPLAY", "kwin-mcp-no-such-display")]);
     initialize(&mut client);
     let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
     let content = &started["result"]["structuredContent"];
@@ -1926,4 +1937,57 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
     assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn shim_keeps_the_client_connected_when_another_process_sends_sigterm() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start_shim();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+    let first = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    let shim = client.child.id();
+    let sent = Command::new("kill")
+        .args(["-TERM", &shim.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -TERM {shim} failed");
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        client.child.try_wait().expect("shim status").is_none(),
+        "the shim exited after SIGTERM from another process"
+    );
+
+    let old = call_tool(&mut client, 3, "screenshot", json!({"session_id": first}));
+    let old_text = old["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert_eq!(old["result"]["isError"], true, "{old}");
+    assert!(old_text.contains("sent SIGTERM"), "{old}");
+
+    let restarted = call_tool(&mut client, 4, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(restarted["result"]["structuredContent"]["status"], "started", "{restarted}");
+    let second = restarted["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    assert_ne!(first, second);
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({"session_id": second}));
+    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(shim).expect("shim pid"));
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).expect("SIGTERM from the client");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while client.child.try_wait().expect("shim status").is_none() {
+        assert!(Instant::now() < deadline, "the shim ignored SIGTERM from its client");
+        thread::sleep(Duration::from_millis(200));
+    }
 }
