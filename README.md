@@ -108,6 +108,8 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+
 ### Two-phase D-Bus startup
 
 1. bwrap starts, dbus-daemon creates session bus
