@@ -76,6 +76,8 @@ const DBUS_PROXY_POLL: Duration = Duration::from_millis(20);
 
 // KWin unique-name discovery: per-candidate introspect probe timeout.
 const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+// Detailed ListNames and probe operations share this start/end log budget.
+const KWIN_DISCOVERY_LOG_LIMIT: usize = 64;
 
 // AT-SPI tree traversal hard timeout (find_ui_elements).
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1566,8 +1568,8 @@ impl KwinMcp {
             display,
         }
     }
-    fn set_start_stage(&self, stage: &'static str) {
-        eprintln!("session_start: stage: {stage}");
+    fn set_start_stage(&self, stage: &'static str, attempt: &SessionStartAttempt) {
+        attempt.log(format_args!("stage: {stage}"));
         if let Ok(mut current) = self.start_stage.lock() {
             *current = stage;
         }
@@ -3435,12 +3437,29 @@ fn append_session_start_outcome(started: std::time::Instant, error: Option<&str>
 
 struct SessionStartAttempt {
     started: std::time::Instant,
+    outer_deadline: tokio::time::Instant,
     recorded: bool,
 }
 
 impl SessionStartAttempt {
     fn new() -> Self {
-        Self { started: std::time::Instant::now(), recorded: false }
+        let started = std::time::Instant::now();
+        let outer_deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        Self {
+            started,
+            outer_deadline,
+            recorded: false,
+        }
+    }
+
+    fn log(&self, checkpoint: impl std::fmt::Display) {
+        let elapsed = self.started.elapsed();
+        let remaining = self.outer_deadline.saturating_duration_since(tokio::time::Instant::now());
+        eprintln!(
+            "session_start: {checkpoint} attempt_elapsed_ms={} outer_remaining_ms={}",
+            elapsed.as_millis(),
+            remaining.as_millis(),
+        );
     }
 
     fn finish(&mut self, error: Option<&str>) {
@@ -3458,6 +3477,34 @@ impl Drop for SessionStartAttempt {
         if !self.recorded {
             let _ = append_session_start_outcome(self.started, Some("cancelled"));
         }
+    }
+}
+
+struct DiscoveryLogBudget<'a> {
+    attempt: &'a SessionStartAttempt,
+    logged: usize,
+    suppressed: usize,
+}
+
+impl DiscoveryLogBudget<'_> {
+    fn admit_operation(&mut self) -> bool {
+        if self.logged < KWIN_DISCOVERY_LOG_LIMIT {
+            self.logged += 1;
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+}
+
+impl Drop for DiscoveryLogBudget<'_> {
+    fn drop(&mut self) {
+        self.attempt.log(format_args!(
+            "KWin discovery log summary logged_operations={} suppressed_operations={}",
+            self.logged,
+            self.suppressed,
+        ));
     }
 }
 
@@ -3551,7 +3598,8 @@ impl KwinMcp {
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
         let mut attempt = SessionStartAttempt::new();
-        let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        let deadline = attempt.outer_deadline;
+        attempt.log("waiting for the lifecycle gate");
         let gate = match self.lifecycle_gate(deadline, "session_start").await {
             Ok(gate) => gate,
             Err(error) => {
@@ -3602,9 +3650,9 @@ impl KwinMcp {
                 })).await);
             }
         }
-        self.set_start_stage("preparing the session workdir");
+        self.set_start_stage("preparing the session workdir", &attempt);
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
-        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone())).await {
+        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone(), &attempt)).await {
             Ok(res) => res,
             Err(_) => {
                 let stage = self.start_stage();
@@ -3612,7 +3660,7 @@ impl KwinMcp {
                     "session_start exceeded {}s hard limit while {stage}",
                     SESSION_START_HARD_TIMEOUT.as_secs()
                 );
-                eprintln!("session_start: {message}");
+                attempt.log(&message);
                 let blocked = host_work.lock().ok().and_then(|mut slot| slot.take()).filter(|handle| !handle.is_finished());
                 if let Some(handle) = blocked {
                     // A host call is still blocked in the kernel and may yet
@@ -3652,6 +3700,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: SessionStartParams,
         host_work: HostWork,
+        attempt: &SessionStartAttempt,
     ) -> Result<CallToolResult, McpError> {
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -3769,7 +3818,7 @@ impl KwinMcp {
         // a blocking thread so the hard limit can still answer; the handle
         // stays in `host_work` so a timed-out start defers workdir cleanup
         // until this thread has stopped writing into it.
-        self.set_start_stage("scanning host mounts, sockets, and processes");
+        self.set_start_stage("scanning host mounts, sockets, and processes", attempt);
         let (view_tx, view_rx) = tokio::sync::oneshot::channel();
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
@@ -3857,7 +3906,14 @@ impl KwinMcp {
             export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n\
-            mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
+            mkdir -p /tmp/fontconfig-cache && {{\n\
+                kwin_mcp_fc_started=$EPOCHREALTIME\n\
+                printf 'session_start: fc-cache start epoch_s=%s\\n' \"$kwin_mcp_fc_started\" >&2\n\
+                fc-cache -f 2>/dev/null\n\
+                kwin_mcp_fc_status=$?\n\
+                kwin_mcp_fc_ended=$EPOCHREALTIME\n\
+                printf 'session_start: fc-cache end epoch_s=%s elapsed_us=%s exit_code=%s\\n' \"$kwin_mcp_fc_ended\" \"$((10#${{kwin_mcp_fc_ended/./}} - 10#${{kwin_mcp_fc_started/./}}))\" \"$kwin_mcp_fc_status\" >&2\n\
+            }}\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
@@ -3865,8 +3921,11 @@ impl KwinMcp {
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            kwin_mcp_kwin_launch=$EPOCHREALTIME\n\
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
+            kwin_mcp_kwin_pid=$!\n\
+            printf 'session_start: KWin launched pid=%s launch_started_epoch_s=%s launched_epoch_s=%s\\n' \"$kwin_mcp_kwin_pid\" \"$kwin_mcp_kwin_launch\" \"$EPOCHREALTIME\" >&2\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
@@ -3891,7 +3950,7 @@ impl KwinMcp {
         // Begin ownership before the first proxy is spawned. Any failure or
         // cancellation between proxy acquisitions is therefore still covered.
         let mut startup = StartupResources::new();
-        self.set_start_stage("starting host D-Bus proxies");
+        self.set_start_stage("starting host D-Bus proxies", attempt);
         let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
         match spawn_dbus_proxy(
             "unix:path=/run/dbus/system_bus_socket",
@@ -3926,7 +3985,7 @@ impl KwinMcp {
         // Session apps reach KWallet through a session-local service on a private
         // bus (see wallet_mediator): a one-time guarded snapshot of the host
         // wallet, then answers from memory; the host is never contacted again.
-        self.set_start_stage("starting the KWallet mediator");
+        self.set_start_stage("starting the KWallet mediator", attempt);
         let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
         let wallet_bus_config = host_xdg_dir.join("kwallet-bus.conf");
         if let Err(error) = std::fs::write(&wallet_bus_config, format!(
@@ -4167,7 +4226,7 @@ impl KwinMcp {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
-        self.set_start_stage("spawning the pasta and bwrap sandbox");
+        self.set_start_stage("spawning the pasta and bwrap sandbox", attempt);
         let sandbox_child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => return cleanup_err(format!("start pasta: {error} (install passt)"), &mut startup),
@@ -4178,7 +4237,7 @@ impl KwinMcp {
             && let Err(error) = self.workdir.mark_sandbox(sandbox_pid) {
                 return cleanup_err(format!("record sandbox owner: {error}"), &mut startup);
             }
-        eprintln!("session_start: pasta spawned pid={sandbox_pid:?}");
+        attempt.log(format_args!("pasta spawned pid={sandbox_pid:?}"));
         if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
         }
@@ -4193,7 +4252,7 @@ impl KwinMcp {
         test_startup_delay("after-bwrap").await;
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
         let dbus_ready_path = host_xdg_dir.join("dbus-ready");
-        self.set_start_stage("waiting for the container D-Bus daemon");
+        self.set_start_stage("waiting for the container D-Bus daemon", attempt);
         if let Err(e) = wait_for_socket(
             &dbus_ready_path,
             "dbus-ready marker",
@@ -4201,12 +4260,12 @@ impl KwinMcp {
         ).await {
             return cleanup_err(e, &mut startup);
         }
-        eprintln!("session_start: dbus-ready");
+        attempt.log("dbus-ready");
         let bus_addr = format!("unix:path={xdg_dir_str}/bus");
 
         // Create proxy_conn: claims org.kde.KWin, registers InputDevice objects
         // This must happen BEFORE KWin starts so we own the well-known name
-        eprintln!("session_start: creating proxy_conn");
+        attempt.log("creating proxy_conn");
         let proxy_conn =
             match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
             {
@@ -4217,7 +4276,7 @@ impl KwinMcp {
         if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
             return cleanup_err(format!("claim org.kde.KWin: {e}"), &mut startup);
         }
-        eprintln!("session_start: proxy_conn owns org.kde.KWin");
+        attempt.log("proxy_conn owns org.kde.KWin");
 
         // Register InputDevice objects on proxy_conn
         let mouse_sysname = mouse_evdev
@@ -4235,12 +4294,12 @@ impl KwinMcp {
         if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
             return cleanup_err(format!("register input devices: {e}"), &mut startup);
         }
-        eprintln!("session_start: input devices registered on proxy_conn");
+        attempt.log("input devices registered on proxy_conn");
 
         // Signal bridge-ready so the entrypoint starts KWin
         let bridge_ready_path = host_xdg_dir.join("bridge-ready");
         std::fs::write(&bridge_ready_path, "").map_err(|e| ver_err(format!("write bridge-ready: {e}")))?;
-        eprintln!("session_start: bridge-ready signaled, KWin starting");
+        attempt.log("bridge-ready signaled, KWin starting");
 
         // Create kwin_conn: separate connection for talking to KWin
         let kwin_conn =
@@ -4252,7 +4311,7 @@ impl KwinMcp {
 
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
         let wayland_socket = host_xdg_dir.join("wayland-0");
-        self.set_start_stage("waiting for KWin's Wayland socket");
+        self.set_start_stage("waiting for KWin's Wayland socket", attempt);
         if let Err(e) = wait_for_socket(
             &wayland_socket,
             "wayland-0 socket",
@@ -4260,10 +4319,15 @@ impl KwinMcp {
         ).await {
             return cleanup_err(e, &mut startup);
         }
-        eprintln!("session_start: wayland-0 ready");
+        attempt.log("wayland-0 ready");
 
         // Discover KWin's unique bus name — try each unique name for EIS interface
-        eprintln!("session_start: discovering KWin unique name");
+        self.set_start_stage("discovering KWin unique name", attempt);
+        let mut discovery_logs = DiscoveryLogBudget {
+            attempt,
+            logged: 0,
+            suppressed: 0,
+        };
         let dbus_proxy = zbus::fdo::DBusProxy::new(&kwin_conn)
             .await
             .map_err(|e| ver_err(format!("DBus proxy: {e}")))?;
@@ -4275,14 +4339,33 @@ impl KwinMcp {
         let kwin_conn_unique = kwin_conn.unique_name()
             .map(|n| n.to_string()).unwrap_or_default();
         loop {
-            let names = dbus_proxy.list_names().await
-                .map_err(|e| ver_err(format!("ListNames: {e}")))?;
+            let list_names_started = std::time::Instant::now();
+            let log_list_names = discovery_logs.admit_operation();
+            if log_list_names {
+                attempt.log("ListNames start");
+            }
+            let names = dbus_proxy.list_names().await;
+            if log_list_names {
+                attempt.log(format_args!(
+                    "ListNames end elapsed_ms={} result={}",
+                    list_names_started.elapsed().as_millis(),
+                    if names.is_ok() { "ok" } else { "dbus_error" },
+                ));
+            }
+            let names = names.map_err(|e| ver_err(format!("ListNames: {e}")))?;
             let mut found = None;
-            for name in &names {
+            for (candidate_index, name) in names.iter().enumerate() {
                 let name_str = name.as_str();
                 if !name_str.starts_with(':') { continue; }
                 if name_str == proxy_unique || name_str == kwin_conn_unique { continue; }
                 // Quick probe with timeout — Introspect the EIS path
+                let probe_started = std::time::Instant::now();
+                let log_probe = discovery_logs.admit_operation();
+                if log_probe {
+                    attempt.log(format_args!(
+                        "EIS probe start candidate_index={candidate_index} bus={name_str}"
+                    ));
+                }
                 let probe_result = tokio::time::timeout(
                     KWIN_NAME_PROBE_TIMEOUT,
                     async {
@@ -4296,8 +4379,19 @@ impl KwinMcp {
                         Ok::<String, zbus::Error>(r.0)
                     }
                 ).await;
-                if let Ok(Ok(xml)) = probe_result
-                    && xml.contains("connectToEIS") {
+                let (result_class, matched) = match probe_result {
+                    Ok(Ok(xml)) if xml.contains("connectToEIS") => ("match", true),
+                    Ok(Ok(_)) => ("nonmatch", false),
+                    Ok(Err(_)) => ("dbus_error", false),
+                    Err(_) => ("timeout", false),
+                };
+                if log_probe {
+                    attempt.log(format_args!(
+                        "EIS probe end candidate_index={candidate_index} bus={name_str} probe_elapsed_ms={} result={result_class}",
+                        probe_started.elapsed().as_millis(),
+                    ));
+                }
+                if matched {
                     found = Some(name_str.to_owned());
                     break;
                 }
@@ -4311,10 +4405,11 @@ impl KwinMcp {
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
-        eprintln!("session_start: KWin unique name = {kwin_unique_name}");
+        drop(discovery_logs);
+        attempt.log(format_args!("KWin unique name = {kwin_unique_name}"));
 
         // Connect to KWin EIS using its unique name
-        self.set_start_stage("connecting to KWin EIS input");
+        self.set_start_stage("connecting to KWin EIS input", attempt);
         let eis_builder = KWinEisProxy::builder(&kwin_conn)
             .destination(kwin_unique_name.as_str())
             .map_err(|e| ver_err(format!("EIS proxy builder: {e}")))?;
@@ -4326,14 +4421,14 @@ impl KwinMcp {
             Ok(r) => r,
             Err(e) => return cleanup_err(format!("connectToEIS: {e}"), &mut startup),
         };
-        eprintln!("session_start: EIS fd received, negotiating");
+        attempt.log("EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
         let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
             Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), &mut startup),
             Err(e) => return cleanup_err(format!("EIS task: {e}"), &mut startup),
         };
-        eprintln!("session_start: EIS ready");
+        attempt.log("EIS ready");
 
         let atspi_bus_address = atspi::proxy::bus::BusProxy::new(&kwin_conn)
             .await

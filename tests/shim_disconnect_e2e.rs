@@ -23,6 +23,9 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const POLL_PAUSE: Duration = Duration::from_millis(20);
 const POST_EXIT_OBSERVE: Duration = Duration::from_secs(4);
 const PROOF_INTERVAL: Duration = Duration::from_millis(500);
+const STARTUP_SAMPLES: &str = "startup-probe-samples.jsonl";
+const STARTUP_RECEIPT: &str = "startup-probe-result.json";
+const STARTUP_HARD_LIMIT: Duration = Duration::from_secs(20);
 const TTL_WAIT: Duration = Duration::from_secs(90);
 const TTL_POLL_PAUSE: Duration = Duration::from_millis(500);
 const TTL_MINUTES: &str = "1";
@@ -93,6 +96,8 @@ impl PrivateHome {
             "stderr.log",
             "scoped-sweep.log",
             "startup-response.json",
+            STARTUP_SAMPLES,
+            STARTUP_RECEIPT,
             SERVER_INVOCATIONS,
             RESISTANT_PID,
             TTL_RECEIPTS,
@@ -675,6 +680,7 @@ struct Connection {
     shim: i32,
     endpoint: Endpoint,
     home: PrivateHome,
+    startup_probe_started: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1200,6 +1206,7 @@ impl Connection {
             buffered: Vec::new(),
             endpoint,
             home,
+            startup_probe_started: None,
         };
         if launcher {
             let deadline = Instant::now() + EXIT_WAIT;
@@ -1601,6 +1608,38 @@ impl Connection {
         Ok(())
     }
 
+    fn record_startup_sample(&self, started: Instant, phase: &str) -> TestResult {
+        let processes: Vec<_> = self.recorded_tree().iter().map(|process| {
+            let stat = process.stat();
+            json!({
+                "pid": process.pid,
+                "starttime": process.starttime,
+                "comm": process.comm,
+                "identity_observed": stat.is_some(),
+                "state": stat.as_ref().map(|stat| stat.state.to_string()),
+                "ppid": stat.as_ref().map(|stat| stat.ppid),
+                "zombie_wait_status": stat.as_ref().filter(|stat| stat.state == 'Z').and_then(|stat| stat.exit_code),
+            })
+        }).collect();
+        let mut samples = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.home.0.join(STARTUP_SAMPLES))?;
+        writeln!(
+            samples,
+            "{}",
+            json!({
+                "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                "client_elapsed_ms": started.elapsed().as_millis(),
+                "phase": phase,
+                "processes": processes,
+                "loadavg": std::fs::read_to_string("/proc/loadavg").ok(),
+            })
+        )?;
+        samples.flush()?;
+        Ok(())
+    }
+
     fn disconnect_input(&mut self) {
         // Drop the only writer into the actual client-to-shim pipe.
         self.input.take();
@@ -1701,6 +1740,9 @@ impl Connection {
         loop {
             if std::env::var_os(PROOF_DIR_ENV).is_some() && Instant::now() >= next_proof {
                 self.processes.capture_tree()?;
+                if let Some(started) = self.startup_probe_started {
+                    self.record_startup_sample(started, "awaiting_response")?;
+                }
                 // Snapshot available compositor logs before a failed startup
                 // can autoclean its workdir. The merged stderr is copied too.
                 self.retain_proof()?;
@@ -2740,4 +2782,169 @@ fn launching_client_fixture() -> TestResult {
         );
         thread::sleep(POLL_PAUSE);
     }
+}
+
+#[test]
+#[ignore = "one owned headless startup diagnostic call; requires KWIN_MCP_E2E=1, both binary overrides, and proof receipts; no viewer"]
+fn headless_startup_records_precleanup_trace() -> TestResult {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    for name in ["KWIN_MCP_E2E_SHIM", "KWIN_MCP_E2E_SERVER", PROOF_DIR_ENV] {
+        assert!(
+            std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+            "startup trace proof requires {name}"
+        );
+    }
+    let mut connection = Connection::start(false)?;
+    let started = Instant::now();
+    connection.startup_probe_started = Some(started);
+    let response = connection.rpc(
+        2,
+        "tools/call",
+        json!({"name":"session_start","arguments":{"width":800,"height":600}}),
+    )?;
+    let elapsed_ms = started.elapsed().as_millis();
+    connection.startup_probe_started = None;
+    connection.processes.capture_tree()?;
+    connection.record_startup_sample(started, "response_received")?;
+    std::fs::write(
+        connection.home.0.join("startup-response.json"),
+        serde_json::to_vec_pretty(&response)?,
+    )?;
+    connection.retain_proof()?;
+    let succeeded = response["result"]["structuredContent"]["status"] == "started";
+    let timed_out = response["error"]["data"]["reason"] == "hard_timeout";
+    let mut stopped = None;
+    if succeeded {
+        let content = &response["result"]["structuredContent"];
+        assert_eq!(content["viewer"]["state"], "closed", "{response}");
+        assert_eq!(content["width"], 800, "{response}");
+        assert_eq!(content["height"], 600, "{response}");
+        assert!(connection.processes.owned.values().any(|process| {
+            process.comm == "kwin_wayland"
+                && process
+                    .stat()
+                    .is_some_and(|stat| !matches!(stat.state, 'Z' | 'X'))
+        }));
+        let session_id = content["session_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("successful startup has no session ID"))?;
+        let reply = connection.rpc(
+            3,
+            "tools/call",
+            json!({"name":"session_stop","arguments":{"session_id":session_id}}),
+        )?;
+        assert_eq!(
+            reply["result"]["structuredContent"]["status"], "cleaned",
+            "{reply}"
+        );
+        stopped = Some(reply);
+    }
+    let recorded = connection.recorded_tree();
+    connection.disconnect_input();
+    connection.wait_for_exit(LIVE_EXIT_WAIT);
+    let mut checked_paths = Vec::new();
+    for process in recorded.iter().filter(|process| process.comm == "kwin-mcp") {
+        for root in [
+            PathBuf::from(LIVE_SOCKET_ROOT),
+            connection.home.0.join(".cache/kwin-mcp"),
+        ] {
+            let path = root.join(format!("kwin-mcp-{}", process.pid));
+            assert_absent(&path)?;
+            checked_paths.push(path);
+        }
+    }
+    let samples = std::fs::read_to_string(connection.home.0.join(STARTUP_SAMPLES))?;
+    let samples: Vec<Value> = samples
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let sample_count = samples.len();
+    let mut kwin_before_cleanup = Vec::new();
+    for sample in &samples {
+        let before_cleanup = succeeded
+            || (timed_out
+                && sample["phase"] == "awaiting_response"
+                && sample["client_elapsed_ms"]
+                    .as_u64()
+                    .is_some_and(|elapsed| u128::from(elapsed) < STARTUP_HARD_LIMIT.as_millis()));
+        if before_cleanup && let Some(processes) = sample["processes"].as_array() {
+            for process in processes.iter().filter(|process| {
+                process["comm"] == "kwin_wayland" && process["identity_observed"] == true
+            }) {
+                kwin_before_cleanup.push(json!({
+                    "sample_unix_ms": sample["unix_ms"],
+                    "client_elapsed_ms": sample["client_elapsed_ms"],
+                    "phase": sample["phase"],
+                    "process": process,
+                }));
+            }
+        }
+    }
+    let receipt = json!({
+        "startup_outcome": if succeeded { "started" } else if timed_out { "hard_timeout" } else { "setup_error" },
+        "start_calls": 1,
+        "client_elapsed_ms": elapsed_ms,
+        "requested_display": [800, 600],
+        "live_tmpdir": LIVE_SOCKET_ROOT,
+        "response": response,
+        "stop_response": stopped,
+        "sample_count": sample_count,
+        "kwin_precleanup_coverage": if kwin_before_cleanup.is_empty() { "unknown" } else { "observed" },
+        "kwin_precleanup_observations": kwin_before_cleanup,
+        "missing_process_state": "unavailable_or_identity_mismatch_not_exit_proof",
+        "missing_zombie_wait_status": "exit_status_unknown",
+        "recorded_processes_after_exit": connection.process_receipts(),
+        "checked_absent_paths": checked_paths,
+        "viewer_open_calls": 0,
+    });
+    std::fs::write(
+        connection.home.0.join(STARTUP_RECEIPT),
+        serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    connection.retain_proof()?;
+    eprintln!("startup trace receipt: {receipt}");
+    assert!(
+        !checked_paths.is_empty(),
+        "no owned server paths were checked"
+    );
+    assert!(
+        sample_count > 0,
+        "startup has no pre-response process samples"
+    );
+    assert!(
+        succeeded || timed_out,
+        "setup failure excluded from startup acceptance: {response}"
+    );
+    if succeeded {
+        assert!(
+            !kwin_before_cleanup.is_empty(),
+            "successful startup has no pre-stop KWin sample"
+        );
+    }
+    let log = connection.log();
+    assert!(log.contains("attempt_elapsed_ms="), "{log}");
+    assert!(log.contains("outer_remaining_ms="), "{log}");
+    if log.contains("session_start: wayland-0 ready") {
+        assert!(log.contains("stage: discovering KWin unique name"), "{log}");
+    }
+    if timed_out
+        && log.contains("stage: discovering KWin unique name")
+        && !log.contains("stage: connecting to KWin EIS input")
+    {
+        assert_eq!(
+            response["error"]["data"]["stage"],
+            "discovering KWin unique name"
+        );
+    }
+    if succeeded {
+        for checkpoint in [
+            "fc-cache start",
+            "fc-cache end",
+            "KWin launched",
+            "ListNames start",
+        ] {
+            assert!(log.contains(checkpoint), "missing {checkpoint}: {log}");
+        }
+    }
+    Ok(())
 }
