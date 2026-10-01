@@ -1803,7 +1803,10 @@ fn assert_cancelled_held_start(cancelled: Value, surviving: Value) -> TestResult
     File::open(&source)?.set_modified(SystemTime::now())?;
     let cargo = connection.held_start_process(HELD_START_CARGO_IDENTITY)?;
     let process = procfs::process::Process::new(cargo.pid)?;
-    assert_eq!(process.cwd()?, connection.home.0.join(WATCHED_PROJECT));
+    assert_eq!(
+        process.cwd()?,
+        connection.home.0.join(WATCHED_PROJECT).canonicalize()?
+    );
     let argv = process.cmdline()?;
     let build = argv
         .iter()
@@ -2047,7 +2050,10 @@ fn stdin_eof_drains_running_cargo_wrapper_and_its_descendants() -> TestResult {
     )?;
     let (helper, descendant) = connection.background_helpers()?;
     let process = procfs::process::Process::new(helper.pid)?;
-    assert_eq!(process.cwd()?, connection.home.0.join(WATCHED_PROJECT));
+    assert_eq!(
+        process.cwd()?,
+        connection.home.0.join(WATCHED_PROJECT).canonicalize()?
+    );
     let argv = process.cmdline()?;
     let build = argv
         .iter()
