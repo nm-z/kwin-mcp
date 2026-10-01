@@ -1835,11 +1835,10 @@ fn forward_input(
         WindowEvent::KeyboardInput { event: key, .. } => {
             let PhysicalKey::Code(kc) = key.physical_key else { return };
             let Some(evdev) = key_code_to_evdev(kc) else { return };
-            let pressed = matches!(key.state, ElementState::Pressed);
-            if pressed {
+            let Some(op) = key_op(evdev, key.state, key.repeat) else { return };
+            if matches!(key.state, ElementState::Pressed) {
                 state.held_keys.insert(evdev);
-                if !key.repeat
-                    && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
+                if let Some(chord) = clipboard_chord(evdev, &state.held_keys)
                     && let Some(bridge) = state.clipboard.as_mut()
                     && let Err(error) = bridge.before(chord)
                 {
@@ -1848,10 +1847,16 @@ fn forward_input(
             } else {
                 state.held_keys.remove(&evdev);
             }
-            state.out.send(Op::Key(evdev, if pressed { 1 } else { 0 }));
+            state.out.send(op);
         }
         _ => {}
     }
+}
+
+/// The record for one host key event. Host auto-repeats send nothing: the
+/// session's clients repeat a held key themselves from wl_keyboard.repeat_info.
+fn key_op(evdev: u32, state: ElementState, repeat: bool) -> Option<Op> {
+    (!repeat).then(|| Op::Key(evdev, u32::from(matches!(state, ElementState::Pressed))))
 }
 
 fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
@@ -2113,6 +2118,15 @@ mod wire_tests {
         }
         assert!(Op::decode(&mut input)?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn host_auto_repeat_sends_nothing() {
+        let held = key_op(30, ElementState::Pressed, false);
+        assert!(held.is_some_and(|op| same(op, Op::Key(30, 1))));
+        assert!(key_op(30, ElementState::Pressed, true).is_none());
+        let released = key_op(30, ElementState::Released, false);
+        assert!(released.is_some_and(|op| same(op, Op::Key(30, 0))));
     }
 
     #[test]
