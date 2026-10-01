@@ -1274,8 +1274,21 @@ fn reexec(path: &Path, args: &[String], client_params: Option<Value>, ended: &Ha
 
 // ── Main ─────────────────────────────────────────────────────────────────
 
+/// The path the client started the shim by, unresolved, when it names a
+/// file. It keeps naming the installed shim after its directory is moved or
+/// swapped, which the resolved /proc/self/exe does not.
+fn launch_path(argv0: Option<&std::ffi::OsStr>, cwd: &Path, exe: PathBuf) -> PathBuf {
+    argv0.map(Path::new)
+        .filter(|path| path.components().count() > 1)
+        .map(|path| cwd.join(path))
+        .filter(|path| path.is_file())
+        .unwrap_or(exe)
+}
+
 fn locate() -> Result<(PathBuf, PathBuf, Option<PathBuf>, bool), String> {
     let exe = std::env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let exe = launch_path(std::env::args_os().next().as_deref(), &cwd, exe);
     let dir = exe.parent().ok_or("shim executable has no directory")?.to_path_buf();
     let binary = std::env::var_os("KWIN_MCP_BINARY").map(PathBuf::from).unwrap_or_else(|| dir.join("kwin-mcp"));
     let release = dir.file_name().is_some_and(|name| name == "release");
@@ -1505,5 +1518,34 @@ mod host_bus_tests {
         assert_eq!(counts.get(&10), Some(&2));
         assert_eq!(counts.get(&11), Some(&2));
         assert_eq!(counts.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod launch_path_tests {
+    use super::launch_path;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn shim_path_is_the_one_the_client_launched() -> std::io::Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!("kwin-mcp-shim-launch-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real"))?;
+        std::fs::write(dir.join("real/kwin-mcp-shim"), b"")?;
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link"))?;
+        let exe = PathBuf::from("/resolved/kwin-mcp-shim");
+        let launched = dir.join("link/kwin-mcp-shim");
+        assert_eq!(launch_path(Some(launched.as_os_str()), Path::new("/"), exe.clone()), launched);
+        assert_eq!(
+            launch_path(Some(OsStr::new("./kwin-mcp-shim")), &dir.join("link"), exe.clone()),
+            dir.join("link/./kwin-mcp-shim")
+        );
+        assert_eq!(launch_path(Some(OsStr::new("kwin-mcp-shim")), &dir.join("link"), exe.clone()), exe);
+        assert_eq!(launch_path(Some(dir.join("gone/kwin-mcp-shim").as_os_str()), Path::new("/"), exe.clone()), exe);
+        assert_eq!(launch_path(None, Path::new("/"), exe.clone()), exe);
+        std::fs::remove_dir_all(&dir)
     }
 }
