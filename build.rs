@@ -19,18 +19,22 @@ fn watch_git_identity() {
     if Path::new(".git").is_file() {
         watch(Path::new(".git"));
     }
-    for name in ["HEAD", "packed-refs"] {
-        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
-            let path = Path::new(&path);
-            if path.exists() {
-                watch(path);
-            }
+    if let Some(path) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        let path = Path::new(&path);
+        if path.exists() {
+            watch(path);
         }
     }
     if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"])
         && let Some(path) = git(&["rev-parse", "--git-path", &reference])
     {
         let mut path = PathBuf::from(path);
+        if !path.exists()
+            && let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"])
+            && Path::new(&packed).exists()
+        {
+            watch(Path::new(&packed));
+        }
         while !path.exists() {
             if !path.pop() {
                 return;
