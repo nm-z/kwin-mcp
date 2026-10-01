@@ -98,10 +98,10 @@ const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LAUNCH_WINDOW_POLLS: u32 = 75;  // 15s total
 
-// KWin can close a capture pipe before the advertised frame is complete while
-// several isolated sessions capture concurrently. Retry only that short-read
-// boundary instead of retrying arbitrary D-Bus or compositor failures.
-const SCREENSHOT_CAPTURE_ATTEMPTS: u32 = 3;
+// KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
+// it when a non-blocking pipe is full at close. Frames are captured into a
+// memfd instead, which never blocks a write; the fill is checked this often.
+const SCREENSHOT_FILL_POLL: Duration = Duration::from_millis(5);
 
 // A screenshot shortly after input waits for the app to handle it and repaint:
 // it polls frames until the screen has been unchanged for SCREENSHOT_SETTLE_QUIET,
@@ -2288,7 +2288,7 @@ struct SettleReport {
 
 type Frame = (u32, u32, u32, Vec<u8>);
 
-/// One complete CaptureScreen frame, retrying short pipe reads.
+/// One complete CaptureScreen frame.
 async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
     tokio::time::timeout(SCREENSHOT_FRAME_TIMEOUT, capture_frame_inner(proxy))
         .await
@@ -2300,75 +2300,46 @@ async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpErr
         })?
 }
 
-async fn read_frame_pixels(
-    read_fd: std::os::fd::OwnedFd,
-    expected: usize,
-) -> Result<Vec<u8>, McpError> {
-    nix::fcntl::fcntl(
-        &read_fd,
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .map_err(KwinError::from)?;
-    let reader = tokio::io::unix::AsyncFd::new(read_fd).map_err(KwinError::from)?;
-    let mut pixels = vec![0; expected];
-    let mut received = 0;
-    while received < expected {
-        let mut ready = reader.readable().await.map_err(KwinError::from)?;
-        match ready.try_io(|fd| {
-            nix::unistd::read(fd.get_ref(), &mut pixels[received..]).map_err(std::io::Error::from)
-        }) {
-            Ok(Ok(0)) => break,
-            Ok(Ok(size)) => received += size,
-            Ok(Err(error)) => return Err(KwinError::from(error).into()),
-            Err(_) => continue,
-        }
+/// The frame KWin writes into `frame`, once all `expected` bytes are there.
+async fn read_frame_file(frame: &std::fs::File, expected: usize) -> Result<Vec<u8>, McpError> {
+    use std::os::unix::fs::FileExt;
+    let expected_len = u64::try_from(expected).map_err(KwinError::from)?;
+    while frame.metadata().map_err(KwinError::from)?.len() < expected_len {
+        tokio::time::sleep(SCREENSHOT_FILL_POLL).await;
     }
-    pixels.truncate(received);
+    let mut pixels = vec![0; expected];
+    frame.read_exact_at(&mut pixels, 0).map_err(KwinError::from)?;
     Ok(pixels)
 }
 
 async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
-    let mut last_size = None;
-    for attempt in 1..=SCREENSHOT_CAPTURE_ATTEMPTS {
-        let (read_fd, write_fd) = nix::unistd::pipe().map_err(KwinError::from)?;
-        let pipe_fd = zbus::zvariant::OwnedFd::from(write_fd);
-        let mut opts = std::collections::HashMap::new();
-        opts.insert("include-cursor", zbus::zvariant::Value::from(true));
-        opts.insert("include-decoration", zbus::zvariant::Value::from(true));
-        opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
-        // CaptureScreen composites all surfaces including popups (xdg_popup menus);
-        // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
-        let meta = proxy
-            .capture_screen("Virtual-0", opts, pipe_fd)
-            .await
-            .map_err(KwinError::from)?;
-        let get_u32 = |k: &str| -> Result<u32, McpError> {
-            let val = meta
-                .get(k)
-                .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
-            let n: u32 = val.try_into().map_err(KwinError::from)?;
-            Ok(n)
-        };
-        let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
-        let expected =
-            usize::try_from(u64::from(stride) * u64::from(height)).map_err(KwinError::from)?;
-        let pixels = read_frame_pixels(read_fd, expected).await?;
-        let received = pixels.len();
-        if received == expected {
-            return Ok((width, height, stride, pixels));
-        }
-        last_size = Some((expected, received));
-        eprintln!(
-            "screenshot: incomplete pixel buffer on attempt {attempt}/{SCREENSHOT_CAPTURE_ATTEMPTS}: expected {expected} bytes, received {received}"
-        );
-    }
-    let (expected, received) = last_size.unwrap_or((0, 0));
-    Err(McpError::internal_error(
-        format!(
-            "screenshot: incomplete pixel buffer after {SCREENSHOT_CAPTURE_ATTEMPTS} attempts (expected {expected} bytes, received {received})"
-        ),
-        None,
-    ))
+    let frame = std::fs::File::from(
+        nix::sys::memfd::memfd_create("kwin-mcp-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+            .map_err(KwinError::from)?,
+    );
+    let writer = std::os::fd::OwnedFd::from(frame.try_clone().map_err(KwinError::from)?);
+    let mut opts = std::collections::HashMap::new();
+    opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+    opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+    opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
+    // CaptureScreen composites all surfaces including popups (xdg_popup menus);
+    // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
+    let meta = proxy
+        .capture_screen("Virtual-0", opts, zbus::zvariant::OwnedFd::from(writer))
+        .await
+        .map_err(KwinError::from)?;
+    let get_u32 = |k: &str| -> Result<u32, McpError> {
+        let val = meta
+            .get(k)
+            .ok_or_else(|| McpError::internal_error(format!("screenshot: no {k}"), None))?;
+        let n: u32 = val.try_into().map_err(KwinError::from)?;
+        Ok(n)
+    };
+    let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
+    let expected =
+        usize::try_from(u64::from(stride) * u64::from(height)).map_err(KwinError::from)?;
+    let pixels = read_frame_file(&frame, expected).await?;
+    Ok((width, height, stride, pixels))
 }
 
 /// Capture a frame that reflects recent input. Input tools return once their
@@ -6096,44 +6067,50 @@ mod instructions_tests {
 }
 
 #[cfg(test)]
-mod capture_pipe_tests {
-    use super::read_frame_pixels;
+mod capture_file_tests {
+    use super::read_frame_file;
+    use std::io::Write;
     use std::time::Duration;
 
+    fn frame_file() -> Result<std::fs::File, Box<dyn std::error::Error>> {
+        let fd = nix::sys::memfd::memfd_create("test-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+        Ok(std::fs::File::from(fd))
+    }
+
     #[tokio::test]
-    async fn complete_frame_returns_while_the_writer_remains_open()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (reader, writer) = nix::unistd::pipe()?;
-        nix::unistd::write(&writer, b"frame")?;
-        let frame = tokio::time::timeout(Duration::from_millis(200), read_frame_pixels(reader, 5))
-            .await??;
-        assert_eq!(frame, b"frame");
-        drop(writer);
+    async fn complete_frame_is_read_from_the_start() -> Result<(), Box<dyn std::error::Error>> {
+        let frame = frame_file()?;
+        frame.try_clone()?.write_all(b"frame")?;
+        assert_eq!(read_frame_file(&frame, 5).await?, b"frame");
         Ok(())
     }
 
     #[tokio::test]
-    async fn incomplete_closed_pipe_reports_only_the_received_pixels()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (reader, writer) = nix::unistd::pipe()?;
-        nix::unistd::write(&writer, b"abc")?;
-        drop(writer);
-        assert_eq!(read_frame_pixels(reader, 5).await?, b"abc");
+    async fn frame_is_returned_once_the_writer_fills_it() -> Result<(), Box<dyn std::error::Error>> {
+        let frame = frame_file()?;
+        let mut writer = frame.try_clone()?;
+        writer.write_all(b"fra")?;
+        let finish = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            writer.write_all(b"me")
+        });
+        let read = tokio::time::timeout(Duration::from_millis(500), read_frame_file(&frame, 5));
+        assert_eq!(read.await??, b"frame");
+        finish.await??;
         Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pending_frame_allows_other_tasks_and_cancels_with_a_deadline()
+    async fn unfilled_frame_allows_other_tasks_and_cancels_with_a_deadline()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (reader, writer) = nix::unistd::pipe()?;
+        let frame = frame_file()?;
         let other_task = tokio::spawn(async {
             tokio::task::yield_now().await;
             "responsive"
         });
-        let read = tokio::time::timeout(Duration::from_millis(30), read_frame_pixels(reader, 5));
+        let read = tokio::time::timeout(Duration::from_millis(30), read_frame_file(&frame, 5));
         assert!(read.await.is_err());
         assert_eq!(other_task.await?, "responsive");
-        drop(writer);
         Ok(())
     }
 }
