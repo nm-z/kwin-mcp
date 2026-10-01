@@ -179,6 +179,25 @@ fn peers_under(peers: &[u32], roots: &[u32], parent: impl Fn(u32) -> Option<u32>
     counts
 }
 
+/// Environment variable that names the agent owning a kwin-mcp server.
+const OWNER_ENV: &str = "KWIN_MCP_OWNER";
+
+/// The agent process that started this shim, as "COMM pid PID", plus its
+/// Claude Code session id when the agent passed one down. Read once, so
+/// servers started after the agent is gone still name it.
+fn owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER.get_or_init(|| {
+        let parent = std::os::unix::process::parent_id();
+        let comm = std::fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
+        let mut owner = format!("{} pid {parent}", comm.trim());
+        if let Ok(session) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+            owner.push_str(&format!(" session {session}"));
+        }
+        owner
+    })
+}
+
 // ── Events ───────────────────────────────────────────────────────────────
 
 enum Event {
@@ -314,6 +333,7 @@ impl Shim {
         let mut command = tokio::process::Command::new(&self.child_bin);
         command
             .args(&self.child_args)
+            .env(OWNER_ENV, owner())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
@@ -585,6 +605,7 @@ impl Shim {
             return "No live sessions. session_start creates one and returns its session_id.".to_owned();
         }
         let now = Instant::now();
+        let owner = owner();
         let roots: Vec<u32> = self.children.values().map(|child| child.pid).collect();
         let bus_peers = host_bus_peer_pids().map(|peers| peers_under(&peers, &roots, parent_pid));
         let mut lines = Vec::new();
@@ -596,7 +617,7 @@ impl Shim {
                 |counts| counts.get(&child.pid).copied().unwrap_or(0).to_string(),
             );
             lines.push(format!(
-                "{session}: server pid {}, workdir /tmp/kwin-mcp-{}, age {}s, idle {}s, host user-bus connections {bus}, {current}",
+                "{session}: server pid {}, workdir /tmp/kwin-mcp-{}, age {}s, idle {}s, host user-bus connections {bus}, owner {owner}, {current}",
                 child.pid, child.pid,
                 now.duration_since(child.spawned).as_secs(),
                 now.duration_since(child.last_used).as_secs(),
@@ -1237,6 +1258,7 @@ fn take_resume() -> Option<Resume> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    owner();
     let resume = take_resume();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(run(resume));
