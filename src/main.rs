@@ -2494,6 +2494,38 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// The DRM device nodes to show the session when some of `/dev/dri` is
+/// useless to it, or `None` when the whole directory should be bound. Mesa
+/// cannot drive a node owned by the proprietary `nvidia` kernel driver unless
+/// the NVIDIA GBM backend is installed; KWin would probe every such node for
+/// seconds and still fall back to llvmpipe.
+fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir("/dev/dri").ok()?;
+    let mut nodes = Vec::new();
+    let mut skipped = false;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let driver = std::fs::read_link(Path::new("/sys/class/drm").join(&name).join("device/driver")).ok();
+        let nvidia = driver.as_deref().and_then(Path::file_name).is_some_and(|driver| driver == "nvidia");
+        if nvidia && !nvidia_gbm_installed {
+            skipped = true;
+        } else {
+            nodes.push(entry.path());
+        }
+    }
+    skipped.then_some(nodes)
+}
+
+fn nvidia_gbm_installed() -> bool {
+    ["/usr/lib/gbm", "/usr/lib64/gbm", "/usr/lib/x86_64-linux-gnu/gbm"]
+        .iter()
+        .any(|dir| Path::new(dir).join("nvidia-drm_gbm.so").exists())
+}
+
 /// Whether `command` starts a Chromium-family browser (leading VAR=value words
 /// skipped); editors built on Electron do not count.
 fn launches_chromium(command: &str) -> bool {
@@ -4086,9 +4118,20 @@ impl KwinMcp {
         let home_kscreenlockerrc = format!("{home}/.config/kscreenlockerrc");
         let home_kcmfonts = format!("{home}/.config/kcmfonts");
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
+        cmd.args(["--dev", "/dev"]);
+        match usable_dri_nodes(nvidia_gbm_installed()) {
+            None => {
+                cmd.args(["--dev-bind", "/dev/dri", "/dev/dri"]);
+            }
+            Some(nodes) => {
+                eprintln!("session_start: /dev/dri nodes shown to the session: {}", nodes.len());
+                cmd.args(["--dir", "/dev/dri"]);
+                for node in &nodes {
+                    cmd.arg("--dev-bind").arg(node).arg(node);
+                }
+            }
+        }
         cmd.args([
-            "--dev", "/dev",
-            "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
