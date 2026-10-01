@@ -8,6 +8,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
@@ -20,9 +21,15 @@ const EXIT_WAIT: Duration = Duration::from_secs(10);
 const LIVE_EXIT_WAIT: Duration = Duration::from_secs(70);
 const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const POLL_PAUSE: Duration = Duration::from_millis(20);
+const POST_EXIT_OBSERVE: Duration = Duration::from_secs(4);
+const PROOF_INTERVAL: Duration = Duration::from_millis(500);
 const FIXTURE_HOME: &str = "KWIN_MCP_DISCONNECT_FIXTURE_HOME";
+const PROOF_DIR_ENV: &str = "KWIN_MCP_PROOF_DIR";
+const LIVE_SOCKET_ROOT: &str = "/tmp";
+const SERVER_INVOCATIONS: &str = "server-invocations.log";
+const RESISTANT_PID: &str = "term-resistant.pid";
 
-struct PrivateHome(PathBuf);
+struct PrivateHome(PathBuf, PathBuf);
 
 impl PrivateHome {
     fn create() -> TestResult<Self> {
@@ -30,17 +37,80 @@ impl PrivateHome {
         let home = Self(
             PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
                 .join(format!("shim-disconnect-{}-{nonce}", std::process::id())),
+            // Keep the CLI sweep fixture isolated. Live sessions use /tmp;
+            // the private HOME overlay and logs stay on disk.
+            PathBuf::from("/tmp").join(format!("kmd-{}-{nonce}", std::process::id())),
         );
         for path in [".config", ".local/share", ".local/state", ".cache", ".kde"] {
             std::fs::create_dir_all(home.0.join(path))?;
         }
+        std::fs::set_permissions(&home.0, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::create_dir(&home.1)?;
+        std::fs::set_permissions(&home.1, std::fs::Permissions::from_mode(0o700))?;
         Ok(home)
+    }
+
+    fn retain_diagnostics(&self) -> io::Result<Option<PathBuf>> {
+        let Some(root) = std::env::var_os(PROOF_DIR_ENV).filter(|root| !root.is_empty()) else {
+            return Ok(None);
+        };
+        let name = self
+            .0
+            .file_name()
+            .ok_or_else(|| io::Error::other("private HOME has no fixture name"))?;
+        let proof = PathBuf::from(root).join(name);
+        std::fs::create_dir_all(&proof)?;
+        std::fs::set_permissions(&proof, std::fs::Permissions::from_mode(0o700))?;
+        for name in [
+            "stderr.log",
+            "scoped-sweep.log",
+            "startup-response.json",
+            SERVER_INVOCATIONS,
+            RESISTANT_PID,
+        ] {
+            copy_diagnostic(&self.0.join(name), &proof.join(name))?;
+        }
+        Ok(Some(proof))
     }
 }
 
 impl Drop for PrivateHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // The process guard has already run, so this last copy also includes
+        // stderr written during failure cleanup. KWin inherits that stderr.
+        let remove_home = match self.retain_diagnostics() {
+            Ok(Some(proof)) => {
+                eprintln!("shim disconnect diagnostics: {}", proof.display());
+                true
+            }
+            Ok(None) => true,
+            Err(error) => {
+                eprintln!(
+                    "could not retain shim disconnect diagnostics: {error}; private HOME retained at {}",
+                    self.0.display()
+                );
+                false
+            }
+        };
+        if remove_home {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
+fn copy_diagnostic(source: &Path, destination: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(source) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::copy(source, destination)?;
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::other(format!(
+            "diagnostic is not a regular file: {}",
+            source.display()
+        ))),
     }
 }
 
@@ -56,12 +126,53 @@ fn shim_command(home: &Path) -> Command {
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("KDEHOME", home.join(".kde"))
+        // The live sandbox creates a fresh /tmp. Use the prior live-fixture
+        // temporary root independently of the isolated CLI sweep fixture.
+        .env("TMPDIR", LIVE_SOCKET_ROOT)
         .env("KWIN_MCP_REPO", home.join("no-repository"))
         .env_remove("KWIN_MCP_SHIM_RESUME");
     if let Some(binary) = std::env::var_os("KWIN_MCP_E2E_SERVER") {
         command.env("KWIN_MCP_BINARY", binary);
     }
     command
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn real_server_binary() -> PathBuf {
+    std::env::var_os("KWIN_MCP_E2E_SERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp")))
+}
+
+fn recording_server(home: &Path) -> TestResult<PathBuf> {
+    let binary = std::fs::canonicalize(real_server_binary())?;
+    let wrapper = home.join("recording-server.sh");
+    let invocations = shell_quote(&home.join(SERVER_INVOCATIONS));
+    let resistant_pid = shell_quote(&home.join(RESISTANT_PID));
+    // The wrapper never implements MCP. Metadata, sessions, and sweeping all
+    // execute the selected real server, including an installed baseline.
+    // Keep the resistant descendant outside the sandbox's PID namespace so
+    // killing the namespace init cannot hide a missing shim drain. Its own
+    // process session also exercises descendants that escape the server SID.
+    let script = format!(
+        "#!/bin/bash\n\
+         case \"$1\" in\n\
+         --describe) printf 'describe %s\\n' \"$$\" >> {invocations} ;;\n\
+         --sweep-workdirs) printf 'sweep %s\\n' \"$$\" >> {invocations} ;;\n\
+         *)\n\
+           printf 'server %s\\n' \"$$\" >> {invocations}\n\
+           setsid bash -c 'trap \"\" TERM HUP; printf \"%s\\n\" \"$BASHPID\" > \"$1\"; while :; do sleep 1; done' shim-disconnect-descendant {resistant_pid} </dev/null >/dev/null 2>&1 &\n\
+           ;;\n\
+         esac\n\
+         exec {} \"$@\"\n",
+        shell_quote(&binary),
+    );
+    std::fs::write(&wrapper, script)?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    Ok(wrapper)
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +198,14 @@ impl OwnedProcess {
             .stat()
             .ok()
             .filter(|stat| stat.starttime == self.starttime)
+    }
+
+    fn signal(&self, signal: Signal) -> TestResult {
+        if self.stat().is_none() {
+            return Err(io::Error::other(format!("owned process disappeared: {self:?}")).into());
+        }
+        kill(Pid::from_raw(self.pid), signal)?;
+        Ok(())
     }
 }
 
@@ -180,6 +299,7 @@ impl OwnedProcesses {
     fn wait_for_child(&mut self, timeout: Duration) -> TestResult<ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
+            self.capture_tree()?;
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status);
             }
@@ -212,6 +332,9 @@ impl OwnedProcesses {
 impl Drop for OwnedProcesses {
     fn drop(&mut self) {
         let _ = self.capture_tree();
+        // A failed assertion must release a test-stopped server before TERM.
+        // Every signal still checks the recorded PID and birth time.
+        self.signal_owned(Signal::SIGCONT);
         self.signal_owned(Signal::SIGTERM);
         self.wait_for_cleanup();
         self.signal_owned(Signal::SIGKILL);
@@ -236,8 +359,26 @@ struct Connection {
     home: PrivateHome,
 }
 
+struct HeadlessSession {
+    server: OwnedProcess,
+    workdir: PathBuf,
+    disk: PathBuf,
+}
+
+fn assert_absent(path: &Path) -> TestResult {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(io::Error::other(format!("path survived: {}", path.display())).into()),
+    }
+}
+
 impl Connection {
     fn start(launcher: bool) -> TestResult<Self> {
+        Self::start_with_recording_server(launcher, false)
+    }
+
+    fn start_with_recording_server(launcher: bool, record_server: bool) -> TestResult<Self> {
         let home = PrivateHome::create()?;
         let mut command = if launcher {
             let mut command = Command::new(std::env::current_exe()?);
@@ -255,6 +396,13 @@ impl Connection {
         } else {
             shim_command(&home.0)
         };
+        if record_server {
+            assert!(
+                !launcher,
+                "the recording fixture launches the shim directly"
+            );
+            command.env("KWIN_MCP_BINARY", recording_server(&home.0)?);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -301,6 +449,211 @@ impl Connection {
         Ok(connection)
     }
 
+    fn start_headless(&mut self) -> TestResult<HeadlessSession> {
+        let started = self.rpc(
+            2,
+            "tools/call",
+            json!({"name":"session_start","arguments":{"width":800,"height":600}}),
+        )?;
+        self.processes.capture_tree()?;
+        std::fs::write(
+            self.home.0.join("startup-response.json"),
+            serde_json::to_vec_pretty(&started)?,
+        )?;
+        self.retain_proof()?;
+        let session = &started["result"]["structuredContent"];
+        assert_eq!(session["status"], "started", "{started}");
+        assert_eq!(session["viewer"]["state"], "closed", "{started}");
+        let pid: i32 = session["session_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix('s'))
+            .ok_or_else(|| io::Error::other("session_start returned no shim session_id"))?
+            .parse()?;
+        let server = self
+            .processes
+            .owned
+            .get(&pid)
+            .cloned()
+            .ok_or_else(|| io::Error::other("server is not in the test-owned tree"))?;
+        let stat = server
+            .stat()
+            .ok_or_else(|| io::Error::other("owned server exited during session_start"))?;
+        assert_eq!(stat.ppid, self.shim, "shim directly owns the real server");
+        assert_eq!(stat.session, pid, "server owns its process session");
+        assert!(
+            self.processes
+                .owned
+                .values()
+                .any(|process| process.comm == "kwin_wayland" && process.stat().is_some()),
+            "real compositor is in the owned tree"
+        );
+        let workdir = PathBuf::from(
+            session["workdir"]
+                .as_str()
+                .ok_or_else(|| io::Error::other("session_start returned no workdir"))?,
+        );
+        assert_eq!(
+            workdir,
+            Path::new(LIVE_SOCKET_ROOT).join(format!("kwin-mcp-{pid}")),
+            "live fixture uses the production socket root"
+        );
+        let disk = self
+            .home
+            .0
+            .join(".cache/kwin-mcp")
+            .join(format!("kwin-mcp-{pid}"));
+        assert!(workdir.is_dir(), "socket workdir exists before disconnect");
+        assert!(disk.is_dir(), "overlay directory exists before disconnect");
+        Ok(HeadlessSession {
+            server,
+            workdir,
+            disk,
+        })
+    }
+
+    fn resistant_descendant(&mut self, session: &HeadlessSession) -> TestResult<OwnedProcess> {
+        let deadline = Instant::now() + EXIT_WAIT;
+        let marker = self.home.0.join(RESISTANT_PID);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant did not record its PID"
+            );
+            thread::sleep(POLL_PAUSE);
+        };
+        self.processes.capture_tree()?;
+        let process = self
+            .processes
+            .owned
+            .get(&pid)
+            .cloned()
+            .ok_or_else(|| io::Error::other("resistant descendant is not test-owned"))?;
+        let stat = process
+            .stat()
+            .ok_or_else(|| io::Error::other("resistant descendant exited during setup"))?;
+        assert_eq!(stat.ppid, session.server.pid, "real server owns descendant");
+        assert_eq!(
+            stat.session, process.pid,
+            "descendant owns its process session"
+        );
+        assert_ne!(
+            stat.session, session.server.pid,
+            "descendant escaped server SID"
+        );
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let ignored = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:\t"))
+            .ok_or_else(|| io::Error::other("descendant has no ignored-signal mask"))?;
+        let ignored = u64::from_str_radix(ignored.trim(), 16)?;
+        let term_bit = u32::try_from(nix::libc::SIGTERM - 1)?;
+        assert_ne!(
+            ignored & (1u64 << term_bit),
+            0,
+            "descendant must ignore TERM"
+        );
+        process.signal(Signal::SIGTERM)?;
+        assert!(process.stat().is_some(), "descendant must survive TERM");
+        Ok(process)
+    }
+
+    fn recorded_tree(&self) -> Vec<OwnedProcess> {
+        let mut recorded: Vec<_> = self.processes.owned.values().cloned().collect();
+        recorded.sort_by_key(|process| process.pid);
+        recorded
+    }
+
+    fn retain_proof(&self) -> TestResult {
+        let Some(proof) = self.home.retain_diagnostics()? else {
+            return Ok(());
+        };
+        let recorded: Vec<_> = self
+            .recorded_tree()
+            .iter()
+            .map(|process| {
+                json!({
+                    "pid": process.pid,
+                    "starttime": process.starttime,
+                    "comm": process.comm,
+                    "state": process.stat().map(|stat| stat.state.to_string()),
+                })
+            })
+            .collect();
+        std::fs::write(
+            proof.join("owned-tree.json"),
+            serde_json::to_vec_pretty(&json!({
+                "shim_pid": self.shim,
+                "private_home": self.home.0,
+                "live_tmpdir": LIVE_SOCKET_ROOT,
+                "private_cli_tmpdir": self.home.1,
+                "server_binary": real_server_binary(),
+                "processes": recorded,
+            }))?,
+        )?;
+        for process in self.processes.owned.values() {
+            if process.stat().is_none() {
+                continue;
+            }
+            let workdir = Path::new(LIVE_SOCKET_ROOT).join(format!("kwin-mcp-{}", process.pid));
+            for name in ["kwin.log", "kwin_wayland.log", "kwin-wayland.log"] {
+                copy_diagnostic(
+                    &workdir.join(name),
+                    &proof.join(format!("server-{}-{name}", process.pid)),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn disconnect_input(&mut self) {
+        // Drop the only writer into the actual client-to-shim pipe.
+        self.input.take();
+    }
+
+    fn assert_session_removed(&mut self, session: &HeadlessSession) -> TestResult {
+        let remaining = self.processes.remaining();
+        assert!(
+            remaining.is_empty(),
+            "owned tree survived shim exit: {remaining:?}\n{}",
+            self.log()
+        );
+        assert_absent(&session.workdir)?;
+        assert_absent(&session.disk)?;
+        Ok(())
+    }
+
+    fn assert_no_later_reaper(&mut self, session: &HeadlessSession) -> TestResult {
+        // Require cleanup before observing, without launching another server
+        // or invoking --sweep-workdirs from the test to repair a leak.
+        self.assert_session_removed(session)?;
+        let invocations = self.home.0.join(SERVER_INVOCATIONS);
+        let at_exit = std::fs::read_to_string(&invocations)?;
+        assert_eq!(
+            at_exit
+                .lines()
+                .filter(|line| line.starts_with("server "))
+                .count(),
+            1,
+            "shutdown must not start a replacement server: {at_exit}"
+        );
+        let deadline = Instant::now() + POST_EXIT_OBSERVE;
+        while Instant::now() < deadline {
+            thread::sleep(POLL_PAUSE);
+            assert_eq!(
+                std::fs::read_to_string(&invocations)?,
+                at_exit,
+                "a server or workdir reaper ran after shim exit"
+            );
+            self.assert_session_removed(session)?;
+        }
+        Ok(())
+    }
+
     fn send(&mut self, value: Value) -> io::Result<()> {
         let input = self
             .input
@@ -313,7 +666,15 @@ impl Connection {
     fn rpc(&mut self, id: u64, method: &str, params: Value) -> TestResult<Value> {
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
         let deadline = Instant::now() + RESPONSE_WAIT;
+        let mut next_proof = Instant::now();
         loop {
+            if std::env::var_os(PROOF_DIR_ENV).is_some() && Instant::now() >= next_proof {
+                self.processes.capture_tree()?;
+                // Snapshot available compositor logs before a failed startup
+                // can autoclean its workdir. The merged stderr is copied too.
+                self.retain_proof()?;
+                next_proof = Instant::now() + PROOF_INTERVAL;
+            }
             while let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.buffered.drain(..=end).collect();
                 // The launching fixture also emits libtest progress lines.
@@ -383,6 +744,9 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        if let Err(error) = self.retain_proof() {
+            eprintln!("could not retain owned shim proof: {error}");
+        }
         self.input.take();
         self.output.take();
         // Field order drops the process guard before the private HOME.
@@ -425,66 +789,195 @@ fn shim_exits_when_launching_client_dies_with_stdin_open() -> TestResult {
 fn stdout_disconnect_removes_its_headless_session() -> TestResult {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut connection = Connection::start(false)?;
-    let started = connection.rpc(
-        2,
-        "tools/call",
-        json!({"name":"session_start","arguments":{"width":800,"height":600}}),
-    )?;
-    connection.processes.capture_tree()?;
-    let session = &started["result"]["structuredContent"];
-    assert_eq!(session["status"], "started", "{started}");
-    assert_eq!(session["viewer"]["state"], "closed", "{started}");
-    let server: i32 = session["session_id"]
-        .as_str()
-        .and_then(|id| id.strip_prefix('s'))
-        .ok_or_else(|| io::Error::other("session_start returned no shim session_id"))?
-        .parse()?;
-    assert!(
-        connection.processes.owned.contains_key(&server),
-        "server is test-owned"
-    );
-    assert!(
-        connection
-            .processes
-            .owned
-            .values()
-            .any(|process| process.comm == "kwin_wayland"),
-        "real compositor is in the owned tree"
-    );
-    let workdir = PathBuf::from(
-        session["workdir"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("session_start returned no workdir"))?,
-    );
-    assert_eq!(workdir, PathBuf::from(format!("/tmp/kwin-mcp-{server}")));
-    let disk = connection
-        .home
-        .0
-        .join(".cache/kwin-mcp")
-        .join(format!("kwin-mcp-{server}"));
-    assert!(workdir.exists(), "socket workdir exists before disconnect");
-    assert!(disk.exists(), "overlay directory exists before disconnect");
-    let mut recorded: Vec<_> = connection.processes.owned.values().cloned().collect();
-    recorded.sort_by_key(|process| process.pid);
+    let session = connection.start_headless()?;
+    let recorded = connection.recorded_tree();
     connection.disconnect_output()?;
     connection.wait_for_exit(LIVE_EXIT_WAIT);
     assert!(connection.input.is_some(), "test must retain stdin");
-    assert!(
-        !workdir.exists(),
-        "socket workdir survived: {}",
-        workdir.display()
-    );
-    assert!(
-        !disk.exists(),
-        "overlay directory survived: {}",
-        disk.display()
-    );
+    connection.assert_session_removed(&session)?;
     assert!(connection.processes.wait_for_child(EXIT_WAIT)?.success());
     eprintln!(
-        "live_stdout_disconnect: shim_pid={} server_pid={server} recorded_owned_tree={recorded:?} socket_workdir={} socket_workdir_removed=true disk_workdir={} disk_workdir_removed=true stdin_retained=true exited=true",
+        "live_stdout_disconnect: shim_pid={} server_pid={} recorded_owned_tree={recorded:?} socket_workdir={} socket_workdir_removed=true disk_workdir={} disk_workdir_removed=true stdin_retained=true exited=true",
         connection.shim,
-        workdir.display(),
-        disk.display()
+        session.server.pid,
+        session.workdir.display(),
+        session.disk.display()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires KWin, bubblewrap, input devices, and a GPU session; no host viewer"]
+fn stdin_eof_drains_stopped_server_and_term_resistant_descendant() -> TestResult {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut connection = Connection::start_with_recording_server(false, true)?;
+    let session = connection.start_headless()?;
+    let resistant = connection.resistant_descendant(&session)?;
+    session.server.signal(Signal::SIGSTOP)?;
+    let deadline = Instant::now() + EXIT_WAIT;
+    loop {
+        let stat = session
+            .server
+            .stat()
+            .ok_or_else(|| io::Error::other("owned server exited before client EOF"))?;
+        if stat.state == 'T' {
+            break;
+        }
+        assert!(Instant::now() < deadline, "owned server did not stop");
+        thread::sleep(POLL_PAUSE);
+    }
+    connection.processes.capture_tree()?;
+    let recorded = connection.recorded_tree();
+    let disconnected = Instant::now();
+    connection.disconnect_input();
+    let status = connection.processes.wait_for_child(LIVE_EXIT_WAIT)?;
+    let elapsed = disconnected.elapsed();
+    assert!(
+        status.success(),
+        "shim failed during EOF shutdown: {status}"
+    );
+    assert!(
+        elapsed < LIVE_EXIT_WAIT,
+        "EOF escalation exceeded its bound"
+    );
+    assert!(connection.output.is_some(), "test must retain stdout");
+    connection.assert_session_removed(&session)?;
+    connection.assert_no_later_reaper(&session)?;
+    eprintln!(
+        "stopped_server_eof: shim_pid={} server={:?} term_resistant={resistant:?} recorded_owned_tree={recorded:?} elapsed_ms={} socket_workdir={} disk_workdir={} removed_at_shim_exit=true later_reaper=false stdout_retained=true",
+        connection.shim,
+        session.server,
+        elapsed.as_millis(),
+        session.workdir.display(),
+        session.disk.display()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires KWin, bubblewrap, input devices, and a GPU session; no host viewer"]
+fn last_child_exit_then_stdin_eof_drains_its_descendants() -> TestResult {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut connection = Connection::start_with_recording_server(false, true)?;
+    let session = connection.start_headless()?;
+    let resistant = connection.resistant_descendant(&session)?;
+    connection.processes.capture_tree()?;
+    let recorded = connection.recorded_tree();
+    session.server.signal(Signal::SIGKILL)?;
+    let exit_record = format!("child {} exited (", session.server.pid);
+    let deadline = Instant::now() + EXIT_WAIT;
+    loop {
+        // Observe the shim handling its last ChildExited event, then close
+        // the client pipe immediately. No extra tool call starts a server.
+        if connection.log().contains(&exit_record) {
+            connection.disconnect_input();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shim did not observe the last child exit: {}",
+            connection.log()
+        );
+        thread::sleep(POLL_PAUSE);
+    }
+    let disconnected = Instant::now();
+    let status = connection.processes.wait_for_child(LIVE_EXIT_WAIT)?;
+    let elapsed = disconnected.elapsed();
+    assert!(
+        status.success(),
+        "shim failed after last child exit: {status}"
+    );
+    assert!(
+        elapsed < LIVE_EXIT_WAIT,
+        "last-child drain exceeded its bound"
+    );
+    assert!(connection.output.is_some(), "test must retain stdout");
+    connection.assert_session_removed(&session)?;
+    connection.assert_no_later_reaper(&session)?;
+    eprintln!(
+        "last_child_eof: shim_pid={} server={:?} term_resistant={resistant:?} recorded_owned_tree={recorded:?} elapsed_ms={} socket_workdir={} disk_workdir={} removed_at_shim_exit=true later_reaper=false stdout_retained=true",
+        connection.shim,
+        session.server,
+        elapsed.as_millis(),
+        session.workdir.display(),
+        session.disk.display()
+    );
+    Ok(())
+}
+
+fn run_scoped_sweep(home: &PrivateHome, owners: &[String]) -> TestResult<ExitStatus> {
+    let mut command = Command::new(real_server_binary());
+    command
+        .arg("--sweep-workdirs")
+        .args(owners)
+        .env("HOME", &home.0)
+        .env("TMPDIR", &home.1)
+        .env("XDG_CACHE_HOME", home.0.join(".cache"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(home.0.join("scoped-sweep.log"))?);
+    let mut processes = OwnedProcesses::spawn(&mut command)?;
+    processes.wait_for_child(EXIT_WAIT)
+}
+
+#[test]
+fn scoped_workdir_sweep_preserves_other_owners_and_rejects_invalid_pids() -> TestResult {
+    let home = PrivateHome::create()?;
+    // PIDs beyond the current kernel allocation limit cannot be concurrently
+    // assigned to another session. Confirm absence before creating fixtures.
+    let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")?
+        .trim()
+        .parse()?;
+    let selected = pid_max
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("kernel PID limit overflow"))?;
+    let other = selected
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("fixture PID overflow"))?;
+    let paths = |pid: u32| {
+        [
+            home.1.join(format!("kwin-mcp-{pid}")),
+            home.0
+                .join(".cache/kwin-mcp")
+                .join(format!("kwin-mcp-{pid}")),
+        ]
+    };
+    for pid in [selected, other] {
+        assert_absent(&PathBuf::from(format!("/proc/{pid}")))?;
+        for path in paths(pid) {
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join("fixture.txt"), format!("owner={pid}\n"))?;
+        }
+    }
+    assert!(
+        run_scoped_sweep(&home, &[selected.to_string()])?.success(),
+        "PID-scoped sweep failed"
+    );
+    for path in paths(selected) {
+        assert_absent(&path)?;
+    }
+    for path in paths(other) {
+        assert_eq!(
+            std::fs::read_to_string(path.join("fixture.txt"))?,
+            format!("owner={other}\n"),
+            "scoped sweep changed another owner's workdir"
+        );
+    }
+    // A valid owner followed by an invalid PID must fail before any sweep,
+    // rather than applying a partially parsed filter or reverting to global.
+    assert!(
+        !run_scoped_sweep(&home, &[other.to_string(), "0".to_owned()])?.success(),
+        "invalid owner PID was accepted"
+    );
+    for path in paths(other) {
+        assert_eq!(
+            std::fs::read_to_string(path.join("fixture.txt"))?,
+            format!("owner={other}\n"),
+            "invalid PID input removed another owner's workdir"
+        );
+    }
+    eprintln!(
+        "scoped_sweep: selected_owner={selected} other_owner={other} selected_pair_removed=true other_pair_preserved=true invalid_input_rejected=true"
     );
     Ok(())
 }

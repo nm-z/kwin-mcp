@@ -58,6 +58,9 @@ const CRASH_BACKOFF: Duration = Duration::from_secs(10);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How long shutdown waits for children to tear their sessions down.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// Bound the final descendant drain after the server grace period.
+const SHUTDOWN_DRAIN_WAIT: Duration = Duration::from_secs(10);
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Prefix of every JSON-RPC id the shim itself owns on a child connection.
 const SHIM_ID: &str = "__kwin_shim:";
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
@@ -120,19 +123,6 @@ fn signal(pid: u32, sig: nix::sys::signal::Signal) {
     }
 }
 
-/// Wait for killed children to exit and reap them, giving up at `deadline`
-/// (a child stuck in the kernel stays a zombie rather than blocking the shim).
-fn reap(pids: &[u32], deadline: Instant) {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    let mut left: Vec<nix::unistd::Pid> = pids.iter()
-        .filter_map(|&pid| i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw))
-        .collect();
-    while !left.is_empty() && Instant::now() < deadline {
-        left.retain(|&pid| matches!(waitpid(pid, Some(WaitPidFlag::WNOHANG)), Ok(WaitStatus::StillAlive)));
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 /// Process ids of every peer on the host user bus, from dbus-broker's peer
 /// accounting. None when the bus is not dbus-broker or does not answer within
 /// three seconds, so session_list never waits on a wedged bus.
@@ -160,6 +150,44 @@ fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 4, after the parenthesized command name, which may hold spaces.
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn descendants(root: i32) -> Result<Vec<procfs::process::Stat>, procfs::ProcError> {
+    let stats: Vec<_> = procfs::process::all_processes()?.flatten()
+        .filter_map(|process| process.stat().ok()).collect();
+    let mut owned = HashSet::from([root]);
+    loop {
+        let before = owned.len();
+        for stat in &stats {
+            if owned.contains(&stat.ppid) { owned.insert(stat.pid); }
+        }
+        if before == owned.len() { break }
+    }
+    Ok(stats.into_iter().filter(|stat| stat.pid != root && owned.contains(&stat.pid)).collect())
+}
+
+fn owned_descendant(pid: i32, starttime: u64, root: i32) -> Option<procfs::process::Stat> {
+    let leaf = procfs::process::Process::new(pid).ok()?.stat().ok()?;
+    if leaf.starttime != starttime { return None }
+    let mut lineage = vec![(leaf.pid, leaf.starttime, leaf.ppid)];
+    let mut parent = leaf.ppid;
+    for _ in 0..64 {
+        if parent == root {
+            // /proc enumeration is not atomic. Validate every recorded parent
+            // identity and edge before relying on the ancestry for a signal.
+            for (pid, born, parent) in lineage {
+                let current = procfs::process::Process::new(pid).ok()?.stat().ok()?;
+                if current.starttime != born || current.ppid != parent { return None }
+            }
+            return Some(leaf);
+        }
+        if parent <= 1 { return None }
+        let stat = procfs::process::Process::new(parent).ok()?.stat().ok()?;
+        if stat.ppid == parent { return None }
+        lineage.push((stat.pid, stat.starttime, stat.ppid));
+        parent = stat.ppid;
+    }
+    None
 }
 
 /// How many of `peers` run inside the process tree of each of `roots`.
@@ -322,6 +350,7 @@ struct Shim {
     pending_lists: Vec<Value>,
     init_result: Option<Value>,
     describing: bool,
+    describe_task: Option<tokio::task::JoinHandle<()>>,
     tools: Option<Vec<Value>>,
     /// Tool definitions of the newest build, before rewriting.
     base_tools: Vec<Value>,
@@ -336,6 +365,8 @@ struct Shim {
     /// Session ids (= pids) of children that exited; leftover processes in
     /// those process sessions are killed.
     dead_sids: HashSet<i32>,
+    /// Server owners whose workdirs must be checked before this shim exits.
+    cleanup_owners: HashSet<u32>,
     orphans: HashMap<i32, Instant>,
     closing: bool,
     /// This shim's own executable, and its identity when it started and at
@@ -361,7 +392,7 @@ impl Shim {
         let binary = self.child_bin.clone();
         let args = self.child_args.clone();
         let events = self.events.clone();
-        tokio::spawn(async move {
+        self.describe_task = Some(tokio::spawn(async move {
             let result = async {
                 let output = tokio::process::Command::new(binary)
                     .arg("--describe").args(args)
@@ -383,7 +414,7 @@ impl Shim {
             let result = tokio::time::timeout(DESCRIBE_TIMEOUT, result).await
                 .unwrap_or_else(|_| Err("server metadata exceeded 10 seconds".to_owned()));
             let _ = events.send(Event::Described(build, result));
-        });
+        }));
     }
 
     fn metadata_error(&mut self, message: String) {
@@ -398,6 +429,7 @@ impl Shim {
 
     fn on_described(&mut self, build: Stamp, result: Result<Value, String>) {
         self.describing = false;
+        self.describe_task.take();
         if self.closing { return }
         if stamp(&self.child_bin) != Some(build) {
             self.describe();
@@ -994,6 +1026,7 @@ impl Shim {
 
     fn on_child_exit(&mut self, key: u64, status: &str) {
         let Some(child) = self.children.remove(&key) else { return };
+        self.cleanup_owners.insert(child.pid);
         let status = if child.killed_at.is_some() {
             format!("{status}; supervisor watchdog received no ping response for {} seconds", WEDGE_TIMEOUT.as_secs())
         } else { status.to_owned() };
@@ -1180,6 +1213,62 @@ impl Shim {
         self.idle = None;
     }
 
+    async fn finish_shutdown(&mut self) -> Result<(), String> {
+        if let Some(task) = self.describe_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        // The normal EOF grace has expired for any server still in this map.
+        for child in self.children.values() {
+            self.cleanup_owners.insert(child.pid);
+        }
+        let me = i32::try_from(std::process::id()).map_err(|error| error.to_string())?;
+        let servers: HashSet<i32> = self.children.values()
+            .filter_map(|child| i32::try_from(child.pid).ok()).collect();
+        let mut signaled = HashMap::new();
+        let deadline = Instant::now() + SHUTDOWN_DRAIN_WAIT;
+        loop {
+            // Subreaping keeps daemonized descendants below this shim even
+            // after their server exits or they create a new process session.
+            let owned = match descendants(me) {
+                Ok(owned) => owned,
+                Err(error) => return Err(format!("shutdown could not inspect owned descendants: {error}")),
+            };
+            if owned.is_empty() { break }
+            for stat in &owned {
+                let Some(current) = owned_descendant(stat.pid, stat.starttime, me) else { continue };
+                let pid = nix::unistd::Pid::from_raw(current.pid);
+                if current.state == 'Z' {
+                    if current.ppid == me {
+                        let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+                    }
+                    continue;
+                }
+                let (first, new) = match signaled.entry((current.pid, current.starttime)) {
+                    std::collections::hash_map::Entry::Vacant(entry) => (entry.insert(Instant::now()), true),
+                    std::collections::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
+                };
+                let signal = if servers.contains(&current.pid) || first.elapsed() >= KILL_GRACE {
+                    nix::sys::signal::Signal::SIGKILL
+                } else if !new {
+                    continue;
+                } else {
+                    nix::sys::signal::Signal::SIGTERM
+                };
+                let _ = nix::sys::signal::kill(pid, signal);
+            }
+            if Instant::now() >= deadline {
+                let pids: Vec<_> = owned.iter().map(|stat| stat.pid).collect();
+                return Err(format!("shutdown drain timed out while checking descendant PIDs {pids:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !self.cleanup_owners.is_empty() {
+            sweep_workdirs(&self.child_bin, Some(&self.cleanup_owners)).await?;
+        }
+        Ok(())
+    }
+
     /// SIGTERM from a process other than the client: a cleanup that matched
     /// this shim. Its sessions are stopped, as the cleanup asked, but the
     /// client stays connected and can start new ones.
@@ -1290,21 +1379,38 @@ async fn watch(repo: Option<PathBuf>, release: bool, binary: PathBuf, events: mp
     }
 }
 
+async fn sweep_workdirs(binary: &Path, owners: Option<&HashSet<u32>>) -> Result<(), String> {
+    let mut command = tokio::process::Command::new(binary);
+    command.arg("--sweep-workdirs")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(owners) = owners {
+        command.args(owners.iter().map(u32::to_string));
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(format!("workdir sweep could not start: {error}")),
+    };
+    match tokio::time::timeout(SWEEP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(result) => Err(format!("workdir sweep failed: {result:?}")),
+        Err(_) => {
+            log("workdir sweep timed out; killing its helper");
+            let _ = child.start_kill();
+            let stopped = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+            Err(format!("workdir sweep timed out; helper kill result: {stopped:?}"))
+        }
+    }
+}
+
 async fn sweeper(binary: PathBuf, mut trigger: mpsc::UnboundedReceiver<()>) {
     if trigger.recv().await.is_none() { return }
     loop {
         // Coalesce bursts, and give a dead child's container a moment to go.
         tokio::time::sleep(Duration::from_secs(3)).await;
         while trigger.try_recv().is_ok() {}
-        let status = tokio::process::Command::new(&binary)
-            .arg("--sweep-workdirs")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .status()
-            .await;
-        if let Err(error) = status {
-            log(&format!("workdir sweep failed: {error}"));
-        }
+        if let Err(error) = sweep_workdirs(&binary, None).await { log(&error); }
         if matches!(tokio::time::timeout(SWEEP_INTERVAL, trigger.recv()).await, Ok(None)) {
             return;
         }
@@ -1469,9 +1575,9 @@ async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn s
             if tick_events.send(Event::Tick).is_err() { break }
         }
     });
-    tokio::spawn(watch(repo, release, binary.clone(), event_tx.clone()));
+    let watcher_task = tokio::spawn(watch(repo, release, binary.clone(), event_tx.clone()));
     watch_sigterm(event_tx.clone())?;
-    tokio::spawn(sweeper(binary.clone(), sweep_rx));
+    let sweeper_task = tokio::spawn(sweeper(binary.clone(), sweep_rx));
 
     let self_stamp = stamp(&self_path);
     let mut shim = Shim {
@@ -1480,9 +1586,9 @@ async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn s
         children: HashMap::new(), next_child: 0, idle: None,
         sessions: BTreeMap::new(), ended: HashMap::new(), inflight: HashMap::new(),
         reverse: HashMap::new(), next_reverse: 0, client_params: None, pending_init: None,
-        pending_lists: Vec::new(), init_result: None, describing: false, tools: None, base_tools: Vec::new(), client_ready: false,
+        pending_lists: Vec::new(), init_result: None, describing: false, describe_task: None, tools: None, base_tools: Vec::new(), client_ready: false,
         latest: None, building: false, held_starts: Vec::new(), crashes: VecDeque::new(), respawn_after: None,
-        dead_sids: HashSet::new(), orphans: HashMap::new(), closing: false,
+        dead_sids: HashSet::new(), cleanup_owners: HashSet::new(), orphans: HashMap::new(), closing: false,
         self_path, self_stamp, self_seen: self_stamp, upgrading: false, freeze: freeze.clone(), carried: Vec::new(),
     };
     shim.latest = stamp(&shim.child_bin);
@@ -1553,16 +1659,17 @@ async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn s
                 break;
             }
             if Instant::now() >= at {
-                for child in shim.children.values() {
-                    signal(child.pid, nix::sys::signal::Signal::SIGKILL);
-                }
-                // A re-exec drops the tasks that would wait on these children,
-                // so reap them here or they stay zombies under the new shim.
-                let pids: Vec<u32> = shim.children.values().map(|child| child.pid).collect();
-                reap(&pids, Instant::now() + SHUTDOWN_WAIT);
                 break;
             }
         }
+    }
+    watcher_task.abort();
+    let _ = watcher_task.await;
+    sweeper_task.abort();
+    let _ = sweeper_task.await;
+    if let Err(error) = shim.finish_shutdown().await {
+        log(&error);
+        return Err(error.into());
     }
     if shim.upgrading && !client_closed {
         // Everything the client sent but this shim did not handle goes to the
