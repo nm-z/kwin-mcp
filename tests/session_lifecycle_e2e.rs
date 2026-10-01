@@ -2059,3 +2059,72 @@ fn session_overlay_lives_on_disk_and_is_removed_at_stop() {
     assert!(!disk.exists(), "session_stop left {}", disk.display());
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
+fn keyboard_key_warns_when_the_browser_page_lacks_focus() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":1024,"height":768}));
+    let workdir = workdir(&started);
+    let page = workdir.join("focus.html");
+    std::fs::write(
+        &page,
+        "<html><head><title>K:ready</title></head><body><script>\
+         addEventListener('keydown',e=>{if(['Control','Shift','Alt','Meta'].includes(e.key))return;\
+         document.title='K:'+e.code;},true);\
+         </script></body></html>",
+    )
+    .expect("write focus page");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --no-first-run --new-window 'file://{}'", page.display())}),
+    );
+    assert!(launched["error"].is_null(), "launch failed: {launched}");
+    let mut id = 4;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(&mut client, id, "K:ready").is_none() {
+        id += 1;
+        assert!(Instant::now() < deadline, "focus page did not load");
+        thread::sleep(Duration::from_millis(300));
+    }
+    let key = |client: &mut RpcClient, id: &mut u64, combo: &str| -> Value {
+        *id += 1;
+        let pressed = call_tool(client, *id, "keyboard_key", json!({"key":combo}));
+        assert!(pressed["error"].is_null(), "{combo} failed: {pressed}");
+        pressed["result"]["structuredContent"]["warning"].clone()
+    };
+    // The page has focus: no warning, and the page sees the key.
+    assert!(key(&mut client, &mut id, "a").is_null());
+    // ctrl+L is sent while the page has focus and moves it to the address bar.
+    assert!(key(&mut client, &mut id, "ctrl+L").is_null());
+    let warned = key(&mut client, &mut id, "b");
+    assert!(
+        warned.as_str().is_some_and(|text| text.contains("did not have keyboard focus")),
+        "no warning with focus in the address bar: {warned}"
+    );
+    // A click inside the page gives it focus back.
+    id += 1;
+    let clicked = call_tool(&mut client, id, "mouse_click", json!({"x":500,"y":400}));
+    assert!(clicked["error"].is_null(), "click failed: {clicked}");
+    assert!(key(&mut client, &mut id, "c").is_null());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        id += 1;
+        if window_title(&mut client, id, "K:KeyC").is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "page did not see c after the click");
+        thread::sleep(Duration::from_millis(200));
+    }
+    id += 1;
+    call_tool(&mut client, id, "session_stop", json!({}));
+    client.stop_process();
+}
