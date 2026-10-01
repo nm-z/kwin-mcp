@@ -77,6 +77,9 @@ impl RpcClient {
         ] {
             std::fs::create_dir_all(directory).expect("create private test HOME");
         }
+        let program = if program == env!("CARGO_BIN_EXE_kwin-mcp") {
+            std::env::var("KWIN_MCP_E2E_SERVER").unwrap_or_else(|_| program.to_owned())
+        } else { program.to_owned() };
         let mut command = Command::new(program);
         command
             .args(["--autoclean"])
@@ -1955,6 +1958,9 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     let finished = call_tool(&mut client, 5, "launch_app", json!({"command":"true"}));
     assert_ne!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(finished["result"]["structuredContent"]["exit_status"], 0, "{finished}");
+    let retained = std::fs::read_dir(workdir(&started)).expect("workdir").flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-") && entry.path().extension().is_some_and(|ext| ext == "sh")).count();
+    assert_eq!(retained, 0, "launch command files were retained");
 
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
     assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
@@ -2258,5 +2264,101 @@ fn shim_releases_server_after_call_without_session() {
     assert!(direct_children(client.child.id()).is_empty());
     client.send(3, "ping", json!({}));
     assert_eq!(client.response(3, Duration::from_secs(2))["result"], json!({}));
+    client.stop_process();
+}
+
+fn child_compositor(server: u32) -> i32 {
+    let server = i32::try_from(server).expect("server pid");
+    let stats: Vec<_> = procfs::process::all_processes().expect("process inventory").flatten()
+        .filter_map(|process| process.stat().ok()).collect();
+    let owned: Vec<_> = stats.iter().filter(|stat| stat.comm == "kwin_wayland").filter(|stat| {
+        let mut parent = stat.ppid;
+        for _ in 0..64 {
+            if parent == server { return true }
+            let Some(next) = stats.iter().find(|stat| stat.pid == parent) else { return false };
+            if next.ppid == parent { return false }
+            parent = next.ppid;
+        }
+        false
+    }).map(|stat| stat.pid).collect();
+    assert_eq!(owned.len(), 1, "expected one compositor below server {server}: {owned:?}");
+    owned[0]
+}
+
+struct ResumeProcess(nix::unistd::Pid);
+impl Drop for ResumeProcess {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGCONT);
+    }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+    let workdir = workdir(&started);
+    let compositor = child_compositor(client.child.id());
+    let resumed = ResumeProcess(nix::unistd::Pid::from_raw(compositor));
+    nix::sys::signal::kill(resumed.0, nix::sys::signal::Signal::SIGSTOP).expect("stop owned compositor");
+    let begun = Instant::now();
+    client.send(3, "tools/call", json!({"name":"launch_app","arguments":{"command":"konsole --separate --hold -e bash -c 'printf launch-deadline-proof'"}}));
+    thread::sleep(Duration::from_millis(300));
+    let ping_started = Instant::now();
+    client.send(4, "ping", json!({}));
+    assert_eq!(client.response(4, Duration::from_secs(2))["result"], json!({}));
+    let ping_ms = ping_started.elapsed().as_millis();
+    let timed_out = client.response(3, Duration::from_secs(25));
+    let elapsed_ms = begun.elapsed().as_millis();
+    assert_eq!(timed_out["error"]["data"]["reason"], "launch_timeout", "{timed_out}");
+    assert_eq!(timed_out["error"]["data"]["command_submitted"], false, "{timed_out}");
+    assert!(timed_out["error"]["data"]["stage"].as_str().expect("stage").contains("active window"));
+    assert!((19_000..23_000).contains(&elapsed_ms), "timeout duration {elapsed_ms}ms");
+    eprintln!("launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} timeout_ms={elapsed_ms} response={timed_out}", client.child.id());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let scripts = std::fs::read_dir(&workdir).expect("workdir").flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("kwin-mcp-") && entry.path().extension().is_some_and(|ext| ext == "js")).count();
+        if scripts == 0 { break }
+        assert!(Instant::now() < deadline, "cancelled script file was retained");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let bus = zbus::blocking::connection::Builder::address(format!("unix:path={}", workdir.join("bus").display()).as_str())
+        .expect("session bus address").build().expect("session bus connection");
+    let server_name = started["result"]["structuredContent"]["bus"].as_str().expect("server bus name");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let reply = bus.call_method(Some(server_name), "/KWinMCP", Some("org.freedesktop.DBus.Introspectable"), "Introspect", &());
+        let empty = match reply {
+            Ok(reply) => !reply.body().deserialize::<String>().expect("introspection XML").contains("<node name="),
+            Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject" => true,
+            Err(error) => panic!("callback inspection failed: {error}"),
+        };
+        if empty { break }
+        assert!(Instant::now() < deadline, "cancelled callback registration was retained");
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(resumed);
+    let launched = call_tool(&mut client, 5, "launch_app", json!({"command":"konsole --separate --hold -e bash -c 'printf launch-deadline-recovery'"}));
+    assert!(launched["error"].is_null(), "{launched}");
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    let windows = call_tool(&mut client, 6, "window_list", json!({}));
+    assert!(windows.to_string().to_lowercase().contains("konsole"), "{windows}");
+    let screenshot = call_tool(&mut client, 7, "screenshot", json!({"inline":false}));
+    assert!(screenshot["error"].is_null(), "{screenshot}");
+    if let Some(directory) = std::env::var_os("KWIN_MCP_PROOF_DIR") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("proof directory");
+        let capture = screenshot["result"]["structuredContent"]["path"].as_str().expect("screenshot path");
+        std::fs::copy(capture, directory.join("launch-recovery.png")).expect("copy screenshot");
+        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"timeout_ms":elapsed_ms,"response":timed_out,
+            "commit":started["result"]["structuredContent"]["commit"],"version":started["result"]["structuredContent"]["version"]}).to_string()).expect("write fault proof");
+    }
+    let stopped = call_tool(&mut client, 8, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    assert!(!workdir.exists());
     client.stop_process();
 }
