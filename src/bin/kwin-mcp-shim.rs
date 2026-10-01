@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
+#[path = "../shim_protocol.rs"]
+mod shim_protocol;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -472,6 +474,7 @@ impl Shim {
         command
             .args(&self.child_args)
             .env(OWNER_ENV, owner())
+            .env(shim_protocol::RETIRE_ON_TTL_ENV, "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());

@@ -1,6 +1,7 @@
 mod fuse_bridge;
 mod input_bridge;
 mod kwin_script;
+mod shim_protocol;
 use kwin_script::run_kwin_script;
 mod wallet_mediator;
 
@@ -1549,6 +1550,8 @@ struct KwinMcp {
     start_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last startup checkpoint reached, named in the hard-limit error.
     start_stage: Arc<std::sync::Mutex<&'static str>>,
+    /// Prevent a queued start from reviving a child committed to TTL retirement.
+    ttl_retired: Arc<std::sync::atomic::AtomicBool>,
     display: DisplayConfig,
 }
 
@@ -1559,6 +1562,7 @@ impl KwinMcp {
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
+            ttl_retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             display,
         }
     }
@@ -1704,7 +1708,7 @@ impl KwinMcp {
         }
     }
 
-    async fn idle_reaper(self) {
+    async fn idle_reaper(self, retire: bool, expired: impl FnOnce() + Send) {
         let Some(ttl) = self.display.ttl else { return };
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1722,6 +1726,9 @@ impl KwinMcp {
                 }
             };
             if let Some(sess) = stopped {
+                if retire {
+                    self.ttl_retired.store(true, std::sync::atomic::Ordering::Release);
+                }
                 eprintln!("ttl: session idle for {} minutes; tearing down", ttl.as_secs() / 60);
                 teardown_blocking(sess).await;
                 match self.workdir.remove() {
@@ -1730,6 +1737,11 @@ impl KwinMcp {
                     WorkdirCleanup::Retained { dir, error } => {
                         eprintln!("ttl: could not remove {}: {error}", dir.display())
                     }
+                }
+                if retire {
+                    eprintln!("ttl: cleanup finished; retiring shim-owned server");
+                    expired();
+                    return;
                 }
             }
         }
@@ -3547,6 +3559,11 @@ impl KwinMcp {
                 return Err(error);
             }
         };
+        if self.ttl_retired.load(std::sync::atomic::Ordering::Acquire) {
+            let error = McpError::internal_error("session expired; this server is retiring", None);
+            attempt.finish(Some(&error.message));
+            return Err(error);
+        }
         {
             let mut guard = match tokio::time::timeout_at(deadline, self.session.lock()).await {
                 Ok(guard) => guard,
@@ -5913,6 +5930,9 @@ fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let retire_on_ttl = std::env::var(shim_protocol::RETIRE_ON_TTL_ENV).as_deref() == Ok("1");
+    // Consume the shim marker before threads or sandbox apps can inherit it.
+    unsafe { std::env::remove_var(shim_protocol::RETIRE_ON_TTL_ENV); }
     // Inside the sandbox this binary also serves FUSE (see fuse_bridge).
     let mut argv = std::env::args();
     if let Some(program) = argv.next().as_deref().and_then(fuse_bridge::shim_program) {
@@ -5974,7 +5994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run_server());
+    let result = runtime.block_on(run_server(retire_on_ttl));
     // Tokio's stdio reader uses a blocking thread. A signal leaves stdin open,
     // so waiting indefinitely for that thread would keep the server alive
     // after its session and workdir have already been cleaned up.
@@ -6016,7 +6036,7 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
     tool_router
 }
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(retire_on_ttl: bool) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
@@ -6038,9 +6058,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();
     let service = router.serve(transport).await?;
-    let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper());
-    let viewer_reaper = tokio::spawn(shutdown.clone().viewer_reaper());
     let cancellation = service.cancellation_token();
+    let ttl_cancellation = service.cancellation_token();
+    let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper(retire_on_ttl, move || ttl_cancellation.cancel()));
+    let viewer_reaper = tokio::spawn(shutdown.clone().viewer_reaper());
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
