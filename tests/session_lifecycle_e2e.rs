@@ -1739,3 +1739,159 @@ fn session_kwallet_access_fails_closed_and_releases_host_handles() {
     assert_eq!(users(), users_before, "session left host KWallet handles");
     assert_eq!(wallets(), wallets_before, "session changed the host wallet list");
 }
+
+fn host_bus_peer_pids() -> Vec<u32> {
+    let output = Command::new("busctl")
+        .args([
+            "--user",
+            "--json=short",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.Debug.Stats",
+            "GetStats",
+        ])
+        .output()
+        .expect("run busctl GetStats");
+    assert!(
+        output.status.success(),
+        "GetStats failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats: Value = serde_json::from_slice(&output.stdout).expect("GetStats JSON");
+    stats
+        .pointer("/data/0/org.bus1.DBus.Debug.Stats.PeerAccounting/data")
+        .and_then(Value::as_array)
+        .expect("dbus-broker peer accounting")
+        .iter()
+        .filter_map(|peer| peer.pointer("/1/ProcessID/data")?.as_u64())
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .collect()
+}
+
+fn host_bus_broker_fds() -> usize {
+    let output = Command::new("busctl")
+        .args([
+            "--user",
+            "--json=short",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            "s",
+            "org.freedesktop.DBus",
+        ])
+        .output()
+        .expect("run busctl GetConnectionUnixProcessID");
+    let reply: Value = serde_json::from_slice(&output.stdout).expect("broker pid JSON");
+    let launcher = reply["data"][0].as_u64().expect("broker pid");
+    let children = std::fs::read_to_string(format!("/proc/{launcher}/task/{launcher}/children"))
+        .unwrap_or_default();
+    let pid = children
+        .split_whitespace()
+        .find(|child| {
+            std::fs::read_to_string(format!("/proc/{child}/comm"))
+                .is_ok_and(|name| name.trim() == "dbus-broker")
+        })
+        .map_or_else(|| launcher.to_string(), str::to_owned);
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read broker fds")
+        .count()
+}
+
+fn ancestor_in(mut pid: u32, roots: &[u32]) -> Option<u32> {
+    for _ in 0..64 {
+        if roots.contains(&pid) {
+            return Some(pid);
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        pid = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+        if pid <= 1 {
+            return None;
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, dbus-broker, input devices, and a live GPU session"]
+fn parallel_sessions_hold_no_host_user_bus_connections() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let count: usize = std::env::var("KWIN_MCP_E2E_SESSIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(6);
+    let fds_before = host_bus_broker_fds();
+
+    let starts: Vec<_> = (0..count)
+        .map(|index| {
+            thread::spawn(move || {
+                let mut client = RpcClient::start();
+                client.send(
+                    1,
+                    "initialize",
+                    json!({
+                        "protocolVersion":"2025-06-18",
+                        "capabilities":{},
+                        "clientInfo":{"name":"host-bus-e2e","version":"1"}
+                    }),
+                );
+                let initialized = client.response(1, Duration::from_secs(10));
+                assert!(initialized["result"].is_object(), "initialize failed: {initialized}");
+                client.notify("notifications/initialized", json!({}));
+                let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+                assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+                let dir = workdir(&started);
+                let launched = call_tool(
+                    &mut client,
+                    3,
+                    "launch_app",
+                    json!({"command":format!(
+                        "google-chrome-stable --no-first-run --user-data-dir=$XDG_RUNTIME_DIR/chrome-{index} about:blank"
+                    )}),
+                );
+                assert!(
+                    launched["result"]["structuredContent"]["window"]
+                        .as_str()
+                        .is_some_and(|window| window.starts_with('{')),
+                    "Chrome did not open a window: {launched}"
+                );
+                (client, dir)
+            })
+        })
+        .collect();
+    let sessions: Vec<_> = starts
+        .into_iter()
+        .map(|start| start.join().expect("session thread"))
+        .collect();
+    let roots: Vec<u32> = sessions.iter().map(|(client, _)| client.child.id()).collect();
+
+    let held: Vec<(u32, u32)> = host_bus_peer_pids()
+        .into_iter()
+        .filter_map(|peer| ancestor_in(peer, &roots).map(|root| (root, peer)))
+        .collect();
+    assert!(held.is_empty(), "(server, peer) pairs on the host user bus: {held:?}");
+    let fds_running = host_bus_broker_fds();
+
+    for (mut client, dir) in sessions {
+        let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+        assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+        assert!(!dir.exists(), "session_stop left {}", dir.display());
+        client.stop_process();
+    }
+    let fds_after = host_bus_broker_fds();
+    eprintln!("host bus broker fds: before {fds_before}, {count} sessions running {fds_running}, after {fds_after}");
+    assert!(
+        fds_running <= fds_before + count,
+        "broker fds grew from {fds_before} to {fds_running} with {count} sessions"
+    );
+    assert!(
+        fds_after <= fds_before + count,
+        "broker fds {fds_after} after stop, {fds_before} before"
+    );
+}
