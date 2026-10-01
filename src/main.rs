@@ -2494,6 +2494,47 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// The DRM device nodes to show the session when the host's NVIDIA nodes are
+/// useless to it, or `None` when `/dev/dri` and `/dev/nvidia*` should be bound
+/// whole. Mesa cannot drive a node owned by the proprietary `nvidia` kernel
+/// driver unless the NVIDIA GBM backend is installed; KWin would probe every
+/// such node for seconds and still composite with llvmpipe. Without a render
+/// node KWin falls back to QPainter, which cannot serve screenshots, so one
+/// NVIDIA render node stays when the host has no other.
+fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
+    if nvidia_gbm_installed {
+        return None;
+    }
+    let entries = std::fs::read_dir("/dev/dri").ok()?;
+    let mut other = Vec::new();
+    let mut nvidia = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let driver = std::fs::read_link(Path::new("/sys/class/drm").join(&name).join("device/driver")).ok();
+        let owned_by_nvidia = driver.as_deref().and_then(Path::file_name).is_some_and(|driver| driver == "nvidia");
+        if owned_by_nvidia { nvidia.push(entry.path()) } else { other.push(entry.path()) }
+    }
+    if nvidia.is_empty() {
+        return None;
+    }
+    let is_render = |node: &PathBuf| node.file_name().is_some_and(|name| name.to_string_lossy().starts_with("renderD"));
+    if !other.iter().any(is_render) {
+        nvidia.sort();
+        other.extend(nvidia.into_iter().find(is_render));
+    }
+    Some(other)
+}
+
+fn nvidia_gbm_installed() -> bool {
+    ["/usr/lib/gbm", "/usr/lib64/gbm", "/usr/lib/x86_64-linux-gnu/gbm"]
+        .iter()
+        .any(|dir| Path::new(dir).join("nvidia-drm_gbm.so").exists())
+}
+
 /// Whether `command` starts a Chromium-family browser (leading VAR=value words
 /// skipped); editors built on Electron do not count.
 fn launches_chromium(command: &str) -> bool {
@@ -3854,10 +3895,8 @@ impl KwinMcp {
             export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
             export GDK_SCALE={KDE_SCALE_FACTOR}\n\
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
-            export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n\
-            mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
@@ -4088,9 +4127,21 @@ impl KwinMcp {
         let home_kscreenlockerrc = format!("{home}/.config/kscreenlockerrc");
         let home_kcmfonts = format!("{home}/.config/kcmfonts");
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
+        cmd.args(["--dev", "/dev"]);
+        let trimmed_dri = usable_dri_nodes(nvidia_gbm_installed());
+        match &trimmed_dri {
+            None => {
+                cmd.args(["--dev-bind", "/dev/dri", "/dev/dri"]);
+            }
+            Some(nodes) => {
+                eprintln!("session_start: /dev/dri nodes shown to the session: {}", nodes.len());
+                cmd.args(["--dir", "/dev/dri"]);
+                for node in nodes {
+                    cmd.arg("--dev-bind").arg(node).arg(node);
+                }
+            }
+        }
         cmd.args([
-            "--dev", "/dev",
-            "--dev-bind", "/dev/dri", "/dev/dri",
             "--dev-bind", "/dev/uinput", "/dev/uinput",
             "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
             "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
@@ -4117,8 +4168,10 @@ impl KwinMcp {
         // driver=(null) → eglInitialize fails → KWin's virtual backend can't composite
         // → ScreenShot2 returns Error.Cancelled. Glob so we pick up whatever this host
         // exposes; -try so non-NVIDIA hosts (no matches) still start.
-        for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
-            cmd.arg("--dev-bind-try").arg(&path).arg(&path);
+        if trimmed_dri.is_none() {
+            for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
+                cmd.arg("--dev-bind-try").arg(&path).arg(&path);
+            }
         }
         // FUSE: /dev/fuse, CAP_SYS_ADMIN in the sandbox's user namespace for
         // the helper only, and fusermount shims over the real binaries.
