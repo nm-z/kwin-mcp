@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
@@ -32,6 +32,7 @@ const LIVE_SOCKET_ROOT: &str = "/tmp";
 const SERVER_INVOCATIONS: &str = "server-invocations.log";
 const RESISTANT_PID: &str = "term-resistant.pid";
 const TTL_RECEIPTS: &str = "ttl-receipts.jsonl";
+const STOP_RETRY_RECEIPTS: &str = "stop-retry-receipts.jsonl";
 
 struct PrivateHome(PathBuf, PathBuf);
 
@@ -72,6 +73,7 @@ impl PrivateHome {
             SERVER_INVOCATIONS,
             RESISTANT_PID,
             TTL_RECEIPTS,
+            STOP_RETRY_RECEIPTS,
         ] {
             copy_diagnostic(&self.0.join(name), &proof.join(name))?;
         }
@@ -107,6 +109,8 @@ impl Drop for PrivateHome {
 fn copy_diagnostic(source: &Path, destination: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(source) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        // The stop-retry fixture temporarily replaces its workdir with a file.
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => Ok(()),
         Err(error) => Err(error),
         Ok(metadata) if metadata.file_type().is_file() => {
             std::fs::copy(source, destination)?;
@@ -388,6 +392,97 @@ struct HeadlessSession {
     ttl_expirations_before: usize,
 }
 
+struct StopRetryFault {
+    original: PathBuf,
+    parked: PathBuf,
+    directory: std::fs::Metadata,
+    placeholder: Option<File>,
+    active: bool,
+}
+
+impl StopRetryFault {
+    fn install(session: &HeadlessSession) -> TestResult<Self> {
+        assert!(session.server.stat().is_some(), "owned server exited");
+        let directory = std::fs::symlink_metadata(&session.workdir)?;
+        assert!(directory.is_dir(), "owned workdir is not a directory");
+        assert_eq!(directory.uid(), std::fs::metadata("/proc/self")?.uid());
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let parked = session.workdir.with_file_name(format!(
+            "kwin-mcp-stop-retry-{}-{nonce}",
+            session.server.pid
+        ));
+        assert_absent(&parked)?;
+        std::fs::rename(&session.workdir, &parked)?;
+        // Arm restoration before creating the placeholder. A setup error or
+        // assertion unwinds this guard before Connection tears down processes.
+        let mut fault = Self {
+            original: session.workdir.clone(),
+            parked,
+            directory,
+            placeholder: None,
+            active: true,
+        };
+        fault.placeholder = Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&fault.original)?,
+        );
+        // Permission repair skips regular files; remove_dir_all returns
+        // ENOTDIR. Teardown still removes the disk twin by the original name.
+        Ok(fault)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let directory = std::fs::symlink_metadata(&self.parked)?;
+        if !directory.is_dir()
+            || directory.dev() != self.directory.dev()
+            || directory.ino() != self.directory.ino()
+        {
+            return Err(io::Error::other("parked workdir identity changed"));
+        }
+        match std::fs::symlink_metadata(&self.original) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(current) => {
+                let placeholder = self
+                    .placeholder
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("workdir path has an unowned entry"))?
+                    .metadata()?;
+                if !current.is_file()
+                    || current.dev() != placeholder.dev()
+                    || current.ino() != placeholder.ino()
+                {
+                    return Err(io::Error::other("workdir placeholder identity changed"));
+                }
+                std::fs::remove_file(&self.original)?;
+            }
+        }
+        std::fs::rename(&self.parked, &self.original)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StopRetryFault {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!(
+                "could not restore stop-retry workdir {} from {}: {error}",
+                self.original.display(),
+                self.parked.display()
+            );
+        }
+    }
+}
+
 fn assert_absent(path: &Path) -> TestResult {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -621,6 +716,48 @@ impl Connection {
                 "private_home": self.home.0,
                 "live_tmpdir": LIVE_SOCKET_ROOT,
                 "session": session,
+                "processes": self.process_receipts(),
+                "details": details,
+            })
+        )?;
+        receipt.flush()?;
+        self.retain_proof()
+    }
+
+    fn record_stop_retry_receipt(
+        &self,
+        event: &str,
+        session: &HeadlessSession,
+        fault: &StopRetryFault,
+        details: Value,
+    ) -> TestResult {
+        let mut receipt = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.home.0.join(STOP_RETRY_RECEIPTS))?;
+        writeln!(
+            receipt,
+            "{}",
+            json!({
+                "event": event,
+                "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                "shim_pid": self.shim,
+                "shim_binary": shim_binary(),
+                "server_binary": real_server_binary(),
+                "session_id": session.session_id,
+                "server_pid": session.server.pid,
+                "server_starttime": session.server.starttime,
+                "server_current_starttime": session.server.stat().map(|stat| stat.starttime),
+                "workdir": session.workdir,
+                "workdir_exists": session.workdir.try_exists().ok(),
+                "workdir_is_file": session.workdir.is_file(),
+                "disk_workdir": session.disk,
+                "disk_workdir_exists": session.disk.try_exists().ok(),
+                "parked_workdir": fault.parked,
+                "parked_workdir_exists": fault.parked.try_exists().ok(),
+                "parked_workdir_dev": fault.directory.dev(),
+                "parked_workdir_ino": fault.directory.ino(),
+                "fault_active": fault.active,
                 "processes": self.process_receipts(),
                 "details": details,
             })
@@ -984,6 +1121,156 @@ impl Drop for Connection {
         self.output.take();
         // Field order drops the process guard before the private HOME.
     }
+}
+
+#[test]
+#[ignore = "requires KWin, bubblewrap, input devices, a GPU session, both binary overrides, and proof receipts; no host viewer"]
+fn shim_stop_cleanup_failure_retains_session_for_retry() -> TestResult {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    for name in ["KWIN_MCP_E2E_SHIM", "KWIN_MCP_E2E_SERVER", PROOF_DIR_ENV] {
+        assert!(
+            std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+            "stop-retry proof requires {name}"
+        );
+    }
+    let mut connection = Connection::start(false)?;
+    let session = connection.start_headless()?;
+    let id = session
+        .session_id
+        .as_deref()
+        .ok_or_else(|| io::Error::other("stop-retry fixture has no shim session_id"))?;
+    let original_shim = OwnedProcess::read(connection.shim)?;
+    connection.processes.capture_tree()?;
+    let recorded = connection.recorded_tree();
+    // Declare the fault after Connection so it restores the owned directory
+    // before an assertion failure closes stdio and runs process cleanup.
+    let mut fault = StopRetryFault::install(&session)?;
+    connection.record_stop_retry_receipt("fault-installed", &session, &fault, json!({}))?;
+    let failed = connection.rpc(
+        5,
+        "tools/call",
+        json!({"name":"session_stop","arguments":{"session_id":id}}),
+    )?;
+    connection.record_stop_retry_receipt(
+        "stop-response",
+        &session,
+        &fault,
+        json!({"response":failed}),
+    )?;
+    assert_eq!(failed["error"]["code"], -32603, "{failed}");
+    let error = failed["error"]["message"]
+        .as_str()
+        .ok_or_else(|| io::Error::other(format!("stop returned no cleanup error: {failed}")))?;
+    assert!(
+        error.contains(&session.workdir.display().to_string())
+            && error.contains("Cleanup is still owned")
+            && error.contains(&format!("os error {}", nix::libc::ENOTDIR)),
+        "stop did not report the injected cleanup failure: {failed}"
+    );
+    assert!(session.workdir.is_file(), "cleanup removed the placeholder");
+    assert!(fault.parked.is_dir(), "cleanup removed the parked workdir");
+    let (listed, listing) = connection.session_listing_until(Instant::now() + RESPONSE_WAIT)?;
+    connection.record_stop_retry_receipt(
+        "route-readback",
+        &session,
+        &fault,
+        json!({"session_list":listed}),
+    )?;
+    assert!(
+        listing
+            .lines()
+            .any(|line| line.starts_with(&format!("{id}: server pid {},", session.server.pid))),
+        "failed stop lost the original route: {listed}"
+    );
+    let retained_server = session
+        .server
+        .stat()
+        .ok_or_else(|| io::Error::other("failed stop retired the original server"))?;
+    assert_ne!(retained_server.state, 'Z', "original server is a zombie");
+    assert_eq!(retained_server.ppid, connection.shim);
+    assert_eq!(retained_server.starttime, session.server.starttime);
+    fault.restore()?;
+    assert!(
+        session.workdir.is_dir(),
+        "original workdir was not restored"
+    );
+    assert_absent(&fault.parked)?;
+    connection.record_stop_retry_receipt("fault-restored", &session, &fault, json!({}))?;
+    let stopped = connection.rpc(
+        6,
+        "tools/call",
+        json!({"name":"session_stop","arguments":{"session_id":id}}),
+    )?;
+    connection.record_stop_retry_receipt(
+        "retry-response",
+        &session,
+        &fault,
+        json!({"response":stopped}),
+    )?;
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    assert_ne!(stopped["result"]["isError"], true, "{stopped}");
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "cleaned",
+        "retry did not clean the original server's retained ownership: {stopped}"
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["workdir_removed"],
+        session.workdir.display().to_string(),
+        "{stopped}"
+    );
+    let deadline = Instant::now() + EXIT_WAIT;
+    while !connection.only_connection_remains()? {
+        assert!(
+            Instant::now() < deadline,
+            "successful stop left owned processes"
+        );
+        thread::sleep(POLL_PAUSE);
+    }
+    for process in recorded
+        .iter()
+        .filter(|process| process.pid != connection.shim)
+    {
+        assert!(
+            process.stat().is_none(),
+            "recorded process survived: {process:?}"
+        );
+    }
+    assert_absent(&session.workdir)?;
+    assert_absent(&session.disk)?;
+    assert_absent(&fault.parked)?;
+    let (listed, listing) = connection.session_listing_until(Instant::now() + RESPONSE_WAIT)?;
+    assert!(listing.starts_with("No live sessions."), "{listed}");
+    let ping = connection.ping_until(Instant::now() + RESPONSE_WAIT)?;
+    assert!(original_shim.stat().is_some(), "original shim was replaced");
+    assert!(
+        connection.input.is_some(),
+        "successful stop must retain stdin"
+    );
+    assert!(
+        connection.output.is_some(),
+        "successful stop must retain stdout"
+    );
+    connection.record_stop_retry_receipt(
+        "final-ping",
+        &session,
+        &fault,
+        json!({
+            "session_list":listed,
+            "ping":ping,
+            "original_shim_starttime":original_shim.starttime,
+            "recorded_tree_removed":true,
+            "stdin_retained":connection.input.is_some(),
+            "stdout_retained":connection.output.is_some(),
+        }),
+    )?;
+    connection.disconnect_input();
+    assert!(connection.processes.wait_for_child(EXIT_WAIT)?.success());
+    connection.wait_for_exit(EXIT_WAIT);
+    eprintln!(
+        "stop_retry: session_id={id} server={:?} original_route_retained=true fault_cleared=true same_id_retry=true recorded_owned_tree={recorded:?} owned_workdirs_removed=true parked_workdir_removed=true final_ping=true",
+        session.server
+    );
+    Ok(())
 }
 
 #[test]
