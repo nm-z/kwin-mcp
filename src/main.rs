@@ -5803,7 +5803,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
             }
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] [--memory-max GIB] [--memory-swap-max GIB] | kwin-mcp --stats [SECONDS]"
+                    "unknown argument '{other}': usage: kwin-mcp [--describe] [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] [--memory-max GIB] [--memory-swap-max GIB] | kwin-mcp --stats [SECONDS]"
                 ));
             }
         }
@@ -5937,6 +5937,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(fuse_bridge::run_client(program));
     }
     match argv.next().as_deref() {
+        Some("--describe") => {
+            let display = parse_cli_args_from(argv)?;
+            let server = KwinMcp::new(display);
+            let tool_router = configured_tool_router();
+            let description = serde_json::json!({
+                "initialize": rmcp::ServerHandler::get_info(&server),
+                "tools": tool_router.list_all(),
+            });
+            serde_json::to_writer(std::io::stdout().lock(), &description)?;
+            println!();
+            return Ok(());
+        }
         Some("--stats") => {
             let seconds = match argv.next() {
                 Some(value) => value.parse::<u64>().map_err(|error| format!("--stats '{value}': {error}"))?,
@@ -5971,23 +5983,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
-    }
-    let display = parse_cli_args()?;
-    if display.autoclean
-        && let Err(error) = sweep_orphaned_workdirs() {
-            eprintln!("autoclean: orphan sweep skipped: {error}");
-    }
-    eprintln!(
-        "kwin-mcp: display default {}x{}{}; viewer on demand",
-        display.width,
-        display.height,
-        if display.locked { " (locked, --no-override)" } else { "" },
-    );
-    let kwin = KwinMcp::new(display);
-    let shutdown = kwin.clone();
+fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<KwinMcp> {
     // Inject the host's installed browsers into the launch_app description so the
     // agent knows what it can actually run without guessing (issue #28).
     let mut tool_router = KwinMcp::tool_router();
@@ -6018,6 +6014,27 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             })
         });
     }
+    tool_router
+}
+
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
+    }
+    let display = parse_cli_args()?;
+    if display.autoclean
+        && let Err(error) = sweep_orphaned_workdirs() {
+            eprintln!("autoclean: orphan sweep skipped: {error}");
+    }
+    eprintln!(
+        "kwin-mcp: display default {}x{}{}; viewer on demand",
+        display.width,
+        display.height,
+        if display.locked { " (locked, --no-override)" } else { "" },
+    );
+    let kwin = KwinMcp::new(display);
+    let shutdown = kwin.clone();
+    let tool_router = configured_tool_router();
     let router =
         rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
     let transport = rmcp::transport::io::stdio();

@@ -2128,3 +2128,135 @@ fn keyboard_key_warns_when_the_browser_page_lacks_focus() {
     call_tool(&mut client, id, "session_stop", json!({}));
     client.stop_process();
 }
+
+fn direct_children(pid: u32) -> Vec<i32> {
+    let parent = i32::try_from(pid).expect("parent pid");
+    procfs::process::all_processes().expect("read procfs").flatten()
+        .filter_map(|process| process.stat().ok())
+        .filter(|stat| stat.ppid == parent)
+        .map(|stat| stat.pid)
+        .collect()
+}
+
+#[test]
+fn shim_discovery_has_no_persistent_server() {
+    let mut client = RpcClient::start_shim();
+    thread::sleep(Duration::from_secs(2));
+    assert!(direct_children(client.child.id()).is_empty());
+    initialize(&mut client);
+    client.send(2, "tools/list", json!({}));
+    let listed = client.response(2, Duration::from_secs(10));
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    assert!(tools.iter().any(|tool| tool["name"] == "session_start"));
+    assert!(tools.iter().any(|tool| tool["name"] == "session_list"));
+    for tool in tools.iter().filter(|tool| tool["name"] != "session_list") {
+        assert_eq!(tool["inputSchema"]["properties"]["session_id"]["type"], "string");
+    }
+    call_tool(&mut client, 3, "session_list", json!({}));
+    client.send(4, "ping", json!({}));
+    assert_eq!(client.response(4, Duration::from_secs(2))["result"], json!({}));
+    for (index, method) in ["resources/list", "resources/templates/list", "prompts/list", "completion/complete"].iter().enumerate() {
+        let id = 5 + u64::try_from(index).expect("index");
+        client.send(id, method, json!({"ref":{"type":"ref/prompt","name":"unused"},"argument":{"name":"unused","value":""}}));
+        assert!(client.response(id, Duration::from_secs(2))["result"].is_object(), "{method} failed");
+    }
+    thread::sleep(Duration::from_secs(4));
+    assert!(direct_children(client.child.id()).is_empty(), "discovery retained a child");
+    assert!(!client.stderr.try_iter().any(|line| line.contains("started child")));
+    client.stop_process();
+}
+
+#[test]
+fn describe_matches_the_stdio_server() {
+    let described = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
+        .args(["--describe", "--autoclean"])
+        .output().expect("describe");
+    assert!(described.status.success(), "{}", String::from_utf8_lossy(&described.stderr));
+    let metadata: Value = serde_json::from_slice(&described.stdout).expect("metadata JSON");
+    let mut client = RpcClient::start();
+    client.send(1, "initialize", json!({"protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"test", "version":"1"}}));
+    let initialized = client.response(1, Duration::from_secs(10));
+    assert_eq!(metadata["initialize"], initialized["result"]);
+    client.notify("notifications/initialized", json!({}));
+    client.send(2, "tools/list", json!({}));
+    let listed = client.response(2, Duration::from_secs(10));
+    let sorted = |value: &Value| {
+        let mut tools = value.as_array().expect("tools").clone();
+        tools.sort_by_key(|tool| tool["name"].as_str().unwrap_or_default().to_owned());
+        tools
+    };
+    assert_eq!(sorted(&metadata["tools"]), sorted(&listed["result"]["tools"]));
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, kdialog, input devices, and a live GPU session"]
+fn shim_starts_only_requested_sessions_and_does_not_replace_stopped_servers() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_shim();
+    initialize(&mut client);
+    assert!(direct_children(client.child.id()).is_empty());
+    let first = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(first["result"]["structuredContent"]["status"], "started", "{first}");
+    let first_id = first["result"]["structuredContent"]["session_id"].as_str().expect("session id").to_owned();
+    eprintln!("lazy proof: shim={} first={first_id}", client.child.id());
+    assert_eq!(direct_children(client.child.id()).len(), 1, "unexpected spare server");
+    let launched = call_tool(&mut client, 3, "launch_app", json!({"session_id":first_id, "command":"kdialog --title lazy-server-proof --msgbox lazy-server-proof"}));
+    assert!(!launched["result"]["isError"].as_bool().unwrap_or(false), "{launched}");
+    let windows = call_tool(&mut client, 4, "window_list", json!({"session_id":first_id}));
+    assert!(windows.to_string().contains("lazy-server-proof"), "{windows}");
+    let screenshot = call_tool(&mut client, 5, "screenshot", json!({"session_id":first_id,"inline":true}));
+    assert!(screenshot["result"]["content"].as_array().expect("screenshot content")
+        .iter().any(|item| item["type"] == "image"), "screenshot did not return an image");
+    if let Some(directory) = std::env::var_os("KWIN_MCP_PROOF_DIR") {
+        use base64::Engine;
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("proof directory");
+        let image = screenshot["result"]["content"].as_array().expect("content").iter()
+            .find(|item| item["type"] == "image").expect("image");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image["data"].as_str().expect("image data")).expect("decode image");
+        std::fs::write(directory.join("lazy-first-session.png"), bytes).expect("write proof");
+    }
+    let second = call_tool(&mut client, 6, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(second["result"]["structuredContent"]["status"], "started", "{second}");
+    let second_id = second["result"]["structuredContent"]["session_id"].as_str().expect("session id").to_owned();
+    eprintln!("lazy proof: second={second_id}");
+    assert_ne!(first_id, second_id);
+    assert_eq!(direct_children(client.child.id()).len(), 2, "unexpected spare server");
+    let second_windows = call_tool(&mut client, 7, "window_list", json!({"session_id":second_id}));
+    assert!(!second_windows.to_string().contains("lazy-server-proof"), "window leaked between sessions");
+    for (index, session) in [first_id, second_id].iter().enumerate() {
+        let id = 8 + u64::try_from(index).expect("index");
+        let stopped = call_tool(&mut client, id, "session_stop", json!({"session_id":session}));
+        assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !direct_children(client.child.id()).is_empty() {
+        assert!(Instant::now() < deadline, "server did not exit after session_stop");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_secs(4));
+    assert!(direct_children(client.child.id()).is_empty(), "server respawned without a call");
+    client.send(10, "ping", json!({}));
+    assert_eq!(client.response(10, Duration::from_secs(2))["result"], json!({}));
+    client.stop_process();
+}
+
+#[test]
+fn shim_releases_server_after_call_without_session() {
+    let mut client = RpcClient::start_shim();
+    initialize(&mut client);
+    let result = call_tool(&mut client, 2, "window_list", json!({}));
+    assert!(result.to_string().contains("no session"), "{result}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !direct_children(client.child.id()).is_empty() {
+        assert!(Instant::now() < deadline, "unbound server did not exit");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_secs(4));
+    assert!(direct_children(client.child.id()).is_empty());
+    client.send(3, "ping", json!({}));
+    assert_eq!(client.response(3, Duration::from_secs(2))["result"], json!({}));
+    client.stop_process();
+}

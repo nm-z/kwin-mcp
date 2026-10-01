@@ -8,11 +8,12 @@
 //!   session has its own display, window stack, keyboard focus and mouse. The
 //!   returned `session_id` routes every later tool call (issue #95).
 //! - Hot reload. When the source tree changes the shim runs `cargo build`;
-//!   when the kwin-mcp binary changes it swaps in a new idle child and sends
+//!   when the kwin-mcp binary changes it refreshes metadata and sends
 //!   `notifications/tools/list_changed`. Live sessions keep running on the
 //!   child they started on until they stop; new sessions get the new build:
 //!   a `session_start` made while a build is pending waits for it, and every
-//!   start checks the binary on disk rather than trusting the warm child.
+//!   start checks the binary on disk. Discovery uses a short-lived --describe
+//!   command, without starting the server runtime or keeping a spare child.
 //!   No client reconnect is needed.
 //! - Self-upgrade. When the shim binary itself is rebuilt, the shim re-executes
 //!   it in place (same pid, same client pipes) as soon as no session is live
@@ -60,6 +61,7 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 /// Prefix of every JSON-RPC id the shim itself owns on a child connection.
 const SHIM_ID: &str = "__kwin_shim:";
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Carries the client connection state across a self-upgrade exec.
 const RESUME_ENV: &str = "KWIN_MCP_SHIM_RESUME";
 
@@ -208,6 +210,7 @@ enum Event {
     Child(u64, Value),
     ChildExited(u64, String),
     BinaryChanged(Stamp),
+    Described(Stamp, Result<Value, String>),
     /// The watcher saw a source change (true) or finished building it (false).
     Building(bool),
     Tick,
@@ -307,8 +310,7 @@ struct Shim {
     child_args: Vec<String>,
     children: HashMap<u64, Child>,
     next_child: u64,
-    /// The warm child with no session: answers tools/list and calls made
-    /// before any session exists, and becomes the next session's child.
+    /// A child requested by a tool call before any session exists.
     idle: Option<u64>,
     sessions: BTreeMap<String, u64>,
     ended: HashMap<String, String>,
@@ -319,8 +321,9 @@ struct Shim {
     pending_init: Option<Value>,
     pending_lists: Vec<Value>,
     init_result: Option<Value>,
+    describing: bool,
     tools: Option<Vec<Value>>,
-    /// Tool definitions of the newest idle child, before rewriting.
+    /// Tool definitions of the newest build, before rewriting.
     base_tools: Vec<Value>,
     client_ready: bool,
     latest: Option<Stamp>,
@@ -348,6 +351,72 @@ struct Shim {
 }
 
 impl Shim {
+    fn describe(&mut self) {
+        if self.describing || self.closing { return }
+        let Some(build) = stamp(&self.child_bin) else {
+            self.metadata_error("kwin-mcp executable is unavailable".to_owned());
+            return;
+        };
+        self.describing = true;
+        let binary = self.child_bin.clone();
+        let args = self.child_args.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let output = tokio::process::Command::new(binary)
+                    .arg("--describe").args(args)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true).output().await
+                    .map_err(|error| format!("could not read server metadata: {error}"))?;
+                if !output.status.success() {
+                    return Err(format!("server metadata failed ({}): {}", output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()));
+                }
+                let value: Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|error| format!("invalid server metadata: {error}"))?;
+                if !value.get("initialize").is_some_and(Value::is_object)
+                    || !value.get("tools").is_some_and(Value::is_array) {
+                    return Err("server metadata has no initialize result or tools".to_owned());
+                }
+                Ok(value)
+            };
+            let result = tokio::time::timeout(DESCRIBE_TIMEOUT, result).await
+                .unwrap_or_else(|_| Err("server metadata exceeded 10 seconds".to_owned()));
+            let _ = events.send(Event::Described(build, result));
+        });
+    }
+
+    fn metadata_error(&mut self, message: String) {
+        log(&message);
+        if let Some(id) = self.pending_init.take() {
+            self.reply_error(id, -32603, message.clone());
+        }
+        for id in std::mem::take(&mut self.pending_lists) {
+            self.reply_error(id, -32603, message.clone());
+        }
+    }
+
+    fn on_described(&mut self, build: Stamp, result: Result<Value, String>) {
+        self.describing = false;
+        if self.closing { return }
+        if stamp(&self.child_bin) != Some(build) {
+            self.describe();
+            return;
+        }
+        match result {
+            Ok(metadata) => {
+                self.init_result = metadata.get("initialize").cloned();
+                self.base_tools = metadata.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
+                self.publish_tools();
+                if let Some(id) = self.pending_init.take()
+                    && let Some(result) = self.client_init_result() {
+                    self.reply(id, result);
+                }
+            }
+            Err(message) => self.metadata_error(message),
+        }
+    }
+
     fn write(&self, value: &Value) {
         let _ = self.out.send(value.to_string());
     }
@@ -438,7 +507,7 @@ impl Shim {
         Some(key)
     }
 
-    /// Make sure a warm idle child exists, spawning one if needed.
+    /// Start a server only for a tool call that needs one.
     fn ensure_idle(&mut self) -> Option<u64> {
         if let Some(key) = self.idle && self.children.contains_key(&key) {
             return Some(key);
@@ -524,22 +593,23 @@ impl Shim {
                     self.reply(id, result);
                 } else {
                     self.pending_init = Some(id);
-                    self.ensure_idle();
+                    self.describe();
                 }
             }
             "ping" => self.reply(id, json!({})),
+            "resources/list" => self.reply(id, json!(rmcp::model::ListResourcesResult::default())),
+            "resources/templates/list" => self.reply(id, json!(rmcp::model::ListResourceTemplatesResult::default())),
+            "prompts/list" => self.reply(id, json!(rmcp::model::ListPromptsResult::default())),
+            "completion/complete" => self.reply(id, json!(rmcp::model::CompleteResult::default())),
             "tools/list" => match &self.tools {
                 Some(tools) => self.reply(id, json!({ "tools": tools })),
                 None => {
                     self.pending_lists.push(id);
-                    self.ensure_idle();
+                    self.describe();
                 }
             },
             "tools/call" => self.route_call(id, message),
-            _ => match self.ensure_idle() {
-                Some(key) => self.forward(key, id, false, FlightKind::Plain, &message),
-                None => self.reply_error(id, -32603, "kwin-mcp is restarting".to_owned()),
-            },
+            _ => self.reply_error(id, -32601, format!("method not found: {method}")),
         }
     }
 
@@ -591,6 +661,10 @@ impl Shim {
     /// Start a new session on a fresh child running the binary on disk now.
     /// While a source change is still building, the call waits for it.
     fn start_session(&mut self, id: Value, message: Value) {
+        if self.closing {
+            self.reply(id, tool_error("kwin-mcp is shutting down".to_owned()));
+            return;
+        }
         if self.building {
             log("session_start waits for the kwin-mcp build in progress");
             self.held_starts.push((id, message, Instant::now()));
@@ -611,7 +685,6 @@ impl Shim {
             Some(key) => Some(key),
             None => self.spawn_child(),
         };
-        self.ensure_idle();
         let Some(key) = key else {
             self.reply(id, tool_error("kwin-mcp could not start a server process; see the MCP server log".to_owned()));
             return;
@@ -755,7 +828,7 @@ impl Shim {
                         child.send_raw(line);
                     }
                 }
-                if self.idle == Some(key) || self.tools.is_none() {
+                if Some(child.build) == self.latest {
                     self.base_tools = tools;
                 }
                 self.publish_tools();
@@ -801,6 +874,7 @@ impl Shim {
                         }
                     }
                     log(&format!("session {session} started"));
+                    self.publish_tools();
                 } else {
                     self.retire(key);
                 }
@@ -821,6 +895,9 @@ impl Shim {
         {
             child.stdin = None;
         }
+        if self.children.get(&key).is_some_and(|child| child.session.is_none() && child.inflight == 0) {
+            self.retire(key);
+        }
         self.write(&message);
         // Right after a session_stop, before the next session_start is read.
         self.maybe_upgrade(false);
@@ -828,6 +905,15 @@ impl Shim {
 
     fn client_init_result(&self) -> Option<Value> {
         let mut result = self.init_result.clone()?;
+        // Match rmcp's negotiation: accept an older client protocol version.
+        if let Some(version) = self.client_params.as_ref().and_then(|params| params.get("protocolVersion"))
+            && let (Ok(client), Ok(server)) = (
+                serde_json::from_value::<rmcp::model::ProtocolVersion>(version.clone()),
+                serde_json::from_value::<rmcp::model::ProtocolVersion>(result.get("protocolVersion")?.clone()),
+            )
+            && client < server {
+            result["protocolVersion"] = version.clone();
+        }
         let object = result.as_object_mut()?;
         let capabilities = object.entry("capabilities").or_insert_with(|| json!({}));
         if let Some(capabilities) = capabilities.as_object_mut() {
@@ -963,23 +1049,21 @@ impl Shim {
         if first {
             return;
         }
-        log("kwin-mcp binary changed; swapping in a new idle child (live sessions keep their child)");
+        log("kwin-mcp binary changed; refreshing metadata (live sessions keep their child)");
         if let Some(old) = self.idle.take() {
             self.retire(old);
         }
         if self.client_params.is_some() {
             self.respawn_after = None;
-            self.ensure_idle();
+            self.describe();
         }
     }
 
     fn on_tick(&mut self) {
         let now = Instant::now();
-        if self.client_params.is_some() && !self.closing {
-            if self.respawn_after.is_some_and(|at| now >= at) {
-                self.respawn_after = None;
-            }
-            self.ensure_idle();
+        if self.client_params.is_some() && !self.closing
+            && self.respawn_after.is_some_and(|at| now >= at) {
+            self.respawn_after = None;
         }
         if self.held_starts.first().is_some_and(|(_, _, at)| now.duration_since(*at) > BUILD_WAIT) {
             log("kwin-mcp build is taking too long; starting held sessions on the current binary");
@@ -1072,7 +1156,8 @@ impl Shim {
             self.self_seen = current;
         }
         let quiet = self.sessions.is_empty() && self.inflight.is_empty() && self.reverse.is_empty()
-            && self.held_starts.is_empty() && self.pending_init.is_none() && self.pending_lists.is_empty();
+            && self.held_starts.is_empty() && self.pending_init.is_none() && self.pending_lists.is_empty()
+            && !self.describing;
         if !stable || current == self.self_stamp || self.building || self.closing || !self.client_ready || !quiet {
             return;
         }
@@ -1084,6 +1169,7 @@ impl Shim {
 
     fn begin_shutdown(&mut self) {
         self.closing = true;
+        self.held_starts.clear();
         let keys: Vec<u64> = self.children.keys().copied().collect();
         for key in keys {
             if let Some(child) = self.children.get_mut(&key) {
@@ -1205,8 +1291,8 @@ async fn watch(repo: Option<PathBuf>, release: bool, binary: PathBuf, events: mp
 }
 
 async fn sweeper(binary: PathBuf, mut trigger: mpsc::UnboundedReceiver<()>) {
+    if trigger.recv().await.is_none() { return }
     loop {
-        let _ = tokio::time::timeout(SWEEP_INTERVAL, trigger.recv()).await;
         // Coalesce bursts, and give a dead child's container a moment to go.
         tokio::time::sleep(Duration::from_secs(3)).await;
         while trigger.try_recv().is_ok() {}
@@ -1218,6 +1304,9 @@ async fn sweeper(binary: PathBuf, mut trigger: mpsc::UnboundedReceiver<()>) {
             .await;
         if let Err(error) = status {
             log(&format!("workdir sweep failed: {error}"));
+        }
+        if matches!(tokio::time::timeout(SWEEP_INTERVAL, trigger.recv()).await, Ok(None)) {
+            return;
         }
     }
 }
@@ -1379,7 +1468,6 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(watch(repo, release, binary.clone(), event_tx.clone()));
     watch_sigterm(event_tx.clone())?;
     tokio::spawn(sweeper(binary.clone(), sweep_rx));
-    let _ = sweep_tx.send(());
 
     let self_stamp = stamp(&self_path);
     let mut shim = Shim {
@@ -1388,7 +1476,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         children: HashMap::new(), next_child: 0, idle: None,
         sessions: BTreeMap::new(), ended: HashMap::new(), inflight: HashMap::new(),
         reverse: HashMap::new(), next_reverse: 0, client_params: None, pending_init: None,
-        pending_lists: Vec::new(), init_result: None, tools: None, base_tools: Vec::new(), client_ready: false,
+        pending_lists: Vec::new(), init_result: None, describing: false, tools: None, base_tools: Vec::new(), client_ready: false,
         latest: None, building: false, held_starts: Vec::new(), crashes: VecDeque::new(), respawn_after: None,
         dead_sids: HashSet::new(), orphans: HashMap::new(), closing: false,
         self_path, self_stamp, self_seen: self_stamp, upgrading: false, freeze: freeze.clone(), carried: Vec::new(),
@@ -1400,7 +1488,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
         shim.client_params = Some(resume.client_params);
         shim.client_ready = true;
         shim.ended = resume.ended;
-        shim.ensure_idle();
+        shim.describe();
     }
 
     let started_under = std::os::unix::process::parent_id();
@@ -1443,6 +1531,7 @@ async fn run(resume: Option<Resume>) -> Result<(), Box<dyn std::error::Error>> {
             Event::Child(key, message) => shim.on_child(key, message),
             Event::ChildExited(key, status) => shim.on_child_exit(key, &status),
             Event::BinaryChanged(build) => shim.on_binary_changed(build),
+            Event::Described(build, result) => shim.on_described(build, result),
             Event::Building(active) => shim.on_building(active),
             Event::Tick => shim.on_tick(),
             Event::Terminated(sender) => shim.on_foreign_term(sender),
