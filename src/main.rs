@@ -3854,10 +3854,8 @@ impl KwinMcp {
             export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
             export GDK_SCALE={KDE_SCALE_FACTOR}\n\
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
-            export FONTCONFIG_CACHE=/tmp/fontconfig-cache\n\
             export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon\n\
             mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n\
-            mkdir -p /tmp/fontconfig-cache && fc-cache -f 2>/dev/null\n\
             printf '<busconfig><include>/usr/share/dbus-1/session.conf</include><auth>ANONYMOUS</auth><allow_anonymous/></busconfig>' > /tmp/mcp-dbus.conf\n\
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
