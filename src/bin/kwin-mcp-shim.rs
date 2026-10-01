@@ -775,8 +775,17 @@ impl Shim {
         match method {
             "notifications/initialized" => self.client_ready = true,
             "notifications/cancelled" => {
-                let target = message.pointer("/params/requestId").map(id_key)
-                    .and_then(|key| self.inflight.get(&key)).map(|flight| flight.child);
+                let Some(id) = message.pointer("/params/requestId") else { return };
+                let key = id_key(id);
+                let held_before = self.held_starts.len();
+                self.held_starts.retain(|(held_id, _, _)| id_key(held_id) != key);
+                if self.held_starts.len() != held_before {
+                    // MCP cancellation releases the request without a response.
+                    let reason = message.pointer("/params/reason").and_then(Value::as_str);
+                    log(&format!("cancelled held session_start {key}{}",
+                        reason.map(|reason| format!(": {reason}")).unwrap_or_default()));
+                }
+                let target = self.inflight.get(&key).map(|flight| flight.child);
                 if let Some(child) = target.and_then(|key| self.children.get_mut(&key)) {
                     child.send(message.to_string());
                 }

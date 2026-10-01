@@ -47,6 +47,15 @@ const CONTROLLED_CARGO: &str = "controlled-cargo.sh";
 const PERIODIC_SWEEP_SERVER: &str = "periodic-sweep-server.sh";
 const BACKGROUND_DESCENDANT_SCRIPT: &str = "background-descendant.sh";
 const WATCHED_PROJECT: &str = "watched-project";
+const HELD_START_RECEIPTS: &str = "held-start-receipts.jsonl";
+const HELD_START_RESPONSES: &str = "held-start-responses.jsonl";
+const HELD_START_INVOCATIONS: &str = "held-start-invocations.log";
+const HELD_START_CARGO_IDENTITY: &str = "held-start-cargo.identity";
+const HELD_START_CARGO_RELEASE: &str = "held-start-cargo.release";
+const HELD_START_CARGO_FINISHED: &str = "held-start-cargo.finished";
+const HELD_START_SERVER: &str = "held-start-server.sh";
+const HELD_START_SERVER_IDENTITY: &str = "held-start-server.identity";
+const HELD_START_SERVER_RELEASE: &str = "held-start-server.release";
 
 struct PrivateHome(PathBuf, PathBuf);
 
@@ -97,6 +106,15 @@ impl PrivateHome {
             CONTROLLED_CARGO,
             PERIODIC_SWEEP_SERVER,
             BACKGROUND_DESCENDANT_SCRIPT,
+            HELD_START_RECEIPTS,
+            HELD_START_RESPONSES,
+            HELD_START_INVOCATIONS,
+            HELD_START_CARGO_IDENTITY,
+            HELD_START_CARGO_RELEASE,
+            HELD_START_CARGO_FINISHED,
+            HELD_START_SERVER,
+            HELD_START_SERVER_IDENTITY,
+            HELD_START_SERVER_RELEASE,
         ] {
             copy_diagnostic(&self.0.join(name), &proof.join(name))?;
         }
@@ -239,6 +257,90 @@ fn write_executable(path: &Path, script: &str) -> TestResult {
     std::fs::write(path, script)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+fn watched_project(home: &Path) -> TestResult<PathBuf> {
+    let repo = home.join(WATCHED_PROJECT);
+    std::fs::create_dir_all(repo.join("src"))?;
+    let manifest = repo.join("Cargo.toml");
+    let source = repo.join("src/main.rs");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"shutdown-watch-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
+    )?;
+    std::fs::write(&source, "fn main() {}\n")?;
+    // Suppress a startup build; each fixture mutates this after initialize.
+    for path in [&manifest, &source] {
+        File::open(path)?.set_modified(UNIX_EPOCH + Duration::from_secs(1))?;
+    }
+    Ok(repo)
+}
+
+fn held_start_scripts(home: &Path) -> TestResult<PathBuf> {
+    let binary = std::fs::canonicalize(real_server_binary())?;
+    let invocations = shell_quote(&home.join(HELD_START_INVOCATIONS));
+    let identity = "read -r stat < \"/proc/$BASHPID/stat\"\n\
+                    read -r -a fields <<< \"${stat##*) }\"\n";
+    let invocation = format!(
+        "printf -v arguments ' %q' \"$@\"\n\
+         printf '%s %s %s unix_s=%s cwd=%q argc=%s argv=%s\\n' \"$kind\" \"$BASHPID\" \"${{fields[19]}}\" \"$EPOCHREALTIME\" \"$PWD\" \"$#\" \"$arguments\" >> {invocations}\n",
+    );
+    let lifetime = BACKGROUND_HELPER_LIFETIME.as_secs();
+    let cargo = home.join(CONTROLLED_CARGO);
+    write_executable(
+        &cargo,
+        &format!(
+            "#!/bin/bash\n\
+             set -eu\n\
+             [[ ${{1-}} == build && ( $# == 1 || ( $# == 2 && ${{2-}} == --release ) ) ]] || exit 125\n\
+             {identity}\
+             kind=cargo-start\n\
+             {invocation}\
+             printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {}\n\
+             while [[ ! -f {} ]]; do\n\
+               (( SECONDS < {lifetime} )) || exit 124\n\
+               /bin/sleep 0.02\n\
+             done\n\
+             kind=cargo-release\n\
+             {invocation}\
+             printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {}\n\
+             exit 0\n",
+            shell_quote(&home.join(HELD_START_CARGO_IDENTITY)),
+            shell_quote(&home.join(HELD_START_CARGO_RELEASE)),
+            shell_quote(&home.join(HELD_START_CARGO_FINISHED)),
+        ),
+    )?;
+    let server = home.join(HELD_START_SERVER);
+    // Only log and gate process launch. Every MCP byte and CLI operation is
+    // handled by the selected real backend, and CARGO never runs a compiler.
+    write_executable(
+        &server,
+        &format!(
+            "#!/bin/bash\n\
+             set -eu\n\
+             {identity}\
+             case \"${{1-}}\" in\n\
+               --describe) kind=describe ;;\n\
+               --sweep-workdirs) kind=sweep ;;\n\
+               *) kind=server ;;\n\
+             esac\n\
+             {invocation}\
+             if [[ $kind == server ]]; then\n\
+               printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {}\n\
+               while [[ ! -f {} ]]; do\n\
+                 (( SECONDS < {lifetime} )) || exit 124\n\
+                 /bin/sleep 0.02\n\
+               done\n\
+               kind=server-delegate\n\
+               {invocation}\
+             fi\n\
+             exec {} \"$@\"\n",
+            shell_quote(&home.join(HELD_START_SERVER_IDENTITY)),
+            shell_quote(&home.join(HELD_START_SERVER_RELEASE)),
+            shell_quote(&binary),
+        ),
+    )?;
+    Ok(server)
 }
 
 fn background_scripts(home: &Path, case: BackgroundCase) -> TestResult<PathBuf> {
@@ -729,19 +831,7 @@ impl Connection {
         command.env("TMPDIR", &home.1);
         match case {
             BackgroundCase::Cargo => {
-                let repo = home.0.join(WATCHED_PROJECT);
-                std::fs::create_dir_all(repo.join("src"))?;
-                let manifest = repo.join("Cargo.toml");
-                let source = repo.join("src/main.rs");
-                std::fs::write(
-                    &manifest,
-                    "[package]\nname = \"shutdown-watch-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
-                )?;
-                std::fs::write(&source, "fn main() {}\n")?;
-                // Suppress a startup build; mutate this source after initialize.
-                for path in [&manifest, &source] {
-                    File::open(path)?.set_modified(UNIX_EPOCH + Duration::from_secs(1))?;
-                }
+                let repo = watched_project(&home.0)?;
                 command.env("KWIN_MCP_REPO", &repo).env("CARGO", &wrapper);
             }
             BackgroundCase::PeriodicSweep => {
@@ -752,6 +842,78 @@ impl Connection {
         let connection = Self::connect(home, command, false, Endpoint::Shim)?;
         connection.record_background_receipt(case, "initialized", json!({}))?;
         Ok((connection, started))
+    }
+
+    fn start_held_start() -> TestResult<Self> {
+        let home = PrivateHome::create()?;
+        let repo = watched_project(&home.0)?;
+        let server = held_start_scripts(&home.0)?;
+        let mut command = shim_command(&home.0);
+        command
+            .env("TMPDIR", &home.1)
+            .env("KWIN_MCP_REPO", &repo)
+            .env("CARGO", home.0.join(CONTROLLED_CARGO))
+            .env("KWIN_MCP_BINARY", server);
+        Self::connect(home, command, false, Endpoint::Shim)
+    }
+
+    fn record_held_start_receipt(&self, event: &str, details: Value) -> TestResult {
+        let invocations = std::fs::read_to_string(self.home.0.join(HELD_START_INVOCATIONS))?;
+        let receipt = json!({
+            "event": event,
+            "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            "shim_pid": self.shim,
+            "original_connection": self.processes.owned.get(&self.shim).map(background_process_receipt),
+            "shim_binary": shim_binary(),
+            "shim_argv": ["--autoclean", "--no-viewer"],
+            "real_server_binary": std::fs::canonicalize(real_server_binary())?,
+            "server_wrapper": self.home.0.join(HELD_START_SERVER),
+            "cargo_wrapper": self.home.0.join(CONTROLLED_CARGO),
+            "private_home": self.home.0,
+            "tmpdir": self.home.1,
+            "watched_project": self.home.0.join(WATCHED_PROJECT),
+            "stdin_retained": self.input.is_some(),
+            "stdout_retained": self.output.is_some(),
+            "server_invocations": invocations.lines().filter(|line| line.starts_with("server ")).count(),
+            "invocations": invocations,
+            "responses": std::fs::read_to_string(self.home.0.join(HELD_START_RESPONSES)).ok(),
+            "processes": self.recorded_tree().iter().map(background_process_receipt).collect::<Vec<_>>(),
+            "details": details,
+        });
+        let mut output = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.home.0.join(HELD_START_RECEIPTS))?;
+        writeln!(output, "{receipt}")?;
+        output.flush()?;
+        eprintln!("held start cancellation receipt: {receipt}");
+        self.retain_proof()
+    }
+
+    fn held_start_process(&mut self, marker: &str) -> TestResult<OwnedProcess> {
+        let deadline = Instant::now() + BACKGROUND_READY_WAIT;
+        loop {
+            self.processes.capture_tree()?;
+            if let Some(process) = read_background_identity(&self.home.0.join(marker))? {
+                self.processes.capture_tree()?;
+                assert!(
+                    self.processes
+                        .owned
+                        .get(&process.pid)
+                        .is_some_and(|owned| owned.starttime == process.starttime),
+                    "held start marker is not an owned process: {process:?}"
+                );
+                assert_eq!(assert_background_process_running(&process)?.ppid, self.shim);
+                return Ok(process);
+            }
+            assert!(self.processes.child.try_wait()?.is_none(), "{}", self.log());
+            assert!(
+                Instant::now() < deadline,
+                "marker {marker} timed out: {}",
+                self.log()
+            );
+            thread::sleep(POLL_PAUSE);
+        }
     }
 
     fn record_background_receipt(
@@ -1509,6 +1671,32 @@ impl Connection {
     }
 
     fn response_until(&mut self, id: u64, deadline: Instant) -> TestResult<Value> {
+        self.response_value_until(&json!(id), deadline, None)
+    }
+
+    fn response_value_until(
+        &mut self,
+        id: &Value,
+        deadline: Instant,
+        transcript: Option<&Path>,
+    ) -> TestResult<Value> {
+        loop {
+            let value = self.message_until(deadline)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("unexpected stdout EOF: {}", self.log()),
+                )
+            })?;
+            if let Some(path) = transcript {
+                append_response(path, &value)?;
+            }
+            if value.get("id") == Some(id) {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn message_until(&mut self, deadline: Instant) -> TestResult<Option<Value>> {
         let mut next_proof = Instant::now();
         loop {
             if std::env::var_os(PROOF_DIR_ENV).is_some() && Instant::now() >= next_proof {
@@ -1520,16 +1708,14 @@ impl Connection {
             }
             assert!(
                 Instant::now() < deadline,
-                "response {id} timed out: {}",
+                "stdio message timed out: {}",
                 self.log()
             );
             while let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.buffered.drain(..=end).collect();
                 // The launching fixture also emits libtest progress lines.
-                if let Ok(value) = serde_json::from_slice::<Value>(&line)
-                    && value["id"] == id
-                {
-                    return Ok(value);
+                if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+                    return Ok(Some(value));
                 }
             }
             let output = self.output.as_mut().ok_or_else(|| {
@@ -1546,7 +1732,9 @@ impl Connection {
             }
             let mut bytes = [0u8; 4096];
             let read = output.read(&mut bytes)?;
-            assert_ne!(read, 0, "unexpected stdout EOF: {}", self.log());
+            if read == 0 {
+                return Ok(None);
+            }
             self.buffered.extend_from_slice(&bytes[..read]);
         }
     }
@@ -1594,6 +1782,255 @@ impl Drop for Connection {
         self.output.take();
         // Field order drops the process guard before the private HOME.
     }
+}
+
+fn append_response(path: &Path, value: &Value) -> io::Result<()> {
+    let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(output, "{value}")?;
+    output.flush()
+}
+
+fn assert_cancelled_held_start(cancelled: Value, surviving: Value) -> TestResult {
+    let mut connection = Connection::start_held_start()?;
+    let original = OwnedProcess::read(connection.shim)?;
+    let transcript = connection.home.0.join(HELD_START_RESPONSES);
+    connection.record_held_start_receipt(
+        "initialized",
+        json!({"cancelled_id":cancelled, "surviving_id":surviving}),
+    )?;
+    let source = connection.home.0.join(WATCHED_PROJECT).join("src/main.rs");
+    std::fs::write(&source, "fn main() { /* trigger the private watcher */ }\n")?;
+    File::open(&source)?.set_modified(SystemTime::now())?;
+    let cargo = connection.held_start_process(HELD_START_CARGO_IDENTITY)?;
+    let process = procfs::process::Process::new(cargo.pid)?;
+    assert_eq!(process.cwd()?, connection.home.0.join(WATCHED_PROJECT));
+    let argv = process.cmdline()?;
+    let build = argv
+        .iter()
+        .position(|argument| argument == "build")
+        .ok_or_else(|| io::Error::other(format!("CARGO wrapper received no build: {argv:?}")))?;
+    assert!(argv[build..] == ["build"] || argv[build..] == ["build", "--release"]);
+    connection.record_held_start_receipt(
+        "build-held",
+        json!({"cargo":background_process_receipt(&cargo), "argv":argv}),
+    )?;
+
+    // Both IDs carry invalid dimensions, so even the unfixed shim can be
+    // measured without a desktop. Invocation counts expose unwanted launches.
+    let requests = [cancelled.clone(), surviving.clone()].map(|id| {
+        json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+            "params":{"name":"session_start", "arguments":{"width":0,"height":600}}})
+    });
+    for request in &requests {
+        connection.send(request.clone())?;
+    }
+    let cancellation = json!({"jsonrpc":"2.0", "method":"notifications/cancelled",
+        "params":{"requestId":cancelled, "reason":"held start regression"}});
+    connection.send(cancellation.clone())?;
+    connection.send(json!({"jsonrpc":"2.0","id":194,"method":"ping"}))?;
+    let barrier = connection.response_value_until(
+        &json!(194),
+        Instant::now() + RESPONSE_WAIT,
+        Some(&transcript),
+    )?;
+    connection.record_held_start_receipt(
+        "cancelled-before-build-release",
+        json!({"requests":requests,"cancellation":cancellation,"ping_barrier":barrier}),
+    )?;
+    assert_eq!(barrier["result"], json!({}), "{barrier}");
+    assert!(barrier.get("error").is_none(), "{barrier}");
+    assert_eq!(
+        connection
+            .log()
+            .matches("session_start waits for the kwin-mcp build in progress")
+            .count(),
+        2,
+        "both requests must be held before cancellation: {}",
+        connection.log()
+    );
+    assert_background_process_running(&cargo)?;
+    assert_absent(&connection.home.0.join(HELD_START_CARGO_FINISHED))?;
+    assert_absent(&connection.home.0.join(HELD_START_CARGO_RELEASE))?;
+    let held_invocations = std::fs::read_to_string(connection.home.0.join(HELD_START_INVOCATIONS))?;
+    assert_eq!(
+        held_invocations
+            .lines()
+            .filter(|line| line.starts_with("server "))
+            .count(),
+        0
+    );
+
+    // The ping response orders cancellation processing before this release.
+    std::fs::write(
+        connection.home.0.join(HELD_START_CARGO_RELEASE),
+        b"release\n",
+    )?;
+    connection
+        .record_held_start_receipt("build-release-requested", json!({"ping_barrier":barrier}))?;
+    let server = connection.held_start_process(HELD_START_SERVER_IDENTITY)?;
+    assert_eq!(
+        assert_background_process_running(&server)?.session,
+        server.pid
+    );
+    assert_eq!(
+        std::fs::read_to_string(connection.home.0.join(HELD_START_CARGO_FINISHED))?,
+        format!("{} {}\n", cargo.pid, cargo.starttime),
+        "the held build must actually reach its release"
+    );
+    connection.record_held_start_receipt(
+        "build-released-backend-held",
+        json!({"cargo":background_process_receipt(&cargo),"server":background_process_receipt(&server)}),
+    )?;
+    std::fs::write(
+        connection.home.0.join(HELD_START_SERVER_RELEASE),
+        b"delegate\n",
+    )?;
+    let response = connection.response_value_until(
+        &surviving,
+        Instant::now() + RESPONSE_WAIT,
+        Some(&transcript),
+    )?;
+    connection
+        .record_held_start_receipt("surviving-start-response", json!({"response":response}))?;
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("width 0 out of range ")),
+        "the surviving request must reach real dimension validation: {response}"
+    );
+    connection.send(json!({"jsonrpc":"2.0","id":195,"method":"ping"}))?;
+    let ping = connection.response_value_until(
+        &json!(195),
+        Instant::now() + RESPONSE_WAIT,
+        Some(&transcript),
+    )?;
+    assert_eq!(ping["result"], json!({}), "{ping}");
+    assert!(ping.get("error").is_none(), "{ping}");
+    let deadline = Instant::now() + EXIT_WAIT;
+    while !connection.only_connection_remains()? {
+        assert!(
+            Instant::now() < deadline,
+            "backend did not retire: {}",
+            connection.log()
+        );
+        thread::sleep(POLL_PAUSE);
+    }
+    assert_eq!(
+        OwnedProcess::read(connection.shim)?.starttime,
+        original.starttime
+    );
+    assert!(connection.input.is_some() && connection.output.is_some());
+    connection.record_held_start_receipt("original-connection-retained", json!({"ping":ping}))?;
+
+    connection.disconnect_input();
+    let status = connection.processes.wait_for_child(BACKGROUND_EXIT_WAIT)?;
+    let survivors: Vec<_> = connection
+        .recorded_tree()
+        .iter()
+        .filter_map(|process| process.stat().map(|_| background_process_receipt(process)))
+        .collect();
+    // Drain through actual stdout EOF. A late cancelled response cannot be
+    // discarded by a wait for a different ID or hidden behind a ping barrier.
+    let deadline = Instant::now() + EXIT_WAIT;
+    while let Some(value) = connection.message_until(deadline)? {
+        append_response(&transcript, &value)?;
+    }
+    connection.record_held_start_receipt(
+        "cleanup",
+        json!({"exit_status":status.to_string(),"exit_success":status.success(),
+            "survivors_at_exit":survivors,"stdout_eof":true}),
+    )?;
+    assert!(
+        status.success(),
+        "shim failed: {status}\n{}",
+        connection.log()
+    );
+    assert!(
+        survivors.is_empty(),
+        "owned processes survived cleanup: {survivors:?}"
+    );
+
+    let invocations = std::fs::read_to_string(connection.home.0.join(HELD_START_INVOCATIONS))?;
+    let lines: Vec<_> = invocations.lines().collect();
+    for (kind, process) in [
+        ("cargo-start", &cargo),
+        ("cargo-release", &cargo),
+        ("server", &server),
+        ("server-delegate", &server),
+    ] {
+        let matching: Vec<_> = lines
+            .iter()
+            .filter(|line| line.starts_with(&format!("{kind} ")))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "unexpected {kind} invocation count: {invocations}"
+        );
+        assert!(
+            matching[0].starts_with(&format!("{kind} {} {} ", process.pid, process.starttime)),
+            "invocation identity changed: {invocations}"
+        );
+    }
+    assert!(
+        lines.iter().any(|line| line.starts_with("describe ")),
+        "metadata must use the real server"
+    );
+    let released = lines
+        .iter()
+        .position(|line| line.starts_with("cargo-release "));
+    let launched = lines.iter().position(|line| line.starts_with("server "));
+    assert!(
+        released < launched,
+        "backend launch must follow actual build release: {invocations}"
+    );
+    let responses: Vec<Value> = std::fs::read_to_string(&transcript)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert!(
+        !responses
+            .iter()
+            .any(|value| value.get("id") == Some(&cancelled)),
+        "cancelled held requests must receive no response: {responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|value| value.get("id") == Some(&surviving))
+            .count(),
+        1
+    );
+    assert!(connection.log().contains(&format!(
+        "cancelled held session_start {cancelled}: held start regression"
+    )));
+    assert_eq!(
+        connection
+            .log()
+            .lines()
+            .filter(|line| line.starts_with("kwin-mcp v") && line.ends_with(" session_start"))
+            .count(),
+        1
+    );
+    assert!(
+        !connection.log().contains("host_xdg_dir ready"),
+        "validation must precede workdir creation"
+    );
+    for root in [Path::new(LIVE_SOCKET_ROOT), connection.home.1.as_path()] {
+        assert_absent(&root.join(format!("kwin-mcp-{}", server.pid)))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_numeric_held_start_preserves_same_valued_string_request() -> TestResult {
+    assert_cancelled_held_start(json!(193), json!("193"))
+}
+
+#[test]
+fn cancelled_string_held_start_preserves_same_valued_numeric_request() -> TestResult {
+    assert_cancelled_held_start(json!("193"), json!(193))
 }
 
 #[test]
