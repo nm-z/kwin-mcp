@@ -515,7 +515,7 @@ async fn handle_call(session: &zbus::Connection, state: &Arc<Mutex<State>>, mess
             .await;
     }
     let body = message.body();
-    let signature = body.signature().to_string();
+    let signature = body.signature().to_string_no_parens();
     let deny = |reason: &str| format!("kwin-mcp: {member} {reason}");
     let bad = |error: zbus::Error| zbus::Error::Failure(format!("{member}: {error}"));
 
@@ -706,6 +706,13 @@ mod tests {
         wallet.folders.entry("Chrome Keys".to_owned()).or_default();
         assert!(wallet.write("Chrome Keys", "Chrome Safe Storage", TYPE_PASSWORD, b"secret".to_vec()));
         wallet
+    }
+
+    #[test]
+    fn multi_argument_calls_are_matched_without_outer_parens() -> zbus::Result<()> {
+        let message = zbus::Message::method_call(PATH, "close")?.interface(INTERFACE)?.build(&(1i32, false, "app"))?;
+        assert_eq!(message.body().signature().to_string_no_parens(), "ibs");
+        Ok(())
     }
 
     #[test]
