@@ -104,6 +104,8 @@ const DRAG_STEPS: i32 = 20;
 
 // Pixels per smooth-scroll tick.
 const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
+// EIS scroll_discrete takes value120 units: 120 = one wheel notch.
+const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 
 // launch_app: window-appear polling.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -577,7 +579,11 @@ impl Eis {
     }
 
     fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
-        self.scroll.scroll_discrete(dx, dy);
+        let notches = dx.unsigned_abs().max(dy.unsigned_abs());
+        for _ in 0..notches {
+            self.scroll.scroll_discrete(dx.signum() * SCROLL_VALUE120_PER_NOTCH, dy.signum() * SCROLL_VALUE120_PER_NOTCH);
+            self.ptr_dev.frame(self.next_serial(), self.now_us());
+        }
         self.scroll.scroll_stop(0, 0, 0);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
         self.flush()
