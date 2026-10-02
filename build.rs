@@ -30,6 +30,13 @@ fn watch_git_identity() {
     {
         let mut path = PathBuf::from(path);
         if !path.exists()
+            && let Some(log) = git(&["rev-parse", "--git-path", &format!("logs/{reference}")])
+            && Path::new(&log).exists()
+        {
+            watch(Path::new(&log));
+            return;
+        }
+        if !path.exists()
             && let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"])
             && Path::new(&packed).exists()
         {

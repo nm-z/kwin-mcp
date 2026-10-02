@@ -71,6 +71,18 @@ snapshot "$fixture" > "$proof_root/packed-before.txt"
 build "$fixture" packed-unchanged build --release
 snapshot "$fixture" > "$proof_root/packed-after.txt"
 cmp "$proof_root/packed-before.txt" "$proof_root/packed-after.txt"
+git -C "$fixture" update-ref refs/tags/packed-current-unrelated HEAD
+git -C "$fixture" branch packed-current-other HEAD
+git -C "$fixture" pack-refs --all --prune
+build "$fixture" packed-current-unrelated-ref build --release
+snapshot "$fixture" > "$proof_root/packed-unrelated.txt"
+cmp "$proof_root/packed-before.txt" "$proof_root/packed-unrelated.txt"
+old=$(stamp "$fixture")
+git -C "$fixture" update-ref refs/heads/metadata-proof "$(git -C "$fixture" commit-tree -p HEAD -m 'Direct ref update' HEAD^{tree})"
+git -C "$fixture" pack-refs --all --prune
+build "$fixture" packed-direct-update build --release
+assert_commit "$fixture"
+[[ $(stamp "$fixture") != "$old" ]]
 git -C "$fixture" commit --allow-empty -qm 'Update packed branch'
 build "$fixture" packed-update build --release
 assert_commit "$fixture"
@@ -105,5 +117,5 @@ if build "$worktree" invalid-number build --release; then
   printf 'Invalid release number was accepted.\n' >&2
   exit 1
 fi
-printf 'unchanged=PASS\nunrelated_packed_ref=PASS\ntest_only=PASS\nsource_change=PASS\nbranch_commit=PASS\npacked_ref=PASS\npacked_unchanged=PASS\npacked_update=PASS\nworktree=PASS\nlinked_branch_update=PASS\ndetach=PASS\ndetached_unrelated_ref=PASS\ndetached_update=PASS\nexplicit_number=PASS\nexplicit_unchanged=PASS\ninvalid_number=PASS\nfixture=%s\nworktree=%s\n' "$fixture" "$worktree" > "$proof_root/results.txt"
+printf 'unchanged=PASS\nunrelated_packed_ref=PASS\npacked_current_unrelated_ref=PASS\npacked_direct_update=PASS\ntest_only=PASS\nsource_change=PASS\nbranch_commit=PASS\npacked_ref=PASS\npacked_unchanged=PASS\npacked_update=PASS\nworktree=PASS\nlinked_branch_update=PASS\ndetach=PASS\ndetached_unrelated_ref=PASS\ndetached_update=PASS\nexplicit_number=PASS\nexplicit_unchanged=PASS\ninvalid_number=PASS\nfixture=%s\nworktree=%s\n' "$fixture" "$worktree" > "$proof_root/results.txt"
 cat "$proof_root/results.txt"
