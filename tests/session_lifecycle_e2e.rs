@@ -2448,14 +2448,17 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
 }
 
 #[test]
-#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, squashfuse, mksquashfs, input devices, and a live GPU session"]
 fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
+    use base64::Engine;
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let fixture = PathBuf::from(std::env::var("HOME").expect("HOME"))
-        .join(format!(".cache/kwin-mcp-e2e-nested-{}-{nonce}", std::process::id()));
+    // Keep the test mount outside the real HOME so other agents' overlay plans
+    // do not change while this fixture is mounted. /var/tmp is disk-backed.
+    let fixture = PathBuf::from("/var/tmp")
+        .join(format!("kwin-mcp-e2e-nested-{}-{nonce}", std::process::id()));
     struct Fixture(PathBuf);
     impl Drop for Fixture {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -2468,6 +2471,28 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     let mount_source = fixture.join("mount-source");
     std::fs::create_dir(&mount_source).expect("mount source");
     std::fs::write(mount_source.join("visible.txt"), "mounted-data").expect("mounted fixture");
+    let mount_image = fixture.join("mount.squashfs");
+    assert!(Command::new("mksquashfs").arg(&mount_source).arg(&mount_image)
+        .args(["-noappend", "-processors", "1", "-quiet"])
+        .stdout(Stdio::null()).status().expect("create mount image").success());
+    let mount_point = home.join("project/portal");
+    struct Mount(Child, PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3").arg("-u").arg(&self.1).status();
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _mount = Mount(Command::new("squashfuse").arg("-f").arg(&mount_image).arg(&mount_point)
+        .stdout(Stdio::null()).spawn().expect("mount owned fixture"), mount_point.clone());
+    let mount_deadline = Instant::now() + Duration::from_secs(5);
+    while !procfs::process::Process::myself().expect("self").mountinfo().expect("mounts")
+        .0.iter().any(|mount| mount.mount_point == mount_point)
+    {
+        assert!(Instant::now() < mount_deadline, "fixture mount did not appear");
+        thread::sleep(Duration::from_millis(20));
+    }
     let ordinary = home.join("project/ordinary.bin");
     let large = home.join("project/large.bin");
     let explicit = home.join("project/explicit.bin");
@@ -2484,16 +2509,8 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         .arg(&large).arg(&clone_probe).stderr(Stdio::null()).status().expect("reflink probe").success();
     let _ = std::fs::remove_file(&clone_probe);
     let quote = |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
-    let server = PathBuf::from(std::env::var("KWIN_MCP_E2E_SERVER")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned()));
-    let wrapper = fixture.join("server.sh");
-    std::fs::write(&wrapper, format!(
-        "#!/bin/sh\nexec bwrap --die-with-parent --bind / / --dev-bind /dev /dev --proc /proc --ro-bind {} {} -- {} \"$@\"\n",
-        quote(&mount_source), quote(&home.join("project/portal")), quote(&server)
-    )).expect("write namespace wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("wrapper mode");
     let home_text = home.display().to_string();
-    let mut client = RpcClient::start_program(wrapper.to_str().expect("wrapper path"), None, false, false, &[
+    let mut client = RpcClient::start_with_env(&[
         ("HOME", &home_text),
         ("XDG_CONFIG_HOME", &format!("{home_text}/.config")),
         ("XDG_DATA_HOME", &format!("{home_text}/.local/share")),
@@ -2506,16 +2523,22 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     let started = call_tool(&mut client, 2, "session_start", json!({
         "width":800, "height":600, "writable_paths":[explicit]
     }));
+    if !started["error"].is_null() {
+        for line in client.stderr.try_iter() { eprintln!("{line}"); }
+    }
     assert!(started_at.elapsed() < Duration::from_secs(20), "startup exceeded deadline: {started}");
     let dir = workdir(&started);
     let disk = home.join(".cache/kwin-mcp").join(dir.file_name().expect("workdir name"));
+    if !reflink {
+        // bwrap creates an empty mountpoint file beneath the read-only bind.
+        let staged = std::fs::metadata(disk.join("overlay-root/project/large.bin")).expect("bind mountpoint");
+        assert_eq!(staged.len(), 0, "eager oversized copy");
+        assert_eq!(staged.blocks(), 0, "oversized file data allocated in staging");
+    }
     let fallback = started["result"]["structuredContent"]["oversized_read_only_files"]
         .as_array().expect("fallback report");
     assert_eq!(fallback.contains(&json!(large)), !reflink, "{started}");
     assert!(!fallback.contains(&json!(ordinary)) && !fallback.contains(&json!(explicit)), "{started}");
-    if !reflink {
-        assert!(!disk.join("overlay-root/project/large.bin").exists(), "eager oversized copy");
-    }
     assert!(disk.join("overlay-root/project/explicit.bin").is_file(), "explicit writable copy missing");
     let repeat = call_tool(&mut client, 3, "session_start", json!({}));
     assert_eq!(repeat["result"]["structuredContent"]["oversized_read_only_files"], json!(fallback));
@@ -2555,7 +2578,8 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     assert!(!inline_png(&screenshot).is_empty(), "missing rendered output");
     if let Ok(proof) = std::env::var("KWIN_MCP_E2E_PROOF_DIR") {
         std::fs::create_dir_all(&proof).expect("proof directory");
-        std::fs::write(PathBuf::from(&proof).join("nested-ancestor.png"), inline_png(&screenshot)).expect("retain screenshot");
+        let image = base64::engine::general_purpose::STANDARD.decode(inline_png(&screenshot)).expect("screenshot base64");
+        std::fs::write(PathBuf::from(&proof).join("nested-ancestor.png"), image).expect("retain screenshot");
         std::fs::write(PathBuf::from(&proof).join("nested-start.json"), started.to_string()).expect("retain start response");
     }
     for path in [&ordinary, &large, &explicit] {
