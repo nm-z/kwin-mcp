@@ -72,6 +72,17 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
+Nested mounts under HOME require separate overlays. Regular files directly in
+their ancestor directories are copied into the private session. For files larger
+than 64 MiB, kwin-mcp first tries a copy-on-write reflink. If the filesystem cannot
+clone the file, it uses a read-only bind instead of copying its data during
+startup. Other files and directory overlays keep their existing write behavior.
+`session_start` reports these fallback files in `oversized_read_only_files`.
+To require private writable copies for specific files or directories, pass their
+absolute paths under HOME in `writable_paths` when starting a new session.
+Explicit copies still share the 20-second startup deadline; this option does not
+make existing read-only host mounts writable or change a running session.
+
 ### Session memory limits
 
 Each new sandbox runs in a systemd user scope with `MemoryHigh=3G`,
