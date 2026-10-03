@@ -737,6 +737,10 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 
+/// Nested mounts require private copies of files in their ancestor directories.
+/// Avoid eager bulk copies unless the caller explicitly requests writability.
+const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
 /// gnome-keyring's control and PKCS#11 sockets, and p11-kit's. Sockets from
@@ -774,6 +778,7 @@ struct OverlayPlan {
     host_runtime: Option<PathBuf>,
     /// Directories the session sees as empty tmpfs; the host copies stay hidden.
     empty_dirs: Vec<PathBuf>,
+    oversized_read_only_files: Vec<PathBuf>,
 }
 
 impl OverlayPlan {
@@ -934,6 +939,20 @@ struct SplitOverlayContext<'a> {
     work_root: &'a Path,
     mounts: &'a [procfs::process::MountInfo],
     initialize: bool,
+    writable_paths: &'a [PathBuf],
+}
+
+fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let source = std::fs::File::open(source)?;
+    let destination = std::fs::OpenOptions::new()
+        .write(true).create_new(true).open(destination)?;
+    // Both descriptors stay open for this ioctl. FICLONE shares data extents;
+    // later writes to either file leave the other file's contents unchanged.
+    if unsafe { nix::libc::ioctl(destination.as_raw_fd(), nix::libc::FICLONE, source.as_raw_fd()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    destination.set_permissions(source.metadata()?.permissions())
 }
 
 fn prepare_split_overlay_directory(
@@ -941,6 +960,7 @@ fn prepare_split_overlay_directory(
     context: &SplitOverlayContext<'_>,
     overlays: &mut Vec<OverlayMount>,
     read_only_binds: &mut Vec<PathBuf>,
+    oversized_read_only_files: &mut Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     let relative_directory = source_directory.strip_prefix(context.target)?;
     let staged_directory = context.staging_root.join(relative_directory);
@@ -968,7 +988,7 @@ fn prepare_split_overlay_directory(
 
         if file_type.is_dir() {
             if context.mounts.iter().any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source)) {
-                prepare_split_overlay_directory(&source, context, overlays, read_only_binds)?;
+                prepare_split_overlay_directory(&source, context, overlays, read_only_binds, oversized_read_only_files)?;
             } else {
                 create_staging_directory(&source, &staged, context.initialize)?;
                 let upper = context.upper_root.join(relative);
@@ -991,10 +1011,34 @@ fn prepare_split_overlay_directory(
             }
         } else if file_type.is_file() {
             if context.initialize && !staged_exists {
+                let requested_writable = context.writable_paths.iter().any(|path| source.starts_with(path));
+                let size = match entry.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if size > STAGING_COPY_MAX_BYTES {
+                    match clone_staging_file(&source, &staged) {
+                        Ok(()) => continue,
+                        Err(error) => {
+                            match std::fs::remove_file(&staged) {
+                                Ok(()) => {}
+                                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(cleanup) => return Err(cleanup.into()),
+                            }
+                            if !requested_writable {
+                                eprintln!("session_start: oversized ancestor file {} ({size} bytes) stays read-only; reflink unavailable: {error}", source.display());
+                                oversized_read_only_files.push(source.clone());
+                                read_only_binds.push(source);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 match std::fs::copy(&source, &staged) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && !requested_writable => {
                         let _ = std::fs::remove_file(&staged);
                         read_only_binds.push(source);
                     }
@@ -1012,6 +1056,7 @@ fn prepare_overlay_plan(
     target: &Path,
     session_tmp: &Path,
     mounts: &[procfs::process::MountInfo],
+    writable_paths: &[PathBuf],
 ) -> anyhow::Result<OverlayPlan> {
     let excluded_mounts = mount_descendants(mounts, target);
     if excluded_mounts.is_empty() {
@@ -1021,7 +1066,7 @@ fn prepare_overlay_plan(
         std::fs::create_dir_all(&work)?;
         let overlay = OverlayMount { lower: target.to_path_buf(), upper, work, destination: target.to_path_buf() };
         return Ok(OverlayPlan { staging_root: None, overlays: vec![overlay], read_only_binds: Vec::new(),
-            socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new() });
+            socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new(), oversized_read_only_files: Vec::new() });
     }
 
     let staging_root = session_tmp.join("overlay-root");
@@ -1039,10 +1084,12 @@ fn prepare_overlay_plan(
         work_root: &work_root,
         mounts,
         initialize,
+        writable_paths,
     };
     let mut overlays = Vec::new();
     let mut read_only_binds = excluded_mounts;
-    prepare_split_overlay_directory(target, &context, &mut overlays, &mut read_only_binds)?;
+    let mut oversized_read_only_files = Vec::new();
+    prepare_split_overlay_directory(target, &context, &mut overlays, &mut read_only_binds, &mut oversized_read_only_files)?;
     read_only_binds.sort_by(|left, right| {
         left.components()
             .count()
@@ -1059,6 +1106,7 @@ fn prepare_overlay_plan(
         overlays,
         read_only_binds,
         socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new(),
+        oversized_read_only_files,
     })
 }
 
@@ -1276,7 +1324,7 @@ struct HostView {
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
 /// host socket exposure, and the host kdeglobals.
-fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) -> anyhow::Result<HostView> {
+fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path, writable_paths: &[PathBuf]) -> anyhow::Result<HostView> {
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
         .and_then(|process| process.mountinfo())
@@ -1305,7 +1353,7 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path) ->
             disk.display(), gib(SESSION_DISK_MIN_FREE), gib(free)
         );
     }
-    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory)
+    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory, writable_paths)
         .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
     // sees an empty directory there instead.
@@ -1360,6 +1408,7 @@ struct Session {
     /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
+    oversized_read_only_files: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
     screen_height: u32,
@@ -3438,6 +3487,10 @@ struct SessionStartParams {
     /// Virtual display height in pixels for this session. Omit to use the
     /// server default. Ignored when the server was launched with --no-override.
     height: Option<u32>,
+    /// Absolute paths under HOME whose oversized ancestor files need writable
+    /// private copies. Default: files over 64 MiB use reflink or a read-only
+    /// bind. Explicit copies still share the 20-second startup deadline.
+    writable_paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -3646,6 +3699,7 @@ impl KwinMcp {
                     "width": existing.screen_width,
                     "height": existing.screen_height,
                     "viewer": viewer,
+                    "oversized_read_only_files": existing.oversized_read_only_files,
                 })).await);
             }
         }
@@ -3808,6 +3862,14 @@ impl KwinMcp {
         if !overlay_target.is_absolute() {
             return Err(ver_err(format!("overlay target must be absolute: {}", overlay_target.display())));
         }
+        let writable_paths = params.writable_paths.unwrap_or_default();
+        for path in &writable_paths {
+            if !path.is_absolute() || !path.starts_with(&overlay_target)
+                || path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(ver_err(format!("writable_paths must contain absolute paths under HOME without '..': {}", path.display())));
+            }
+        }
         let host_runtime = std::env::var("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .map_err(|error| ver_err(format!("host runtime directory: {error}")))?;
@@ -3821,7 +3883,7 @@ impl KwinMcp {
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime));
+            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime, &writable_paths));
         });
         if let Ok(mut slot) = host_work.lock() {
             *slot = Some(handle);
@@ -4431,6 +4493,10 @@ impl KwinMcp {
         let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
         let viewer = viewer_report(&host_xdg_dir, None, None);
         let msg = format!("{msg} {}", viewer_summary(&viewer));
+        let oversized_read_only_files = std::mem::take(&mut overlay_plan.oversized_read_only_files);
+        let msg = if oversized_read_only_files.is_empty() { msg } else {
+            format!("{msg}; {} oversized ancestor file(s) are read-only; see oversized_read_only_files. Request writable_paths on a new session for private writable copies.", oversized_read_only_files.len())
+        };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
         let overlay_work_paths = overlay_plan.overlays.iter()
             .map(|overlay| overlay.work.join("work"))
@@ -4455,6 +4521,7 @@ impl KwinMcp {
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
+            oversized_read_only_files: oversized_read_only_files.clone(),
             _socket_links: socket_links,
             screen_width: screen_w,
             screen_height: screen_h,
@@ -4474,6 +4541,7 @@ impl KwinMcp {
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
+            "oversized_read_only_files": oversized_read_only_files,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),

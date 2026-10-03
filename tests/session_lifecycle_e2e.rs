@@ -2446,3 +2446,152 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
     assert!(!workdir.exists());
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, squashfuse, mksquashfs, input devices, and a live GPU session"]
+fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
+    use base64::Engine;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    // Keep the test mount outside the real HOME so other agents' overlay plans
+    // do not change while this fixture is mounted. /var/tmp is disk-backed.
+    let fixture = PathBuf::from("/var/tmp")
+        .join(format!("kwin-mcp-e2e-nested-{}-{nonce}", std::process::id()));
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let _fixture = Fixture(fixture.clone());
+    let home = fixture.join("home");
+    for directory in [".config", ".local/share", ".cache", ".local/state", ".kde", "project/portal"] {
+        std::fs::create_dir_all(home.join(directory)).expect("fixture directory");
+    }
+    let mount_source = fixture.join("mount-source");
+    std::fs::create_dir(&mount_source).expect("mount source");
+    std::fs::write(mount_source.join("visible.txt"), "mounted-data").expect("mounted fixture");
+    let mount_image = fixture.join("mount.squashfs");
+    assert!(Command::new("mksquashfs").arg(&mount_source).arg(&mount_image)
+        .args(["-noappend", "-processors", "1", "-quiet"])
+        .stdout(Stdio::null()).status().expect("create mount image").success());
+    let mount_point = home.join("project/portal");
+    struct Mount(Child, PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3").arg("-u").arg(&self.1).status();
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _mount = Mount(Command::new("squashfuse").arg("-f").arg(&mount_image).arg(&mount_point)
+        .stdout(Stdio::null()).spawn().expect("mount owned fixture"), mount_point.clone());
+    let mount_deadline = Instant::now() + Duration::from_secs(5);
+    while !procfs::process::Process::myself().expect("self").mountinfo().expect("mounts")
+        .0.iter().any(|mount| mount.mount_point == mount_point)
+    {
+        assert!(Instant::now() < mount_deadline, "fixture mount did not appear");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let ordinary = home.join("project/ordinary.bin");
+    let large = home.join("project/large.bin");
+    let explicit = home.join("project/explicit.bin");
+    let threshold = 64 * 1024 * 1024;
+    for (path, length) in [(&ordinary, threshold), (&large, threshold + 1), (&explicit, threshold + 1)] {
+        let mut file = std::fs::File::create(path).expect("fixture file");
+        file.set_len(length).expect("sparse fixture size");
+        file.write_all(b"host-data").expect("fixture header");
+        file.seek(SeekFrom::End(-9)).expect("fixture tail position");
+        file.write_all(b"host-tail").expect("fixture tail");
+    }
+    let clone_probe = fixture.join("clone-probe");
+    let reflink = Command::new("cp").args(["--reflink=always", "--"])
+        .arg(&large).arg(&clone_probe).stderr(Stdio::null()).status().expect("reflink probe").success();
+    let _ = std::fs::remove_file(&clone_probe);
+    let quote = |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
+    let home_text = home.display().to_string();
+    let mut client = RpcClient::start_with_env(&[
+        ("HOME", &home_text),
+        ("XDG_CONFIG_HOME", &format!("{home_text}/.config")),
+        ("XDG_DATA_HOME", &format!("{home_text}/.local/share")),
+        ("XDG_CACHE_HOME", &format!("{home_text}/.cache")),
+        ("XDG_STATE_HOME", &format!("{home_text}/.local/state")),
+        ("KDEHOME", &format!("{home_text}/.kde")),
+    ]);
+    initialize(&mut client);
+    let started_at = Instant::now();
+    let started = call_tool(&mut client, 2, "session_start", json!({
+        "width":800, "height":600, "writable_paths":[explicit]
+    }));
+    if !started["error"].is_null() {
+        for line in client.stderr.try_iter() { eprintln!("{line}"); }
+    }
+    assert!(started_at.elapsed() < Duration::from_secs(20), "startup exceeded deadline: {started}");
+    let dir = workdir(&started);
+    let disk = home.join(".cache/kwin-mcp").join(dir.file_name().expect("workdir name"));
+    if !reflink {
+        // bwrap creates an empty mountpoint file beneath the read-only bind.
+        let staged = std::fs::metadata(disk.join("overlay-root/project/large.bin")).expect("bind mountpoint");
+        assert_eq!(staged.len(), 0, "eager oversized copy");
+        assert_eq!(staged.blocks(), 0, "oversized file data allocated in staging");
+    }
+    let fallback = started["result"]["structuredContent"]["oversized_read_only_files"]
+        .as_array().expect("fallback report");
+    assert_eq!(fallback.contains(&json!(large)), !reflink, "{started}");
+    assert!(!fallback.contains(&json!(ordinary)) && !fallback.contains(&json!(explicit)), "{started}");
+    assert!(disk.join("overlay-root/project/explicit.bin").is_file(), "explicit writable copy missing");
+    let repeat = call_tool(&mut client, 3, "session_start", json!({}));
+    assert_eq!(repeat["result"]["structuredContent"]["oversized_read_only_files"], json!(fallback));
+    let report = dir.join("ancestor-check.txt");
+    let script = dir.join("ancestor-check.sh");
+    let oversized_write = if reflink {
+        format!("printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none\n", quote(&large))
+    } else {
+        format!("if printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none 2>/dev/null; then exit 1; fi\n", quote(&large))
+    };
+    std::fs::write(&script, format!(
+        "set -eu\n\
+         test \"$(cat {})\" = mounted-data\n\
+         for path in {} {} {}; do\n\
+           test \"$(head -c 9 \"$path\")\" = host-data\n\
+           test \"$(tail -c 9 \"$path\")\" = host-tail\n\
+         done\n\
+         for path in {} {}; do\n\
+           printf sessionxx | dd of=\"$path\" bs=9 count=1 conv=notrunc status=none\n\
+           test \"$(head -c 9 \"$path\")\" = sessionxx\n\
+         done\n\
+         {oversized_write}\
+         printf 'ANCESTOR_COPY_PASS\\n' | tee {}\n",
+        quote(&home.join("project/portal/visible.txt")), quote(&ordinary), quote(&large), quote(&explicit),
+        quote(&ordinary), quote(&explicit), quote(&report)
+    )).expect("session check script");
+    let launched = call_tool(&mut client, 4, "launch_app", json!({
+        "command": format!("konsole --hold -e bash {}", quote(&script))
+    }));
+    assert!(launched["error"].is_null(), "{launched}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n") {
+        assert!(Instant::now() < deadline, "session file checks did not pass: {launched}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let screenshot = call_tool(&mut client, 5, "screenshot", json!({"inline":true}));
+    assert!(!inline_png(&screenshot).is_empty(), "missing rendered output");
+    if let Ok(proof) = std::env::var("KWIN_MCP_E2E_PROOF_DIR") {
+        std::fs::create_dir_all(&proof).expect("proof directory");
+        let image = base64::engine::general_purpose::STANDARD.decode(inline_png(&screenshot)).expect("screenshot base64");
+        std::fs::write(PathBuf::from(&proof).join("nested-ancestor.png"), image).expect("retain screenshot");
+        std::fs::write(PathBuf::from(&proof).join("nested-start.json"), started.to_string()).expect("retain start response");
+    }
+    for path in [&ordinary, &large, &explicit] {
+        let mut file = std::fs::File::open(path).expect("host fixture");
+        let mut header = [0; 9];
+        file.read_exact(&mut header).expect("host header");
+        assert_eq!(&header, b"host-data", "host file changed: {}", path.display());
+        assert_eq!(file.metadata().expect("host metadata").nlink(), 1, "host hardlink created");
+    }
+    let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
+    client.stop_process();
+    println!("PASS: nested mount, 64 MiB writable boundary, oversized readable/private, explicit writable copy, rendered output, host files unchanged, cleanup; reflink={reflink}");
+}
