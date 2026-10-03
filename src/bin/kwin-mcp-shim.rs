@@ -1580,6 +1580,60 @@ struct Resume {
     input: Vec<u8>,
 }
 
+const USAGE: &str = "Usage: kwin-mcp-shim [OPTIONS]
+
+Relay MCP over stdin/stdout, with one kwin-mcp child per session.
+
+Options:
+  -h, --help              Print this help and exit
+      --version           Print the package version and exit
+      --width N           Default virtual display width in pixels
+      --height N          Default virtual display height in pixels
+      --no-override       Ignore display size overrides in session_start
+      --no-viewer         Accepted for compatibility; viewers open on demand
+      --autoclean         Remove owned session workdirs after shutdown
+      --ttl MINUTES       Stop idle sessions; implies --autoclean
+      --memory-high GIB   Session memory throttle threshold (0 disables it)
+      --memory-max GIB    Session memory limit
+      --memory-swap-max GIB  Session swap limit
+";
+
+enum Invocation {
+    Help,
+    Version,
+    Relay(Vec<String>),
+}
+
+fn parse_invocation(mut args: impl Iterator<Item = String>) -> Result<Invocation, String> {
+    let mut forwarded = Vec::new();
+    let mut help = false;
+    let mut version = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "-h" | "--help" => help = true,
+            "--version" => version = true,
+            "--no-override" | "--no-viewer" | "--autoclean" => forwarded.push(argument),
+            "--width" | "--height" | "--ttl" | "--memory-high" | "--memory-max"
+            | "--memory-swap-max" => {
+                let value = args
+                    .next()
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                // The child owns numeric ranges and cross-option validation.
+                forwarded.extend([argument, value]);
+            }
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+    }
+    if help {
+        Ok(Invocation::Help)
+    } else if version {
+        Ok(Invocation::Version)
+    } else {
+        Ok(Invocation::Relay(forwarded))
+    }
+}
+
 fn take_resume() -> Option<Resume> {
     let text = std::env::var(RESUME_ENV).ok()?;
     // Single-threaded here: the runtime starts after this.
@@ -1600,16 +1654,31 @@ fn take_resume() -> Option<Resume> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = match parse_invocation(std::env::args().skip(1)) {
+        Ok(Invocation::Help) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Ok(Invocation::Version) => {
+            println!("kwin-mcp-shim {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Ok(Invocation::Relay(args)) => args,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let started_under = std::os::unix::process::parent_id();
     owner();
     let resume = take_resume();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run(resume, started_under));
+    let result = runtime.block_on(run(resume, started_under, args));
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
-async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(resume: Option<Resume>, started_under: u32, args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
         // Orphans of dead children reparent to the shim so it can reap them.
@@ -1662,7 +1731,7 @@ async fn run(resume: Option<Resume>, started_under: u32) -> Result<(), Box<dyn s
     let self_stamp = stamp(&self_path);
     let mut shim = Shim {
         out: out_tx, events: event_tx, sweep: sweep_tx,
-        child_bin: binary, child_args: std::env::args().skip(1).collect(),
+        child_bin: binary, child_args: args,
         children: HashMap::new(), next_child: 0, idle: None,
         sessions: BTreeMap::new(), ended: HashMap::new(), inflight: HashMap::new(),
         reverse: HashMap::new(), next_reverse: 0, client_params: None, pending_init: None,

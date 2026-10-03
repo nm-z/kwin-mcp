@@ -140,6 +140,10 @@ cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 
 ## Shim: hot reload and one session per agent
 
+Run `kwin-mcp-shim --help` (or `-h`) for its options and
+`kwin-mcp-shim --version` for its version. These commands exit without starting
+the relay or any child process. Unknown options fail before relay startup.
+
 Point your MCP client at `target/release/kwin-mcp-shim` instead of `kwin-mcp`, with the same arguments. The shim is launched once and never restarts. It runs each real `kwin-mcp` server as a child and relays MCP:
 
 - **One session per agent.** Every `session_start` without a `session_id` gets its own child process, so each session has its own display, windows, keyboard focus and mouse. The result includes a `session_id` (for example `s12345`, matching `/tmp/kwin-mcp-12345`). Every tool accepts `session_id`. It may be omitted only while exactly one session is live; otherwise the call fails and lists the live ids. `session_list` shows every session and its owner. Each server's environment carries `KWIN_MCP_OWNER` (the agent process that started the shim, as `COMM pid PID`, plus `session ID` for Claude Code), so a cleanup selects one agent's servers with `grep -lz '^KWIN_MCP_OWNER=node pid 1234' /proc/*/environ` instead of by command line. Parallel subagents that share one MCP connection each call `session_start` and use their own id.
