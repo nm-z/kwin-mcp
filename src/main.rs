@@ -4222,7 +4222,15 @@ impl KwinMcp {
         cmd.args(["--", "bash", "-c", &sandbox_command]);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::inherit());
+        // Applications can write arbitrary bytes (including crash diagnostics).
+        // Keep them off MCP stderr: clients may stop draining it on invalid UTF-8.
+        let sandbox_log_path = session_disk_path(&host_xdg_dir).join("sandbox.log");
+        let sandbox_log = match std::fs::File::create(&sandbox_log_path) {
+            Ok(file) => file,
+            Err(error) => return cleanup_err(format!("create sandbox log: {error}"), &mut startup),
+        };
+        cmd.stderr(std::process::Stdio::from(sandbox_log));
+        eprintln!("session_start: sandbox stderr: {}", sandbox_log_path.display());
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);

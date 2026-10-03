@@ -1934,6 +1934,34 @@ fn parallel_sessions_hold_no_host_user_bus_connections() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn application_binary_stderr_keeps_screenshots_and_shutdown_working() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    assert_eq!(started["result"]["structuredContent"]["status"], "started", "{started}");
+    let directory = workdir(&started);
+    let log = client.home.join(".cache/kwin-mcp")
+        .join(directory.file_name().expect("workdir name")).join("sandbox.log");
+    let launched = call_tool(&mut client, 3, "launch_app", json!({
+        "command":"printf '\\377\\376\\n' >&2; kdialog --title binary-stderr-proof --msgbox binary-stderr-proof"
+    }));
+    assert!(launched["error"].is_null(), "{launched}");
+    let captured = call_tool(&mut client, 4, "screenshot", json!({"inline":false}));
+    assert!(captured["error"].is_null(), "{captured}");
+    let capture = captured["result"]["structuredContent"]["path"].as_str().expect("screenshot path");
+    assert!(std::fs::metadata(capture).expect("captured PNG").len() > 0);
+    let diagnostics = std::fs::read(&log).expect("raw sandbox diagnostics");
+    assert!(diagnostics.windows(3).any(|bytes| bytes == [255, 254, 10]));
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
+    assert_eq!(stopped["result"]["structuredContent"]["status"], "stopped", "{stopped}");
+    assert!(!directory.exists(), "session workdir remains");
+    assert!(!log.exists(), "sandbox log remains after stop");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn launch_app_reports_commands_that_exit_without_a_window() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
