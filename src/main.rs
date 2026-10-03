@@ -1138,7 +1138,7 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![target.join(".codex/state_5.sqlite")];
+    let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
         for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {

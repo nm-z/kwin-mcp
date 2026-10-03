@@ -1934,6 +1934,62 @@ fn parallel_sessions_hold_no_host_user_bus_connections() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn session_start_preserves_live_codex_state_database() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let codex_home = client.home.join(".codex");
+    std::fs::create_dir(&codex_home).expect("create fixture directory");
+    let source = rusqlite::Connection::open(codex_home.join("state_5.sqlite"))
+        .expect("open host state fixture");
+    source
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE retained_state (value TEXT NOT NULL);
+             INSERT INTO retained_state VALUES ('host-state');",
+        )
+        .expect("write live WAL fixture");
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let directory = workdir(&started);
+    let snapshot_path = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(directory.file_name().expect("workdir name"))
+        .join("overlay-upper/.codex/state_5.sqlite");
+    let snapshot = rusqlite::Connection::open_with_flags(
+        &snapshot_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open isolated state snapshot");
+    source
+        .execute("UPDATE retained_state SET value = 'host-changed'", [])
+        .expect("change host fixture after session start");
+    let value: String = snapshot
+        .query_row("SELECT value FROM retained_state", [], |row| row.get(0))
+        .expect("read preserved state");
+    assert_eq!(value, "host-state");
+    drop(snapshot);
+    drop(source);
+    let stopped = call_tool(&mut client, 3, "session_stop", json!({}));
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    assert!(!snapshot_path.exists(), "state snapshot remains after stop");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn application_binary_stderr_keeps_screenshots_and_shutdown_working() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
