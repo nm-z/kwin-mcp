@@ -150,6 +150,40 @@ Changes to the shim itself still need a client reconnect. Keep it thin.
 
 ## Setup
 
+### Claude Code registration
+
+Register the shim once at **user scope** so it remains available when a session
+changes projects or leaves your home directory. Use an absolute path to the
+installed binary, with `kwin-mcp` and `kwin-viewer` installed beside it:
+
+```bash
+claude mcp add --scope user --transport stdio kwin-mcp -- \
+  /absolute/path/to/kwin-mcp-shim \
+  --width 1920 --height 1080 --autoclean --ttl 120
+```
+
+Claude Code stores this registration in the top-level `mcpServers` object in
+`~/.claude.json`. See [Claude Code's MCP installation scopes](https://code.claude.com/docs/en/mcp#user-scope).
+
+If an installation already has a user registration, keep that entry and migrate
+the existing configuration:
+
+1. Remove duplicate local registrations from `projects["<project path>"].mcpServers`
+   in `~/.claude.json`, and duplicate project registrations from `.mcp.json` files,
+   including `~/.mcp.json`. A duplicate may use another name, such as `kwin-rust`;
+   compare its command and arguments before removing it.
+2. Remove `kwin-mcp` from `projects["<project path>"].disabledMcpServers` in
+   `~/.claude.json` wherever it was disabled. Preserve other disabled server names.
+3. Start a new Claude Code session after changing the files. In `/mcp`, verify one
+   enabled user-scope `kwin-mcp` server. Repeat from a directory outside the former
+   project, then change the working directory in a session and confirm its tools
+   remain available.
+
+The expected configuration has one user-scope registration, no project or local
+duplicate, and no workspace override disabling `kwin-mcp`.
+
+### System dependencies
+
 Add your user to these groups:
 ```
 sudo usermod -aG input,uinput,video,render $USER
