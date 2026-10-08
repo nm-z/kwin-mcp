@@ -6096,10 +6096,6 @@ impl SessionStartAttempt {
         self.recorded = true;
         let _ = append_session_start_outcome(self.started, error);
     }
-
-    fn skip(&mut self) {
-        self.recorded = true;
-    }
 }
 
 impl Drop for SessionStartAttempt {
@@ -6208,7 +6204,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Each call without session_id creates a new isolated desktop. Passing an existing session_id returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -6227,58 +6223,6 @@ impl KwinMcp {
                 return Err(error);
             }
         };
-        {
-            let mut guard = match tokio::time::timeout_at(deadline, self.session.write()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let error = McpError::internal_error(
-                        format!(
-                            "session_start exceeded {}s hard limit while checking for an existing session",
-                            SESSION_START_HARD_TIMEOUT.as_secs()
-                        ),
-                        None,
-                    );
-                    attempt.finish(Some(&error.message));
-                    return Err(error);
-                }
-            };
-            if let Some(existing) = guard.as_mut() {
-                let bus_name = existing
-                    .kwin_conn
-                    .unique_name()
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
-                let workdir = existing.host_xdg_dir.display().to_string();
-                let viewer = viewer_report(
-                    &existing.host_xdg_dir,
-                    existing.viewer_child.as_mut(),
-                    existing.viewer_unavailable.as_deref(),
-                );
-                let version_stamp = format!(
-                    "kwin-mcp v{}.{} ({})",
-                    env!("CARGO_PKG_VERSION"),
-                    env!("BUILD_NUMBER"),
-                    env!("GIT_HASH")
-                );
-                let msg = format!(
-                    "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
-                    existing.kwin_unique_name, existing.screen_width, existing.screen_height,
-                );
-                attempt.skip();
-                return Ok(structured_result(&peer, msg, serde_json::json!({
-                    "status": "already_running",
-                    "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
-                    "commit": env!("GIT_HASH"),
-                    "bus": bus_name,
-                    "kwin_unique": existing.kwin_unique_name,
-                    "workdir": workdir,
-                    "width": existing.screen_width,
-                    "height": existing.screen_height,
-                    "viewer": viewer,
-                    "oversized_read_only_files": existing.oversized_read_only_files,
-                })).await);
-            }
-        }
         self.set_start_stage("preparing the session workdir");
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
         let outcome = match tokio::time::timeout_at(
@@ -9472,6 +9416,8 @@ fn input_tool(name: &str) -> bool {
     name.starts_with("mouse_") || name.starts_with("keyboard_")
 }
 
+const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls.";
+
 #[derive(Clone)]
 struct SessionRouter {
     sessions: Arc<std::sync::Mutex<std::collections::BTreeMap<String, KwinMcp>>>,
@@ -9503,6 +9449,17 @@ impl SessionRouter {
         &self,
         request: &mut rmcp::model::CallToolRequestParams,
     ) -> Result<(String, KwinMcp), McpError> {
+        if request.name == "session_start"
+            && request
+                .arguments
+                .as_ref()
+                .is_some_and(|args| args.contains_key("session_id"))
+        {
+            return Err(McpError::invalid_params(
+                "session_start does not accept session_id; omit it to create your own new session",
+                None,
+            ));
+        }
         let id = request
             .arguments
             .as_mut()
@@ -9521,7 +9478,7 @@ impl SessionRouter {
             .sessions
             .lock()
             .map_err(|_| McpError::internal_error("session map lock poisoned", None))?;
-        if request.name == "session_start" && id.is_none() {
+        if request.name == "session_start" {
             let number = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let id = format!("s{}-{number}", std::process::id());
             let mut session = KwinMcp::new(self.display);
@@ -9570,8 +9527,11 @@ impl SessionRouter {
         }
         Ok(structured_result(
             peer,
-            serde_json::to_string(&records).map_err(KwinError::from)?,
-            serde_json::json!({"sessions": records}),
+            format!(
+                "{SESSION_OWNERSHIP_NOTICE}\n{}",
+                serde_json::to_string(&records).map_err(KwinError::from)?
+            ),
+            serde_json::json!({"sessions": records, "ownership_notice": SESSION_OWNERSHIP_NOTICE}),
         )
         .await)
     }
@@ -9628,6 +9588,11 @@ impl SessionRouter {
     fn tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.routes.list_all();
         for tool in &mut tools {
+            if tool.name == "session_start" {
+                Arc::make_mut(&mut tool.input_schema)
+                    .insert("additionalProperties".to_owned(), serde_json::json!(false));
+                continue;
+            }
             let schema = Arc::make_mut(&mut tool.input_schema);
             let properties = schema
                 .entry("properties")
@@ -9636,11 +9601,16 @@ impl SessionRouter {
                 properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist."}));
             }
             let description = tool.description.take().unwrap_or_default();
-            tool.description = Some(format!("{description} Pass session_id to choose an existing session. Each session_start without session_id creates a new isolated desktop.").into());
+            tool.description = Some(
+                format!("{description} Pass a session_id returned by your own session_start call.")
+                    .into(),
+            );
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            "List live isolated sessions in this server process.",
+            format!(
+                "List live isolated sessions in this server process. {SESSION_OWNERSHIP_NOTICE}"
+            ),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -9659,7 +9629,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start without session_id creates a new isolated desktop in this server process. Pass the returned session_id to every later tool. session_list lists live sessions.",
+            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. session_list may include other agents' sessions.",
             info.instructions.unwrap_or_default()
         ));
         info
