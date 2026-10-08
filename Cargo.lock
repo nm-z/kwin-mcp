@@ -1739,6 +1739,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
@@ -3524,8 +3525,10 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
