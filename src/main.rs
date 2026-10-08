@@ -1,9 +1,1647 @@
-mod fuse_bridge;
+mod fuse_bridge {
+    //! FUSE inside the isolated session.
+    //!
+    //! bwrap runs everything with no_new_privs, so the setuid `fusermount`
+    //! binaries cannot mount, and root is unmapped in the sandbox's user
+    //! namespace. The sandbox is instead started with CAP_SYS_ADMIN (scoped to its
+    //! own user namespace), which only one process keeps: this helper. The session
+    //! entrypoint clears the inheritable and ambient sets for everything else, and
+    //! no_new_privs stops file capabilities from restoring it.
+    //!
+    //! `fusermount` and `fusermount3` inside the sandbox are this binary. As a
+    //! client it forwards its arguments, working directory, `_FUSE_*` environment,
+    //! and the descriptors those variables name (plus stdio) to the helper, which
+    //! runs the real binary with that capability and returns its exit status. The
+    //! real binaries are the same setuid helpers FUSE already trusts with arbitrary
+    //! unprivileged input: they only mount and unmount FUSE filesystems on paths
+    //! the user owns.
+
+    use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+    use serde::{Deserialize, Serialize};
+    use std::io::{IoSlice, IoSliceMut, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+
+    /// Helper socket, in the sandbox's private /tmp so host processes cannot
+    /// reach it through the shared workdir.
+    pub const HELPER_SOCKET: &str = "/tmp/.kwin-mcp-fuse.sock";
+    /// Where the sandbox sees the real fusermount binaries.
+    pub const REAL_BINARY_DIR: &str = "/run/kwin-mcp-fuse";
+    /// The FUSE helper programs the bridge serves, as named on the host.
+    pub const PROGRAMS: [&str; 2] = ["fusermount", "fusermount3"];
+    /// Most descriptors one request may carry (stdio plus `_FUSE_*` sockets).
+    const MAX_FDS: usize = 8;
+    /// Largest request message.
+    const MAX_REQUEST_BYTES: usize = 64 * 1024;
+    /// Descriptor floor for received fds, above any target number they map to.
+    const HIGH_FD_BASE: RawFd = 100;
+
+    #[derive(Serialize, Deserialize)]
+    struct Request {
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+        /// Descriptor number each passed fd takes in the real binary.
+        targets: Vec<RawFd>,
+    }
+
+    /// Program name when this binary was invoked as a fusermount shim.
+    pub fn shim_program(argv0: &str) -> Option<&'static str> {
+        let name = Path::new(argv0).file_name()?.to_str()?;
+        PROGRAMS.into_iter().find(|program| *program == name)
+    }
+
+    /// Client side: forward this invocation to the helper and return its exit code.
+    pub fn run_client(program: &str) -> i32 {
+        match forward(program) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("{program} (kwin-mcp FUSE bridge): {error:#}");
+                1
+            }
+        }
+    }
+
+    fn forward(program: &str) -> anyhow::Result<i32> {
+        let mut targets: Vec<RawFd> = vec![0, 1, 2];
+        let mut env = Vec::new();
+        for (key, value) in std::env::vars() {
+            if !key.starts_with("_FUSE_") {
+                continue;
+            }
+            if let Ok(fd) = value.parse::<RawFd>()
+                && fd > 2
+                && !targets.contains(&fd)
+                && nix::fcntl::fcntl(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+                    nix::fcntl::FcntlArg::F_GETFD,
+                )
+                .is_ok()
+            {
+                targets.push(fd);
+            }
+            env.push((key, value));
+        }
+        anyhow::ensure!(targets.len() <= MAX_FDS, "too many FUSE descriptors");
+        let request = Request {
+            program: program.to_owned(),
+            args: std::env::args().skip(1).collect(),
+            cwd: std::env::current_dir()?.display().to_string(),
+            env,
+            targets: targets.clone(),
+        };
+        let body = serde_json::to_vec(&request)?;
+        anyhow::ensure!(body.len() <= MAX_REQUEST_BYTES, "request too large");
+        let mut stream = UnixStream::connect(HELPER_SOCKET)
+            .map_err(|error| anyhow::anyhow!("connect {HELPER_SOCKET}: {error}"))?;
+        let fds = [ControlMessage::ScmRights(&targets)];
+        sendmsg::<()>(
+            stream.as_raw_fd(),
+            &[IoSlice::new(&body)],
+            &fds,
+            MsgFlags::empty(),
+            None,
+        )?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        let mut status = [0u8; 4];
+        stream.read_exact(&mut status)?;
+        Ok(i32::from_le_bytes(status))
+    }
+
+    /// The helper's fusermount runs as the namespace's root, which fusermount
+    /// trusts completely. Hold requests to what it allows an unprivileged user:
+    /// mount only on a directory the user owns, and unmount only FUSE mounts.
+    fn authorize(request: &Request) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let mut unmount = false;
+        let mut mountpoint = None;
+        let mut options_done = false;
+        let mut args = request.args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                _ if options_done => mountpoint = Some(arg),
+                "--" => options_done = true,
+                "-o" => {
+                    args.next();
+                }
+                "-u" | "--unmount" => unmount = true,
+                "-h" | "--help" | "-V" | "--version" => return Ok(()),
+                option if option.starts_with('-') => {}
+                _ => mountpoint = Some(arg),
+            }
+        }
+        let Some(mountpoint) = mountpoint else {
+            return Ok(());
+        };
+        // Lexical absolute path: a dead FUSE mount cannot be canonicalized.
+        let mut path = std::path::PathBuf::from(&request.cwd);
+        for component in Path::new(mountpoint).components() {
+            match component {
+                std::path::Component::RootDir => path = std::path::PathBuf::from("/"),
+                std::path::Component::ParentDir => {
+                    path.pop();
+                }
+                std::path::Component::Normal(part) => path.push(part),
+                std::path::Component::CurDir | std::path::Component::Prefix(_) => {}
+            }
+        }
+        if unmount {
+            let mounts = procfs::process::Process::myself()?.mountinfo()?;
+            anyhow::ensure!(
+                mounts
+                    .0
+                    .iter()
+                    .any(|mount| mount.mount_point == path && mount.fs_type.starts_with("fuse")),
+                "{} is not a FUSE mount",
+                path.display()
+            );
+            return Ok(());
+        }
+        let owner = std::fs::metadata(&path)?.uid();
+        let user = std::fs::metadata("/proc/self")?.uid();
+        anyhow::ensure!(
+            owner == user,
+            "mountpoint {} is not owned by the user",
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Helper side: serve requests until the sandbox exits.
+    pub fn run_helper(socket: &Path) -> anyhow::Result<()> {
+        let _ = std::fs::remove_file(socket);
+        let listener = UnixListener::bind(socket)?;
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || {
+                if let Err(error) = serve(stream) {
+                    eprintln!("kwin-mcp FUSE helper: {error:#}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn serve(mut stream: UnixStream) -> anyhow::Result<()> {
+        let mut body = vec![0u8; MAX_REQUEST_BYTES];
+        let mut space = nix::cmsg_space!([RawFd; MAX_FDS]);
+        let (length, mut received) = {
+            let mut iov = [IoSliceMut::new(&mut body)];
+            let message = recvmsg::<()>(
+                stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut space),
+                MsgFlags::MSG_CMSG_CLOEXEC,
+            )?;
+            let mut received: Vec<OwnedFd> = Vec::new();
+            for control in message.cmsgs()? {
+                if let ControlMessageOwned::ScmRights(fds) = control {
+                    // SAFETY: SCM_RIGHTS hands this process new descriptors it owns.
+                    received.extend(
+                        fds.into_iter()
+                            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+                    );
+                }
+            }
+            (message.bytes, received)
+        };
+        body.truncate(length);
+        let request: Request = serde_json::from_slice(&body)?;
+        anyhow::ensure!(
+            PROGRAMS.contains(&request.program.as_str()),
+            "refusing to run {}",
+            request.program
+        );
+        anyhow::ensure!(
+            received.len() == request.targets.len()
+                && request.targets.len() >= 3
+                && request.targets[..3] == [0, 1, 2],
+            "descriptor mismatch"
+        );
+        anyhow::ensure!(
+            request.env.iter().all(|(key, _)| key.starts_with("_FUSE_")),
+            "unexpected environment"
+        );
+        if let Err(error) = authorize(&request) {
+            stream.write_all(&1i32.to_le_bytes())?;
+            if let Some(stderr) = received.get(2) {
+                let _ = nix::unistd::write(
+                    stderr,
+                    format!("{}: {error:#}\n", request.program).as_bytes(),
+                );
+            }
+            return Ok(());
+        }
+        let extra: Vec<(OwnedFd, RawFd)> = received
+            .split_off(3)
+            .into_iter()
+            .zip(request.targets[3..].iter().copied())
+            .enumerate()
+            .map(|(index, (fd, target))| {
+                let floor = HIGH_FD_BASE + RawFd::try_from(index).unwrap_or(0);
+                let high = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(floor))?;
+                // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor this process owns.
+                Ok((unsafe { OwnedFd::from_raw_fd(high) }, target))
+            })
+            .collect::<nix::Result<_>>()?;
+        let mut stdio = received.into_iter();
+        let (Some(stdin), Some(stdout), Some(stderr)) = (stdio.next(), stdio.next(), stdio.next())
+        else {
+            anyhow::bail!("missing stdio");
+        };
+        let mut command =
+            std::process::Command::new(Path::new(REAL_BINARY_DIR).join(&request.program));
+        command
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(request.env.iter().map(|(key, value)| (key, value)))
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr);
+        let mapping: Vec<(RawFd, RawFd)> = extra
+            .iter()
+            .map(|(fd, target)| (fd.as_raw_fd(), *target))
+            .collect();
+        // SAFETY: only async-signal-safe dup2 calls run between fork and exec.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                for (source, target) in &mapping {
+                    if nix::libc::dup2(*source, *target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let status = command.spawn()?.wait()?;
+        drop(extra);
+        let code = status.code().unwrap_or_else(|| {
+            128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
+        });
+        stream.write_all(&code.to_le_bytes())?;
+        Ok(())
+    }
+}
 mod input_bridge;
-mod kwin_script;
-mod shim_protocol;
+mod kwin_script {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::KwinError;
+
+    const KWIN_SCRIPTING_PATH: &str = "/Scripting";
+    const KWIN_SCRIPTING_INTERFACE: &str = "org.kde.kwin.Scripting";
+    const KWIN_SCRIPT_INTERFACE: &str = "org.kde.kwin.Script";
+    const KWIN_CALLBACK_INTERFACE: &str = "org.kde.KWinMCP";
+    const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+    static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) async fn run_kwin_script(
+        conn: &zbus::Connection,
+        kwin_unique: &str,
+        host_xdg_dir: &Path,
+        script_body: &str,
+    ) -> Result<String, KwinError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            KwinError::Msg(format!("KWin script requires a Tokio runtime: {error}"))
+        })?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let pid = std::process::id();
+        let sequence = NEXT_SCRIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let marker = format!("kwin-mcp-{pid}-{timestamp}-{sequence}");
+        let callback_path = format!("/KWinMCP/{pid}_{timestamp}_{sequence}");
+        let our_name = conn
+            .unique_name()
+            .ok_or_else(|| KwinError::Msg("no bus name".to_owned()))?
+            .to_string();
+        let our_name_json = serde_json::to_string(&our_name)?;
+        let callback_path_json = serde_json::to_string(&callback_path)?;
+        let script = format!(
+            "{script_body}\n\
+        callDBus({our_name_json},{callback_path_json},'{KWIN_CALLBACK_INTERFACE}','result',JSON.stringify(result));"
+        );
+        let object_path = zbus::zvariant::ObjectPath::try_from(callback_path.clone())?;
+        let script_file = host_xdg_dir.join(format!("{marker}.js"));
+        let mut cleanup = ScriptCleanup {
+            conn: conn.clone(),
+            kwin_unique: kwin_unique.to_owned(),
+            object_path,
+            marker,
+            script_file,
+            runtime,
+            file_created: false,
+            callback_attempted: false,
+            load_attempted: false,
+            cleanup_started: false,
+        };
+
+        let result = async {
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&cleanup.script_file)?;
+                cleanup.file_created = true;
+                file.write_all(script.as_bytes())?;
+            }
+            let container_script_path = cleanup.script_file.to_string_lossy().to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            let callback = KWinCallback {
+                tx: std::sync::Mutex::new(Some(tx)),
+            };
+            cleanup.callback_attempted = true;
+            let registered = conn
+                .object_server()
+                .at(&cleanup.object_path, callback)
+                .await?;
+            eprintln!(
+                "run_kwin_script: our_name={our_name} path={callback_path} registered={registered}"
+            );
+            if !registered {
+                cleanup.callback_attempted = false;
+                return Err(KwinError::Msg(format!(
+                    "failed to register callback at {callback_path}"
+                )));
+            }
+
+            let scripting: zbus::Proxy = zbus::proxy::Builder::new(conn)
+                .destination(kwin_unique)?
+                .path(KWIN_SCRIPTING_PATH)?
+                .interface(KWIN_SCRIPTING_INTERFACE)?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await?;
+            cleanup.load_attempted = true;
+            let (script_id,): (i32,) = scripting
+                .call("loadScript", &(&container_script_path, &cleanup.marker))
+                .await?;
+            if script_id < 0 {
+                return Err(KwinError::Msg(format!(
+                    "KWin loadScript failed, id={script_id}"
+                )));
+            }
+            let script_proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
+                .destination(kwin_unique)?
+                .path(format!("{KWIN_SCRIPTING_PATH}/Script{script_id}"))?
+                .interface(KWIN_SCRIPT_INTERFACE)?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await?;
+            script_proxy.call::<_, (), ()>("run", &()).await?;
+            rx.await
+                .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()))
+        }
+        .await;
+
+        let cleanup_result = cleanup.finish().await;
+        match result {
+            Ok(payload) => {
+                cleanup_result?;
+                Ok(payload)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    struct ScriptCleanup {
+        conn: zbus::Connection,
+        kwin_unique: String,
+        object_path: zbus::zvariant::ObjectPath<'static>,
+        marker: String,
+        script_file: PathBuf,
+        runtime: tokio::runtime::Handle,
+        file_created: bool,
+        callback_attempted: bool,
+        load_attempted: bool,
+        cleanup_started: bool,
+    }
+
+    impl ScriptCleanup {
+        fn start(&mut self) -> Option<tokio::task::JoinHandle<Result<(), KwinError>>> {
+            if self.cleanup_started {
+                return None;
+            }
+            self.cleanup_started = true;
+            let file_result = if self.file_created {
+                match std::fs::remove_file(&self.script_file) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => {
+                        eprintln!(
+                            "KWin script cleanup {}: remove {}: {error}",
+                            self.marker,
+                            self.script_file.display()
+                        );
+                        Err(KwinError::from(error))
+                    }
+                }
+            } else {
+                Ok(())
+            };
+            let conn = self.conn.clone();
+            let kwin_unique = self.kwin_unique.clone();
+            let object_path = self.object_path.clone();
+            let marker = self.marker.clone();
+            let callback_attempted = self.callback_attempted;
+            let load_attempted = self.load_attempted;
+
+            Some(self.runtime.spawn(async move {
+            let callback_cleanup = async {
+                if !callback_attempted {
+                    return Ok(());
+                }
+                match tokio::time::timeout(
+                    SCRIPT_CLEANUP_TIMEOUT,
+                    conn.object_server().remove::<KWinCallback, _>(&object_path),
+                )
+                .await
+                {
+                    Ok(Ok(_)) | Ok(Err(zbus::Error::InterfaceNotFound)) => Ok(()),
+                    Ok(Err(error)) => Err(KwinError::from(error)),
+                    Err(_) => Err(KwinError::Msg(format!(
+                        "KWin callback cleanup timed out at {object_path} after {SCRIPT_CLEANUP_TIMEOUT:?}"
+                    ))),
+                }
+            };
+            let unload_cleanup = async {
+                if !load_attempted {
+                    return Ok(());
+                }
+                let reply = tokio::time::timeout(
+                    SCRIPT_CLEANUP_TIMEOUT,
+                    conn.call_method(
+                        Some(kwin_unique.as_str()),
+                        KWIN_SCRIPTING_PATH,
+                        Some(KWIN_SCRIPTING_INTERFACE),
+                        "unloadScript",
+                        &(marker.as_str(),),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    KwinError::Msg(format!(
+                        "KWin unloadScript cleanup timed out for {marker} after {SCRIPT_CLEANUP_TIMEOUT:?}"
+                    ))
+                })??;
+                let (_,): (bool,) = reply.body().deserialize()?;
+                Ok(())
+            };
+            let (callback_result, unload_result) =
+                tokio::join!(callback_cleanup, unload_cleanup);
+            if let Err(error) = &callback_result {
+                eprintln!("KWin script cleanup {marker}: {error}");
+            }
+            if let Err(error) = &unload_result {
+                eprintln!("KWin script cleanup {marker}: {error}");
+            }
+            file_result.and(callback_result).and(unload_result)
+        }))
+        }
+
+        async fn finish(&mut self) -> Result<(), KwinError> {
+            match self.start() {
+                Some(task) => task.await.map_err(|error| {
+                    KwinError::Msg(format!("KWin script cleanup task failed: {error}"))
+                })?,
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for ScriptCleanup {
+        fn drop(&mut self) {
+            if let Some(task) = self.start() {
+                drop(task);
+            }
+        }
+    }
+
+    struct KWinCallback {
+        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.KWinMCP")]
+    impl KWinCallback {
+        #[zbus(name = "result")]
+        fn result(&self, payload: String) {
+            match self.tx.lock() {
+                Ok(mut sender) => {
+                    if let Some(tx) = sender.take()
+                        && tx.send(payload).is_err()
+                    {
+                        eprintln!("KWin callback receiver dropped");
+                    }
+                }
+                Err(error) => eprintln!("KWin callback lock poisoned: {error}"),
+            }
+        }
+    }
+}
 use kwin_script::run_kwin_script;
-mod wallet_mediator;
+mod wallet_mediator {
+    //! A session-local KWallet for the isolated session.
+    //!
+    //! Session apps (Chrome with --password-store=kwallet6) talk to
+    //! `org.kde.kwalletd6` on a private bus served by this module. The session
+    //! never reaches the host's wallet or Secret Service: at `session_start` one
+    //! guarded, read-only snapshot of the host wallet is taken, and from then on
+    //! every call is answered from memory. Writes land in the session's copy only
+    //! and vanish with the session.
+    //!
+    //! The snapshot is taken so that it cannot disturb the host:
+    //!
+    //! - it never starts a service: `org.kde.ksecretd` must already own its name,
+    //!   and every call is sent with NoAutoStart;
+    //! - it never unlocks or prompts: a locked wallet is refused, and the lock
+    //!   state comes from `org.kde.ksecretd` only, never from
+    //!   `org.freedesktop.secrets` (gnome-keyring aborts when a short-lived
+    //!   client disconnects mid-request);
+    //! - snapshots are serialized across every kwin-mcp server on the host and
+    //!   spaced apart, so many sessions starting together make no burst;
+    //! - it does not depend on kwalletd6 being healthy: when kwalletd6 is missing
+    //!   or does not answer, the same wallet is read from ksecretd directly with
+    //!   the standard Secret Service calls (a wedged kwalletd6 after a user-bus
+    //!   restart otherwise left every session without its Chrome Safe Storage key,
+    //!   and Chrome then drops every cookie it cannot decrypt).
+
+    use futures::StreamExt;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zbus::message::Type as MessageType;
+    use zbus::zvariant::Value;
+
+    pub const SERVICE: &str = "org.kde.kwalletd6";
+    pub const PATH: &str = "/modules/kwalletd6";
+    pub const INTERFACE: &str = "org.kde.KWallet";
+    /// The only Secret Service the lock state is read from.
+    const SECRET_BACKEND: &str = "org.kde.ksecretd";
+    /// App id the snapshot's own handle is opened under.
+    const SNAPSHOT_APP: &str = "kwin-mcp-snapshot";
+    /// Bound for each host call during the snapshot.
+    const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Bound for each way of reading the wallet.
+    const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(6);
+    /// Bound for the whole snapshot, lock wait included, inside session_start's
+    /// 20 s hard limit.
+    const SNAPSHOT_BUDGET: Duration = Duration::from_secs(12);
+    /// Minimum gap between two snapshots on this host.
+    const SNAPSHOT_SPACING: Duration = Duration::from_millis(100);
+    /// After kwalletd6 fails to answer, snapshots read ksecretd directly for this
+    /// long instead of each waiting out HOST_CALL_TIMEOUT.
+    const KWALLETD_BACKOFF: Duration = Duration::from_secs(60);
+    /// Limits that keep a runaway wallet from filling the server's memory.
+    const MAX_ENTRIES: usize = 20_000;
+    const MAX_BYTES: usize = 64 << 20;
+
+    /// KWallet entry types.
+    const TYPE_UNKNOWN: i32 = 0;
+    const TYPE_PASSWORD: i32 = 1;
+    const TYPE_STREAM: i32 = 2;
+    const TYPE_MAP: i32 = 3;
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        kind: i32,
+        data: Vec<u8>,
+    }
+
+    /// The wallet the session sees: the host snapshot plus the session's own writes.
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    pub struct Wallet {
+        name: String,
+        folders: BTreeMap<String, BTreeMap<String, Entry>>,
+    }
+
+    impl Wallet {
+        pub fn entry_count(&self) -> usize {
+            self.folders.values().map(BTreeMap::len).sum()
+        }
+
+        fn entry(&self, folder: &str, key: &str) -> Option<&Entry> {
+            self.folders.get(folder)?.get(key)
+        }
+
+        fn write(&mut self, folder: &str, key: &str, kind: i32, data: Vec<u8>) -> bool {
+            match self.folders.get_mut(folder) {
+                Some(entries) => {
+                    entries.insert(key.to_owned(), Entry { kind, data });
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Outcome of the host snapshot, reported by session_start.
+    pub struct Snapshot {
+        pub wallet: Option<Wallet>,
+        pub reason: String,
+    }
+
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    pub(super) struct State {
+        wallet: Option<Wallet>,
+        /// Handles the session opened, with the app id each belongs to.
+        handles: HashMap<i32, String>,
+        next_handle: i32,
+        next_transaction: i32,
+    }
+
+    pub struct WalletMediator {
+        state: Arc<Mutex<State>>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for WalletMediator {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
+    type HostResult<T> = zbus::Result<T>;
+
+    async fn host_call<B, R>(proxy: &zbus::Proxy<'_>, method: &str, body: &B) -> HostResult<R>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+        R: serde::de::DeserializeOwned + zbus::zvariant::Type,
+    {
+        tokio::time::timeout(
+            HOST_CALL_TIMEOUT,
+            proxy.call_with_flags::<_, _, R>(
+                method,
+                zbus::proxy::MethodFlags::NoAutoStart.into(),
+                body,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            zbus::Error::Failure(format!(
+                "{method}: the host service did not answer in {HOST_CALL_TIMEOUT:?}"
+            ))
+        })??
+        .ok_or_else(|| zbus::Error::Failure(format!("{method}: no reply")))
+    }
+
+    async fn name_has_owner(host: &zbus::Connection, name: &str) -> bool {
+        let Ok(proxy) = zbus::fdo::DBusProxy::new(host).await else {
+            return false;
+        };
+        let Ok(name) = zbus::names::BusName::try_from(name) else {
+            return false;
+        };
+        proxy.name_has_owner(name).await.unwrap_or(false)
+    }
+
+    /// Serializes snapshots across processes with a lock file in the user runtime
+    /// directory, and spaces them SNAPSHOT_SPACING apart.
+    struct HostSlot {
+        file: nix::fcntl::Flock<std::fs::File>,
+        /// Touched when kwalletd6 does not answer; see KWALLETD_BACKOFF.
+        kwalletd_unreachable: std::path::PathBuf,
+    }
+
+    impl HostSlot {
+        async fn take() -> Result<Self, String> {
+            let directory = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?
+                .join("kwin-mcp");
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("create {}: {error}", directory.display()))?;
+            let path = directory.join("wallet-snapshot.lock");
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .map_err(|error| format!("open {}: {error}", path.display()))?;
+            loop {
+                match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                    Ok(locked) => {
+                        let slot = Self {
+                            file: locked,
+                            kwalletd_unreachable: directory.join("kwalletd-unreachable"),
+                        };
+                        let since = slot
+                            .file
+                            .metadata()
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                            .and_then(|time| time.elapsed().ok());
+                        if let Some(wait) =
+                            since.and_then(|elapsed| SNAPSHOT_SPACING.checked_sub(elapsed))
+                        {
+                            tokio::time::sleep(wait).await;
+                        }
+                        return Ok(slot);
+                    }
+                    Err((returned, nix::errno::Errno::EWOULDBLOCK)) => {
+                        file = returned;
+                        tokio::time::sleep(SNAPSHOT_SPACING).await;
+                    }
+                    Err((_, error)) => return Err(format!("lock {}: {error}", path.display())),
+                }
+            }
+        }
+
+        fn kwalletd_recently_unreachable(&self) -> bool {
+            std::fs::metadata(&self.kwalletd_unreachable)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|elapsed| elapsed < KWALLETD_BACKOFF)
+        }
+
+        fn mark_kwalletd(&self, unreachable: bool) {
+            if unreachable {
+                let _ = std::fs::write(&self.kwalletd_unreachable, b"");
+            } else {
+                let _ = std::fs::remove_file(&self.kwalletd_unreachable);
+            }
+        }
+    }
+
+    impl Drop for HostSlot {
+        fn drop(&mut self) {
+            // The modification time is what spaces the next snapshot.
+            let _ = self.file.set_modified(std::time::SystemTime::now());
+        }
+    }
+
+    fn refused(reason: impl Into<String>) -> Snapshot {
+        Snapshot {
+            wallet: None,
+            reason: reason.into(),
+        }
+    }
+
+    /// Set to read the host wallet from ksecretd only (diagnostics).
+    const FROM_SECRET_SERVICE_ENV: &str = "KWIN_MCP_WALLET_FROM_SECRET_SERVICE";
+
+    /// Why one way of reading the host wallet did not work.
+    enum Failure {
+        /// A decision, not a fault: the wallet is disabled, locked or not listed.
+        /// No other way of reading it is tried.
+        Refused(String),
+        /// kwalletd6 is missing, wedged or erroring. ksecretd, the Secret Service
+        /// behind it, may still answer, so the copy is tried from there.
+        Unreachable(String),
+    }
+
+    fn unreachable_error(what: &str) -> impl FnOnce(zbus::Error) -> Failure + '_ {
+        move |error| Failure::Unreachable(format!("{what}: {error}"))
+    }
+
+    /// Take the one read-only snapshot of the host wallet, or say why not.
+    pub async fn snapshot(host: &zbus::Connection) -> Snapshot {
+        let guarded = async {
+            let slot = HostSlot::take().await?;
+            let outcome = snapshot_locked(host, &slot).await;
+            drop(slot);
+            Ok::<_, String>(outcome)
+        };
+        match tokio::time::timeout(SNAPSHOT_BUDGET, guarded).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(reason)) => refused(reason),
+            Err(_) => refused(format!(
+                "host wallet snapshot did not finish within {} s",
+                SNAPSHOT_BUDGET.as_secs()
+            )),
+        }
+    }
+
+    async fn snapshot_locked(host: &zbus::Connection, slot: &HostSlot) -> Snapshot {
+        // Diagnostic switch: read from ksecretd even while kwalletd6 answers, to
+        // exercise the fallback.
+        let why = if std::env::var_os(FROM_SECRET_SERVICE_ENV).is_some() {
+            format!("{FROM_SECRET_SERVICE_ENV} is set")
+        } else if slot.kwalletd_recently_unreachable() {
+            format!(
+                "host kwalletd6 did not answer within the last {} s",
+                KWALLETD_BACKOFF.as_secs()
+            )
+        } else {
+            let why = match tokio::time::timeout(SNAPSHOT_TIMEOUT, read_via_kwalletd(host)).await {
+                Ok(Ok(snapshot)) => {
+                    slot.mark_kwalletd(false);
+                    return snapshot;
+                }
+                Ok(Err(Failure::Refused(reason))) => return refused(reason),
+                Ok(Err(Failure::Unreachable(reason))) => reason,
+                Err(_) => "host kwalletd6 snapshot timed out".to_owned(),
+            };
+            slot.mark_kwalletd(true);
+            why
+        };
+        match tokio::time::timeout(SNAPSHOT_TIMEOUT, read_via_secret_service(host, &why)).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(Failure::Refused(reason) | Failure::Unreachable(reason))) => {
+                refused(format!("{why}; {reason}"))
+            }
+            Err(_) => refused(format!("{why}; reading ksecretd timed out")),
+        }
+    }
+
+    async fn read_via_kwalletd(host: &zbus::Connection) -> Result<Snapshot, Failure> {
+        if !name_has_owner(host, SECRET_BACKEND).await {
+            return Err(Failure::Refused(format!(
+                "{SECRET_BACKEND} is not running on the host; kwin-mcp does not start it"
+            )));
+        }
+        if !name_has_owner(host, SERVICE).await {
+            return Err(Failure::Unreachable(format!(
+                "{SERVICE} is not running on the host; kwin-mcp does not start it"
+            )));
+        }
+        let proxy = zbus::Proxy::new(host, SERVICE, PATH, INTERFACE)
+            .await
+            .map_err(unreachable_error("host kwalletd6 proxy"))?;
+        match host_call::<_, bool>(&proxy, "isEnabled", &()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Failure::Refused(
+                    "KWallet is disabled on the host".to_owned(),
+                ));
+            }
+            Err(error) => {
+                return Err(Failure::Unreachable(format!(
+                    "host kwalletd6 unavailable: {error}"
+                )));
+            }
+        }
+        let name: String = host_call(&proxy, "networkWallet", &())
+            .await
+            .map_err(unreachable_error("networkWallet"))?;
+        let listed: Vec<String> = host_call(&proxy, "wallets", &())
+            .await
+            .map_err(unreachable_error("wallets"))?;
+        if !listed.contains(&name) {
+            return Err(Failure::Refused(format!(
+                "host wallet '{name}' is not listed by kwalletd6; kwin-mcp does not create it"
+            )));
+        }
+        match find_collection(host, &name).await {
+            Some((_, false)) => {}
+            Some((_, true)) => {
+                return Err(Failure::Refused(format!(
+                    "host wallet '{name}' is locked; kwin-mcp does not unlock it"
+                )));
+            }
+            None => {
+                return Err(Failure::Refused(format!(
+                    "host Secret Service has no readable collection for '{name}'"
+                )));
+            }
+        }
+        let handle: i32 =
+            match host_call(&proxy, "open", &(name.as_str(), 0i64, SNAPSHOT_APP)).await {
+                Ok(handle) if handle >= 0 => handle,
+                Ok(_) => {
+                    return Err(Failure::Unreachable(
+                        "host kwalletd6 refused to open the wallet".to_owned(),
+                    ));
+                }
+                Err(error) => return Err(Failure::Unreachable(format!("open: {error}"))),
+            };
+        let copied = copy_entries(&proxy, handle, &name).await;
+        // The snapshot's own handle is always released, whatever the copy did.
+        let _ = host_call::<_, i32>(&proxy, "close", &(handle, false, SNAPSHOT_APP)).await;
+        let wallet = copied.map_err(Failure::Unreachable)?;
+        let reason = format!(
+            "session-local copy of host wallet '{name}': {} entries",
+            wallet.entry_count()
+        );
+        Ok(Snapshot {
+            wallet: Some(wallet),
+            reason,
+        })
+    }
+
+    /// The collection holding `wallet`, and whether it is locked.
+    async fn find_collection(
+        host: &zbus::Connection,
+        wallet: &str,
+    ) -> Option<(zbus::zvariant::OwnedObjectPath, bool)> {
+        let service = zbus::Proxy::new(
+            host,
+            SECRET_BACKEND,
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service",
+        )
+        .await
+        .ok()?;
+        let collections = service
+            .get_property::<Vec<zbus::zvariant::OwnedObjectPath>>("Collections")
+            .await
+            .ok()?;
+        for path in collections {
+            let Ok(collection) = zbus::Proxy::new(
+                host,
+                SECRET_BACKEND,
+                path.clone(),
+                "org.freedesktop.Secret.Collection",
+            )
+            .await
+            else {
+                continue;
+            };
+            let label = collection
+                .get_property::<String>("Label")
+                .await
+                .unwrap_or_default();
+            if label == wallet || path.as_str().rsplit('/').next() == Some(wallet) {
+                let locked = collection.get_property::<bool>("Locked").await.ok()?;
+                return Some((path, locked));
+            }
+        }
+        None
+    }
+
+    /// Wallet the host's own default points at when kwalletd6 cannot be asked.
+    const DEFAULT_WALLET: &str = "kdewallet";
+
+    /// Read the wallet straight from ksecretd with the standard Secret Service
+    /// calls (OpenSession "plain", GetSecrets). It never unlocks anything: a
+    /// locked collection is refused, and GetSecrets on an unlocked one cannot
+    /// prompt. kwalletd6 is a thin layer over these items: the KWallet folder is
+    /// the item's `server` attribute, the entry name its `user`, and `type` is
+    /// plaintext, binary or map.
+    async fn read_via_secret_service(
+        host: &zbus::Connection,
+        why: &str,
+    ) -> Result<Snapshot, Failure> {
+        use std::collections::HashMap;
+        use zbus::zvariant::{OwnedObjectPath, Value};
+        if !name_has_owner(host, SECRET_BACKEND).await {
+            return Err(Failure::Refused(format!(
+                "{SECRET_BACKEND} is not running on the host; kwin-mcp does not start it"
+            )));
+        }
+        let (collection_path, locked) =
+            find_collection(host, DEFAULT_WALLET).await.ok_or_else(|| {
+                Failure::Refused(format!(
+                    "{SECRET_BACKEND} has no readable collection '{DEFAULT_WALLET}'"
+                ))
+            })?;
+        if locked {
+            return Err(Failure::Refused(format!(
+                "host wallet '{DEFAULT_WALLET}' is locked; kwin-mcp does not unlock it"
+            )));
+        }
+        let service = zbus::Proxy::new(
+            host,
+            SECRET_BACKEND,
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service",
+        )
+        .await
+        .map_err(unreachable_error("ksecretd proxy"))?;
+        let collection = zbus::Proxy::new(
+            host,
+            SECRET_BACKEND,
+            collection_path.clone(),
+            "org.freedesktop.Secret.Collection",
+        )
+        .await
+        .map_err(unreachable_error("ksecretd collection proxy"))?;
+        let items: Vec<OwnedObjectPath> = collection
+            .get_property("Items")
+            .await
+            .map_err(unreachable_error("Items"))?;
+        if items.len() > MAX_ENTRIES {
+            return Err(Failure::Refused(
+                "host wallet is too large to copy into a session".to_owned(),
+            ));
+        }
+        let (_, session): (zbus::zvariant::OwnedValue, OwnedObjectPath) = host_call(
+            &service,
+            "OpenSession",
+            &("plain", Value::new(String::new())),
+        )
+        .await
+        .map_err(unreachable_error("OpenSession"))?;
+        let secrets = host_call::<
+            _,
+            HashMap<OwnedObjectPath, (OwnedObjectPath, Vec<u8>, Vec<u8>, String)>,
+        >(&service, "GetSecrets", &(&items, &session))
+        .await;
+        let mut found: Vec<(u64, String, String, Entry)> = Vec::new();
+        let mut result: Result<(), Failure> = Ok(());
+        match secrets {
+            Err(error) => result = Err(Failure::Unreachable(format!("GetSecrets: {error}"))),
+            Ok(secrets) => {
+                for (path, (_, _, value, _)) in secrets {
+                    let Ok(item) = zbus::Proxy::new(
+                        host,
+                        SECRET_BACKEND,
+                        path.clone(),
+                        "org.freedesktop.Secret.Item",
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let attributes: HashMap<String, String> =
+                        match item.get_property("Attributes").await {
+                            Ok(attributes) => attributes,
+                            Err(_) => continue,
+                        };
+                    let (Some(folder), Some(key)) =
+                        (attributes.get("server"), attributes.get("user"))
+                    else {
+                        continue;
+                    };
+                    let modified: u64 = item.get_property("Modified").await.unwrap_or(0);
+                    let kind = match attributes.get("type").map(String::as_str) {
+                        Some("plaintext") => TYPE_PASSWORD,
+                        Some("map") => TYPE_MAP,
+                        Some("binary") => TYPE_STREAM,
+                        _ if std::str::from_utf8(&value).is_ok() => TYPE_PASSWORD,
+                        _ => TYPE_STREAM,
+                    };
+                    found.push((
+                        modified,
+                        folder.clone(),
+                        key.clone(),
+                        Entry { kind, data: value },
+                    ));
+                }
+            }
+        }
+        // The session is closed whatever the read did.
+        if let Ok(proxy) = zbus::Proxy::new(
+            host,
+            SECRET_BACKEND,
+            session,
+            "org.freedesktop.Secret.Session",
+        )
+        .await
+        {
+            let _ = host_call::<_, ()>(&proxy, "Close", &()).await;
+        }
+        result?;
+        // Two items can share a folder and name (the host wallet has two "Chrome
+        // Safe Storage" items, written by different clients): the most recently
+        // modified one is used.
+        found.sort_by_key(|(modified, ..)| *modified);
+        let mut wallet = Wallet {
+            name: DEFAULT_WALLET.to_owned(),
+            folders: BTreeMap::new(),
+        };
+        let (mut bytes, mut conflicts) = (0usize, 0usize);
+        for (_, folder, key, entry) in found {
+            bytes += entry.data.len();
+            if bytes > MAX_BYTES {
+                return Err(Failure::Refused(
+                    "host wallet is too large to copy into a session".to_owned(),
+                ));
+            }
+            let previous = wallet
+                .folders
+                .entry(folder)
+                .or_default()
+                .insert(key, entry.clone());
+            conflicts += usize::from(previous.is_some_and(|previous| previous.data != entry.data));
+        }
+        let reason = format!(
+            "session-local copy of host wallet '{DEFAULT_WALLET}' read from ksecretd because {why}: {} entries{}",
+            wallet.entry_count(),
+            if conflicts > 0 {
+                format!(
+                    " ({conflicts} duplicate name(s) held different values; the newest was used)"
+                )
+            } else {
+                String::new()
+            }
+        );
+        Ok(Snapshot {
+            wallet: Some(wallet),
+            reason,
+        })
+    }
+
+    async fn copy_entries(
+        proxy: &zbus::Proxy<'_>,
+        handle: i32,
+        name: &str,
+    ) -> Result<Wallet, String> {
+        let describe = |what: &str, error: zbus::Error| format!("{what}: {error}");
+        let mut wallet = Wallet {
+            name: name.to_owned(),
+            folders: BTreeMap::new(),
+        };
+        let (mut entries, mut bytes) = (0usize, 0usize);
+        // kwalletd6 over a Secret Service backend lists a folder once per item it
+        // holds (2848 names for 17 folders on the dev machine), so names are
+        // deduplicated before each is read.
+        let folders: std::collections::BTreeSet<String> =
+            host_call::<_, Vec<String>>(proxy, "folderList", &(handle, SNAPSHOT_APP))
+                .await
+                .map_err(|e| describe("folderList", e))?
+                .into_iter()
+                .collect();
+        for folder in folders {
+            let keys: std::collections::BTreeSet<String> = host_call::<_, Vec<String>>(
+                proxy,
+                "entryList",
+                &(handle, folder.as_str(), SNAPSHOT_APP),
+            )
+            .await
+            .map_err(|e| describe("entryList", e))?
+            .into_iter()
+            .collect();
+            let mut copy = BTreeMap::new();
+            for key in keys {
+                let args = (handle, folder.as_str(), key.as_str(), SNAPSHOT_APP);
+                let kind: i32 = host_call(proxy, "entryType", &args)
+                    .await
+                    .map_err(|e| describe("entryType", e))?;
+                let data: Vec<u8> = match kind {
+                    TYPE_PASSWORD => host_call::<_, String>(proxy, "readPassword", &args)
+                        .await
+                        .map_err(|e| describe("readPassword", e))?
+                        .into_bytes(),
+                    TYPE_MAP => host_call(proxy, "readMap", &args)
+                        .await
+                        .map_err(|e| describe("readMap", e))?,
+                    _ => host_call(proxy, "readEntry", &args)
+                        .await
+                        .map_err(|e| describe("readEntry", e))?,
+                };
+                entries += 1;
+                bytes += data.len();
+                if entries > MAX_ENTRIES || bytes > MAX_BYTES {
+                    return Err("host wallet is too large to copy into a session".to_owned());
+                }
+                copy.insert(key, Entry { kind, data });
+            }
+            wallet.folders.insert(folder, copy);
+        }
+        Ok(wallet)
+    }
+
+    impl WalletMediator {
+        /// Serve org.kde.kwalletd6 on the private bus at `bus_address` from
+        /// `wallet`. None answers as a disabled KWallet.
+        pub async fn start(bus_address: &str, wallet: Option<Wallet>) -> zbus::Result<Self> {
+            Self::start_state(
+                bus_address,
+                State {
+                    wallet,
+                    next_handle: 1,
+                    next_transaction: 1,
+                    ..State::default()
+                },
+            )
+            .await
+        }
+        pub(super) fn saved_state(&self) -> std::io::Result<State> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| std::io::Error::other("wallet state lock poisoned"))
+        }
+        pub(super) async fn start_state(bus_address: &str, saved: State) -> zbus::Result<Self> {
+            let session = zbus::connection::Builder::address(bus_address)?
+                .name(SERVICE)?
+                .build()
+                .await?;
+            let state = Arc::new(Mutex::new(saved));
+            let mut calls = zbus::MessageStream::from(&session);
+            let task = {
+                let (session, state) = (session.clone(), state.clone());
+                tokio::spawn(async move {
+                    while let Some(Ok(message)) = calls.next().await {
+                        if message.message_type() != MessageType::MethodCall {
+                            continue;
+                        }
+                        let (session, state) = (session.clone(), state.clone());
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_call(&session, &state, &message).await {
+                                eprintln!("session wallet: {error}");
+                                let _ = session
+                                    .reply_error(
+                                        &message.header(),
+                                        "org.freedesktop.DBus.Error.Failed",
+                                        &error.to_string(),
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                })
+            };
+            Ok(Self {
+                state,
+                tasks: vec![task],
+            })
+        }
+
+        /// Stop serving and drop the session's wallet. Nothing on the host is
+        /// touched.
+        pub async fn shutdown(mut self) {
+            for task in self.tasks.drain(..) {
+                task.abort();
+            }
+            if let Ok(mut state) = self.state.lock() {
+                *state = State::default();
+            }
+        }
+    }
+
+    const INTROSPECTION: &str = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \
+\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\"><node><interface name=\"org.kde.KWallet\"/></node>";
+
+    /// The wallet behind `handle` when `app` owns it.
+    fn owned<'a>(state: &'a mut State, handle: i32, app: &str) -> Option<&'a mut Wallet> {
+        if state.handles.get(&handle).is_some_and(|owner| owner == app) {
+            state.wallet.as_mut()
+        } else {
+            None
+        }
+    }
+
+    async fn handle_call(
+        session: &zbus::Connection,
+        state: &Arc<Mutex<State>>,
+        message: &zbus::Message,
+    ) -> zbus::Result<()> {
+        let header = message.header();
+        let member = header
+            .member()
+            .map(|member| member.to_string())
+            .unwrap_or_default();
+        let interface = header
+            .interface()
+            .map(|interface| interface.to_string())
+            .unwrap_or_default();
+        match (interface.as_str(), member.as_str()) {
+            ("org.freedesktop.DBus.Introspectable", "Introspect") => {
+                return session.reply(&header, &INTROSPECTION).await;
+            }
+            ("org.freedesktop.DBus.Peer", "Ping") => return session.reply(&header, &()).await,
+            ("org.freedesktop.DBus.Peer", "GetMachineId") => {
+                let id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+                return session.reply(&header, &id.trim()).await;
+            }
+            _ => {}
+        }
+        if header.path().map(|path| path.as_str()) != Some(PATH)
+            || (interface != INTERFACE && !interface.is_empty())
+        {
+            return session
+                .reply_error(
+                    &header,
+                    "org.freedesktop.DBus.Error.UnknownObject",
+                    &"kwin-mcp exposes only org.kde.KWallet at /modules/kwalletd6",
+                )
+                .await;
+        }
+        let body = message.body();
+        let signature = body.signature().to_string_no_parens();
+        let deny = |reason: &str| format!("kwin-mcp: {member} {reason}");
+        let bad = |error: zbus::Error| zbus::Error::Failure(format!("{member}: {error}"));
+
+        // Replies are built under the lock and sent after it is released.
+        enum Reply {
+            Bool(bool),
+            Int(i32),
+            Text(String),
+            Bytes(Vec<u8>),
+            List(Vec<String>),
+            Dict(HashMap<String, Value<'static>>),
+            Denied,
+            /// An asynchronous open: the transaction id, then the result signal.
+            Async(i32, i32),
+        }
+        let wallet_name = state
+            .lock()
+            .map_err(|_| zbus::Error::Failure("wallet state poisoned".to_owned()))?
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.name.clone());
+        let Some(name) = wallet_name else {
+            return match member.as_str() {
+                "isEnabled" => session.reply(&header, &false).await,
+                "wallets" => session.reply(&header, &Vec::<String>::new()).await,
+                "open" | "openPath" => session.reply(&header, &-1i32).await,
+                _ => {
+                    session
+                        .reply_error(
+                            &header,
+                            "org.freedesktop.DBus.Error.AccessDenied",
+                            &deny(
+                                "is unavailable: the host wallet is not copied into this session",
+                            ),
+                        )
+                        .await
+                }
+            };
+        };
+        let reply = {
+            let mut state = state
+                .lock()
+                .map_err(|_| zbus::Error::Failure("wallet state poisoned".to_owned()))?;
+            match member.as_str() {
+                "isEnabled" => Reply::Bool(true),
+                "networkWallet" | "localWallet" => Reply::Text(name),
+                "wallets" => Reply::List(vec![name]),
+                "users" => Reply::List(Vec::new()),
+                "isOpen" if signature == "s" => {
+                    let requested: String = body.deserialize().map_err(bad)?;
+                    Reply::Bool(requested == name && !state.handles.is_empty())
+                }
+                "isOpen" => {
+                    let handle: i32 = body.deserialize().map_err(bad)?;
+                    Reply::Bool(state.handles.contains_key(&handle))
+                }
+                "open" | "openAsync" => {
+                    let (requested, app, asynchronous) = if member == "open" {
+                        let (requested, _window, app): (String, i64, String) =
+                            body.deserialize().map_err(bad)?;
+                        (requested, app, false)
+                    } else {
+                        let (requested, _window, app, _session): (String, i64, String, bool) =
+                            body.deserialize().map_err(bad)?;
+                        (requested, app, true)
+                    };
+                    if requested != name {
+                        Reply::Int(-1)
+                    } else {
+                        let handle = state.next_handle;
+                        state.next_handle += 1;
+                        state.handles.insert(handle, app);
+                        if asynchronous {
+                            let transaction = state.next_transaction;
+                            state.next_transaction += 1;
+                            Reply::Async(transaction, handle)
+                        } else {
+                            Reply::Int(handle)
+                        }
+                    }
+                }
+                "openPath" | "openPathAsync" => Reply::Int(-1),
+                "close" if signature == "ibs" => {
+                    let (handle, _force, app): (i32, bool, String) =
+                        body.deserialize().map_err(bad)?;
+                    if state
+                        .handles
+                        .get(&handle)
+                        .is_some_and(|owner| *owner == app)
+                    {
+                        state.handles.remove(&handle);
+                        Reply::Int(0)
+                    } else {
+                        Reply::Int(-1)
+                    }
+                }
+                "close" => Reply::Int(-1),
+                "folderList" => {
+                    let (handle, app): (i32, String) = body.deserialize().map_err(bad)?;
+                    Reply::List(
+                        owned(&mut state, handle, &app)
+                            .map(|wallet| wallet.folders.keys().cloned().collect())
+                            .unwrap_or_default(),
+                    )
+                }
+                "hasFolder" => {
+                    let (handle, folder, app): (i32, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    Reply::Bool(
+                        owned(&mut state, handle, &app)
+                            .is_some_and(|wallet| wallet.folders.contains_key(&folder)),
+                    )
+                }
+                "entryList" => {
+                    let (handle, folder, app): (i32, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    Reply::List(
+                        owned(&mut state, handle, &app)
+                            .and_then(|wallet| wallet.folders.get(&folder))
+                            .map(|entries| entries.keys().cloned().collect())
+                            .unwrap_or_default(),
+                    )
+                }
+                "hasEntry" | "entryType" | "readPassword" | "readEntry" | "readMap" => {
+                    let (handle, folder, key, app): (i32, String, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    let entry = owned(&mut state, handle, &app)
+                        .and_then(|wallet| wallet.entry(&folder, &key))
+                        .cloned();
+                    match member.as_str() {
+                        "hasEntry" => Reply::Bool(entry.is_some()),
+                        "entryType" => Reply::Int(entry.map_or(TYPE_UNKNOWN, |entry| entry.kind)),
+                        "readPassword" => Reply::Text(
+                            entry
+                                .map(|entry| String::from_utf8_lossy(&entry.data).into_owned())
+                                .unwrap_or_default(),
+                        ),
+                        _ => Reply::Bytes(entry.map(|entry| entry.data).unwrap_or_default()),
+                    }
+                }
+                "entriesList" | "mapList" | "passwordList" => {
+                    let (handle, folder, app): (i32, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    let wanted = match member.as_str() {
+                        "mapList" => Some(TYPE_MAP),
+                        "passwordList" => Some(TYPE_PASSWORD),
+                        _ => None,
+                    };
+                    let mut dict = HashMap::new();
+                    if let Some(entries) = owned(&mut state, handle, &app)
+                        .and_then(|wallet| wallet.folders.get(&folder))
+                    {
+                        for (key, entry) in entries
+                            .iter()
+                            .filter(|(_, entry)| wanted.is_none_or(|kind| entry.kind == kind))
+                        {
+                            let value =
+                                if entry.kind == TYPE_PASSWORD && wanted == Some(TYPE_PASSWORD) {
+                                    Value::from(String::from_utf8_lossy(&entry.data).into_owned())
+                                } else {
+                                    Value::from(entry.data.clone())
+                                };
+                            dict.insert(key.clone(), value);
+                        }
+                    }
+                    Reply::Dict(dict)
+                }
+                // Writes change the session's copy only.
+                "createFolder" => {
+                    let (handle, folder, app): (i32, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    Reply::Bool(owned(&mut state, handle, &app).is_some_and(|wallet| {
+                        wallet.folders.entry(folder).or_default();
+                        true
+                    }))
+                }
+                "removeFolder" => {
+                    let (handle, folder, app): (i32, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    Reply::Bool(
+                        owned(&mut state, handle, &app)
+                            .is_some_and(|wallet| wallet.folders.remove(&folder).is_some()),
+                    )
+                }
+                "writePassword" => {
+                    let (handle, folder, key, value, app): (i32, String, String, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    let done = owned(&mut state, handle, &app).is_some_and(|wallet| {
+                        wallet.write(&folder, &key, TYPE_PASSWORD, value.into_bytes())
+                    });
+                    Reply::Int(if done { 0 } else { -1 })
+                }
+                "writeEntry" | "writeMap" => {
+                    let (handle, folder, key, value, kind, app): (
+                        i32,
+                        String,
+                        String,
+                        Vec<u8>,
+                        i32,
+                        String,
+                    ) = if signature == "issayis" {
+                        body.deserialize().map_err(bad)?
+                    } else {
+                        let (handle, folder, key, value, app): (
+                            i32,
+                            String,
+                            String,
+                            Vec<u8>,
+                            String,
+                        ) = body.deserialize().map_err(bad)?;
+                        (
+                            handle,
+                            folder,
+                            key,
+                            value,
+                            if member == "writeMap" {
+                                TYPE_MAP
+                            } else {
+                                TYPE_STREAM
+                            },
+                            app,
+                        )
+                    };
+                    let done = owned(&mut state, handle, &app)
+                        .is_some_and(|wallet| wallet.write(&folder, &key, kind, value));
+                    Reply::Int(if done { 0 } else { -1 })
+                }
+                "removeEntry" => {
+                    let (handle, folder, key, app): (i32, String, String, String) =
+                        body.deserialize().map_err(bad)?;
+                    let done = owned(&mut state, handle, &app).is_some_and(|wallet| {
+                        wallet
+                            .folders
+                            .get_mut(&folder)
+                            .is_some_and(|entries| entries.remove(&key).is_some())
+                    });
+                    Reply::Int(if done { 0 } else { -1 })
+                }
+                _ => Reply::Denied,
+            }
+        };
+        match reply {
+            Reply::Bool(value) => session.reply(&header, &value).await,
+            Reply::Int(value) => session.reply(&header, &value).await,
+            Reply::Text(value) => session.reply(&header, &value).await,
+            Reply::Bytes(value) => session.reply(&header, &value).await,
+            Reply::List(value) => session.reply(&header, &value).await,
+            Reply::Dict(value) => session.reply(&header, &value).await,
+            Reply::Denied => {
+                session
+                    .reply_error(
+                        &header,
+                        "org.freedesktop.DBus.Error.AccessDenied",
+                        &deny("is not available in the session-local wallet"),
+                    )
+                    .await
+            }
+            Reply::Async(transaction, handle) => {
+                // The app learns its transaction id first, then the result.
+                session.reply(&header, &transaction).await?;
+                session
+                    .emit_signal(
+                        None::<&str>,
+                        PATH,
+                        INTERFACE,
+                        "walletAsyncOpened",
+                        &(transaction, handle),
+                    )
+                    .await?;
+                session
+                    .emit_signal(None::<&str>, PATH, INTERFACE, "walletOpened", &(handle,))
+                    .await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn wallet() -> Wallet {
+            let mut wallet = Wallet {
+                name: "kdewallet".to_owned(),
+                folders: BTreeMap::new(),
+            };
+            wallet.folders.entry("Chrome Keys".to_owned()).or_default();
+            assert!(wallet.write(
+                "Chrome Keys",
+                "Chrome Safe Storage",
+                TYPE_PASSWORD,
+                b"secret".to_vec()
+            ));
+            wallet
+        }
+
+        #[test]
+        fn multi_argument_calls_are_matched_without_outer_parens() -> zbus::Result<()> {
+            let message = zbus::Message::method_call(PATH, "close")?
+                .interface(INTERFACE)?
+                .build(&(1i32, false, "app"))?;
+            assert_eq!(message.body().signature().to_string_no_parens(), "ibs");
+            Ok(())
+        }
+
+        #[test]
+        fn writes_need_an_existing_folder_and_stay_in_the_copy() {
+            let mut wallet = wallet();
+            assert!(!wallet.write("Other", "key", TYPE_STREAM, vec![1]));
+            assert_eq!(wallet.entry_count(), 1);
+            assert!(wallet.write("Chrome Keys", "extra", TYPE_MAP, vec![2, 3]));
+            assert_eq!(wallet.entry_count(), 2);
+            assert_eq!(
+                wallet.entry("Chrome Keys", "extra").map(|entry| entry.kind),
+                Some(TYPE_MAP)
+            );
+        }
+
+        #[test]
+        fn handles_belong_to_the_app_that_opened_them() {
+            let mut state = State {
+                wallet: Some(wallet()),
+                next_handle: 1,
+                ..State::default()
+            };
+            state.handles.insert(7, "chrome".to_owned());
+            assert!(owned(&mut state, 7, "chrome").is_some());
+            assert!(owned(&mut state, 7, "other").is_none());
+            assert!(owned(&mut state, 8, "chrome").is_none());
+        }
+    }
+}
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
@@ -18,17 +1656,28 @@ type McpError = rmcp::ErrorData;
 
 #[derive(Debug, thiserror::Error)]
 enum KwinError {
-    #[error(transparent)] Zbus(#[from] zbus::Error),
-    #[error(transparent)] Zvariant(#[from] zbus::zvariant::Error),
-    #[error(transparent)] Io(#[from] std::io::Error),
-    #[error(transparent)] Nix(#[from] nix::Error),
-    #[error(transparent)] Anyhow(#[from] anyhow::Error),
-    #[error(transparent)] TryFromInt(#[from] std::num::TryFromIntError),
-    #[error(transparent)] SerdeJson(#[from] serde_json::Error),
-    #[error(transparent)] SystemTime(#[from] std::time::SystemTimeError),
-    #[error(transparent)] Atspi(#[from] atspi::AtspiError),
-    #[error(transparent)] Png(#[from] png::EncodingError),
-    #[error("{0}")] Msg(String),
+    #[error(transparent)]
+    Zbus(#[from] zbus::Error),
+    #[error(transparent)]
+    Zvariant(#[from] zbus::zvariant::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Nix(#[from] nix::Error),
+    #[error(transparent)]
+    Anyhow(#[from] anyhow::Error),
+    #[error(transparent)]
+    TryFromInt(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    SerdeJson(#[from] serde_json::Error),
+    #[error(transparent)]
+    SystemTime(#[from] std::time::SystemTimeError),
+    #[error(transparent)]
+    Atspi(#[from] atspi::AtspiError),
+    #[error(transparent)]
+    Png(#[from] png::EncodingError),
+    #[error("{0}")]
+    Msg(String),
 }
 
 impl From<KwinError> for McpError {
@@ -125,7 +1774,7 @@ const SCREENSHOT_SETTLE_POLL: Duration = Duration::from_millis(40);
 const SCREENSHOT_SETTLE_LIMIT: Duration = Duration::from_millis(1500);
 
 // launch_app: CDP connect retry.
-const CDP_CONNECT_POLLS: u32 = 25;    // 5s total (reuses LAUNCH_POLL_INTERVAL)
+const CDP_CONNECT_POLLS: u32 = 25; // 5s total (reuses LAUNCH_POLL_INTERVAL)
 
 // screenshot cursor=true: half-edge of crop region around cursor (output covers
 // CURSOR_ZOOM_HALF_EDGE*2 source pixels). Render size / source pixels = zoom factor.
@@ -216,27 +1865,28 @@ fn char_key(ch: char) -> Result<(u32, bool), McpError> {
     };
     // Punctuation keys not in keyboard-codes crate — use evdev codes directly
     let code: u32 = match raw {
-        '`' => 41,   // KEY_GRAVE
-        '-' => 12,   // KEY_MINUS
-        '=' => 13,   // KEY_EQUAL
-        '[' => 26,   // KEY_LEFTBRACE
-        ']' => 27,   // KEY_RIGHTBRACE
-        '\\' => 43,  // KEY_BACKSLASH
-        ';' => 39,   // KEY_SEMICOLON
-        '\'' => 40,  // KEY_APOSTROPHE
-        ',' => 51,   // KEY_COMMA
-        '.' => 52,   // KEY_DOT
-        '/' => 53,   // KEY_SLASH
-        ' ' => 57,   // KEY_SPACE
-        '\t' => 15,  // KEY_TAB
-        '\n' => 28,  // KEY_ENTER
+        '`' => 41,  // KEY_GRAVE
+        '-' => 12,  // KEY_MINUS
+        '=' => 13,  // KEY_EQUAL
+        '[' => 26,  // KEY_LEFTBRACE
+        ']' => 27,  // KEY_RIGHTBRACE
+        '\\' => 43, // KEY_BACKSLASH
+        ';' => 39,  // KEY_SEMICOLON
+        '\'' => 40, // KEY_APOSTROPHE
+        ',' => 51,  // KEY_COMMA
+        '.' => 52,  // KEY_DOT
+        '/' => 53,  // KEY_SLASH
+        ' ' => 57,  // KEY_SPACE
+        '\t' => 15, // KEY_TAB
+        '\n' => 28, // KEY_ENTER
         _ => {
             let key_str = String::from(raw);
-            let input: keyboard_codes::KeyboardInput = key_str
-                .parse()
-                .map_err(|e| McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None))?;
-            u32::try_from(input.to_code(Platform::Linux))
-                .map_err(|e| McpError::invalid_params(format!("keycode overflow '{ch}': {e}"), None))?
+            let input: keyboard_codes::KeyboardInput = key_str.parse().map_err(|e| {
+                McpError::invalid_params(format!("keycode parse '{ch}': {e}"), None)
+            })?;
+            u32::try_from(input.to_code(Platform::Linux)).map_err(|e| {
+                McpError::invalid_params(format!("keycode overflow '{ch}': {e}"), None)
+            })?
         }
     };
     Ok((code, shifted))
@@ -263,39 +1913,48 @@ fn modifier_code(token: &str) -> Option<u32> {
 /// Shift, or None when the token names no key.
 fn named_key(token: &str) -> Option<(u32, bool)> {
     let named = match token.to_ascii_lowercase().as_str() {
-        "return" | "enter" => Some(28_u32),    // KEY_ENTER
-        "backspace" => Some(14),               // KEY_BACKSPACE
-        "tab" => Some(15),                     // KEY_TAB
-        "escape" | "esc" => Some(1),           // KEY_ESC
-        "space" => Some(57),                   // KEY_SPACE
-        "delete" | "del" => Some(111),         // KEY_DELETE
-        "insert" | "ins" => Some(110),         // KEY_INSERT
-        "home" => Some(102),                   // KEY_HOME
-        "end" => Some(107),                    // KEY_END
-        "pageup" | "page_up" | "pgup" => Some(104), // KEY_PAGEUP
+        "return" | "enter" => Some(28_u32),             // KEY_ENTER
+        "backspace" => Some(14),                        // KEY_BACKSPACE
+        "tab" => Some(15),                              // KEY_TAB
+        "escape" | "esc" => Some(1),                    // KEY_ESC
+        "space" => Some(57),                            // KEY_SPACE
+        "delete" | "del" => Some(111),                  // KEY_DELETE
+        "insert" | "ins" => Some(110),                  // KEY_INSERT
+        "home" => Some(102),                            // KEY_HOME
+        "end" => Some(107),                             // KEY_END
+        "pageup" | "page_up" | "pgup" => Some(104),     // KEY_PAGEUP
         "pagedown" | "page_down" | "pgdn" => Some(109), // KEY_PAGEDOWN
-        "up" => Some(103),                     // KEY_UP
-        "down" => Some(108),                   // KEY_DOWN
-        "left" => Some(105),                   // KEY_LEFT
-        "right" => Some(106),                  // KEY_RIGHT
-        "numlock" | "num_lock" => Some(69),    // KEY_NUMLOCK
-        "capslock" | "caps_lock" => Some(58),  // KEY_CAPSLOCK
-        "menu" => Some(127),                   // KEY_COMPOSE
-        "print" | "printscreen" => Some(99),   // KEY_SYSRQ
-        "minus" | "hyphen" | "dash" => Some(12), // KEY_MINUS
-        "equal" | "equals" => Some(13),        // KEY_EQUAL
-        "comma" => Some(51),                   // KEY_COMMA
-        "period" | "dot" => Some(52),          // KEY_DOT
-        "slash" => Some(53),                   // KEY_SLASH
-        "backslash" => Some(43),               // KEY_BACKSLASH
-        "semicolon" => Some(39),               // KEY_SEMICOLON
-        "apostrophe" | "quote" => Some(40),    // KEY_APOSTROPHE
-        "grave" | "backtick" => Some(41),      // KEY_GRAVE
-        "bracketleft" | "leftbracket" => Some(26), // KEY_LEFTBRACE
-        "bracketright" | "rightbracket" => Some(27), // KEY_RIGHTBRACE
-        "f1" => Some(59), "f2" => Some(60), "f3" => Some(61), "f4" => Some(62),
-        "f5" => Some(63), "f6" => Some(64), "f7" => Some(65), "f8" => Some(66),
-        "f9" => Some(67), "f10" => Some(68), "f11" => Some(87), "f12" => Some(88),
+        "up" => Some(103),                              // KEY_UP
+        "down" => Some(108),                            // KEY_DOWN
+        "left" => Some(105),                            // KEY_LEFT
+        "right" => Some(106),                           // KEY_RIGHT
+        "numlock" | "num_lock" => Some(69),             // KEY_NUMLOCK
+        "capslock" | "caps_lock" => Some(58),           // KEY_CAPSLOCK
+        "menu" => Some(127),                            // KEY_COMPOSE
+        "print" | "printscreen" => Some(99),            // KEY_SYSRQ
+        "minus" | "hyphen" | "dash" => Some(12),        // KEY_MINUS
+        "equal" | "equals" => Some(13),                 // KEY_EQUAL
+        "comma" => Some(51),                            // KEY_COMMA
+        "period" | "dot" => Some(52),                   // KEY_DOT
+        "slash" => Some(53),                            // KEY_SLASH
+        "backslash" => Some(43),                        // KEY_BACKSLASH
+        "semicolon" => Some(39),                        // KEY_SEMICOLON
+        "apostrophe" | "quote" => Some(40),             // KEY_APOSTROPHE
+        "grave" | "backtick" => Some(41),               // KEY_GRAVE
+        "bracketleft" | "leftbracket" => Some(26),      // KEY_LEFTBRACE
+        "bracketright" | "rightbracket" => Some(27),    // KEY_RIGHTBRACE
+        "f1" => Some(59),
+        "f2" => Some(60),
+        "f3" => Some(61),
+        "f4" => Some(62),
+        "f5" => Some(63),
+        "f6" => Some(64),
+        "f7" => Some(65),
+        "f8" => Some(66),
+        "f9" => Some(67),
+        "f10" => Some(68),
+        "f11" => Some(87),
+        "f12" => Some(88),
         _ => None,
     };
     if let Some(code) = named {
@@ -315,15 +1974,28 @@ fn named_key(token: &str) -> Option<(u32, bool)> {
 /// Parse a key or combo into modifier codes plus one main key. Every token
 /// must resolve; an unparseable combo fails before any input is sent.
 fn parse_combo(key: &str) -> Result<(Vec<u32>, u32), McpError> {
-    let invalid = |detail: String| McpError::invalid_params(format!("{detail} in key combo '{key}'; {COMBO_SYNTAX}"), None);
+    let invalid = |detail: String| {
+        McpError::invalid_params(
+            format!("{detail} in key combo '{key}'; {COMBO_SYNTAX}"),
+            None,
+        )
+    };
     if key.is_empty() {
         return Err(invalid("empty key".to_owned()));
     }
     // A single character (including '+') is always that key.
     let mut chars = key.chars();
     if let (Some(ch), None) = (chars.next(), chars.next()) {
-        let (code, shifted) = char_key(ch).map_err(|_| invalid(format!("unsupported key '{ch}'")))?;
-        return Ok((if shifted { vec![LINUX_KEY_LEFTSHIFT] } else { Vec::new() }, code));
+        let (code, shifted) =
+            char_key(ch).map_err(|_| invalid(format!("unsupported key '{ch}'")))?;
+        return Ok((
+            if shifted {
+                vec![LINUX_KEY_LEFTSHIFT]
+            } else {
+                Vec::new()
+            },
+            code,
+        ));
     }
     // "ctrl++" names the '+' key: a trailing empty token after '+'.
     let mut tokens: Vec<&str> = key.split('+').collect();
@@ -337,7 +2009,8 @@ fn parse_combo(key: &str) -> Result<(Vec<u32>, u32), McpError> {
     let mut mods = Vec::new();
     for token in prefix {
         let token = token.trim();
-        let code = modifier_code(token).ok_or_else(|| invalid(format!("'{token}' is not a modifier")))?;
+        let code =
+            modifier_code(token).ok_or_else(|| invalid(format!("'{token}' is not a modifier")))?;
         if !mods.contains(&code) {
             mods.push(code);
         }
@@ -350,7 +2023,8 @@ fn parse_combo(key: &str) -> Result<(Vec<u32>, u32), McpError> {
         // A lone modifier, or a chord of modifiers, presses the last one.
         return Ok((mods, code));
     }
-    let (code, shifted) = named_key(last).ok_or_else(|| invalid(format!("unknown key '{last}'")))?;
+    let (code, shifted) =
+        named_key(last).ok_or_else(|| invalid(format!("unknown key '{last}'")))?;
     if shifted && !mods.contains(&LINUX_KEY_LEFTSHIFT) {
         mods.push(LINUX_KEY_LEFTSHIFT);
     }
@@ -369,7 +2043,6 @@ fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
     }
 }
 
-
 // ── KWin D-Bus proxies ──────────────────────────────────────────────────
 
 #[zbus::proxy(
@@ -379,10 +2052,7 @@ fn btn_code(btn: Option<&str>) -> Result<u32, McpError> {
 )]
 trait KWinEis {
     #[zbus(name = "connectToEIS")]
-    fn connect_to_eis(
-        &self,
-        capabilities: i32,
-    ) -> zbus::Result<(zbus::zvariant::OwnedFd, i32)>;
+    fn connect_to_eis(&self, capabilities: i32) -> zbus::Result<(zbus::zvariant::OwnedFd, i32)>;
 }
 
 #[zbus::proxy(
@@ -448,8 +2118,12 @@ impl Eis {
         let (mut abs, mut bt, mut sc, mut kb) = (None, None, None, None);
         let deadline = std::time::Instant::now() + EIS_NEGOTIATION_TIMEOUT;
         loop {
-            if dev.is_some() && kb.is_some() { break; }
-            if std::time::Instant::now() > deadline { anyhow::bail!("EIS negotiation timed out"); }
+            if dev.is_some() && kb.is_some() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("EIS negotiation timed out");
+            }
             context.read()?;
             while let Some(pending) = context.pending_event() {
                 match pending {
@@ -486,13 +2160,16 @@ impl Eis {
                                 bt = d.interface::<reis::ei::Button>();
                                 sc = d.interface::<reis::ei::Scroll>();
                                 dev = Some(d.device().clone());
-                                if let (Some(k), None) = (d.interface::<reis::ei::Keyboard>(), &kb) {
-                                        kb = Some(k);
-                                        kbd_d = Some(d.device().clone());
-                                    }
+                                if let (Some(k), None) = (d.interface::<reis::ei::Keyboard>(), &kb)
+                                {
+                                    kb = Some(k);
+                                    kbd_d = Some(d.device().clone());
+                                }
                             }
                             false => {
-                                if d.has_capability(reis::event::DeviceCapability::Keyboard) && kb.is_none() {
+                                if d.has_capability(reis::event::DeviceCapability::Keyboard)
+                                    && kb.is_none()
+                                {
                                     d.device().start_emulating(serial, 0);
                                     kb = d.interface::<reis::ei::Keyboard>();
                                     kbd_d = Some(d.device().clone());
@@ -549,14 +2226,21 @@ impl Eis {
         loop {
             match self.context.flush() {
                 Ok(()) => return Ok(()),
-                Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error)
+                    if std::io::Error::from(error).kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                anyhow::bail!("KWin stopped reading input: the EIS socket stayed full for {}s", EIS_FLUSH_TIMEOUT.as_secs());
+                anyhow::bail!(
+                    "KWin stopped reading input: the EIS socket stayed full for {}s",
+                    EIS_FLUSH_TIMEOUT.as_secs()
+                );
             }
-            let mut fds = [nix::poll::PollFd::new(self.context.as_fd(), nix::poll::PollFlags::POLLOUT)];
+            let mut fds = [nix::poll::PollFd::new(
+                self.context.as_fd(),
+                nix::poll::PollFlags::POLLOUT,
+            )];
             let wait = u16::try_from(left.as_millis()).unwrap_or(u16::MAX);
             let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(wait));
         }
@@ -581,7 +2265,10 @@ impl Eis {
     fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
         let notches = dx.unsigned_abs().max(dy.unsigned_abs());
         for _ in 0..notches {
-            self.scroll.scroll_discrete(dx.signum() * SCROLL_VALUE120_PER_NOTCH, dy.signum() * SCROLL_VALUE120_PER_NOTCH);
+            self.scroll.scroll_discrete(
+                dx.signum() * SCROLL_VALUE120_PER_NOTCH,
+                dy.signum() * SCROLL_VALUE120_PER_NOTCH,
+            );
             self.ptr_dev.frame(self.next_serial(), self.now_us());
         }
         self.scroll.scroll_stop(0, 0, 0);
@@ -613,7 +2300,9 @@ async fn wait_for_socket(
     deadline: std::time::Instant,
 ) -> Result<(), String> {
     loop {
-        if path.exists() { return Ok(()); }
+        if path.exists() {
+            return Ok(());
+        }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "{description} did not appear at {} within {}s",
@@ -631,7 +2320,11 @@ async fn connect_session_bus(
 ) -> Result<zbus::Connection, String> {
     loop {
         let attempt_error = match zbus::connection::Builder::address(address) {
-            Ok(builder) => match builder.auth_mechanism(zbus::AuthMechanism::Anonymous).build().await {
+            Ok(builder) => match builder
+                .auth_mechanism(zbus::AuthMechanism::Anonymous)
+                .build()
+                .await
+            {
                 Ok(conn) => return Ok(conn),
                 Err(e) => e.to_string(),
             },
@@ -659,7 +2352,7 @@ async fn spawn_dbus_proxy(
     command.arg(address).arg(socket).arg("--filter").args(rules);
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
-    let mut child = command.spawn()?;
+    let mut child = spawn_session_child(command, false).await?;
     let deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
     while !std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
         if std::time::Instant::now() >= deadline {
@@ -670,6 +2363,81 @@ async fn spawn_dbus_proxy(
         tokio::time::sleep(DBUS_PROXY_POLL).await;
     }
     Ok(child)
+}
+
+// Linux parent-death signals follow the spawning thread. Session children and
+// exec therefore belong to the main thread, which survives re-execution.
+enum ProcessRequest {
+    Spawn {
+        command: Box<std::process::Command>,
+        process_group: bool,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<std::process::Child>>,
+    },
+    Exec {
+        command: Box<std::process::Command>,
+        reply: tokio::sync::oneshot::Sender<std::io::Error>,
+    },
+}
+static PROCESS_REQUESTS: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<ProcessRequest>> =
+    std::sync::OnceLock::new();
+impl ProcessRequest {
+    fn execute(self) {
+        match self {
+            Self::Spawn {
+                mut command,
+                process_group,
+                reply,
+            } => {
+                if reply.is_closed() {
+                    return;
+                }
+                if let Err(Ok(child)) = reply.send(command.spawn()) {
+                    tokio::task::spawn_blocking(move || {
+                        terminate_child(child, process_group, "cancelled session child")
+                    });
+                }
+            }
+            Self::Exec { mut command, reply } => {
+                if reply.is_closed() {
+                    return;
+                }
+                use std::os::unix::process::CommandExt;
+                let _ = reply.send(command.exec());
+            }
+        }
+    }
+}
+async fn spawn_session_child(
+    command: std::process::Command,
+    process_group: bool,
+) -> std::io::Result<std::process::Child> {
+    let (reply, response) = tokio::sync::oneshot::channel();
+    PROCESS_REQUESTS
+        .get()
+        .ok_or_else(|| std::io::Error::other("session process owner is unavailable"))?
+        .send(ProcessRequest::Spawn {
+            command: Box::new(command),
+            process_group,
+            reply,
+        })
+        .map_err(|_| std::io::Error::other("session process owner stopped"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("session process owner stopped"))?
+}
+async fn exec_on_main(command: std::process::Command) -> std::io::Result<std::io::Error> {
+    let (reply, response) = tokio::sync::oneshot::channel();
+    PROCESS_REQUESTS
+        .get()
+        .ok_or_else(|| std::io::Error::other("session process owner is unavailable"))?
+        .send(ProcessRequest::Exec {
+            command: Box::new(command),
+            reply,
+        })
+        .map_err(|_| std::io::Error::other("session process owner stopped"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("session process owner stopped"))
 }
 
 fn terminate_with_parent(command: &mut std::process::Command) {
@@ -684,7 +2452,15 @@ fn terminate_with_parent(command: &mut std::process::Command) {
 
 // ── uinput virtual devices ──────────────────────────────────────────────
 
-fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::PathBuf, evdev::uinput::VirtualDevice, std::path::PathBuf), KwinError> {
+fn create_uinput_devices() -> Result<
+    (
+        evdev::uinput::VirtualDevice,
+        std::path::PathBuf,
+        evdev::uinput::VirtualDevice,
+        std::path::PathBuf,
+    ),
+    KwinError,
+> {
     // Mouse: buttons + relative axes
     let mut mouse_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
     mouse_keys.insert(evdev::KeyCode::BTN_LEFT);
@@ -712,7 +2488,9 @@ fn create_uinput_devices() -> Result<(evdev::uinput::VirtualDevice, std::path::P
     let mut kbd_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
     let mut code: u16 = 1;
     loop {
-        if code > 0x2ff { break; }
+        if code > 0x2ff {
+            break;
+        }
         kbd_keys.insert(evdev::KeyCode::new(code));
         code = match code.checked_add(1) {
             Some(v) => v,
@@ -749,10 +2527,17 @@ const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const HOST_SECRET_ENTRIES: &[&str] = &["bus", "keyring", "p11-kit"];
 
 fn mount_descendants(mounts: &[procfs::process::MountInfo], path: &Path) -> Vec<PathBuf> {
-    let mut descendants: Vec<PathBuf> = mounts.iter()
+    let mut descendants: Vec<PathBuf> = mounts
+        .iter()
         .filter(|mount| mount.mount_point != path && mount.mount_point.starts_with(path))
-        .map(|mount| mount.mount_point.clone()).collect();
-    descendants.sort_by(|left, right| left.components().count().cmp(&right.components().count()).then_with(|| left.cmp(right)));
+        .map(|mount| mount.mount_point.clone())
+        .collect();
+    descendants.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
     descendants.dedup();
     descendants
 }
@@ -767,12 +2552,20 @@ struct OverlayMount {
 #[derive(Default)]
 struct SocketLinks(Vec<(PathBuf, PathBuf)>);
 impl Drop for SocketLinks {
-    fn drop(&mut self) { for (path, target) in &self.0 { if std::fs::read_link(path).is_ok_and(|link| link == *target) { let _ = std::fs::remove_file(path); } } } }
+    fn drop(&mut self) {
+        for (path, target) in &self.0 {
+            if std::fs::read_link(path).is_ok_and(|link| link == *target) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
 struct OverlayPlan {
     staging_root: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
-    socket_binds: Vec<PathBuf>, socket_links: SocketLinks,
+    socket_binds: Vec<PathBuf>,
+    socket_links: SocketLinks,
     /// The host user runtime directory, when sockets from it are exposed. Its
     /// secret-bearing entries (HOST_SECRET_ENTRIES) are masked in the session.
     host_runtime: Option<PathBuf>,
@@ -786,13 +2579,24 @@ impl OverlayPlan {
     /// when the path is not under a writable overlay (read-only bind or a
     /// file copied into the split-overlay staging root).
     fn upper_path(&self, path: &Path) -> Option<(PathBuf, &OverlayMount)> {
-        if self.read_only_binds.iter().any(|mount| path.starts_with(mount)) {
+        if self
+            .read_only_binds
+            .iter()
+            .any(|mount| path.starts_with(mount))
+        {
             return None;
         }
-        let overlay = self.overlays.iter()
+        let overlay = self
+            .overlays
+            .iter()
             .filter(|overlay| path.starts_with(&overlay.destination))
             .max_by_key(|overlay| overlay.destination.components().count())?;
-        Some((overlay.upper.join(path.strip_prefix(&overlay.destination).ok()?), overlay))
+        Some((
+            overlay
+                .upper
+                .join(path.strip_prefix(&overlay.destination).ok()?),
+            overlay,
+        ))
     }
 
     fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
@@ -803,7 +2607,11 @@ impl OverlayPlan {
         // The plan is made seconds before bwrap runs. HOME entries that vanished
         // since (lock directories such as ~/.claude.json.lock) would make bwrap
         // fail, so skip them; their staging stub stays an empty directory.
-        for overlay in self.overlays.iter().filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok()) {
+        for overlay in self
+            .overlays
+            .iter()
+            .filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok())
+        {
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -820,14 +2628,28 @@ impl OverlayPlan {
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
-            command.arg("--dir").arg(&destination).arg("--ro-bind").arg(source).arg(&destination);
-            if self.host_runtime.as_ref().is_some_and(|runtime| runtime == source) {
+            command
+                .arg("--dir")
+                .arg(&destination)
+                .arg("--ro-bind")
+                .arg(source)
+                .arg(&destination);
+            if self
+                .host_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime == source)
+            {
                 for name in HOST_SECRET_ENTRIES {
-                    let Ok(metadata) = std::fs::symlink_metadata(source.join(name)) else { continue };
+                    let Ok(metadata) = std::fs::symlink_metadata(source.join(name)) else {
+                        continue;
+                    };
                     if metadata.is_dir() {
                         command.arg("--tmpfs").arg(destination.join(name));
                     } else {
-                        command.arg("--ro-bind").arg("/dev/null").arg(destination.join(name));
+                        command
+                            .arg("--ro-bind")
+                            .arg("/dev/null")
+                            .arg(destination.join(name));
                     }
                 }
             }
@@ -846,35 +2668,89 @@ impl OverlayPlan {
         let current_uid = procfs::process::Process::myself()?.uid()?;
         let graphical_inodes = graphical_socket_inodes()?;
         self.host_runtime = Some(canonical_runtime.clone());
-        let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?.into_iter().filter_map(|entry| {
-            if entry.state != procfs::net::UnixState::UNCONNECTED { return None; }
-            let path = entry.path?; let parent = std::fs::canonicalize(path.parent()?).ok()?;
-            let metadata = std::fs::metadata(&path).ok()?;
-            if metadata.uid() != current_uid || !metadata.file_type().is_socket()
-                || graphical_inodes.contains(&entry.inode) { return None; }
-            if path.starts_with(target) && parent.starts_with(&canonical_target) {
-                Some((path.clone(), parent, path))
-            } else if path.starts_with(host_runtime) && parent.starts_with(&canonical_runtime)
-                && !path.strip_prefix(host_runtime).ok().and_then(|relative| relative.components().next())
-                    .is_some_and(|first| HOST_SECRET_ENTRIES.iter().any(|name| first.as_os_str() == std::ffi::OsStr::new(name))) {
-                Some((path.clone(), parent, isolated_runtime.join(path.strip_prefix(host_runtime).ok()?)))
-            } else {
-                None
-            }
-        }).filter(|(path, _, _)| !self.read_only_binds.iter().any(|mount| path != mount && path.starts_with(mount))).collect();
-        sockets.sort(); sockets.dedup();
+        let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?
+            .into_iter()
+            .filter_map(|entry| {
+                if entry.state != procfs::net::UnixState::UNCONNECTED {
+                    return None;
+                }
+                let path = entry.path?;
+                let parent = std::fs::canonicalize(path.parent()?).ok()?;
+                let metadata = std::fs::metadata(&path).ok()?;
+                if metadata.uid() != current_uid
+                    || !metadata.file_type().is_socket()
+                    || graphical_inodes.contains(&entry.inode)
+                {
+                    return None;
+                }
+                if path.starts_with(target) && parent.starts_with(&canonical_target) {
+                    Some((path.clone(), parent, path))
+                } else if path.starts_with(host_runtime)
+                    && parent.starts_with(&canonical_runtime)
+                    && !path
+                        .strip_prefix(host_runtime)
+                        .ok()
+                        .and_then(|relative| relative.components().next())
+                        .is_some_and(|first| {
+                            HOST_SECRET_ENTRIES
+                                .iter()
+                                .any(|name| first.as_os_str() == std::ffi::OsStr::new(name))
+                        })
+                {
+                    Some((
+                        path.clone(),
+                        parent,
+                        isolated_runtime.join(path.strip_prefix(host_runtime).ok()?),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .filter(|(path, _, _)| {
+                !self
+                    .read_only_binds
+                    .iter()
+                    .any(|mount| path != mount && path.starts_with(mount))
+            })
+            .collect();
+        sockets.sort();
+        sockets.dedup();
         for (path, parent, destination) in sockets {
             self.read_only_binds.retain(|mount| mount != &path);
-            let index = self.socket_binds.iter().position(|bind| bind == &parent).unwrap_or_else(|| { let index = self.socket_binds.len(); self.socket_binds.push(parent); index });
+            let index = self
+                .socket_binds
+                .iter()
+                .position(|bind| bind == &parent)
+                .unwrap_or_else(|| {
+                    let index = self.socket_binds.len();
+                    self.socket_binds.push(parent);
+                    index
+                });
             let link = if path.starts_with(target) {
-                let mount = self.overlays.iter().filter(|overlay| path.starts_with(&overlay.destination)).max_by_key(|overlay| overlay.destination.components().count());
-                if let Some(overlay) = mount { overlay.upper.join(path.strip_prefix(&overlay.destination)?) }
-                    else { self.staging_root.as_ref().ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?.join(path.strip_prefix(target)?) }
+                let mount = self
+                    .overlays
+                    .iter()
+                    .filter(|overlay| path.starts_with(&overlay.destination))
+                    .max_by_key(|overlay| overlay.destination.components().count());
+                if let Some(overlay) = mount {
+                    overlay.upper.join(path.strip_prefix(&overlay.destination)?)
+                } else {
+                    self.staging_root
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?
+                        .join(path.strip_prefix(target)?)
+                }
             } else {
                 destination
             };
-            std::fs::create_dir_all(link.parent().ok_or_else(|| anyhow::anyhow!("no parent for {}", link.display()))?)?;
-            let generated = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}")).join(path.file_name().ok_or_else(|| anyhow::anyhow!("unnamed socket {}", path.display()))?);
+            std::fs::create_dir_all(
+                link.parent()
+                    .ok_or_else(|| anyhow::anyhow!("no parent for {}", link.display()))?,
+            )?;
+            let generated = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}")).join(
+                path.file_name()
+                    .ok_or_else(|| anyhow::anyhow!("unnamed socket {}", path.display()))?,
+            );
             match std::fs::symlink_metadata(&link) {
                 Ok(_) => anyhow::bail!("refusing to replace {}", link.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -893,12 +2769,18 @@ fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
     let mut graphical = std::collections::HashSet::new();
     for process in procfs::process::all_processes()?.flatten() {
         let environment = process.environ().unwrap_or_default();
-        let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
-        let display_attached = host_display.as_ref().is_some_and(|value| environment.get(std::ffi::OsStr::new("DISPLAY")) == Some(value))
-            || host_wayland.as_ref().is_some_and(|value| environment.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")) == Some(value));
+        let cgroup =
+            std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
+        let display_attached = host_display
+            .as_ref()
+            .is_some_and(|value| environment.get(std::ffi::OsStr::new("DISPLAY")) == Some(value))
+            || host_wayland.as_ref().is_some_and(|value| {
+                environment.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")) == Some(value)
+            });
         let desktop_scope = cgroup.contains("/session.slice/")
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
-        let descriptors: Vec<procfs::process::FDInfo> = process.fd().into_iter().flatten().flatten().collect();
+        let descriptors: Vec<procfs::process::FDInfo> =
+            process.fd().into_iter().flatten().flatten().collect();
         let input_attached = descriptors.iter().any(|descriptor| {
             if let procfs::process::FDTarget::Path(path) = &descriptor.target {
                 path == Path::new("/dev/uinput") || path.starts_with("/dev/input")
@@ -946,10 +2828,19 @@ fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> 
     use std::os::fd::AsRawFd;
     let source = std::fs::File::open(source)?;
     let destination = std::fs::OpenOptions::new()
-        .write(true).create_new(true).open(destination)?;
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
     // Both descriptors stay open for this ioctl. FICLONE shares data extents;
     // later writes to either file leave the other file's contents unchanged.
-    if unsafe { nix::libc::ioctl(destination.as_raw_fd(), nix::libc::FICLONE, source.as_raw_fd()) } == -1 {
+    if unsafe {
+        nix::libc::ioctl(
+            destination.as_raw_fd(),
+            nix::libc::FICLONE,
+            source.as_raw_fd(),
+        )
+    } == -1
+    {
         return Err(std::io::Error::last_os_error());
     }
     destination.set_permissions(source.metadata()?.permissions())
@@ -966,7 +2857,8 @@ fn prepare_split_overlay_directory(
     let staged_directory = context.staging_root.join(relative_directory);
     create_staging_directory(source_directory, &staged_directory, context.initialize)?;
 
-    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(source_directory)?.collect::<Result<_, _>>()?;
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(source_directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
@@ -976,7 +2868,11 @@ fn prepare_split_overlay_directory(
         let file_type = entry.file_type()?;
         let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
 
-        if context.mounts.iter().any(|mount| mount.mount_point == source) {
+        if context
+            .mounts
+            .iter()
+            .any(|mount| mount.mount_point == source)
+        {
             // Only a stub for bwrap's bind: the mount shadows its mode. Never
             // stat the mount itself; a hung FUSE or network mount would block
             // session_start in the kernel.
@@ -987,8 +2883,18 @@ fn prepare_split_overlay_directory(
         }
 
         if file_type.is_dir() {
-            if context.mounts.iter().any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source)) {
-                prepare_split_overlay_directory(&source, context, overlays, read_only_binds, oversized_read_only_files)?;
+            if context
+                .mounts
+                .iter()
+                .any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source))
+            {
+                prepare_split_overlay_directory(
+                    &source,
+                    context,
+                    overlays,
+                    read_only_binds,
+                    oversized_read_only_files,
+                )?;
             } else {
                 create_staging_directory(&source, &staged, context.initialize)?;
                 let upper = context.upper_root.join(relative);
@@ -1011,7 +2917,10 @@ fn prepare_split_overlay_directory(
             }
         } else if file_type.is_file() {
             if context.initialize && !staged_exists {
-                let requested_writable = context.writable_paths.iter().any(|path| source.starts_with(path));
+                let requested_writable = context
+                    .writable_paths
+                    .iter()
+                    .any(|path| source.starts_with(path));
                 let size = match entry.metadata() {
                     Ok(metadata) => metadata.len(),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1027,7 +2936,10 @@ fn prepare_split_overlay_directory(
                                 Err(cleanup) => return Err(cleanup.into()),
                             }
                             if !requested_writable {
-                                eprintln!("session_start: oversized ancestor file {} ({size} bytes) stays read-only; reflink unavailable: {error}", source.display());
+                                eprintln!(
+                                    "session_start: oversized ancestor file {} ({size} bytes) stays read-only; reflink unavailable: {error}",
+                                    source.display()
+                                );
                                 oversized_read_only_files.push(source.clone());
                                 read_only_binds.push(source);
                                 continue;
@@ -1038,7 +2950,10 @@ fn prepare_split_overlay_directory(
                 match std::fs::copy(&source, &staged) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && !requested_writable => {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::PermissionDenied
+                            && !requested_writable =>
+                    {
                         let _ = std::fs::remove_file(&staged);
                         read_only_binds.push(source);
                     }
@@ -1064,9 +2979,22 @@ fn prepare_overlay_plan(
         let work = session_tmp.join("overlay-work");
         std::fs::create_dir_all(&upper)?;
         std::fs::create_dir_all(&work)?;
-        let overlay = OverlayMount { lower: target.to_path_buf(), upper, work, destination: target.to_path_buf() };
-        return Ok(OverlayPlan { staging_root: None, overlays: vec![overlay], read_only_binds: Vec::new(),
-            socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new(), oversized_read_only_files: Vec::new() });
+        let overlay = OverlayMount {
+            lower: target.to_path_buf(),
+            upper,
+            work,
+            destination: target.to_path_buf(),
+        };
+        return Ok(OverlayPlan {
+            staging_root: None,
+            overlays: vec![overlay],
+            read_only_binds: Vec::new(),
+            socket_binds: Vec::new(),
+            socket_links: SocketLinks::default(),
+            host_runtime: None,
+            empty_dirs: Vec::new(),
+            oversized_read_only_files: Vec::new(),
+        });
     }
 
     let staging_root = session_tmp.join("overlay-root");
@@ -1089,7 +3017,13 @@ fn prepare_overlay_plan(
     let mut overlays = Vec::new();
     let mut read_only_binds = excluded_mounts;
     let mut oversized_read_only_files = Vec::new();
-    prepare_split_overlay_directory(target, &context, &mut overlays, &mut read_only_binds, &mut oversized_read_only_files)?;
+    prepare_split_overlay_directory(
+        target,
+        &context,
+        &mut overlays,
+        &mut read_only_binds,
+        &mut oversized_read_only_files,
+    )?;
     read_only_binds.sort_by(|left, right| {
         left.components()
             .count()
@@ -1105,7 +3039,10 @@ fn prepare_overlay_plan(
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
-        socket_binds: Vec::new(), socket_links: SocketLinks::default(), host_runtime: None, empty_dirs: Vec::new(),
+        socket_binds: Vec::new(),
+        socket_links: SocketLinks::default(),
+        host_runtime: None,
+        empty_dirs: Vec::new(),
         oversized_read_only_files,
     })
 }
@@ -1118,18 +3055,38 @@ type HostWork = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 /// list is sorted for stable logs.
 fn live_sqlite_databases(target: &Path) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(canonical_target) = std::fs::canonicalize(target) else { return Vec::new() };
-    let uid = std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or(u32::MAX);
+    let Ok(canonical_target) = std::fs::canonicalize(target) else {
+        return Vec::new();
+    };
+    let uid = std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(u32::MAX);
     let mut databases = Vec::new();
-    for process in procfs::process::all_processes().into_iter().flatten().flatten() {
+    for process in procfs::process::all_processes()
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         if process.uid().ok() != Some(uid) {
             continue;
         }
         for descriptor in process.fd().into_iter().flatten().flatten() {
-            let procfs::process::FDTarget::Path(path) = descriptor.target else { continue };
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
-            let Some(database) = name.strip_suffix("-wal") else { continue };
-            let Ok(relative) = path.with_file_name(database).strip_prefix(&canonical_target).map(Path::to_path_buf) else { continue };
+            let procfs::process::FDTarget::Path(path) = descriptor.target else {
+                continue;
+            };
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(database) = name.strip_suffix("-wal") else {
+                continue;
+            };
+            let Ok(relative) = path
+                .with_file_name(database)
+                .strip_prefix(&canonical_target)
+                .map(Path::to_path_buf)
+            else {
+                continue;
+            };
             databases.push(target.join(relative));
         }
     }
@@ -1158,17 +3115,24 @@ const SQLITE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// directory shows its upper attributes). Writes there land in the session's
 /// tmpfs, never on the host file.
 fn upper_file(plan: &OverlayPlan, path: &Path) -> anyhow::Result<PathBuf> {
-    let (upper, overlay) = plan.upper_path(path).ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
+    let (upper, overlay) = plan
+        .upper_path(path)
+        .ok_or_else(|| anyhow::anyhow!("not under a writable overlay"))?;
     let parent = upper.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
     let mut missing = Vec::new();
     let mut cursor = parent.to_path_buf();
     while !cursor.exists() && cursor.starts_with(&overlay.upper) && cursor != overlay.upper {
         missing.push(cursor.clone());
-        cursor = cursor.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?.to_path_buf();
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("no parent"))?
+            .to_path_buf();
     }
     for directory in missing.iter().rev() {
         std::fs::create_dir(directory)?;
-        let lower = overlay.destination.join(directory.strip_prefix(&overlay.upper)?);
+        let lower = overlay
+            .destination
+            .join(directory.strip_prefix(&overlay.upper)?);
         if let Ok(meta) = std::fs::metadata(&lower) {
             std::fs::set_permissions(directory, meta.permissions())?;
         }
@@ -1178,8 +3142,12 @@ fn upper_file(plan: &OverlayPlan, path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Chromium-family config directories whose profiles are copied into sessions.
 const BROWSER_CONFIG_DIRS: &[&str] = &[
-    ".config/google-chrome", ".config/google-chrome-beta", ".config/google-chrome-unstable",
-    ".config/chromium", ".config/BraveSoftware/Brave-Browser", ".config/microsoft-edge",
+    ".config/google-chrome",
+    ".config/google-chrome-beta",
+    ".config/google-chrome-unstable",
+    ".config/chromium",
+    ".config/BraveSoftware/Brave-Browser",
+    ".config/microsoft-edge",
     ".config/vivaldi",
 ];
 
@@ -1188,11 +3156,18 @@ const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favi
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
-        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
-        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
+            continue;
+        };
+        for profile in profiles
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        {
             for name in EMPTY_BROWSER_DATABASES {
                 let path = profile.path().join(name);
-                if path.is_file() { paths.push(path); }
+                if path.is_file() {
+                    paths.push(path);
+                }
             }
         }
     }
@@ -1201,9 +3176,13 @@ fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
 
 fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow::Result<()> {
     for database in databases {
-        if !database.parent().is_some_and(Path::is_dir) { continue }
+        if !database.parent().is_some_and(Path::is_dir) {
+            continue;
+        }
         for suffix in ["", "-wal", "-shm"] {
-            let name = database.file_name().ok_or_else(|| anyhow::anyhow!("database has no name"))?;
+            let name = database
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
             let path = database.with_file_name(format!("{}{suffix}", name.to_string_lossy()));
             let upper = upper_file(plan, &path)?;
             std::fs::write(upper, [])?;
@@ -1225,8 +3204,13 @@ fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow:
 /// drop logins that live in them.
 fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
     for config in BROWSER_CONFIG_DIRS {
-        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
-        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
+            continue;
+        };
+        for profile in profiles
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        {
             let sessions = profile.path().join("Sessions");
             if sessions.is_dir() {
                 plan.empty_dirs.push(sessions);
@@ -1239,8 +3223,13 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
     use std::os::unix::fs::PermissionsExt;
     let mut marked = 0;
     for config in BROWSER_CONFIG_DIRS {
-        let Ok(profiles) = std::fs::read_dir(target.join(config)) else { continue };
-        for profile in profiles.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+        let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
+            continue;
+        };
+        for profile in profiles
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        {
             let preferences = profile.path().join("Preferences");
             let result = (|| -> anyhow::Result<bool> {
                 let text = match std::fs::read(&preferences) {
@@ -1249,15 +3238,29 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
                     Err(error) => return Err(error.into()),
                 };
                 let mut json: serde_json::Value = serde_json::from_slice(&text)?;
-                let profile_prefs = json.as_object_mut().ok_or_else(|| anyhow::anyhow!("not a JSON object"))?
-                    .entry("profile").or_insert_with(|| serde_json::json!({}));
-                let profile_prefs = profile_prefs.as_object_mut().ok_or_else(|| anyhow::anyhow!("profile is not an object"))?;
-                if profile_prefs.get("exit_type").and_then(serde_json::Value::as_str) == Some("Normal")
-                    && profile_prefs.get("exited_cleanly").and_then(serde_json::Value::as_bool) == Some(true)
+                let profile_prefs = json
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("not a JSON object"))?
+                    .entry("profile")
+                    .or_insert_with(|| serde_json::json!({}));
+                let profile_prefs = profile_prefs
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("profile is not an object"))?;
+                if profile_prefs
+                    .get("exit_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Normal")
+                    && profile_prefs
+                        .get("exited_cleanly")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
                 {
                     return Ok(false);
                 }
-                profile_prefs.insert("exit_type".to_owned(), serde_json::Value::String("Normal".to_owned()));
+                profile_prefs.insert(
+                    "exit_type".to_owned(),
+                    serde_json::Value::String("Normal".to_owned()),
+                );
                 profile_prefs.insert("exited_cleanly".to_owned(), serde_json::Value::Bool(true));
                 let upper = upper_file(plan, &preferences)?;
                 let temporary = upper.with_file_name(".Preferences.kwin-mcp");
@@ -1270,7 +3273,10 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
             match result {
                 Ok(true) => marked += 1,
                 Ok(false) => {}
-                Err(error) => eprintln!("session_start: left {} as is: {error:#}", preferences.display()),
+                Err(error) => eprintln!(
+                    "session_start: left {} as is: {error:#}",
+                    preferences.display()
+                ),
             }
         }
     }
@@ -1280,27 +3286,45 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
 fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let size = std::fs::metadata(database)?.len();
-    anyhow::ensure!(size <= SQLITE_SNAPSHOT_MAX_BYTES, "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit");
+    anyhow::ensure!(
+        size <= SQLITE_SNAPSHOT_MAX_BYTES,
+        "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit"
+    );
     let upper = upper_file(plan, database)?;
     let temporary = upper.with_file_name(format!(
         ".{}.kwin-mcp-snapshot",
-        upper.file_name().and_then(|name| name.to_str()).unwrap_or("db")
+        upper
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("db")
     ));
     let result = (|| -> anyhow::Result<()> {
-        let source = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let source = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         source.busy_timeout(Duration::ZERO)?;
         let mut copy = rusqlite::Connection::open(&temporary)?;
         // One step copies every page under a single read lock. A WAL reader is
         // refused only while the host holds the database exclusively, as
         // Chromium-based apps do for as long as they run, so waiting cannot help.
         let step = rusqlite::backup::Backup::new(&source, &mut copy)?.step(-1)?;
-        anyhow::ensure!(step == rusqlite::backup::StepResult::Done, "the host process holds it exclusively ({step:?})");
+        anyhow::ensure!(
+            step == rusqlite::backup::StepResult::Done,
+            "the host process holds it exclusively ({step:?})"
+        );
         drop(copy);
         let mode = std::fs::metadata(database)?.permissions().mode();
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
         std::fs::rename(&temporary, &upper)?;
         for suffix in ["-wal", "-shm"] {
-            let sidecar = upper.with_file_name(format!("{}{suffix}", upper.file_name().and_then(|name| name.to_str()).unwrap_or_default()));
+            let sidecar = upper.with_file_name(format!(
+                "{}{suffix}",
+                upper
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+            ));
             std::fs::write(&sidecar, b"")?;
             std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(mode))?;
         }
@@ -1324,7 +3348,12 @@ struct HostView {
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
 /// host socket exposure, and the host kdeglobals.
-fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path, writable_paths: &[PathBuf]) -> anyhow::Result<HostView> {
+fn prepare_host_view(
+    target: &Path,
+    host_xdg_dir: &Path,
+    host_runtime: &Path,
+    writable_paths: &[PathBuf],
+) -> anyhow::Result<HostView> {
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
         .and_then(|process| process.mountinfo())
@@ -1337,20 +3366,27 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path, wr
         overlay_exclusions.len()
     );
     for mount in &overlay_exclusions {
-        eprintln!("session_start: excluding mount from overlay: {}", mount.display());
+        eprintln!(
+            "session_start: excluding mount from overlay: {}",
+            mount.display()
+        );
     }
     // A leftover twin (a crash, or this pid's run before a reboot) never leaks
     // into the new session.
     let disk = session_disk_path(host_xdg_dir);
     remove_verified_workdir(&disk).map_err(|e| anyhow::anyhow!("clear {}: {e}", disk.display()))?;
-    std::fs::create_dir_all(&disk).map_err(|e| anyhow::anyhow!("create {}: {e}", disk.display()))?;
-    let stat = nix::sys::statvfs::statvfs(&disk).map_err(|e| anyhow::anyhow!("statvfs {}: {e}", disk.display()))?;
+    std::fs::create_dir_all(&disk)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", disk.display()))?;
+    let stat = nix::sys::statvfs::statvfs(&disk)
+        .map_err(|e| anyhow::anyhow!("statvfs {}: {e}", disk.display()))?;
     let free = stat.blocks_available().saturating_mul(stat.fragment_size());
     if free < SESSION_DISK_MIN_FREE {
         let _ = std::fs::remove_dir(&disk);
         anyhow::bail!(
             "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free",
-            disk.display(), gib(SESSION_DISK_MIN_FREE), gib(free)
+            disk.display(),
+            gib(SESSION_DISK_MIN_FREE),
+            gib(free)
         );
     }
     let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory, writable_paths)
@@ -1366,45 +3402,121 @@ fn prepare_host_view(target: &Path, host_xdg_dir: &Path, host_runtime: &Path, wr
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
     eprintln!(
         "session_start: overlay plan={} overlays={} read-only-mounts={}",
-        if overlay_plan.staging_root.is_some() { "split" } else { "whole" },
+        if overlay_plan.staging_root.is_some() {
+            "split"
+        } else {
+            "whole"
+        },
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
     let discarded = discarded_session_databases(target);
-    for database in live_sqlite_databases(target).into_iter().filter(|database| !discarded.contains(database)) {
+    for database in live_sqlite_databases(target)
+        .into_iter()
+        .filter(|database| !discarded.contains(database))
+    {
         match snapshot_live_sqlite(&overlay_plan, &database) {
-            Ok(()) => eprintln!("session_start: snapshotted live SQLite database {}", database.display()),
-            Err(error) => eprintln!("session_start: live SQLite database {} left shared: {error:#}", database.display()),
+            Ok(()) => eprintln!(
+                "session_start: snapshotted live SQLite database {}",
+                database.display()
+            ),
+            Err(error) => eprintln!(
+                "session_start: live SQLite database {} left shared: {error:#}",
+                database.display()
+            ),
         }
     }
     empty_session_databases(&overlay_plan, &discarded)?;
     let browser_cache = target.join(".cache/google-chrome");
-    if browser_cache.is_dir() { overlay_plan.empty_dirs.push(browser_cache); }
+    if browser_cache.is_dir() {
+        overlay_plan.empty_dirs.push(browser_cache);
+    }
     let marked = mark_browser_exits_clean(&overlay_plan, target);
     hide_browser_sessions(&mut overlay_plan, target);
-    eprintln!("session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty", overlay_plan.empty_dirs.len());
+    eprintln!(
+        "session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty",
+        overlay_plan.empty_dirs.len()
+    );
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
-    Ok(HostView { overlay_plan, kdeglobals })
+    Ok(HostView {
+        overlay_plan,
+        kdeglobals,
+    })
 }
 
 // ── Session ──────────────────────────────────────────────────────────────
 
+/// A child of this same PID, including children retained across exec.
+fn input_sysname(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+struct SessionProcess {
+    pid: u32,
+    status: Option<std::process::ExitStatus>,
+}
+impl From<std::process::Child> for SessionProcess {
+    fn from(child: std::process::Child) -> Self {
+        Self {
+            pid: child.id(),
+            status: None,
+        }
+    }
+}
+impl SessionProcess {
+    fn id(&self) -> u32 {
+        self.pid
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if self.status.is_some() {
+            return Ok(self.status);
+        }
+        let pid =
+            nix::unistd::Pid::from_raw(i32::try_from(self.pid).map_err(std::io::Error::other)?);
+        let mut status = 0;
+        let waited = unsafe { nix::libc::waitpid(pid.as_raw(), &mut status, nix::libc::WNOHANG) };
+        if waited < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if waited == 0 {
+            return Ok(None);
+        }
+        self.status = Some(std::process::ExitStatus::from_raw(status));
+        Ok(self.status)
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 struct Session {
-    kwin_conn: zbus::Connection,       // talks to KWin via its unique name
-    _proxy_conn: zbus::Connection,    // owns org.kde.KWin, has InputDevice objects (kept alive)
+    kwin_conn: zbus::Connection, // talks to KWin via its unique name
+    _proxy_socket: std::os::fd::OwnedFd,
+    _proxy_conn: zbus::Connection, // owns org.kde.KWin, has InputDevice objects (kept alive)
     kwin_unique_name: String,
     service_bus_address: String,
     atspi_bus_address: String,
     eis: Eis,
-    sandbox_child: std::process::Child,
-    sandbox_stdin: std::process::ChildStdin,
+    sandbox_child: SessionProcess,
+    sandbox_stdin: std::os::fd::OwnedFd,
     host_xdg_dir: std::path::PathBuf,
-    _uinput_mouse: evdev::uinput::VirtualDevice,
-    _uinput_keyboard: evdev::uinput::VirtualDevice,
+    _uinput_mouse: std::os::fd::OwnedFd,
+    _uinput_keyboard: std::os::fd::OwnedFd,
+    mouse_sysname: String,
+    kbd_sysname: String,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
     cdp_forward_port: u16,
-    service_proxy_children: Vec<std::process::Child>,
-    viewer_child: Option<std::process::Child>,
+    service_proxy_children: Vec<SessionProcess>,
+    viewer_child: Option<SessionProcess>,
     /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
@@ -1447,12 +3559,8 @@ struct DisplayConfig {
 
 const STARTUP_CHILD_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn signal_child(
-    child: &std::process::Child,
-    process_group: bool,
-    signal: nix::sys::signal::Signal,
-) {
-    let Ok(pid) = i32::try_from(child.id()) else {
+fn signal_child(child_id: u32, process_group: bool, signal: nix::sys::signal::Signal) {
+    let Ok(pid) = i32::try_from(child_id) else {
         return;
     };
     let target = if process_group { -pid } else { pid };
@@ -1462,8 +3570,9 @@ fn signal_child(
 /// Terminate a startup or session child without allowing a TERM-resistant
 /// process to hold the lifecycle gate forever. The final wait reaps the child
 /// after the bounded TERM grace period and SIGKILL escalation.
-fn terminate_child(mut child: std::process::Child, process_group: bool, label: &str) {
-    signal_child(&child, process_group, nix::sys::signal::Signal::SIGTERM);
+fn terminate_child(child: impl Into<SessionProcess>, process_group: bool, label: &str) {
+    let mut child = child.into();
+    signal_child(child.id(), process_group, nix::sys::signal::Signal::SIGTERM);
     let deadline = std::time::Instant::now() + STARTUP_CHILD_TERMINATION_GRACE;
     loop {
         match child.try_wait() {
@@ -1475,7 +3584,7 @@ fn terminate_child(mut child: std::process::Child, process_group: bool, label: &
         }
     }
     eprintln!("{label} did not exit after SIGTERM; escalating to SIGKILL");
-    signal_child(&child, process_group, nix::sys::signal::Signal::SIGKILL);
+    signal_child(child.id(), process_group, nix::sys::signal::Signal::SIGKILL);
     let deadline = std::time::Instant::now() + STARTUP_CHILD_TERMINATION_GRACE;
     while std::time::Instant::now() < deadline {
         if !matches!(child.try_wait(), Ok(None)) {
@@ -1488,7 +3597,9 @@ fn terminate_child(mut child: std::process::Child, process_group: bool, label: &
     eprintln!("{label} still blocked after SIGKILL; reaping in the background");
     let _ = std::thread::Builder::new()
         .name("kwin-mcp-reaper".to_owned())
-        .spawn(move || { let _ = child.wait(); });
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Resources created while session_start is still unpublished. The guard owns
@@ -1523,7 +3634,13 @@ impl StartupResources {
         }
     }
 
-    fn into_parts(mut self) -> (std::process::Child, std::process::ChildStdin, Vec<std::process::Child>) {
+    fn into_parts(
+        mut self,
+    ) -> (
+        std::process::Child,
+        std::process::ChildStdin,
+        Vec<std::process::Child>,
+    ) {
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -1549,7 +3666,10 @@ impl Drop for StartupResources {
 /// allowing the test to prove the owning guards clean it before workdir removal.
 async fn test_startup_delay(stage: &str) {
     if !cfg!(debug_assertions)
-        || std::env::var("KWIN_MCP_TEST_STARTUP_DELAY_STAGE").ok().as_deref() != Some(stage)
+        || std::env::var("KWIN_MCP_TEST_STARTUP_DELAY_STAGE")
+            .ok()
+            .as_deref()
+            != Some(stage)
     {
         return;
     }
@@ -1586,13 +3706,17 @@ fn test_stop_bwrap(child: &std::process::Child) {
     {
         return;
     }
-    signal_child(child, false, nix::sys::signal::Signal::SIGSTOP);
+    signal_child(child.id(), false, nix::sys::signal::Signal::SIGSTOP);
     eprintln!("session_start: test stopped bwrap pid={}", child.id());
 }
 
 #[derive(Clone)]
 struct KwinMcp {
-    session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    path: PathBuf,
+    input_gate: Arc<tokio::sync::Mutex<()>>,
+    input_order: Arc<InputOrder>,
+    tool_calls: Arc<std::sync::Mutex<usize>>,
+    session: Arc<tokio::sync::RwLock<Option<Session>>>,
     /// Cleanup ownership of the session workdir under --autoclean. Claimed
     /// before session_start creates the directory and released only once the
     /// directory is gone, so every terminal start, stop, and shutdown outcome
@@ -1605,19 +3729,20 @@ struct KwinMcp {
     start_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last startup checkpoint reached, named in the hard-limit error.
     start_stage: Arc<std::sync::Mutex<&'static str>>,
-    /// Prevent a queued start from reviving a child committed to TTL retirement.
-    ttl_retired: Arc<std::sync::atomic::AtomicBool>,
     display: DisplayConfig,
 }
 
 impl KwinMcp {
     fn new(display: DisplayConfig) -> Self {
         Self {
-            session: Arc::new(tokio::sync::Mutex::new(None)),
+            session: Arc::new(tokio::sync::RwLock::new(None)),
+            path: session_workdir_path(),
+            input_gate: Arc::new(tokio::sync::Mutex::new(())),
+            input_order: Arc::new(InputOrder::default()),
+            tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
-            ttl_retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             display,
         }
     }
@@ -1628,7 +3753,10 @@ impl KwinMcp {
         }
     }
     fn start_stage(&self) -> &'static str {
-        self.start_stage.lock().map(|stage| *stage).unwrap_or("unknown")
+        self.start_stage
+            .lock()
+            .map(|stage| *stage)
+            .unwrap_or("unknown")
     }
     /// Wait for the lifecycle gate, bounded so a start, stop, or reaper stuck
     /// behind a blocked host call answers with an error instead of hanging.
@@ -1650,15 +3778,19 @@ impl KwinMcp {
             })
     }
     async fn mark_input(&self) {
-        if let Some(session) = self.session.lock().await.as_mut() {
+        if let Some(session) = self.session.write().await.as_mut() {
             session.last_input = Some(std::time::Instant::now());
         }
     }
     async fn last_input(&self) -> Option<std::time::Instant> {
-        self.session.lock().await.as_ref().and_then(|session| session.last_input)
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .and_then(|session| session.last_input)
     }
     async fn touch_activity(&self) {
-        if let Some(session) = self.session.lock().await.as_mut() {
+        if let Some(session) = self.session.write().await.as_mut() {
             session.last_activity = std::time::Instant::now();
         }
     }
@@ -1666,7 +3798,7 @@ impl KwinMcp {
         &self,
         f: impl FnOnce(&Session) -> Result<R, McpError>,
     ) -> Result<R, McpError> {
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         match &*guard {
             Some(s) => f(s),
             None => Err(McpError::internal_error(
@@ -1676,7 +3808,7 @@ impl KwinMcp {
         }
     }
     async fn kwin_conn(&self) -> Result<zbus::Connection, McpError> {
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         match &*guard {
             Some(s) => Ok(s.kwin_conn.clone()),
             None => Err(McpError::internal_error(
@@ -1686,7 +3818,7 @@ impl KwinMcp {
         }
     }
     async fn kwin_unique_name(&self) -> Result<String, McpError> {
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         match &*guard {
             Some(s) => Ok(s.kwin_unique_name.clone()),
             None => Err(McpError::internal_error(
@@ -1696,7 +3828,7 @@ impl KwinMcp {
         }
     }
     async fn host_xdg_dir(&self) -> Result<std::path::PathBuf, McpError> {
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         match &*guard {
             Some(s) => Ok(s.host_xdg_dir.clone()),
             None => Err(McpError::internal_error(
@@ -1710,7 +3842,7 @@ impl KwinMcp {
     /// that never created its directory. A start that did publish a Session
     /// keeps its workdir, which session_stop then owns.
     async fn autoclean_unpublished_workdir(&self, error: McpError) -> McpError {
-        if self.session.lock().await.is_some() {
+        if self.session.read().await.is_some() {
             return error;
         }
         match self.workdir.remove() {
@@ -1719,7 +3851,10 @@ impl KwinMcp {
                 eprintln!("session_start: autoclean removed {}", dir.display());
                 error
             }
-            WorkdirCleanup::Retained { dir, error: remove_error } => McpError::internal_error(
+            WorkdirCleanup::Retained {
+                dir,
+                error: remove_error,
+            } => McpError::internal_error(
                 format!(
                     "{}; session workdir {} not removed: {remove_error}. Cleanup is still owned, call session_stop to retry.",
                     error.message,
@@ -1731,78 +3866,36 @@ impl KwinMcp {
     }
     /// Final terminal transition for transport close or a handled signal.
     async fn shutdown_cleanup(&self) {
-        let gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "shutdown cleanup").await;
+        let gate = self
+            .lifecycle_gate(
+                tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT,
+                "shutdown cleanup",
+            )
+            .await;
         if let Err(error) = &gate {
             eprintln!("shutdown: {}; cleaning up without it", error.message);
         }
         if let Some(dir) = self.workdir.owned() {
             eprintln!("shutdown: autoclean owns {}", dir.display());
         }
-        let stopped = self.session.lock().await.take();
+        let stopped = self.session.write().await.take();
         if let Some(sess) = stopped {
             teardown_blocking(sess).await;
         }
         match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {}
-            WorkdirCleanup::Removed(dir) => eprintln!("shutdown: autoclean removed {}", dir.display()),
+            WorkdirCleanup::Removed(dir) => {
+                eprintln!("shutdown: autoclean removed {}", dir.display())
+            }
             WorkdirCleanup::Retained { dir, error } => {
-                eprintln!("shutdown: autoclean could not remove {}: {error}", dir.display())
-            }
-        }
-    }
-
-    /// Collect a viewer that exited on its own (the user closed its window, or
-    /// the stream ended) so it never lingers as a zombie under this server.
-    /// Child::try_wait reaps it and keeps the status for viewer_report.
-    async fn viewer_reaper(self) {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(child) = self.session.lock().await.as_mut().and_then(|s| s.viewer_child.as_mut()) {
-                let _ = child.try_wait();
-            }
-        }
-    }
-
-    async fn idle_reaper(self, retire: bool, expired: impl FnOnce() + Send) {
-        let Some(ttl) = self.display.ttl else { return };
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let idle = self.session.lock().await.as_ref().is_some_and(|s| s.last_activity.elapsed() >= ttl);
-            if !idle {
-                continue;
-            }
-            let Ok(_start_gate) = self.start_gate.try_lock() else { continue };
-            let stopped = {
-                let mut session = self.session.lock().await;
-                if session.as_ref().is_some_and(|s| s.last_activity.elapsed() >= ttl) {
-                    session.take()
-                } else {
-                    None
-                }
-            };
-            if let Some(sess) = stopped {
-                if retire {
-                    self.ttl_retired.store(true, std::sync::atomic::Ordering::Release);
-                }
-                eprintln!("ttl: session idle for {} minutes; tearing down", ttl.as_secs() / 60);
-                teardown_blocking(sess).await;
-                match self.workdir.remove() {
-                    WorkdirCleanup::NothingOwned => {}
-                    WorkdirCleanup::Removed(dir) => eprintln!("ttl: removed {}", dir.display()),
-                    WorkdirCleanup::Retained { dir, error } => {
-                        eprintln!("ttl: could not remove {}: {error}", dir.display())
-                    }
-                }
-                if retire {
-                    eprintln!("ttl: cleanup finished; retiring shim-owned server");
-                    expired();
-                    return;
-                }
+                eprintln!(
+                    "shutdown: autoclean could not remove {}: {error}",
+                    dir.display()
+                )
             }
         }
     }
 }
-
 
 struct CursorSprite {
     rgba: Vec<u8>,
@@ -1824,36 +3917,52 @@ const CURSOR_HOTSPOT_Y: i32 = 10;
 /// None only if the embedded PNG is malformed (shouldn't happen).
 fn cursor_sprite() -> Option<&'static CursorSprite> {
     static CACHE: std::sync::OnceLock<Option<CursorSprite>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        const PNG_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.png"));
-        let decoder = png::Decoder::new(PNG_BYTES);
-        let mut reader = decoder.read_info().ok()?;
-        let mut buf = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).ok()?;
-        if info.bit_depth != png::BitDepth::Eight { return None; }
-        let raw = &buf[..info.buffer_size()];
-        let rgba: Vec<u8> = match info.color_type {
-            png::ColorType::Rgba => raw.to_vec(),
-            png::ColorType::Rgb => {
-                let mut out = Vec::with_capacity(raw.len() / 3 * 4);
-                for chunk in raw.as_chunks::<3>().0 {
-                    out.extend_from_slice(chunk);
-                    out.push(255);
-                }
-                out
+    CACHE
+        .get_or_init(|| {
+            const PNG_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.png"));
+            let decoder = png::Decoder::new(PNG_BYTES);
+            let mut reader = decoder.read_info().ok()?;
+            let mut buf = vec![0u8; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).ok()?;
+            if info.bit_depth != png::BitDepth::Eight {
+                return None;
             }
-            png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha | png::ColorType::Indexed => return None,
-        };
-        Some(CursorSprite { rgba, w: info.width, h: info.height })
-    }).as_ref()
+            let raw = &buf[..info.buffer_size()];
+            let rgba: Vec<u8> = match info.color_type {
+                png::ColorType::Rgba => raw.to_vec(),
+                png::ColorType::Rgb => {
+                    let mut out = Vec::with_capacity(raw.len() / 3 * 4);
+                    for chunk in raw.as_chunks::<3>().0 {
+                        out.extend_from_slice(chunk);
+                        out.push(255);
+                    }
+                    out
+                }
+                png::ColorType::Grayscale
+                | png::ColorType::GrayscaleAlpha
+                | png::ColorType::Indexed => return None,
+            };
+            Some(CursorSprite {
+                rgba,
+                w: info.width,
+                h: info.height,
+            })
+        })
+        .as_ref()
 }
 
-async fn structured_result(peer: &rmcp::Peer<rmcp::RoleServer>, text: impl Into<String>, structured: serde_json::Value) -> CallToolResult {
+async fn structured_result(
+    peer: &rmcp::Peer<rmcp::RoleServer>,
+    text: impl Into<String>,
+    structured: serde_json::Value,
+) -> CallToolResult {
     let s: String = text.into();
-    let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
-        rmcp::model::LoggingLevel::Info,
-        serde_json::json!(s),
-    )).await;
+    let _ = peer
+        .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
+            rmcp::model::LoggingLevel::Info,
+            serde_json::json!(s),
+        ))
+        .await;
     let mut r = CallToolResult::success(vec![Content::text(s)]);
     r.structured_content = Some(structured);
     r
@@ -1878,13 +3987,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "viewer.log",
         VIEWER_STATUS_FILE,
     ];
-    const STALE_DIRS: &[&str] = &[
-        "at-spi",
-        "browser-bin",
-        "dbus-1",
-        "dconf",
-        "doc",
-    ];
+    const STALE_DIRS: &[&str] = &["at-spi", "browser-bin", "dbus-1", "dconf", "doc"];
     for name in STALE_FILES {
         let _ = std::fs::remove_file(dir.join(name));
     }
@@ -1941,7 +4044,9 @@ fn session_disk_root() -> std::path::PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
         .unwrap_or_else(std::env::temp_dir)
         .join("kwin-mcp")
 }
@@ -1992,12 +4097,13 @@ fn repair_workdir_directory_tree(dir: std::os::fd::OwnedFd, depth: u32) {
     let Ok(entries) = std::fs::read_dir(proc_fd_path(&dir)) else {
         return;
     };
-    let flags = nix::fcntl::OFlag::O_PATH
-        | nix::fcntl::OFlag::O_NOFOLLOW
-        | nix::fcntl::OFlag::O_CLOEXEC;
+    let flags =
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC;
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if let Ok(child) = nix::fcntl::openat(&dir, name.as_os_str(), flags, nix::sys::stat::Mode::empty()) {
+        if let Ok(child) =
+            nix::fcntl::openat(&dir, name.as_os_str(), flags, nix::sys::stat::Mode::empty())
+        {
             repair_workdir_directory_tree(child, depth + 1);
         }
     }
@@ -2010,10 +4116,23 @@ fn repair_workdir_directory_tree(dir: std::os::fd::OwnedFd, depth: u32) {
 /// after a partial delete converges instead of inventing a new failure.
 fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
     let expected = session_workdir_path();
-    if dir != expected {
+    if dir != expected
+        && !(dir.parent() == expected.parent()
+            && dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.strip_prefix(&format!("kwin-mcp-{}-", std::process::id()))
+                        .is_some_and(|suffix| suffix.parse::<u64>().is_ok())
+                }))
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is not this server's session workdir {}", dir.display(), expected.display()),
+            format!(
+                "{} is not this server's session workdir {}",
+                dir.display(),
+                expected.display()
+            ),
         ));
     }
     remove_verified_workdir(dir)
@@ -2022,9 +4141,8 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Remove a directory after the caller has proved its ownership. This helper
 /// never follows a symlink while repairing nested permissions.
 fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
-    let flags = nix::fcntl::OFlag::O_PATH
-        | nix::fcntl::OFlag::O_NOFOLLOW
-        | nix::fcntl::OFlag::O_CLOEXEC;
+    let flags =
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC;
     if let Ok(root) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) {
         repair_workdir_directory_tree(root, 0);
     }
@@ -2049,34 +4167,81 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
-        if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
-        if owners.is_some_and(|owners| pid_text.parse::<u32>().map_or(true, |pid| !owners.contains(&pid))) { continue }
+        let Some(pid_text) = name.strip_prefix("kwin-mcp-") else {
+            continue;
+        };
+        let Some(pid_text) = pid_text
+            .split('-')
+            .next()
+            .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if owners.is_some_and(|owners| {
+            pid_text
+                .parse::<u32>()
+                .map_or(true, |pid| !owners.contains(&pid))
+        }) {
+            continue;
+        }
         let dir = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
-        if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
+        let Ok(metadata) = std::fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid {
+            continue;
+        }
         let marker_path = dir.join(WORKDIR_LEASE_FILE);
-        let Ok(mut marker) = std::fs::OpenOptions::new().read(true).write(true)
+        let Ok(mut marker) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-            .open(&marker_path) else { continue };
-        let Ok(marker_metadata) = marker.metadata() else { continue };
-        if !marker_metadata.file_type().is_file() || marker_metadata.uid() != uid
-            || marker_metadata.len() > 128 || marker.try_lock().is_err() { continue }
+            .open(&marker_path)
+        else {
+            continue;
+        };
+        let Ok(marker_metadata) = marker.metadata() else {
+            continue;
+        };
+        if !marker_metadata.file_type().is_file()
+            || marker_metadata.uid() != uid
+            || marker_metadata.len() > 128
+            || marker.try_lock().is_err()
+        {
+            continue;
+        }
         let mut contents = String::new();
-        if marker.read_to_string(&mut contents).is_err() { continue }
+        if marker.read_to_string(&mut contents).is_err() {
+            continue;
+        }
         let mut fields = contents.split_whitespace();
         let (Some(version), Some(owner), Some(group), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
-        let Ok(group) = group.parse::<i32>() else { continue };
-        if version != WORKDIR_LEASE_VERSION || owner != pid_text || group <= 1 { continue }
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(group) = group.parse::<i32>() else {
+            continue;
+        };
+        if version != WORKDIR_LEASE_VERSION || owner != pid_text || group <= 1 {
+            continue;
+        }
         // kill(..., 0) only queries process-group existence. EPERM also means
         // a live group, so only ESRCH authorizes an orphan transition.
         if unsafe { nix::libc::kill(-group, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ESRCH) { continue }
+            || std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ESRCH)
+        {
+            continue;
+        }
         let dir_text = dir.to_string_lossy();
         let mount_prefix = format!("{dir_text}/");
-        if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
-            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
+        if mounts
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
+        {
+            continue;
+        }
         match remove_verified_workdir(&dir) {
             Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
             Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
@@ -2089,7 +4254,9 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
 /// owning server is gone they are leaked: remove them, unless a live kwin-mcp
 /// still has that pid, something is mounted inside, or any process still names
 /// the directory on its command line (a surviving sandbox binds it by path).
-fn sweep_dead_owner_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> std::io::Result<()> {
+fn sweep_dead_owner_workdirs(
+    owners: Option<&std::collections::HashSet<u32>>,
+) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let temp = std::env::temp_dir();
     let uid = std::fs::metadata("/proc/self")?.uid();
@@ -2102,28 +4269,68 @@ fn sweep_dead_owner_workdirs(owners: Option<&std::collections::HashSet<u32>>) ->
     // Disk twins (session_disk_root) count too: a twin whose workdir is gone,
     // removed above or cleared from /tmp by a reboot, is leaked the same way.
     for root in [temp.clone(), session_disk_root()] {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(pid_text) = name.strip_prefix("kwin-mcp-") else { continue };
-            if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) { continue }
-            if owners.is_some_and(|owners| pid_text.parse::<u32>().map_or(true, |pid| !owners.contains(&pid))) { continue }
-            if root != temp && std::fs::symlink_metadata(temp.join(name)).is_ok() { continue }
+            let Some(pid_text) = name.strip_prefix("kwin-mcp-") else {
+                continue;
+            };
+            let Some(pid_text) = pid_text
+                .split('-')
+                .next()
+                .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            else {
+                continue;
+            };
+            if owners.is_some_and(|owners| {
+                pid_text
+                    .parse::<u32>()
+                    .map_or(true, |pid| !owners.contains(&pid))
+            }) {
+                continue;
+            }
+            if root != temp && std::fs::symlink_metadata(temp.join(name)).is_ok() {
+                continue;
+            }
             let dir = entry.path();
-            let Ok(metadata) = std::fs::symlink_metadata(&dir) else { continue };
-            if !metadata.file_type().is_dir() || metadata.uid() != uid { continue }
-            if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() { continue }
-            let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe")).ok()
-                .and_then(|exe| exe.file_name().map(|file| file.to_string_lossy().starts_with("kwin-mcp")))
+            let Ok(metadata) = std::fs::symlink_metadata(&dir) else {
+                continue;
+            };
+            if !metadata.file_type().is_dir() || metadata.uid() != uid {
+                continue;
+            }
+            if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() {
+                continue;
+            }
+            let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe"))
+                .ok()
+                .and_then(|exe| {
+                    exe.file_name()
+                        .map(|file| file.to_string_lossy().starts_with("kwin-mcp"))
+                })
                 .unwrap_or(false);
-            if owner_alive { continue }
+            if owner_alive {
+                continue;
+            }
             let dir_text = dir.to_string_lossy();
             let mount_prefix = format!("{dir_text}/");
-            if mounts.lines().filter_map(|line| line.split_whitespace().nth(4))
-                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix)) { continue }
-            if cmdlines.iter().any(|args| args.split(' ').any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))) { continue }
+            if mounts
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(4))
+                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
+            {
+                continue;
+            }
+            if cmdlines.iter().any(|args| {
+                args.split(' ')
+                    .any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))
+            }) {
+                continue;
+            }
             match remove_verified_workdir(&dir) {
                 Ok(()) => eprintln!("sweep: removed leaked {}", dir.display()),
                 Err(error) => eprintln!("sweep: retained leaked {}: {error}", dir.display()),
@@ -2159,31 +4366,69 @@ struct WorkdirOwnership {
 
 impl WorkdirOwnership {
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<WorkdirClaim>> {
-        self.owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Idle to Owned. The caller creates the directory just before this call,
     /// with no cancellation point between creation and the claim.
     fn claim(&self, dir: &std::path::Path) {
-        *self.lock() = Some(WorkdirClaim { dir: dir.to_path_buf(), lease: None });
+        *self.lock() = Some(WorkdirClaim {
+            dir: dir.to_path_buf(),
+            lease: None,
+        });
     }
     fn create_lease(&self) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut owned = self.lock();
-        let claim = owned.as_mut().ok_or_else(|| std::io::Error::other("no claimed workdir"))?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
-            .mode(0o600).open(claim.dir.join(WORKDIR_LEASE_FILE))?;
+        let claim = owned
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no claimed workdir"))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(claim.dir.join(WORKDIR_LEASE_FILE))?;
         file.try_lock()?;
         claim.lease = Some(file);
         Ok(())
     }
+    fn inherit_lease(&self, dir: &Path, descriptor: Option<i32>) -> std::io::Result<()> {
+        let lease = descriptor
+            .map(adopt_descriptor)
+            .transpose()?
+            .map(std::fs::File::from);
+        *self.lock() = Some(WorkdirClaim {
+            dir: dir.to_owned(),
+            lease,
+        });
+        Ok(())
+    }
+    fn saved_lease(
+        &self,
+        retained: &mut Vec<std::os::fd::OwnedFd>,
+    ) -> std::io::Result<Option<i32>> {
+        self.lock()
+            .as_ref()
+            .and_then(|claim| claim.lease.as_ref())
+            .map(|file| retain_descriptor(file, retained))
+            .transpose()
+    }
     fn mark_sandbox(&self, group: u32) -> std::io::Result<()> {
         use std::io::{Seek, Write};
         let mut owned = self.lock();
-        let file = owned.as_mut().and_then(|claim| claim.lease.as_mut())
+        let file = owned
+            .as_mut()
+            .and_then(|claim| claim.lease.as_mut())
             .ok_or_else(|| std::io::Error::other("no workdir lease"))?;
         file.set_len(0)?;
         file.rewind()?;
-        writeln!(file, "{WORKDIR_LEASE_VERSION} {} {group}", std::process::id())?;
+        writeln!(
+            file,
+            "{WORKDIR_LEASE_VERSION} {} {group}",
+            std::process::id()
+        )?;
         file.sync_data()
     }
     /// The owned path, used by shutdown to decide whether it has work to do.
@@ -2280,7 +4525,9 @@ fn gib(bytes: u64) -> String {
 /// still shows free space) and the filesystem's own free space.
 fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
     let mut message = format!("writing {} failed: {error}", path.display());
-    let Some(code) = error.raw_os_error() else { return message };
+    let Some(code) = error.raw_os_error() else {
+        return message;
+    };
     if code != nix::libc::EDQUOT && code != nix::libc::ENOSPC {
         return message;
     }
@@ -2289,7 +4536,9 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
         use std::os::fd::AsRawFd;
         let mut quota = IfDqblk::default();
         use std::os::unix::fs::MetadataExt;
-        let uid = std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or_default();
+        let uid = std::fs::metadata("/proc/self")
+            .map(|meta| meta.uid())
+            .unwrap_or_default();
         // SAFETY: quotactl_fd writes one struct if_dqblk into `quota`, which is
         // repr(C) with the kernel layout and outlives the call.
         let result = unsafe {
@@ -2324,7 +4573,8 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
 /// failed write never leaves a truncated file at `path`.
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension("partial");
-    let written = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
+    let written =
+        std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
@@ -2373,26 +4623,40 @@ fn same_contents(left: &Path, right: &Path) -> std::io::Result<bool> {
 /// Copy a session file (read through the sandbox root) to a host path with a
 /// temporary file and rename, then verify the host copy byte for byte.
 fn export_session_file(source: &Path, destination: &Path, overwrite: bool) -> Result<u64, String> {
-    let metadata = std::fs::metadata(source).map_err(|error| format!("read {}: {error}", source.display()))?;
+    let metadata =
+        std::fs::metadata(source).map_err(|error| format!("read {}: {error}", source.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", source.display()));
     }
     if !overwrite && std::fs::symlink_metadata(destination).is_ok() {
-        return Err(format!("{} already exists on the host; pass overwrite=true to replace it", destination.display()));
+        return Err(format!(
+            "{} already exists on the host; pass overwrite=true to replace it",
+            destination.display()
+        ));
     }
-    let parent = destination.parent().ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
     if !parent.is_dir() {
-        return Err(format!("host directory {} does not exist", parent.display()));
+        return Err(format!(
+            "host directory {} does not exist",
+            parent.display()
+        ));
     }
     let temporary = parent.join(format!(
         ".{}.kwin-mcp-export",
-        destination.file_name().and_then(|name| name.to_str()).unwrap_or("file")
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
     ));
     let copied = std::fs::copy(source, &temporary)
         .map_err(|error| describe_write_failure(&temporary, &error))
         .and_then(|bytes| match same_contents(source, &temporary) {
             Ok(true) => Ok(bytes),
-            Ok(false) => Err("host copy differs from the session file (was it still being written?)".to_owned()),
+            Ok(false) => Err(
+                "host copy differs from the session file (was it still being written?)".to_owned(),
+            ),
             Err(error) => Err(format!("verify host copy: {error}")),
         })
         .and_then(|bytes| {
@@ -2434,7 +4698,9 @@ async fn read_frame_file(frame: &std::fs::File, expected: usize) -> Result<Vec<u
         tokio::time::sleep(SCREENSHOT_FILL_POLL).await;
     }
     let mut pixels = vec![0; expected];
-    frame.read_exact_at(&mut pixels, 0).map_err(KwinError::from)?;
+    frame
+        .read_exact_at(&mut pixels, 0)
+        .map_err(KwinError::from)?;
     Ok(pixels)
 }
 
@@ -2502,7 +4768,16 @@ async fn capture_settled_frame(
         frame = next;
     };
     let (width, height, stride, pixels) = frame;
-    Ok((width, height, stride, pixels, Some(SettleReport { settled, waited: started.elapsed() })))
+    Ok((
+        width,
+        height,
+        stride,
+        pixels,
+        Some(SettleReport {
+            settled,
+            waited: started.elapsed(),
+        }),
+    ))
 }
 
 /// FUSE support for the sandbox, when the host allows it: /dev/fuse exists,
@@ -2510,11 +4785,13 @@ async fn capture_settled_frame(
 /// setpriv can drop them for everything but the helper, and at least one real
 /// fusermount binary exists. Returns (host binary, program name) pairs.
 fn fuse_support() -> Option<Vec<(PathBuf, &'static str)>> {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::PermissionsExt;
     let find = |name: &str| {
         std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file())
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
         })
     };
     if !std::fs::metadata("/dev/fuse").is_ok_and(|meta| meta.file_type().is_char_device()) {
@@ -2539,7 +4816,11 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     let me = std::env::current_exe().ok()?;
     let dir = me.parent()?;
     let candidate = dir.join("kwin-viewer");
-    if candidate.exists() { Some(candidate) } else { None }
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Quote one complete shell expression as a single argument to `bash -c`.
@@ -2564,19 +4845,36 @@ fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
     let mut other = Vec::new();
     let mut nvidia = Vec::new();
     for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if kind.is_dir() {
             continue;
         }
         let name = entry.file_name();
-        let driver = std::fs::read_link(Path::new("/sys/class/drm").join(&name).join("device/driver")).ok();
-        let owned_by_nvidia = driver.as_deref().and_then(Path::file_name).is_some_and(|driver| driver == "nvidia");
-        if owned_by_nvidia { nvidia.push(entry.path()) } else { other.push(entry.path()) }
+        let driver = std::fs::read_link(
+            Path::new("/sys/class/drm")
+                .join(&name)
+                .join("device/driver"),
+        )
+        .ok();
+        let owned_by_nvidia = driver
+            .as_deref()
+            .and_then(Path::file_name)
+            .is_some_and(|driver| driver == "nvidia");
+        if owned_by_nvidia {
+            nvidia.push(entry.path())
+        } else {
+            other.push(entry.path())
+        }
     }
     if nvidia.is_empty() {
         return None;
     }
-    let is_render = |node: &PathBuf| node.file_name().is_some_and(|name| name.to_string_lossy().starts_with("renderD"));
+    let is_render = |node: &PathBuf| {
+        node.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("renderD"))
+    };
     if !other.iter().any(is_render) {
         nvidia.sort();
         other.extend(nvidia.into_iter().find(is_render));
@@ -2585,9 +4883,13 @@ fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
 }
 
 fn nvidia_gbm_installed() -> bool {
-    ["/usr/lib/gbm", "/usr/lib64/gbm", "/usr/lib/x86_64-linux-gnu/gbm"]
-        .iter()
-        .any(|dir| Path::new(dir).join("nvidia-drm_gbm.so").exists())
+    [
+        "/usr/lib/gbm",
+        "/usr/lib64/gbm",
+        "/usr/lib/x86_64-linux-gnu/gbm",
+    ]
+    .iter()
+    .any(|dir| Path::new(dir).join("nvidia-drm_gbm.so").exists())
 }
 
 /// Whether `command` starts a Chromium-family browser (leading VAR=value words
@@ -2598,13 +4900,29 @@ fn launches_chromium(command: &str) -> bool {
         .find(|word| !word.contains('='))
         .and_then(|program| Path::new(program).file_name())
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|name| BROWSER_COMMANDS.contains(&name) && !matches!(name, "code" | "codium" | "vscodium" | "electron"))
+        .is_some_and(|name| {
+            BROWSER_COMMANDS.contains(&name)
+                && !matches!(name, "code" | "codium" | "vscodium" | "electron")
+        })
 }
 
 const BROWSER_COMMANDS: &[&str] = &[
-    "google-chrome-stable", "google-chrome", "chrome", "chromium", "chromium-browser",
-    "brave", "brave-browser", "vivaldi", "vivaldi-stable", "microsoft-edge",
-    "microsoft-edge-stable", "msedge", "code", "codium", "vscodium", "electron",
+    "google-chrome-stable",
+    "google-chrome",
+    "chrome",
+    "chromium",
+    "chromium-browser",
+    "brave",
+    "brave-browser",
+    "vivaldi",
+    "vivaldi-stable",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "msedge",
+    "code",
+    "codium",
+    "vscodium",
+    "electron",
 ];
 
 // Bash resolves the browser itself, so compound commands and wrappers need no
@@ -2697,7 +5015,8 @@ fn detect_browsers() -> Vec<String> {
         .filter(|name| {
             dirs.iter().any(|dir| {
                 let candidate = dir.join(name);
-                std::fs::metadata(&candidate).is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+                std::fs::metadata(&candidate)
+                    .is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
             })
         })
         .map(|name| (*name).to_owned())
@@ -2706,42 +5025,124 @@ fn detect_browsers() -> Vec<String> {
 
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     use std::os::unix::fs::FileTypeExt;
-    let (inherited_display, inherited_runtime) = (std::env::var_os("WAYLAND_DISPLAY"), std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
-    let socket = |runtime: &Path, display: &std::ffi::OsStr| if Path::new(display).is_absolute() { PathBuf::from(display) } else { runtime.join(display) };
+    let (inherited_display, inherited_runtime) = (
+        std::env::var_os("WAYLAND_DISPLAY"),
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+    );
+    let socket = |runtime: &Path, display: &std::ffi::OsStr| {
+        if Path::new(display).is_absolute() {
+            PathBuf::from(display)
+        } else {
+            runtime.join(display)
+        }
+    };
     if let (Some(runtime), Some(display)) = (&inherited_runtime, &inherited_display) {
-        let path = socket(runtime, display); anyhow::ensure!(std::fs::metadata(&path)?.file_type().is_socket(), "{} is not a Unix socket", path.display());
+        let path = socket(runtime, display);
+        anyhow::ensure!(
+            std::fs::metadata(&path)?.file_type().is_socket(),
+            "{} is not a Unix socket",
+            path.display()
+        );
         return Ok((runtime.clone(), display.clone()));
     }
     let system = zbus::Connection::system().await?;
-    let login = zbus::Proxy::new(&system, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager").await?;
-    let (user_path,): (zbus::zvariant::OwnedObjectPath,) = login.call("GetUserByPID", &(std::process::id(),)).await?;
-    let user = zbus::Proxy::new(&system, "org.freedesktop.login1", user_path, "org.freedesktop.login1.User").await?;
-    let runtime = inherited_runtime.unwrap_or(PathBuf::from(user.get_property::<String>("RuntimePath").await?));
+    let login = zbus::Proxy::new(
+        &system,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    let (user_path,): (zbus::zvariant::OwnedObjectPath,) =
+        login.call("GetUserByPID", &(std::process::id(),)).await?;
+    let user = zbus::Proxy::new(
+        &system,
+        "org.freedesktop.login1",
+        user_path,
+        "org.freedesktop.login1.User",
+    )
+    .await?;
+    let runtime = inherited_runtime.unwrap_or(PathBuf::from(
+        user.get_property::<String>("RuntimePath").await?,
+    ));
     let display = if let Some(display) = inherited_display {
         display
     } else {
-        let (_, session_path): (String, zbus::zvariant::OwnedObjectPath) = user.get_property("Display").await?;
-        let session = zbus::Proxy::new(&system, "org.freedesktop.login1", session_path, "org.freedesktop.login1.Session").await?;
-        anyhow::ensure!(session.get_property::<bool>("Active").await?
-            && session.get_property::<String>("State").await? == "active"
-            && session.get_property::<String>("Type").await? == "wayland", "no active logind Wayland session");
+        let (_, session_path): (String, zbus::zvariant::OwnedObjectPath) =
+            user.get_property("Display").await?;
+        let session = zbus::Proxy::new(
+            &system,
+            "org.freedesktop.login1",
+            session_path,
+            "org.freedesktop.login1.Session",
+        )
+        .await?;
+        anyhow::ensure!(
+            session.get_property::<bool>("Active").await?
+                && session.get_property::<String>("State").await? == "active"
+                && session.get_property::<String>("Type").await? == "wayland",
+            "no active logind Wayland session"
+        );
         let managed = async {
             let address = format!("unix:path={}/bus", runtime.display());
-            let user_bus = zbus::connection::Builder::address(address.as_str())?.build().await?;
-            let manager = zbus::Proxy::new(&user_bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager").await?;
-            anyhow::Ok(manager.get_property::<Vec<String>>("Environment").await?.into_iter()
-            .find_map(|entry| entry.strip_prefix("WAYLAND_DISPLAY=").map(std::ffi::OsString::from))
-            .filter(|display| std::fs::metadata(socket(&runtime, display)).is_ok_and(|meta| meta.file_type().is_socket())))
-        }.await.ok().flatten();
-        managed.or_else(|| std::fs::read_dir(&runtime).ok()?.filter_map(Result::ok).filter_map(|entry| {
-                let name = entry.file_name();
-                let number = name.to_str()?.strip_prefix("wayland-")?.parse::<u32>().ok()?;
-                entry.file_type().ok()?.is_socket().then_some((number, name))
-            }).min_by_key(|entry| entry.0).map(|entry| entry.1))
+            let user_bus = zbus::connection::Builder::address(address.as_str())?
+                .build()
+                .await?;
+            let manager = zbus::Proxy::new(
+                &user_bus,
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+            )
+            .await?;
+            anyhow::Ok(
+                manager
+                    .get_property::<Vec<String>>("Environment")
+                    .await?
+                    .into_iter()
+                    .find_map(|entry| {
+                        entry
+                            .strip_prefix("WAYLAND_DISPLAY=")
+                            .map(std::ffi::OsString::from)
+                    })
+                    .filter(|display| {
+                        std::fs::metadata(socket(&runtime, display))
+                            .is_ok_and(|meta| meta.file_type().is_socket())
+                    }),
+            )
+        }
+        .await
+        .ok()
+        .flatten();
+        managed
+            .or_else(|| {
+                std::fs::read_dir(&runtime)
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let number = name
+                            .to_str()?
+                            .strip_prefix("wayland-")?
+                            .parse::<u32>()
+                            .ok()?;
+                        entry
+                            .file_type()
+                            .ok()?
+                            .is_socket()
+                            .then_some((number, name))
+                    })
+                    .min_by_key(|entry| entry.0)
+                    .map(|entry| entry.1)
+            })
             .ok_or_else(|| anyhow::anyhow!("no Wayland socket in {}", runtime.display()))?
     };
     let socket = socket(&runtime, &display);
-    anyhow::ensure!(std::fs::metadata(&socket)?.file_type().is_socket(), "{} is not a Unix socket", socket.display());
+    anyhow::ensure!(
+        std::fs::metadata(&socket)?.file_type().is_socket(),
+        "{} is not a Unix socket",
+        socket.display()
+    );
     Ok((runtime, display))
 }
 
@@ -2755,9 +5156,9 @@ const TOOL_CALLS_FIFO: &str = "tool-calls";
 /// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
 /// Non-blocking and best effort: with no viewer reading the FIFO the open
 /// fails with ENXIO and nothing is sent, so tool calls never wait on it.
-fn signal_tool_call(mark: u8) {
+fn signal_tool_call(dir: &Path, mark: u8) {
     use std::os::unix::fs::OpenOptionsExt;
-    let path = session_workdir_path().join(TOOL_CALLS_FIFO);
+    let path = dir.join(TOOL_CALLS_FIFO);
     if let Ok(mut fifo) = std::fs::OpenOptions::new()
         .write(true)
         .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
@@ -2769,18 +5170,31 @@ fn signal_tool_call(mark: u8) {
 
 /// Marks one tool call in flight for the viewer; the end is sent on drop, so
 /// it goes out whether the call returns, errors or is cancelled.
-struct ToolCallMark;
+struct ToolCallMark(PathBuf, Arc<std::sync::Mutex<usize>>);
 
 impl ToolCallMark {
-    fn begin() -> Self {
-        signal_tool_call(b'B');
-        Self
+    fn begin(dir: &Path, calls: &Arc<std::sync::Mutex<usize>>) -> Self {
+        let mut active = calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *active == 0 {
+            signal_tool_call(dir, b'B');
+        }
+        *active += 1;
+        Self(dir.to_owned(), calls.clone())
     }
 }
 
 impl Drop for ToolCallMark {
     fn drop(&mut self) {
-        signal_tool_call(b'E');
+        let mut active = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active -= 1;
+        if *active == 0 {
+            signal_tool_call(&self.0, b'E');
+        }
     }
 }
 /// How long viewer_open waits for the viewer to show a frame
@@ -2793,17 +5207,25 @@ const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
 /// the reason reported in the viewer outcome. Stderr lands in
 /// {session_dir}/viewer.log so crashes and input-forwarding diagnostics
 /// survive past the spawn.
-async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<std::process::Child, String> {
+async fn spawn_viewer(
+    host_xdg_dir: &Path,
+    width: u32,
+    height: u32,
+) -> Result<SessionProcess, String> {
     let log_path = host_xdg_dir.join("viewer.log");
     let _ = std::fs::remove_file(host_xdg_dir.join(VIEWER_STATUS_FILE));
-    let mut log_file = std::fs::File::create(&log_path).map_err(|error| format!("create {}: {error}", log_path.display()))?;
+    let mut log_file = std::fs::File::create(&log_path)
+        .map_err(|error| format!("create {}: {error}", log_path.display()))?;
     let note = |log_file: &mut std::fs::File, reason: String| {
         let _ = std::io::Write::write_all(log_file, format!("kwin-viewer: {reason}\n").as_bytes());
         eprintln!("session viewer unavailable: {reason}");
         reason
     };
     let Some(bin) = resolve_viewer_binary() else {
-        return Err(note(&mut log_file, "kwin-viewer binary not found next to kwin-mcp".to_owned()));
+        return Err(note(
+            &mut log_file,
+            "kwin-viewer binary not found next to kwin-mcp".to_owned(),
+        ));
     };
     let (runtime, display) = match host_wayland().await {
         Ok(found) => found,
@@ -2818,11 +5240,15 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
                 host = host.trim(),
                 dir = host_xdg_dir.display(),
             );
-            return Err(note(&mut log_file, format!("host Wayland resolution failed: {error:#}; {remote}")));
+            return Err(note(
+                &mut log_file,
+                format!("host Wayland resolution failed: {error:#}; {remote}"),
+            ));
         }
     };
     let mut command = std::process::Command::new(&bin);
-    command.arg(host_xdg_dir)
+    command
+        .arg(host_xdg_dir)
         .arg(width.to_string())
         .arg(height.to_string())
         .env("XDG_RUNTIME_DIR", runtime)
@@ -2830,10 +5256,10 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(log_file));
     terminate_with_parent(&mut command);
-    match command.spawn() {
+    match spawn_session_child(command, false).await {
         Ok(child) => {
             eprintln!("viewer_open: spawned viewer pid={}", child.id());
-            Ok(child)
+            Ok(child.into())
         }
         Err(e) => {
             let reason = format!("spawn failed: {e}");
@@ -2846,25 +5272,46 @@ async fn spawn_viewer(host_xdg_dir: &Path, width: u32, height: u32) -> Result<st
 
 /// The viewer outcome: ready (a frame is showing in a host window), starting,
 /// unavailable with a reason, or closed.
-fn viewer_report(host_xdg_dir: &Path, child: Option<&mut std::process::Child>, unavailable: Option<&str>) -> serde_json::Value {
+fn viewer_report(
+    host_xdg_dir: &Path,
+    child: Option<&mut SessionProcess>,
+    unavailable: Option<&str>,
+) -> serde_json::Value {
     let log = host_xdg_dir.join("viewer.log").display().to_string();
-    let status: Option<serde_json::Value> = std::fs::read_to_string(host_xdg_dir.join(VIEWER_STATUS_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok());
-    let field = |name: &str| status.as_ref().and_then(|value| value[name].as_str()).unwrap_or_default().to_owned();
+    let status: Option<serde_json::Value> =
+        std::fs::read_to_string(host_xdg_dir.join(VIEWER_STATUS_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+    let field = |name: &str| {
+        status
+            .as_ref()
+            .and_then(|value| value[name].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
     let Some(child) = child else {
         let reason = unavailable.unwrap_or("viewer not open");
-        let state = if unavailable.is_some() { "unavailable" } else { "closed" };
+        let state = if unavailable.is_some() {
+            "unavailable"
+        } else {
+            "closed"
+        };
         return serde_json::json!({"state": state, "reason": reason, "log": log});
     };
     if let Ok(Some(exit)) = child.try_wait() {
         let detail = field("detail");
-        let reason = if detail.is_empty() { format!("viewer exited ({exit})") } else { format!("viewer exited ({exit}): {detail}") };
+        let reason = if detail.is_empty() {
+            format!("viewer exited ({exit})")
+        } else {
+            format!("viewer exited ({exit}): {detail}")
+        };
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
     match field("state").as_str() {
         "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
-        "failed" | "closed" => serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log}),
+        "failed" | "closed" => {
+            serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
+        }
         phase => serde_json::json!({
             "state": "starting",
             "phase": if phase.is_empty() { "launching" } else { phase },
@@ -2875,7 +5322,7 @@ fn viewer_report(host_xdg_dir: &Path, child: Option<&mut std::process::Child>, u
 }
 
 /// Poll the viewer until it is ready, has failed, or VIEWER_READY_WAIT passes.
-async fn wait_for_viewer(host_xdg_dir: &Path, child: &mut std::process::Child) -> serde_json::Value {
+async fn wait_for_viewer(host_xdg_dir: &Path, child: &mut SessionProcess) -> serde_json::Value {
     let deadline = std::time::Instant::now() + VIEWER_READY_WAIT;
     loop {
         let report = viewer_report(host_xdg_dir, Some(child), None);
@@ -2891,12 +5338,22 @@ fn viewer_summary(report: &serde_json::Value) -> String {
     match report["state"].as_str().unwrap_or_default() {
         "ready" => "viewer=ready".to_owned(),
         "closed" => "viewer=closed".to_owned(),
-        "starting" => format!("viewer=starting ({})", report["phase"].as_str().unwrap_or_default()),
-        state => format!("viewer={state}: {}", report["reason"].as_str().unwrap_or_default()),
+        "starting" => format!(
+            "viewer=starting ({})",
+            report["phase"].as_str().unwrap_or_default()
+        ),
+        state => format!(
+            "viewer={state}: {}",
+            report["reason"].as_str().unwrap_or_default()
+        ),
     }
 }
 
-async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg_dir: &std::path::Path) -> Result<(i32, i32, WindowGeometry), KwinError> {
+async fn active_window_info(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &std::path::Path,
+) -> Result<(i32, i32, WindowGeometry), KwinError> {
     let json = run_kwin_script(
         conn,
         kwin_unique,
@@ -2910,7 +5367,9 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
     )
     .await?;
     if json == "null" {
-        return Err(KwinError::Msg("KWin script error: No active window".to_owned()));
+        return Err(KwinError::Msg(
+            "KWin script error: No active window".to_owned(),
+        ));
     }
     let info: WindowGeometry = serde_json::from_str(&json)?;
     #[expect(clippy::as_conversions)]
@@ -3041,9 +5500,8 @@ async fn activate_window(
            break;\
          }}"
     );
-    let activated: bool = serde_json::from_str(
-        &run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?,
-    )?;
+    let activated: bool =
+        serde_json::from_str(&run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?)?;
     if !activated {
         return Err(KwinError::Msg(format!("no window with id {window_id}")));
     }
@@ -3176,36 +5634,82 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
     }
     let check = async {
         use atspi::proxy::accessible::ObjectRefExt;
-        let address = atspi::proxy::bus::BusProxy::new(conn).await.ok()?.get_address().await.ok()?;
-        let bus = connect_session_bus(&address, std::time::Instant::now() + KEY_FOCUS_CHECK_TIMEOUT).await.ok()?;
+        let address = atspi::proxy::bus::BusProxy::new(conn)
+            .await
+            .ok()?
+            .get_address()
+            .await
+            .ok()?;
+        let bus = connect_session_bus(
+            &address,
+            std::time::Instant::now() + KEY_FOCUS_CHECK_TIMEOUT,
+        )
+        .await
+        .ok()?;
         let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
-            .destination("org.a11y.atspi.Registry").ok()?
+            .destination("org.a11y.atspi.Registry")
+            .ok()?
             .cache_properties(zbus::proxy::CacheProperties::No)
-            .build().await.ok()?;
+            .build()
+            .await
+            .ok()?;
         let mut visited = 0usize;
         for app in root.get_children().await.ok()? {
-            let Ok(app) = app.as_accessible_proxy(&bus).await else { continue };
+            let Ok(app) = app.as_accessible_proxy(&bus).await else {
+                continue;
+            };
             let name = app.name().await.unwrap_or_default().to_lowercase();
-            if !CHROMIUM_APP_NAMES.iter().any(|browser| name.contains(browser)) { continue }
+            if !CHROMIUM_APP_NAMES
+                .iter()
+                .any(|browser| name.contains(browser))
+            {
+                continue;
+            }
             for frame in app.get_children().await.unwrap_or_default() {
-                let Ok(frame) = frame.as_accessible_proxy(&bus).await else { continue };
+                let Ok(frame) = frame.as_accessible_proxy(&bus).await else {
+                    continue;
+                };
                 // Chromium sets no Active state on its frames; the KWin caption of the
                 // active window starts its frame name (which adds the profile name).
-                if !frame.name().await.unwrap_or_default().starts_with(active_title) { continue }
-                let mut stack: Vec<(atspi::ObjectRefOwned, bool)> =
-                    frame.get_children().await.unwrap_or_default().into_iter().map(|child| (child, false)).collect();
-                let (mut page_seen, mut focused_in_page, mut focused_outside) = (false, false, false);
+                if !frame
+                    .name()
+                    .await
+                    .unwrap_or_default()
+                    .starts_with(active_title)
+                {
+                    continue;
+                }
+                let mut stack: Vec<(atspi::ObjectRefOwned, bool)> = frame
+                    .get_children()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|child| (child, false))
+                    .collect();
+                let (mut page_seen, mut focused_in_page, mut focused_outside) =
+                    (false, false, false);
                 while let Some((object, in_page)) = stack.pop() {
                     visited += 1;
-                    if visited > KEY_FOCUS_CHECK_NODES { return None }
-                    let Ok(node) = object.as_accessible_proxy(&bus).await else { continue };
+                    if visited > KEY_FOCUS_CHECK_NODES {
+                        return None;
+                    }
+                    let Ok(node) = object.as_accessible_proxy(&bus).await else {
+                        continue;
+                    };
                     let states = node.get_state().await.unwrap_or_default();
-                    let page = node.get_role().await.is_ok_and(|role| role == atspi::Role::DocumentWeb)
+                    let page = node
+                        .get_role()
+                        .await
+                        .is_ok_and(|role| role == atspi::Role::DocumentWeb)
                         && states.contains(atspi::State::Showing);
                     let in_page = in_page || page;
                     page_seen |= page;
                     if states.contains(atspi::State::Focused) {
-                        if in_page { focused_in_page = true } else { focused_outside = true }
+                        if in_page {
+                            focused_in_page = true
+                        } else {
+                            focused_outside = true
+                        }
                     }
                     for child in node.get_children().await.unwrap_or_default() {
                         stack.push((child, in_page));
@@ -3218,7 +5722,10 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
         }
         Some(false)
     };
-    matches!(tokio::time::timeout(KEY_FOCUS_CHECK_TIMEOUT, check).await, Ok(Some(true)))
+    matches!(
+        tokio::time::timeout(KEY_FOCUS_CHECK_TIMEOUT, check).await,
+        Ok(Some(true))
+    )
 }
 
 fn tree_field(value: &str) -> String {
@@ -3431,6 +5938,30 @@ struct LaunchAppParams {
     command: String,
 }
 
+async fn poll_launch_window(
+    conn: zbus::Connection,
+    kwin_unique: String,
+    xdg: PathBuf,
+    previous: Option<String>,
+    exit_file: PathBuf,
+) -> Result<Option<WindowGeometry>, McpError> {
+    loop {
+        tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
+        if let Ok((_, _, geometry)) = active_window_info(&conn, &kwin_unique, &xdg).await
+            && previous.as_deref() != Some(&geometry.id)
+        {
+            return Ok(Some(geometry));
+        }
+        if std::fs::read_to_string(&exit_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .is_some_and(|status| status != 0)
+        {
+            return Ok(None);
+        }
+    }
+}
+
 struct LaunchProgress {
     stage: &'static str,
     command_submitted: bool,
@@ -3453,7 +5984,9 @@ fn launch_timeout(progress: &LaunchProgress, timeout: Duration) -> McpError {
     McpError::internal_error(
         format!(
             "launch_app exceeded {} seconds while {}. Command submitted: {}. The session remains open; use window_list before retrying.",
-            timeout.as_secs(), progress.stage, progress.command_submitted,
+            timeout.as_secs(),
+            progress.stage,
+            progress.command_submitted,
         ),
         Some(serde_json::json!({
             "reason": "launch_timeout", "stage": progress.stage,
@@ -3509,9 +6042,16 @@ fn session_start_log_path() -> Option<PathBuf> {
     Some(PathBuf::from(runtime).join("kwin-mcp/session-starts.log"))
 }
 
-fn append_session_start_outcome(started: std::time::Instant, error: Option<&str>) -> std::io::Result<()> {
-    let Some(path) = session_start_log_path() else { return Ok(()) };
-    let Some(parent) = path.parent() else { return Ok(()) };
+fn append_session_start_outcome(
+    started: std::time::Instant,
+    error: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(path) = session_start_log_path() else {
+        return Ok(());
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
     std::fs::create_dir_all(parent)?;
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3525,10 +6065,16 @@ fn append_session_start_outcome(started: std::time::Instant, error: Option<&str>
         std::process::id(),
         env!("GIT_HASH"),
     );
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     // One O_APPEND write keeps records from concurrent server processes together.
     if file.write(line.as_bytes())? != line.len() {
-        return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short session-start log write"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "short session-start log write",
+        ));
     }
     Ok(())
 }
@@ -3540,7 +6086,10 @@ struct SessionStartAttempt {
 
 impl SessionStartAttempt {
     fn new() -> Self {
-        Self { started: std::time::Instant::now(), recorded: false }
+        Self {
+            started: std::time::Instant::now(),
+            recorded: false,
+        }
     }
 
     fn finish(&mut self, error: Option<&str>) {
@@ -3579,10 +6128,27 @@ fn print_session_start_stats(seconds: u64) -> std::io::Result<()> {
             for line in std::io::BufReader::new(file).lines() {
                 let line = line?;
                 let mut fields = line.splitn(6, '\t');
-                let (Some(timestamp), Some(status), Some(_duration), Some(_pid), Some(_commit), Some(error)) =
-                    (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-                else { continue };
-                let Ok(timestamp) = timestamp.parse::<u64>() else { continue };
+                let (
+                    Some(timestamp),
+                    Some(status),
+                    Some(_duration),
+                    Some(_pid),
+                    Some(_commit),
+                    Some(error),
+                ) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                )
+                else {
+                    continue;
+                };
+                let Ok(timestamp) = timestamp.parse::<u64>() else {
+                    continue;
+                };
                 if timestamp < now.saturating_sub(seconds) || timestamp > now {
                     continue;
                 }
@@ -3604,7 +6170,9 @@ fn print_session_start_stats(seconds: u64) -> std::io::Result<()> {
     reasons.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     print!("session_start {successes}/{attempts} last {seconds}s");
     if !reasons.is_empty() {
-        let top = reasons.into_iter().take(5)
+        let top = reasons
+            .into_iter()
+            .take(5)
             .map(|(reason, count)| format!("{count}x {reason}"))
             .collect::<Vec<_>>()
             .join("; ");
@@ -3620,7 +6188,7 @@ impl rmcp::ServerHandler for KwinMcp {
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
                 "KDE Wayland desktop automation in an isolated container. \
-                First call session_start: every other tool fails until it succeeds. It is idempotent (session_stop then session_start to restart). \
+                Call session_start to create an isolated desktop, then pass its session_id to later tools. Call session_stop to close that desktop. \
                 Flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify → session_stop. Prefer find_ui_elements for a named control; use accessibility_tree only when structure helps, and fall back to screenshots if it is empty or costly. If a prompt or app seems missing, call window_list, then window_activate with its ID. \
                 Work without a viewer by default. Call viewer_open whenever the user needs to see something or do something you cannot or must not do (a password, OTP, Duo push, CAPTCHA, a choice, a result); never stop the session or send the user elsewhere for it. Poll with screenshots while they act, continue when the page advances, then call viewer_close. \
                 At a login field in a session browser, click it and pick the saved-credential suggestion: autofill fills it without you reading or typing the value. If none appears, open the viewer. \
@@ -3640,7 +6208,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before every other tool; all fail with 'no session' until this succeeds. Idempotent: if a session is already running, returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Each call without session_id creates a new isolated desktop. Passing an existing session_id returns its bus name and workdir without disturbing it (status=already_running). Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override, and ignored on an already-running session (session_stop first to resize). The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); then call viewer_open, keep the session live, and call viewer_close when that step is done. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -3659,17 +6227,15 @@ impl KwinMcp {
                 return Err(error);
             }
         };
-        if self.ttl_retired.load(std::sync::atomic::Ordering::Acquire) {
-            let error = McpError::internal_error("session expired; this server is retiring", None);
-            attempt.finish(Some(&error.message));
-            return Err(error);
-        }
         {
-            let mut guard = match tokio::time::timeout_at(deadline, self.session.lock()).await {
+            let mut guard = match tokio::time::timeout_at(deadline, self.session.write()).await {
                 Ok(guard) => guard,
                 Err(_) => {
                     let error = McpError::internal_error(
-                        format!("session_start exceeded {}s hard limit while checking for an existing session", SESSION_START_HARD_TIMEOUT.as_secs()),
+                        format!(
+                            "session_start exceeded {}s hard limit while checking for an existing session",
+                            SESSION_START_HARD_TIMEOUT.as_secs()
+                        ),
                         None,
                     );
                     attempt.finish(Some(&error.message));
@@ -3677,12 +6243,22 @@ impl KwinMcp {
                 }
             };
             if let Some(existing) = guard.as_mut() {
-                let bus_name = existing.kwin_conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
+                let bus_name = existing
+                    .kwin_conn
+                    .unique_name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
                 let workdir = existing.host_xdg_dir.display().to_string();
-                let viewer = viewer_report(&existing.host_xdg_dir, existing.viewer_child.as_mut(), existing.viewer_unavailable.as_deref());
+                let viewer = viewer_report(
+                    &existing.host_xdg_dir,
+                    existing.viewer_child.as_mut(),
+                    existing.viewer_unavailable.as_deref(),
+                );
                 let version_stamp = format!(
                     "kwin-mcp v{}.{} ({})",
-                    env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"), env!("GIT_HASH")
+                    env!("CARGO_PKG_VERSION"),
+                    env!("BUILD_NUMBER"),
+                    env!("GIT_HASH")
                 );
                 let msg = format!(
                     "{version_stamp} — session already running bus={bus_name} kwin={} display={}x{} workdir={workdir}. Call session_stop first to restart.",
@@ -3705,7 +6281,12 @@ impl KwinMcp {
         }
         self.set_start_stage("preparing the session workdir");
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
-        let outcome = match tokio::time::timeout_at(deadline, self.session_start_inner(peer, params, host_work.clone())).await {
+        let outcome = match tokio::time::timeout_at(
+            deadline,
+            self.session_start_inner(peer, params, host_work.clone()),
+        )
+        .await
+        {
             Ok(res) => res,
             Err(_) => {
                 let stage = self.start_stage();
@@ -3714,7 +6295,11 @@ impl KwinMcp {
                     SESSION_START_HARD_TIMEOUT.as_secs()
                 );
                 eprintln!("session_start: {message}");
-                let blocked = host_work.lock().ok().and_then(|mut slot| slot.take()).filter(|handle| !handle.is_finished());
+                let blocked = host_work
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .filter(|handle| !handle.is_finished());
                 if let Some(handle) = blocked {
                     // A host call is still blocked in the kernel and may yet
                     // write into the workdir. Keep the gate and the workdir
@@ -3722,20 +6307,34 @@ impl KwinMcp {
                     let this = self.clone();
                     tokio::spawn(async move {
                         let _ = handle.await;
-                        let error = this.autoclean_unpublished_workdir(McpError::internal_error("deferred startup cleanup", None)).await;
-                        eprintln!("session_start: blocked host scan returned; {}", error.message);
+                        let error = this
+                            .autoclean_unpublished_workdir(McpError::internal_error(
+                                "deferred startup cleanup",
+                                None,
+                            ))
+                            .await;
+                        eprintln!(
+                            "session_start: blocked host scan returned; {}",
+                            error.message
+                        );
                         drop(gate);
                     });
                     let error = McpError::internal_error(
-                        format!("{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."),
-                        Some(serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true})),
+                        format!(
+                            "{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."
+                        ),
+                        Some(
+                            serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true}),
+                        ),
                     );
                     attempt.finish(Some(&error.message));
                     return Err(error);
                 }
                 Err(McpError::internal_error(
                     message,
-                    Some(serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": false})),
+                    Some(
+                        serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": false}),
+                    ),
                 ))
             }
         };
@@ -3791,17 +6390,20 @@ impl KwinMcp {
             (w, h)
         };
         eprintln!("session_start: virtual display {screen_w}x{screen_h}");
-        let host_xdg_dir = session_workdir_path();
+        let host_xdg_dir = self.path.clone();
         // Creation and the ownership claim are synchronous with no cancellation
         // point between them. Never claim an existing path from another run.
         std::fs::create_dir(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         if self.display.autoclean {
             self.workdir.claim(&host_xdg_dir);
-            self.workdir.create_lease().map_err(|e| ver_err(format!("create workdir lease: {e}")))?;
+            self.workdir
+                .create_lease()
+                .map_err(|e| ver_err(format!("create workdir lease: {e}")))?;
         }
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
-        create_browser_wrappers(&host_xdg_dir).map_err(|e| ver_err(format!("browser wrappers: {e}")))?;
+        create_browser_wrappers(&host_xdg_dir)
+            .map_err(|e| ver_err(format!("browser wrappers: {e}")))?;
         eprintln!(
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
@@ -3825,27 +6427,37 @@ impl KwinMcp {
         // Write kwin-mcp display config files to host_xdg_dir for --ro-bind mounting.
         // Protected from agent writes: the ro-bind shadows the overlay entry.
         let kwinrc_path = host_xdg_dir.join("kwinrc");
-        std::fs::write(&kwinrc_path,
+        std::fs::write(
+            &kwinrc_path,
             "[org.kde.kdecoration2]\nBorderSize=None\nShadowSize=0\n\n\
-             [Compositing]\nLockScreenAutoLockEnabled=false\n"
-        ).map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
+             [Compositing]\nLockScreenAutoLockEnabled=false\n",
+        )
+        .map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
         let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
-        std::fs::write(&kwinrulesrc_path,
+        std::fs::write(
+            &kwinrulesrc_path,
             "[1]\nDescription=No decorations, maximized\nnoborder=true\nnoborderrule=2\n\
              maximizehoriz=true\nmaximizehorizrule=2\nmaximizevert=true\nmaximizevertrule=2\n\
-             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
-        ).map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n",
+        )
+        .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
         let kscreenlockerrc_path = host_xdg_dir.join("kscreenlockerrc");
-        std::fs::write(&kscreenlockerrc_path,
-            "[Daemon]\nAutolock=false\nLockOnResume=false\nTimeout=0\n"
-        ).map_err(|e| ver_err(format!("write kscreenlockerrc: {e}")))?;
+        std::fs::write(
+            &kscreenlockerrc_path,
+            "[Daemon]\nAutolock=false\nLockOnResume=false\nTimeout=0\n",
+        )
+        .map_err(|e| ver_err(format!("write kscreenlockerrc: {e}")))?;
         let kcmfonts_path = host_xdg_dir.join("kcmfonts");
-        std::fs::write(&kcmfonts_path,
-            format!("[General]\nforceFontDPI={KDE_FORCE_FONT_DPI}\n")
-        ).map_err(|e| ver_err(format!("write kcmfonts: {e}")))?;
+        std::fs::write(
+            &kcmfonts_path,
+            format!("[General]\nforceFontDPI={KDE_FORCE_FONT_DPI}\n"),
+        )
+        .map_err(|e| ver_err(format!("write kcmfonts: {e}")))?;
         let fonts_conf_path = host_xdg_dir.join("fonts.conf");
-        std::fs::write(&fonts_conf_path, format!(
-            "<?xml version=\"1.0\"?>\n\
+        std::fs::write(
+            &fonts_conf_path,
+            format!(
+                "<?xml version=\"1.0\"?>\n\
              <!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
              <fontconfig>\n\
              <match target=\"font\">\n\
@@ -3855,19 +6467,30 @@ impl KwinMcp {
              <edit name=\"rgba\" mode=\"assign\"><const>{KDE_SUB_PIXEL}</const></edit>\n\
              </match>\n\
              </fontconfig>\n"
-        )).map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
+            ),
+        )
+        .map_err(|e| ver_err(format!("write fonts.conf: {e}")))?;
         // Read host kdeglobals and patch display settings for the virtual session
         let home = std::env::var("HOME").map_err(|e| ver_err(e.to_string()))?;
         let overlay_target = PathBuf::from(&home);
         if !overlay_target.is_absolute() {
-            return Err(ver_err(format!("overlay target must be absolute: {}", overlay_target.display())));
+            return Err(ver_err(format!(
+                "overlay target must be absolute: {}",
+                overlay_target.display()
+            )));
         }
         let writable_paths = params.writable_paths.unwrap_or_default();
         for path in &writable_paths {
-            if !path.is_absolute() || !path.starts_with(&overlay_target)
-                || path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+            if !path.is_absolute()
+                || !path.starts_with(&overlay_target)
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
             {
-                return Err(ver_err(format!("writable_paths must contain absolute paths under HOME without '..': {}", path.display())));
+                return Err(ver_err(format!(
+                    "writable_paths must contain absolute paths under HOME without '..': {}",
+                    path.display()
+                )));
             }
         }
         let host_runtime = std::env::var("XDG_RUNTIME_DIR")
@@ -3883,7 +6506,12 @@ impl KwinMcp {
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let _ = view_tx.send(prepare_host_view(&view_target, &view_xdg, &host_runtime, &writable_paths));
+            let _ = view_tx.send(prepare_host_view(
+                &view_target,
+                &view_xdg,
+                &host_runtime,
+                &writable_paths,
+            ));
         });
         if let Ok(mut slot) = host_work.lock() {
             *slot = Some(handle);
@@ -3895,11 +6523,24 @@ impl KwinMcp {
         if let Ok(mut slot) = host_work.lock() {
             slot.take();
         }
-        let HostView { mut overlay_plan, kdeglobals: mut kdeglobals_content } = host_view;
+        let HostView {
+            mut overlay_plan,
+            kdeglobals: mut kdeglobals_content,
+        } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
-        let ui_small = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE_SMALL, FONT_WEIGHT_REGULAR, false);
+        let ui_small = qt_font_spec(
+            UI_FONT_FAMILY,
+            UI_FONT_SIZE_SMALL,
+            FONT_WEIGHT_REGULAR,
+            false,
+        );
         let ui_bold = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_BOLD, true);
-        let fixed = qt_font_spec(FIXED_FONT_FAMILY, FIXED_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
+        let fixed = qt_font_spec(
+            FIXED_FONT_FAMILY,
+            FIXED_FONT_SIZE,
+            FONT_WEIGHT_REGULAR,
+            false,
+        );
         let replacements: [(&str, String); 10] = [
             ("ScaleFactor=", format!("ScaleFactor={KDE_SCALE_FACTOR}")),
             ("ScreenScaleFactors=", "ScreenScaleFactors=".to_owned()),
@@ -3907,7 +6548,10 @@ impl KwinMcp {
             ("XftSubPixel=", format!("XftSubPixel={KDE_SUB_PIXEL}")),
             ("font=", format!("font={ui_regular}")),
             ("menuFont=", format!("menuFont={ui_regular}")),
-            ("smallestReadableFont=", format!("smallestReadableFont={ui_small}")),
+            (
+                "smallestReadableFont=",
+                format!("smallestReadableFont={ui_small}"),
+            ),
             ("toolBarFont=", format!("toolBarFont={ui_regular}")),
             ("activeFont=", format!("activeFont={ui_bold}")),
             ("fixed=", format!("fixed={fixed}")),
@@ -3916,8 +6560,11 @@ impl KwinMcp {
             kdeglobals_content = kdeglobals_content
                 .lines()
                 .map(|line| {
-                    if line.starts_with(prefix) { replacement.clone() }
-                    else { line.to_owned() }
+                    if line.starts_with(prefix) {
+                        replacement.clone()
+                    } else {
+                        line.to_owned()
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -3948,10 +6595,12 @@ impl KwinMcp {
         )).map_err(|e| ver_err(format!("write fontconfig lcd: {e}")))?;
         let fc_hinting_str = fc_hinting_path.display().to_string();
         let fc_lcd_str = fc_lcd_path.display().to_string();
-        let fc_hinting_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/10-hinting-slight.conf")
-            .map_err(|e| ver_err(format!("resolve fontconfig hinting destination: {e}")))?;
-        let fc_lcd_dest = std::fs::canonicalize("/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf")
-            .map_err(|e| ver_err(format!("resolve fontconfig LCD destination: {e}")))?;
+        let fc_hinting_dest =
+            std::fs::canonicalize("/usr/share/fontconfig/conf.default/10-hinting-slight.conf")
+                .map_err(|e| ver_err(format!("resolve fontconfig hinting destination: {e}")))?;
+        let fc_lcd_dest =
+            std::fs::canonicalize("/usr/share/fontconfig/conf.default/11-lcdfilter-default.conf")
+                .map_err(|e| ver_err(format!("resolve fontconfig LCD destination: {e}")))?;
         let fc_hinting_dest_str = fc_hinting_dest.display().to_string();
         let fc_lcd_dest_str = fc_lcd_dest.display().to_string();
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
@@ -4028,7 +6677,9 @@ impl KwinMcp {
         }
         let host_session_bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
             Ok(address) => address,
-            Err(error) => return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup),
+            Err(error) => {
+                return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup);
+            }
         };
         // Session apps reach KWallet through a session-local service on a private
         // bus (see wallet_mediator): a one-time guarded snapshot of the host
@@ -4036,14 +6687,17 @@ impl KwinMcp {
         self.set_start_stage("starting the KWallet mediator");
         let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
         let wallet_bus_config = host_xdg_dir.join("kwallet-bus.conf");
-        if let Err(error) = std::fs::write(&wallet_bus_config, format!(
-            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
+        if let Err(error) = std::fs::write(
+            &wallet_bus_config,
+            format!(
+                "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
              \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
              <busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth>\
              <policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/>\
              <allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>\n",
-            wallet_bus_socket.display()
-        )) {
+                wallet_bus_socket.display()
+            ),
+        ) {
             return cleanup_err(format!("write KWallet bus config: {error}"), &mut startup);
         }
         let mut wallet_bus = std::process::Command::new("dbus-daemon");
@@ -4053,11 +6707,17 @@ impl KwinMcp {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         terminate_with_parent(&mut wallet_bus);
-        match wallet_bus.spawn() {
+        match spawn_session_child(wallet_bus, false).await {
             Ok(child) => startup.add_proxy(child),
             Err(error) => return cleanup_err(format!("start KWallet bus: {error}"), &mut startup),
         }
-        if let Err(error) = wait_for_socket(&wallet_bus_socket, "KWallet bus socket", std::time::Instant::now() + DBUS_PROXY_TIMEOUT).await {
+        if let Err(error) = wait_for_socket(
+            &wallet_bus_socket,
+            "KWallet bus socket",
+            std::time::Instant::now() + DBUS_PROXY_TIMEOUT,
+        )
+        .await
+        {
             return cleanup_err(error, &mut startup);
         }
         let wallet_bus_address = format!("unix:path={}", wallet_bus_socket.display());
@@ -4069,10 +6729,18 @@ impl KwinMcp {
         // session is then served from memory and never reaches the host wallet.
         let wallet_snapshot = match host_bus {
             Ok(host_bus) => wallet_mediator::snapshot(&host_bus).await,
-            Err(error) => wallet_mediator::Snapshot { wallet: None, reason: format!("host session bus unavailable: {error}") },
+            Err(error) => wallet_mediator::Snapshot {
+                wallet: None,
+                reason: format!("host session bus unavailable: {error}"),
+            },
         };
         eprintln!("session_start: KWallet: {}", wallet_snapshot.reason);
-        let wallet = match wallet_mediator::WalletMediator::start(&wallet_bus_address, wallet_snapshot.wallet.clone()).await {
+        let wallet = match wallet_mediator::WalletMediator::start(
+            &wallet_bus_address,
+            wallet_snapshot.wallet.clone(),
+        )
+        .await
+        {
             Ok(mediator) => mediator,
             Err(error) => return cleanup_err(format!("KWallet service: {error}"), &mut startup),
         };
@@ -4157,18 +6825,36 @@ impl KwinMcp {
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
         let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
-            eprintln!("session_start: host IPv4 lookup failed ({error:#}); pasta picks the address itself");
+            eprintln!(
+                "session_start: host IPv4 lookup failed ({error:#}); pasta picks the address itself"
+            );
             None
         });
         // A host address marked noprefixroute leaves pasta without a connected
         // route. Assign the default-route interface's IPv4 address and prefix explicitly.
         if let Some((address, prefix)) = &host_ipv4 {
-            cmd.args(["--address", &address.to_string(), "--netmask", &prefix.to_string()]);
+            cmd.args([
+                "--address",
+                &address.to_string(),
+                "--netmask",
+                &prefix.to_string(),
+            ]);
         }
         cmd.args([
-            "--quiet", "--config-net", "--no-map-gw", "--host-lo-to-ns-lo",
-            "--tcp-ports", &cdp_forward_spec, "--udp-ports", "none",
-            "--tcp-ns", &host_ports_spec, "--udp-ns", &host_ports_spec, "--", "bwrap",
+            "--quiet",
+            "--config-net",
+            "--no-map-gw",
+            "--host-lo-to-ns-lo",
+            "--tcp-ports",
+            &cdp_forward_spec,
+            "--udp-ports",
+            "none",
+            "--tcp-ns",
+            &host_ports_spec,
+            "--udp-ns",
+            &host_ports_spec,
+            "--",
+            "bwrap",
         ]);
         // FUSE needs a process holding CAP_SYS_ADMIN in the user namespace that
         // owns the sandbox's mount namespace. With --uid other than 0, bwrap
@@ -4177,10 +6863,23 @@ impl KwinMcp {
         // namespace for the helper, and the entrypoint nests the namespace
         // that maps the real uid for everything else.
         let fuse = fuse_support();
-        let (sandbox_uid, sandbox_gid) = if fuse.is_some() { ("0", "0") } else { (uid.as_str(), gid.as_str()) };
+        let (sandbox_uid, sandbox_gid) = if fuse.is_some() {
+            ("0", "0")
+        } else {
+            (uid.as_str(), gid.as_str())
+        };
         cmd.args([
-            "--die-with-parent", "--unshare-user", "--uid", sandbox_uid, "--gid", sandbox_gid,
-            "--unshare-pid", "--unshare-uts", "--hostname", host_name, "--unshare-ipc",
+            "--die-with-parent",
+            "--unshare-user",
+            "--uid",
+            sandbox_uid,
+            "--gid",
+            sandbox_gid,
+            "--unshare-pid",
+            "--unshare-uts",
+            "--hostname",
+            host_name,
+            "--unshare-ipc",
         ]);
         overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
         let kwinrc_str = kwinrc_path.display().to_string();
@@ -4202,7 +6901,10 @@ impl KwinMcp {
                 cmd.args(["--dev-bind", "/dev/dri", "/dev/dri"]);
             }
             Some(nodes) => {
-                eprintln!("session_start: /dev/dri nodes shown to the session: {}", nodes.len());
+                eprintln!(
+                    "session_start: /dev/dri nodes shown to the session: {}",
+                    nodes.len()
+                );
                 cmd.args(["--dir", "/dev/dri"]);
                 for node in nodes {
                     cmd.arg("--dev-bind").arg(node).arg(node);
@@ -4210,25 +6912,55 @@ impl KwinMcp {
             }
         }
         cmd.args([
-            "--dev-bind", "/dev/uinput", "/dev/uinput",
-            "--dev-bind", &mouse_evdev_str, &mouse_evdev_str,
-            "--dev-bind", &kbd_evdev_str, &kbd_evdev_str,
-            "--proc", "/proc",
-            "--tmpfs", "/tmp",
-            "--ro-bind-try", &proxy_sock_str, "/run/dbus/system_bus_socket",
-            "--bind", &xdg_dir_str, &xdg_dir_str,
+            "--dev-bind",
+            "/dev/uinput",
+            "/dev/uinput",
+            "--dev-bind",
+            &mouse_evdev_str,
+            &mouse_evdev_str,
+            "--dev-bind",
+            &kbd_evdev_str,
+            &kbd_evdev_str,
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--ro-bind-try",
+            &proxy_sock_str,
+            "/run/dbus/system_bus_socket",
+            "--bind",
+            &xdg_dir_str,
+            &xdg_dir_str,
             // System config overrides (read-only)
-            "--ro-bind", &atspi_conf_path.display().to_string(), "/usr/share/defaults/at-spi2/accessibility.conf",
-            "--ro-bind", &fc_hinting_str, &fc_hinting_dest_str,
-            "--ro-bind", &fc_lcd_str, &fc_lcd_dest_str,
+            "--ro-bind",
+            &atspi_conf_path.display().to_string(),
+            "/usr/share/defaults/at-spi2/accessibility.conf",
+            "--ro-bind",
+            &fc_hinting_str,
+            &fc_hinting_dest_str,
+            "--ro-bind",
+            &fc_lcd_str,
+            &fc_lcd_dest_str,
             // Mask dbus service files so the container's dbus-daemon doesn't auto-activate
             // $HOME config overrides (read-only — protects display settings from agent writes)
-            "--ro-bind", &kwinrc_str, &home_kwinrc,
-            "--ro-bind", &kdeglobals_str, &home_kdeglobals,
-            "--ro-bind", &kwinrulesrc_str, &home_kwinrulesrc,
-            "--ro-bind", &kscreenlockerrc_str, &home_kscreenlockerrc,
-            "--ro-bind", &kcmfonts_str, &home_kcmfonts,
-            "--ro-bind", &fonts_conf_str, &home_fonts_conf,
+            "--ro-bind",
+            &kwinrc_str,
+            &home_kwinrc,
+            "--ro-bind",
+            &kdeglobals_str,
+            &home_kdeglobals,
+            "--ro-bind",
+            &kwinrulesrc_str,
+            &home_kwinrulesrc,
+            "--ro-bind",
+            &kscreenlockerrc_str,
+            &home_kscreenlockerrc,
+            "--ro-bind",
+            &kcmfonts_str,
+            &home_kcmfonts,
+            "--ro-bind",
+            &fonts_conf_str,
+            &home_fonts_conf,
         ]);
         // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
         // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
@@ -4252,22 +6984,45 @@ impl KwinMcp {
                 // /proc/self/exe stays readable after deletion; bwrap will not
                 // bind it directly, so it is copied into the session dir.
                 let exe = host_xdg_dir.join("kwin-mcp-exe");
-                std::fs::copy("/proc/self/exe", &exe).map_err(|e| ver_err(format!("copy running binary for the FUSE bridge: {e}")))?;
+                std::fs::copy("/proc/self/exe", &exe).map_err(|e| {
+                    ver_err(format!("copy running binary for the FUSE bridge: {e}"))
+                })?;
                 let exe = &exe;
-                cmd.args(["--dev-bind", "/dev/fuse", "/dev/fuse", "--cap-add", "CAP_SYS_ADMIN"]);
+                cmd.args([
+                    "--dev-bind",
+                    "/dev/fuse",
+                    "/dev/fuse",
+                    "--cap-add",
+                    "CAP_SYS_ADMIN",
+                ]);
                 for (real, program) in binaries {
                     let hidden = format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR);
                     cmd.arg("--ro-bind").arg(real).arg(&hidden);
                     cmd.arg("--ro-bind").arg(exe).arg(real);
                 }
                 let entrypoint_path = host_xdg_dir.join("entrypoint.sh");
-                std::fs::write(&entrypoint_path, &entrypoint).map_err(|e| ver_err(format!("write entrypoint: {e}")))?;
-                eprintln!("session_start: FUSE bridge enabled ({})", binaries.iter().map(|(_, program)| *program).collect::<Vec<_>>().join(", "));
+                std::fs::write(&entrypoint_path, &entrypoint)
+                    .map_err(|e| ver_err(format!("write entrypoint: {e}")))?;
+                eprintln!(
+                    "session_start: FUSE bridge enabled ({})",
+                    binaries
+                        .iter()
+                        .map(|(_, program)| *program)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 // The AppImage runtime only accepts a setuid-root fusermount
                 // from PATH, which no binary is inside a user namespace; it
                 // takes FUSERMOUNT_PROG as given.
-                let prog = binaries.iter().find(|(_, program)| *program == "fusermount3")
-                    .map(|(real, _)| format!("export FUSERMOUNT_PROG={}\n", shell_quote(&real.display().to_string())))
+                let prog = binaries
+                    .iter()
+                    .find(|(_, program)| *program == "fusermount3")
+                    .map(|(real, _)| {
+                        format!(
+                            "export FUSERMOUNT_PROG={}\n",
+                            shell_quote(&real.display().to_string())
+                        )
+                    })
                     .unwrap_or_default();
                 format!(
                     "{prog}{} --fuse-helper {} </dev/null >/dev/null &\nexec unshare --user --map-user={uid} --map-group={gid} setpriv --inh-caps=-all --ambient-caps=-all bash {}",
@@ -4277,7 +7032,9 @@ impl KwinMcp {
                 )
             }
             None => {
-                eprintln!("session_start: FUSE unavailable on this host (needs /dev/fuse, non-setuid bwrap, setpriv, fusermount)");
+                eprintln!(
+                    "session_start: FUSE unavailable on this host (needs /dev/fuse, non-setuid bwrap, setpriv, fusermount)"
+                );
                 entrypoint.clone()
             }
         };
@@ -4292,21 +7049,34 @@ impl KwinMcp {
             Err(error) => return cleanup_err(format!("create sandbox log: {error}"), &mut startup),
         };
         cmd.stderr(std::process::Stdio::from(sandbox_log));
-        eprintln!("session_start: sandbox stderr: {}", sandbox_log_path.display());
+        eprintln!(
+            "session_start: sandbox stderr: {}",
+            sandbox_log_path.display()
+        );
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
         self.set_start_stage("spawning the pasta and bwrap sandbox");
-        let sandbox_child = match cmd.spawn() {
+        let sandbox_child = match spawn_session_child(cmd, true).await {
             Ok(child) => child,
-            Err(error) => return cleanup_err(format!("start pasta: {error} (install passt)"), &mut startup),
+            Err(error) => {
+                return cleanup_err(
+                    format!("start pasta: {error} (install passt)"),
+                    &mut startup,
+                );
+            }
         };
         startup.sandbox_child = Some(sandbox_child);
-        let sandbox_pid = startup.sandbox_child.as_ref().map(std::process::Child::id).unwrap_or_default();
+        let sandbox_pid = startup
+            .sandbox_child
+            .as_ref()
+            .map(std::process::Child::id)
+            .unwrap_or_default();
         if self.display.autoclean
-            && let Err(error) = self.workdir.mark_sandbox(sandbox_pid) {
-                return cleanup_err(format!("record sandbox owner: {error}"), &mut startup);
-            }
+            && let Err(error) = self.workdir.mark_sandbox(sandbox_pid)
+        {
+            return cleanup_err(format!("record sandbox owner: {error}"), &mut startup);
+        }
         eprintln!("session_start: pasta spawned pid={sandbox_pid:?}");
         if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
@@ -4327,7 +7097,9 @@ impl KwinMcp {
             &dbus_ready_path,
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
-        ).await {
+        )
+        .await
+        {
             return cleanup_err(e, &mut startup);
         }
         eprintln!("session_start: dbus-ready");
@@ -4336,12 +7108,19 @@ impl KwinMcp {
         // Create proxy_conn: claims org.kde.KWin, registers InputDevice objects
         // This must happen BEFORE KWin starts so we own the well-known name
         eprintln!("session_start: creating proxy_conn");
-        let proxy_conn =
-            match connect_session_bus(&bus_addr, std::time::Instant::now() + STARTUP_TIMEOUT).await
-            {
-                Ok(conn) => conn,
-                Err(e) => return cleanup_err(e, &mut startup),
-            };
+        let proxy_stream = std::os::unix::net::UnixStream::connect(host_xdg_dir.join("bus"))
+            .map_err(KwinError::from)?;
+        let proxy_socket: std::os::fd::OwnedFd =
+            proxy_stream.try_clone().map_err(KwinError::from)?.into();
+        proxy_stream
+            .set_nonblocking(true)
+            .map_err(KwinError::from)?;
+        let proxy_stream =
+            tokio::net::UnixStream::from_std(proxy_stream).map_err(KwinError::from)?;
+        let proxy_conn = zbus::connection::Builder::unix_stream(proxy_stream)
+            .build()
+            .await
+            .map_err(KwinError::from)?;
         // Claim org.kde.KWin on proxy_conn (before KWin starts, so we get it first)
         if let Err(e) = proxy_conn.request_name("org.kde.KWin").await {
             return cleanup_err(format!("claim org.kde.KWin: {e}"), &mut startup);
@@ -4361,14 +7140,16 @@ impl KwinMcp {
             .to_string();
         let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
         let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
-        if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await {
+        if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await
+        {
             return cleanup_err(format!("register input devices: {e}"), &mut startup);
         }
         eprintln!("session_start: input devices registered on proxy_conn");
 
         // Signal bridge-ready so the entrypoint starts KWin
         let bridge_ready_path = host_xdg_dir.join("bridge-ready");
-        std::fs::write(&bridge_ready_path, "").map_err(|e| ver_err(format!("write bridge-ready: {e}")))?;
+        std::fs::write(&bridge_ready_path, "")
+            .map_err(|e| ver_err(format!("write bridge-ready: {e}")))?;
         eprintln!("session_start: bridge-ready signaled, KWin starting");
 
         // Create kwin_conn: separate connection for talking to KWin
@@ -4386,7 +7167,9 @@ impl KwinMcp {
             &wayland_socket,
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
-        ).await {
+        )
+        .await
+        {
             return cleanup_err(e, &mut startup);
         }
         eprintln!("session_start: wayland-0 ready");
@@ -4399,34 +7182,43 @@ impl KwinMcp {
         let kwin_unique_name;
         let kwin_deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
         // Skip our own connections
-        let proxy_unique = proxy_conn.unique_name()
-            .map(|n| n.to_string()).unwrap_or_default();
-        let kwin_conn_unique = kwin_conn.unique_name()
-            .map(|n| n.to_string()).unwrap_or_default();
+        let proxy_unique = proxy_conn
+            .unique_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let kwin_conn_unique = kwin_conn
+            .unique_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         loop {
-            let names = dbus_proxy.list_names().await
+            let names = dbus_proxy
+                .list_names()
+                .await
                 .map_err(|e| ver_err(format!("ListNames: {e}")))?;
             let mut found = None;
             for name in &names {
                 let name_str = name.as_str();
-                if !name_str.starts_with(':') { continue; }
-                if name_str == proxy_unique || name_str == kwin_conn_unique { continue; }
+                if !name_str.starts_with(':') {
+                    continue;
+                }
+                if name_str == proxy_unique || name_str == kwin_conn_unique {
+                    continue;
+                }
                 // Quick probe with timeout — Introspect the EIS path
-                let probe_result = tokio::time::timeout(
-                    KWIN_NAME_PROBE_TIMEOUT,
-                    async {
-                        let p: zbus::Proxy = zbus::proxy::Builder::new(&kwin_conn)
-                            .destination(name_str)?
-                            .path("/org/kde/KWin/EIS/RemoteDesktop")?
-                            .interface("org.freedesktop.DBus.Introspectable")?
-                            .build()
-                            .await?;
-                        let r: (String,) = p.call("Introspect", &()).await?;
-                        Ok::<String, zbus::Error>(r.0)
-                    }
-                ).await;
+                let probe_result = tokio::time::timeout(KWIN_NAME_PROBE_TIMEOUT, async {
+                    let p: zbus::Proxy = zbus::proxy::Builder::new(&kwin_conn)
+                        .destination(name_str)?
+                        .path("/org/kde/KWin/EIS/RemoteDesktop")?
+                        .interface("org.freedesktop.DBus.Introspectable")?
+                        .build()
+                        .await?;
+                    let r: (String,) = p.call("Introspect", &()).await?;
+                    Ok::<String, zbus::Error>(r.0)
+                })
+                .await;
                 if let Ok(Ok(xml)) = probe_result
-                    && xml.contains("connectToEIS") {
+                    && xml.contains("connectToEIS")
+                {
                     found = Some(name_str.to_owned());
                     break;
                 }
@@ -4436,7 +7228,10 @@ impl KwinMcp {
                 break;
             }
             if std::time::Instant::now() >= kwin_deadline {
-                return cleanup_err("could not discover KWin unique name".to_owned(), &mut startup);
+                return cleanup_err(
+                    "could not discover KWin unique name".to_owned(),
+                    &mut startup,
+                );
             }
             tokio::time::sleep(STARTUP_POLL).await;
         }
@@ -4475,14 +7270,23 @@ impl KwinMcp {
         // accessibility disabled — Chrome then registers on the AT-SPI bus but
         // exposes zero children. Non-fatal: Qt apps are unaffected either way
         // (QT_LINUX_ACCESSIBILITY_ALWAYS_ON is exported in the entrypoint).
-        if let Err(e) = kwin_conn.call_method(
-            Some("org.a11y.Bus"),
-            "/org/a11y/bus",
-            Some("org.freedesktop.DBus.Properties"),
-            "Set",
-            &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)),
-        ).await {
-            eprintln!("session_start: enabling org.a11y.Status failed (Chromium AT-SPI trees will be empty): {e}");
+        if let Err(e) = kwin_conn
+            .call_method(
+                Some("org.a11y.Bus"),
+                "/org/a11y/bus",
+                Some("org.freedesktop.DBus.Properties"),
+                "Set",
+                &(
+                    "org.a11y.Status",
+                    "IsEnabled",
+                    zbus::zvariant::Value::from(true),
+                ),
+            )
+            .await
+        {
+            eprintln!(
+                "session_start: enabling org.a11y.Status failed (Chromium AT-SPI trees will be empty): {e}"
+            );
         }
 
         let bus_name = kwin_conn
@@ -4490,34 +7294,53 @@ impl KwinMcp {
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
-        let msg = format!("{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}");
+        let msg = format!(
+            "{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}"
+        );
         let viewer = viewer_report(&host_xdg_dir, None, None);
         let msg = format!("{msg} {}", viewer_summary(&viewer));
         let oversized_read_only_files = std::mem::take(&mut overlay_plan.oversized_read_only_files);
-        let msg = if oversized_read_only_files.is_empty() { msg } else {
-            format!("{msg}; {} oversized ancestor file(s) are read-only; see oversized_read_only_files. Request writable_paths on a new session for private writable copies.", oversized_read_only_files.len())
+        let msg = if oversized_read_only_files.is_empty() {
+            msg
+        } else {
+            format!(
+                "{msg}; {} oversized ancestor file(s) are read-only; see oversized_read_only_files. Request writable_paths on a new session for private writable copies.",
+                oversized_read_only_files.len()
+            )
         };
         let socket_links = std::mem::take(&mut overlay_plan.socket_links);
-        let overlay_work_paths = overlay_plan.overlays.iter()
+        let overlay_work_paths = overlay_plan
+            .overlays
+            .iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
-        let mut guard = self.session.lock().await;
+        let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
             kwin_conn,
             _proxy_conn: proxy_conn,
+            _proxy_socket: proxy_socket,
             kwin_unique_name: kwin_unique_name.clone(),
             service_bus_address,
             atspi_bus_address,
             eis,
-            sandbox_child,
-            sandbox_stdin,
+            sandbox_child: sandbox_child.into(),
+            sandbox_stdin: sandbox_stdin.into(),
             host_xdg_dir,
-            _uinput_mouse: uinput_mouse,
-            _uinput_keyboard: uinput_keyboard,
+            _uinput_mouse: std::os::fd::AsFd::as_fd(&uinput_mouse)
+                .try_clone_to_owned()
+                .map_err(KwinError::from)?,
+            _uinput_keyboard: std::os::fd::AsFd::as_fd(&uinput_keyboard)
+                .try_clone_to_owned()
+                .map_err(KwinError::from)?,
             cdp_browser: None,
             cdp_forward_port,
-            service_proxy_children,
+            service_proxy_children: service_proxy_children
+                .into_iter()
+                .map(SessionProcess::from)
+                .collect(),
+            mouse_sysname: input_sysname(&mouse_evdev),
+            kbd_sysname: input_sysname(&kbd_evdev),
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
@@ -4529,7 +7352,10 @@ impl KwinMcp {
             last_input: None,
             fuse_enabled: fuse.is_some(),
             wallet: Some(wallet),
-            wallet_note: wallet_snapshot.wallet.is_none().then(|| wallet_snapshot.reason.clone()),
+            wallet_note: wallet_snapshot
+                .wallet
+                .is_none()
+                .then(|| wallet_snapshot.reason.clone()),
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
@@ -4554,11 +7380,19 @@ impl KwinMcp {
         name = "viewer_open",
         description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Reuses an already open viewer. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
     )]
-    async fn viewer_open(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn viewer_open(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let _gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "viewer_open").await?;
+        let _gate = self
+            .lifecycle_gate(
+                tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT,
+                "viewer_open",
+            )
+            .await?;
         let (host_xdg_dir, width, height) = {
-            let mut guard = self.session.lock().await;
+            let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
@@ -4570,18 +7404,33 @@ impl KwinMcp {
                 let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
                 let message = format!("viewer already open: {}", viewer_summary(&viewer));
                 drop(guard);
-                return Ok(structured_result(&peer, message, serde_json::json!({"status": "already_open", "viewer": viewer})).await);
+                return Ok(structured_result(
+                    &peer,
+                    message,
+                    serde_json::json!({"status": "already_open", "viewer": viewer}),
+                )
+                .await);
             }
-            (sess.host_xdg_dir.clone(), sess.screen_width, sess.screen_height)
+            (
+                sess.host_xdg_dir.clone(),
+                sess.screen_width,
+                sess.screen_height,
+            )
         };
         let spawned = spawn_viewer(&host_xdg_dir, width, height).await;
-        let mut guard = self.session.lock().await;
-        let Some(sess) = guard.as_mut().filter(|sess| sess.host_xdg_dir == host_xdg_dir) else {
+        let mut guard = self.session.write().await;
+        let Some(sess) = guard
+            .as_mut()
+            .filter(|sess| sess.host_xdg_dir == host_xdg_dir)
+        else {
             // The session stopped while the viewer was starting.
             if let Ok(child) = spawned {
                 terminate_child(child, false, "orphaned viewer");
             }
-            return Err(McpError::internal_error("session stopped while opening the viewer", None));
+            return Err(McpError::internal_error(
+                "session stopped while opening the viewer",
+                None,
+            ));
         };
         match spawned {
             Ok(child) => {
@@ -4599,8 +7448,11 @@ impl KwinMcp {
             Some(child) if unavailable.is_none() => wait_for_viewer(&host_xdg_dir, child).await,
             _ => viewer_report(&host_xdg_dir, None, unavailable.as_deref()),
         };
-        let mut guard = self.session.lock().await;
-        match guard.as_mut().filter(|sess| sess.host_xdg_dir == host_xdg_dir) {
+        let mut guard = self.session.write().await;
+        match guard
+            .as_mut()
+            .filter(|sess| sess.host_xdg_dir == host_xdg_dir)
+        {
             Some(sess) => sess.viewer_child = child,
             None => {
                 if let Some(child) = child {
@@ -4609,18 +7461,35 @@ impl KwinMcp {
             }
         }
         drop(guard);
-        let status = if viewer["state"] == "unavailable" { "unavailable" } else { "opened" };
-        Ok(structured_result(&peer, format!("viewer {status}: {}", viewer_summary(&viewer)), serde_json::json!({"status": status, "viewer": viewer})).await)
+        let status = if viewer["state"] == "unavailable" {
+            "unavailable"
+        } else {
+            "opened"
+        };
+        Ok(structured_result(
+            &peer,
+            format!("viewer {status}: {}", viewer_summary(&viewer)),
+            serde_json::json!({"status": status, "viewer": viewer}),
+        )
+        .await)
     }
 
     #[rmcp::tool(
         name = "viewer_close",
         description = "Close the host viewer window after the user-facing step is done, without stopping the isolated session. No-op if the viewer is already closed. Call viewer_open again if the user needs to act or asks to watch later."
     )]
-    async fn viewer_close(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn viewer_close(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let _gate = self.lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "viewer_close").await?;
-        let mut guard = self.session.lock().await;
+        let _gate = self
+            .lifecycle_gate(
+                tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT,
+                "viewer_close",
+            )
+            .await?;
+        let mut guard = self.session.write().await;
         let sess = guard.as_mut().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
@@ -4635,7 +7504,12 @@ impl KwinMcp {
             "already_closed"
         };
         let viewer = viewer_report(&host_xdg_dir, None, None);
-        Ok(structured_result(&peer, format!("viewer {status}"), serde_json::json!({"status": status, "viewer": viewer})).await)
+        Ok(structured_result(
+            &peer,
+            format!("viewer {status}"),
+            serde_json::json!({"status": status, "viewer": viewer}),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -4643,16 +7517,22 @@ impl KwinMcp {
         description = "Tear down the current session and its container processes. With --autoclean or --ttl, remove the session workdir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
-    async fn session_stop(&self, peer: rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn session_stop(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         // Serialize stop with the entire start attempt, including workdir
         // creation and failed-start cleanup. Without this gate, stop can see no
         // published Session, delete a workdir that startup is still using, and
         // release cleanup ownership while start continues against the path.
         let _start_gate = self
-            .lifecycle_gate(tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT, "session_stop")
+            .lifecycle_gate(
+                tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT,
+                "session_stop",
+            )
             .await?;
-        let stopped = self.session.lock().await.take();
+        let stopped = self.session.write().await.take();
         let had_session = stopped.is_some();
         if let Some(sess) = stopped {
             teardown_blocking(sess).await;
@@ -4660,9 +7540,19 @@ impl KwinMcp {
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
                 return Ok(if had_session {
-                    structured_result(&peer, "session stopped", serde_json::json!({"status": "stopped"})).await
+                    structured_result(
+                        &peer,
+                        "session stopped",
+                        serde_json::json!({"status": "stopped"}),
+                    )
+                    .await
                 } else {
-                    structured_result(&peer, "no session running", serde_json::json!({"status": "none"})).await
+                    structured_result(
+                        &peer,
+                        "no session running",
+                        serde_json::json!({"status": "none"}),
+                    )
+                    .await
                 });
             }
             WorkdirCleanup::Removed(dir) => dir,
@@ -4670,7 +7560,11 @@ impl KwinMcp {
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
-                let stopped_note = if had_session { "session stopped, but " } else { "" };
+                let stopped_note = if had_session {
+                    "session stopped, but "
+                } else {
+                    ""
+                };
                 return Err(McpError::internal_error(
                     format!(
                         "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
@@ -4682,14 +7576,25 @@ impl KwinMcp {
         };
         let workdir = dir.display().to_string();
         let (status, message) = if had_session {
-            ("stopped", format!("session stopped, workdir {workdir} removed"))
+            (
+                "stopped",
+                format!("session stopped, workdir {workdir} removed"),
+            )
         } else {
-            ("cleaned", format!("no session running, leftover workdir {workdir} removed"))
+            (
+                "cleaned",
+                format!("no session running, leftover workdir {workdir} removed"),
+            )
         };
-        Ok(structured_result(&peer, message, serde_json::json!({
-            "status": status,
-            "workdir_removed": workdir,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            message,
+            serde_json::json!({
+                "status": status,
+                "workdir_removed": workdir,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -4753,28 +7658,66 @@ impl KwinMcp {
     // PNG (with transparent padding and soft shadow); we shift its origin by the
     // hardcoded CURSOR_HOTSPOT_* offsets instead of cropping at runtime.
     fn overlay_cursor(rgba: &mut [u8], img_w: u32, img_h: u32, cx: i32, cy: i32) {
-        let Some(sprite) = cursor_sprite() else { return };
+        let Some(sprite) = cursor_sprite() else {
+            return;
+        };
         let origin_x = cx - CURSOR_HOTSPOT_X;
         let origin_y = cy - CURSOR_HOTSPOT_Y;
         for dy in 0..sprite.h {
-            let Ok(dy_i) = i32::try_from(dy) else { continue };
+            let Ok(dy_i) = i32::try_from(dy) else {
+                continue;
+            };
             let py = origin_y + dy_i;
-            if py < 0 { continue; }
-            let Ok(py_u) = u32::try_from(py) else { continue };
-            if py_u >= img_h { continue; }
+            if py < 0 {
+                continue;
+            }
+            let Ok(py_u) = u32::try_from(py) else {
+                continue;
+            };
+            if py_u >= img_h {
+                continue;
+            }
             for dx in 0..sprite.w {
-                let Ok(dx_i) = i32::try_from(dx) else { continue };
+                let Ok(dx_i) = i32::try_from(dx) else {
+                    continue;
+                };
                 let px = origin_x + dx_i;
-                if px < 0 { continue; }
-                let Ok(px_u) = u32::try_from(px) else { continue };
-                if px_u >= img_w { continue; }
-                let Some(s_lin) = dy.checked_mul(sprite.w).and_then(|v| v.checked_add(dx)).and_then(|v| v.checked_mul(4)) else { continue };
-                let Some(d_lin) = py_u.checked_mul(img_w).and_then(|v| v.checked_add(px_u)).and_then(|v| v.checked_mul(4)) else { continue };
-                let Ok(s) = usize::try_from(s_lin) else { continue };
-                let Ok(d) = usize::try_from(d_lin) else { continue };
-                if s + 3 >= sprite.rgba.len() || d + 3 >= rgba.len() { continue; }
+                if px < 0 {
+                    continue;
+                }
+                let Ok(px_u) = u32::try_from(px) else {
+                    continue;
+                };
+                if px_u >= img_w {
+                    continue;
+                }
+                let Some(s_lin) = dy
+                    .checked_mul(sprite.w)
+                    .and_then(|v| v.checked_add(dx))
+                    .and_then(|v| v.checked_mul(4))
+                else {
+                    continue;
+                };
+                let Some(d_lin) = py_u
+                    .checked_mul(img_w)
+                    .and_then(|v| v.checked_add(px_u))
+                    .and_then(|v| v.checked_mul(4))
+                else {
+                    continue;
+                };
+                let Ok(s) = usize::try_from(s_lin) else {
+                    continue;
+                };
+                let Ok(d) = usize::try_from(d_lin) else {
+                    continue;
+                };
+                if s + 3 >= sprite.rgba.len() || d + 3 >= rgba.len() {
+                    continue;
+                }
                 let a = u32::from(sprite.rgba[s + 3]);
-                if a == 0 { continue; }
+                if a == 0 {
+                    continue;
+                }
                 let inv = 255 - a;
                 for c in 0..3 {
                     let src_c = u32::from(sprite.rgba[s + c]);
@@ -4797,9 +7740,17 @@ impl KwinMcp {
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        tokio::time::timeout(SCREENSHOT_TOOL_TIMEOUT, self.screenshot_result(peer, params))
-            .await
-            .map_err(|_| McpError::internal_error("screenshot: capture exceeded 20 seconds; the session remains open", None))?
+        tokio::time::timeout(
+            SCREENSHOT_TOOL_TIMEOUT,
+            self.screenshot_result(peer, params),
+        )
+        .await
+        .map_err(|_| {
+            McpError::internal_error(
+                "screenshot: capture exceeded 20 seconds; the session remains open",
+                None,
+            )
+        })?
     }
 
     async fn screenshot_result(
@@ -4811,7 +7762,10 @@ impl KwinMcp {
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
         if params.cursor && params.region.is_some() {
-            return Err(McpError::invalid_params("region and cursor are mutually exclusive", None));
+            return Err(McpError::invalid_params(
+                "region and cursor are mutually exclusive",
+                None,
+            ));
         }
         let (win_x, win_y, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
         #[expect(clippy::as_conversions)]
@@ -4822,7 +7776,10 @@ impl KwinMcp {
         // window edges (e.g. to include a popup) and is clamped to the screen.
         let region = if params.cursor {
             #[expect(clippy::as_conversions)]
-            let (cx, cy) = (win_geo.cx.round() as i32 - win_x, win_geo.cy.round() as i32 - win_y);
+            let (cx, cy) = (
+                win_geo.cx.round() as i32 - win_x,
+                win_geo.cy.round() as i32 - win_y,
+            );
             [
                 cx - CURSOR_ZOOM_HALF_EDGE,
                 cy - CURSOR_ZOOM_HALF_EDGE,
@@ -4838,7 +7795,8 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let (width, height, stride, pixels, settle) = capture_settled_frame(&proxy, self.last_input().await).await?;
+        let (width, height, stride, pixels, settle) =
+            capture_settled_frame(&proxy, self.last_input().await).await?;
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
@@ -4854,8 +7812,16 @@ impl KwinMcp {
         }
         // Window-relative region -> clamped display rectangle.
         let [x1, y1, x2, y2] = region;
-        let clamp_x = |v: i32| u32::try_from(v.saturating_add(win_x).max(0)).unwrap_or(0).min(width);
-        let clamp_y = |v: i32| u32::try_from(v.saturating_add(win_y).max(0)).unwrap_or(0).min(height);
+        let clamp_x = |v: i32| {
+            u32::try_from(v.saturating_add(win_x).max(0))
+                .unwrap_or(0)
+                .min(width)
+        };
+        let clamp_y = |v: i32| {
+            u32::try_from(v.saturating_add(win_y).max(0))
+                .unwrap_or(0)
+                .min(height)
+        };
         let (cx1, cy1, cx2, cy2) = (clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2));
         let cw = cx2.saturating_sub(cx1);
         let ch = cy2.saturating_sub(cy1);
@@ -4867,7 +7833,8 @@ impl KwinMcp {
         }
         let mut out_rgba = vec![0u8; usize::try_from(cw * ch * 4).map_err(KwinError::from)?];
         for row in 0..ch {
-            let src = usize::try_from((cy1 + row) * width * 4 + cx1 * 4).map_err(KwinError::from)?;
+            let src =
+                usize::try_from((cy1 + row) * width * 4 + cx1 * 4).map_err(KwinError::from)?;
             let dst = usize::try_from(row * cw * 4).map_err(KwinError::from)?;
             let len = usize::try_from(cw * 4).map_err(KwinError::from)?;
             out_rgba[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
@@ -4876,7 +7843,12 @@ impl KwinMcp {
         // Image pixel (0,0) in window-relative input coordinates.
         let origin_x = i32::try_from(cx1).map_err(KwinError::from)? - win_x;
         let origin_y = i32::try_from(cy1).map_err(KwinError::from)? - win_y;
-        let out_region = [origin_x, origin_y, origin_x + i32::try_from(cw).map_err(KwinError::from)?, origin_y + i32::try_from(ch).map_err(KwinError::from)?];
+        let out_region = [
+            origin_x,
+            origin_y,
+            origin_x + i32::try_from(cw).map_err(KwinError::from)?,
+            origin_y + i32::try_from(ch).map_err(KwinError::from)?,
+        ];
         // Overlay the high-visibility cursor; its position is absolute on the
         // screen, so shift it into the output frame by the crop's display origin.
         #[expect(clippy::as_conversions)]
@@ -4885,7 +7857,13 @@ impl KwinMcp {
         let cursor_abs_y = win_geo.cy.round() as i32;
         let crop_ox_i = i32::try_from(cx1).unwrap_or(0);
         let crop_oy_i = i32::try_from(cy1).unwrap_or(0);
-        Self::overlay_cursor(&mut out_rgba, out_w, out_h, cursor_abs_x - crop_ox_i, cursor_abs_y - crop_oy_i);
+        Self::overlay_cursor(
+            &mut out_rgba,
+            out_w,
+            out_h,
+            cursor_abs_x - crop_ox_i,
+            cursor_abs_y - crop_oy_i,
+        );
         let path = xdg.join("screenshot.png");
         let mut png_bytes: Vec<u8> = Vec::new();
         {
@@ -4893,7 +7871,9 @@ impl KwinMcp {
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             let mut writer = enc.write_header().map_err(KwinError::from)?;
-            writer.write_image_data(&out_rgba).map_err(KwinError::from)?;
+            writer
+                .write_image_data(&out_rgba)
+                .map_err(KwinError::from)?;
         }
         // Never leave a partial or stale capture at the path: on failure the
         // previous screenshot is removed too, so the file is always this call's.
@@ -4905,7 +7885,9 @@ impl KwinMcp {
             eprintln!("screenshot: {error}");
             if !params.inline {
                 return Err(McpError::internal_error(
-                    format!("screenshot captured but not saved: {error}. Pass inline=true to receive the image without writing it."),
+                    format!(
+                        "screenshot captured but not saved: {error}. Pass inline=true to receive the image without writing it."
+                    ),
                     Some(serde_json::json!({"reason": "write_failed"})),
                 ));
             }
@@ -4949,10 +7931,12 @@ impl KwinMcp {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
-            let _ = peer.notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
-                rmcp::model::LoggingLevel::Info,
-                serde_json::json!(text),
-            )).await;
+            let _ = peer
+                .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
+                    rmcp::model::LoggingLevel::Info,
+                    serde_json::json!(text),
+                ))
+                .await;
             Ok(CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
@@ -4973,9 +7957,17 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, self.accessibility_tree_result(peer, params))
-            .await
-            .map_err(|_| McpError::internal_error("accessibility_tree: traversal exceeded 5 seconds; the session remains open", None))?
+        tokio::time::timeout(
+            ATSPI_TRAVERSAL_TIMEOUT,
+            self.accessibility_tree_result(peer, params),
+        )
+        .await
+        .map_err(|_| {
+            McpError::internal_error(
+                "accessibility_tree: traversal exceeded 5 seconds; the session remains open",
+                None,
+            )
+        })?
     }
 
     async fn accessibility_tree_result(
@@ -4997,7 +7989,7 @@ impl KwinMcp {
         // CDP path for Chromium/Electron apps
         let cdp_browser = self
             .session
-            .lock()
+            .read()
             .await
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
@@ -5024,14 +8016,15 @@ impl KwinMcp {
                     .collect();
                 let text = |i: usize| -> Option<String> {
                     let node = &returns.nodes[i];
-                    let value =
-                        |v: &Option<chromiumoxide::cdp::browser_protocol::accessibility::AxValue>| {
-                            v.as_ref()
-                                .and_then(|v| v.value.as_ref())
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_owned()
-                        };
+                    let value = |v: &Option<
+                        chromiumoxide::cdp::browser_protocol::accessibility::AxValue,
+                    >| {
+                        v.as_ref()
+                            .and_then(|v| v.value.as_ref())
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned()
+                    };
                     let (role, name) = (value(&node.role), value(&node.name));
                     let shown = (!node.ignored || show_elements)
                         && (!name.is_empty() || show_elements)
@@ -5071,8 +8064,11 @@ impl KwinMcp {
                         }
                         let forced = params.root.is_some() && parent.is_none();
                         if let Some(line) = text(i).or_else(|| forced.then(|| "root".to_owned())) {
-                            let at =
-                                tree.push(line, returns.nodes[i].node_id.inner().to_string(), parent);
+                            let at = tree.push(
+                                line,
+                                returns.nodes[i].node_id.inner().to_string(),
+                                parent,
+                            );
                             level.push((i, at));
                         } else {
                             for child in returns.nodes[i].child_ids.iter().flatten().rev() {
@@ -5140,7 +8136,8 @@ impl KwinMcp {
         };
         let mut tree = LevelTree::default();
         // Level 0: the requested root, or the first shown nodes of each matching app.
-        let mut level: Vec<(usize, atspi::proxy::accessible::AccessibleProxy<'static>)> = Vec::new();
+        let mut level: Vec<(usize, atspi::proxy::accessible::AccessibleProxy<'static>)> =
+            Vec::new();
         let mut pending: Vec<(
             atspi::proxy::accessible::AccessibleProxy<'static>,
             Option<usize>,
@@ -5223,7 +8220,8 @@ impl KwinMcp {
                     .rev()
                 {
                     if let Some(dest) = child.name()
-                        && let Ok(child) = proxy_at(dest.to_string(), child.path().to_string()).await
+                        && let Ok(child) =
+                            proxy_at(dest.to_string(), child.path().to_string()).await
                     {
                         pending.push((child, Some(at)));
                     }
@@ -5248,7 +8246,10 @@ impl KwinMcp {
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
 
-        let cdp_browser = self.session.lock().await
+        let cdp_browser = self
+            .session
+            .read()
+            .await
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
 
@@ -5270,7 +8271,14 @@ impl KwinMcp {
                             })
                     )"#;
                     #[derive(Deserialize)]
-                    struct CdpElement { role: String, text: String, x: i32, y: i32, w: i32, h: i32 }
+                    struct CdpElement {
+                        role: String,
+                        text: String,
+                        x: i32,
+                        y: i32,
+                        w: i32,
+                        h: i32,
+                    }
                     for page in &pages {
                         let url = page.url().await.ok().flatten().unwrap_or_default();
                         if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
@@ -5282,7 +8290,8 @@ impl KwinMcp {
                             && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
                         {
                             for el in &elements {
-                                if el.w > 1 && el.h > 1
+                                if el.w > 1
+                                    && el.h > 1
                                     && (el.text.to_lowercase().contains(&query)
                                         || el.role.to_lowercase().contains(&query))
                                 {
@@ -5300,18 +8309,19 @@ impl KwinMcp {
                 // AT-SPI path for native apps (5s timeout)
                 let atspi_result = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
                     use atspi::proxy::accessible::ObjectRefExt;
-                    let zbus_conn = self.with_session(|s| {
-                        Ok(s.kwin_conn.clone())
-                    }).await?;
+                    let zbus_conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
                     let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
                         .await
                         .map_err(KwinError::from)?
                         .get_address()
                         .await
                         .map_err(KwinError::from)?;
-                    let a11y_bus = connect_session_bus(&a11y_addr, std::time::Instant::now() + STARTUP_TIMEOUT)
-                        .await
-                        .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
+                    let a11y_bus = connect_session_bus(
+                        &a11y_addr,
+                        std::time::Instant::now() + STARTUP_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
                     let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
                         .destination("org.a11y.atspi.Registry")
                         .map_err(KwinError::from)?
@@ -5346,12 +8356,19 @@ impl KwinMcp {
                                 node.role, node.name, x, y, w, h
                             ));
                         }
-                        for child in acc.get_children().await.unwrap_or_default().into_iter().rev() {
+                        for child in acc
+                            .get_children()
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .rev()
+                        {
                             stack.push(child);
                         }
                     }
                     Ok::<Vec<String>, McpError>(results)
-                }).await;
+                })
+                .await;
                 match atspi_result {
                     Ok(Ok(results)) => out.extend(results),
                     Ok(Err(e)) => return Err(e),
@@ -5361,7 +8378,12 @@ impl KwinMcp {
         }
 
         if out.is_empty() {
-            Ok(structured_result(&peer, format!("no elements matching '{}'", params.query), serde_json::json!({"matches": 0, "query": params.query})).await)
+            Ok(structured_result(
+                &peer,
+                format!("no elements matching '{}'", params.query),
+                serde_json::json!({"matches": 0, "query": params.query}),
+            )
+            .await)
         } else {
             let results = out.join("\n");
             Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
@@ -5380,18 +8402,26 @@ impl KwinMcp {
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(
+            &self.kwin_conn().await?,
+            &self.kwin_unique_name().await?,
+            &self.host_xdg_dir().await?,
+        )
+        .await?;
         let code = btn_code(params.button.as_deref())?;
         let count = match (params.triple, params.double) {
             (Some(true), _) => 3,
             (_, Some(true)) => 2,
             (Some(false) | None, Some(false) | None) => 1,
         };
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        let (ax, ay) = (
+            f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
+            f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
+        );
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         tokio::time::sleep(MOVE_TO_CLICK_DELAY).await;
         for n in 0..count {
@@ -5404,9 +8434,14 @@ impl KwinMcp {
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("clicked ({x},{y}) x{count}"), serde_json::json!({
-            "action": "click", "x": x, "y": y, "count": count,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("clicked ({x},{y}) x{count}"),
+            serde_json::json!({
+                "action": "click", "x": x, "y": y, "count": count,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5422,18 +8457,31 @@ impl KwinMcp {
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
-        let guard = self.session.lock().await;
+        let (wx, wy, _) = active_window_info(
+            &self.kwin_conn().await?,
+            &self.kwin_unique_name().await?,
+            &self.host_xdg_dir().await?,
+        )
+        .await?;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        let (ax, ay) = (
+            f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
+            f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
+        );
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("moved ({x},{y})"), serde_json::json!({
-            "action": "move", "x": x, "y": y,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("moved ({x},{y})"),
+            serde_json::json!({
+                "action": "move", "x": x, "y": y,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5449,27 +8497,41 @@ impl KwinMcp {
         let x = params.x;
         let y = params.y;
         let delta = params.delta;
-        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
-        let guard = self.session.lock().await;
+        let (wx, wy, _) = active_window_info(
+            &self.kwin_conn().await?,
+            &self.kwin_unique_name().await?,
+            &self.host_xdg_dir().await?,
+        )
+        .await?;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let (ax, ay) = (f32::from(i16::try_from(wx + x).map_err(KwinError::from)?), f32::from(i16::try_from(wy + y).map_err(KwinError::from)?));
+        let (ax, ay) = (
+            f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
+            f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
+        );
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         let horiz = params.horizontal.unwrap_or_default();
         if params.discrete.unwrap_or_default() {
             let (dx, dy) = if horiz { (delta, 0) } else { (0, delta) };
             sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
         } else {
-            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?) * SCROLL_SMOOTH_PIXELS_PER_TICK;
+            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?)
+                * SCROLL_SMOOTH_PIXELS_PER_TICK;
             let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
             sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("scrolled {delta} at ({x},{y})"), serde_json::json!({
-            "action": "scroll", "x": x, "y": y, "delta": delta,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("scrolled {delta} at ({x},{y})"),
+            serde_json::json!({
+                "action": "scroll", "x": x, "y": y, "delta": delta,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5486,9 +8548,14 @@ impl KwinMcp {
         let from_y = params.from_y;
         let to_x = params.to_x;
         let to_y = params.to_y;
-        let (wx, wy, _) = active_window_info(&self.kwin_conn().await?, &self.kwin_unique_name().await?, &self.host_xdg_dir().await?).await?;
+        let (wx, wy, _) = active_window_info(
+            &self.kwin_conn().await?,
+            &self.kwin_unique_name().await?,
+            &self.host_xdg_dir().await?,
+        )
+        .await?;
         let code = btn_code(params.button.as_deref())?;
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
@@ -5497,17 +8564,28 @@ impl KwinMcp {
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         sess.eis.button(code, true).map_err(KwinError::from)?;
         for step in 1..=DRAG_STEPS {
-            let cx = f32::from(i16::try_from(wx + from_x + (to_x - from_x) * step / DRAG_STEPS).map_err(KwinError::from)?);
-            let cy = f32::from(i16::try_from(wy + from_y + (to_y - from_y) * step / DRAG_STEPS).map_err(KwinError::from)?);
+            let cx = f32::from(
+                i16::try_from(wx + from_x + (to_x - from_x) * step / DRAG_STEPS)
+                    .map_err(KwinError::from)?,
+            );
+            let cy = f32::from(
+                i16::try_from(wy + from_y + (to_y - from_y) * step / DRAG_STEPS)
+                    .map_err(KwinError::from)?,
+            );
             sess.eis.move_abs(cx, cy).map_err(KwinError::from)?;
             tokio::time::sleep(INPUT_EVENT_DELAY).await;
         }
         sess.eis.button(code, false).map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("dragged ({from_x},{from_y})->({to_x},{to_y})"), serde_json::json!({
-            "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("dragged ({from_x},{from_y})->({to_x},{to_y})"),
+            serde_json::json!({
+                "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5520,19 +8598,27 @@ impl KwinMcp {
         Parameters(params): Parameters<KeyboardTypeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
         // Resolve every character before sending anything, so an unsupported
         // character never leaves half the text typed.
-        let keys = params.text.chars().map(char_key).collect::<Result<Vec<_>, _>>()?;
+        let keys = params
+            .text
+            .chars()
+            .map(char_key)
+            .collect::<Result<Vec<_>, _>>()?;
         for (typed, (code, needs_shift)) in keys.iter().enumerate() {
             let sent = (|| {
-                if *needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, true)?; }
+                if *needs_shift {
+                    sess.eis.key(LINUX_KEY_LEFTSHIFT, true)?;
+                }
                 sess.eis.key(*code, true)?;
                 sess.eis.key(*code, false)?;
-                if *needs_shift { sess.eis.key(LINUX_KEY_LEFTSHIFT, false)?; }
+                if *needs_shift {
+                    sess.eis.key(LINUX_KEY_LEFTSHIFT, false)?;
+                }
                 anyhow::Ok(())
             })();
             if let Err(error) = sent {
@@ -5541,18 +8627,27 @@ impl KwinMcp {
                 let _ = sess.eis.key(LINUX_KEY_LEFTSHIFT, false);
                 let done: String = params.text.chars().take(typed).collect();
                 let rest: String = params.text.chars().skip(typed).collect();
-                return Err(McpError::internal_error(format!(
-                    "keyboard_type stopped after {typed} of {} characters: {error}. \
+                return Err(McpError::internal_error(
+                    format!(
+                        "keyboard_type stopped after {typed} of {} characters: {error}. \
                      Typed so far: {done:?}. Not typed (character {} may be partly sent): {rest:?}",
-                    keys.len(), typed + 1,
-                ), None));
+                        keys.len(),
+                        typed + 1,
+                    ),
+                    None,
+                ));
             }
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("typed: {}", params.text), serde_json::json!({
-            "action": "type", "text": params.text,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("typed: {}", params.text),
+            serde_json::json!({
+                "action": "type", "text": params.text,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5567,15 +8662,24 @@ impl KwinMcp {
         self.touch_activity().await;
         let (mods, main) = parse_combo(&params.key)?;
         let (conn, kwin_unique, xdg) = self
-            .with_session(|s| Ok((s.kwin_conn.clone(), s.kwin_unique_name.clone(), s.host_xdg_dir.clone())))
+            .with_session(|s| {
+                Ok((
+                    s.kwin_conn.clone(),
+                    s.kwin_unique_name.clone(),
+                    s.host_xdg_dir.clone(),
+                ))
+            })
             .await?;
-        let active_title = active_window_info(&conn, &kwin_unique, &xdg).await.map(|(_, _, geo)| geo.title).unwrap_or_default();
+        let active_title = active_window_info(&conn, &kwin_unique, &xdg)
+            .await
+            .map(|(_, _, geo)| geo.title)
+            .unwrap_or_default();
         let warning = browser_page_unfocused(&conn, &active_title).await.then_some(
             "the browser page did not have keyboard focus when the key was sent (its window was active), \
              so the key went to the browser's own UI, such as the address bar, not to the page; \
              to reach the page, click inside it and send the key again",
         );
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
@@ -5601,21 +8705,27 @@ impl KwinMcp {
             Some(warning) => format!("key: {}. warning: {warning}", params.key),
             None => format!("key: {}", params.key),
         };
-        Ok(structured_result(&peer, text, serde_json::json!({
-            "action": "key", "key": params.key, "warning": warning,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({
+                "action": "key", "key": params.key, "warning": warning,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
         name = "keyboard_press",
-        description = "Press a key or combo WITHOUT releasing — useful when you need to hold the chord across a screenshot to verify a transient UI (e.g. a menu that opens on combo). Call keyboard_release with the same combo afterwards to release.")]
+        description = "Press a key or combo WITHOUT releasing — useful when you need to hold the chord across a screenshot to verify a transient UI (e.g. a menu that opens on combo). Call keyboard_release with the same combo afterwards to release."
+    )]
     async fn keyboard_press(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
@@ -5630,21 +8740,27 @@ impl KwinMcp {
         sess.eis.key(k, true).map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("press: {}", params.key), serde_json::json!({
-            "action": "press", "key": params.key,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("press: {}", params.key),
+            serde_json::json!({
+                "action": "press", "key": params.key,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
         name = "keyboard_release",
-        description = "Release a key or combo previously pressed via keyboard_press. Pass the same string.")]
+        description = "Release a key or combo previously pressed via keyboard_press. Pass the same string."
+    )]
     async fn keyboard_release(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let guard = self.session.lock().await;
+        let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
@@ -5659,9 +8775,14 @@ impl KwinMcp {
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(&peer, format!("release: {}", params.key), serde_json::json!({
-            "action": "release", "key": params.key,
-        })).await)
+        Ok(structured_result(
+            &peer,
+            format!("release: {}", params.key),
+            serde_json::json!({
+                "action": "release", "key": params.key,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
@@ -5674,17 +8795,28 @@ impl KwinMcp {
         Parameters(params): Parameters<ExportFileParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let sandbox_pid = self.with_session(|sess| Ok(sess.sandbox_child.id())).await?;
+        let sandbox_pid = self
+            .with_session(|sess| Ok(sess.sandbox_child.id()))
+            .await?;
         let session_path = PathBuf::from(&params.session_path);
         if !session_path.is_absolute() {
-            return Err(McpError::invalid_params(format!("session_path must be absolute: {}", params.session_path), None));
+            return Err(McpError::invalid_params(
+                format!("session_path must be absolute: {}", params.session_path),
+                None,
+            ));
         }
-        let mut destination = PathBuf::from(params.host_path.as_deref().unwrap_or(&params.session_path));
+        let mut destination =
+            PathBuf::from(params.host_path.as_deref().unwrap_or(&params.session_path));
         if !destination.is_absolute() {
-            return Err(McpError::invalid_params(format!("host_path must be absolute: {}", destination.display()), None));
+            return Err(McpError::invalid_params(
+                format!("host_path must be absolute: {}", destination.display()),
+                None,
+            ));
         }
         if destination.is_dir() {
-            let name = session_path.file_name().ok_or_else(|| McpError::invalid_params("session_path has no file name", None))?;
+            let name = session_path
+                .file_name()
+                .ok_or_else(|| McpError::invalid_params("session_path has no file name", None))?;
             destination = destination.join(name);
         }
         let overwrite = params.overwrite;
@@ -5707,14 +8839,23 @@ impl KwinMcp {
         .map_err(|error| McpError::internal_error(format!("export task: {error}"), None))?;
         match outcome {
             Ok((destination, bytes)) => {
-                let text = format!("exported {} -> {} ({bytes} bytes, verified)", params.session_path, destination.display());
-                Ok(structured_result(&peer, text, serde_json::json!({
-                    "status": "exported",
-                    "session_path": params.session_path,
-                    "host_path": destination.display().to_string(),
-                    "bytes": bytes,
-                    "verified": true,
-                })).await)
+                let text = format!(
+                    "exported {} -> {} ({bytes} bytes, verified)",
+                    params.session_path,
+                    destination.display()
+                );
+                Ok(structured_result(
+                    &peer,
+                    text,
+                    serde_json::json!({
+                        "status": "exported",
+                        "session_path": params.session_path,
+                        "host_path": destination.display().to_string(),
+                        "bytes": bytes,
+                        "verified": true,
+                    }),
+                )
+                .await)
             }
             Err(reason) => Err(McpError::internal_error(
                 format!("export_file wrote nothing: {reason}"),
@@ -5732,10 +8873,30 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
-        let mut progress = LaunchProgress { stage: "waiting for the session", command_submitted: false };
-        match tokio::time::timeout(LAUNCH_CALL_TIMEOUT, self.launch_app_inner(peer, params, &mut progress)).await {
-            Ok(result) => result,
-            Err(_) => Err(launch_timeout(&progress, LAUNCH_CALL_TIMEOUT)),
+        use tower::ServiceExt;
+        let progress = Arc::new(std::sync::Mutex::new(LaunchProgress {
+            stage: "waiting for the session",
+            command_submitted: false,
+        }));
+        let observed = progress.clone();
+        let service = tower::service_fn(|(peer, params)| {
+            self.launch_app_inner(peer, params, progress.clone())
+        });
+        match tower::timeout::Timeout::new(service, LAUNCH_CALL_TIMEOUT)
+            .oneshot((peer, params))
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if error.is::<tower::timeout::error::Elapsed>() {
+                    let progress = observed.lock().map_err(|_| {
+                        McpError::internal_error("launch progress lock poisoned", None)
+                    })?;
+                    Err(launch_timeout(&progress, LAUNCH_CALL_TIMEOUT))
+                } else {
+                    Err(McpError::internal_error(error.to_string(), None))
+                }
+            }
         }
     }
 
@@ -5743,16 +8904,26 @@ impl KwinMcp {
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: LaunchAppParams,
-        progress: &mut LaunchProgress,
+        progress: Arc<std::sync::Mutex<LaunchProgress>>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        use futures::StreamExt;
         use std::os::fd::AsFd;
         use tokio::io::AsyncWriteExt;
-        use futures::StreamExt;
+        use tower::ServiceExt;
 
         // Record current active window ID before launching
-        let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address, cdp_port, fuse_enabled, wallet_note) = {
-            let guard = self.session.lock().await;
+        let (
+            conn,
+            kwin_unique,
+            xdg,
+            service_bus_address,
+            atspi_bus_address,
+            cdp_port,
+            fuse_enabled,
+            wallet_note,
+        ) = {
+            let guard = self.session.read().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
@@ -5767,8 +8938,11 @@ impl KwinMcp {
                 sess.wallet_note.clone(),
             )
         };
-        progress.stage = "reading the active window before launch";
-        let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg).await
+        if let Ok(mut progress) = progress.lock() {
+            progress.stage = "reading the active window before launch";
+        }
+        let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg)
+            .await
             .map(|(_, _, geo)| geo.id)
             .ok();
 
@@ -5779,7 +8953,11 @@ impl KwinMcp {
         let exit_file = xdg.join(format!("launch-{launch_id}.status"));
         let launch_cmd = format!(
             "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}; echo $? > {}",
-            if fuse_enabled { "" } else { "APPIMAGE_EXTRACT_AND_RUN=1 " },
+            if fuse_enabled {
+                ""
+            } else {
+                "APPIMAGE_EXTRACT_AND_RUN=1 "
+            },
             shell_quote(&xdg.join("browser-bin").display().to_string()),
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
@@ -5787,56 +8965,78 @@ impl KwinMcp {
             shell_quote(&params.command),
             shell_quote(&exit_file.display().to_string()),
         );
-        progress.stage = "submitting the command to the session shell";
+        if let Ok(mut progress) = progress.lock() {
+            progress.stage = "submitting the command to the session shell";
+        }
         let command_path = xdg.join(format!("launch-{launch_id}.sh"));
-        let mut script = std::fs::OpenOptions::new().write(true).create_new(true)
-            .open(&command_path).map_err(KwinError::from)?;
-        let mut command_file = PendingLaunchFile { path: command_path, submitted: false };
+        let mut script = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&command_path)
+            .map_err(KwinError::from)?;
+        let mut command_file = PendingLaunchFile {
+            path: command_path,
+            submitted: false,
+        };
         let quoted_path = shell_quote(&command_file.path.display().to_string());
         let script_body = format!("unlink -- {quoted_path}\n{launch_cmd}");
-        script.write_all(script_body.as_bytes()).map_err(KwinError::from)?;
+        script
+            .write_all(script_body.as_bytes())
+            .map_err(KwinError::from)?;
         drop(script);
         let dispatch = format!("bash {quoted_path}\n");
         // A short pipe write is atomic, so cancellation cannot leave half a
         // shell command that the next launch would complete accidentally.
         if dispatch.len() > nix::libc::PIPE_BUF {
-            return Err(McpError::internal_error("launch command path exceeds the atomic pipe-write limit", None));
+            return Err(McpError::internal_error(
+                "launch command path exceeds the atomic pipe-write limit",
+                None,
+            ));
         }
         {
-            let guard = self.session.lock().await;
+            let guard = self.session.read().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
-            let fd = sess.sandbox_stdin.as_fd().try_clone_to_owned().map_err(KwinError::from)?;
-            let mut pipe = tokio::net::unix::pipe::Sender::from_owned_fd(fd).map_err(KwinError::from)?;
-            pipe.write_all(dispatch.as_bytes()).await.map_err(KwinError::from)?;
-            progress.command_submitted = true;
+            let fd = sess
+                .sandbox_stdin
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(KwinError::from)?;
+            let mut pipe =
+                tokio::net::unix::pipe::Sender::from_owned_fd(fd).map_err(KwinError::from)?;
+            pipe.write_all(dispatch.as_bytes())
+                .await
+                .map_err(KwinError::from)?;
+            if let Ok(mut progress) = progress.lock() {
+                progress.command_submitted = true;
+            }
             command_file.submitted = true;
         }
 
-        // Poll until a NEW window appears (different ID from before launch)
-        let mut win_geo = None;
-        let mut exit_status = None;
-        progress.stage = "waiting for a new window";
-        let window_deadline = tokio::time::Instant::now() + LAUNCH_WINDOW_TIMEOUT;
-        while tokio::time::Instant::now() < window_deadline {
-            tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
-            if tokio::time::Instant::now() >= window_deadline { break }
-            let Ok(window) = tokio::time::timeout_at(window_deadline, active_window_info(&conn, &kwin_unique, &xdg)).await else { break };
-            if let Ok((_, _, geo)) = window
-                && prev_window_id.as_deref() != Some(&geo.id) {
-                win_geo = Some(geo);
-                break;
-            }
-            if exit_status.is_none() {
-                exit_status = std::fs::read_to_string(&exit_file).ok().and_then(|text| text.trim().parse::<i32>().ok());
-            }
-            // A single-instance app exits 0 while another process opens its
-            // window, so only a failure ends the wait.
-            if exit_status.is_some_and(|status| status != 0) {
-                break;
-            }
+        if let Ok(mut progress) = progress.lock() {
+            progress.stage = "waiting for a new window";
         }
+        let waiting = tower::service_fn(|()| {
+            poll_launch_window(
+                conn.clone(),
+                kwin_unique.clone(),
+                xdg.clone(),
+                prev_window_id.clone(),
+                exit_file.clone(),
+            )
+        });
+        let win_geo = match tower::timeout::Timeout::new(waiting, LAUNCH_WINDOW_TIMEOUT)
+            .oneshot(())
+            .await
+        {
+            Ok(geometry) => geometry,
+            Err(error) if error.is::<tower::timeout::error::Elapsed>() => None,
+            Err(error) => return Err(McpError::internal_error(error.to_string(), None)),
+        };
+        let exit_status = std::fs::read_to_string(&exit_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok());
         let _ = std::fs::remove_file(&exit_file);
 
         // The browser wrapper records CDP intent only when it actually ran.
@@ -5844,13 +9044,15 @@ impl KwinMcp {
         let _ = std::fs::remove_file(&browser_marker);
         let mut cdp_connected = false;
         if cdp_requested && win_geo.is_some() {
-            progress.stage = "connecting to browser accessibility";
+            if let Ok(mut progress) = progress.lock() {
+                progress.stage = "connecting to browser accessibility";
+            }
             let cdp_url = format!("http://127.0.0.1:{cdp_port}");
             for _ in 0..CDP_CONNECT_POLLS {
                 match chromiumoxide::Browser::connect(&cdp_url).await {
                     Ok((browser, mut handler)) => {
                         tokio::spawn(async move { while handler.next().await.is_some() {} });
-                        let mut guard = self.session.lock().await;
+                        let mut guard = self.session.write().await;
                         if let Some(sess) = guard.as_mut() {
                             sess.cdp_browser = Some(Arc::new(browser));
                         }
@@ -5869,7 +9071,10 @@ impl KwinMcp {
         let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
             format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
         });
-        let suffix = warning.as_deref().map(|text| format!(". {text}")).unwrap_or_default();
+        let suffix = warning
+            .as_deref()
+            .map(|text| format!(". {text}"))
+            .unwrap_or_default();
         match (win_geo, exit_status) {
             (Some(geo), _) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
                 "action": "launch", "command": params.command, "window": geo.id,
@@ -5974,26 +9179,37 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
         if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
             continue;
         }
-        let (Ok(flags), Ok(metric)) = (
-            u32::from_str_radix(fields[3], 16), fields[6].parse::<u32>()
-        ) else { continue };
+        let (Ok(flags), Ok(metric)) =
+            (u32::from_str_radix(fields[3], 16), fields[6].parse::<u32>())
+        else {
+            continue;
+        };
         if flags & IPV4_ROUTE_UP != 0 && default.is_none_or(|(_, best)| metric < best) {
             default = Some((fields[0], metric));
         }
     }
-    let Some((interface, _)) = default else { return Ok(None) };
+    let Some((interface, _)) = default else {
+        return Ok(None);
+    };
     let (address, mask) = nix::ifaddrs::getifaddrs()?
         .find_map(|entry| {
-            if entry.interface_name != interface { return None; }
+            if entry.interface_name != interface {
+                return None;
+            }
             Some((
                 entry.address.as_ref()?.as_sockaddr_in()?.ip(),
                 entry.netmask.as_ref()?.as_sockaddr_in()?.ip(),
             ))
         })
-        .ok_or_else(|| anyhow::anyhow!("default-route interface {interface} has no IPv4 address and netmask"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("default-route interface {interface} has no IPv4 address and netmask")
+        })?;
     let mask_bits = u32::from(mask);
     let prefix = mask_bits.count_ones();
-    anyhow::ensure!(mask_bits.leading_ones() == prefix, "non-contiguous IPv4 netmask {mask} on {interface}");
+    anyhow::ensure!(
+        mask_bits.leading_ones() == prefix,
+        "non-contiguous IPv4 netmask {mask} on {interface}"
+    );
     Ok(Some((address, prefix)))
 }
 
@@ -6002,7 +9218,8 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
 const SESSION_NOFILE: &str = "--nofile=1024:65536";
 
 fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
 /// Start the pasta and bwrap tree in a bounded systemd user scope.
@@ -6041,33 +9258,44 @@ fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, Stri
     if on_path("prlimit") {
         command.args(["prlimit", SESSION_NOFILE]);
     } else {
-        eprintln!("session_start: prlimit not found; the session keeps the default descriptor limit");
+        eprintln!(
+            "session_start: prlimit not found; the session keeps the default descriptor limit"
+        );
     }
     command.arg("pasta");
     Ok(command)
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
-    let value = args.next().ok_or_else(|| "--ttl requires minutes".to_owned())?;
-    let minutes: u64 = value.parse().map_err(|error| format!("--ttl '{value}': {error}"))?;
-    if minutes == 0 { return Err("--ttl must be positive".to_owned()); }
-    let seconds = minutes.checked_mul(60).ok_or_else(|| "--ttl is too large".to_owned())?;
+    let value = args
+        .next()
+        .ok_or_else(|| "--ttl requires minutes".to_owned())?;
+    let minutes: u64 = value
+        .parse()
+        .map_err(|error| format!("--ttl '{value}': {error}"))?;
+    if minutes == 0 {
+        return Err("--ttl must be positive".to_owned());
+    }
+    let seconds = minutes
+        .checked_mul(60)
+        .ok_or_else(|| "--ttl is too large".to_owned())?;
     Ok(Duration::from_secs(seconds))
 }
 
 fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u32, String> {
-    let v = args.next().ok_or_else(|| format!("{flag} requires a value"))?;
+    let v = args
+        .next()
+        .ok_or_else(|| format!("{flag} requires a value"))?;
     let n: u32 = v.parse().map_err(|e| format!("{flag} '{v}': {e}"))?;
     if !(MIN_SCREEN_DIM..=MAX_SCREEN_DIM).contains(&n) {
-        return Err(format!("{flag} {n} out of range {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}"));
+        return Err(format!(
+            "{flag} {n} out of range {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}"
+        ));
     }
     Ok(n)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let retire_on_ttl = std::env::var(shim_protocol::RETIRE_ON_TTL_ENV).as_deref() == Ok("1");
-    // Consume the shim marker before threads or sandbox apps can inherit it.
-    unsafe { std::env::remove_var(shim_protocol::RETIRE_ON_TTL_ENV); }
     // Inside the sandbox this binary also serves FUSE (see fuse_bridge).
     let mut argv = std::env::args();
     if let Some(program) = argv.next().as_deref().and_then(fuse_bridge::shim_program) {
@@ -6076,11 +9304,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match argv.next().as_deref() {
         Some("--describe") => {
             let display = parse_cli_args_from(argv)?;
-            let server = KwinMcp::new(display);
-            let tool_router = configured_tool_router();
+            let server = SessionRouter::new(display);
             let description = serde_json::json!({
                 "initialize": rmcp::ServerHandler::get_info(&server),
-                "tools": tool_router.list_all(),
+                "tools": server.tools(),
             });
             serde_json::to_writer(std::io::stdout().lock(), &description)?;
             println!();
@@ -6088,7 +9315,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--stats") => {
             let seconds = match argv.next() {
-                Some(value) => value.parse::<u64>().map_err(|error| format!("--stats '{value}': {error}"))?,
+                Some(value) => value
+                    .parse::<u64>()
+                    .map_err(|error| format!("--stats '{value}': {error}"))?,
                 None => DEFAULT_STATS_SECONDS,
             };
             if let Some(extra) = argv.next() {
@@ -6098,17 +9327,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Some("--fuse-helper") => {
-            let socket = argv.next().unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
+            let socket = argv
+                .next()
+                .unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
             fuse_bridge::run_helper(Path::new(&socket))?;
             return Ok(());
         }
         // One orphan sweep, then exit: kwin-mcp-shim runs this on a timer so
         // leaked workdirs are reaped even while no new server starts.
         Some("--sweep-workdirs") => {
-            let owners: std::collections::HashSet<u32> = argv.map(|value| {
-                value.parse::<u32>().ok().filter(|pid| *pid > 1)
-                    .ok_or_else(|| format!("--sweep-workdirs requires owner PIDs greater than 1, got '{value}'"))
-            }).collect::<Result<_, _>>()?;
+            let owners: std::collections::HashSet<u32> = argv
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 1)
+                        .ok_or_else(|| {
+                            format!(
+                                "--sweep-workdirs requires owner PIDs greater than 1, got '{value}'"
+                            )
+                        })
+                })
+                .collect::<Result<_, _>>()?;
             let owners = (!owners.is_empty()).then_some(&owners);
             sweep_orphaned_workdirs(owners)?;
             sweep_dead_owner_workdirs(owners)?;
@@ -6119,7 +9359,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match std::fs::symlink_metadata(&dir) {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => return Err(error.into()),
-                            Ok(_) => return Err(format!("workdir sweep retained {}", dir.display()).into()),
+                            Ok(_) => {
+                                return Err(
+                                    format!("workdir sweep retained {}", dir.display()).into()
+                                );
+                            }
                         }
                     }
                 }
@@ -6128,8 +9372,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {}
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run_server(retire_on_ttl));
+    let restored = restore_state()?;
+    // Consume the handoff marker before runtime threads or applications inherit it.
+    unsafe {
+        std::env::remove_var(RESUME_DESCRIPTOR);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_server(restored));
     // Tokio's stdio reader uses a blocking thread. A signal leaves stdin open,
     // so waiting indefinitely for that thread would keep the server alive
     // after its session and workdir have already been cleaned up.
@@ -6142,7 +9393,14 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
     // agent knows what it can actually run without guessing (issue #28).
     let mut tool_router = KwinMcp::tool_router();
     let browsers = detect_browsers();
-    eprintln!("kwin-mcp: detected browsers: {}", if browsers.is_empty() { "(none)".to_owned() } else { browsers.join(", ") });
+    eprintln!(
+        "kwin-mcp: detected browsers: {}",
+        if browsers.is_empty() {
+            "(none)".to_owned()
+        } else {
+            browsers.join(", ")
+        }
+    );
     if let Some(route) = tool_router.map.get_mut("launch_app") {
         let hint = if browsers.is_empty() {
             "\n\nNo known browser was found on this host's PATH.".to_owned()
@@ -6154,7 +9412,12 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
                 browsers.join(", ")
             )
         };
-        let base = route.attr.description.take().map(std::borrow::Cow::into_owned).unwrap_or_default();
+        let base = route
+            .attr
+            .description
+            .take()
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
     // Every tool call is bracketed for the viewer's input gate.
@@ -6163,7 +9426,7 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
         route.call = std::sync::Arc::new(move |context| {
             let inner = std::sync::Arc::clone(&inner);
             Box::pin(async move {
-                let _mark = ToolCallMark::begin();
+                let _mark = ToolCallMark::begin(&context.service.path, &context.service.tool_calls);
                 inner(context).await
             })
         });
@@ -6171,52 +9434,1119 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
     tool_router
 }
 
-async fn run_server(retire_on_ttl: bool) -> Result<(), Box<dyn std::error::Error>> {
+// Each isolated desktop is a Tower service. The map owns its lifecycle;
+// the shared layer limits execution without serializing reads or other desktops.
+type ToolRoutes = rmcp::handler::server::router::tool::ToolRouter<KwinMcp>;
+type ToolContext = rmcp::service::RequestContext<rmcp::RoleServer>;
+struct SessionCall {
+    request: rmcp::model::CallToolRequestParams,
+    context: ToolContext,
+    routes: Arc<ToolRoutes>,
+}
+
+impl tower::Service<SessionCall> for KwinMcp {
+    type Response = CallToolResult;
+    type Error = McpError;
+    type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, call: SessionCall) -> Self::Future {
+        let session = self.clone();
+        Box::pin(async move {
+            call.routes
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    &session,
+                    call.request,
+                    call.context,
+                ))
+                .await
+        })
+    }
+}
+
+fn input_tool(name: &str) -> bool {
+    name.starts_with("mouse_") || name.starts_with("keyboard_")
+}
+
+#[derive(Clone)]
+struct SessionRouter {
+    sessions: Arc<std::sync::Mutex<std::collections::BTreeMap<String, KwinMcp>>>,
+    next: Arc<std::sync::atomic::AtomicU64>,
+    display: DisplayConfig,
+    routes: Arc<ToolRoutes>,
+    limit: tower::limit::GlobalConcurrencyLimitLayer,
+}
+
+impl SessionRouter {
+    fn new(display: DisplayConfig) -> Self {
+        Self {
+            sessions: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            next: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            display,
+            routes: Arc::new(configured_tool_router()),
+            limit: tower::limit::GlobalConcurrencyLimitLayer::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            ),
+        }
+    }
+    fn entries(&self) -> Result<std::collections::BTreeMap<String, KwinMcp>, McpError> {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.clone())
+            .map_err(|_| McpError::internal_error("session map lock poisoned", None))
+    }
+    fn resolve(
+        &self,
+        request: &mut rmcp::model::CallToolRequestParams,
+    ) -> Result<(String, KwinMcp), McpError> {
+        let id = request
+            .arguments
+            .as_mut()
+            .and_then(|args| args.remove("session_id"));
+        let id = match id {
+            Some(serde_json::Value::String(id)) => Some(id),
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    "session_id must be a string",
+                    None,
+                ));
+            }
+            None => None,
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| McpError::internal_error("session map lock poisoned", None))?;
+        if request.name == "session_start" && id.is_none() {
+            let number = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = format!("s{}-{number}", std::process::id());
+            let mut session = KwinMcp::new(self.display);
+            session.path =
+                std::env::temp_dir().join(format!("kwin-mcp-{}-{number}", std::process::id()));
+            sessions.insert(id.clone(), session.clone());
+            return Ok((id, session));
+        }
+        let id = match id {
+            Some(id) => id,
+            None if sessions.len() == 1 => sessions
+                .keys()
+                .next()
+                .cloned()
+                .ok_or_else(|| McpError::internal_error("no session", None))?,
+            None if sessions.is_empty() => {
+                return Err(McpError::invalid_params(
+                    "no session; call session_start first",
+                    None,
+                ));
+            }
+            None => {
+                return Err(McpError::invalid_params(
+                    "several sessions exist; pass the session_id returned by session_start",
+                    None,
+                ));
+            }
+        };
+        let session = sessions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| McpError::invalid_params(format!("unknown session_id '{id}'"), None))?;
+        Ok((id, session))
+    }
+    async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
+        let mut records = Vec::new();
+        for (id, service) in self.entries()? {
+            let guard = service.session.read().await;
+            if let Some(session) = guard.as_ref() {
+                records.push(serde_json::json!({
+                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(),
+                    "workdir": session.host_xdg_dir, "width": session.screen_width,
+                    "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
+                }));
+            }
+        }
+        Ok(structured_result(
+            peer,
+            serde_json::to_string(&records).map_err(KwinError::from)?,
+            serde_json::json!({"sessions": records}),
+        )
+        .await)
+    }
+    async fn shutdown(&self) {
+        if let Ok(entries) = self.entries() {
+            futures::future::join_all(
+                entries
+                    .into_values()
+                    .map(|session| async move { session.shutdown_cleanup().await }),
+            )
+            .await;
+        }
+    }
+    async fn reap(self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Ok(entries) = self.entries() else {
+                continue;
+            };
+            for (_, service) in entries {
+                let Ok(_gate) = service.start_gate.try_lock() else {
+                    continue;
+                };
+                let Ok(mut guard) = service.session.try_write() else {
+                    continue;
+                };
+                if let Some(child) = guard
+                    .as_mut()
+                    .and_then(|session| session.viewer_child.as_mut())
+                {
+                    let _ = child.try_wait();
+                }
+                let expired = service.display.ttl.is_some_and(|ttl| {
+                    guard
+                        .as_ref()
+                        .is_some_and(|session| session.last_activity.elapsed() >= ttl)
+                });
+                if expired {
+                    let stopped = guard.take();
+                    drop(guard);
+                    if let Some(session) = stopped {
+                        teardown_blocking(session).await;
+                    }
+                    match service.workdir.remove() {
+                        WorkdirCleanup::Retained { dir, error } => {
+                            eprintln!("ttl: retained {}: {error}", dir.display())
+                        }
+                        WorkdirCleanup::NothingOwned | WorkdirCleanup::Removed(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    fn tools(&self) -> Vec<rmcp::model::Tool> {
+        let mut tools = self.routes.list_all();
+        for tool in &mut tools {
+            let schema = Arc::make_mut(&mut tool.input_schema);
+            let properties = schema
+                .entry("properties")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(properties) = properties.as_object_mut() {
+                properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist."}));
+            }
+            let description = tool.description.take().unwrap_or_default();
+            tool.description = Some(format!("{description} Pass session_id to choose an existing session. Each session_start without session_id creates a new isolated desktop.").into());
+        }
+        tools.push(rmcp::model::Tool::new(
+            "session_list",
+            "List live isolated sessions in this server process.",
+            Arc::new(
+                serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
+                    .unwrap_or_default(),
+            ),
+        ));
+        tools
+    }
+}
+
+impl rmcp::ServerHandler for SessionRouter {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = KwinMcp::new(self.display).get_info();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_logging()
+            .build();
+        info.instructions = Some(format!(
+            "{} Each session_start without session_id creates a new isolated desktop in this server process. Pass the returned session_id to every later tool. session_list lists live sessions.",
+            info.instructions.unwrap_or_default()
+        ));
+        info
+    }
+    async fn list_tools(
+        &self,
+        _: Option<rmcp::model::PaginatedRequestParams>,
+        _: ToolContext,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tools(),
+            next_cursor: None,
+            ..Default::default()
+        })
+    }
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tools().into_iter().find(|tool| tool.name == name)
+    }
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        use tower::{Layer, ServiceExt};
+        if request.name == "session_list" {
+            return self
+                .limit
+                .layer(tower::service_fn(
+                    |peer| async move { self.list(&peer).await },
+                ))
+                .oneshot(context.peer)
+                .await;
+        }
+        let (id, session) = self.resolve(&mut request)?;
+        let start = request.name == "session_start";
+        let stop = request.name == "session_stop";
+        let input = input_tool(&request.name);
+        // Queued input waits outside the global limit so it cannot starve reads.
+        let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
+        if let Some(turn) = &turn {
+            turn.wait().await;
+        }
+        let _input = if input && turn.is_none() {
+            Some(session.input_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        let execution = session.clone();
+        let result = self
+            .limit
+            .layer(execution)
+            .oneshot(SessionCall {
+                request,
+                context,
+                routes: self.routes.clone(),
+            })
+            .await;
+        if (stop && result.is_ok() || start && result.is_err() && session.workdir.owned().is_none())
+            && let Ok(mut sessions) = self.sessions.lock()
+        {
+            sessions.remove(&id);
+        }
+        let mut result = match result {
+            Ok(result) => result,
+            Err(mut error) => {
+                if start && session.workdir.owned().is_some() {
+                    error.message =
+                        format!("{}; retry session_stop with session_id={id}", error.message)
+                            .into();
+                    let mut data = error
+                        .data
+                        .take()
+                        .and_then(|data| data.as_object().cloned())
+                        .unwrap_or_default();
+                    data.insert("session_id".to_owned(), serde_json::json!(id));
+                    error.data = Some(serde_json::Value::Object(data));
+                }
+                return Err(error);
+            }
+        };
+        if start {
+            if let Some(data) = result
+                .structured_content
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                data.insert("session_id".to_owned(), serde_json::json!(id));
+            }
+            result
+                .content
+                .push(Content::text(format!("session_id: {id}")));
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Default)]
+struct InputOrder {
+    counters: std::sync::Mutex<(u64, u64, std::collections::BTreeSet<u64>)>,
+    changed: tokio::sync::Notify,
+}
+struct InputTurn {
+    order: Arc<InputOrder>,
+    number: u64,
+}
+impl InputOrder {
+    fn enqueue(self: &Arc<Self>) -> Arc<InputTurn> {
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let number = counters.0;
+        counters.0 += 1;
+        Arc::new(InputTurn {
+            order: self.clone(),
+            number,
+        })
+    }
+}
+impl InputTurn {
+    async fn wait(&self) {
+        loop {
+            let changed = self.order.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .order
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1
+                == self.number
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+impl Drop for InputTurn {
+    fn drop(&mut self) {
+        let mut counters = self
+            .order
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.2.insert(self.number);
+        loop {
+            let current = counters.1;
+            if !counters.2.remove(&current) {
+                break;
+            }
+            counters.1 += 1;
+        }
+        drop(counters);
+        self.order.changed.notify_waiters();
+    }
+}
+
+#[derive(Default)]
+struct WireState {
+    input: Vec<u8>,
+    incoming: std::collections::HashSet<rmcp::model::RequestId>,
+    outgoing: std::collections::HashSet<rmcp::model::RequestId>,
+    paused: bool,
+    reading: bool,
+    parsing: bool,
+}
+#[derive(Clone)]
+struct SessionStdio {
+    reader: Arc<tokio::io::unix::AsyncFd<std::fs::File>>,
+    writer: Arc<tokio::sync::Mutex<tokio::io::unix::AsyncFd<std::fs::File>>>,
+    state: Arc<std::sync::Mutex<WireState>>,
+    changed: Arc<tokio::sync::Notify>,
+    router: SessionRouter,
+}
+impl SessionStdio {
+    fn new(router: SessionRouter, input: Vec<u8>) -> std::io::Result<Self> {
+        use std::os::fd::{AsFd, BorrowedFd};
+        let descriptor = |number| -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
+            let descriptor = unsafe { BorrowedFd::borrow_raw(number) }.try_clone_to_owned()?;
+            let flags = nix::fcntl::fcntl(descriptor.as_fd(), nix::fcntl::FcntlArg::F_GETFL)
+                .map_err(std::io::Error::other)?;
+            let flags =
+                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+            nix::fcntl::fcntl(descriptor.as_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))
+                .map_err(std::io::Error::other)?;
+            tokio::io::unix::AsyncFd::new(std::fs::File::from(descriptor))
+        };
+        Ok(Self {
+            reader: Arc::new(descriptor(0)?),
+            writer: Arc::new(tokio::sync::Mutex::new(descriptor(1)?)),
+            state: Arc::new(std::sync::Mutex::new(WireState {
+                input,
+                ..Default::default()
+            })),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            router,
+        })
+    }
+    async fn freeze(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paused = true;
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let empty = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.incoming.is_empty()
+                    && state.outgoing.is_empty()
+                    && !state.reading
+                    && !state.parsing
+            };
+            if empty {
+                return;
+            }
+            changed.await;
+        }
+    }
+    fn thaw(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paused = false;
+        self.changed.notify_waiters();
+    }
+}
+impl rmcp::transport::Transport<rmcp::RoleServer> for SessionStdio {
+    type Error = std::io::Error;
+    fn send(
+        &mut self,
+        item: rmcp::model::ServerJsonRpcMessage,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send + 'static {
+        let wire = self.clone();
+        async move {
+            let mut bytes = serde_json::to_vec(&item)?;
+            bytes.push(b'\n');
+            let writer = wire.writer.lock().await;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let written = writer
+                    .async_io(tokio::io::Interest::WRITABLE, |mut file| {
+                        std::io::Write::write(&mut file, &bytes[offset..])
+                    })
+                    .await?;
+                if written == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "MCP stdout closed",
+                    ));
+                }
+                offset += written;
+            }
+            let mut state = wire
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match item {
+                rmcp::model::JsonRpcMessage::Response(response) => {
+                    state.incoming.remove(&response.id);
+                }
+                rmcp::model::JsonRpcMessage::Error(error) => {
+                    state.incoming.remove(&error.id);
+                }
+                rmcp::model::JsonRpcMessage::Request(request) => {
+                    state.outgoing.insert(request.id);
+                }
+                rmcp::model::JsonRpcMessage::Notification(_) => {}
+            }
+            drop(state);
+            wire.changed.notify_waiters();
+            Ok(())
+        }
+    }
+    async fn receive(&mut self) -> Option<rmcp::model::ClientJsonRpcMessage> {
+        use rmcp::model::GetExtensions;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (paused, line) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let paused = state.paused;
+                let line = if paused {
+                    None
+                } else {
+                    state
+                        .input
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|end| state.input.drain(..=end).collect::<Vec<_>>())
+                };
+                state.parsing = line.is_some();
+                (paused, line)
+            };
+            if paused {
+                changed.await;
+                continue;
+            }
+            if let Some(line) = line {
+                let mut message =
+                    match serde_json::from_slice::<rmcp::model::ClientJsonRpcMessage>(&line) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            self.state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .parsing = false;
+                            self.changed.notify_waiters();
+                            eprintln!("MCP invalid message: {error}");
+                            continue;
+                        }
+                    };
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.parsing = false;
+                    self.changed.notify_waiters();
+                    // A freeze that raced line parsing must retain the whole request.
+                    if state.paused {
+                        let mut input = line;
+                        input.append(&mut state.input);
+                        state.input = input;
+                        continue;
+                    }
+                    match &mut message {
+                        rmcp::model::JsonRpcMessage::Request(request) => {
+                            state.incoming.insert(request.id.clone());
+                            if let rmcp::model::ClientRequest::CallToolRequest(call) =
+                                &mut request.request
+                                && input_tool(&call.params.name)
+                            {
+                                let mut params = call.params.clone();
+                                if let Ok((_, session)) = self.router.resolve(&mut params) {
+                                    call.extensions_mut().insert(session.input_order.enqueue());
+                                }
+                            }
+                        }
+                        rmcp::model::JsonRpcMessage::Response(response) => {
+                            state.outgoing.remove(&response.id);
+                        }
+                        rmcp::model::JsonRpcMessage::Error(error) => {
+                            state.outgoing.remove(&error.id);
+                        }
+                        rmcp::model::JsonRpcMessage::Notification(_) => {}
+                    }
+                }
+                self.changed.notify_waiters();
+                return Some(message);
+            }
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.paused {
+                    continue;
+                }
+                state.reading = true;
+            }
+            let mut bytes = [0u8; 8192];
+            let read = tokio::select! {
+                read = self.reader.async_io(tokio::io::Interest::READABLE, |mut file| std::io::Read::read(&mut file, &mut bytes)) => Some(read),
+                _ = &mut changed => None,
+            };
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.reading = false;
+                if let Some(Ok(count)) = &read {
+                    state.input.extend_from_slice(&bytes[..*count]);
+                }
+            }
+            self.changed.notify_waiters();
+            match read {
+                Some(Ok(0)) => return None,
+                Some(Ok(_)) | None => {}
+                Some(Err(error)) => {
+                    eprintln!("MCP stdin: {error}");
+                    return None;
+                }
+            }
+        }
+    }
+    async fn close(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+const RESUME_DESCRIPTOR: &str = "KWIN_MCP_RESUME_FD";
+
+#[derive(Serialize, Deserialize)]
+struct SessionRestore {
+    id: String,
+    path: PathBuf,
+    sandbox_pid: u32,
+    stdin_fd: i32,
+    mouse_fd: i32,
+    keyboard_fd: i32,
+    proxy_fd: i32,
+    proxy_guid: String,
+    proxy_name: String,
+    mouse_sysname: String,
+    kbd_sysname: String,
+    proxies: Vec<u32>,
+    viewer: Option<u32>,
+    kwin_unique: String,
+    service_bus: String,
+    atspi_bus: String,
+    width: u32,
+    height: u32,
+    cdp_port: u16,
+    overlay_work_paths: Vec<PathBuf>,
+    oversized_files: Vec<PathBuf>,
+    socket_links: Vec<(PathBuf, PathBuf)>,
+    idle_millis: u64,
+    input_millis: Option<u64>,
+    wallet: Option<wallet_mediator::State>,
+    wallet_note: Option<String>,
+    fuse_enabled: bool,
+    lease_fd: Option<i32>,
+}
+#[derive(Serialize, Deserialize)]
+struct ServerRestore {
+    pid: u32,
+    client: Option<rmcp::model::ClientInfo>,
+    next: u64,
+    next_launch: u64,
+    sessions: Vec<SessionRestore>,
+    cleanup: Vec<(String, PathBuf, Option<i32>)>,
+    input: Vec<u8>,
+}
+
+fn retain_descriptor(
+    fd: impl std::os::fd::AsFd,
+    retained: &mut Vec<std::os::fd::OwnedFd>,
+) -> std::io::Result<i32> {
+    use std::os::fd::AsRawFd;
+    let copy = fd.as_fd().try_clone_to_owned()?;
+    nix::fcntl::fcntl(
+        &copy,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+    )
+    .map_err(std::io::Error::other)?;
+    let number = copy.as_raw_fd();
+    retained.push(copy);
+    Ok(number)
+}
+fn adopt_descriptor(number: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{BorrowedFd, FromRawFd};
+    if number <= 2 {
+        return Err(std::io::Error::other(
+            "invalid inherited session descriptor",
+        ));
+    }
+    let descriptor = unsafe { BorrowedFd::borrow_raw(number) };
+    nix::fcntl::fcntl(
+        descriptor,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(std::io::Error::other)?;
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(number) })
+}
+fn restore_state() -> anyhow::Result<Option<ServerRestore>> {
+    let Some(number) = std::env::var_os(RESUME_DESCRIPTOR) else {
+        return Ok(None);
+    };
+    let number: i32 = number.to_string_lossy().parse()?;
+    let mut file = std::fs::File::from(adopt_descriptor(number)?);
+    use std::io::Seek;
+    file.rewind()?;
+    let state: ServerRestore = serde_json::from_reader(file)?;
+    anyhow::ensure!(
+        state.pid == std::process::id(),
+        "reload state belongs to another server PID"
+    );
+    Ok(Some(state))
+}
+impl SessionRouter {
+    async fn reattach(&self, state: ServerRestore) -> anyhow::Result<Vec<u8>> {
+        self.next
+            .store(state.next, std::sync::atomic::Ordering::Relaxed);
+        NEXT_BROWSER_LAUNCH.store(state.next_launch, std::sync::atomic::Ordering::Relaxed);
+        for saved in state.sessions {
+            let mut service = KwinMcp::new(self.display);
+            service.path = saved.path.clone();
+            // Preserve the input-device bus identity so KWin's queued name does
+            // not replace the session's existing proxy during re-execution.
+            let proxy_socket = adopt_descriptor(saved.proxy_fd)?;
+            let socket = std::os::unix::net::UnixStream::from(proxy_socket.try_clone()?);
+            socket.set_nonblocking(true)?;
+            let socket = tokio::net::UnixStream::from_std(socket)?;
+            let proxy_conn =
+                zbus::connection::Builder::authenticated_socket(socket, saved.proxy_guid.as_str())?
+                    .p2p()
+                    .unique_name(saved.proxy_name.as_str())?
+                    .build()
+                    .await?;
+            input_bridge::register_devices(
+                &proxy_conn,
+                vec![
+                    input_bridge::InputDevice::new_pointer(saved.mouse_sysname.clone()),
+                    input_bridge::InputDevice::new_keyboard(saved.kbd_sysname.clone()),
+                ],
+            )
+            .await?;
+            let address = format!("unix:path={}", saved.path.join("bus").display());
+            let kwin_conn = zbus::connection::Builder::address(address.as_str())?
+                .build()
+                .await?;
+            let eis_proxy = KWinEisProxy::builder(&kwin_conn)
+                .destination(saved.kwin_unique.as_str())?
+                .build()
+                .await?;
+            let (fd, _) = eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await?;
+            let eis = tokio::task::spawn_blocking(move || Eis::from_fd(fd.into())).await??;
+            let wallet = match saved.wallet {
+                Some(state) => {
+                    let address = format!("unix:path={}", saved.path.join("kwallet_bus").display());
+                    Some(wallet_mediator::WalletMediator::start_state(&address, state).await?)
+                }
+                None => None,
+            };
+            if saved.lease_fd.is_some() {
+                service.workdir.inherit_lease(&saved.path, saved.lease_fd)?;
+            }
+            *service.session.write().await = Some(Session {
+                kwin_conn,
+                _proxy_conn: proxy_conn,
+                _proxy_socket: proxy_socket,
+                kwin_unique_name: saved.kwin_unique,
+                service_bus_address: saved.service_bus,
+                atspi_bus_address: saved.atspi_bus,
+                eis,
+                sandbox_child: SessionProcess {
+                    pid: saved.sandbox_pid,
+                    status: None,
+                },
+                sandbox_stdin: adopt_descriptor(saved.stdin_fd)?,
+                host_xdg_dir: saved.path,
+                _uinput_mouse: adopt_descriptor(saved.mouse_fd)?,
+                _uinput_keyboard: adopt_descriptor(saved.keyboard_fd)?,
+                mouse_sysname: saved.mouse_sysname,
+                kbd_sysname: saved.kbd_sysname,
+                cdp_browser: None,
+                cdp_forward_port: saved.cdp_port,
+                service_proxy_children: saved
+                    .proxies
+                    .into_iter()
+                    .map(|pid| SessionProcess { pid, status: None })
+                    .collect(),
+                viewer_child: saved.viewer.map(|pid| SessionProcess { pid, status: None }),
+                viewer_unavailable: None,
+                overlay_work_paths: saved.overlay_work_paths,
+                oversized_read_only_files: saved.oversized_files,
+                _socket_links: SocketLinks(saved.socket_links),
+                screen_width: saved.width,
+                screen_height: saved.height,
+                last_activity: std::time::Instant::now()
+                    .checked_sub(Duration::from_millis(saved.idle_millis))
+                    .unwrap_or_else(std::time::Instant::now),
+                last_input: saved.input_millis.and_then(|millis| {
+                    std::time::Instant::now().checked_sub(Duration::from_millis(millis))
+                }),
+                wallet,
+                wallet_note: saved.wallet_note,
+                fuse_enabled: saved.fuse_enabled,
+            });
+            self.sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session map lock poisoned"))?
+                .insert(saved.id, service);
+        }
+        for (id, path, lease) in state.cleanup {
+            let mut service = KwinMcp::new(self.display);
+            service.path = path;
+            service.workdir.inherit_lease(&service.path, lease)?;
+            self.sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session map lock poisoned"))?
+                .insert(id, service);
+        }
+        eprintln!(
+            "reload: reattached {} sessions in PID {}",
+            self.entries()?.len(),
+            std::process::id()
+        );
+        Ok(state.input)
+    }
+    async fn reexecute(
+        &self,
+        wire: &SessionStdio,
+        client: Option<rmcp::model::ClientInfo>,
+        executable: &Path,
+    ) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+        wire.freeze().await;
+        let mut retained = Vec::new();
+        let mut saved = Vec::new();
+        let mut cleanup = Vec::new();
+        let mut gates = Vec::new();
+        for (id, service) in self.entries()? {
+            gates.push(service.start_gate.clone().lock_owned().await);
+            let guard = service.session.read().await;
+            let Some(session) = guard.as_ref() else {
+                if let Some(path) = service.workdir.owned() {
+                    cleanup.push((id, path, service.workdir.saved_lease(&mut retained)?));
+                }
+                continue;
+            };
+            saved.push(SessionRestore {
+                id,
+                path: service.path.clone(),
+                sandbox_pid: session.sandbox_child.id(),
+                stdin_fd: retain_descriptor(&session.sandbox_stdin, &mut retained)?,
+                mouse_fd: retain_descriptor(&session._uinput_mouse, &mut retained)?,
+                keyboard_fd: retain_descriptor(&session._uinput_keyboard, &mut retained)?,
+                proxy_fd: retain_descriptor(&session._proxy_socket, &mut retained)?,
+                proxy_guid: session._proxy_conn.server_guid().to_string(),
+                proxy_name: session
+                    ._proxy_conn
+                    .unique_name()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default(),
+                mouse_sysname: session.mouse_sysname.clone(),
+                kbd_sysname: session.kbd_sysname.clone(),
+                proxies: session
+                    .service_proxy_children
+                    .iter()
+                    .map(SessionProcess::id)
+                    .collect(),
+                viewer: session.viewer_child.as_ref().map(SessionProcess::id),
+                kwin_unique: session.kwin_unique_name.clone(),
+                service_bus: session.service_bus_address.clone(),
+                atspi_bus: session.atspi_bus_address.clone(),
+                width: session.screen_width,
+                height: session.screen_height,
+                cdp_port: session.cdp_forward_port,
+                overlay_work_paths: session.overlay_work_paths.clone(),
+                oversized_files: session.oversized_read_only_files.clone(),
+                socket_links: session._socket_links.0.clone(),
+                idle_millis: u64::try_from(session.last_activity.elapsed().as_millis())?,
+                input_millis: session
+                    .last_input
+                    .map(|input| u64::try_from(input.elapsed().as_millis()))
+                    .transpose()?,
+                wallet: session
+                    .wallet
+                    .as_ref()
+                    .map(wallet_mediator::WalletMediator::saved_state)
+                    .transpose()?,
+                wallet_note: session.wallet_note.clone(),
+                fuse_enabled: session.fuse_enabled,
+                lease_fd: service.workdir.saved_lease(&mut retained)?,
+            });
+        }
+        let input = wire
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .input
+            .clone();
+        let state = ServerRestore {
+            pid: std::process::id(),
+            client,
+            next: self.next.load(std::sync::atomic::Ordering::Relaxed),
+            next_launch: NEXT_BROWSER_LAUNCH.load(std::sync::atomic::Ordering::Relaxed),
+            sessions: saved,
+            cleanup,
+            input,
+        };
+        // Wallet data stays in an anonymous descriptor, never in a workdir,
+        // environment variable, log, or command line.
+        let descriptor =
+            nix::sys::memfd::memfd_create(c"kwin-mcp-reload", nix::sys::memfd::MFdFlags::empty())?;
+        let mut file = std::fs::File::from(descriptor);
+        serde_json::to_writer(&mut file, &state)?;
+        file.flush()?;
+        eprintln!(
+            "reload: re-executing PID {} with {} live sessions",
+            std::process::id(),
+            state.sessions.len()
+        );
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(std::env::args_os().skip(1))
+            .env(RESUME_DESCRIPTOR, file.as_raw_fd().to_string());
+        let error = exec_on_main(command).await?;
+        wire.thaw();
+        Err(error.into())
+    }
+}
+
+fn source_stamp(root: &Path) -> Option<std::time::SystemTime> {
+    fn latest(path: &Path) -> Option<std::time::SystemTime> {
+        if path.is_file() {
+            return std::fs::metadata(path).ok()?.modified().ok();
+        }
+        std::fs::read_dir(path)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| latest(&entry.path()))
+            .max()
+    }
+    ["src", "Cargo.toml", "Cargo.lock", "build.rs"]
+        .into_iter()
+        .filter_map(|path| latest(&root.join(path)))
+        .max()
+}
+fn binary_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+async fn watch_reload(
+    router: SessionRouter,
+    wire: SessionStdio,
+    peer: rmcp::Peer<rmcp::RoleServer>,
+) {
+    let executable = std::env::current_exe().unwrap_or_default();
+    let executable = std::env::var_os("KWIN_MCP_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or(executable);
+    let inferred = executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .filter(|root| root.join("Cargo.toml").is_file())
+        .map(Path::to_owned);
+    let root = std::env::var_os("KWIN_MCP_REPO")
+        .map(PathBuf::from)
+        .or(inferred);
+    let mut source = root.as_deref().and_then(source_stamp);
+    let mut binary = binary_stamp(&executable);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(root) = &root {
+            let next = source_stamp(root);
+            if next != source {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                source = source_stamp(root);
+                let log_path = session_disk_root().join("build.log");
+                let result = async {
+                    std::fs::create_dir_all(session_disk_root())?;
+                    let log = std::fs::File::create(&log_path)?;
+                    let mut command = tokio::process::Command::new(
+                        std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+                    );
+                    command
+                        .current_dir(root)
+                        .args(["build", "--bin", "kwin-mcp"]);
+                    if executable
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "release")
+                    {
+                        command.arg("--release");
+                    }
+                    command
+                        .stdout(log.try_clone()?)
+                        .stderr(log)
+                        .kill_on_drop(true);
+                    command.status().await
+                }
+                .await;
+                match result {
+                    Ok(status) if status.success() => eprintln!("reload: build succeeded"),
+                    Ok(status) => {
+                        eprintln!(
+                            "reload: build failed ({status}); see {}",
+                            log_path.display()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("reload: build failed: {error}");
+                        continue;
+                    }
+                }
+            }
+        }
+        let next = binary_stamp(&executable);
+        if next.is_some() && next != binary {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if binary_stamp(&executable) != next {
+                continue;
+            }
+            if let Err(error) = router
+                .reexecute(&wire, peer.peer_info().cloned(), &executable)
+                .await
+            {
+                wire.thaw();
+                eprintln!("reload: re-execution failed: {error}");
+            }
+            binary = next;
+        }
+    }
+}
+
+async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
+    let (process_requests, mut process_commands) = tokio::sync::mpsc::unbounded_channel();
+    PROCESS_REQUESTS
+        .set(process_requests)
+        .map_err(|_| "session process owner already exists")?;
     let display = parse_cli_args()?;
+    let resumed = restored.is_some();
+    let resumed_client = restored.as_ref().and_then(|state| state.client.clone());
     if display.autoclean
-        && let Err(error) = sweep_orphaned_workdirs(None) {
-            eprintln!("autoclean: orphan sweep skipped: {error}");
+        && let Err(error) = sweep_orphaned_workdirs(None)
+    {
+        eprintln!("autoclean: orphan sweep skipped: {error}");
     }
     eprintln!(
         "kwin-mcp: display default {}x{}{}; viewer on demand",
         display.width,
         display.height,
-        if display.locked { " (locked, --no-override)" } else { "" },
+        if display.locked {
+            " (locked, --no-override)"
+        } else {
+            ""
+        },
     );
-    let kwin = KwinMcp::new(display);
-    let shutdown = kwin.clone();
-    let tool_router = configured_tool_router();
-    let router =
-        rmcp::handler::server::router::Router::new(kwin).with_tools(tool_router);
-    let transport = rmcp::transport::io::stdio();
-    let service = router.serve(transport).await?;
+    let router = SessionRouter::new(display);
+    let shutdown = router.clone();
+    let input = match restored {
+        Some(state) => router.reattach(state).await?,
+        None => Vec::new(),
+    };
+    let transport = SessionStdio::new(router.clone(), input)?;
+    let wire = transport.clone();
+    let service = match resumed_client {
+        Some(client) => rmcp::service::serve_directly(router, transport, Some(client)),
+        None => router.serve(transport).await?,
+    };
+    if resumed {
+        service.peer().notify_tool_list_changed().await?;
+    }
+    let reload = tokio::spawn(watch_reload(shutdown.clone(), wire, service.peer().clone()));
     let cancellation = service.cancellation_token();
-    let ttl_cancellation = service.cancellation_token();
-    let ttl_reaper = tokio::spawn(shutdown.clone().idle_reaper(retire_on_ttl, move || ttl_cancellation.cancel()));
-    let viewer_reaper = tokio::spawn(shutdown.clone().viewer_reaper());
+    let reaper = tokio::spawn(shutdown.clone().reap());
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let waited = {
         let wait_future = service.waiting();
         tokio::pin!(wait_future);
-        tokio::select! {
-            result = &mut wait_future => Some(result),
-            _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); None },
-            _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); None },
-            _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); None },
+        loop {
+            tokio::select! {
+                result = &mut wait_future => break Some(result),
+                _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break None },
+                _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break None },
+                _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break None },
+                request = process_commands.recv() => match request {
+                    Some(request) => request.execute(),
+                    None => break None,
+                },
+            }
         }
     };
-    if waited.is_none() { cancellation.cancel(); }
-    ttl_reaper.abort();
-    viewer_reaper.abort();
-    let _ = ttl_reaper.await;
-    let _ = viewer_reaper.await;
-    shutdown.shutdown_cleanup().await;
-    if let Some(result) = waited { result?; }
+    drop(process_commands);
+    if waited.is_none() {
+        cancellation.cancel();
+    }
+    reload.abort();
+    let _ = reload.await;
+    reaper.abort();
+    let _ = reaper.await;
+    shutdown.shutdown().await;
+    if let Some(result) = waited {
+        result?;
+    }
     Ok(())
 }
 
@@ -6386,7 +10716,11 @@ mod instructions_tests {
             });
             let text = server.get_info().instructions.unwrap_or_default();
             assert!(!text.is_empty());
-            assert!(text.chars().count() <= 2048, "{} characters", text.chars().count());
+            assert!(
+                text.chars().count() <= 2048,
+                "{} characters",
+                text.chars().count()
+            );
         }
     }
 }
@@ -6398,7 +10732,8 @@ mod capture_file_tests {
     use std::time::Duration;
 
     fn frame_file() -> Result<std::fs::File, Box<dyn std::error::Error>> {
-        let fd = nix::sys::memfd::memfd_create("test-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+        let fd =
+            nix::sys::memfd::memfd_create("test-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -6411,7 +10746,8 @@ mod capture_file_tests {
     }
 
     #[tokio::test]
-    async fn frame_is_returned_once_the_writer_fills_it() -> Result<(), Box<dyn std::error::Error>> {
+    async fn frame_is_returned_once_the_writer_fills_it() -> Result<(), Box<dyn std::error::Error>>
+    {
         let frame = frame_file()?;
         let mut writer = frame.try_clone()?;
         writer.write_all(b"fra")?;
@@ -6446,7 +10782,9 @@ mod launch_warning_tests {
 
     #[test]
     fn chromium_family_commands_are_recognized() {
-        assert!(launches_chromium("google-chrome-stable --test-type https://claude.ai"));
+        assert!(launches_chromium(
+            "google-chrome-stable --test-type https://claude.ai"
+        ));
         assert!(launches_chromium("FOO=1 /usr/bin/chromium --app=file:///x"));
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));

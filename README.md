@@ -94,7 +94,7 @@ For a gateway that needs more memory, set all three limits explicitly when
 launching its server or shim:
 
 ```bash
-kwin-mcp-shim --memory-high 8 --memory-max 10 --memory-swap-max 6
+kwin-mcp --memory-high 8 --memory-max 10 --memory-swap-max 6
 ```
 
 Values are whole GiB. `--memory-high 0` disables throttling while retaining
@@ -119,7 +119,7 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
 ### Two-phase D-Bus startup
 
@@ -149,31 +149,25 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
-## Shim: hot reload and one session per agent
+## Sessions and reloads
 
-Run `kwin-mcp-shim --help` (or `-h`) for its options and
-`kwin-mcp-shim --version` for its version. These commands exit without starting
-the relay or any child process. Unknown options fail before relay startup.
+Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Each `session_start` without `session_id` creates a desktop and returns its ID. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops.
 
-Point your MCP client at `target/release/kwin-mcp-shim` instead of `kwin-mcp`, with the same arguments. The shim is launched once and never restarts. It runs each real `kwin-mcp` server as a child and relays MCP:
+Sessions run concurrently. Input requests retain arrival order within a desktop, reads run concurrently, and a shared Tower concurrency limit matches the machine thread count. App launches use a Tower timeout.
 
-- **One session per agent.** Every `session_start` without a `session_id` gets its own child process, so each session has its own display, windows, keyboard focus and mouse. The result includes a `session_id` (for example `s12345`, matching `/tmp/kwin-mcp-12345`). Every tool accepts `session_id`. It may be omitted only while exactly one session is live; otherwise the call fails and lists the live ids. `session_list` shows every session and its owner. Each server's environment carries `KWIN_MCP_OWNER` (the agent process that started the shim, as `COMM pid PID`, plus `session ID` for Claude Code), so a cleanup selects one agent's servers with `grep -lz '^KWIN_MCP_OWNER=node pid 1234' /proc/*/environ` instead of by command line. Parallel subagents that share one MCP connection each call `session_start` and use their own id.
-- **Hot reload, no reconnect.** The shim watches `src/`, `Cargo.toml`, `Cargo.lock` and `build.rs` next to its own binary and runs `cargo build` when they change (log: `~/.cache/kwin-mcp-shim/build.log`). When the `kwin-mcp` binary changes, from its build or anyone else's, it swaps in a fresh idle child and sends `notifications/tools/list_changed`. New sessions get the new build. Live sessions keep running on their original child until they stop, and tools they still serve stay published. Calling a tool newer than a session's build fails with a clear message.
-- **Supervision.** A child that exits, or does not answer a ping for 90 seconds, is replaced. Its in-flight calls fail with a clear error, and processes left in its process session are killed. The shim is a child subreaper, so orphans are reaped. Every 5 minutes, and after each child exit, it runs `kwin-mcp --sweep-workdirs`. That removes leased autoclean workdirs whose sandbox is gone, and unleased `/tmp/kwin-mcp-<pid>` workdirs whose server has exited. Servers the shim did not start are never touched.
-
-Changes to the shim itself still need a client reconnect. Keep it thin.
+The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its executable. A source change triggers a rebuild. A rebuilt executable replaces the server in place while preserving its PID, client pipes, and live desktops. The client receives `notifications/tools/list_changed`. Build diagnostics are in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/build.log`. Set `KWIN_MCP_REPO` when the source is elsewhere.
 
 ## Setup
 
 ### Claude Code registration
 
-Register the shim once at **user scope** so it remains available when a session
+Register the server once at **user scope** so it remains available when a session
 changes projects or leaves your home directory. Use an absolute path to the
-installed binary, with `kwin-mcp` and `kwin-viewer` installed beside it:
+installed `kwin-mcp` binary. Keep `kwin-viewer` beside it when using the viewer:
 
 ```bash
 claude mcp add --scope user --transport stdio kwin-mcp -- \
-  /absolute/path/to/kwin-mcp-shim \
+  /absolute/path/to/kwin-mcp \
   --width 1920 --height 1080 --autoclean --ttl 120
 ```
 
