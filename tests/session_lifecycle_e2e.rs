@@ -17,8 +17,6 @@ struct RpcClient {
     pending: HashMap<u64, Value>,
     /// Private HOME for this run, removed on drop.
     home: PathBuf,
-    selected_session: Option<String>,
-    new_sessions: bool,
     notifications: Vec<Value>,
     binary_copy: Option<PathBuf>,
 }
@@ -237,22 +235,12 @@ impl RpcClient {
             stderr: stderr_rx,
             pending: HashMap::new(),
             home,
-            selected_session: None,
-            new_sessions: false,
             notifications: Vec::new(),
             binary_copy,
         }
     }
 
-    fn send(&mut self, id: u64, method: &str, mut params: Value) {
-        if method == "tools/call"
-            && params["name"] == "session_start"
-            && !self.new_sessions
-            && let Some(session) = &self.selected_session
-            && params["arguments"].get("session_id").is_none()
-        {
-            params["arguments"]["session_id"] = json!(session);
-        }
+    fn send(&mut self, id: u64, method: &str, params: Value) {
         let request = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
         writeln!(self.stdin.as_mut().expect("open client stdin"), "{request}")
             .expect("write JSON-RPC request");
@@ -286,7 +274,6 @@ impl RpcClient {
                 .recv_timeout(remaining)
                 .expect("JSON-RPC response");
             if message.get("id").and_then(Value::as_u64) == Some(id) {
-                self.observe(&message);
                 return message;
             }
             if let Some(other_id) = message.get("id").and_then(Value::as_u64) {
@@ -297,14 +284,6 @@ impl RpcClient {
         }
     }
 
-    fn observe(&mut self, message: &Value) {
-        if let Some(session) = message["result"]["structuredContent"]["session_id"].as_str() {
-            self.selected_session = Some(session.to_owned());
-        }
-        if message["result"]["structuredContent"]["status"] == "stopped" {
-            self.selected_session = None;
-        }
-    }
     fn wait_for_notification(&mut self, method: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1579,11 +1558,13 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         wait_for_viewer_windows(pid, 0).is_empty(),
         "viewer_close left a host window"
     );
-    let running = call_tool(&mut client, 6, "session_start", json!({}));
+    let running = call_tool(&mut client, 6, "session_list", json!({}));
     assert_eq!(
-        running["result"]["structuredContent"]["status"],
-        json!("already_running"),
-        "{running}"
+        running["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .expect("live sessions")
+            .len(),
+        1
     );
     call_tool(&mut client, 7, "session_stop", json!({}));
     client.stop_process();
@@ -2895,7 +2876,10 @@ fn discovery_creates_no_session_processes() {
     let tools = listed["result"]["tools"].as_array().expect("tools");
     assert!(tools.iter().any(|tool| tool["name"] == "session_start"));
     assert!(tools.iter().any(|tool| tool["name"] == "session_list"));
-    for tool in tools.iter().filter(|tool| tool["name"] != "session_list") {
+    for tool in tools
+        .iter()
+        .filter(|tool| tool["name"] != "session_list" && tool["name"] != "session_start")
+    {
         assert_eq!(
             tool["inputSchema"]["properties"]["session_id"]["type"],
             "string"
@@ -3514,7 +3498,6 @@ fn submitted_text(path: &std::path::Path) -> String {
 fn one_process_routes_parallel_sessions_and_orders_input_on_stdio() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
-    client.new_sessions = true;
     initialize(&mut client);
     let starting = Instant::now();
     for id in [2, 3] {
@@ -3723,7 +3706,6 @@ fn check_reexecution(source_reload: bool) {
             if source_reload { "1" } else { "0" },
         ),
     ]);
-    client.new_sessions = true;
     initialize(&mut client);
     let a = call_tool(
         &mut client,
@@ -3878,7 +3860,6 @@ fn check_reexecution(source_reload: bool) {
 fn transport_eof_cleans_every_owned_session() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
-    client.new_sessions = true;
     initialize(&mut client);
     let mut directories = Vec::new();
     for request in [2, 3] {
@@ -3910,4 +3891,137 @@ fn transport_eof_cleans_every_owned_session() {
             directory.display()
         );
     }
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, input devices, and kdialog"]
+fn starts_cannot_adopt_listed_sessions_and_each_caller_gets_a_new_desktop() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    client.send(2, "tools/list", json!({}));
+    let metadata = client.response(2, Duration::from_secs(5));
+    let tools = metadata["result"]["tools"].as_array().expect("tools");
+    let start = tools
+        .iter()
+        .find(|tool| tool["name"] == "session_start")
+        .expect("start tool");
+    assert!(
+        start["inputSchema"]["properties"]
+            .get("session_id")
+            .is_none()
+    );
+    let list = tools
+        .iter()
+        .find(|tool| tool["name"] == "session_list")
+        .expect("list tool");
+    assert!(
+        list["description"]
+            .as_str()
+            .expect("description")
+            .contains("other agents' sessions")
+    );
+    let a = call_tool(
+        &mut client,
+        3,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let a_id = session_handle(&a);
+    let launched = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"session_id":a_id,"command":format!("kdialog --title caller-A --inputbox 'Caller A owns this desktop' > {}/caller.txt",workdir(&a).display())}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let listed = call_tool(&mut client, 5, "session_list", json!({}));
+    let contents = &listed["result"]["structuredContent"];
+    assert!(
+        contents["ownership_notice"]
+            .as_str()
+            .expect("ownership notice")
+            .contains("your own session_start calls")
+    );
+    let foreign = contents["sessions"][0]["session_id"]
+        .as_str()
+        .expect("listed session");
+    assert!(contents["sessions"][0].get("owner").is_none());
+    let refused = call_tool(
+        &mut client,
+        6,
+        "session_start",
+        json!({"session_id":foreign}),
+    );
+    assert!(
+        refused["error"].is_object(),
+        "listed session was adopted: {refused}"
+    );
+    assert!(refused.to_string().contains("session_id"), "{refused}");
+    let b = call_tool(
+        &mut client,
+        7,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let b_id = session_handle(&b);
+    assert_ne!(a_id, b_id);
+    assert_ne!(workdir(&a), workdir(&b));
+    let b_windows = call_tool(&mut client, 8, "window_list", json!({"session_id":b_id}));
+    assert!(!b_windows.to_string().contains("caller-A"), "{b_windows}");
+    call_tool(
+        &mut client,
+        9,
+        "launch_app",
+        json!({"session_id":b_id,"command":format!("kdialog --title caller-B --inputbox 'Caller B owns this desktop' > {}/caller.txt",workdir(&b).display())}),
+    );
+    for (request, id, text) in [(10, &a_id, "only-A"), (11, &b_id, "only-B")] {
+        let typed = call_tool(
+            &mut client,
+            request,
+            "keyboard_type",
+            json!({"session_id":id,"text":text}),
+        );
+        assert!(typed["error"].is_null(), "{typed}");
+    }
+    save_session_image(&mut client, 12, &a_id, "caller-a.png");
+    save_session_image(&mut client, 13, &b_id, "caller-b.png");
+    for (request, id, response, expected) in
+        [(14, &a_id, &a, "only-A\n"), (15, &b_id, &b, "only-B\n")]
+    {
+        call_tool(
+            &mut client,
+            request,
+            "keyboard_key",
+            json!({"session_id":id,"key":"Return"}),
+        );
+        assert_eq!(
+            submitted_text(&workdir(response).join("caller.txt")),
+            expected
+        );
+    }
+    let listed = call_tool(&mut client, 16, "session_list", json!({}));
+    let sessions = listed["result"]["structuredContent"]["sessions"]
+        .as_array()
+        .expect("sessions");
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.get("owner").is_none())
+    );
+    assert!(
+        listed["result"]["content"]
+            .to_string()
+            .contains("other agents' sessions")
+    );
+    for (request, id) in [(17, &a_id), (18, &b_id)] {
+        call_tool(
+            &mut client,
+            request,
+            "session_stop",
+            json!({"session_id":id}),
+        );
+    }
+    client.stop_process();
 }
