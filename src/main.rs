@@ -2080,7 +2080,358 @@ trait KWinScreenShot2 {
 
 // ── EIS input ───────────────────────────────────────────────────────────
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct InputHistory {
+    held: std::collections::BTreeMap<u32, HeldInputKey>,
+    last_release_ns: Option<u64>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct HeldInputKey {
+    down_ns: u64,
+    character: Option<char>,
+    gap_before_ns: Option<u64>,
+}
+struct InputCallLog {
+    tool: String,
+    request_id: serde_json::Value,
+    start_ns: u64,
+    origin: [f64; 2],
+    window_id: Option<String>,
+    pointer_start: Option<[f64; 2]>,
+    pointer_start_ns: Option<u64>,
+    typing_span: Option<(u64, u64)>,
+    scroll_span: Option<(u64, u64)>,
+    scroll_mode: Option<String>,
+    scroll_unit: Option<String>,
+    pointer_last: Option<(u64, [f64; 2])>,
+    path_length: f64,
+    peak_speed: f64,
+    motion_events: u64,
+    characters: String,
+    keys: Vec<serde_json::Value>,
+    scroll_delta: [f64; 2],
+    scroll_events: u32,
+}
+struct InputLogState {
+    file: std::fs::File,
+    history: InputHistory,
+    call: Option<InputCallLog>,
+}
+struct InputLog {
+    path: PathBuf,
+    state: std::sync::Mutex<InputLogState>,
+}
+
+fn input_clock() -> std::io::Result<(u64, u64)> {
+    let mut mono = nix::libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut mono) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ns = u64::try_from(mono.tv_sec).map_err(std::io::Error::other)? * 1_000_000_000
+        + u64::try_from(mono.tv_nsec).map_err(std::io::Error::other)?;
+    let wall = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos(),
+    )
+    .map_err(std::io::Error::other)?;
+    Ok((ns, wall))
+}
+fn input_log_path(session_id: &str) -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        })
+        .join("kwin-mcp/input")
+        .join(format!("{session_id}.jsonl"))
+}
+impl InputLog {
+    fn open(
+        session_id: &str,
+        history: InputHistory,
+        saved_path: Option<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let resume = saved_path.is_some();
+        let mut path = saved_path.unwrap_or_else(|| input_log_path(session_id));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .append(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW);
+        options.create_new(!resume);
+        let file = match options.open(&path) {
+            Err(error) if !resume && error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (_, wall) = input_clock()?;
+                path.set_file_name(format!("{session_id}-{wall}.jsonl"));
+                options.open(&path)?
+            }
+            result => result?,
+        };
+        Ok(Arc::new(Self {
+            path,
+            state: std::sync::Mutex::new(InputLogState {
+                file,
+                history,
+                call: None,
+            }),
+        }))
+    }
+    fn write(
+        state: &mut InputLogState,
+        mut record: serde_json::Value,
+        mono: u64,
+        wall: u64,
+    ) -> std::io::Result<()> {
+        record["monotonic_ns"] = serde_json::json!(mono);
+        record["wall_time_unix_ns"] = serde_json::json!(wall);
+        if let Some(call) = &state.call {
+            record["tool"] = serde_json::json!({"name":call.tool,"request_id":call.request_id});
+        }
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        state.file.write_all(&line)
+    }
+    fn begin(
+        self: &Arc<Self>,
+        tool: String,
+        request_id: serde_json::Value,
+    ) -> std::io::Result<InputLogGuard> {
+        let (mono, wall) = input_clock()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("input log lock poisoned"))?;
+        state.call = Some(InputCallLog {
+            tool,
+            request_id,
+            start_ns: mono,
+            origin: [0.0, 0.0],
+            window_id: None,
+            pointer_start: None,
+            pointer_start_ns: None,
+            typing_span: None,
+            scroll_span: None,
+            scroll_mode: None,
+            scroll_unit: None,
+            pointer_last: None,
+            path_length: 0.0,
+            peak_speed: 0.0,
+            motion_events: 0,
+            characters: String::new(),
+            keys: Vec::new(),
+            scroll_delta: [0.0, 0.0],
+            scroll_events: 0,
+        });
+        Self::write(
+            &mut state,
+            serde_json::json!({"type":"call_start"}),
+            mono,
+            wall,
+        )?;
+        Ok(InputLogGuard {
+            log: self.clone(),
+            finished: false,
+        })
+    }
+    fn pointer_origin(
+        &self,
+        origin: [f64; 2],
+        position: [f64; 2],
+        window: &str,
+    ) -> std::io::Result<()> {
+        let (mono, _) = input_clock()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("input log lock poisoned"))?;
+        if let Some(call) = &mut state.call {
+            call.origin = origin;
+            call.window_id = Some(window.to_owned());
+            call.pointer_start = Some(position);
+            call.pointer_start_ns = Some(mono);
+            call.pointer_last = Some((mono, position));
+        }
+        Ok(())
+    }
+    fn event(
+        &self,
+        mut event: serde_json::Value,
+        delivery: &anyhow::Result<()>,
+    ) -> std::io::Result<()> {
+        let (mono, wall) = input_clock()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("input log lock poisoned"))?;
+        event["delivery"] = serde_json::json!(if delivery.is_ok() {
+            "flushed"
+        } else {
+            "uncertain"
+        });
+        if let Err(error) = delivery {
+            event["error"] = serde_json::json!(error.to_string());
+        }
+        let mut key_timing = None;
+        if event["event"] == "key" {
+            let code = event["keycode"]
+                .as_u64()
+                .and_then(|code| u32::try_from(code).ok())
+                .ok_or_else(|| std::io::Error::other("input keycode missing"))?;
+            let character = event["character"]
+                .as_str()
+                .and_then(|text| text.chars().next());
+            if event["pressed"] == true {
+                let gap = state
+                    .history
+                    .last_release_ns
+                    .map(|release| mono.saturating_sub(release));
+                event["gap_before_ns"] = serde_json::json!(gap);
+                state.history.held.entry(code).or_insert(HeldInputKey {
+                    down_ns: mono,
+                    character,
+                    gap_before_ns: gap,
+                });
+            } else {
+                if let Some(held) = state.history.held.remove(&code) {
+                    event["character"] = serde_json::json!(held.character);
+                    event["hold_ns"] = serde_json::json!(mono.saturating_sub(held.down_ns));
+                    key_timing = Some(
+                        serde_json::json!({"keycode":code,"character":held.character,"down_ns":held.down_ns,"up_ns":mono,"hold_ns":mono.saturating_sub(held.down_ns),"gap_before_ns":held.gap_before_ns}),
+                    );
+                }
+                state.history.last_release_ns = Some(mono);
+            }
+        }
+        if let Some(call) = &mut state.call {
+            if event["event"] == "motion" {
+                let position = [
+                    event["screen_x"].as_f64().unwrap_or_default(),
+                    event["screen_y"].as_f64().unwrap_or_default(),
+                ];
+                event["window_x"] = serde_json::json!(position[0] - call.origin[0]);
+                event["window_y"] = serde_json::json!(position[1] - call.origin[1]);
+                event["window_id"] = serde_json::json!(call.window_id);
+                event["window_origin"] = serde_json::json!(call.origin);
+                if let Some((previous_ns, previous)) = call.pointer_last {
+                    let distance = (position[0] - previous[0]).hypot(position[1] - previous[1]);
+                    call.path_length += distance;
+                    let seconds =
+                        Duration::from_nanos(mono.saturating_sub(previous_ns)).as_secs_f64();
+                    if seconds > 0.0 {
+                        call.peak_speed = call.peak_speed.max(distance / seconds);
+                    }
+                }
+                call.pointer_start.get_or_insert(position);
+                call.pointer_start_ns.get_or_insert(mono);
+                call.pointer_last = Some((mono, position));
+                call.motion_events += 1;
+            }
+            if event["event"] == "key" {
+                call.typing_span.get_or_insert((mono, mono)).1 = mono;
+            }
+            if event["event"] == "key"
+                && event["pressed"] == true
+                && let Some(character) = event["character"].as_str()
+            {
+                call.characters.push_str(character);
+            }
+            if let Some(timing) = key_timing {
+                call.keys.push(timing);
+            }
+            if event["event"] == "scroll" || event["event"] == "scroll_stop" {
+                call.scroll_span.get_or_insert((mono, mono)).1 = mono;
+            }
+            if event["event"] == "scroll" {
+                call.scroll_mode = event["mode"].as_str().map(str::to_owned);
+                call.scroll_unit = event["unit"].as_str().map(str::to_owned);
+                call.scroll_delta[0] += event["dx"].as_f64().unwrap_or_default();
+                call.scroll_delta[1] += event["dy"].as_f64().unwrap_or_default();
+                call.scroll_events += 1;
+            }
+        }
+        event["type"] = serde_json::json!("event");
+        Self::write(&mut state, event, mono, wall)
+    }
+    fn finish(&self, outcome: &str) -> std::io::Result<()> {
+        let (mono, wall) = input_clock()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("input log lock poisoned"))?;
+        let Some(call) = &state.call else {
+            return Ok(());
+        };
+        let duration = mono.saturating_sub(call.start_ns);
+        let pointer_duration = call
+            .pointer_start_ns
+            .zip(call.pointer_last)
+            .map(|(start, (end, _))| end.saturating_sub(start))
+            .unwrap_or_default();
+        let typing_duration = call
+            .typing_span
+            .map(|(start, end)| end.saturating_sub(start))
+            .unwrap_or_default();
+        let scroll_duration = call
+            .scroll_span
+            .map(|(start, end)| end.saturating_sub(start))
+            .unwrap_or_default();
+        let seconds = Duration::from_nanos(scroll_duration).as_secs_f64();
+        let mut keys = call.keys.clone();
+        for (code, held) in &state.history.held {
+            if held.down_ns >= call.start_ns {
+                keys.push(serde_json::json!({"keycode":code,"character":held.character,"down_ns":held.down_ns,"up_ns":null,"hold_ns":null,"gap_before_ns":held.gap_before_ns}));
+            }
+        }
+        let summary = serde_json::json!({"type":"call_summary","outcome":outcome,"duration_ns":duration,
+            "pointer":{"start":call.pointer_start,"end":call.pointer_last.map(|(_,p)|p),"start_ns":call.pointer_start_ns,"end_ns":call.pointer_last.map(|(ns,_)|ns),"path_length_px":call.path_length,"duration_ns":pointer_duration,"peak_speed_px_s":call.peak_speed,"events":call.motion_events},
+            "typing":{"characters":call.characters,"character_count":call.characters.chars().count(),"duration_ns":typing_duration,"keys":keys},
+            "scroll":{"total_dx":call.scroll_delta[0],"total_dy":call.scroll_delta[1],"mode":call.scroll_mode,"unit":call.scroll_unit,"duration_ns":scroll_duration,"events":call.scroll_events,"events_per_second":if seconds>0.0 {Some(f64::from(call.scroll_events)/seconds)} else {None}}});
+        Self::write(&mut state, summary, mono, wall)?;
+        state.file.sync_data()?;
+        state.call = None;
+        Ok(())
+    }
+    fn history(&self) -> InputHistory {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history
+            .clone()
+    }
+}
+struct InputLogGuard {
+    log: Arc<InputLog>,
+    finished: bool,
+}
+impl InputLogGuard {
+    fn finish(mut self, outcome: &str) -> std::io::Result<()> {
+        let result = self.log.finish(outcome);
+        self.finished = true;
+        result
+    }
+}
+impl Drop for InputLogGuard {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Err(error) = self.log.finish("cancelled")
+        {
+            eprintln!("input log summary failed: {error}");
+        }
+    }
+}
+
 struct Eis {
+    audit: Option<Arc<InputLog>>,
     context: reis::ei::Context,
     abs_ptr: reis::ei::PointerAbsolute,
     btn: reis::ei::Button,
@@ -2204,6 +2555,7 @@ impl Eis {
             std::thread::sleep(EIS_NEGOTIATION_POLL);
         }
         Ok(Self {
+            audit: None,
             context,
             abs_ptr: abs.ok_or_else(|| anyhow::anyhow!("no EIS pointer"))?,
             btn: bt.ok_or_else(|| anyhow::anyhow!("no EIS button"))?,
@@ -2246,10 +2598,32 @@ impl Eis {
         }
     }
 
+    fn flush_logged(&self, event: serde_json::Value) -> anyhow::Result<()> {
+        let delivery = self.flush();
+        if let Some(log) = &self.audit {
+            log.event(event, &delivery).map_err(|error| {
+                anyhow::anyhow!(
+                    "input was submitted but log {} could not be appended: {error}",
+                    log.path.display()
+                )
+            })?;
+        }
+        delivery
+    }
+    fn pointer_origin(&self, wx: i32, wy: i32, geometry: &WindowGeometry) -> anyhow::Result<()> {
+        if let Some(log) = &self.audit {
+            log.pointer_origin(
+                [f64::from(wx), f64::from(wy)],
+                [geometry.cx, geometry.cy],
+                &geometry.id,
+            )?;
+        }
+        Ok(())
+    }
     fn move_abs(&self, x: f32, y: f32) -> anyhow::Result<()> {
         self.abs_ptr.motion_absolute(x, y);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        self.flush()
+        self.flush_logged(serde_json::json!({"event":"motion","screen_x":x,"screen_y":y}))
     }
 
     fn button(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
@@ -2259,38 +2633,65 @@ impl Eis {
         };
         self.btn.button(code, st);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        self.flush()
+        self.flush_logged(serde_json::json!({"event":"button","button":code,"pressed":pressed}))
     }
 
     fn scroll_discrete(&self, dx: i32, dy: i32) -> anyhow::Result<()> {
         let notches = dx.unsigned_abs().max(dy.unsigned_abs());
+        let (dx, dy) = (
+            dx.signum() * SCROLL_VALUE120_PER_NOTCH,
+            dy.signum() * SCROLL_VALUE120_PER_NOTCH,
+        );
         for _ in 0..notches {
-            self.scroll.scroll_discrete(
-                dx.signum() * SCROLL_VALUE120_PER_NOTCH,
-                dy.signum() * SCROLL_VALUE120_PER_NOTCH,
-            );
+            self.scroll.scroll_discrete(dx, dy);
             self.ptr_dev.frame(self.next_serial(), self.now_us());
+            self.flush_logged(serde_json::json!({"event":"scroll","mode":"discrete","unit":"value120","dx":dx,"dy":dy}))?;
         }
         self.scroll.scroll_stop(0, 0, 0);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        self.flush()
+        self.flush_logged(
+            serde_json::json!({"event":"scroll_stop","mode":"discrete","dx":0,"dy":0}),
+        )
     }
-
     fn scroll_smooth(&self, dx: f32, dy: f32) -> anyhow::Result<()> {
         self.scroll.scroll(dx, dy);
+        self.ptr_dev.frame(self.next_serial(), self.now_us());
+        self.flush_logged(
+            serde_json::json!({"event":"scroll","mode":"smooth","unit":"pixels","dx":dx,"dy":dy}),
+        )?;
         self.scroll.scroll_stop(0, 0, 0);
         self.ptr_dev.frame(self.next_serial(), self.now_us());
-        self.flush()
+        self.flush_logged(serde_json::json!({"event":"scroll_stop","mode":"smooth","dx":0,"dy":0}))
     }
-
     fn key(&self, code: u32, pressed: bool) -> anyhow::Result<()> {
+        let character = self.audit.as_ref().and_then(|log| {
+            let history = log.history();
+            if [KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTMETA]
+                .iter()
+                .any(|key| history.held.contains_key(key))
+            {
+                return None;
+            }
+            let shifted = history.held.contains_key(&LINUX_KEY_LEFTSHIFT);
+            (' '..='~').chain(['\t', '\n']).find(|character| {
+                char_key(*character).is_ok_and(|(key, shift)| key == code && shift == shifted)
+            })
+        });
+        self.key_with_character(code, pressed, character)
+    }
+    fn key_with_character(
+        &self,
+        code: u32,
+        pressed: bool,
+        character: Option<char>,
+    ) -> anyhow::Result<()> {
         let st = match pressed {
             true => reis::ei::keyboard::KeyState::Press,
             false => reis::ei::keyboard::KeyState::Released,
         };
         self.kbd.key(code, st);
         self.kbd_dev.frame(self.next_serial(), self.now_us());
-        self.flush()
+        self.flush_logged(serde_json::json!({"event":"key","keycode":code,"pressed":pressed,"character":character}))
     }
 }
 
@@ -3712,6 +4113,7 @@ fn test_stop_bwrap(child: &std::process::Child) {
 
 #[derive(Clone)]
 struct KwinMcp {
+    input_log: Option<Arc<InputLog>>,
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
     input_order: Arc<InputOrder>,
@@ -3735,6 +4137,7 @@ struct KwinMcp {
 impl KwinMcp {
     fn new(display: DisplayConfig) -> Self {
         Self {
+            input_log: None,
             session: Arc::new(tokio::sync::RwLock::new(None)),
             path: session_workdir_path(),
             input_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -7196,11 +7599,12 @@ impl KwinMcp {
         };
         eprintln!("session_start: EIS fd received, negotiating");
         let eis_owned_fd = std::os::fd::OwnedFd::from(eis_fd);
-        let eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
+        let mut eis = match tokio::task::spawn_blocking(move || Eis::from_fd(eis_owned_fd)).await {
             Ok(Ok(eis)) => eis,
             Ok(Err(e)) => return cleanup_err(format!("EIS negotiation: {e}"), &mut startup),
             Err(e) => return cleanup_err(format!("EIS task: {e}"), &mut startup),
         };
+        eis.audit = self.input_log.clone();
         eprintln!("session_start: EIS ready");
 
         let atspi_bus_address = atspi::proxy::bus::BusProxy::new(&kwin_conn)
@@ -8346,7 +8750,7 @@ impl KwinMcp {
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(
+        let (wx, wy, geometry) = active_window_info(
             &self.kwin_conn().await?,
             &self.kwin_unique_name().await?,
             &self.host_xdg_dir().await?,
@@ -8366,6 +8770,9 @@ impl KwinMcp {
             f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
             f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
         );
+        sess.eis
+            .pointer_origin(wx, wy, &geometry)
+            .map_err(KwinError::from)?;
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         tokio::time::sleep(MOVE_TO_CLICK_DELAY).await;
         for n in 0..count {
@@ -8401,7 +8808,7 @@ impl KwinMcp {
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
-        let (wx, wy, _) = active_window_info(
+        let (wx, wy, geometry) = active_window_info(
             &self.kwin_conn().await?,
             &self.kwin_unique_name().await?,
             &self.host_xdg_dir().await?,
@@ -8415,6 +8822,9 @@ impl KwinMcp {
             f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
             f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
         );
+        sess.eis
+            .pointer_origin(wx, wy, &geometry)
+            .map_err(KwinError::from)?;
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
@@ -8441,7 +8851,7 @@ impl KwinMcp {
         let x = params.x;
         let y = params.y;
         let delta = params.delta;
-        let (wx, wy, _) = active_window_info(
+        let (wx, wy, geometry) = active_window_info(
             &self.kwin_conn().await?,
             &self.kwin_unique_name().await?,
             &self.host_xdg_dir().await?,
@@ -8455,6 +8865,9 @@ impl KwinMcp {
             f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
             f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
         );
+        sess.eis
+            .pointer_origin(wx, wy, &geometry)
+            .map_err(KwinError::from)?;
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         let horiz = params.horizontal.unwrap_or_default();
         if params.discrete.unwrap_or_default() {
@@ -8492,7 +8905,7 @@ impl KwinMcp {
         let from_y = params.from_y;
         let to_x = params.to_x;
         let to_y = params.to_y;
-        let (wx, wy, _) = active_window_info(
+        let (wx, wy, geometry) = active_window_info(
             &self.kwin_conn().await?,
             &self.kwin_unique_name().await?,
             &self.host_xdg_dir().await?,
@@ -8505,6 +8918,9 @@ impl KwinMcp {
         })?;
         let ax = f32::from(i16::try_from(wx + from_x).map_err(KwinError::from)?);
         let ay = f32::from(i16::try_from(wy + from_y).map_err(KwinError::from)?);
+        sess.eis
+            .pointer_origin(wx, wy, &geometry)
+            .map_err(KwinError::from)?;
         sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
         sess.eis.button(code, true).map_err(KwinError::from)?;
         for step in 1..=DRAG_STEPS {
@@ -8553,13 +8969,15 @@ impl KwinMcp {
             .chars()
             .map(char_key)
             .collect::<Result<Vec<_>, _>>()?;
-        for (typed, (code, needs_shift)) in keys.iter().enumerate() {
+        for (typed, (character, (code, needs_shift))) in
+            params.text.chars().zip(keys.iter()).enumerate()
+        {
             let sent = (|| {
                 if *needs_shift {
                     sess.eis.key(LINUX_KEY_LEFTSHIFT, true)?;
                 }
-                sess.eis.key(*code, true)?;
-                sess.eis.key(*code, false)?;
+                sess.eis.key_with_character(*code, true, Some(character))?;
+                sess.eis.key_with_character(*code, false, Some(character))?;
                 if *needs_shift {
                     sess.eis.key(LINUX_KEY_LEFTSHIFT, false)?;
                 }
@@ -9401,13 +9819,41 @@ impl tower::Service<SessionCall> for KwinMcp {
     fn call(&mut self, call: SessionCall) -> Self::Future {
         let session = self.clone();
         Box::pin(async move {
-            call.routes
+            let audit = if input_tool(&call.request.name) {
+                session
+                    .input_log
+                    .as_ref()
+                    .map(|log| {
+                        log.begin(
+                            call.request.name.to_string(),
+                            serde_json::json!(call.context.id),
+                        )
+                    })
+                    .transpose()
+                    .map_err(KwinError::from)?
+            } else {
+                None
+            };
+            let result = call
+                .routes
                 .call(rmcp::handler::server::tool::ToolCallContext::new(
                     &session,
                     call.request,
                     call.context,
                 ))
-                .await
+                .await;
+            if let Some(audit) = audit {
+                let outcome = if result
+                    .as_ref()
+                    .is_ok_and(|result| result.is_error != Some(true))
+                {
+                    "ok"
+                } else {
+                    "error"
+                };
+                audit.finish(outcome).map_err(KwinError::from)?;
+            }
+            result
         })
     }
 }
@@ -9482,6 +9928,8 @@ impl SessionRouter {
             let number = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let id = format!("s{}-{number}", std::process::id());
             let mut session = KwinMcp::new(self.display);
+            session.input_log =
+                Some(InputLog::open(&id, InputHistory::default(), None).map_err(KwinError::from)?);
             session.path =
                 std::env::temp_dir().join(format!("kwin-mcp-{}-{number}", std::process::id()));
             sessions.insert(id.clone(), session.clone());
@@ -9519,7 +9967,7 @@ impl SessionRouter {
             let guard = service.session.read().await;
             if let Some(session) = guard.as_ref() {
                 records.push(serde_json::json!({
-                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(),
+                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "input_log":service.input_log.as_ref().map(|log| &log.path),
                     "workdir": session.host_xdg_dir, "width": session.screen_width,
                     "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
                 }));
@@ -9705,6 +10153,10 @@ impl rmcp::ServerHandler for SessionRouter {
                         .and_then(|data| data.as_object().cloned())
                         .unwrap_or_default();
                     data.insert("session_id".to_owned(), serde_json::json!(id));
+                    data.insert(
+                        "input_log".to_owned(),
+                        serde_json::json!(session.input_log.as_ref().map(|log| &log.path)),
+                    );
                     error.data = Some(serde_json::Value::Object(data));
                 }
                 return Err(error);
@@ -9717,10 +10169,19 @@ impl rmcp::ServerHandler for SessionRouter {
                 .and_then(serde_json::Value::as_object_mut)
             {
                 data.insert("session_id".to_owned(), serde_json::json!(id));
+                data.insert(
+                    "input_log".to_owned(),
+                    serde_json::json!(session.input_log.as_ref().map(|log| &log.path)),
+                );
             }
-            result
-                .content
-                .push(Content::text(format!("session_id: {id}")));
+            result.content.push(Content::text(format!(
+                "session_id: {id}\ninput_log: {}",
+                session
+                    .input_log
+                    .as_ref()
+                    .map(|log| log.path.display().to_string())
+                    .unwrap_or_default()
+            )));
         }
         Ok(result)
     }
@@ -10038,6 +10499,10 @@ const RESUME_DESCRIPTOR: &str = "KWIN_MCP_RESUME_FD";
 #[derive(Serialize, Deserialize)]
 struct SessionRestore {
     id: String,
+    #[serde(default)]
+    input_history: InputHistory,
+    #[serde(default)]
+    input_log_path: Option<PathBuf>,
     path: PathBuf,
     sandbox_pid: u32,
     stdin_fd: i32,
@@ -10129,6 +10594,11 @@ impl SessionRouter {
         NEXT_BROWSER_LAUNCH.store(state.next_launch, std::sync::atomic::Ordering::Relaxed);
         for saved in state.sessions {
             let mut service = KwinMcp::new(self.display);
+            service.input_log = Some(InputLog::open(
+                &saved.id,
+                saved.input_history,
+                saved.input_log_path,
+            )?);
             service.path = saved.path.clone();
             // Preserve the input-device bus identity so KWin's queued name does
             // not replace the session's existing proxy during re-execution.
@@ -10159,7 +10629,8 @@ impl SessionRouter {
                 .build()
                 .await?;
             let (fd, _) = eis_proxy.connect_to_eis(EIS_CAPS_KBD_POINTER).await?;
-            let eis = tokio::task::spawn_blocking(move || Eis::from_fd(fd.into())).await??;
+            let mut eis = tokio::task::spawn_blocking(move || Eis::from_fd(fd.into())).await??;
+            eis.audit = service.input_log.clone();
             let wallet = match saved.wallet {
                 Some(state) => {
                     let address = format!("unix:path={}", saved.path.join("kwallet_bus").display());
@@ -10255,6 +10726,12 @@ impl SessionRouter {
                 continue;
             };
             saved.push(SessionRestore {
+                input_log_path: service.input_log.as_ref().map(|log| log.path.clone()),
+                input_history: service
+                    .input_log
+                    .as_ref()
+                    .map(|log| log.history())
+                    .unwrap_or_default(),
                 id,
                 path: service.path.clone(),
                 sandbox_pid: session.sandbox_child.id(),

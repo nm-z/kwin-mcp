@@ -3719,6 +3719,11 @@ fn check_reexecution(source_reload: bool) {
         "session_start",
         json!({"width":800,"height":600}),
     );
+    let a_log = PathBuf::from(
+        a["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("input log"),
+    );
     let a_id = session_handle(&a);
     let b_id = session_handle(&b);
     for (request, id, response, title) in [(4, &a_id, &a, "reload-A"), (5, &b_id, &b, "reload-B")] {
@@ -3741,6 +3746,7 @@ fn check_reexecution(source_reload: bool) {
         );
     }
     save_session_image(&mut client, 20, &a_id, "session-a-before-reload.png");
+    let log_before = std::fs::read_to_string(&a_log).expect("input before reload");
     let pid = client.child.id();
     let pipes: Vec<_> = [0, 1]
         .map(|fd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).expect("client pipe"))
@@ -3814,6 +3820,21 @@ fn check_reexecution(source_reload: bool) {
         .flush()
         .expect("flush request");
     let retained = client.response(30, Duration::from_secs(10));
+    let logged_sessions = call_tool(&mut client, 29, "session_list", json!({}));
+    let rows = logged_sessions["result"]["structuredContent"]["sessions"]
+        .as_array()
+        .expect("sessions");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row["session_id"] == a_id)
+            .expect("session A")["input_log"],
+        a_log.to_str().expect("path")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a_log).expect("input after reload"),
+        log_before
+    );
+
     if source_reload {
         client.send(60, "tools/list", json!({}));
         let tools = client.response(60, Duration::from_secs(10));
@@ -4024,4 +4045,248 @@ fn starts_cannot_adopt_listed_sessions_and_each_caller_gets_a_new_desktop() {
         );
     }
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, bubblewrap, input devices, and kdialog"]
+fn input_events_are_logged_immediately_and_survive_session_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let state = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "input-log-state-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let mut client =
+        RpcClient::start_with_env(&[("XDG_STATE_HOME", state.to_str().expect("state path"))]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session = session_handle(&started);
+    let log = PathBuf::from(
+        started["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("input log path"),
+    );
+    assert!(log.starts_with(&state));
+    assert_eq!(
+        std::fs::metadata(&log)
+            .expect("log metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let listed = call_tool(&mut client, 3, "session_list", json!({}));
+    assert_eq!(
+        listed["result"]["structuredContent"]["sessions"][0]["input_log"],
+        log.to_str().expect("path")
+    );
+    let launched = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"session_id":session,"command":format!("kdialog --title input-log --inputbox 'Persistent input log' > {}/submitted.txt", workdir(&started).display())}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let operations = [
+        (5, "mouse_move", json!({"x":30,"y":40})),
+        (6, "mouse_click", json!({"x":30,"y":40})),
+        (
+            7,
+            "mouse_drag",
+            json!({"from_x":30,"from_y":40,"to_x":80,"to_y":40}),
+        ),
+        (
+            8,
+            "mouse_scroll",
+            json!({"x":30,"y":40,"delta":2,"discrete":true}),
+        ),
+        (
+            9,
+            "mouse_scroll",
+            json!({"x":30,"y":40,"delta":24,"horizontal":true}),
+        ),
+        (10, "keyboard_type", json!({"text":"Ab"})),
+        (11, "keyboard_press", json!({"key":"Shift"})),
+    ];
+    for (id, tool, mut args) in operations {
+        args["session_id"] = json!(session);
+        let result = call_tool(&mut client, id, tool, args);
+        assert!(
+            result["error"].is_null() && result["result"]["isError"] != true,
+            "{tool}: {result}"
+        );
+        let text = std::fs::read_to_string(&log).expect("live log");
+        let latest: Value =
+            serde_json::from_str(text.lines().last().expect("record")).expect("JSONL");
+        assert_eq!(latest["type"], "call_summary");
+        assert_eq!(latest["tool"]["request_id"], id);
+    }
+    thread::sleep(Duration::from_millis(50));
+    let released = call_tool(
+        &mut client,
+        12,
+        "keyboard_release",
+        json!({"session_id":session,"key":"Shift"}),
+    );
+    assert!(released["error"].is_null(), "{released}");
+    save_session_image(&mut client, 13, &session, "input-log.png");
+    call_tool(
+        &mut client,
+        14,
+        "keyboard_key",
+        json!({"session_id":session,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&workdir(&started).join("submitted.txt")),
+        "Ab\n"
+    );
+    let invalid = call_tool(
+        &mut client,
+        16,
+        "keyboard_type",
+        json!({"session_id":session,"text":"é"}),
+    );
+    assert!(
+        invalid["error"].is_object() || invalid["result"]["isError"] == true,
+        "{invalid}"
+    );
+    let records: Vec<Value> = std::fs::read_to_string(&log)
+        .expect("log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSONL record"))
+        .collect();
+    let mut previous = 0;
+    for record in &records {
+        let mono = record["monotonic_ns"]
+            .as_u64()
+            .expect("monotonic timestamp");
+        assert!(mono >= previous);
+        previous = mono;
+        assert!(
+            record["wall_time_unix_ns"]
+                .as_u64()
+                .expect("wall timestamp")
+                > 1_700_000_000_000_000_000
+        );
+        assert!(record["tool"]["name"].as_str().is_some());
+        assert!(record["tool"]["request_id"].as_u64().is_some());
+        if record["type"] == "event" {
+            assert_eq!(record["delivery"], "flushed");
+        }
+        if record["event"] == "motion" {
+            for (screen, local, axis) in [("screen_x", "window_x", 0), ("screen_y", "window_y", 1)]
+            {
+                assert_eq!(
+                    record[screen].as_f64().expect("screen"),
+                    record[local].as_f64().expect("local")
+                        + record["window_origin"][axis].as_f64().expect("origin")
+                );
+            }
+        }
+    }
+    let summary = |id: u64| {
+        records
+            .iter()
+            .find(|r| r["type"] == "call_summary" && r["tool"]["request_id"] == id)
+            .expect("summary")
+    };
+    assert_eq!(summary(16)["outcome"], "error");
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["tool"]["request_id"] == 16 && r["type"] == "event")
+    );
+    let typing = &summary(10)["typing"];
+    assert_eq!(typing["characters"], "Ab");
+    assert_eq!(typing["character_count"], 2);
+    assert_eq!(typing["keys"].as_array().expect("keys").len(), 3);
+    for key in typing["keys"].as_array().expect("keys") {
+        assert_eq!(
+            key["hold_ns"].as_u64(),
+            Some(key["up_ns"].as_u64().expect("up") - key["down_ns"].as_u64().expect("down"))
+        );
+    }
+    assert!(summary(11)["typing"]["keys"][0]["up_ns"].is_null());
+    assert!(
+        summary(12)["typing"]["keys"][0]["hold_ns"]
+            .as_u64()
+            .expect("held duration")
+            >= 50_000_000
+    );
+    for id in [5, 7] {
+        let pointer = &summary(id)["pointer"];
+        assert!(pointer["path_length_px"].as_f64().expect("path length") > 0.0);
+        assert!(pointer["peak_speed_px_s"].as_f64().expect("speed") > 0.0);
+        assert_eq!(
+            pointer["duration_ns"].as_u64(),
+            Some(
+                pointer["end_ns"].as_u64().expect("end")
+                    - pointer["start_ns"].as_u64().expect("start")
+            )
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|r| r["event"] == "button" && r["pressed"] == true)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["event"] == "button" && r["pressed"] == false)
+    );
+    for (id, mode, unit) in [(8, "discrete", "value120"), (9, "smooth", "pixels")] {
+        let scroll = &summary(id)["scroll"];
+        let events: Vec<_> = records
+            .iter()
+            .filter(|r| r["tool"]["request_id"] == id && r["event"] == "scroll")
+            .collect();
+        assert_eq!(scroll["mode"], mode);
+        assert_eq!(scroll["unit"], unit);
+        assert_eq!(
+            scroll["events"].as_u64(),
+            Some(u64::try_from(events.len()).expect("event count"))
+        );
+        for (raw, total) in [("dx", "total_dx"), ("dy", "total_dy")] {
+            assert_eq!(
+                scroll[total].as_f64(),
+                Some(
+                    events
+                        .iter()
+                        .map(|r| r[raw].as_f64().expect("delta"))
+                        .sum::<f64>()
+                )
+            );
+        }
+        assert!(scroll["events_per_second"].as_f64().expect("event rate") > 0.0);
+    }
+    call_tool(
+        &mut client,
+        15,
+        "session_stop",
+        json!({"session_id":session}),
+    );
+    assert!(!workdir(&started).exists(), "session workdir remains");
+    client.stop_process();
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("persistent log")
+            .lines()
+            .count(),
+        records.len()
+    );
+    println!(
+        "PASS: {} timestamped records; pointer, buttons, typing holds/gaps, discrete/smooth scroll; log survives session stop and server exit",
+        records.len()
+    );
+    std::fs::remove_dir_all(state).expect("remove private test state");
 }
