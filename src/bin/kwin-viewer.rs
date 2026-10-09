@@ -84,11 +84,24 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(1);
 const PASTE_SETTLE: Duration = Duration::from_millis(200);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
+    let state = session
+        .and_then(|path| std::fs::read_to_string(path.join("viewer-pipewire.json")).ok())
+        .unwrap_or_else(|| "not connected".to_owned());
+    format!(
+        "viewer did not present a frame within {} seconds; last PipeWire state: {}",
+        FIRST_FRAME_TIMEOUT.as_secs(),
+        state.trim()
+    )
+}
+
 /// Status file kwin-mcp reads to report the viewer outcome; the name is shared
 /// with src/main.rs.
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 
-/// Atomically publish the viewer's lifecycle state: starting, streaming,
+/// Atomically publish the viewer's lifecycle state: starting,
 /// ready (a frame is on the host window), closed, or failed.
 fn write_status(session: &std::path::Path, state: &str, detail: &str) {
     let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
@@ -1079,7 +1092,7 @@ impl SessionLink {
             }
         };
         eprintln!("kwin-viewer: connected to pipewire node {node_id}");
-        write_status(session_path, "streaming", &format!("pipewire node {node_id}"));
+        write_status(session_path, "starting", &format!("waiting for a frame from pipewire node {node_id}"));
 
         // The pipewire loop runs on its own thread and is stopped through this
         // channel, so main can join it instead of leaving it behind on exit.
@@ -1263,6 +1276,9 @@ fn window_loop(
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
     let mut ready_reported = false;
+    let mut first_frame_submitted = false;
+    let mut startup_error = None;
+    let started = Instant::now();
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
 
@@ -1274,6 +1290,20 @@ fn window_loop(
             return;
         }
 
+        if first_frame_submitted && !ready_reported {
+            ready_reported = true;
+            eprintln!("kwin-viewer: first frame presented");
+            if let Some(dir) = status_dir {write_status(dir,"ready","host window is showing the session");}
+            if matches!(input_state.out,InputOut::Remote(_)) { input_state.out.send(Op::Presented); }
+        }
+        if !ready_reported && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+            let reason=frame_timeout_reason(status_dir);
+            if let Some(dir)=status_dir {write_status(dir,"failed",&reason);}
+            startup_error=Some(reason);
+            shutdown.request();
+            frame.exit();
+            return;
+        }
         if Instant::now() >= next_title_check {
             let next = title.text();
             if next != shown_title {
@@ -1328,13 +1358,7 @@ fn window_loop(
             frame
                 .render_graph
                 .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
-            if !ready_reported {
-                ready_reported = true;
-                eprintln!("kwin-viewer: first frame presented");
-                if let Some(dir) = status_dir {
-                    write_status(dir, "ready", "host window is showing the session");
-                }
-            }
+            first_frame_submitted = true;
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
         }
@@ -1346,6 +1370,7 @@ fn window_loop(
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
     })?;
+    if let Some(error)=startup_error {anyhow::bail!(error);}
     Ok(())
 }
 
@@ -1444,24 +1469,36 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
     let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
 
+    let presented=Arc::new(AtomicBool::new(false));
     // Input records come in until the client's ssh pipe closes. The thread
     // blocks in read, so it is left to end with the process.
     {
         let (gate, shutdown) = (gate.clone(), shutdown.clone());
+        let presented=presented.clone();
+        let session_path=session_path.clone();
         std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
             let mut stdin = std::io::stdin().lock();
             while let Ok(Some(op)) = Op::decode(&mut stdin) {
-                gate.send(op);
+                if matches!(op,Op::Presented) {
+                    presented.store(true,Ordering::Release);
+                    write_status(&session_path,"ready","remote viewer presented its first frame");
+                } else { gate.send(op); }
             }
             shutdown.request();
         })?;
     }
 
-    write_status(&session_path, "ready", "remote viewer is streaming");
+    write_status(&session_path, "starting", "waiting for remote first-frame presentation");
+    let started=Instant::now();
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     let mut result = Ok(());
     let mut sent_title = String::new();
     while !shutdown.requested() {
+        if !presented.load(Ordering::Acquire) && started.elapsed()>=FIRST_FRAME_TIMEOUT {
+            result=Err(anyhow::anyhow!(frame_timeout_reason(Some(&session_path))));
+            shutdown.request();
+            break;
+        }
         let title = session_title(&session_path);
         if title != sent_title {
             if let Err(error) = write_title(&mut stdout,&title) { result=Err(error); break; }
@@ -1484,7 +1521,10 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     if gate_thread.join().is_err() {
         eprintln!("kwin-viewer: tool-gate thread panicked");
     }
-    write_status(&session_path, "closed", "remote viewer disconnected");
+    match &result {
+        Ok(()) => write_status(&session_path,"closed","remote viewer disconnected"),
+        Err(error) => write_status(&session_path,"failed",&error.to_string()),
+    }
     result
 }
 
@@ -1574,6 +1614,7 @@ enum Op {
     Button(u32, u32),
     Axis(u32, f64),
     Key(u32, u32),
+    Presented,
 }
 
 impl Op {
@@ -1585,6 +1626,7 @@ impl Op {
             Op::Button(code, state) => (2, u64::from(code), u64::from(state)),
             Op::Axis(axis, value) => (3, u64::from(axis), value.to_bits()),
             Op::Key(code, state) => (4, u64::from(code), u64::from(state)),
+            Op::Presented => (5,0,0),
         };
         let mut record = [0u8; 17];
         record[0] = tag;
@@ -1613,6 +1655,7 @@ impl Op {
             2 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Button(code, state)),
             3 => narrow(a).map(|axis| Op::Axis(axis, f64::from_bits(b))),
             4 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Key(code, state)),
+            5 if a==0 && b==0 => Some(Op::Presented),
             _ => None,
         })
     }
@@ -1622,7 +1665,7 @@ impl Op {
         match self {
             Op::Button(code, 0) => down.contains(&(false, code)),
             Op::Key(code, 0) => down.contains(&(true, code)),
-            Op::Button(..) | Op::Key(..) | Op::Motion(..) | Op::Axis(..) => false,
+            Op::Button(..) | Op::Key(..) | Op::Motion(..) | Op::Axis(..) | Op::Presented => false,
         }
     }
 
@@ -1632,13 +1675,14 @@ impl Op {
             Op::Button(code, _) => { down.remove(&(false, code)); }
             Op::Key(code, 1) => { down.insert((true, code)); }
             Op::Key(code, _) => { down.remove(&(true, code)); }
-            Op::Motion(..) | Op::Axis(..) => {}
+            Op::Motion(..) | Op::Axis(..) | Op::Presented => {}
         }
         match self {
             Op::Motion(x, y) => fake_input.pointer_motion_absolute(x, y),
             Op::Button(code, state) => fake_input.button(code, state),
             Op::Axis(axis, value) => fake_input.axis(axis, value),
             Op::Key(code, state) => fake_input.keyboard_key(code, state),
+            Op::Presented => {},
         }
     }
 }
@@ -2040,10 +2084,15 @@ fn run_pipewire(
         },
     )?;
 
+    let state_path=socket_path.parent().unwrap_or(std::path::Path::new(".")).join("viewer-pipewire.json");
     let _listener = stream
         .add_local_listener_with_user_data(data)
-        .state_changed(|_, _, old, new| {
+        .state_changed(move |_, _, old, new| {
             eprintln!("kwin-viewer: pw stream {old:?} -> {new:?}");
+            let temporary=state_path.with_extension("tmp");
+            if std::fs::write(&temporary,serde_json::json!({"node_id":node_id,"state":format!("{new:?}")}).to_string()).is_ok() {
+                let _=std::fs::rename(temporary,&state_path);
+            }
         })
         .param_changed(|_, ud, id, param| {
             let Some(param) = param else { return };
@@ -2191,7 +2240,7 @@ mod wire_tests {
 
     #[test]
     fn input_records_round_trip() -> std::io::Result<()> {
-        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0)];
+        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0), Op::Presented];
         let bytes: Vec<u8> = ops.iter().flat_map(|op| op.encode()).collect();
         let mut input = Cursor::new(bytes);
         for op in ops {

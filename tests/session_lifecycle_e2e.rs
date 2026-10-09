@@ -2978,6 +2978,10 @@ fn call_without_session_creates_no_processes() {
 }
 
 fn child_compositor(server: u32) -> i32 {
+    child_named_process(server, "kwin_wayland")
+}
+
+fn child_named_process(server: u32, name: &str) -> i32 {
     let server = i32::try_from(server).expect("server pid");
     let stats: Vec<_> = procfs::process::all_processes()
         .expect("process inventory")
@@ -2986,7 +2990,7 @@ fn child_compositor(server: u32) -> i32 {
         .collect();
     let owned: Vec<_> = stats
         .iter()
-        .filter(|stat| stat.comm == "kwin_wayland")
+        .filter(|stat| stat.comm == name)
         .filter(|stat| {
             let mut parent = stat.ppid;
             for _ in 0..64 {
@@ -3008,7 +3012,7 @@ fn child_compositor(server: u32) -> i32 {
     assert_eq!(
         owned.len(),
         1,
-        "expected one compositor below server {server}: {owned:?}"
+        "expected one {name} below server {server}: {owned:?}"
     );
     owned[0]
 }
@@ -4711,4 +4715,208 @@ fn viewer_titles_identify_sessions_and_update_reasons_in_private_desktop() {
         json!({"session_id":host_id}),
     );
     desktop.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, PipeWire, WirePlumber, and Vulkan"]
+fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    assert!(display.exists());
+    let mut client = RpcClient::start_with_env(&[(
+        "WAYLAND_DISPLAY",
+        display.to_str().expect("private display"),
+    )]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let session = session_handle(&started);
+    let path = workdir(&started);
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session,"command":"kdialog --title pipewire-recovery --inputbox 'Recovered private viewer'"}),
+    );
+    struct GraphMonitor(Child);
+    impl Drop for GraphMonitor {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let graph_path = path.join("private-pipewire-graph.json");
+    let graph_errors = path.join("private-pipewire-graph.stderr");
+    let _monitor = GraphMonitor(
+        Command::new("pw-dump")
+            .env("HOME", &client.home)
+            .env("XDG_CONFIG_HOME", client.home.join(".config"))
+            .env("XDG_RUNTIME_DIR", &path)
+            .args(["--monitor", "--remote"])
+            .arg(path.join("pipewire-0"))
+            .stdout(Stdio::from(
+                std::fs::File::create(&graph_path).expect("graph file"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(&graph_errors).expect("graph errors"),
+            ))
+            .spawn()
+            .expect("monitor private graph"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while std::fs::metadata(&graph_path).expect("graph file").len() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "private graph monitor did not initialize: {}",
+            std::fs::read_to_string(&graph_errors).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let policy = child_named_process(client.child.id(), "wireplumber");
+    let resume = ResumeProcess(nix::unistd::Pid::from_raw(policy));
+    nix::sys::signal::kill(resume.0, nix::sys::signal::Signal::SIGSTOP)
+        .expect("stop owned private policy manager");
+    let began = Instant::now();
+    client.send(4,"tools/call",json!({"name":"viewer_open","arguments":{"session_id":session,"reason":"Verify the picture is visible"}}));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let node = loop {
+        let log = std::fs::read_to_string(path.join("viewer.log")).unwrap_or_default();
+        if log.contains("pw stream Unconnected -> Connecting") {
+            if let Some(id) = log.lines().find_map(|line| {
+                line.strip_prefix("kwin-viewer: connected to pipewire node ")
+                    .and_then(|id| id.parse::<u64>().ok())
+            }) {
+                break id;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "private stream did not reach Connecting: {log}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let objects = loop {
+        let text = std::fs::read_to_string(&graph_path).expect("graph snapshot");
+        let values: Vec<Value> = serde_json::Deserializer::from_str(&text)
+            .into_iter::<Value>()
+            .map_while(Result::ok)
+            .collect();
+        let objects: Vec<Value> = values
+            .into_iter()
+            .filter_map(|value| value.as_array().cloned())
+            .flatten()
+            .collect();
+        if objects
+            .iter()
+            .any(|object| object["id"] == node && object["type"] == "PipeWire:Interface:Node")
+        {
+            break objects;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "current screencast node missing in private graph"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let target = objects
+        .iter()
+        .find(|object| object["id"] == node)
+        .expect("live screencast node");
+    let props = &target["info"]["props"];
+    let owner = objects
+        .iter()
+        .find(|object| object["id"] == props["client.id"])
+        .expect("node client");
+    assert_eq!(
+        owner["info"]["props"]["application.process.binary"],
+        "kwin_wayland"
+    );
+    println!(
+        "Connecting target: live node {node}, serial {}, owner {}",
+        props["object.serial"], owner["info"]["props"]["application.process.binary"]
+    );
+    let connecting: Value = serde_json::from_str(
+        &std::fs::read_to_string(path.join("viewer-status.json")).expect("connecting status"),
+    )
+    .expect("JSON status");
+    assert_eq!(
+        connecting["state"], "starting",
+        "premature streaming status: {connecting}"
+    );
+    thread::sleep(Duration::from_millis(150));
+    save_session_image(&mut desktop, 9, &host_id, "viewer-stalled.png");
+    let result = client.response(4, Duration::from_secs(10));
+    println!("viewer result: {}", result["result"]["structuredContent"]);
+    assert_eq!(
+        result["result"]["structuredContent"]["viewer"]["state"], "unavailable",
+        "{result}"
+    );
+    assert!(result.to_string().contains("Connecting"), "{result}");
+    assert!(began.elapsed() < Duration::from_secs(8));
+    let status: Value = serde_json::from_str(
+        &std::fs::read_to_string(path.join("viewer-status.json")).expect("status file"),
+    )
+    .expect("status JSON");
+    assert_eq!(status["state"], "failed");
+    assert!(
+        status["detail"]
+            .as_str()
+            .expect("failure detail")
+            .contains("Connecting")
+    );
+    drop(resume);
+    let ready = call_tool(
+        &mut client,
+        5,
+        "viewer_open",
+        json!({"session_id":session,"reason":"Confirm recovery"}),
+    );
+    assert_eq!(
+        ready["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{ready}"
+    );
+    let log = std::fs::read_to_string(path.join("viewer.log")).expect("viewer log");
+    assert!(log.contains("first frame presented"), "{log}");
+    thread::sleep(Duration::from_millis(400));
+    save_session_image(&mut desktop, 3, &host_id, "viewer-recovered.png");
+    let reused = call_tool(&mut client, 7, "viewer_open", json!({"session_id":session}));
+    assert_eq!(
+        reused["result"]["structuredContent"]["status"],
+        "already_open"
+    );
+    assert_eq!(
+        reused["result"]["structuredContent"]["viewer"]["pid"],
+        ready["result"]["structuredContent"]["viewer"]["pid"]
+    );
+    call_tool(
+        &mut client,
+        6,
+        "session_stop",
+        json!({"session_id":session}),
+    );
+    client.stop_process();
+    call_tool(
+        &mut desktop,
+        4,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
+    println!(
+        "PASS: live KWin node stalled while its policy manager was suspended; bounded unavailable/failed result with Connecting; retry presents a frame"
+    );
 }
