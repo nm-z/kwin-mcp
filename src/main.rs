@@ -5852,7 +5852,7 @@ impl Drop for ToolCallMark {
 }
 /// How long viewer_open waits for the viewer to show a frame
 /// before reporting it as still starting.
-const VIEWER_READY_WAIT: Duration = Duration::from_secs(4);
+const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
@@ -5867,6 +5867,7 @@ async fn spawn_viewer(
 ) -> Result<SessionProcess, String> {
     let log_path = host_xdg_dir.join("viewer.log");
     let _ = std::fs::remove_file(host_xdg_dir.join(VIEWER_STATUS_FILE));
+    let _ = std::fs::remove_file(host_xdg_dir.join("viewer-pipewire.json"));
     let mut log_file = std::fs::File::create(&log_path)
         .map_err(|error| format!("create {}: {error}", log_path.display()))?;
     let note = |log_file: &mut std::fs::File, reason: String| {
@@ -8002,7 +8003,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Reuses an already open viewer and updates its title. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Reuses an already open viewer and updates its title. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready after a frame is presented, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
     )]
     async fn viewer_open(
         &self,
@@ -8028,7 +8029,7 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
-        let (host_xdg_dir, width, height) = {
+        let (host_xdg_dir, width, height, existing) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -8043,22 +8044,33 @@ impl KwinMcp {
             };
             if running {
                 let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
-                let message = format!("viewer already open: {}", viewer_summary(&viewer));
-                drop(guard);
-                return Ok(structured_result(
+                if viewer["state"] == "ready" {
+                    let message = format!("viewer already open: {}", viewer_summary(&viewer));
+                    drop(guard);
+                    return Ok(structured_result(
                     &peer,
                     message,
                     serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
+                }
             }
             (
                 sess.host_xdg_dir.clone(),
                 sess.screen_width,
                 sess.screen_height,
+                if running {
+                    sess.viewer_child.take()
+                } else {
+                    None
+                },
             )
         };
-        let spawned = spawn_viewer(&host_xdg_dir, width, height).await;
+        let reused = existing.is_some();
+        let spawned = match existing {
+            Some(child) => Ok(child),
+            None => spawn_viewer(&host_xdg_dir, width, height).await,
+        };
         let mut guard = self.session.write().await;
         let Some(sess) = guard
             .as_mut()
@@ -8085,16 +8097,51 @@ impl KwinMcp {
         let mut child = sess.viewer_child.take();
         let unavailable = sess.viewer_unavailable.clone();
         drop(guard);
-        let viewer = match child.as_mut() {
+        let mut viewer = match child.as_mut() {
             Some(child) if unavailable.is_none() => wait_for_viewer(&host_xdg_dir, child).await,
             _ => viewer_report(&host_xdg_dir, None, unavailable.as_deref()),
         };
+        if viewer["state"] == "starting" {
+            let pipewire = std::fs::read_to_string(host_xdg_dir.join("viewer-pipewire.json"))
+                .unwrap_or_else(|_| "not connected".to_owned());
+            let reason = format!(
+                "viewer did not present a frame within {} seconds; last PipeWire state: {}",
+                VIEWER_READY_WAIT.as_secs(),
+                pipewire.trim()
+            );
+            if let Some(stalled) = child.take() {
+                tokio::task::spawn_blocking(move || {
+                    terminate_child(stalled, false, "stalled viewer")
+                })
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+            }
+            std::fs::write(
+                host_xdg_dir.join(VIEWER_STATUS_FILE),
+                serde_json::json!({"state":"failed","detail":reason}).to_string(),
+            )
+            .map_err(KwinError::from)?;
+            viewer = serde_json::json!({"state":"unavailable","reason":reason,"log":host_xdg_dir.join("viewer.log")});
+        }
+        if viewer["state"] == "unavailable"
+            && let Some(mut failed) = child.take()
+            && matches!(failed.try_wait(), Ok(None))
+        {
+            tokio::task::spawn_blocking(move || terminate_child(failed, false, "failed viewer"))
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+        }
         let mut guard = self.session.write().await;
         match guard
             .as_mut()
             .filter(|sess| sess.host_xdg_dir == host_xdg_dir)
         {
-            Some(sess) => sess.viewer_child = child,
+            Some(sess) => {
+                if viewer["state"] == "unavailable" {
+                    sess.viewer_unavailable = viewer["reason"].as_str().map(str::to_owned);
+                }
+                sess.viewer_child = child;
+            }
             None => {
                 if let Some(child) = child {
                     terminate_child(child, false, "orphaned viewer");
@@ -8104,6 +8151,8 @@ impl KwinMcp {
         drop(guard);
         let status = if viewer["state"] == "unavailable" {
             "unavailable"
+        } else if reused {
+            "already_open"
         } else {
             "opened"
         };
