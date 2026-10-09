@@ -1740,16 +1740,10 @@ const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 // context window.
 const A11Y_TREE_MAX_CHARS: usize = 30_000;
 
-// Input-event pacing (clicks, drag steps, key hold).
-const INPUT_EVENT_DELAY: Duration = Duration::from_millis(50);
+// Let KWin publish an activated window before reading its geometry.
+const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
 /// How long an input send may wait for KWin to drain a full EIS socket.
 const EIS_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
-
-// Settle time between cursor move and button press in mouse_click.
-const MOVE_TO_CLICK_DELAY: Duration = Duration::from_millis(200);
-
-// Mouse drag interpolation step count.
-const DRAG_STEPS: i32 = 20;
 
 // Pixels per smooth-scroll tick.
 const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
@@ -2078,6 +2072,250 @@ trait KWinScreenShot2 {
     ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 }
 
+// Timing profile: MacKenzie and Buxton (CHI 1992), plus a fitted sample of
+// Dhakal et al. (CHI 2018). See data/README.md for data and modeling choices.
+const POINTER_REPORT_INTERVAL: Duration = Duration::from_millis(8);
+const DEFAULT_TARGET_WIDTH: f64 = 20.0;
+const FITTS_INTERCEPT_MS: f64 = 230.0;
+const FITTS_SLOPE_MS: f64 = 166.0;
+const FITTS_RESIDUAL_MS: f64 = 64.0;
+
+#[derive(Deserialize)]
+struct HumanInputProfile {
+    bigrams: std::collections::BTreeMap<String, [f64; 6]>,
+}
+fn human_input_profile() -> anyhow::Result<&'static HumanInputProfile> {
+    static PROFILE: std::sync::OnceLock<Result<HumanInputProfile, String>> =
+        std::sync::OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            serde_json::from_str(include_str!("../data/input-profile.json"))
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("invalid embedded input profile: {error}"))
+}
+fn normal_sample() -> f64 {
+    let radius = (-2.0 * rand::random::<f64>().max(f64::MIN_POSITIVE).ln()).sqrt();
+    radius * (std::f64::consts::TAU * rand::random::<f64>()).cos()
+}
+#[derive(Clone, Copy)]
+struct InputPace {
+    speed: f64,
+    target_width: f64,
+}
+impl InputPace {
+    fn new(speed: Option<f64>, target_width: Option<f64>) -> Result<Self, McpError> {
+        let speed = speed.unwrap_or(1.0);
+        let target_width = target_width.unwrap_or(DEFAULT_TARGET_WIDTH);
+        if !speed.is_finite() || speed <= 0.0 || !target_width.is_finite() || target_width <= 0.0 {
+            return Err(McpError::invalid_params(
+                "speed and target_width must be finite and positive",
+                None,
+            ));
+        }
+        Ok(Self {
+            speed,
+            target_width,
+        })
+    }
+    fn delay(self, ms: f64) -> anyhow::Result<Duration> {
+        Ok(Duration::try_from_secs_f64(ms / (1000.0 * self.speed))?)
+    }
+    fn key_timing(self, current: char, next: Option<char>) -> anyhow::Result<(Duration, Duration)> {
+        let profile = human_input_profile()?;
+        let pair: String = [
+            Some(current.to_ascii_lowercase()),
+            next.map(|c| c.to_ascii_lowercase()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let stats = profile
+            .bigrams
+            .get(&pair)
+            .or_else(|| profile.bigrams.get("*"))
+            .ok_or_else(|| anyhow::anyhow!("input profile has no fallback"))?;
+        let hold_z = normal_sample();
+        let iki_z = stats[5] * hold_z + (1.0 - stats[5].powi(2)).max(0.0).sqrt() * normal_sample();
+        Ok((
+            self.delay((stats[1] + stats[2] * hold_z).exp())?,
+            self.delay((stats[3] + stats[4] * iki_z).exp())?,
+        ))
+    }
+    fn hold(self) -> anyhow::Result<Duration> {
+        Ok(self.key_timing('\0', None)?.0)
+    }
+    async fn move_pointer(self, eis: &Eis, start: [f64; 2], end: [f64; 2]) -> anyhow::Result<()> {
+        let distance = (end[0] - start[0]).hypot(end[1] - start[1]);
+        if distance < f64::EPSILON {
+            return Ok(());
+        }
+        let mean =
+            FITTS_INTERCEPT_MS + FITTS_SLOPE_MS * (distance / self.target_width + 1.0).log2();
+        let duration = self.delay(
+            (mean + FITTS_RESIDUAL_MS * normal_sample())
+                .max(POINTER_REPORT_INTERVAL.as_secs_f64() * 1000.0),
+        )?;
+        let bend = (normal_sample() * distance * 0.03).clamp(-30.0, 30.0);
+        let normal = [
+            -(end[1] - start[1]) / distance,
+            (end[0] - start[0]) / distance,
+        ];
+        if distance > 200.0 {
+            let correction = (self.target_width * 0.2).min(6.0) * (0.5 + rand::random::<f64>());
+            let near = [
+                end[0] - (end[0] - start[0]) / distance * correction,
+                end[1] - (end[1] - start[1]) / distance * correction,
+            ];
+            self.move_segment(eis, start, near, normal, bend, duration.mul_f64(0.85))
+                .await?;
+            self.move_segment(eis, near, end, normal, 0.0, duration.mul_f64(0.15))
+                .await
+        } else {
+            self.move_segment(eis, start, end, normal, bend, duration)
+                .await
+        }
+    }
+    async fn move_segment(
+        self,
+        eis: &Eis,
+        start: [f64; 2],
+        end: [f64; 2],
+        normal: [f64; 2],
+        bend: f64,
+        duration: Duration,
+    ) -> anyhow::Result<()> {
+        let began = tokio::time::Instant::now();
+        loop {
+            let elapsed = began.elapsed();
+            if elapsed >= duration {
+                break;
+            }
+            tokio::time::sleep(POINTER_REPORT_INTERVAL.min(duration - elapsed)).await;
+            let t = (began.elapsed().as_secs_f64() / duration.as_secs_f64()).min(1.0);
+            // Minimum jerk from zero velocity/acceleration at both endpoints.
+            let s = t.powi(3) * (10.0 - 15.0 * t + 6.0 * t * t);
+            let curve = bend * 16.0 * s * s * (1.0 - s).powi(2);
+            eis.move_abs(
+                input_coordinate(start[0] + (end[0] - start[0]) * s + normal[0] * curve),
+                input_coordinate(start[1] + (end[1] - start[1]) * s + normal[1] * curve),
+            )?;
+            if t >= 1.0 {
+                return Ok(());
+            }
+        }
+        eis.move_abs(input_coordinate(end[0]), input_coordinate(end[1]))
+    }
+}
+#[expect(clippy::as_conversions, reason = "EIS accepts f32 screen coordinates")]
+fn input_coordinate(value: f64) -> f32 {
+    value as f32
+}
+
+// Release only input pressed by this operation on error or cancellation.
+struct SentInput<'a> {
+    eis: &'a Eis,
+    keys: std::collections::BTreeMap<u32, Option<char>>,
+    button: Option<u32>,
+}
+impl<'a> SentInput<'a> {
+    fn new(eis: &'a Eis) -> Self {
+        Self {
+            eis,
+            keys: Default::default(),
+            button: None,
+        }
+    }
+    fn key(&mut self, code: u32, pressed: bool, character: Option<char>) -> anyhow::Result<()> {
+        if pressed {
+            self.keys.insert(code, character);
+        }
+        if character.is_some() {
+            self.eis.key_with_character(code, pressed, character)?;
+        } else {
+            self.eis.key(code, pressed)?;
+        }
+        if !pressed {
+            self.keys.remove(&code);
+        }
+        Ok(())
+    }
+    fn button(&mut self, code: u32, pressed: bool) -> anyhow::Result<()> {
+        if pressed {
+            self.button = Some(code);
+        }
+        self.eis.button(code, pressed)?;
+        if !pressed {
+            self.button = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for SentInput<'_> {
+    fn drop(&mut self) {
+        for (code, character) in &self.keys {
+            let _ = self.eis.key_with_character(*code, false, *character);
+        }
+        if let Some(code) = self.button {
+            let _ = self.eis.button(code, false);
+        }
+    }
+}
+
+async fn type_with_profile(
+    eis: &Eis,
+    text: &str,
+    keys: &[(u32, bool)],
+    pace: InputPace,
+) -> anyhow::Result<()> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut held = SentInput::new(eis);
+    let began = tokio::time::Instant::now();
+    let mut next_down = Duration::ZERO;
+    let mut pending: Vec<(Duration, u32, char)> = Vec::new();
+    let mut shifted = false;
+    let mut submitted = 0;
+    let result: anyhow::Result<()> = async {
+        for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
+            let (hold, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
+            // Repeated keys must release before their next press. Shift transitions
+            // also wait for held characters so their requested case stays intact.
+            for (up, key, _) in &pending {
+                if *key == code || shift != shifted {
+                    next_down = next_down.max(*up);
+                }
+            }
+            pending.sort_by_key(|event| event.0);
+            while pending.first().is_some_and(|event| event.0 <= next_down) {
+                let (up, key, c) = pending.remove(0);
+                tokio::time::sleep_until(began + up).await;
+                held.key(key, false, Some(c))?;
+            }
+            tokio::time::sleep_until(began + next_down).await;
+            if shift != shifted {
+                held.key(LINUX_KEY_LEFTSHIFT, shift, None)?;
+                shifted = shift;
+            }
+            held.key(code, true, Some(character))?;
+            submitted += 1;
+            pending.push((next_down + hold, code, character));
+            next_down += interval;
+        }
+        pending.sort_by_key(|event| event.0);
+        for (up, key, c) in pending {
+            tokio::time::sleep_until(began + up).await;
+            held.key(key, false, Some(c))?;
+        }
+        if shifted {
+            held.key(LINUX_KEY_LEFTSHIFT, false, None)?;
+        }
+        Ok(())
+    }
+    .await;
+    result.map_err(|error|anyhow::anyhow!("keyboard_type stopped after submitting {submitted} of {} characters: {error}. The next character may be partly sent; check the input log before retrying.",characters.len()))
+}
+
 // ── EIS input ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -2295,7 +2533,7 @@ impl InputLog {
                     .history
                     .last_release_ns
                     .map(|release| mono.saturating_sub(release));
-                event["gap_before_ns"] = serde_json::json!(gap);
+                event["since_last_release_ns"] = serde_json::json!(gap);
                 state.history.held.entry(code).or_insert(HeldInputKey {
                     down_ns: mono,
                     character,
@@ -2390,6 +2628,16 @@ impl InputLog {
         for (code, held) in &state.history.held {
             if held.down_ns >= call.start_ns {
                 keys.push(serde_json::json!({"keycode":code,"character":held.character,"down_ns":held.down_ns,"up_ns":null,"hold_ns":null,"gap_before_ns":held.gap_before_ns}));
+            }
+        }
+        keys.sort_by_key(|key| key["down_ns"].as_u64());
+        for index in 1..keys.len() {
+            if let (Some(down), Some(previous_up)) = (
+                keys[index]["down_ns"].as_u64(),
+                keys[index - 1]["up_ns"].as_u64(),
+            ) {
+                keys[index]["gap_before_ns"] =
+                    serde_json::json!(i128::from(down) - i128::from(previous_up));
             }
         }
         let summary = serde_json::json!({"type":"call_summary","outcome":outcome,"duration_ns":duration,
@@ -5908,7 +6156,7 @@ async fn activate_window(
     if !activated {
         return Err(KwinError::Msg(format!("no window with id {window_id}")));
     }
-    tokio::time::sleep(INPUT_EVENT_DELAY).await;
+    tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
     let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
     let window = windows
         .into_iter()
@@ -6269,6 +6517,10 @@ struct ScreenshotParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// Smaller target dimension in pixels for movement timing. Default 20.
+    target_width: Option<f64>,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     x: i32,
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -6280,6 +6532,10 @@ struct MouseClickParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseMoveParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// Smaller target dimension in pixels for movement timing. Default 20.
+    target_width: Option<f64>,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     x: i32,
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -6288,6 +6544,10 @@ struct MouseMoveParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseScrollParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// Smaller target dimension in pixels for movement timing. Default 20.
+    target_width: Option<f64>,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     x: i32,
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -6300,6 +6560,10 @@ struct MouseScrollParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MouseDragParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// Smaller target dimension in pixels for movement timing. Default 20.
+    target_width: Option<f64>,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     from_x: i32,
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -6313,11 +6577,15 @@ struct MouseDragParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct KeyboardTypeParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
     text: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct KeyboardKeyParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
     key: String,
 }
 
@@ -8747,6 +9015,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, params.target_width)?;
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
@@ -8773,16 +9042,23 @@ impl KwinMcp {
         sess.eis
             .pointer_origin(wx, wy, &geometry)
             .map_err(KwinError::from)?;
-        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
-        tokio::time::sleep(MOVE_TO_CLICK_DELAY).await;
+        pace.move_pointer(
+            &sess.eis,
+            [geometry.cx, geometry.cy],
+            [f64::from(ax), f64::from(ay)],
+        )
+        .await
+        .map_err(KwinError::from)?;
+        let mut sent = SentInput::new(&sess.eis);
         for n in 0..count {
             if n > 0 {
-                tokio::time::sleep(INPUT_EVENT_DELAY).await;
+                tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
             }
-            sess.eis.button(code, true).map_err(KwinError::from)?;
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
-            sess.eis.button(code, false).map_err(KwinError::from)?;
+            sent.button(code, true).map_err(KwinError::from)?;
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+            sent.button(code, false).map_err(KwinError::from)?;
         }
+        drop(sent);
         drop(guard);
         self.mark_input().await;
         Ok(structured_result(
@@ -8805,6 +9081,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, params.target_width)?;
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
@@ -8825,7 +9102,13 @@ impl KwinMcp {
         sess.eis
             .pointer_origin(wx, wy, &geometry)
             .map_err(KwinError::from)?;
-        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
+        pace.move_pointer(
+            &sess.eis,
+            [geometry.cx, geometry.cy],
+            [f64::from(ax), f64::from(ay)],
+        )
+        .await
+        .map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
         Ok(structured_result(
@@ -8847,6 +9130,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, params.target_width)?;
         self.touch_activity().await;
         let x = params.x;
         let y = params.y;
@@ -8868,16 +9152,41 @@ impl KwinMcp {
         sess.eis
             .pointer_origin(wx, wy, &geometry)
             .map_err(KwinError::from)?;
-        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
+        pace.move_pointer(
+            &sess.eis,
+            [geometry.cx, geometry.cy],
+            [f64::from(ax), f64::from(ay)],
+        )
+        .await
+        .map_err(KwinError::from)?;
         let horiz = params.horizontal.unwrap_or_default();
-        if params.discrete.unwrap_or_default() {
-            let (dx, dy) = if horiz { (delta, 0) } else { (0, delta) };
-            sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
-        } else {
-            let d = f32::from(i16::try_from(delta).map_err(KwinError::from)?)
-                * SCROLL_SMOOTH_PIXELS_PER_TICK;
-            let (dx, dy) = if horiz { (d, 0.0) } else { (0.0, d) };
-            sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
+        let ticks = delta.unsigned_abs();
+        for index in 0..ticks {
+            if index > 0 {
+                tokio::time::sleep(pace.key_timing(' ', Some(' ')).map_err(KwinError::from)?.1)
+                    .await;
+            }
+            if params.discrete.unwrap_or_default() {
+                let (dx, dy) = if horiz {
+                    (delta.signum(), 0)
+                } else {
+                    (0, delta.signum())
+                };
+                sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
+            } else {
+                let d = f32::from(i16::try_from(delta.signum()).map_err(KwinError::from)?)
+                    * SCROLL_SMOOTH_PIXELS_PER_TICK;
+                // Smooth wheel ticks use three reports whose sum is exactly the requested delta.
+                for part in [0.25, 0.5, 0.25] {
+                    let (dx, dy) = if horiz {
+                        (d * part, 0.0)
+                    } else {
+                        (0.0, d * part)
+                    };
+                    sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
+                    tokio::time::sleep(POINTER_REPORT_INTERVAL).await;
+                }
+            }
         }
         drop(guard);
         self.mark_input().await;
@@ -8900,6 +9209,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, params.target_width)?;
         self.touch_activity().await;
         let from_x = params.from_x;
         let from_y = params.from_y;
@@ -8921,21 +9231,24 @@ impl KwinMcp {
         sess.eis
             .pointer_origin(wx, wy, &geometry)
             .map_err(KwinError::from)?;
-        sess.eis.move_abs(ax, ay).map_err(KwinError::from)?;
-        sess.eis.button(code, true).map_err(KwinError::from)?;
-        for step in 1..=DRAG_STEPS {
-            let cx = f32::from(
-                i16::try_from(wx + from_x + (to_x - from_x) * step / DRAG_STEPS)
-                    .map_err(KwinError::from)?,
-            );
-            let cy = f32::from(
-                i16::try_from(wy + from_y + (to_y - from_y) * step / DRAG_STEPS)
-                    .map_err(KwinError::from)?,
-            );
-            sess.eis.move_abs(cx, cy).map_err(KwinError::from)?;
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
-        }
-        sess.eis.button(code, false).map_err(KwinError::from)?;
+        pace.move_pointer(
+            &sess.eis,
+            [geometry.cx, geometry.cy],
+            [f64::from(ax), f64::from(ay)],
+        )
+        .await
+        .map_err(KwinError::from)?;
+        let end = [
+            f64::from(i16::try_from(wx + to_x).map_err(KwinError::from)?),
+            f64::from(i16::try_from(wy + to_y).map_err(KwinError::from)?),
+        ];
+        let mut sent = SentInput::new(&sess.eis);
+        sent.button(code, true).map_err(KwinError::from)?;
+        pace.move_pointer(&sess.eis, [f64::from(ax), f64::from(ay)], end)
+            .await
+            .map_err(KwinError::from)?;
+        sent.button(code, false).map_err(KwinError::from)?;
+        drop(sent);
         drop(guard);
         self.mark_input().await;
         Ok(structured_result(
@@ -8957,6 +9270,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardTypeParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
@@ -8969,37 +9283,9 @@ impl KwinMcp {
             .chars()
             .map(char_key)
             .collect::<Result<Vec<_>, _>>()?;
-        for (typed, (character, (code, needs_shift))) in
-            params.text.chars().zip(keys.iter()).enumerate()
-        {
-            let sent = (|| {
-                if *needs_shift {
-                    sess.eis.key(LINUX_KEY_LEFTSHIFT, true)?;
-                }
-                sess.eis.key_with_character(*code, true, Some(character))?;
-                sess.eis.key_with_character(*code, false, Some(character))?;
-                if *needs_shift {
-                    sess.eis.key(LINUX_KEY_LEFTSHIFT, false)?;
-                }
-                anyhow::Ok(())
-            })();
-            if let Err(error) = sent {
-                // Never leave a key or Shift held down after a failure.
-                let _ = sess.eis.key(*code, false);
-                let _ = sess.eis.key(LINUX_KEY_LEFTSHIFT, false);
-                let done: String = params.text.chars().take(typed).collect();
-                let rest: String = params.text.chars().skip(typed).collect();
-                return Err(McpError::internal_error(
-                    format!(
-                        "keyboard_type stopped after {typed} of {} characters: {error}. \
-                     Typed so far: {done:?}. Not typed (character {} may be partly sent): {rest:?}",
-                        keys.len(),
-                        typed + 1,
-                    ),
-                    None,
-                ));
-            }
-        }
+        type_with_profile(&sess.eis, &params.text, &keys, pace)
+            .await
+            .map_err(KwinError::from)?;
         drop(guard);
         self.mark_input().await;
         Ok(structured_result(
@@ -9021,6 +9307,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
         let (mods, main) = parse_combo(&params.key)?;
         let (conn, kwin_unique, xdg) = self
@@ -9045,22 +9332,24 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
+        let mut sent = SentInput::new(&sess.eis);
         for m in &mods {
-            sess.eis.key(*m, true).map_err(KwinError::from)?;
+            sent.key(*m, true, None).map_err(KwinError::from)?;
         }
         if !mods.is_empty() {
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
         }
         let k = main;
-        sess.eis.key(k, true).map_err(KwinError::from)?;
-        tokio::time::sleep(INPUT_EVENT_DELAY).await;
-        sess.eis.key(k, false).map_err(KwinError::from)?;
+        sent.key(k, true, None).map_err(KwinError::from)?;
+        tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+        sent.key(k, false, None).map_err(KwinError::from)?;
         if !mods.is_empty() {
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
         }
         for m in mods.iter().rev() {
-            sess.eis.key(*m, false).map_err(KwinError::from)?;
+            sent.key(*m, false, None).map_err(KwinError::from)?;
         }
+        drop(sent);
         drop(guard);
         self.mark_input().await;
         let text = match warning {
@@ -9086,6 +9375,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
@@ -9096,7 +9386,7 @@ impl KwinMcp {
             sess.eis.key(*m, true).map_err(KwinError::from)?;
         }
         if !mods.is_empty() {
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
         }
         let k = main;
         sess.eis.key(k, true).map_err(KwinError::from)?;
@@ -9121,6 +9411,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<KeyboardKeyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
@@ -9130,7 +9421,7 @@ impl KwinMcp {
         let k = main;
         sess.eis.key(k, false).map_err(KwinError::from)?;
         if !mods.is_empty() {
-            tokio::time::sleep(INPUT_EVENT_DELAY).await;
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
         }
         for m in mods.iter().rev() {
             sess.eis.key(*m, false).map_err(KwinError::from)?;
@@ -10825,7 +11116,7 @@ fn source_stamp(root: &Path) -> Option<std::time::SystemTime> {
             .filter_map(|entry| latest(&entry.path()))
             .max()
     }
-    ["src", "Cargo.toml", "Cargo.lock", "build.rs"]
+    ["src", "data", "Cargo.toml", "Cargo.lock", "build.rs"]
         .into_iter()
         .filter_map(|path| latest(&root.join(path)))
         .max()

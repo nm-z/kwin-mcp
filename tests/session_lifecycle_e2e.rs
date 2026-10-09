@@ -99,6 +99,7 @@ impl RpcClient {
                 .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
             for name in [
                 "src",
+                "data",
                 "Cargo.toml",
                 "Cargo.lock",
                 "build.rs",
@@ -4289,4 +4290,273 @@ fn input_events_are_logged_immediately_and_survive_session_stop() {
         records.len()
     );
     std::fs::remove_dir_all(state).expect("remove private test state");
+}
+
+#[test]
+#[ignore = "requires private KWin session and approximately two minutes of real input"]
+fn human_input_matches_published_timing_profile_on_stdio() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session = session_handle(&started);
+    let log = PathBuf::from(
+        started["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("log path"),
+    );
+    call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session,"command":format!("kdialog --title human-input --inputbox 'Human input timing' > {}/submitted.txt", workdir(&started).display())}),
+    );
+    let read_records = || -> Vec<Value> {
+        std::fs::read_to_string(&log)
+            .expect("input log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSONL"))
+            .collect()
+    };
+    let mut request = 10;
+    let mut measured = Vec::new();
+    for (distance, width, speed) in [
+        (80.0_f64, 20.0_f64, 1.0_f64),
+        (600.0, 20.0, 1.0),
+        (600.0, 80.0, 1.0),
+        (600.0, 20.0, 2.0),
+    ] {
+        let mut durations = Vec::new();
+        for _ in 0..4 {
+            call_tool(
+                &mut client,
+                request,
+                "mouse_move",
+                json!({"session_id":session,"x":50,"y":100,"speed":4}),
+            );
+            request += 1;
+            let response = call_tool(
+                &mut client,
+                request,
+                "mouse_move",
+                json!({"session_id":session,"x":format!("{:.0}",50.0+distance),"y":100,"target_width":width,"speed":speed}),
+            );
+            assert!(response["error"].is_null(), "{response}");
+            let records = read_records();
+            let summary = records
+                .iter()
+                .find(|r| r["type"] == "call_summary" && r["tool"]["request_id"] == request)
+                .expect("move summary");
+            let pointer = &summary["pointer"];
+            let duration = pointer["duration_ns"].as_f64().expect("duration") / 1e6;
+            durations.push(duration);
+            let events: Vec<_> = records
+                .iter()
+                .filter(|r| r["event"] == "motion" && r["tool"]["request_id"] == request)
+                .collect();
+            assert!(events.len() > 10, "pointer still jumps");
+            assert_eq!(
+                events.last().expect("last motion")["window_x"].as_f64(),
+                Some(50.0 + distance)
+            );
+            assert_eq!(
+                events.last().expect("last motion")["window_y"].as_f64(),
+                Some(100.0)
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|r| (r["window_y"].as_f64().expect("y") - 100.0).abs() > 0.01),
+                "straight path"
+            );
+            let mut intervals: Vec<_> = events
+                .windows(2)
+                .map(|pair| {
+                    (pair[1]["monotonic_ns"].as_f64().expect("time")
+                        - pair[0]["monotonic_ns"].as_f64().expect("time"))
+                        / 1e6
+                })
+                .collect();
+            intervals.sort_by(f64::total_cmp);
+            assert!(
+                (6.0..30.0).contains(&intervals[intervals.len() / 2]),
+                "report interval {intervals:?}"
+            );
+            let start_ns = pointer["start_ns"].as_f64().expect("start");
+            let surge = if distance > 200.0 { 0.85 } else { 1.0 };
+            let near_distance = if distance > 200.0 {
+                distance - width.min(30.0) * 0.2
+            } else {
+                distance
+            };
+            let mut deviation = Vec::new();
+            for event in &events {
+                let t = (event["monotonic_ns"].as_f64().expect("time") - start_ns)
+                    / (duration * 1e6 * surge);
+                if (0.1..0.8).contains(&t) {
+                    let expected = 10.0 * t.powi(3) - 15.0 * t.powi(4) + 6.0 * t.powi(5);
+                    deviation.push(
+                        ((event["window_x"].as_f64().expect("x") - 50.0) / near_distance
+                            - expected)
+                            .abs(),
+                    );
+                }
+            }
+            assert!(!deviation.is_empty());
+            assert!(
+                deviation.iter().sum::<f64>()
+                    / f64::from(u32::try_from(deviation.len()).expect("samples"))
+                    < 0.08,
+                "minimum-jerk shape differs"
+            );
+            request += 1;
+        }
+        let mean = durations.iter().sum::<f64>() / 4.0;
+        let expected = (230.0 + 166.0 * (distance / width + 1.0).log2()) / speed;
+        assert!(
+            (mean - expected).abs() < 160.0 / speed + 25.0,
+            "Fitts mean {mean} vs {expected}"
+        );
+        println!(
+            "pointer D={distance} W={width} speed={speed}: mean={mean:.1} ms, published fit={expected:.1} ms"
+        );
+        measured.push(mean);
+    }
+    assert!(
+        measured[1] > measured[0] && measured[1] > measured[2] && measured[1] > measured[3] * 1.5
+    );
+    for (id, discrete) in [(60, true), (61, false)] {
+        let result = call_tool(
+            &mut client,
+            id,
+            "mouse_scroll",
+            json!({"session_id":session,"x":100,"y":100,"delta":4,"discrete":discrete}),
+        );
+        assert!(result["error"].is_null(), "{result}");
+        let records = read_records();
+        let events: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "scroll" && r["tool"]["request_id"] == id)
+            .collect();
+        assert_eq!(events.len(), if discrete { 4 } else { 12 });
+        assert_eq!(
+            events
+                .iter()
+                .map(|r| r["dy"].as_f64().expect("delta"))
+                .sum::<f64>(),
+            if discrete { 480.0 } else { 60.0 }
+        );
+        assert!(
+            events.last().expect("last")["monotonic_ns"]
+                .as_u64()
+                .expect("time")
+                - events[0]["monotonic_ns"].as_u64().expect("time")
+                > 100_000_000
+        );
+    }
+    let text = "the little red fox sees the green tree and the blue sky. ".repeat(5);
+    let profile: Value = serde_json::from_str(include_str!("../data/input-profile.json"))
+        .expect("published sample fit");
+    let mut typing_durations = Vec::new();
+    for (id, speed) in [(70, 1.0), (72, 2.0)] {
+        call_tool(
+            &mut client,
+            id - 1,
+            "keyboard_key",
+            json!({"session_id":session,"key":"ctrl+a","speed":speed}),
+        );
+        client.send(id,"tools/call",json!({"name":"keyboard_type","arguments":{"session_id":session,"text":text,"speed":speed}}));
+        let response = client.response(id, Duration::from_secs(90));
+        assert!(response["error"].is_null(), "{response}");
+        let records = read_records();
+        let summary = records
+            .iter()
+            .find(|r| r["type"] == "call_summary" && r["tool"]["request_id"] == id)
+            .expect("typing summary");
+        assert_eq!(summary["typing"]["characters"], text);
+        let keys = summary["typing"]["keys"].as_array().expect("key timings");
+        assert_eq!(keys.len(), text.len());
+        let mut hold_z = Vec::new();
+        let mut iki_z = Vec::new();
+        let mut overlap = 0_u32;
+        for pair in keys.windows(2) {
+            let bigram = format!(
+                "{}{}",
+                pair[0]["character"].as_str().expect("char"),
+                pair[1]["character"].as_str().expect("char")
+            );
+            let stats = profile["bigrams"]
+                .get(&bigram)
+                .unwrap_or(&profile["bigrams"]["*"]);
+            let hold = pair[0]["hold_ns"].as_f64().expect("hold") / 1e6 * speed;
+            let iki = (pair[1]["down_ns"].as_f64().expect("down")
+                - pair[0]["down_ns"].as_f64().expect("down"))
+                / 1e6
+                * speed;
+            hold_z.push(
+                (hold.ln() - stats[1].as_f64().expect("mean")) / stats[2].as_f64().expect("sd"),
+            );
+            iki_z.push(
+                (iki.ln() - stats[3].as_f64().expect("mean")) / stats[4].as_f64().expect("sd"),
+            );
+            if pair[1]["down_ns"].as_u64() < pair[0]["up_ns"].as_u64() {
+                overlap += 1;
+                assert!(pair[1]["gap_before_ns"].as_i64().expect("signed gap") < 0);
+            }
+        }
+        for (name, z) in [("hold", hold_z), ("interval", iki_z)] {
+            let n = f64::from(u32::try_from(z.len()).expect("sample count"));
+            let mean = z.iter().sum::<f64>() / n;
+            let second = z.iter().map(|v| v * v).sum::<f64>() / n;
+            assert!(
+                mean.abs() < 0.35 && (0.5..1.8).contains(&second),
+                "{name} fitted log-z mean={mean} second moment={second}"
+            );
+            println!(
+                "typing speed={speed} {name}: log-z mean={mean:.3}, second moment={second:.3}"
+            );
+        }
+        assert!(overlap > 20, "rollover missing");
+        let duration = summary["typing"]["duration_ns"].as_f64().expect("duration") / 1e9;
+        let wpm = f64::from(u32::try_from(text.len()).expect("characters")) / 5.0 / duration * 60.0;
+        println!("typing speed={speed}: {wpm:.1} WPM, {overlap} overlapping pairs");
+        assert!((70.0 * speed..140.0 * speed).contains(&wpm));
+        typing_durations.push(duration);
+    }
+    assert!(typing_durations[0] > typing_durations[1] * 1.5);
+    save_session_image(&mut client, 80, &session, "human-input.png");
+    call_tool(
+        &mut client,
+        81,
+        "keyboard_key",
+        json!({"session_id":session,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&workdir(&started).join("submitted.txt")),
+        format!("{text}\n")
+    );
+    let invalid = call_tool(
+        &mut client,
+        82,
+        "mouse_move",
+        json!({"session_id":session,"x":5,"y":5,"speed":0}),
+    );
+    assert!(invalid["error"].is_object());
+    assert!(
+        !read_records()
+            .iter()
+            .any(|r| r["type"] == "event" && r["tool"]["request_id"] == 82)
+    );
+    call_tool(
+        &mut client,
+        83,
+        "session_stop",
+        json!({"session_id":session}),
+    );
+    client.stop_process();
 }
