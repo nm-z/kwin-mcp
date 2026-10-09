@@ -4560,3 +4560,155 @@ fn human_input_matches_published_timing_profile_on_stdio() {
     );
     client.stop_process();
 }
+
+#[test]
+#[ignore = "requires three private KWin sessions and Vulkan viewer rendering"]
+fn viewer_titles_identify_sessions_and_update_reasons_in_private_desktop() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":1024,"height":768}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    assert!(display.exists(), "private viewer display missing");
+    let mut client = RpcClient::start_with_env(&[(
+        "WAYLAND_DISPLAY",
+        display.to_str().expect("private display"),
+    )]);
+    initialize(&mut client);
+    let a = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let b = call_tool(
+        &mut client,
+        3,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let a_id = session_handle(&a);
+    let b_id = session_handle(&b);
+    for (request, id, title) in [(4, &a_id, "Viewer A"), (5, &b_id, "Viewer B")] {
+        call_tool(
+            &mut client,
+            request,
+            "launch_app",
+            json!({"session_id":id,"command":format!("kdialog --title '{title}' --inputbox '{title} content'")}),
+        );
+    }
+    let reason = "tick \"I am human\", then Continue shopping";
+    let first = call_tool(
+        &mut client,
+        6,
+        "viewer_open",
+        json!({"session_id":a_id,"reason":reason}),
+    );
+    assert_ne!(
+        first["result"]["structuredContent"]["viewer"]["state"], "unavailable",
+        "{first}"
+    );
+    let second = call_tool(&mut client, 7, "viewer_open", json!({"session_id":b_id}));
+    assert_ne!(
+        second["result"]["structuredContent"]["viewer"]["state"], "unavailable",
+        "{second}"
+    );
+    let windows = call_tool(
+        &mut desktop,
+        3,
+        "window_list",
+        json!({"session_id":host_id}),
+    );
+    println!(
+        "private viewer windows: {}",
+        windows["result"]["structuredContent"]
+    );
+    call_tool(
+        &mut desktop,
+        5,
+        "keyboard_press",
+        json!({"session_id":host_id,"key":"alt+Tab"}),
+    );
+    save_session_image(&mut desktop, 4, &host_id, "viewer-titles.png");
+    call_tool(
+        &mut desktop,
+        6,
+        "keyboard_release",
+        json!({"session_id":host_id,"key":"alt+Tab"}),
+    );
+    let expected_a = format!("kwin-viewer {a_id}: {reason}");
+    let expected_b = format!("kwin-viewer {b_id}");
+    let rows = windows["result"]["structuredContent"]["windows"]
+        .as_array()
+        .expect("windows");
+    assert!(
+        rows.iter().any(|row| row["title"] == expected_a),
+        "missing title {expected_a}: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row["title"] == expected_b),
+        "missing title {expected_b}: {rows:?}"
+    );
+    let first_pid = first["result"]["structuredContent"]["viewer"]["pid"].clone();
+    let updated = call_tool(
+        &mut client,
+        8,
+        "viewer_open",
+        json!({"session_id":a_id,"reason":"Enter the verification code"}),
+    );
+    assert_eq!(
+        updated["result"]["structuredContent"]["viewer"]["pid"],
+        first_pid
+    );
+    assert_eq!(
+        updated["result"]["structuredContent"]["status"],
+        "already_open"
+    );
+    let expected_updated = format!("kwin-viewer {a_id}: Enter the verification code");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut request = 10;
+    loop {
+        let windows = call_tool(
+            &mut desktop,
+            request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        request += 1;
+        if windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .expect("windows")
+            .iter()
+            .any(|row| row["title"] == expected_updated)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "title did not update: {windows}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    println!(
+        "PASS: distinct session titles; quoted reason; existing viewer PID retained while title changes"
+    );
+    for (request, id) in [(20, a_id), (21, b_id)] {
+        call_tool(
+            &mut client,
+            request,
+            "session_stop",
+            json!({"session_id":id}),
+        );
+    }
+    client.stop_process();
+    call_tool(
+        &mut desktop,
+        request + 1,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
+}

@@ -1122,6 +1122,22 @@ impl SessionLink {
     }
 }
 
+fn session_title_fallback(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let id = name
+        .strip_prefix("kwin-mcp-")
+        .map(|suffix| format!("s{suffix}"))
+        .unwrap_or_else(|| name.to_owned());
+    format!("kwin-viewer {id}")
+}
+fn session_title(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path.join("viewer-title"))
+        .unwrap_or_else(|_| session_title_fallback(path))
+}
+
 fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let virt = parse_size(&mut argv)?;
     let session_path = std::path::PathBuf::from(&session_dir);
@@ -1186,10 +1202,9 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     };
 
     let run_result = window_loop(
-        "kwin-viewer",
+        ViewerTitle::Local(&session_path),
         &mailbox,
         &shutdown,
-        Some(&session_path),
         virt,
         &mut input_state,
         Some((&numlock, &link.fake_input, &link.conn)),
@@ -1212,17 +1227,34 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
 // The viewer window: shows the latest frame from the mailbox and forwards the
 // window's input through `input_state`. `status_dir` is where the local viewer
 // reports readiness; a remote viewer has none.
+enum ViewerTitle<'a> {
+    Local(&'a std::path::Path),
+    Remote(&'a Mutex<String>, &'a str),
+}
+impl ViewerTitle<'_> {
+    fn text(&self) -> String {
+        match self {
+            Self::Local(path) => session_title(path),
+            Self::Remote(title, host) => {
+                let title = title.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                format!("{title} ({host})")
+            }
+        }
+    }
+}
+
 fn window_loop(
-    title: &str,
+    title: ViewerTitle<'_>,
     mailbox: &FrameMailbox,
     shutdown: &Shutdown,
-    status_dir: Option<&std::path::Path>,
     virt: (u32, u32),
     input_state: &mut InputState,
     numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
 ) -> anyhow::Result<()> {
+    let status_dir = match &title {ViewerTitle::Local(path) => Some(*path), ViewerTitle::Remote(_,_) => None};
+    let initial_title = title.text();
     let window = WindowBuilder::default()
-        .window(|wa| wa.with_title(title).with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
+        .window(|wa| wa.with_title(&initial_title).with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -1231,6 +1263,8 @@ fn window_loop(
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
     let mut ready_reported = false;
+    let mut shown_title = initial_title;
+    let mut next_title_check = Instant::now();
 
     window.run(|mut frame| {
         // Leave as soon as anything the viewer depends on has ended, so the
@@ -1240,6 +1274,14 @@ fn window_loop(
             return;
         }
 
+        if Instant::now() >= next_title_check {
+            let next = title.text();
+            if next != shown_title {
+                frame.window.set_title(&next);
+                shown_title = next;
+            }
+            next_title_check = Instant::now() + Duration::from_millis(250);
+        }
         for event in frame.events {
             forward_input(event, (frame.width, frame.height), virt, input_state, numlock);
         }
@@ -1310,8 +1352,19 @@ fn window_loop(
 // Wire format between `--serve` (on the host that runs the session) and
 // `--remote` (on the host with the screen), carried over one ssh stdio pipe.
 // Server to client: WIRE_FRAME, a u32 little-endian length, then a PNG of the
-// frame. Client to server: fixed 17-byte input records (see Op::encode).
+// frame. WIRE_TITLE uses the same length prefix followed by UTF-8 title text.
+// Client to server: fixed 17-byte input records (see Op::encode).
 const WIRE_FRAME: u8 = 1;
+const WIRE_TITLE: u8 = 2;
+
+fn write_title(out: &mut impl Write, title: &str) -> anyhow::Result<()> {
+    out.write_all(&[WIRE_TITLE])?;
+    out.write_all(&u32::try_from(title.len())?.to_le_bytes())?;
+    out.write_all(title.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
 // Frames are sent at most this often; the mailbox keeps only the newest.
 const SERVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const SERVE_IDLE_POLL: Duration = Duration::from_millis(20);
@@ -1335,23 +1388,45 @@ fn write_frame(out: &mut impl Write, frame: &Frame) -> anyhow::Result<()> {
 }
 
 // Read one frame; None when the stream ends.
-fn read_frame(input: &mut impl Read) -> anyhow::Result<Option<Frame>> {
-    let mut head = [0u8; 5];
-    match input.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
+fn read_frame(
+    input: &mut impl Read,
+    title: Option<&Mutex<String>>,
+) -> anyhow::Result<Option<Frame>> {
+    loop {
+        let mut head = [0u8; 5];
+        match input.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        anyhow::ensure!(
+            matches!(head[0], WIRE_FRAME | WIRE_TITLE),
+            "unknown message type {}",
+            head[0]
+        );
+        let length = usize::try_from(u32::from_le_bytes([head[1], head[2], head[3], head[4]]))?;
+        anyhow::ensure!(length <= 64 << 20, "frame of {length} bytes is too large");
+        let mut payload = vec![0u8; length];
+        input.read_exact(&mut payload)?;
+        if head[0] == WIRE_TITLE {
+            let text = String::from_utf8(payload)?;
+            if let Some(title) = title {
+                *title
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("viewer title lock poisoned"))? = text;
+            }
+            continue;
+        }
+        let mut reader = png::Decoder::new(Cursor::new(payload)).read_info()?;
+        let mut rgba = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut rgba)?;
+        rgba.truncate(info.buffer_size());
+        return Ok(Some(Frame {
+            width: info.width,
+            height: info.height,
+            rgba,
+        }));
     }
-    anyhow::ensure!(head[0] == WIRE_FRAME, "unknown message type {}", head[0]);
-    let length = usize::try_from(u32::from_le_bytes([head[1], head[2], head[3], head[4]]))?;
-    anyhow::ensure!(length <= 64 << 20, "frame of {length} bytes is too large");
-    let mut payload = vec![0u8; length];
-    input.read_exact(&mut payload)?;
-    let mut reader = png::Decoder::new(Cursor::new(payload)).read_info()?;
-    let mut rgba = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut rgba)?;
-    rgba.truncate(info.buffer_size());
-    Ok(Some(Frame { width: info.width, height: info.height, rgba }))
 }
 
 // Run on the host that owns the session: no window. Streams the session's
@@ -1385,7 +1460,13 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     write_status(&session_path, "ready", "remote viewer is streaming");
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     let mut result = Ok(());
+    let mut sent_title = String::new();
     while !shutdown.requested() {
+        let title = session_title(&session_path);
+        if title != sent_title {
+            if let Err(error) = write_title(&mut stdout,&title) { result=Err(error); break; }
+            sent_title=title;
+        }
         let latest = mailbox.lock().ok().and_then(|mut g| g.take());
         match latest {
             Some(frame) => {
@@ -1434,11 +1515,13 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
 
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
     let reader = {
+        let title = Arc::clone(&title);
         let (mailbox, shutdown) = (Arc::clone(&mailbox), shutdown.clone());
         std::thread::Builder::new().name("remote-frames".to_owned()).spawn(move || {
             loop {
-                match read_frame(&mut stdout) {
+                match read_frame(&mut stdout,Some(&title)) {
                     Ok(Some(frame)) => {
                         if let Ok(mut slot) = mailbox.lock() {
                             *slot = Some(frame);
@@ -1462,8 +1545,7 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         held_keys: HashSet::new(),
         clipboard: None,
     };
-    let title = format!("kwin-viewer ({host})");
-    let result = window_loop(&title, &mailbox, &shutdown, None, virt, &mut input_state, None);
+    let result = window_loop(ViewerTitle::Remote(&title,&host), &mailbox, &shutdown, virt, &mut input_state, None);
     shutdown.request();
     // Closing the pipe ends `--serve` on the far side; ssh then exits.
     drop(input_state);
@@ -2145,15 +2227,19 @@ mod wire_tests {
         let rgba: Vec<u8> = (0..4 * 6 * 3).map(|i| u8::try_from(i * 7 % 256).unwrap_or(0)).collect();
         let frame = Frame { width: 6, height: 3, rgba: rgba.clone() };
         let mut wire = Vec::new();
+        write_title(&mut wire,"kwin-viewer s1: First instruction")?;
         write_frame(&mut wire, &frame)?;
+        write_title(&mut wire,"kwin-viewer s1: Updated instruction")?;
         write_frame(&mut wire, &frame)?;
         let mut input = Cursor::new(wire);
-        for _ in 0..2 {
-            let got = read_frame(&mut input)?.ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
+        let title = Mutex::new(String::new());
+        for expected in ["kwin-viewer s1: First instruction","kwin-viewer s1: Updated instruction"] {
+            let got = read_frame(&mut input,Some(&title))?.ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
+            assert_eq!(*title.lock().unwrap(),expected);
             assert_eq!((got.width, got.height), (6, 3));
             assert_eq!(got.rgba, rgba);
         }
-        assert!(read_frame(&mut input)?.is_none());
+        assert!(read_frame(&mut input,None)?.is_none());
         Ok(())
     }
 }

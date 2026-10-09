@@ -4361,6 +4361,7 @@ fn test_stop_bwrap(child: &std::process::Child) {
 
 #[derive(Clone)]
 struct KwinMcp {
+    session_id: String,
     input_log: Option<Arc<InputLog>>,
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
@@ -4385,6 +4386,7 @@ struct KwinMcp {
 impl KwinMcp {
     fn new(display: DisplayConfig) -> Self {
         Self {
+            session_id: String::new(),
             input_log: None,
             session: Arc::new(tokio::sync::RwLock::new(None)),
             path: session_workdir_path(),
@@ -6516,6 +6518,12 @@ struct ScreenshotParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ViewerOpenParams {
+    /// A short instruction for the user. Displayed only in the viewer title.
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct MouseClickParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
@@ -7994,11 +8002,12 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Reuses an already open viewer. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Reuses an already open viewer and updates its title. While waiting, keep the page open and poll with screenshots. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the page advances, then call viewer_close when the user-facing step is done. Returns ready, starting, or unavailable with a reason. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer."
     )]
     async fn viewer_open(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<ViewerOpenParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         let _gate = self
@@ -8007,11 +8016,27 @@ impl KwinMcp {
                 "viewer_open",
             )
             .await?;
+        let reason = params
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title = if reason.is_empty() {
+            format!("kwin-viewer {}", self.session_id)
+        } else {
+            format!("kwin-viewer {}: {reason}", self.session_id)
+        };
         let (host_xdg_dir, width, height) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
             })?;
+            let title_path = sess.host_xdg_dir.join("viewer-title");
+            let temporary = title_path.with_extension("tmp");
+            std::fs::write(&temporary, &title).map_err(KwinError::from)?;
+            std::fs::rename(&temporary, &title_path).map_err(KwinError::from)?;
             let running = match sess.viewer_child.as_mut() {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
                 None => false,
@@ -8023,7 +8048,7 @@ impl KwinMcp {
                 return Ok(structured_result(
                     &peer,
                     message,
-                    serde_json::json!({"status": "already_open", "viewer": viewer}),
+                    serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
             }
@@ -8085,7 +8110,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("viewer {status}: {}", viewer_summary(&viewer)),
-            serde_json::json!({"status": status, "viewer": viewer}),
+            serde_json::json!({"status": status, "viewer": viewer,"title":title}),
         )
         .await)
     }
@@ -10219,6 +10244,7 @@ impl SessionRouter {
             let number = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let id = format!("s{}-{number}", std::process::id());
             let mut session = KwinMcp::new(self.display);
+            session.session_id = id.clone();
             session.input_log =
                 Some(InputLog::open(&id, InputHistory::default(), None).map_err(KwinError::from)?);
             session.path =
@@ -10885,6 +10911,7 @@ impl SessionRouter {
         NEXT_BROWSER_LAUNCH.store(state.next_launch, std::sync::atomic::Ordering::Relaxed);
         for saved in state.sessions {
             let mut service = KwinMcp::new(self.display);
+            service.session_id = saved.id.clone();
             service.input_log = Some(InputLog::open(
                 &saved.id,
                 saved.input_history,
