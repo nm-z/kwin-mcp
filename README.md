@@ -149,7 +149,24 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## Input logs
+
+`session_start` and `session_list` report each session's `input_log` path.
+Agent input is appended immediately to JSONL under
+`${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/input/`, with file permissions `0600`.
+Logs remain after session cleanup and continue in the same file after a server reload.
+No export call is required.
+
+Each raw input record includes monotonic and wall-clock nanoseconds, the MCP tool
+name and request ID, and the motion, button, key, or scroll event. Motion records
+include screen and window coordinates. Key records include characters when known,
+hold times, and gaps. Scroll records identify pixels or discrete value120 units.
+Each call ends with a summary of its pointer path and peak speed, typing timing,
+and scroll totals and event rate. A flushed event means the EIS socket accepted
+the data; it does not confirm that an application consumed it.
+
 ## Sessions and reloads
+
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
 
