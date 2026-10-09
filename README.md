@@ -64,7 +64,11 @@ The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Conf
 
 ## Clipboard isolation
 
-KWin MCP does not bridge clipboard contents between the host desktop and the isolated session. Each compositor keeps its own clipboard and primary selection; copying in one session does not overwrite or seed the other session.
+Each session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host clipboard, and Ctrl+V or Shift+Insert pastes from the host clipboard. The viewer restores the session's prior selection afterward. Put anything the user should paste through the viewer on the **host** clipboard.
+
+Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
+
+`clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
 ## KWallet safety
 
