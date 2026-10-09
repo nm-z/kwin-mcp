@@ -1728,6 +1728,7 @@ dependencies = [
  "pipewire",
  "png",
  "procfs",
+ "rand",
  "reis",
  "rmcp",
  "rusqlite",

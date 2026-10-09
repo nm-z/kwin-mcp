@@ -149,6 +149,20 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## Input timing
+
+Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
+(default `1.0`). `keyboard_type` defaults to approximately 100 WPM; `speed: 2`
+requests approximately twice that rate. Mouse tools also accept `target_width`,
+the smaller target dimension in pixels (default `20`), for movement timing.
+
+Pointer movement uses sampled Fitts-law durations, minimum-jerk progress,
+curved paths, and short corrections on long moves. Typing samples per-bigram
+hold times and intervals from a published-data fit, including overlapping keys
+and word-boundary timing. Scrolls preserve the requested total in timed bursts.
+See [profile sources and fitting method](data/README.md) for assumptions and
+source-data terms. No host input is recorded.
+
 ## Input logs
 
 `session_start` and `session_list` report each session's `input_log` path.

@@ -52,7 +52,7 @@ fn watch_git_identity() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    for path in ["build.rs", "Cargo.toml", "Cargo.lock", "src"] {
+    for path in ["build.rs", "Cargo.toml", "Cargo.lock", "src", "data"] {
         watch(Path::new(path));
     }
     watch_git_identity();
