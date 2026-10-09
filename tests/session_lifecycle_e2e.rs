@@ -4920,3 +4920,318 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "PASS: live KWin node stalled while its policy manager was suspended; bounded unavailable/failed result with Connecting; retry presents a frame"
     );
 }
+
+#[test]
+#[ignore = "requires private KWin desktops, kdialog, and wl-paste"]
+fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    let mut client = RpcClient::start_with_env(&[
+        (
+            "WAYLAND_DISPLAY",
+            display.to_str().expect("private display"),
+        ),
+        ("KWIN_MCP_E2E_COPY_BINARY", "1"),
+    ]);
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_kwin-viewer"),
+        client.home.join("kwin-viewer"),
+    )
+    .expect("private viewer executable");
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let id = session_handle(&started);
+    let dir = workdir(&started);
+    let mut request = 10;
+    let mut run = |client: &mut RpcClient, name: &str, arguments: Value| {
+        request += 1;
+        let response = call_tool(client, request, name, arguments);
+        assert!(response["error"].is_null(), "{response}");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        response["result"]["structuredContent"].clone()
+    };
+    let agent_text = "session café ✓";
+    assert_eq!(
+        run(
+            &mut client,
+            "clipboard_write",
+            json!({"session_id":id,"target":"session","text":agent_text})
+        ),
+        json!({"target":"session","length":14})
+    );
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        agent_text
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":format!("kdialog --title 'Session clipboard' --inputbox 'Paste session text' > {}/agent.txt",dir.display())}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"ctrl+v"}),
+    );
+    save_session_image(&mut client, 1000, &id, "clipboard-session.png");
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&dir.join("agent.txt")),
+        format!("{agent_text}\n")
+    );
+
+    run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"host","text":"host paste"}),
+    );
+    assert_eq!(
+        run(
+            &mut desktop,
+            "clipboard_read",
+            json!({"session_id":host_id})
+        )["text"],
+        "host paste"
+    );
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        agent_text
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":format!("kdialog --title 'Viewer clipboard' --inputbox 'Paste through viewer' > {}/viewer.txt",dir.display())}),
+    );
+    let viewer = run(
+        &mut client,
+        "viewer_open",
+        json!({"session_id":id,"reason":"Private clipboard test"}),
+    );
+    assert_eq!(viewer["viewer"]["state"], "ready", "{viewer}");
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"ctrl+v"}),
+    );
+    thread::sleep(Duration::from_millis(250));
+    save_session_image(&mut client, 1001, &id, "clipboard-viewer.png");
+    run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"host","text":"replace on copy"}),
+    );
+    // Let the viewer's existing tool-input idle gate open before user input.
+    thread::sleep(Duration::from_millis(2100));
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"ctrl+a"}),
+    );
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"ctrl+c"}),
+    );
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        run(
+            &mut desktop,
+            "clipboard_read",
+            json!({"session_id":host_id})
+        )["text"],
+        "host paste"
+    );
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        agent_text
+    );
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"Return"}),
+    );
+    assert_eq!(submitted_text(&dir.join("viewer.txt")), "host paste\n");
+
+    let secret =
+        json!({"length":32,"character_classes":["lowercase","uppercase","digits","symbols"]});
+    let result = run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"host","generate_secret":secret}),
+    );
+    assert_eq!(result, json!({"target":"host","length":32}));
+    assert_eq!(
+        run(
+            &mut desktop,
+            "clipboard_read",
+            json!({"session_id":host_id})
+        ),
+        json!({"target":"session","length":32,"text":null,"protected":true})
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":format!("kdialog --title 'Secret paste' --password 'Paste generated secret' > {}/secret.txt",dir.display())}),
+    );
+    thread::sleep(Duration::from_millis(2100));
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"shift+Insert"}),
+    );
+    thread::sleep(Duration::from_millis(250));
+    save_session_image(&mut client, 1002, &id, "clipboard-secret.png");
+    run(
+        &mut desktop,
+        "keyboard_key",
+        json!({"session_id":host_id,"key":"Return"}),
+    );
+    let generated = submitted_text(&dir.join("secret.txt"));
+    let generated = generated.trim_end_matches('\n');
+    assert!(
+        generated.len() == 32
+            && generated.bytes().any(|b| b.is_ascii_lowercase())
+            && generated.bytes().any(|b| b.is_ascii_uppercase())
+            && generated.bytes().any(|b| b.is_ascii_digit())
+            && generated.bytes().any(|b| b.is_ascii_punctuation()),
+        "generated value must satisfy requested length and classes"
+    );
+    let result = run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"session","generate_secret":secret}),
+    );
+    assert_eq!(result, json!({"target":"session","length":32}));
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id})),
+        json!({"target":"session","length":32,"text":null,"protected":true})
+    );
+
+    // The server's anonymous reload state must preserve both clipboard owners.
+    let binary = client.binary_copy.as_ref().expect("private executable");
+    let replacement = binary.with_extension("next");
+    std::fs::copy(binary, &replacement).expect("stage executable");
+    std::fs::rename(replacement, binary).expect("replace executable");
+    client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+    client.wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+    for (connection, session) in [(&mut client, &id), (&mut desktop, &host_id)] {
+        assert_eq!(
+            run(connection, "clipboard_read", json!({"session_id":session})),
+            json!({"target":"session","length":32,"text":null,"protected":true})
+        );
+    }
+    // Replacing a selection from an app must prevent reload from resurrecting it.
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":"printf app-selection | wl-copy"}),
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        "app-selection"
+    );
+    let binary = client.binary_copy.as_ref().expect("private executable");
+    let replacement = binary.with_extension("next");
+    std::fs::copy(binary, &replacement).expect("stage executable");
+    std::fs::rename(replacement, binary).expect("replace executable");
+    client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+    client.wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        "app-selection"
+    );
+    for arguments in [
+        json!({"session_id":id,"target":"session","text":"bad","generate_secret":secret}),
+        json!({"session_id":id,"target":"session","generate_secret":{"length":20,"character_classes":[]}}),
+        json!({"session_id":id,"target":"session","generate_secret":{"length":1,"character_classes":["lowercase","digits"]}}),
+    ] {
+        let response = call_tool(&mut client, 2000, "clipboard_write", arguments);
+        assert!(
+            response["error"].is_object() || response["result"]["isError"] == true,
+            "invalid write accepted"
+        );
+    }
+    assert_eq!(
+        run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
+        "app-selection"
+    );
+    run(&mut client, "session_stop", json!({"session_id":id}));
+    client.stop_process();
+    run(&mut desktop, "session_stop", json!({"session_id":host_id}));
+    desktop.stop_process();
+    println!(
+        "PASS: separate clipboards; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
+    );
+}
+
+#[test]
+#[ignore = "requires a private KWin compositor and input devices"]
+fn clipboard_read_times_out_on_a_private_frozen_compositor_and_recovers() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let id = session_handle(&started);
+    let compositor = nix::unistd::Pid::from_raw(child_compositor(client.child.id()));
+    // Exercise initial connection and an existing clipboard connection separately.
+    for request in [3, 5] {
+        nix::sys::signal::kill(compositor, nix::sys::signal::Signal::SIGSTOP)
+            .expect("pause owned compositor");
+        let resume = ResumeProcess(compositor);
+        let start = Instant::now();
+        let response = call_tool(
+            &mut client,
+            request,
+            "clipboard_read",
+            json!({"session_id":id}),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "clipboard deadline exceeded"
+        );
+        assert!(
+            response["error"].is_object() || response["result"]["isError"] == true,
+            "{response}"
+        );
+        drop(resume);
+        let recovered = call_tool(
+            &mut client,
+            request + 1,
+            "clipboard_read",
+            json!({"session_id":id}),
+        );
+        assert_eq!(
+            recovered["result"]["structuredContent"]["protected"], false,
+            "{recovered}"
+        );
+    }
+    call_tool(&mut client, 7, "session_stop", json!({"session_id":id}));
+    client.stop_process();
+    println!(
+        "PASS: initial and established clipboard connections time out within 3 seconds and recover after resuming the owned compositor"
+    );
+}
