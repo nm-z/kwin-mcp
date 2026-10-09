@@ -5490,6 +5490,29 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// Literal absolute arguments that name something on the host. The session
+/// shell checks these paths before it starts the requested program, because
+/// mounts such as /tmp can hide host files even when the spelling is unchanged.
+fn launch_host_paths(command: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for word in shlex::split(command).unwrap_or_default() {
+        let value = if word.starts_with('/') {
+            word.as_str()
+        } else {
+            word.split_once('=')
+                .map_or(word.as_str(), |(_, value)| value)
+        };
+        let path = Path::new(value);
+        if path.is_absolute()
+            && std::fs::symlink_metadata(path).is_ok()
+            && !paths.iter().any(|saved| saved == path)
+        {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
 /// The DRM device nodes to show the session when the host's NVIDIA nodes are
 /// useless to it, or `None` when `/dev/dri` and `/dev/nvidia*` should be bound
 /// whole. Mesa cannot drive a node owned by the proprietary `nvidia` kernel
@@ -9877,7 +9900,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. The whole call has a 20s deadline; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The whole call has a 20s deadline; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -9959,6 +9982,16 @@ impl KwinMcp {
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
+        let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
+        let mut checked_command = String::new();
+        for path in launch_host_paths(&params.command) {
+            let quoted = shell_quote(&path.display().to_string());
+            checked_command.push_str(&format!(
+                "if [ ! -e {quoted} ]; then printf '%s' {quoted} > {}; exit 125; fi\n",
+                shell_quote(&path_error_file.display().to_string()),
+            ));
+        }
+        checked_command.push_str(&params.command);
         // The command's exit status, written when it exits: a launch that ends
         // before a window appears is reported instead of waited out.
         let exit_file = xdg.join(format!("launch-{launch_id}.status"));
@@ -9973,7 +10006,7 @@ impl KwinMcp {
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
             shell_quote(&browser_marker.display().to_string()),
-            shell_quote(&params.command),
+            shell_quote(&checked_command),
             shell_quote(&exit_file.display().to_string()),
         );
         if let Ok(mut progress) = progress.lock() {
@@ -10049,6 +10082,19 @@ impl KwinMcp {
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
         let _ = std::fs::remove_file(&exit_file);
+        let invisible_path = std::fs::read_to_string(&path_error_file).ok();
+        let _ = std::fs::remove_file(&path_error_file);
+        if let Some(path) = invisible_path {
+            let detail = if Path::new(&path).starts_with("/tmp") {
+                "/tmp is private to the session"
+            } else {
+                "use a path available inside the session"
+            };
+            return Err(McpError::invalid_params(
+                format!("{path} is not visible in the session; {detail}"),
+                None,
+            ));
+        }
 
         // The browser wrapper records CDP intent only when it actually ran.
         let cdp_requested = std::fs::read(&browser_marker).is_ok_and(|value| value == b"cdp");

@@ -1738,6 +1738,7 @@ dependencies = [
  "serde",
  "serde-aux",
  "serde_json",
+ "shlex",
  "thiserror 2.0.18",
  "tokio",
  "tower",

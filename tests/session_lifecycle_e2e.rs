@@ -5235,3 +5235,89 @@ fn clipboard_read_times_out_on_a_private_frozen_compositor_and_recovers() {
         "PASS: initial and established clipboard connections time out within 3 seconds and recover after resuming the owned compositor"
     );
 }
+
+#[test]
+#[ignore = "requires a private KWin session, Bambu Studio, and kdialog"]
+fn launch_rejects_host_tmp_file_before_opening_app() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let path = std::env::temp_dir().join(format!(
+        "kwin-mcp-host-path-{}-{}.stl",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        b"solid triangle\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid triangle\n",
+    )
+    .expect("write host STL");
+    let mut client = RpcClient::start();
+    let visible = client.home.join("visible.stl");
+    std::fs::write(&visible, b"solid visible\nendsolid visible\n").expect("write visible host STL");
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let id = session_handle(&started);
+    for (request, argument) in [
+        (3, format!("bambustudio {}", path.display())),
+        (
+            4,
+            format!(
+                "kdialog --title HiddenHostPath --msgbox --file={}",
+                path.display()
+            ),
+        ),
+    ] {
+        let rejected = call_tool(
+            &mut client,
+            request,
+            "launch_app",
+            json!({"session_id":id,"command":argument}),
+        );
+        let error = rejected["error"].to_string();
+        assert!(
+            error.contains(path.to_str().expect("path text")),
+            "{rejected}"
+        );
+        assert!(
+            error.contains("/tmp is private to the session"),
+            "{rejected}"
+        );
+    }
+    let windows = call_tool(&mut client, 5, "window_list", json!({"session_id":id}));
+    assert!(
+        !windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .expect("windows")
+            .iter()
+            .any(|row| {
+                let title = row["title"].as_str().unwrap_or_default();
+                title.contains("HiddenHostPath") || title.contains("Bambu")
+            }),
+        "path preflight started the app: {windows}"
+    );
+    let ordinary = call_tool(
+        &mut client,
+        6,
+        "launch_app",
+        json!({"session_id":id,"command":format!("kdialog --title OrdinaryLaunch --msgbox {}",visible.display())}),
+    );
+    assert!(ordinary["error"].is_null(), "{ordinary}");
+    let window = &ordinary["result"]["structuredContent"]["window"];
+    assert!(
+        window.is_string() && window != "exited" && window != "timeout",
+        "{ordinary}"
+    );
+    call_tool(&mut client, 7, "session_stop", json!({"session_id":id}));
+    client.stop_process();
+    std::fs::remove_file(&path).expect("remove host test STL");
+    println!(
+        "PASS: host /tmp path and --file path rejected before app launch; ordinary launch still opens a private window"
+    );
+}
