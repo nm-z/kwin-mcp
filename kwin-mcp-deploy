@@ -1,0 +1,39 @@
+#!/bin/bash
+# kwin-mcp-deploy: build kwin-mcp master on the first host that can take a build now
+# (build-host-ok, plus libpipewire for kwin-viewer), then install the release binaries on
+# engi, benji and archy. engi never compiles (Nate's rule); it only receives binaries.
+# Running shims swap to the new binaries on their own. Hosts that are down are skipped.
+set -euo pipefail
+bins=(kwin-mcp kwin-mcp-shim kwin-mcp-strict kwin-viewer)
+builder=""
+for host in ${DEPLOY_BUILD_HOSTS:-sentry archy}; do
+	case "$host" in
+		sentry|archy) ;;
+		*) echo "kwin-mcp-deploy: $host is not an allowed build host; skipped" >&2; continue ;;
+	esac
+	build-host-ok "$host" || continue
+	if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'pkg-config --exists libpipewire-0.3'; then builder=$host; break; fi
+	echo "kwin-mcp-deploy: $host has no libpipewire; skipped" >&2
+done
+[ -n "$builder" ] || { echo "kwin-mcp-deploy: no host can take the build now; nothing deployed" >&2; exit 1; }
+echo "kwin-mcp-deploy: building on $builder" >&2
+ssh -o BatchMode=yes -o ConnectTimeout=5 "$builder" 'bash -se' <<'BUILD'
+set -euo pipefail
+[ -d ~/builds/kwin-mcp-master/.git ] || git clone -q https://github.com/nm-z/kwin-mcp ~/builds/kwin-mcp-master
+cd ~/builds/kwin-mcp-master
+git pull -q
+CARGO_BUILD_JOBS=4 nice -n 19 ionice -c2 -n7 cargo build --release 2>&1 | tail -1
+git log --oneline -1
+BUILD
+stage=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kwin-mcp-deploy.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+rsync -a "${bins[@]/#/$builder:builds/kwin-mcp-master/target/release/}" "$stage/"
+for host in benji archy; do
+	if rsync -a -e 'ssh -o ConnectTimeout=5' "$stage/" "$host:kwin-mcp/target/release/" 2>/dev/null; then
+		echo "kwin-mcp-deploy: $host updated"
+	else
+		echo "kwin-mcp-deploy: $host unreachable; skipped" >&2
+	fi
+done
+mkdir -p "$HOME/kwin-mcp/target/release"
+rsync -a "$stage/" "$HOME/kwin-mcp/target/release/" && echo "kwin-mcp-deploy: engi updated"
