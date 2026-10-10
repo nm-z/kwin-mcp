@@ -1,0 +1,12 @@
+[Unit]
+Description=cloudflared tunnel kwin-mcp (kwin.nm-z.com)
+PartOf=default.target
+After=mcp-gateway.service
+BindsTo=mcp-gateway.service
+
+[Service]
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --config %h/.cloudflared/kwin-mcp.yml run
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
