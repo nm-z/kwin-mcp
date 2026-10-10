@@ -1,0 +1,12 @@
+[Unit]
+Description=kwin-mcp OAuth gateway (kwin.nm-z.com)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+EnvironmentFile=%h/.config/kwin-mcp-remote/env
+ExecStart=%h/.local/bin/kwin-mcp-gateway
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
