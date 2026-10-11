@@ -6163,12 +6163,45 @@ async fn window_snapshots(
     Ok(serde_json::from_str(&json)?)
 }
 
+async fn request_window_activation(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    window_id: &str,
+) -> Result<(), KwinError> {
+    let window_id_json = serde_json::to_string(window_id)?;
+
+    let script = format!(
+        "var targetId = {window_id_json};\
+         var result = false;\
+         var windows = workspace.stackingOrder;\
+         for (var i = 0; i < windows.length; ++i) {{\
+           var w = windows[i];\
+           if (w.internalId.toString() !== targetId) continue;\
+           w.minimized = false;\
+           workspace.raiseWindow(w);\
+           workspace.activeWindow = w;\
+           result = true;\
+           break;\
+         }}"
+    );
+    let activated: bool =
+        serde_json::from_str(&run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?)?;
+    if !activated {
+        return Err(KwinError::Msg(format!("no window with id {window_id}")));
+    }
+    Ok(())
+}
+
 async fn activate_window(
     conn: &zbus::Connection,
     kwin_unique: &str,
     host_xdg_dir: &Path,
     window_id: &str,
 ) -> Result<WindowSnapshot, KwinError> {
+    // Restore the parent first: KWin can also minimize its transient dialogs.
+    request_window_activation(conn, kwin_unique, host_xdg_dir, window_id).await?;
+    tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
     // KWin can raise a chooser along with its parent while leaving keyboard
     // focus on the parent. Resolve the topmost visible dialog descendant before
     // activation so the returned target agrees with what the user will see.
@@ -6199,28 +6232,10 @@ async fn activate_window(
             false
         })
         .map_or(window_id, |window| window.id.as_str());
-    let window_id_json = serde_json::to_string(target_id)?;
-
-    let script = format!(
-        "var targetId = {window_id_json};\
-         var result = false;\
-         var windows = workspace.stackingOrder;\
-         for (var i = 0; i < windows.length; ++i) {{\
-           var w = windows[i];\
-           if (w.internalId.toString() !== targetId) continue;\
-           w.minimized = false;\
-           workspace.raiseWindow(w);\
-           workspace.activeWindow = w;\
-           result = true;\
-           break;\
-         }}"
-    );
-    let activated: bool =
-        serde_json::from_str(&run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?)?;
-    if !activated {
-        return Err(KwinError::Msg(format!("no window with id {window_id}")));
+    if target_id != window_id {
+        request_window_activation(conn, kwin_unique, host_xdg_dir, target_id).await?;
+        tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
     }
-    tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
     let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
     let window = windows
         .into_iter()

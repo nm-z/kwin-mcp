@@ -8,7 +8,7 @@ require 'timeout'
 require 'shellwords'
 
 binary, evidence = ARGV
-abort 'usage: accessibility_partial_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
+abort 'usage: transient_focus_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
 FileUtils.mkdir_p(evidence)
 private_home = File.join(evidence, 'home')
 %w[.config .local/share .cache .local/state .kde].each { |dir| FileUtils.mkdir_p(File.join(private_home, dir)) }
@@ -21,7 +21,7 @@ stdin, stdout, stderr, process = Open3.popen3(env, File.expand_path(binary), '--
 stderr_thread = Thread.new { stderr.each_line { |line| log.write(line); log.flush } }
 sequence = 0
 session = nil
-rpc = lambda do |method, params|
+rpc = lambda do |method, params, allow_error=false|
   sequence += 1
   request = {jsonrpc:'2.0',id:sequence,method:method,params:params}
   stdin.puts(JSON.generate(request)); stdin.flush
@@ -35,12 +35,15 @@ rpc = lambda do |method, params|
     end
   end
   File.write(File.join(evidence,"#{sequence}-response.json"),JSON.pretty_generate(response))
-  raise "RPC failed: #{response}" if response['error'] || response.dig('result','isError')
+  if response['error'] || response.dig('result','isError')
+    raise "RPC failed: #{response}" unless allow_error
+    next response
+  end
   response.fetch('result')
 end
-tool = lambda do |name, arguments|
+tool = lambda do |name, arguments, allow_error=false|
   arguments = arguments.merge('session_id'=>session) if session
-  rpc.call('tools/call', {name:name,arguments:arguments})
+  rpc.call('tools/call', {name:name,arguments:arguments}, allow_error)
 end
 begin
   rpc.call('initialize', {protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'transient-focus-e2e',version:'1'}})
@@ -53,6 +56,15 @@ begin
   windows = tool.call('window_list', {}).dig('structuredContent','windows')
   parent = windows.find { |w| w['title'].include?('transient-parent-fixture') }
   raise "missing Chrome fixture parent: #{windows}" unless parent
+  tool.call('keyboard_key', {key:'super+PageDown'})
+  20.times do
+    windows = tool.call('window_list', {}).dig('structuredContent','windows')
+    break if windows.any? { |w| w['id']==parent['id'] && w['minimized'] }
+    sleep 0.2
+  end
+  raise 'fixture parent was not minimized' unless windows.any? { |w| w['id']==parent['id'] && w['minimized'] }
+  restored = tool.call('window_activate', {window_id:parent['id']}).fetch('structuredContent')
+  raise 'parent was not restored' unless restored.dig('window','id')==parent['id'] && !restored.dig('window','minimized')
   tool.call('keyboard_key', {key:'Return'})
   chooser = nil
   20.times do
@@ -70,6 +82,7 @@ begin
   raise 'request identity lost' unless activated['requested_window_id'] == parent['id']
   windows = tool.call('window_list', {}).dig('structuredContent','windows')
   raise 'compositor focus disagrees' unless windows.any? { |w| w['id']==chooser['id'] && w['active'] }
+  raise 'parent remained minimized behind its chooser' if windows.any? { |w| w['id']==parent['id'] && w['minimized'] }
   screenshot = tool.call('screenshot', {}).fetch('structuredContent')
   raise 'capture/input target disagree' unless screenshot.dig('window','id')==chooser['id']
   FileUtils.cp(screenshot.fetch('path'), File.join(evidence,'focused-chooser.png'))
@@ -84,6 +97,11 @@ begin
   raise 'Escape reached the parent instead of the visible chooser' if windows.any? { |w| w['id']==chooser['id'] }
   after = tool.call('screenshot', {}).fetch('structuredContent')
   FileUtils.cp(after.fetch('path'), File.join(evidence,'after.png'))
+  focus_before = windows.find { |w| w['active'] }&.fetch('id')
+  stale = tool.call('window_activate', {window_id:chooser['id']}, true)
+  raise 'stale chooser activation did not fail' unless stale['error'] || stale.dig('result','isError')
+  after_stale = tool.call('window_list', {}).dig('structuredContent','windows')
+  raise 'stale chooser changed the keyboard target' unless after_stale.find { |w| w['active'] }&.fetch('id')==focus_before
   File.write(File.join(evidence,'verification.json'),JSON.pretty_generate({parent:parent['id'],chooser:chooser['id'],activation:activated,status:'passed'}))
 ensure
   tool.call('session_stop', {}) if session
