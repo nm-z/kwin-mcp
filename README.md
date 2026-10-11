@@ -194,6 +194,23 @@ The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its execu
 
 ## Setup
 
+### Host runtime environment
+
+The server resolves a missing `XDG_RUNTIME_DIR` to the logged-in user's
+`/run/user/<effective UID>` directory. It must already exist, belong to that
+user, and have mode `0700`. A missing `DBUS_SESSION_BUS_ADDRESS` uses that
+directory's existing, user-owned `bus` socket. Explicit invalid overrides fail
+with an error naming the variable before a sandbox is created.
+
+These values are passed to the session setup and wallet snapshot lock without
+changing the server's global environment. Graphical socket filtering uses the
+socket owner's desktop variables, so a launcher with missing variables still
+keeps known host graphical sockets and secret runtime entries isolated. Allowed
+non-graphical sockets retain their existing same-name replacement behavior.
+
+This requires an existing user login runtime and user bus. The strict launcher
+continues to forward inherited desktop values only to its configured MCP server.
+
 ### Claude Code registration
 
 Register the server once at **user scope** so it remains available when a session
