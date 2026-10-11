@@ -86,7 +86,9 @@ begin
   tool.call('session_stop', {})
   session = nil
   raise "Session workdir retained: #{workdir}" if workdir && File.exist?(workdir)
-  request.call('tools/call', 'name' => 'session_list', 'arguments' => {})
+  listed = request.call('tools/call', 'name' => 'session_list', 'arguments' => {})
+  remaining = listed.dig('structuredContent', 'sessions')
+  raise "Sessions remain: #{listed.inspect}" unless remaining == []
   File.write(File.join(run, 'results.txt'), "initialize=PASS\nstart=PASS\nlaunch=PASS\nwindow_list=PASS\nscreenshot=PASS\nstop=PASS\ncleanup=PASS\n")
 ensure
   if session

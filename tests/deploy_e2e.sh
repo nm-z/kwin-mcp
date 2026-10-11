@@ -26,6 +26,15 @@ expect_failure prohibited-builder "$cli" install "$run/package" sentry "$run/pro
 expect_failure relative-destination "$cli" install "$run/package" engi relative
 expect_failure root-destination "$cli" install "$run/package" engi /
 expect_failure invalid-command "$cli" nonsense
+source_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+expect_failure invalid-jobs env CARGO_BUILD_JOBS=0 "$cli" build "$source_root" "$run/invalid-jobs"
+expect_failure invalid-builder env KWIN_MCP_DEPLOY_BUILD_HOSTS=benji "$cli" build "$source_root" "$run/invalid-builder"
+expect_failure invalid-build-root env KWIN_MCP_DEPLOY_BUILD_ROOT=relative "$cli" build "$source_root" "$run/invalid-root"
+# The assigned fleet policy keeps benji offline. A reachable host is left alone.
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 benji true > "$run/benji-probe.log" 2>&1; then
+  "$cli" install "$run/package" benji "$run/benji-private" > "$run/benji-skip.log" 2>&1
+  rg -q 'benji unreachable; skipped' "$run/benji-skip.log"
+fi
 # A preexisting destination models a selected release; it must remain byte identical.
 mkdir "$run/old-release"
 printf 'old release sentinel\n' > "$run/old-release/kwin-mcp"
