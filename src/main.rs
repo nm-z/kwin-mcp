@@ -3344,14 +3344,12 @@ impl OverlayPlan {
         let socket_inventory = procfs::net::unix()?;
         self.sqlite_blocked_sockets = socket_inventory
             .iter()
-            .filter_map(|entry| {
-                if inventory.graphical_sockets.contains(&entry.inode) {
-                    entry.path.clone().filter(|path| path.is_absolute())
-                } else {
-                    None
-                }
-            })
+            // Read-only socket mounts still permit IPC. Data aliases must not
+            // bypass the separate policy for exposing approved helper sockets.
+            .filter_map(|entry| entry.path.clone().filter(|path| path.is_absolute()))
             .collect();
+        self.sqlite_blocked_sockets.sort();
+        self.sqlite_blocked_sockets.dedup();
         let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = socket_inventory
             .into_iter()
             .filter_map(|entry| {

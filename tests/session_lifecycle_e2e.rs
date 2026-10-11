@@ -1928,6 +1928,13 @@ fn session_sqlite_rotation_probe() {
             .is_socket(),
         "alias exposed a graphical host socket"
     );
+    assert!(
+        !std::fs::metadata(parent.join("host-helper.sock"))
+            .expect("masked helper socket")
+            .file_type()
+            .is_socket(),
+        "data alias bypassed helper socket policy"
+    );
     for secret in ["bus", "keyring", "p11-kit"] {
         let path = parent.join("host-runtime-link").join(secret);
         if let Ok(metadata) = std::fs::metadata(&path) {
@@ -1983,6 +1990,8 @@ fn session_follows_host_sqlite_wal_rotation() {
     let mut client = RpcClient::start();
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
+    let _helper_socket = std::os::unix::net::UnixListener::bind(directory.join("host-helper.sock"))
+        .expect("host helper socket fixture");
     struct GraphicalFixture(Child);
     impl Drop for GraphicalFixture {
         fn drop(&mut self) {
