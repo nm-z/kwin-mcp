@@ -11497,8 +11497,9 @@ impl rmcp::ServerHandler for SessionRouter {
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {
-                    if operation == "keyboard_type" {
-                        if let Some(data) = death.as_object_mut() {
+                    if operation == "keyboard_type"
+                        && let Some(data) = death.as_object_mut()
+                    {
                             data.insert("typing_error".to_owned(), serde_json::json!(error.message));
                             data.insert("typing_error_data".to_owned(), error.data.clone().unwrap_or_default());
                             if let Some(original) = error.data.as_ref().and_then(serde_json::Value::as_object) {
@@ -11507,7 +11508,6 @@ impl rmcp::ServerHandler for SessionRouter {
                                 }
                             }
                             data.insert("retry_safe".to_owned(), serde_json::json!(false));
-                        }
                     }
                     let original = if operation == "keyboard_type" {
                         format!(". Typing report: {}. Some input may have arrived; do not retype blindly", error.message)
