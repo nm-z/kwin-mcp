@@ -3310,7 +3310,7 @@ impl OverlayPlan {
         target: &Path,
         host_runtime: &Path,
         isolated_runtime: &Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<PathBuf>> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let canonical_target = std::fs::canonicalize(target)?;
         let canonical_runtime = std::fs::canonicalize(host_runtime)?;
@@ -3408,8 +3408,7 @@ impl OverlayPlan {
             std::os::unix::fs::symlink(&generated, &link)?;
             self.socket_links.0.push((link, generated));
         }
-        bind_live_sqlite(self, target, &inventory.live_databases)?;
-        Ok(())
+        Ok(inventory.live_databases)
     }
 }
 
@@ -3737,10 +3736,9 @@ fn bind_live_sqlite(
     databases: &[PathBuf],
 ) -> anyhow::Result<()> {
     let discarded = discarded_session_databases(target);
-    for database in databases
-        .iter()
-        .filter(|database| !discarded.contains(database))
-    {
+    for database in databases.iter().filter(|database| {
+        !discarded.contains(database) && !browser_cookie_database(target, database)
+    }) {
         let name = database
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
@@ -3756,6 +3754,15 @@ fn bind_live_sqlite(
         );
     }
     Ok(())
+}
+
+/// Browser cookie jars need private writes for refreshed and session cookies.
+/// Keep them in the HOME overlay instead of mounting the host jar read-only.
+fn browser_cookie_database(target: &Path, database: &Path) -> bool {
+    database.file_name().is_some_and(|name| name == "Cookies")
+        && BROWSER_CONFIG_DIRS
+            .iter()
+            .any(|config| database.starts_with(target.join(config)))
 }
 
 /// Recreate missing upper parents using the lower directories' permissions.
@@ -3990,9 +3997,12 @@ fn prepare_host_view(
         overlay_plan.empty_dirs.push(disk_root);
     }
     service.set_start_stage("scanning host sockets and processes");
-    overlay_plan
+    let live_databases = overlay_plan
         .expose_sockets(target, host_runtime, host_xdg_dir)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
+    service.set_start_stage("mounting live SQLite databases read-only");
+    bind_live_sqlite(&mut overlay_plan, target, &live_databases)?;
+
     eprintln!(
         "session_start: overlay plan={} overlays={} read-only-mounts={}",
         if overlay_plan.staging_root.is_some() {

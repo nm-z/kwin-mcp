@@ -1752,6 +1752,19 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         .expect("seed database");
     drop(setup);
 
+    // Cookie jars must remain writable only in the session overlay.
+    let cookie_database = home.join(".config/google-chrome/Default/Network/Cookies");
+    std::fs::create_dir_all(cookie_database.parent().expect("cookie directory"))
+        .expect("create cookie directory");
+    let cookie_host =
+        rusqlite::Connection::open(&cookie_database).expect("open host cookie fixture");
+    cookie_host
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE retained_cookie (value TEXT);
+         INSERT INTO retained_cookie VALUES ('host-cookie');",
+        )
+        .expect("seed host cookie fixture");
+
     // A host app keeps writing its thread store for the whole session.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = {
@@ -1806,8 +1819,13 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
          \x20   w.execute(\"insert into threads(body) values (x'73657373696f6e')\"); w.commit()\n\
          except sqlite3.OperationalError as e:\n\
          \x20   readonly=int('readonly' in str(e))\n\
-         out.write('bad=%d readonly=%d\\n' % (bad,readonly)); out.close()\n",
+         jar=sqlite3.connect('{cookies}')\n\
+         jar.execute(\"insert into retained_cookie values ('session-cookie')\"); jar.commit()\n\
+         private=jar.execute('select count(*) from retained_cookie').fetchone()[0]==2\n\
+         jar.close()\n\
+         out.write('bad=%d readonly=%d private=%d\\n' % (bad,readonly,private)); out.close()\n",
         db = database.display(),
+        cookies = cookie_database.display(),
         out = report.display()
     );
     std::fs::write(workdir.join("sqlite-check.py"), script).expect("write check script");
@@ -1834,7 +1852,7 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
     writer.join().expect("host writer");
     assert_eq!(
         result.trim(),
-        "bad=0 readonly=1",
+        "bad=0 readonly=1 private=1",
         "live database reads or read-only protection failed"
     );
 
@@ -1851,6 +1869,11 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         )
         .expect("host query");
     assert_eq!(leaked, 0, "session write reached the host database");
+    let host_cookies: i64 = cookie_host
+        .query_row("SELECT count(*) FROM retained_cookie", [], |row| row.get(0))
+        .expect("read host cookie fixture");
+    assert_eq!(host_cookies, 1, "session cookie write reached the host jar");
+    drop(cookie_host);
     call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
