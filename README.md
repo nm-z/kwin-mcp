@@ -89,6 +89,12 @@ make existing read-only host mounts writable or change a running session.
 
 ### Session memory limits
 
+Each stdio server watches its launching client with a Linux pidfd. When that
+client exits, all of the server's session scopes are stopped, including nested
+KWin and D-Bus processes, even if another descendant keeps stdin open. The
+watcher and session scope identity survive hot reload. Normal stdin EOF,
+`session_stop`, and startup cancellation use the same scope cleanup path.
+
 Each new sandbox runs in a systemd user scope with `MemoryHigh=3G`,
 `MemoryMax=4G`, and `MemorySwapMax=1G`. Startup fails if the user manager
 cannot create a scope. The limits cover the sandbox and its applications;

@@ -1,3 +1,12 @@
+// A stdio client's exit also closes its diagnostic reader. Cleanup must not
+// panic on EPIPE while stopping the client's scopes and deleting workdirs.
+macro_rules! eprintln {
+    ($($arguments:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arguments)*);
+    }};
+}
+
 mod fuse_bridge {
     //! FUSE inside the isolated session.
     //!
@@ -4176,7 +4185,63 @@ impl SessionProcess {
     }
 }
 
+fn owned_session_scope(unit: &str) -> bool {
+    (unit.starts_with("kwin-mcp-") || unit.starts_with("run-p"))
+        && unit.ends_with(".scope")
+        && unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn session_scope_from_pid(pid: u32) -> Option<String> {
+    let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    groups.lines().find_map(|line| {
+        let path = line.strip_prefix("0::")?;
+        let unit = Path::new(path).file_name()?.to_str()?;
+        owned_session_scope(unit).then(|| unit.to_owned())
+    })
+}
+
+fn stop_session_scope(unit: &str) {
+    if unit.is_empty() {
+        return;
+    }
+    if !owned_session_scope(unit) {
+        eprintln!("cleanup: invalid session scope name; retaining process-group fallback");
+        return;
+    }
+    let environment = (|| -> anyhow::Result<_> {
+        let runtime = host_environment::runtime_dir()?;
+        let bus = host_environment::session_bus_address(&runtime)?;
+        Ok((runtime, bus))
+    })();
+    let (runtime, bus) = match environment {
+        Ok(values) => values,
+        Err(error) => {
+            eprintln!("cleanup: cannot contact session scope manager: {error:#}");
+            return;
+        }
+    };
+    let run = |args: &[&str]| {
+        std::process::Command::new("timeout")
+            .args(["3", "systemctl", "--user"])
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !run(&["stop", unit]) {
+        eprintln!("cleanup: scope {unit} did not stop promptly; killing its members");
+        let _ = run(&["kill", "--kill-whom=all", "--signal=KILL", unit]);
+    }
+    let _ = run(&["reset-failed", unit]);
+}
+
 struct Session {
+    scope_unit: String,
     kwin_conn: zbus::Connection, // talks to KWin via its unique name
     _proxy_socket: std::os::fd::OwnedFd,
     _proxy_conn: zbus::Connection, // owns org.kde.KWin, has InputDevice objects (kept alive)
@@ -4284,6 +4349,7 @@ fn terminate_child(child: impl Into<SessionProcess>, process_group: bool, label:
 /// them until the Session takes them, so cancelling the startup future cannot
 /// detach a process or task that has no reachable cleanup path.
 struct StartupResources {
+    scope_unit: Option<String>,
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
     service_proxy_children: Vec<std::process::Child>,
@@ -4292,6 +4358,7 @@ struct StartupResources {
 impl StartupResources {
     fn new() -> Self {
         Self {
+            scope_unit: None,
             sandbox_child: None,
             sandbox_stdin: None,
             service_proxy_children: Vec::new(),
@@ -4304,6 +4371,9 @@ impl StartupResources {
 
     fn cleanup(&mut self) {
         drop(self.sandbox_stdin.take());
+        if let Some(unit) = self.scope_unit.take() {
+            stop_session_scope(&unit);
+        }
         if let Some(sandbox) = self.sandbox_child.take() {
             terminate_child(sandbox, true, "startup sandbox");
         }
@@ -4319,6 +4389,7 @@ impl StartupResources {
         std::process::ChildStdin,
         Vec<std::process::Child>,
     ) {
+        self.scope_unit.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -5161,6 +5232,7 @@ fn teardown(mut sess: Session) {
         terminate_child(viewer, false, "viewer");
     }
     drop(sess.sandbox_stdin);
+    stop_session_scope(&sess.scope_unit);
     // Kill the pasta and bwrap process group (negative PID = entire group).
     terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
@@ -7679,7 +7751,17 @@ impl KwinMcp {
         // the host does not hold stay private, so concurrent sessions still bind
         // the same port without colliding (#50). The CDP port is excluded so the
         // session's own browser can always bind it.
-        let mut cmd = match sandbox_launcher(self.display, &host_runtime, &host_session_bus) {
+        let scope_unit = format!(
+            "{}.scope",
+            self.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        startup.scope_unit = Some(scope_unit.clone());
+        let mut cmd = match sandbox_launcher(
+            self.display,
+            &host_runtime,
+            &host_session_bus,
+            Some(&scope_unit),
+        ) {
             Ok(command) => command,
             Err(error) => return cleanup_err(error, &mut startup),
         };
@@ -8179,6 +8261,7 @@ impl KwinMcp {
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
+            scope_unit,
             kwin_conn,
             _proxy_conn: proxy_conn,
             _proxy_socket: proxy_socket,
@@ -10338,6 +10421,7 @@ fn sandbox_launcher(
     config: DisplayConfig,
     runtime: &Path,
     session_bus: &str,
+    scope_unit: Option<&str>,
 ) -> Result<std::process::Command, String> {
     let usable = std::process::Command::new("systemd-run")
         .env("XDG_RUNTIME_DIR", runtime)
@@ -10364,7 +10448,12 @@ fn sandbox_launcher(
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
-        .args(["--user", "--scope", "--quiet", "--collect", "-p"])
+        .args(["--user", "--scope", "--quiet", "--collect"]);
+    if let Some(unit) = scope_unit {
+        command.arg("--unit").arg(unit);
+    }
+    command
+        .arg("-p")
         .arg(format!("MemoryHigh={high}"))
         .arg("-p")
         .arg(format!("MemoryMax={}", config.memory_max))
@@ -10731,7 +10820,7 @@ impl SessionRouter {
             let guard = service.session.read().await;
             if let Some(session) = guard.as_ref() {
                 records.push(serde_json::json!({
-                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "input_log":service.input_log.as_ref().map(|log| &log.path),
+                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope_unit, "input_log":service.input_log.as_ref().map(|log| &log.path),
                     "workdir": session.host_xdg_dir, "width": session.screen_width,
                     "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
                 }));
@@ -11025,6 +11114,7 @@ struct WireState {
 }
 #[derive(Clone)]
 struct SessionStdio {
+    client: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
     reader: Arc<tokio::io::unix::AsyncFd<std::fs::File>>,
     writer: Arc<tokio::sync::Mutex<tokio::io::unix::AsyncFd<std::fs::File>>>,
     state: Arc<std::sync::Mutex<WireState>>,
@@ -11032,7 +11122,11 @@ struct SessionStdio {
     router: SessionRouter,
 }
 impl SessionStdio {
-    fn new(router: SessionRouter, input: Vec<u8>) -> std::io::Result<Self> {
+    fn new(
+        router: SessionRouter,
+        input: Vec<u8>,
+        client: std::os::fd::OwnedFd,
+    ) -> std::io::Result<Self> {
         use std::os::fd::{AsFd, BorrowedFd};
         let descriptor = |number| -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
             let descriptor = unsafe { BorrowedFd::borrow_raw(number) }.try_clone_to_owned()?;
@@ -11045,6 +11139,7 @@ impl SessionStdio {
             tokio::io::unix::AsyncFd::new(std::fs::File::from(descriptor))
         };
         Ok(Self {
+            client: Arc::new(tokio::io::unix::AsyncFd::new(client)?),
             reader: Arc::new(descriptor(0)?),
             writer: Arc::new(tokio::sync::Mutex::new(descriptor(1)?)),
             state: Arc::new(std::sync::Mutex::new(WireState {
@@ -11262,6 +11357,8 @@ const RESUME_DESCRIPTOR: &str = "KWIN_MCP_RESUME_FD";
 
 #[derive(Serialize, Deserialize)]
 struct SessionRestore {
+    #[serde(default)]
+    scope_unit: String,
     id: String,
     #[serde(default)]
     input_history: InputHistory,
@@ -11297,6 +11394,8 @@ struct SessionRestore {
 }
 #[derive(Serialize, Deserialize)]
 struct ServerRestore {
+    #[serde(default)]
+    client_fd: Option<i32>,
     #[serde(default)]
     clipboards: Vec<ClipboardRestore>,
     pid: u32,
@@ -11421,6 +11520,11 @@ impl SessionRouter {
                 service.workdir.inherit_lease(&saved.path, saved.lease_fd)?;
             }
             *service.session.write().await = Some(Session {
+                scope_unit: if saved.scope_unit.is_empty() {
+                    session_scope_from_pid(saved.sandbox_pid).unwrap_or_default()
+                } else {
+                    saved.scope_unit
+                },
                 kwin_conn,
                 _proxy_conn: proxy_conn,
                 _proxy_socket: proxy_socket,
@@ -11505,6 +11609,7 @@ impl SessionRouter {
                 continue;
             };
             saved.push(SessionRestore {
+                scope_unit: session.scope_unit.clone(),
                 input_log_path: service.input_log.as_ref().map(|log| log.path.clone()),
                 input_history: service
                     .input_log
@@ -11568,6 +11673,7 @@ impl SessionRouter {
             .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
             .saved()?;
         let state = ServerRestore {
+            client_fd: Some(retain_descriptor(wire.client.get_ref(), &mut retained)?),
             clipboards: clipboard_state,
             pid: std::process::id(),
             client,
@@ -11704,7 +11810,37 @@ async fn watch_reload(
     }
 }
 
+/// A pidfd watches the process, avoids PID reuse, and can be retained across
+/// hot reload even when another descendant keeps the client's stdin open.
+fn client_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let parent = nix::unistd::getppid();
+    if parent.as_raw() <= 1 {
+        return Err(std::io::Error::other(
+            "no live launching client for this stdio server",
+        ));
+    }
+    // SAFETY: pidfd_open takes a PID and flags, with no pointer arguments.
+    let descriptor = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, parent.as_raw(), 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let descriptor = i32::try_from(descriptor).map_err(std::io::Error::other)?;
+    // SAFETY: pidfd_open returned a new descriptor, owned by this process.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) };
+    if nix::unistd::getppid() != parent {
+        return Err(std::io::Error::other(
+            "launching client exited during watcher setup",
+        ));
+    }
+    Ok(owned)
+}
+
 async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::error::Error>> {
+    let client = match restored.as_ref().and_then(|state| state.client_fd) {
+        Some(descriptor) => adopt_descriptor(descriptor)?,
+        None => client_pidfd()?,
+    };
     unsafe {
         nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
     }
@@ -11736,16 +11872,26 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         Some(state) => router.reattach(state).await?,
         None => Vec::new(),
     };
-    let transport = SessionStdio::new(router.clone(), input)?;
+    let transport = SessionStdio::new(router.clone(), input, client)?;
     let wire = transport.clone();
     let service = match resumed_client {
         Some(client) => rmcp::service::serve_directly(router, transport, Some(client)),
-        None => router.serve(transport).await?,
+        None => tokio::select! {
+            result = router.serve(transport) => result?,
+            _ = wire.client.readable() => {
+                shutdown.shutdown().await;
+                return Ok(());
+            },
+        },
     };
     if resumed {
         service.peer().notify_tool_list_changed().await?;
     }
-    let reload = tokio::spawn(watch_reload(shutdown.clone(), wire, service.peer().clone()));
+    let reload = tokio::spawn(watch_reload(
+        shutdown.clone(),
+        wire.clone(),
+        service.peer().clone(),
+    ));
     let cancellation = service.cancellation_token();
     let reaper = tokio::spawn(shutdown.clone().reap());
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -11760,6 +11906,11 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
                 _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break None },
                 _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break None },
                 _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break None },
+                result = wire.client.readable() => {
+                    if let Err(error) = result { eprintln!("client lifetime watcher: {error}"); }
+                    eprintln!("shutdown: launching client exited; stopping owned session scopes");
+                    break None;
+                },
                 request = process_commands.recv() => match request {
                     Some(request) => request.execute(),
                     None => break None,
@@ -11857,7 +12008,7 @@ mod memory_limit_tests {
                 super::host_environment::runtime_dir().map_err(|error| error.to_string())?;
             let session_bus = super::host_environment::session_bus_address(&runtime)
                 .map_err(|error| error.to_string())?;
-            let launcher = sandbox_launcher(config, &runtime, &session_bus)?;
+            let launcher = sandbox_launcher(config, &runtime, &session_bus, None)?;
             let mut args: Vec<_> = launcher.get_args().map(std::ffi::OsStr::to_owned).collect();
             assert_eq!(args.pop().as_deref(), Some(std::ffi::OsStr::new("pasta")));
             // Exercise the same scope properties with a readback process
