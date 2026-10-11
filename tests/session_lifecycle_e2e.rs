@@ -1959,6 +1959,7 @@ fn session_sqlite_rotation_probe() {
     let marker: i64 = reader
         .query_row("select max(marker) from generation", [], |row| row.get(0))
         .expect("latest host generation");
+    drop(reader);
     std::fs::write(report, format!("{marker}\n")).expect("rotation report");
 }
 
@@ -2075,7 +2076,7 @@ fn session_follows_host_sqlite_wal_rotation() {
                 }
             })
         };
-        let writer = Writer {
+        let mut writer = Writer {
             stop,
             thread: Some(writer),
         };
@@ -2103,7 +2104,15 @@ fn session_follows_host_sqlite_wal_rotation() {
             std::fs::read_to_string(report).expect("generation report"),
             format!("{generation}\n")
         );
-        drop(writer);
+        writer
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        writer
+            .thread
+            .take()
+            .expect("host writer thread")
+            .join()
+            .expect("concurrent host writer completed");
         assert!(
             writes.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "host writer never ran during generation {generation}"
