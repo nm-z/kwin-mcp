@@ -185,6 +185,25 @@ the data; it does not confirm that an application consumed it.
 
 ## Sessions and reloads
 
+### Browser cookie continuity
+
+When a session stops, kwin-mcp saves its Chromium profile cookie databases under
+`${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/browser-cookies`, keyed by browser and
+profile. The directory is private (`0700`), and the databases are private (`0600`).
+The next session merges these cookies into its isolated copy of the host profile.
+For each cookie identity, the row with the newer `last_update_utc` wins; partitioned
+cookies retain their partition identity. The host browser profile stays read-only.
+History, cached pages, saved tabs, and other profile changes remain disposable.
+
+Cookies keep their existing encryption and require the copied host wallet key.
+Host cookie snapshots read only the database and WAL files, verify two identical
+observations, and check the resulting private SQLite copy. The host database and
+WAL together must fit within 64 MiB. If the files keep changing during the bounded
+copy attempts, an active rollback journal remains, or the saved schema differs,
+kwin-mcp reports that cookie continuity is unavailable for that profile in stderr.
+Remove the profile's saved database from this directory to discard its session
+cookie history. This does not sign out the host browser.
+
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
 

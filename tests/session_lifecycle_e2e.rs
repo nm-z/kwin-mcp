@@ -345,6 +345,14 @@ impl Drop for RpcClient {
             });
             let _ = writeln!(stdin, "{request}");
             let _ = stdin.flush();
+            let deadline = Instant::now() + Duration::from_secs(35);
+            while let Ok(message) = self.responses.recv_timeout(
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
+                if message["id"] == 9999 {
+                    break;
+                }
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1710,6 +1718,90 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
         "{recovered}"
     );
     call_tool(&mut client, 8, "session_stop", json!({}));
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
+fn browser_cookies_continue_across_sessions_without_host_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let profile = client.home.join(".config/google-chrome/Profile 2");
+    std::fs::create_dir_all(&profile).expect("profile directory");
+    let database = profile.join("Cookies");
+    let host = rusqlite::Connection::open(&database).expect("host cookies");
+    host.execute_batch(
+        "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER,
+         encrypted_value BLOB, UNIQUE(host_key,name,path));
+         INSERT INTO cookies VALUES('.example.test','session','/',10,x'0010');
+         INSERT INTO cookies VALUES('.example.test','host','/',10,x'0010');"
+    ).expect("seed cookies");
+    let wal = profile.join("Cookies-wal");
+    let source_database = std::fs::read(&database).expect("host database bytes");
+    let source_wal = std::fs::read(&wal).expect("host WAL bytes");
+    assert!(!profile.join("Cookies-shm").exists(), "EXCLUSIVE fixture unexpectedly uses shared memory");
+    initialize(&mut client);
+    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let first_workdir = workdir(&started);
+    let created = client.home.join(".config/google-chrome/Default/Cookies");
+    let sql = "PRAGMA journal_mode=WAL; UPDATE cookies SET last_update_utc=20, encrypted_value=x'0020'; INSERT INTO cookies VALUES('.example.test','new','/',40,x'0040');";
+    let new_sql = "CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER, encrypted_value BLOB, UNIQUE(host_key,name,path)); INSERT INTO cookies VALUES('.example.test','session','/',99,x'0099');";
+    let launched = call_tool(&mut client, 3, "launch_app", json!({"command":format!(
+        "sqlite3 {} {} && mkdir -p {} && sqlite3 {} {}; konsole",
+        shlex::try_quote(&database.display().to_string()).expect("database quote"),
+        shlex::try_quote(sql).expect("SQL quote"),
+        shlex::try_quote(&created.parent().expect("profile parent").display().to_string()).expect("profile quote"),
+        shlex::try_quote(&created.display().to_string()).expect("new database quote"),
+        shlex::try_quote(new_sql).expect("new SQL quote")
+    )}));
+    assert!(!launched["result"]["isError"].as_bool().unwrap_or(false), "{launched}");
+    save_session_image(&mut client, 100, started["result"]["structuredContent"]["session_id"].as_str().expect("session ID"), "cookies-first-session.png");
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(!first_workdir.exists(), "first session was not cleaned");
+    let saved = client.home.join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies");
+    assert_eq!(std::fs::metadata(&saved).expect("saved jar").permissions().mode() & 0o777, 0o600);
+    let persisted = rusqlite::Connection::open(&saved).expect("saved cookies");
+    let count: i64 = persisted.query_row("SELECT count(*) FROM cookies", [], |row| row.get(0))
+        .expect("persisted cookie count");
+    assert_eq!(count, 3);
+    drop(persisted);
+    let original: i64 = host.query_row("SELECT last_update_utc FROM cookies WHERE name='session'", [], |row| row.get(0))
+        .expect("host timestamp");
+    assert_eq!(original, 10, "session changed the host profile");
+    assert_eq!(std::fs::read(&database).expect("host database after session"), source_database);
+    assert_eq!(std::fs::read(&wal).expect("host WAL after session"), source_wal);
+    assert!(!profile.join("Cookies-shm").exists(), "session opened host shared memory");
+    assert!(!created.exists(), "session created a host profile");
+    host.execute("UPDATE cookies SET last_update_utc=30,encrypted_value=x'0030' WHERE name='host'", [])
+        .expect("real browser refresh");
+    let started = call_tool(&mut client, 5, "session_start", json!({"width":800,"height":600}));
+    let second_workdir = workdir(&started);
+    let exported = client.home.join("merged-cookies.sqlite");
+    let result = call_tool(&mut client, 6, "export_file", json!({
+        "session_path":database,"host_path":exported
+    }));
+    assert!(!result["result"]["isError"].as_bool().unwrap_or(false), "{result}");
+    let merged = rusqlite::Connection::open(exported).expect("merged jar");
+    let rows = merged.prepare("SELECT name,last_update_utc,hex(encrypted_value) FROM cookies ORDER BY name")
+        .expect("merged query").query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+        .expect("merged rows").collect::<rusqlite::Result<Vec<_>>>().expect("merged values");
+    assert_eq!(rows, vec![("host".to_owned(),30,"0030".to_owned()),
+        ("new".to_owned(),40,"0040".to_owned()),("session".to_owned(),20,"0020".to_owned())]);
+    let new_export = client.home.join("new-profile-cookies.sqlite");
+    let result = call_tool(&mut client, 101, "export_file", json!({
+        "session_path":created,"host_path":new_export
+    }));
+    assert!(!result["result"]["isError"].as_bool().unwrap_or(false), "{result}");
+    let restored = rusqlite::Connection::open(new_export).expect("new profile jar");
+    let updated: i64 = restored.query_row("SELECT last_update_utc FROM cookies WHERE name='session'", [], |row| row.get(0))
+        .expect("new profile cookie");
+    assert_eq!(updated, 99, "profiles shared a cookie jar");
+    let stopped = call_tool(&mut client, 7, "session_stop", json!({}));
+    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(!second_workdir.exists(), "second session was not cleaned");
     client.stop_process();
 }
 

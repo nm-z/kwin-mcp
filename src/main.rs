@@ -3802,6 +3802,66 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
+fn prepare_browser_cookies(
+    plan: &mut OverlayPlan,
+    target: &Path,
+) -> anyhow::Result<Vec<kwin_mcp::browser_cookies::CookieRoot>> {
+    let state = kwin_mcp::browser_cookies::state_root();
+    if state.starts_with(target) {
+        plan.empty_dirs.push(state.clone());
+    }
+    let mut roots = Vec::new();
+    for config in BROWSER_CONFIG_DIRS {
+        let host = target.join(config);
+        let saved = state.join(config);
+        let mut profiles = std::collections::BTreeSet::new();
+        for directory in [&host, &saved] {
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries.flatten().filter(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_dir())
+                }) {
+                    profiles.insert(entry.file_name());
+                }
+            }
+        }
+        for profile in profiles {
+            for name in ["Cookies", "Network/Cookies"] {
+                let database = host.join(&profile).join(name);
+                let previous = saved.join(&profile).join(name);
+                if !database.is_file() && !previous.is_file() {
+                    continue;
+                }
+                let upper = upper_file(plan, &database)?;
+                let result = if database.is_file() {
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
+                        kwin_mcp::browser_cookies::merge(&upper, &previous)
+                    })
+                } else {
+                    kwin_mcp::browser_cookies::snapshot(&previous, &upper)
+                };
+                if let Err(error) = result {
+                    eprintln!("session_start: cookie continuity unavailable for {}: {error:#}",
+                        database.display());
+                }
+            }
+        }
+        for overlay in &plan.overlays {
+            if let Ok(relative) = host.strip_prefix(&overlay.destination) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.join(relative),
+                    saved: saved.clone(),
+                });
+            } else if overlay.destination.starts_with(&host) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.clone(),
+                    saved: state.join(overlay.destination.strip_prefix(target)?),
+                });
+            }
+        }
+    }
+    Ok(roots)
+}
+
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
@@ -3993,6 +4053,7 @@ fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<(
 struct HostView {
     overlay_plan: OverlayPlan,
     kdeglobals: String,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
 }
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
@@ -4062,7 +4123,11 @@ fn prepare_host_view(
     let discarded = discarded_session_databases(target);
     for database in live_sqlite_databases(target)
         .into_iter()
-        .filter(|database| !discarded.contains(database))
+        .filter(|database| {
+            !discarded.contains(database)
+                && !(database.file_name().is_some_and(|name| name == "Cookies")
+                    && BROWSER_CONFIG_DIRS.iter().any(|config| database.starts_with(target.join(config))))
+        })
     {
         match snapshot_live_sqlite(&overlay_plan, &database) {
             Ok(()) => eprintln!(
@@ -4076,6 +4141,7 @@ fn prepare_host_view(
         }
     }
     empty_session_databases(&overlay_plan, &discarded)?;
+    let cookie_roots = prepare_browser_cookies(&mut overlay_plan, target)?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
@@ -4090,6 +4156,7 @@ fn prepare_host_view(
     Ok(HostView {
         overlay_plan,
         kdeglobals,
+        cookie_roots,
     })
 }
 
@@ -4169,6 +4236,7 @@ struct Session {
     /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
     oversized_read_only_files: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -5136,6 +5204,9 @@ fn teardown(mut sess: Session) {
     terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
+    }
+    if let Err(error) = kwin_mcp::browser_cookies::persist(&sess.cookie_roots) {
+        eprintln!("teardown: browser cookies were not saved: {error:#}");
     }
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
@@ -7345,6 +7416,7 @@ impl KwinMcp {
         let HostView {
             mut overlay_plan,
             kdeglobals: mut kdeglobals_content,
+            cookie_roots,
         } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(
@@ -8164,6 +8236,7 @@ impl KwinMcp {
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
+            cookie_roots,
             oversized_read_only_files: oversized_read_only_files.clone(),
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -11225,6 +11298,8 @@ struct SessionRestore {
     height: u32,
     cdp_port: u16,
     overlay_work_paths: Vec<PathBuf>,
+    #[serde(default)]
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
     oversized_files: Vec<PathBuf>,
     socket_links: Vec<(PathBuf, PathBuf)>,
     idle_millis: u64,
@@ -11387,6 +11462,7 @@ impl SessionRouter {
                 viewer_child: saved.viewer.map(|pid| SessionProcess { pid, status: None }),
                 viewer_unavailable: None,
                 overlay_work_paths: saved.overlay_work_paths,
+                cookie_roots: saved.cookie_roots,
                 oversized_read_only_files: saved.oversized_files,
                 _socket_links: SocketLinks(saved.socket_links),
                 screen_width: saved.width,
@@ -11478,6 +11554,7 @@ impl SessionRouter {
                 height: session.screen_height,
                 cdp_port: session.cdp_forward_port,
                 overlay_work_paths: session.overlay_work_paths.clone(),
+                cookie_roots: session.cookie_roots.clone(),
                 oversized_files: session.oversized_read_only_files.clone(),
                 socket_links: session._socket_links.0.clone(),
                 idle_millis: u64::try_from(session.last_activity.elapsed().as_millis())?,
