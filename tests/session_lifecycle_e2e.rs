@@ -1928,6 +1928,24 @@ fn session_sqlite_rotation_probe() {
             .is_socket(),
         "alias exposed a graphical host socket"
     );
+    for secret in ["bus", "keyring", "p11-kit"] {
+        let path = parent.join("host-runtime-link").join(secret);
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            assert!(
+                !metadata.file_type().is_socket(),
+                "alias exposes host runtime secret {secret}"
+            );
+            if metadata.is_dir() {
+                assert!(
+                    std::fs::read_dir(path)
+                        .expect("runtime secret directory")
+                        .next()
+                        .is_none(),
+                    "alias exposes host runtime secret directory {secret}"
+                );
+            }
+        }
+    }
     let reader =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("session reader after WAL rotation");
@@ -1950,6 +1968,11 @@ fn session_follows_host_sqlite_wal_rotation() {
     let database = directory.join("rotation.sqlite");
     let _graphical = std::os::unix::net::UnixListener::bind(directory.join("host-graphical.sock"))
         .expect("graphical socket fixture");
+    std::os::unix::fs::symlink(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("host runtime directory"),
+        directory.join("host-runtime-link"),
+    )
+    .expect("runtime symlink fixture");
     let mut host = rusqlite::Connection::open(&database).expect("host database");
     host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0);")
         .expect("seed generation");

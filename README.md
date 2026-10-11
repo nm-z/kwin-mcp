@@ -131,6 +131,11 @@ databases without copying their contents, and reads use the host inodes and
 SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
+Live database directory aliases also expose their siblings read-only under
+`/run/kwin-mcp-host-sqlite/`. Ordinary sibling paths under HOME remain privately
+writable. The aliases mirror hidden session directories and mask host graphical
+sockets. Symlinks reached through them resolve within the sandbox's mount
+namespace; they do not restore the hidden host runtime bus, keyring, or p11-kit.
 Startup timeout errors name the active preparation stage: host mounts, HOME
 overlays, host sockets and processes, or browser profiles.
 
