@@ -10166,6 +10166,7 @@ fn print_cli_help() {
 {CLI_USAGE}\n\n\
 Options:\n\
   -h, --help             Print this help and exit\n\
+  -V, --version          Print package version, build number, and Git commit\n\
   --describe             Print MCP initialization and tool schemas as JSON, then exit\n\
   --width N              Default session width in pixels (default: {VIRTUAL_SCREEN_WIDTH})\n\
   --height N             Default session height in pixels (default: {VIRTUAL_SCREEN_HEIGHT})\n\
@@ -10388,6 +10389,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match argv.next().as_deref() {
         Some("-h" | "--help") => {
             print_cli_help();
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!(
+                "kwin-mcp v{}.{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("BUILD_NUMBER"),
+                env!("GIT_HASH")
+            );
             return Ok(());
         }
         Some("--describe") => {
