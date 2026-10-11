@@ -1997,8 +1997,11 @@ fn session_follows_host_sqlite_wal_rotation() {
             "host WAL was not unlinked"
         );
         host = rusqlite::Connection::open(&database).expect("reopen host database");
-        host.execute("insert into generation values(?1)", [generation])
-            .expect("new WAL generation");
+        host.execute(
+            "insert into generation values(?1)",
+            [i64::try_from(generation).expect("SQLite generation")],
+        )
+        .expect("new WAL generation");
         let wal_inode = std::fs::metadata(database.with_file_name("rotation.sqlite-wal"))
             .expect("new WAL")
             .ino();
