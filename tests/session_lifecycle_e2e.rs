@@ -1804,36 +1804,21 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
     );
     let workdir = workdir(&started);
     let report = workdir.join("sqlite-check.txt");
-    // Read the shared WAL family while the host writes it, then reject a session write.
-    let script = format!(
-        "import sqlite3,time\n\
-         db='{db}'; out=open('{out}','w'); bad=0; readonly=0\n\
-         for i in range(20):\n\
-         \x20   c=sqlite3.connect('file:'+db+'?mode=ro',uri=True)\n\
-         \x20   c.execute('select count(*),sum(length(body)) from threads').fetchone()\n\
-         \x20   bad+=c.execute('pragma quick_check').fetchone()[0]!='ok'; c.close(); time.sleep(0.05)\n\
-         w=sqlite3.connect(db)\n\
-         for i in range(20):\n\
-         \x20   bad+=w.execute('pragma quick_check').fetchone()[0]!='ok'; time.sleep(0.05)\n\
-         try:\n\
-         \x20   w.execute(\"insert into threads(body) values (x'73657373696f6e')\"); w.commit()\n\
-         except sqlite3.OperationalError as e:\n\
-         \x20   readonly=int('readonly' in str(e))\n\
-         jar=sqlite3.connect('{cookies}')\n\
-         jar.execute(\"insert into retained_cookie values ('session-cookie')\"); jar.commit()\n\
-         private=jar.execute('select count(*) from retained_cookie').fetchone()[0]==2\n\
-         jar.close()\n\
-         out.write('bad=%d readonly=%d private=%d\\n' % (bad,readonly,private)); out.close()\n",
-        db = database.display(),
-        cookies = cookie_database.display(),
-        out = report.display()
-    );
-    std::fs::write(workdir.join("sqlite-check.py"), script).expect("write check script");
+    // Run this test executable inside the real session as a Rust SQLite probe.
+    let probe = workdir.join("sqlite-probe");
+    std::fs::copy(std::env::current_exe().expect("test executable"), &probe)
+        .expect("copy session probe");
     call_tool(
         &mut client,
         3,
         "launch_app",
-        json!({"command":format!("python3 '{}'; konsole", workdir.join("sqlite-check.py").display())}),
+        json!({"command":format!(
+            "KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_COOKIES={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_probe --nocapture; konsole",
+            shlex::try_quote(&database.display().to_string()).expect("quote database"),
+            shlex::try_quote(&cookie_database.display().to_string()).expect("quote cookies"),
+            shlex::try_quote(&report.display().to_string()).expect("quote report"),
+            shlex::try_quote(&probe.display().to_string()).expect("quote probe"),
+        )}),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     let result = loop {
@@ -1876,6 +1861,44 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
     drop(cookie_host);
     call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
+}
+
+#[test]
+#[ignore = "helper launched by session_reads_host_live_sqlite_through_read_only_mounts"]
+fn session_sqlite_probe() {
+    let database = std::env::var("KWIN_SQLITE_PROBE_DB").expect("probe database");
+    let cookies = std::env::var("KWIN_SQLITE_PROBE_COOKIES").expect("probe cookie jar");
+    let report = std::env::var("KWIN_SQLITE_PROBE_REPORT").expect("probe report");
+    for flags in [
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ] {
+        let reader =
+            rusqlite::Connection::open_with_flags(&database, flags).expect("session reader");
+        for _ in 0..20 {
+            let check: String = reader
+                .query_row("pragma quick_check", [], |row| row.get(0))
+                .expect("session quick check");
+            assert_eq!(check, "ok");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let writer = rusqlite::Connection::open(&database).expect("session writer");
+    let error = writer
+        .execute("insert into threads(body) values (x'73657373696f6e')", [])
+        .expect_err("host database must reject session writes");
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ReadOnly)
+    );
+    let jar = rusqlite::Connection::open(cookies).expect("session cookie jar");
+    jar.execute("insert into retained_cookie values ('session-cookie')", [])
+        .expect("private cookie write");
+    let count: i64 = jar
+        .query_row("select count(*) from retained_cookie", [], |row| row.get(0))
+        .expect("private cookie count");
+    assert_eq!(count, 2);
+    std::fs::write(report, "bad=0 readonly=1 private=1\n").expect("probe report");
 }
 
 #[test]
