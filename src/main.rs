@@ -1693,6 +1693,53 @@ impl From<KwinError> for McpError {
     }
 }
 
+fn describe_channel_failure(mut error: McpError, id: &str, operation: &str) -> McpError {
+    let transport = error.message.to_ascii_lowercase();
+    if !transport.contains("broken pipe")
+        && !transport.contains("connection reset")
+        && !transport.contains("connection closed")
+    {
+        return error;
+    }
+    let original = error.message.to_string();
+    let (channel, label) = match operation {
+        "screenshot" | "window_list" | "window_activate" => {
+            ("kwin_control", "KWin control/capture connection")
+        }
+        _ => ("desktop_control", "desktop control connection"),
+    };
+    let mut data = match error.data.take() {
+        Some(serde_json::Value::Object(data)) => data,
+        Some(value) => serde_json::Map::from_iter([("original_data".to_owned(), value)]),
+        None => serde_json::Map::new(),
+    };
+    if let Some(reason) = data.remove("reason") {
+        data.insert("original_reason".to_owned(), reason);
+    }
+    data.insert(
+        "reason".to_owned(),
+        serde_json::json!("session_channel_failed"),
+    );
+    data.insert("session_id".to_owned(), serde_json::json!(id));
+    data.insert("operation".to_owned(), serde_json::json!(operation));
+    data.insert("channel".to_owned(), serde_json::json!(channel));
+    data.insert("transport_error".to_owned(), serde_json::json!(original));
+    data.insert(
+        "sandbox_exit_confirmed".to_owned(),
+        serde_json::json!(false),
+    );
+    data.insert("oom_confirmed".to_owned(), serde_json::json!(false));
+    error.message = format!(
+        "Session {id}: {operation} failed on the {label}: {original}. \
+         The sandbox launcher has not reported an exit; OOM is not confirmed. \
+         Call session_stop for this handle, then session_start without session_id \
+         and relaunch apps to continue. Inspect prior input before repeating an input action."
+    )
+    .into();
+    error.data = Some(serde_json::Value::Object(data));
+    error
+}
+
 // ── Kernel / protocol constants ──────────────────────────────────────────
 
 // Linux /proc/net/route RTF_UP bit.
@@ -11239,6 +11286,7 @@ impl rmcp::ServerHandler for SessionRouter {
             None
         };
         let execution = session.clone();
+        let operation = request.name.to_string();
         let result = self
             .limit
             .layer(execution)
@@ -11257,7 +11305,7 @@ impl rmcp::ServerHandler for SessionRouter {
                     ),
                     Some(death),
                 )),
-                None => result,
+                None => result.map_err(|error| describe_channel_failure(error, &id, &operation)),
             }
         } else {
             result

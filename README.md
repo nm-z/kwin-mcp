@@ -286,3 +286,11 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
+
+### Interrupted desktop control connections
+
+A broken control connection can leave the sandbox launcher running. Tool errors
+report `session_channel_failed`, the operation, session ID and affected channel,
+and preserve the original transport error. This condition does not establish
+an OOM or sandbox exit. Stop that handle, start a new session, and relaunch the
+applications. Check the previous application state before repeating input.
