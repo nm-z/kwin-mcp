@@ -35,7 +35,7 @@ server = Thread.new do
     setting = route.start_with?('/set/')
     present = cookie.include?('kwin_immediate=')
     body = "<!doctype html><html><title>Cookie continuity</title><body style='font:32px sans-serif'><h1>#{setting ? "SET #{value}" : (present ? 'COOKIE PRESENT' : 'COOKIE MISSING')}</h1><p>Private real Chrome cookie persistence test</p></body></html>"
-    headers = setting ? "Set-Cookie: kwin_immediate=#{value}; Max-Age=3600; Path=/; HttpOnly\r\n" : ''
+    headers = setting ? "Set-Cookie: kwin_immediate=#{value}; Max-Age=3600; Path=/; HttpOnly\r\nSet-Cookie: kwin_session=#{value}; Path=/; HttpOnly\r\n" : ''
     connection.write("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: #{body.bytesize}\r\n#{headers}Connection: close\r\n\r\n#{body}")
     connection.close
     requests << [route, cookie, Process.clock_gettime(Process::CLOCK_MONOTONIC)] unless route == '/favicon.ico'
@@ -94,7 +94,8 @@ begin
     tool.call('launch_app', { command: "google-chrome-stable --password-store=basic --no-first-run --disable-background-mode http://127.0.0.1:#{port}#{route}" })
     request = wait_route.call(route)
     if cycle.positive?
-      raise "cookie lost after immediate stop: #{request.inspect}" unless request[1].include?("kwin_immediate=#{cycle - 1}")
+      expected = ["kwin_immediate=#{cycle - 1}", "kwin_session=#{cycle - 1}"]
+      raise "cookie lost after immediate stop: #{request.inspect}" unless expected.all? { |cookie| request[1].include?(cookie) }
       screenshot.call("browser-cookie-restored-#{cycle}.png")
       route = "/set/#{cycle}"
       tool.call('keyboard_key', { key: 'ctrl+l' })
