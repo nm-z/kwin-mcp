@@ -245,9 +245,11 @@ class RuntimeProof
   end
 end
 
-public_runtime = File.join(evidence, 'public-runtime')
-private_runtime = File.join(evidence, 'private-runtime-without-bus')
-runtime_file = File.join(evidence, 'runtime-file')
+fixtures = File.join(evidence, 'input-fixtures')
+FileUtils.mkdir_p(fixtures)
+public_runtime = File.join(fixtures, 'public-runtime')
+private_runtime = File.join(fixtures, 'private-runtime-without-bus')
+runtime_file = File.join(fixtures, 'runtime-file')
 FileUtils.mkdir_p(public_runtime)
 File.chmod(0o755, public_runtime)
 FileUtils.mkdir_p(private_runtime)
