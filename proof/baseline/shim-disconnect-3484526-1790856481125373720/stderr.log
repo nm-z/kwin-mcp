@@ -1,0 +1,18 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3484526-1790856481125373720/held-start-server.sh; hot reload watching /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3484526-1790856481125373720/watched-project
+kwin-mcp-shim: source changed; running cargo build in /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3484526-1790856481125373720/watched-project (log: /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3484526-1790856481125373720/.cache/kwin-mcp-shim/build.log)
+kwin-mcp-shim: session_start waits for the kwin-mcp build in progress
+kwin-mcp-shim: session_start waits for the kwin-mcp build in progress
+kwin-mcp-shim: cargo build succeeded
+kwin-mcp-shim: started child 3484720
+kwin-mcp-shim: started child 3484721
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable
+kwin-mcp: detected browsers: google-chrome-stable
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.3 (4995515) session_start
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.3 (4995515) session_start
+kwin-mcp-shim: child 3484720 exited (exit status: 0)
+kwin-mcp-shim: child 3484721 exited (exit status: 0)
+kwin-mcp-shim: client closed; stopping children

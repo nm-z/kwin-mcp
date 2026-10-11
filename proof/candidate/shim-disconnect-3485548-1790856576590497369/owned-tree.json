@@ -1,0 +1,58 @@
+{
+  "live_tmpdir": "/tmp",
+  "private_cli_tmpdir": "/tmp/kmd-3485548-1790856576590497369",
+  "private_home": "/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576590497369",
+  "processes": [
+    {
+      "comm": "kwin-mcp-shim",
+      "pid": 3485607,
+      "starttime": 34229365,
+      "state": null
+    },
+    {
+      "comm": "periodic-sweep-",
+      "pid": 3485708,
+      "starttime": 34229372,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3485712,
+      "starttime": 34229376,
+      "state": null
+    },
+    {
+      "comm": "periodic-sweep-",
+      "pid": 3485768,
+      "starttime": 34229680,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3485769,
+      "starttime": 34229684,
+      "state": null
+    },
+    {
+      "comm": "bash",
+      "pid": 3485770,
+      "starttime": 34229684,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3485771,
+      "starttime": 34229687,
+      "state": null
+    },
+    {
+      "comm": "kwin-mcp",
+      "pid": 3485915,
+      "starttime": 34230252,
+      "state": null
+    }
+  ],
+  "server_binary": "/home/nate/kwin-mcp/target/release/kwin-mcp",
+  "shim_binary": "/home/nate/builds/kwin-mcp-lifecycle/target/release/kwin-mcp-shim",
+  "shim_pid": 3485607
+}

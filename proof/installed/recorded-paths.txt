@@ -1,0 +1,8 @@
+/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3495862-1790857607737757224
+/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3495862-1790857607737793914
+/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3495862-1790857607741389766
+/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3495862-1790857607741396431
+/tmp/kmd-3495862-1790857607737757224
+/tmp/kmd-3495862-1790857607737793914
+/tmp/kmd-3495862-1790857607741389766
+/tmp/kmd-3495862-1790857607741396431

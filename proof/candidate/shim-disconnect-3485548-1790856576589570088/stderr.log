@@ -1,0 +1,13 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589570088/held-start-server.sh; hot reload watching /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589570088/watched-project
+kwin-mcp-shim: source changed; running cargo build in /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589570088/watched-project (log: /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589570088/.cache/kwin-mcp-shim/build.log)
+kwin-mcp-shim: session_start waits for the kwin-mcp build in progress
+kwin-mcp-shim: session_start waits for the kwin-mcp build in progress
+kwin-mcp-shim: cancelled held session_start "193": held start regression
+kwin-mcp-shim: cargo build succeeded
+kwin-mcp-shim: started child 3485843
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.3 (4995515) session_start
+kwin-mcp-shim: child 3485843 exited (exit status: 0)
+kwin-mcp-shim: client closed; stopping children

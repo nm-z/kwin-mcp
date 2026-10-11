@@ -1,0 +1,6 @@
+describe 3485664 34229367 unix_s=1790856576.624568 cwd=/home/nate argc=3 argv= --describe --autoclean --no-viewer
+cargo-start 3485801 34229768 unix_s=1790856580.660739 cwd=/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589480968/watched-project argc=2 argv= build --release
+cargo-release 3485801 34229768 unix_s=1790856581.272464 cwd=/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576589480968/watched-project argc=2 argv= build --release
+server 3485836 34229837 unix_s=1790856581.392289 cwd=/home/nate argc=2 argv= --autoclean --no-viewer
+server-delegate 3485836 34229837 unix_s=1790856581.662778 cwd=/home/nate argc=2 argv= --autoclean --no-viewer
+sweep 3485889 34229966 unix_s=1790856582.638517 cwd=/home/nate argc=2 argv= --sweep-workdirs 3485836

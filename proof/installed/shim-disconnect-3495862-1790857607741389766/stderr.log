@@ -1,0 +1,11 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3495862-1790857607741389766/periodic-sweep-server.sh; hot reload watching the binary only
+kwin-mcp-shim: started child 3495976
+background invocation kind=server pid=3495976 birth=34332511 argc=2
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable
+kwin-mcp-shim: child 3495976 exited (exit status: 0)
+background invocation kind=periodic-sweep pid=3496021 birth=34332829 argc=1
+background helper kind=periodic-sweep pid=3496021 birth=34332829 descendant=3496023 lease=3496022 lifetime_s=180
+background descendant pid=3496023 birth=34332829 lease=3496024 lifetime_s=180
+kwin-mcp-shim: client closed; stopping children
+background invocation kind=scoped-sweep pid=3496177 birth=34333381 argc=2

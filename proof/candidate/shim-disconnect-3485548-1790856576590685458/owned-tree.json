@@ -1,0 +1,22 @@
+{
+  "live_tmpdir": "/tmp",
+  "private_cli_tmpdir": "/tmp/kmd-3485548-1790856576590685458",
+  "private_home": "/home/nate/builds/kwin-mcp-cancel-start/proof-home/shim-disconnect-3485548-1790856576590685458",
+  "processes": [
+    {
+      "comm": "shim-cancel-tes",
+      "pid": 3485608,
+      "starttime": 34229365,
+      "state": null
+    },
+    {
+      "comm": "kwin-mcp-shim",
+      "pid": 3485685,
+      "starttime": 34229369,
+      "state": null
+    }
+  ],
+  "server_binary": "/home/nate/kwin-mcp/target/release/kwin-mcp",
+  "shim_binary": "/home/nate/builds/kwin-mcp-lifecycle/target/release/kwin-mcp-shim",
+  "shim_pid": 3485685
+}
