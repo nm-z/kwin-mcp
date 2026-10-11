@@ -11,11 +11,14 @@ binary, evidence = ARGV
 abort 'usage: transient_focus_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
 FileUtils.mkdir_p(evidence)
 private_home = File.join(evidence, 'home')
+host_runtime = ENV.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.uid}")
 %w[.config .local/share .cache .local/state .kde].each { |dir| FileUtils.mkdir_p(File.join(private_home, dir)) }
 env = {'HOME'=>private_home, 'XDG_CONFIG_HOME'=>File.join(private_home,'.config'),
        'XDG_DATA_HOME'=>File.join(private_home,'.local/share'), 'XDG_CACHE_HOME'=>File.join(private_home,'.cache'),
        'XDG_STATE_HOME'=>File.join(private_home,'.local/state'), 'KDEHOME'=>File.join(private_home,'.kde'),
-       'KWIN_MCP_REPO'=>File.join(private_home,'no-repository')}
+       'KWIN_MCP_REPO'=>File.join(private_home,'no-repository'),
+       'XDG_RUNTIME_DIR'=>host_runtime,
+       'DBUS_SESSION_BUS_ADDRESS'=>ENV.fetch('DBUS_SESSION_BUS_ADDRESS', "unix:path=#{host_runtime}/bus")}
 log = File.open(File.join(evidence,'server.log'),'w')
 stdin, stdout, stderr, process = Open3.popen3(env, File.expand_path(binary), '--autoclean', '--no-viewer')
 stderr_thread = Thread.new { stderr.each_line { |line| log.write(line); log.flush } }
@@ -76,6 +79,15 @@ begin
   raise "missing real Chrome chooser: #{windows}" unless chooser
   before = tool.call('screenshot', {}).fetch('structuredContent')
   FileUtils.cp(before.fetch('path'), File.join(evidence,'before.png'))
+  tool.call('keyboard_key', {key:'super+PageDown'})
+  20.times do
+    windows = tool.call('window_list', {}).dig('structuredContent','windows')
+    break if windows.any? { |w| w['id']==parent['id'] && w['minimized'] }
+    sleep 0.2
+  end
+  raise 'modal minimize did not minimize its parent' unless windows.any? { |w| w['id']==parent['id'] && w['minimized'] }
+  modal_restored = tool.call('window_activate', {window_id:parent['id']}).fetch('structuredContent')
+  raise 'minimized parent did not restore chooser focus' unless modal_restored.dig('window','id')==chooser['id'] && !modal_restored.dig('window','minimized')
   tool.call('launch_app', {command:['google-chrome','--new-window','data:text/html,<title>other-window-fixture</title>Other window'].shelljoin})
   activated = tool.call('window_activate', {window_id:parent['id']}).fetch('structuredContent')
   raise "wrong activation target: #{activated}" unless activated.dig('window','id') == chooser['id']
