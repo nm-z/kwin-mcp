@@ -1062,7 +1062,9 @@ impl TextReceipt {
                                 "focused field character offsets do not match its text snapshot"
                             );
                         }
-                        let selections = text.get_nselections().await?;
+                        // atspi-proxies 0.13 derives "GetNselections" from its
+                        // Rust spelling; the wire protocol uses "GetNSelections".
+                        let selections: i32 = text.inner().call("GetNSelections", &()).await?;
                         let (start, end) = if selections == 0 {
                             let caret = text.caret_offset().await?;
                             (caret, caret)
