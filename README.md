@@ -113,6 +113,22 @@ the RAM and swap limits. `--memory-swap-max 0` prevents new swap use.
 Existing sessions retain their current limits until their owner restarts them
 or changes their scope properties.
 
+`session_start` also accepts `memory_high`, `memory_max`, and
+`memory_swap_max` in whole GiB. Each omitted value inherits the server's
+default; zero disables the throttle or swap, while the RAM hard limit must
+remain positive. For example:
+
+```json
+{"memory_high":8,"memory_max":10,"memory_swap_max":6}
+```
+
+The result and `session_list` report the actual byte limits and owned scope.
+When the sandbox exits, the server tears down its resources and keeps a dead
+entry until `session_stop`. Later calls return the exit cause and recovery
+guidance. An OOM diagnosis includes the scope result, RAM/swap limits and
+systemd's memory peak when available; a signal exit alone is never treated
+as proof of an OOM kill. After upgrading an older server, scope identity and limits are recovered from the sandbox PID cgroup; values that cannot be recovered remain unknown. Stop the dead handle, start a new desktop without
+`session_id`, and relaunch the applications to continue.
 ```
 kwin-mcp (host process)
   ├── proxy_conn (owns org.kde.KWin on container D-Bus)

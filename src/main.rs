@@ -4193,15 +4193,6 @@ fn owned_session_scope(unit: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
 }
 
-fn session_scope_from_pid(pid: u32) -> Option<String> {
-    let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    groups.lines().find_map(|line| {
-        let path = line.strip_prefix("0::")?;
-        let unit = Path::new(path).file_name()?.to_str()?;
-        owned_session_scope(unit).then(|| unit.to_owned())
-    })
-}
-
 fn stop_session_scope(unit: &str) {
     if unit.is_empty() {
         return;
@@ -4240,8 +4231,162 @@ fn stop_session_scope(unit: &str) {
     let _ = run(&["reset-failed", unit]);
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct SessionScope {
+    unit: String,
+    memory_high: Option<u64>,
+    memory_max: u64,
+    memory_swap_max: u64,
+}
+
+const SCOPE_DIAGNOSTIC_TIMEOUT_SECONDS: &str = "2";
+
+impl SessionScope {
+    /// Older reload records had no scope fields. Read the sandbox's actual
+    /// kernel cgroup instead of substituting the new server's defaults.
+    fn recover(mut self, pid: u32) -> Self {
+        if !self.unit.is_empty() && self.memory_max != 0 {
+            return self;
+        }
+        let group = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|groups| {
+                groups
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+            });
+        let Some(group) = group else {
+            return self;
+        };
+        let Some(unit) = Path::new(&group).file_name().and_then(|name| name.to_str()) else {
+            return self;
+        };
+        // These are the generated sandbox scopes from the old and new
+        // launchers. Never adopt the surrounding host desktop's app scope.
+        if !owned_session_scope(unit) {
+            return self;
+        }
+        self.unit = unit.to_owned();
+        let directory = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+        let read = |name| std::fs::read_to_string(directory.join(name)).ok();
+        let (Some(high), Some(max), Some(swap)) = (
+            read("memory.high"),
+            read("memory.max"),
+            read("memory.swap.max"),
+        ) else {
+            return self;
+        };
+        let (Ok(max), Ok(swap)) = (max.trim().parse::<u64>(), swap.trim().parse::<u64>()) else {
+            return self;
+        };
+        let high = match high.trim() {
+            "max" => None,
+            value => match value.parse::<u64>() {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return self,
+            },
+        };
+        self.memory_high = high;
+        self.memory_max = max;
+        self.memory_swap_max = swap;
+        self
+    }
+
+    fn report(&self) -> serde_json::Value {
+        let known = self.memory_max != 0;
+        serde_json::json!({"unit":(!self.unit.is_empty()).then_some(&self.unit),
+            "memory_high":if known { self.memory_high } else { None },
+            "memory_max":known.then_some(self.memory_max),
+            "memory_swap_max":known.then_some(self.memory_swap_max), "limits_known":known})
+    }
+
+    fn new(path: &Path, config: DisplayConfig) -> Self {
+        Self {
+            unit: format!(
+                "{}.scope",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            memory_high: config.memory_high,
+            memory_max: config.memory_max,
+            memory_swap_max: config.memory_swap_max,
+        }
+    }
+
+    fn diagnose(&self, status: std::process::ExitStatus) -> serde_json::Value {
+        let output = (!self.unit.is_empty())
+            .then(|| {
+                let runtime = host_environment::runtime_dir().ok()?;
+                let bus = host_environment::session_bus_address(&runtime).ok()?;
+                Some(
+                    std::process::Command::new("timeout")
+                        .env("XDG_RUNTIME_DIR", runtime)
+                        .env("DBUS_SESSION_BUS_ADDRESS", bus)
+                        .args([
+                            SCOPE_DIAGNOSTIC_TIMEOUT_SECONDS,
+                            "systemctl",
+                            "--user",
+                            "show",
+                            &self.unit,
+                            "-p",
+                            "Result",
+                            "-p",
+                            "MemoryPeak",
+                            "-p",
+                            "MemoryCurrent",
+                            "-p",
+                            "ControlGroup",
+                        ])
+                        .output(),
+                )
+            })
+            .flatten()
+            .and_then(Result::ok);
+        let properties: std::collections::BTreeMap<String, String> = output
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_once('=')
+                            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let events = properties
+            .get("ControlGroup")
+            .filter(|path| !path.is_empty())
+            .and_then(|path| {
+                std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.events")).ok()
+            });
+        let oom = properties
+            .get("Result")
+            .is_some_and(|result| result == "oom-kill")
+            || events.as_ref().is_some_and(|events| {
+                events.lines().any(|line| {
+                    line.split_once(' ')
+                        .is_some_and(|(key, value)| key == "oom_kill" && value != "0")
+                })
+            });
+        serde_json::json!({
+            "status": "dead", "reason": if oom { "oom_kill" } else { "sandbox_exited" },
+            "exit_status": status.to_string(),
+            "memory_high_bytes": if self.memory_max != 0 { self.memory_high } else { None },
+            "memory_max_bytes": (self.memory_max != 0).then_some(self.memory_max),
+            "memory_swap_max_bytes": (self.memory_max != 0).then_some(self.memory_swap_max),
+            "scope": (!self.unit.is_empty()).then_some(&self.unit), "scope_properties": properties,
+            "memory_events": events,
+            "resume_guidance": "Call session_stop for this handle, then session_start without session_id to create a new isolated desktop. Relaunch apps and restore your task; the old desktop cannot be resumed."
+        })
+    }
+
+    fn stop(&self) {
+        stop_session_scope(&self.unit);
+    }
+}
+
 struct Session {
-    scope_unit: String,
+    scope: SessionScope,
     kwin_conn: zbus::Connection, // talks to KWin via its unique name
     _proxy_socket: std::os::fd::OwnedFd,
     _proxy_conn: zbus::Connection, // owns org.kde.KWin, has InputDevice objects (kept alive)
@@ -4315,6 +4460,9 @@ fn signal_child(child_id: u32, process_group: bool, signal: nix::sys::signal::Si
 /// after the bounded TERM grace period and SIGKILL escalation.
 fn terminate_child(child: impl Into<SessionProcess>, process_group: bool, label: &str) {
     let mut child = child.into();
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     signal_child(child.id(), process_group, nix::sys::signal::Signal::SIGTERM);
     let deadline = std::time::Instant::now() + STARTUP_CHILD_TERMINATION_GRACE;
     loop {
@@ -4461,6 +4609,7 @@ fn test_stop_bwrap(child: &std::process::Child) {
 
 #[derive(Clone)]
 struct KwinMcp {
+    death: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     clipboards: Arc<std::sync::Mutex<ClipboardStore>>,
     session_id: String,
     input_log: Option<Arc<InputLog>>,
@@ -4485,8 +4634,54 @@ struct KwinMcp {
 }
 
 impl KwinMcp {
+    fn death_record(&self) -> Option<serde_json::Value> {
+        self.death
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn set_death(&self, diagnostic: serde_json::Value) {
+        *self
+            .death
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(diagnostic);
+    }
+
+    async fn check_liveness(&self) -> Option<serde_json::Value> {
+        if let Some(death) = self.death_record() {
+            return Some(death);
+        }
+        let mut guard = self.session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return self.death_record();
+        };
+        let status = match session.sandbox_child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!("session liveness: {}: {error}", self.session_id);
+                return None;
+            }
+        };
+        let scope = session.scope.clone();
+        let diagnostic = tokio::task::spawn_blocking(move || scope.diagnose(status)).await
+            .unwrap_or_else(|error| serde_json::json!({"status":"dead", "reason":"sandbox_exited", "diagnostic_error":error.to_string()}));
+        self.set_death(diagnostic.clone());
+        let stopped = guard.take();
+        drop(guard);
+        if let Some(session) = stopped {
+            // The sandbox is already gone. No browser can flush to the
+            // mediator, and this cleanup must survive cancellation of a tool
+            // or of the reaper itself during transport shutdown.
+            let _ = tokio::task::spawn_blocking(move || teardown(session)).await;
+        }
+        eprintln!("session died: {}: {diagnostic}", self.session_id);
+        Some(diagnostic)
+    }
+
     fn new(display: DisplayConfig) -> Self {
         Self {
+            death: Arc::new(std::sync::Mutex::new(None)),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
             session_id: String::new(),
             input_log: None,
@@ -5232,7 +5427,7 @@ fn teardown(mut sess: Session) {
         terminate_child(viewer, false, "viewer");
     }
     drop(sess.sandbox_stdin);
-    stop_session_scope(&sess.scope_unit);
+    sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
     terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
@@ -7005,6 +7200,12 @@ struct FindUiElementsParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SessionStartParams {
+    /// Session RAM throttle in GiB. Zero disables throttling; omit for the server default.
+    memory_high: Option<u64>,
+    /// Session RAM hard limit in GiB. Must be positive; omit for the server default.
+    memory_max: Option<u64>,
+    /// Session swap hard limit in GiB. Zero disables swap; omit for the server default.
+    memory_swap_max: Option<u64>,
     /// Virtual display width in pixels for this session. Omit to use the
     /// server default. Ignored when the server was launched with --no-override.
     width: Option<u32>,
@@ -7015,6 +7216,40 @@ struct SessionStartParams {
     /// private copies. Default: files over 64 MiB use reflink or a read-only
     /// bind. Explicit copies still share the 20-second startup deadline.
     writable_paths: Option<Vec<PathBuf>>,
+}
+
+impl SessionStartParams {
+    fn memory_config(&self, mut config: DisplayConfig) -> Result<DisplayConfig, McpError> {
+        let bytes = |name: &str, value: u64| {
+            value
+                .checked_mul(GIB_BYTES)
+                .ok_or_else(|| McpError::invalid_params(format!("{name} is too large"), None))
+        };
+        if let Some(value) = self.memory_high {
+            config.memory_high = if value == 0 {
+                None
+            } else {
+                Some(bytes("memory_high", value)?)
+            };
+        }
+        if let Some(value) = self.memory_max {
+            config.memory_max = bytes("memory_max", value)?;
+        }
+        if let Some(value) = self.memory_swap_max {
+            config.memory_swap_max = bytes("memory_swap_max", value)?;
+        }
+        if config.memory_max == 0
+            || config
+                .memory_high
+                .is_some_and(|high| high > config.memory_max)
+        {
+            return Err(McpError::invalid_params(
+                "memory_max must be positive and memory_high must not exceed memory_max; set both when lowering the limit",
+                None,
+            ));
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -7195,7 +7430,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -7288,6 +7523,7 @@ impl KwinMcp {
         params: SessionStartParams,
         host_work: HostWork,
     ) -> Result<CallToolResult, McpError> {
+        let memory = params.memory_config(self.display)?;
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
             env!("CARGO_PKG_VERSION"),
@@ -7755,16 +7991,13 @@ impl KwinMcp {
             "{}.scope",
             self.path.file_name().unwrap_or_default().to_string_lossy()
         );
+        let scope = SessionScope::new(&self.path, memory);
         startup.scope_unit = Some(scope_unit.clone());
-        let mut cmd = match sandbox_launcher(
-            self.display,
-            &host_runtime,
-            &host_session_bus,
-            Some(&scope_unit),
-        ) {
-            Ok(command) => command,
-            Err(error) => return cleanup_err(error, &mut startup),
-        };
+        let mut cmd =
+            match sandbox_launcher(memory, &host_runtime, &host_session_bus, Some(&scope_unit)) {
+                Ok(command) => command,
+                Err(error) => return cleanup_err(error, &mut startup),
+            };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         let host_ports_spec = format!("auto,~{cdp_forward_port}");
         let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
@@ -8261,7 +8494,7 @@ impl KwinMcp {
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
-            scope_unit,
+            scope: scope.clone(),
             kwin_conn,
             _proxy_conn: proxy_conn,
             _proxy_socket: proxy_socket,
@@ -8304,6 +8537,7 @@ impl KwinMcp {
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
+            "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
             "bus": bus_name,
@@ -10448,9 +10682,11 @@ fn sandbox_launcher(
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
-        .args(["--user", "--scope", "--quiet", "--collect"]);
+        .args(["--user", "--scope", "--quiet"]);
     if let Some(unit) = scope_unit {
         command.arg("--unit").arg(unit);
+    } else {
+        command.arg("--collect");
     }
     command
         .arg("-p")
@@ -10788,16 +11024,20 @@ impl SessionRouter {
             sessions.insert(id.clone(), session.clone());
             return Ok((id, session));
         }
+        let live: Vec<_> = sessions
+            .iter()
+            .filter(|(_, session)| session.death_record().is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
         let id = match id {
             Some(id) => id,
-            None if sessions.len() == 1 => sessions
-                .keys()
-                .next()
+            None if live.len() == 1 => live
+                .first()
                 .cloned()
                 .ok_or_else(|| McpError::internal_error("no session", None))?,
-            None if sessions.is_empty() => {
+            None if live.is_empty() => {
                 return Err(McpError::invalid_params(
-                    "no session; call session_start first",
+                    "no live session; call session_start without session_id to create a new desktop. Use explicit old handles with session_stop to clear dead entries.",
                     None,
                 ));
             }
@@ -10817,10 +11057,14 @@ impl SessionRouter {
     async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut records = Vec::new();
         for (id, service) in self.entries()? {
+            if let Some(death) = service.check_liveness().await {
+                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":"dead", "diagnostic":death}));
+                continue;
+            }
             let guard = service.session.read().await;
             if let Some(session) = guard.as_ref() {
                 records.push(serde_json::json!({
-                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope_unit, "input_log":service.input_log.as_ref().map(|log| &log.path),
+                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":session.scope.report(), "input_log":service.input_log.as_ref().map(|log| &log.path),
                     "workdir": session.host_xdg_dir, "width": session.screen_width,
                     "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
                 }));
@@ -10853,6 +11097,7 @@ impl SessionRouter {
                 continue;
             };
             for (_, service) in entries {
+                let _ = service.check_liveness().await;
                 let Ok(_gate) = service.start_gate.try_lock() else {
                     continue;
                 };
@@ -10967,6 +11212,21 @@ impl rmcp::ServerHandler for SessionRouter {
         let (id, session) = self.resolve(&mut request)?;
         let start = request.name == "session_start";
         let stop = request.name == "session_stop";
+        if !start
+            && !stop
+            && let Some(death) = session.check_liveness().await
+        {
+            return Err(McpError::internal_error(
+                format!(
+                    "Session {id} is dead: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
+                    death["reason"],
+                    death["memory_max_bytes"]
+                        .as_u64()
+                        .map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
+                ),
+                Some(death),
+            ));
+        }
         let input = ordered_tool(&request.name);
         // Queued input waits outside the global limit so it cannot starve reads.
         let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
@@ -10988,6 +11248,20 @@ impl rmcp::ServerHandler for SessionRouter {
                 routes: self.routes.clone(),
             })
             .await;
+        let result = if !start && !stop && result.is_err() {
+            match session.check_liveness().await {
+                Some(death) => Err(McpError::internal_error(
+                    format!(
+                        "Session {id} died: {}; call session_stop then session_start without session_id to resume in a new desktop",
+                        death["reason"]
+                    ),
+                    Some(death),
+                )),
+                None => result,
+            }
+        } else {
+            result
+        };
         if (stop && result.is_ok() || start && result.is_err() && session.workdir.owned().is_none())
             && let Ok(mut sessions) = self.sessions.lock()
         {
@@ -11358,6 +11632,8 @@ const RESUME_DESCRIPTOR: &str = "KWIN_MCP_RESUME_FD";
 #[derive(Serialize, Deserialize)]
 struct SessionRestore {
     #[serde(default)]
+    scope: SessionScope,
+    #[serde(default)]
     scope_unit: String,
     id: String,
     #[serde(default)]
@@ -11394,6 +11670,8 @@ struct SessionRestore {
 }
 #[derive(Serialize, Deserialize)]
 struct ServerRestore {
+    #[serde(default)]
+    deaths: Vec<(String, serde_json::Value)>,
     #[serde(default)]
     client_fd: Option<i32>,
     #[serde(default)]
@@ -11520,10 +11798,12 @@ impl SessionRouter {
                 service.workdir.inherit_lease(&saved.path, saved.lease_fd)?;
             }
             *service.session.write().await = Some(Session {
-                scope_unit: if saved.scope_unit.is_empty() {
-                    session_scope_from_pid(saved.sandbox_pid).unwrap_or_default()
-                } else {
-                    saved.scope_unit
+                scope: {
+                    let mut scope = saved.scope;
+                    if scope.unit.is_empty() {
+                        scope.unit = saved.scope_unit;
+                    }
+                    scope.recover(saved.sandbox_pid)
                 },
                 kwin_conn,
                 _proxy_conn: proxy_conn,
@@ -11580,6 +11860,23 @@ impl SessionRouter {
                 .map_err(|_| anyhow::anyhow!("session map lock poisoned"))?
                 .insert(id, service);
         }
+        for (id, death) in state.deaths {
+            let service = {
+                let mut entries = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session map lock poisoned"))?;
+                entries
+                    .entry(id.clone())
+                    .or_insert_with(|| {
+                        let mut service = KwinMcp::new(self.display);
+                        service.session_id = id;
+                        service
+                    })
+                    .clone()
+            };
+            service.set_death(death);
+        }
         eprintln!(
             "reload: reattached {} sessions in PID {}",
             self.entries()?.len(),
@@ -11598,9 +11895,13 @@ impl SessionRouter {
         let mut retained = Vec::new();
         let mut saved = Vec::new();
         let mut cleanup = Vec::new();
+        let mut deaths = Vec::new();
         let mut gates = Vec::new();
         for (id, service) in self.entries()? {
             gates.push(service.start_gate.clone().lock_owned().await);
+            if let Some(death) = service.death_record() {
+                deaths.push((id.clone(), death));
+            }
             let guard = service.session.read().await;
             let Some(session) = guard.as_ref() else {
                 if let Some(path) = service.workdir.owned() {
@@ -11609,7 +11910,8 @@ impl SessionRouter {
                 continue;
             };
             saved.push(SessionRestore {
-                scope_unit: session.scope_unit.clone(),
+                scope_unit: session.scope.unit.clone(),
+                scope: session.scope.clone(),
                 input_log_path: service.input_log.as_ref().map(|log| log.path.clone()),
                 input_history: service
                     .input_log
@@ -11673,6 +11975,7 @@ impl SessionRouter {
             .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
             .saved()?;
         let state = ServerRestore {
+            deaths,
             client_fd: Some(retain_descriptor(wire.client.get_ref(), &mut retained)?),
             clipboards: clipboard_state,
             pid: std::process::id(),
