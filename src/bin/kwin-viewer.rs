@@ -854,12 +854,19 @@ fn window_loop(
         }
         for event in frame.events {
             if let Event::WindowEvent {
-                event: WindowEvent::Resized(size), ..
+                event: WindowEvent::Resized(size),
+                ..
             } = event
             {
                 aspect.resize(frame.window, *size);
             }
-            forward_input(event, (frame.width, frame.height), virt, input_state, numlock);
+            forward_input(
+                event,
+                (frame.width, frame.height),
+                virt,
+                input_state,
+                numlock,
+            );
         }
 
         // Consume the latest frame if one arrived; upload into src_image.
@@ -1568,7 +1575,11 @@ fn forward_input(
                 state.out.send(Op::Motion(x, y));
             }
         }
-        WindowEvent::MouseInput { state: btn_state, button, .. } => {
+        WindowEvent::MouseInput {
+            state: btn_state,
+            button,
+            ..
+        } => {
             if state.active_touch.is_some() {
                 return;
             }

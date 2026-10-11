@@ -28,7 +28,7 @@ XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
 The runtime also needs `ruby`, `kdotool`, and ImageMagick `magick` on the KDE host. The test performs these real operations:
 
 1. `session_start` for each production stdio server, then `launch_app` and `viewer_open` for the inner session.
-2. Unmaximize only the viewer in the outer isolated KWin. Resize its width, then its height, using that compositor’s `kdotool`.
+2. Unmaximize only the viewer in the outer isolated KWin. Resize its width through that compositor’s `kdotool`, then drag the bottom edge through real Meta+right-button input.
 3. Query the resulting geometry through `window_list`, capture through `screenshot`, and verify all four picture corners contain the expected colors, with no bars.
 4. Click through the outer session’s `mouse_click` at a known viewer position. Send a real Wayland touch down/up sequence into the same outer compositor. Verify the C application in the inner session received the expected pixels within two pixels.
 5. Export the application events and viewer log, then call `session_stop` on both sessions.
