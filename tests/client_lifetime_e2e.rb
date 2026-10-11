@@ -151,6 +151,19 @@ begin
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
   File.write(File.join(evidence,'verification.json'),JSON.pretty_generate(status:'passed',mode:mode,elapsed:elapsed,writer_still_alive:!record['keeper'].nil?,record:record))
   puts "client_#{mode}=PASS (#{elapsed.round(3)}s; two scopes, members terminated and workdirs gone)"
+rescue Timeout::Error
+  if record
+    observed = {
+      server_present: File.directory?("/proc/#{record.fetch('server')}"),
+      keeper_present: record['keeper'] && File.directory?("/proc/#{record['keeper']}"),
+      sessions: record.fetch('sessions').map do |session|
+        session.merge('workdir_present'=>File.exist?(session.fetch('workdir')),
+                      'remaining_members'=>Dir.glob(File.join(session.fetch('cgroup'),'**','cgroup.procs')).flat_map { |file| File.readlines(file).map(&:to_i) })
+      end,
+    }
+    File.write(File.join(evidence,'timeout-observation.json'),JSON.pretty_generate(observed))
+  end
+  raise
 ensure
   if controller
     Process.kill('TERM',controller) rescue Errno::ESRCH
