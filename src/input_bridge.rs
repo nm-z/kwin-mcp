@@ -927,3 +927,215 @@ pub async fn register_devices(
         .await?;
     Ok(())
 }
+
+// Application-side receipts for paced keyboard input. EIS acknowledgement
+// confirms compositor processing; AT-SPI independently confirms the field text.
+const TEXT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const TEXT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const TEXT_DELIVERY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const TEXT_DISCOVERY_MAX_NODES: usize = 5000;
+const TEXT_SNAPSHOT_MAX_CHARS: i32 = 262_144;
+const TEXT_WINDOW_BOUNDS_TOLERANCE: f64 = 2.0;
+
+pub struct TextReceipt {
+    bus: zbus::Connection,
+    object: atspi::ObjectRefOwned,
+    expected: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct TextDelivery {
+    pub status: &'static str,
+    pub method: &'static str,
+    pub compositor_acknowledged: bool,
+    pub expected_field_characters: Option<usize>,
+    pub observed_field_characters: Option<usize>,
+    pub warning: Option<String>,
+}
+
+impl TextDelivery {
+    pub fn unavailable(reason: String) -> Self {
+        Self {
+            status: "unverified",
+            method: "eis_roundtrip",
+            compositor_acknowledged: true,
+            expected_field_characters: None,
+            observed_field_characters: None,
+            warning: Some(format!(
+                "KWin acknowledged all key events, but field text could not be verified: {reason}. Inspect the field before sending or retrying; retyping can duplicate text."
+            )),
+        }
+    }
+}
+
+impl TextReceipt {
+    pub async fn capture(
+        address: &str,
+        title: &str,
+        bounds: [f64; 4],
+        input: &str,
+    ) -> anyhow::Result<Self> {
+        if input.contains(['\t', '\n']) {
+            anyhow::bail!("Tab or Return may change focus or submit the field");
+        }
+        if title.is_empty() {
+            anyhow::bail!("there is no active window");
+        }
+        tokio::time::timeout(
+            TEXT_DISCOVERY_TIMEOUT,
+            Self::discover(address, title, bounds, input),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("focused text discovery timed out"))?
+    }
+
+    async fn discover(
+        address: &str,
+        title: &str,
+        bounds: [f64; 4],
+        input: &str,
+    ) -> anyhow::Result<Self> {
+        use atspi::proxy::accessible::ObjectRefExt;
+        use atspi::proxy::proxy_ext::ProxyExt;
+        let bus = zbus::connection::Builder::address(address)?
+            .auth_mechanism(zbus::AuthMechanism::Anonymous)
+            .build()
+            .await?;
+        let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
+            .destination("org.a11y.atspi.Registry")?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
+        let mut visited = 0;
+        for app in root.get_children().await? {
+            let app = app.as_accessible_proxy(&bus).await?;
+            for frame in app.get_children().await? {
+                let frame = frame.as_accessible_proxy(&bus).await?;
+                let name = frame.name().await.unwrap_or_default();
+                if !name.starts_with(title) {
+                    continue;
+                }
+                // Electron may retain Focused on nodes in several windows with
+                // the same caption. Bind the receipt to the active client area.
+                let (x, y, w, h) = frame
+                    .proxies()
+                    .await?
+                    .component()
+                    .await?
+                    .get_extents(atspi::CoordType::Screen)
+                    .await?;
+                if [x, y, w, h]
+                    .into_iter()
+                    .zip(bounds)
+                    .any(|(actual, expected)| {
+                        (f64::from(actual) - expected).abs() > TEXT_WINDOW_BOUNDS_TOLERANCE
+                    })
+                {
+                    continue;
+                }
+                let mut stack = frame.get_children().await?;
+                while let Some(object) = stack.pop() {
+                    visited += 1;
+                    if visited > TEXT_DISCOVERY_MAX_NODES {
+                        anyhow::bail!("focused text discovery exceeded its node limit");
+                    }
+                    let node = object.as_accessible_proxy(&bus).await?;
+                    let states = node.get_state().await?;
+                    if states.contains(atspi::State::Focused)
+                        && states.contains(atspi::State::Editable)
+                        && states.contains(atspi::State::Showing)
+                    {
+                        let role = node.get_role().await?;
+                        if role == atspi::Role::PasswordText || role == atspi::Role::Terminal {
+                            anyhow::bail!(
+                                "the focused control is a password field or terminal, not an inspectable editable field"
+                            );
+                        }
+                        let text = node.proxies().await?.text().await?;
+                        let count = text.character_count().await?;
+                        if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {
+                            anyhow::bail!("focused field exceeds the text snapshot limit");
+                        }
+                        let before = text.get_text(0, -1).await?;
+                        if before.chars().count() != usize::try_from(count)? {
+                            anyhow::bail!(
+                                "focused field character offsets do not match its text snapshot"
+                            );
+                        }
+                        let selections = text.get_nselections().await?;
+                        let (start, end) = if selections == 0 {
+                            let caret = text.caret_offset().await?;
+                            (caret, caret)
+                        } else if selections == 1 {
+                            let (a, b) = text.get_selection(0).await?;
+                            (a.min(b), a.max(b))
+                        } else {
+                            anyhow::bail!("focused field has multiple selections");
+                        };
+                        if start < 0 || end < start || end > count {
+                            anyhow::bail!("focused field supplied invalid insertion offsets");
+                        }
+                        let start = usize::try_from(start)?;
+                        let end = usize::try_from(end)?;
+                        let expected = before
+                            .chars()
+                            .take(start)
+                            .chain(input.chars())
+                            .chain(before.chars().skip(end))
+                            .collect();
+                        drop(text);
+                        drop(node);
+                        return Ok(Self {
+                            bus: bus.clone(),
+                            object,
+                            expected,
+                        });
+                    }
+                    stack.extend(node.get_children().await?);
+                }
+            }
+        }
+        anyhow::bail!("the active window exposes no focused editable text through accessibility");
+    }
+
+    pub async fn confirm(self) -> TextDelivery {
+        let expected_count = self.expected.chars().count();
+        let mut observed_count = None;
+        let check = async {
+            use atspi::proxy::accessible::ObjectRefExt;
+            use atspi::proxy::proxy_ext::ProxyExt;
+            let node = self.object.as_accessible_proxy(&self.bus).await?;
+            let text = node.proxies().await?.text().await?;
+            loop {
+                let states = node.get_state().await?;
+                if !states.contains(atspi::State::Focused)
+                    || !states.contains(atspi::State::Showing)
+                {
+                    anyhow::bail!("the target field lost focus or became hidden");
+                }
+                let observed = text.get_text(0, -1).await?;
+                observed_count = Some(observed.chars().count());
+                if observed == self.expected {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(TEXT_DELIVERY_POLL).await;
+            }
+        };
+        match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
+            Ok(Ok(())) => TextDelivery {
+                status: "verified", method: "atspi_focused_text", compositor_acknowledged: true,
+                expected_field_characters: Some(expected_count), observed_field_characters: observed_count,
+                warning: None,
+            },
+            Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
+            Err(_) => TextDelivery {
+                status: "pending_or_mismatched",
+                method: "atspi_focused_text",
+                compositor_acknowledged: true,
+                expected_field_characters: Some(expected_count),
+                observed_field_characters: observed_count,
+                warning: Some("KWin acknowledged the keys, but the focused field did not contain the complete expected text within 10s. Input may still arrive or the application may have transformed it. Inspect the field before sending or retrying; do not retype blindly.".to_owned()),
+            },
+        }
+    }
+}

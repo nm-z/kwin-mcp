@@ -294,3 +294,19 @@ report `session_channel_failed`, the operation, session ID and affected channel,
 and preserve the original transport error. This condition does not establish
 an OOM or sandbox exit. Stop that handle, start a new session, and relaunch the
 applications. Check the previous application state before repeating input.
+
+### Typing delivery receipts
+
+`keyboard_type` submits paced press/release events and waits for a compositor
+acknowledgement. Its `delivery` separates that acknowledgement from application
+text verification. When the focused editable field exposes accessible text,
+`verified` confirms the complete expected insertion; expected/observed character
+counts accompany the receipt. Otherwise `unverified` warns that the application
+text has not been confirmed. A field that still differs after the bounded wait
+reports `pending_or_mismatched` as an error. Inspect the field before sending or
+retrying: delayed input can otherwise be duplicated. Passwords, terminals and
+Tab/Return actions do not expose an application-text receipt.
+
+Errors after submission retain requested/attempted/submitted progress when
+available and explicitly disallow blind retry, including when the session dies
+or writing the input summary fails. No partially submitted text is restarted.
