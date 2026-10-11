@@ -1960,16 +1960,52 @@ fn session_sqlite_rotation_probe() {
 }
 
 #[test]
+#[ignore = "host graphical socket fixture for the live SQLite alias regression"]
+fn host_graphical_socket_fixture() {
+    use std::io::Read;
+    let path = std::env::var_os("KWIN_GRAPHICAL_SOCKET_FIXTURE").expect("socket fixture path");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(path).expect("graphical fixture listener");
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .expect("fixture lifetime");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
 fn session_follows_host_sqlite_wal_rotation() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
-    let _graphical = std::os::unix::net::UnixListener::bind(directory.join("host-graphical.sock"))
-        .expect("graphical socket fixture");
+    struct GraphicalFixture(Child);
+    impl Drop for GraphicalFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let socket = directory.join("host-graphical.sock");
+    let _graphical = GraphicalFixture(
+        Command::new(std::env::current_exe().expect("fixture executable"))
+            .args(["--ignored", "--exact", "host_graphical_socket_fixture"])
+            .env("KWIN_GRAPHICAL_SOCKET_FIXTURE", &socket)
+            // Only this owned helper is marked graphical; no host connection is made.
+            .env("WAYLAND_DISPLAY", "wayland-0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start graphical fixture"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "graphical fixture did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
     std::os::unix::fs::symlink(
-        std::env::var_os("XDG_RUNTIME_DIR").expect("host runtime directory"),
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
         directory.join("host-runtime-link"),
     )
     .expect("runtime symlink fixture");
