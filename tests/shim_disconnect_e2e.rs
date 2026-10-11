@@ -33,6 +33,20 @@ const SERVER_INVOCATIONS: &str = "server-invocations.log";
 const RESISTANT_PID: &str = "term-resistant.pid";
 const TTL_RECEIPTS: &str = "ttl-receipts.jsonl";
 const STOP_RETRY_RECEIPTS: &str = "stop-retry-receipts.jsonl";
+const BACKGROUND_RECEIPTS: &str = "background-receipts.jsonl";
+const BACKGROUND_INVOCATIONS: &str = "background-invocations.log";
+const BACKGROUND_HELPER: &str = "background-helper.identity";
+const BACKGROUND_DESCENDANT: &str = "background-descendant.identity";
+const BACKGROUND_SERVER: &str = "background-server.identity";
+const BACKGROUND_SERVER_RELEASE: &str = "background-server.release";
+const BACKGROUND_EXPIRED: &str = "background-helper-expired.log";
+const BACKGROUND_READY_WAIT: Duration = Duration::from_secs(20);
+const BACKGROUND_EXIT_WAIT: Duration = Duration::from_secs(25);
+const BACKGROUND_HELPER_LIFETIME: Duration = Duration::from_secs(180);
+const CONTROLLED_CARGO: &str = "controlled-cargo.sh";
+const PERIODIC_SWEEP_SERVER: &str = "periodic-sweep-server.sh";
+const BACKGROUND_DESCENDANT_SCRIPT: &str = "background-descendant.sh";
+const WATCHED_PROJECT: &str = "watched-project";
 
 struct PrivateHome(PathBuf, PathBuf);
 
@@ -74,9 +88,22 @@ impl PrivateHome {
             RESISTANT_PID,
             TTL_RECEIPTS,
             STOP_RETRY_RECEIPTS,
+            BACKGROUND_RECEIPTS,
+            BACKGROUND_INVOCATIONS,
+            BACKGROUND_HELPER,
+            BACKGROUND_DESCENDANT,
+            BACKGROUND_SERVER,
+            BACKGROUND_EXPIRED,
+            CONTROLLED_CARGO,
+            PERIODIC_SWEEP_SERVER,
+            BACKGROUND_DESCENDANT_SCRIPT,
         ] {
             copy_diagnostic(&self.0.join(name), &proof.join(name))?;
         }
+        copy_diagnostic(
+            &self.0.join(".cache/kwin-mcp-shim/build.log"),
+            &proof.join("watcher-build.log"),
+        )?;
         Ok(Some(proof))
     }
 }
@@ -191,6 +218,176 @@ fn recording_server(home: &Path) -> TestResult<PathBuf> {
     std::fs::write(&wrapper, script)?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     Ok(wrapper)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BackgroundCase {
+    Cargo,
+    PeriodicSweep,
+}
+
+impl BackgroundCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::PeriodicSweep => "periodic-sweep",
+        }
+    }
+}
+
+fn write_executable(path: &Path, script: &str) -> TestResult {
+    std::fs::write(path, script)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn background_scripts(home: &Path, case: BackgroundCase) -> TestResult<PathBuf> {
+    let invocations = shell_quote(&home.join(BACKGROUND_INVOCATIONS));
+    let helper_identity = shell_quote(&home.join(BACKGROUND_HELPER));
+    let descendant_identity = shell_quote(&home.join(BACKGROUND_DESCENDANT));
+    let expired = shell_quote(&home.join(BACKGROUND_EXPIRED));
+    let descendant = home.join(BACKGROUND_DESCENDANT_SCRIPT);
+    // Bash reads its own stat without spawning a reader. The identity marker
+    // includes field 22 (birth time), even if the command name contains spaces.
+    let identity = "read -r stat < \"/proc/$BASHPID/stat\"\n\
+                    read -r -a fields <<< \"${stat##*) }\"\n";
+    let lifetime = BACKGROUND_HELPER_LIFETIME.as_secs();
+    write_executable(
+        &descendant,
+        &format!(
+            "#!/bin/bash\n\
+             set -eu\n\
+             trap '' TERM HUP\n\
+             /bin/sleep {lifetime} &\n\
+             lease=$!\n\
+             {identity}\
+             printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {descendant_identity}\n\
+             printf 'background descendant pid=%s birth=%s lease=%s lifetime_s={lifetime}\\n' \"$BASHPID\" \"${{fields[19]}}\" \"$lease\" >&2\n\
+             wait \"$lease\"\n\
+             printf 'descendant %s expired\\n' \"$BASHPID\" >> {expired}\n\
+             exit 124\n",
+        ),
+    )?;
+    let invocation = format!(
+        "{identity}\
+         {{ printf '%s %s %s cwd=%q argc=%s argv=' \"$kind\" \"$BASHPID\" \"${{fields[19]}}\" \"$PWD\" \"$#\"; printf ' %q' \"$@\"; printf '\\n'; }} >> {invocations}\n\
+         printf 'background invocation kind=%s pid=%s birth=%s argc=%s\\n' \"$kind\" \"$BASHPID\" \"${{fields[19]}}\" \"$#\" >&2\n",
+    );
+    let hold = format!(
+        "trap '' TERM HUP\n\
+         /bin/sleep {lifetime} &\n\
+         lease=$!\n\
+         setsid /bin/bash {} </dev/null &\n\
+         descendant=$!\n\
+         {identity}\
+         printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {helper_identity}\n\
+         printf 'background helper kind=%s pid=%s birth=%s descendant=%s lease=%s lifetime_s={lifetime}\\n' \"$kind\" \"$BASHPID\" \"${{fields[19]}}\" \"$descendant\" \"$lease\" >&2\n\
+         wait \"$lease\"\n\
+         printf 'helper %s expired\\n' \"$BASHPID\" >> {expired}\n\
+         exit 124\n",
+        shell_quote(&descendant),
+    );
+    let (name, script) = match case {
+        BackgroundCase::Cargo => (
+            CONTROLLED_CARGO,
+            format!(
+                "#!/bin/bash\n\
+                 set -eu\n\
+                 [[ ${{1-}} == build && ( $# == 1 || ( $# == 2 && ${{2-}} == --release ) ) ]] || exit 125\n\
+                 kind=cargo\n\
+                 {invocation}\
+                 {hold}",
+            ),
+        ),
+        BackgroundCase::PeriodicSweep => {
+            let binary = std::fs::canonicalize(real_server_binary())?;
+            let server_identity = shell_quote(&home.join(BACKGROUND_SERVER));
+            let server_release = shell_quote(&home.join(BACKGROUND_SERVER_RELEASE));
+            (
+                PERIODIC_SWEEP_SERVER,
+                format!(
+                    "#!/bin/bash\n\
+                     set -eu\n\
+                     case \"${{1-}}\" in\n\
+                       --describe) kind=describe ;;\n\
+                       --sweep-workdirs)\n\
+                         if (( $# == 1 )); then kind=periodic-sweep; else kind=scoped-sweep; fi ;;\n\
+                       *) kind=server ;;\n\
+                     esac\n\
+                     {invocation}\
+                     if [[ $kind == server ]]; then\n\
+                       printf '%s %s\\n' \"$BASHPID\" \"${{fields[19]}}\" > {server_identity}\n\
+                       while [[ ! -f {server_release} ]]; do\n\
+                         (( SECONDS < {lifetime} )) || exit 124\n\
+                         /bin/sleep 0.02\n\
+                       done\n\
+                     fi\n\
+                     if [[ $kind != periodic-sweep ]]; then exec {} \"$@\"; fi\n\
+                     {hold}",
+                    shell_quote(&binary),
+                ),
+            )
+        }
+    };
+    let wrapper = home.join(name);
+    write_executable(&wrapper, &script)?;
+    Ok(wrapper)
+}
+
+fn read_background_identity(path: &Path) -> TestResult<Option<OwnedProcess>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // An unfinished marker is retried; PID reuse is rejected after parsing.
+    let fields: Vec<_> = text.split_whitespace().collect();
+    if fields.len() != 2 || !text.ends_with('\n') {
+        return Ok(None);
+    }
+    let pid: i32 = fields[0].parse()?;
+    let birth: u64 = fields[1].parse()?;
+    let process = OwnedProcess::read(pid)?;
+    assert_eq!(process.starttime, birth, "helper identity changed: {text}");
+    Ok(Some(process))
+}
+
+fn assert_background_process_running(process: &OwnedProcess) -> TestResult<procfs::process::Stat> {
+    let stat = process
+        .stat()
+        .ok_or_else(|| io::Error::other(format!("background process exited: {process:?}")))?;
+    assert!(
+        !matches!(stat.state, 'Z' | 'X' | 'T' | 't'),
+        "background process is not running: {process:?}, state={}",
+        stat.state
+    );
+    Ok(stat)
+}
+
+fn background_process_receipt(process: &OwnedProcess) -> Value {
+    let stat = process.stat();
+    let argv = stat.as_ref().and_then(|_| {
+        std::fs::read(format!("/proc/{}/cmdline", process.pid))
+            .ok()
+            .map(|bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                    .collect::<Vec<_>>()
+            })
+    });
+    json!({
+        "pid": process.pid,
+        "starttime": process.starttime,
+        "comm": process.comm,
+        "present": stat.is_some(),
+        "ppid": stat.as_ref().map(|stat| stat.ppid),
+        "sid": stat.as_ref().map(|stat| stat.session),
+        "pgrp": stat.as_ref().map(|stat| stat.pgrp),
+        "state": stat.as_ref().map(|stat| stat.state.to_string()),
+        "argv": argv,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -522,6 +719,278 @@ impl Connection {
             command.env("KWIN_MCP_BINARY", recording_server(&home.0)?);
         }
         Self::connect(home, command, launcher, Endpoint::Shim)
+    }
+
+    fn start_background(case: BackgroundCase) -> TestResult<(Self, Instant)> {
+        let home = PrivateHome::create()?;
+        let wrapper = background_scripts(&home.0, case)?;
+        let mut command = shim_command(&home.0);
+        // Even a delegated final sweep sees only the private CLI fixture root.
+        command.env("TMPDIR", &home.1);
+        match case {
+            BackgroundCase::Cargo => {
+                let repo = home.0.join(WATCHED_PROJECT);
+                std::fs::create_dir_all(repo.join("src"))?;
+                let manifest = repo.join("Cargo.toml");
+                let source = repo.join("src/main.rs");
+                std::fs::write(
+                    &manifest,
+                    "[package]\nname = \"shutdown-watch-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
+                )?;
+                std::fs::write(&source, "fn main() {}\n")?;
+                // Suppress a startup build; mutate this source after initialize.
+                for path in [&manifest, &source] {
+                    File::open(path)?.set_modified(UNIX_EPOCH + Duration::from_secs(1))?;
+                }
+                command.env("KWIN_MCP_REPO", &repo).env("CARGO", &wrapper);
+            }
+            BackgroundCase::PeriodicSweep => {
+                command.env("KWIN_MCP_BINARY", &wrapper);
+            }
+        }
+        let started = Instant::now();
+        let connection = Self::connect(home, command, false, Endpoint::Shim)?;
+        connection.record_background_receipt(case, "initialized", json!({}))?;
+        Ok((connection, started))
+    }
+
+    fn record_background_receipt(
+        &self,
+        case: BackgroundCase,
+        event: &str,
+        details: Value,
+    ) -> TestResult {
+        let repo = self.home.0.join(WATCHED_PROJECT);
+        let receipt = json!({
+            "case": case.name(),
+            "event": event,
+            "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            "shim_pid": self.shim,
+            "shim_binary": shim_binary(),
+            "shim_argv": ["--autoclean", "--no-viewer"],
+            "real_server_binary": real_server_binary(),
+            "wrapper": self.home.0.join(match case {
+                BackgroundCase::Cargo => CONTROLLED_CARGO,
+                BackgroundCase::PeriodicSweep => PERIODIC_SWEEP_SERVER,
+            }),
+            "private_home": self.home.0,
+            "tmpdir": self.home.1,
+            "watched_project": repo,
+            "watched_manifest": std::fs::read_to_string(repo.join("Cargo.toml")).ok(),
+            "watched_source": std::fs::read_to_string(repo.join("src/main.rs")).ok(),
+            "helper_lifetime_ms": BACKGROUND_HELPER_LIFETIME.as_millis(),
+            "shutdown_bound_ms": BACKGROUND_EXIT_WAIT.as_millis(),
+            "stdin_retained": self.input.is_some(),
+            "stdout_retained": self.output.is_some(),
+            "invocations": std::fs::read_to_string(self.home.0.join(BACKGROUND_INVOCATIONS)).ok(),
+            "helper_identity": std::fs::read_to_string(self.home.0.join(BACKGROUND_HELPER)).ok(),
+            "descendant_identity": std::fs::read_to_string(self.home.0.join(BACKGROUND_DESCENDANT)).ok(),
+            "processes": self.recorded_tree().iter().map(background_process_receipt).collect::<Vec<_>>(),
+            "details": details,
+        });
+        let mut output = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.home.0.join(BACKGROUND_RECEIPTS))?;
+        writeln!(output, "{receipt}")?;
+        output.flush()?;
+        eprintln!("background shutdown receipt: {receipt}");
+        self.retain_proof()
+    }
+
+    fn background_helpers(&mut self) -> TestResult<(OwnedProcess, OwnedProcess)> {
+        let deadline = Instant::now() + BACKGROUND_READY_WAIT;
+        loop {
+            // Capture ancestry before consulting a marker. The marker alone
+            // never grants signaling or cleanup ownership of a PID.
+            self.processes.capture_tree()?;
+            let helper = read_background_identity(&self.home.0.join(BACKGROUND_HELPER))?;
+            let descendant = read_background_identity(&self.home.0.join(BACKGROUND_DESCENDANT))?;
+            if let (Some(helper), Some(descendant)) = (helper, descendant) {
+                self.processes.capture_tree()?;
+                for process in [&helper, &descendant] {
+                    assert!(
+                        self.processes
+                            .owned
+                            .get(&process.pid)
+                            .is_some_and(|owned| owned.starttime == process.starttime),
+                        "marker does not match a captured owned process: {process:?}"
+                    );
+                }
+                let helper_stat = assert_background_process_running(&helper)?;
+                let descendant_stat = assert_background_process_running(&descendant)?;
+                assert_eq!(helper_stat.ppid, self.shim, "shim launched its helper");
+                assert_eq!(descendant_stat.ppid, helper.pid, "helper owns descendant");
+                assert_eq!(descendant_stat.session, descendant.pid, "setsid succeeded");
+                assert_ne!(descendant_stat.session, helper_stat.session);
+                // Both scripts spawn their bounded sleep before their marker.
+                let leases_ready = [&helper, &descendant].iter().all(|parent| {
+                    self.processes.owned.values().any(|process| {
+                        process.stat().is_some_and(|stat| {
+                            stat.comm == "sleep"
+                                && stat.ppid == parent.pid
+                                && !matches!(stat.state, 'Z' | 'X')
+                        })
+                    })
+                });
+                if !leases_ready {
+                    assert!(Instant::now() < deadline, "bounded leases did not start");
+                    thread::sleep(POLL_PAUSE);
+                    continue;
+                }
+                let status = std::fs::read_to_string(format!("/proc/{}/status", descendant.pid))?;
+                let ignored = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigIgn:\t"))
+                    .ok_or_else(|| io::Error::other("descendant has no ignored-signal mask"))?;
+                let ignored = u64::from_str_radix(ignored.trim(), 16)?;
+                let term_bit = u32::try_from(nix::libc::SIGTERM - 1)?;
+                assert_ne!(
+                    ignored & (1u64 << term_bit),
+                    0,
+                    "descendant must ignore TERM"
+                );
+                descendant.signal(Signal::SIGTERM)?;
+                assert_background_process_running(&descendant)?;
+                return Ok((helper, descendant));
+            }
+            assert!(
+                self.processes.child.try_wait()?.is_none(),
+                "shim exited before its background helper was ready: {}",
+                self.log()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "background helper did not become ready: {}",
+                self.log()
+            );
+            thread::sleep(POLL_PAUSE);
+        }
+    }
+
+    fn release_background_server(&mut self, case: BackgroundCase) -> TestResult<OwnedProcess> {
+        let deadline = Instant::now() + BACKGROUND_READY_WAIT;
+        loop {
+            self.processes.capture_tree()?;
+            if let Some(server) = read_background_identity(&self.home.0.join(BACKGROUND_SERVER))? {
+                self.processes.capture_tree()?;
+                assert!(
+                    self.processes
+                        .owned
+                        .get(&server.pid)
+                        .is_some_and(|owned| owned.starttime == server.starttime),
+                    "normal stdio server wrapper is not in the captured owned tree"
+                );
+                let stat = assert_background_process_running(&server)?;
+                assert_eq!(stat.ppid, self.shim);
+                assert_eq!(stat.session, server.pid);
+                self.record_background_receipt(
+                    case,
+                    "server-captured-before-delegation",
+                    json!({"server":background_process_receipt(&server)}),
+                )?;
+                std::fs::write(self.home.0.join(BACKGROUND_SERVER_RELEASE), b"delegate\n")?;
+                return Ok(server);
+            }
+            assert!(
+                self.processes.child.try_wait()?.is_none(),
+                "shim exited before its server"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "normal stdio server wrapper did not start"
+            );
+            thread::sleep(POLL_PAUSE);
+        }
+    }
+
+    fn assert_background_shutdown(
+        &mut self,
+        case: BackgroundCase,
+        started: Instant,
+        helper: &OwnedProcess,
+        descendant: &OwnedProcess,
+    ) -> TestResult {
+        self.processes.capture_tree()?;
+        let recorded = self.recorded_tree();
+        let recorded_before_eof: Vec<_> = recorded.iter().map(background_process_receipt).collect();
+        assert!(
+            !recorded
+                .iter()
+                .any(|process| process.comm == "kwin_wayland"),
+            "background fixture started a desktop"
+        );
+        self.record_background_receipt(
+            case,
+            "before-eof",
+            json!({
+                "helper": background_process_receipt(helper),
+                "term_resistant_descendant": background_process_receipt(descendant),
+                "fixture_elapsed_ms": started.elapsed().as_millis(),
+            }),
+        )?;
+        // Proof copying can take time. Check liveness and the TTL margin again
+        // immediately before dropping the only stdin writer.
+        assert!(self.input.is_some());
+        assert!(self.processes.child.try_wait()?.is_none());
+        assert_background_process_running(helper)?;
+        assert_background_process_running(descendant)?;
+        assert_absent(&self.home.0.join(BACKGROUND_EXPIRED))?;
+        assert!(
+            started.elapsed() + BACKGROUND_EXIT_WAIT < BACKGROUND_HELPER_LIFETIME,
+            "fixture has insufficient time left before its helper lifetime"
+        );
+        let disconnected = Instant::now();
+        self.disconnect_input();
+        let status = self.processes.wait_for_child(BACKGROUND_EXIT_WAIT)?;
+        let elapsed = disconnected.elapsed();
+        // Check identities before remaining(), reap(), or guard cleanup can
+        // hide a leaked process or an adopted zombie. There is no cleanup wait.
+        let survivors: Vec<_> = self
+            .recorded_tree()
+            .iter()
+            .filter_map(|process| process.stat().map(|_| background_process_receipt(process)))
+            .collect();
+        let fixture_elapsed = started.elapsed();
+        self.record_background_receipt(
+            case,
+            "shim-exit",
+            json!({
+                "exit_status": status.to_string(),
+                "exit_success": status.success(),
+                "elapsed_ms": elapsed.as_millis(),
+                "fixture_elapsed_ms": fixture_elapsed.as_millis(),
+                "recorded_before_eof": recorded_before_eof,
+                "survivors_at_exit": survivors,
+                "helper_lifetime_expired": self.home.0.join(BACKGROUND_EXPIRED).try_exists()?,
+            }),
+        )?;
+        assert!(status.success(), "shim failed: {status}\n{}", self.log());
+        assert!(
+            elapsed < BACKGROUND_EXIT_WAIT,
+            "shutdown exceeded its bound"
+        );
+        assert!(
+            fixture_elapsed < BACKGROUND_HELPER_LIFETIME,
+            "helper lifetime cannot count as shutdown cleanup"
+        );
+        assert_absent(&self.home.0.join(BACKGROUND_EXPIRED))?;
+        assert!(
+            survivors.is_empty(),
+            "background identities survived shim exit: {survivors:?}\n{}",
+            self.log()
+        );
+        assert!(
+            self.output.is_some(),
+            "test must retain stdout at shim exit"
+        );
+        eprintln!(
+            "background_eof: case={} shim_pid={} helper={helper:?} term_resistant={descendant:?} elapsed_ms={} identities_absent_at_exit=true helper_lifetime_expired=false stdout_retained=true",
+            case.name(),
+            self.shim,
+            elapsed.as_millis()
+        );
+        Ok(())
     }
 
     fn start_ttl(endpoint: Endpoint) -> TestResult<Self> {
@@ -1036,6 +1505,10 @@ impl Connection {
     ) -> TestResult<Value> {
         let deadline = deadline.min(Instant::now() + RESPONSE_WAIT);
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
+        self.response_until(id, deadline)
+    }
+
+    fn response_until(&mut self, id: u64, deadline: Instant) -> TestResult<Value> {
         let mut next_proof = Instant::now();
         loop {
             if std::env::var_os(PROOF_DIR_ENV).is_some() && Instant::now() >= next_proof {
@@ -1121,6 +1594,146 @@ impl Drop for Connection {
         self.output.take();
         // Field order drops the process guard before the private HOME.
     }
+}
+
+#[test]
+fn stdin_eof_drains_running_cargo_wrapper_and_its_descendants() -> TestResult {
+    let case = BackgroundCase::Cargo;
+    let (mut connection, started) = Connection::start_background(case)?;
+    let source = connection.home.0.join(WATCHED_PROJECT).join("src/main.rs");
+    std::fs::write(&source, "fn main() { /* trigger the private watcher */ }\n")?;
+    File::open(&source)?.set_modified(SystemTime::now())?;
+    connection.record_background_receipt(
+        case,
+        "private-source-changed",
+        json!({"source":source}),
+    )?;
+    let (helper, descendant) = connection.background_helpers()?;
+    let process = procfs::process::Process::new(helper.pid)?;
+    assert_eq!(process.cwd()?, connection.home.0.join(WATCHED_PROJECT));
+    let argv = process.cmdline()?;
+    let build = argv
+        .iter()
+        .position(|argument| argument == "build")
+        .ok_or_else(|| io::Error::other(format!("watcher did not invoke cargo build: {argv:?}")))?;
+    assert!(
+        argv[build..] == ["build"] || argv[build..] == ["build", "--release"],
+        "unexpected controlled CARGO arguments: {argv:?}"
+    );
+    assert!(
+        argv.iter().any(|argument| {
+            argument
+                == &connection
+                    .home
+                    .0
+                    .join(CONTROLLED_CARGO)
+                    .display()
+                    .to_string()
+        }),
+        "watcher did not use the controlled CARGO path: {argv:?}"
+    );
+    assert!(
+        connection
+            .log()
+            .contains("source changed; running cargo build"),
+        "watcher did not report its real build invocation: {}",
+        connection.log()
+    );
+    connection.assert_background_shutdown(case, started, &helper, &descendant)
+}
+
+#[test]
+fn stdin_eof_drains_unscoped_periodic_sweep_and_its_descendants() -> TestResult {
+    let case = BackgroundCase::PeriodicSweep;
+    let (mut connection, started) = Connection::start_background(case)?;
+    let response_deadline = Instant::now() + RESPONSE_WAIT;
+    connection.send(json!({
+        "jsonrpc":"2.0", "id":2, "method":"tools/call",
+        "params":{"name":"session_stop","arguments":{}}
+    }))?;
+    let server = connection.release_background_server(case)?;
+    let stopped = connection.response_until(2, response_deadline)?;
+    connection.record_background_receipt(
+        case,
+        "unbound-stop-response",
+        json!({"response":stopped}),
+    )?;
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    assert_ne!(stopped["result"]["isError"], true, "{stopped}");
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "none",
+        "{stopped}"
+    );
+    let (helper, descendant) = connection.background_helpers()?;
+    let argv = procfs::process::Process::new(helper.pid)?.cmdline()?;
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("--sweep-workdirs"),
+        "periodic sweep must have no owner arguments: {argv:?}"
+    );
+    assert_eq!(
+        argv.iter()
+            .filter(|argument| *argument == "--sweep-workdirs")
+            .count(),
+        1,
+        "{argv:?}"
+    );
+    let invocations = std::fs::read_to_string(connection.home.0.join(BACKGROUND_INVOCATIONS))?;
+    let servers: Vec<_> = invocations
+        .lines()
+        .filter(|line| line.starts_with("server "))
+        .collect();
+    assert_eq!(
+        servers.len(),
+        1,
+        "stop must create one real server: {invocations}"
+    );
+    let fields: Vec<_> = servers[0].split_whitespace().collect();
+    let pid: i32 = fields[1].parse()?;
+    let birth: u64 = fields[2].parse()?;
+    assert_eq!(server.pid, pid);
+    assert_eq!(server.starttime, birth);
+    assert!(
+        server.stat().is_none(),
+        "unbound stop did not retire its real server: {server:?}"
+    );
+    assert!(connection.log().contains(&format!("child {pid} exited (")));
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("describe ")),
+        "metadata was not delegated: {invocations}"
+    );
+    connection.assert_background_shutdown(case, started, &helper, &descendant)?;
+    let final_invocations =
+        std::fs::read_to_string(connection.home.0.join(BACKGROUND_INVOCATIONS))?;
+    let scoped: Vec<_> = final_invocations
+        .lines()
+        .filter(|line| line.starts_with("scoped-sweep "))
+        .collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "final sweep was not delegated: {final_invocations}"
+    );
+    assert!(
+        scoped[0]
+            .split_whitespace()
+            .any(|argument| argument == pid.to_string()),
+        "final sweep did not select the retired server: {final_invocations}"
+    );
+    assert_eq!(
+        final_invocations
+            .lines()
+            .filter(|line| line.starts_with("periodic-sweep "))
+            .count(),
+        1
+    );
+    connection.record_background_receipt(
+        case,
+        "scoped-final-sweep-delegated",
+        json!({"owner_pid":pid}),
+    )
 }
 
 #[test]

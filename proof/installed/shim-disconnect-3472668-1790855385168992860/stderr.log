@@ -1,0 +1,3 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/kwin-mcp/target/release/kwin-mcp; hot reload watching the binary only
+kwin-mcp-shim: client output closed; stopping children
+kwin-mcp-shim: client closed; stopping children

@@ -1,0 +1,3 @@
+background invocation kind=cargo pid=3472070 birth=34105599 argc=2
+background helper kind=cargo pid=3472070 birth=34105599 descendant=3472073 lease=3472072 lifetime_s=180
+background descendant pid=3472073 birth=34105602 lease=3472075 lifetime_s=180

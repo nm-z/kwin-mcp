@@ -1,0 +1,3 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/kwin-mcp/target/release/kwin-mcp; hot reload watching /home/nate/builds/kwin-mcp-background/proof-home/shim-disconnect-3471994-1790855334842287391/watched-project
+kwin-mcp-shim: source changed; running cargo build in /home/nate/builds/kwin-mcp-background/proof-home/shim-disconnect-3471994-1790855334842287391/watched-project (log: /home/nate/builds/kwin-mcp-background/proof-home/shim-disconnect-3471994-1790855334842287391/.cache/kwin-mcp-shim/build.log)
+kwin-mcp-shim: client closed; stopping children

@@ -1,0 +1,3 @@
+describe 3472120 34105875 cwd=/home/nate argc=3 argv= --describe --autoclean --no-viewer
+server 3472125 34105899 cwd=/home/nate argc=2 argv= --autoclean --no-viewer
+periodic-sweep 3472219 34106234 cwd=/home/nate argc=1 argv= --sweep-workdirs
