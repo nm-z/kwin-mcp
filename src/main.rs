@@ -286,6 +286,7 @@ mod fuse_bridge {
         Ok(())
     }
 }
+mod host_environment;
 mod input_bridge;
 mod kwin_script {
     use std::io::Write;
@@ -713,11 +714,8 @@ mod wallet_mediator {
     }
 
     impl HostSlot {
-        async fn take() -> Result<Self, String> {
-            let directory = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(std::path::PathBuf::from)
-                .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?
-                .join("kwin-mcp");
+        async fn take(runtime: &std::path::Path) -> Result<Self, String> {
+            let directory = runtime.join("kwin-mcp");
             std::fs::create_dir_all(&directory)
                 .map_err(|error| format!("create {}: {error}", directory.display()))?;
             let path = directory.join("wallet-snapshot.lock");
@@ -805,9 +803,9 @@ mod wallet_mediator {
     }
 
     /// Take the one read-only snapshot of the host wallet, or say why not.
-    pub async fn snapshot(host: &zbus::Connection) -> Snapshot {
+    pub async fn snapshot(host: &zbus::Connection, runtime: &std::path::Path) -> Snapshot {
         let guarded = async {
-            let slot = HostSlot::take().await?;
+            let slot = HostSlot::take(runtime).await?;
             let outcome = snapshot_locked(host, &slot).await;
             drop(slot);
             Ok::<_, String>(outcome)
@@ -3218,9 +3216,9 @@ struct OverlayPlan {
     /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
     sqlite_binds: Vec<PathBuf>,
     sqlite_blocked_sockets: Vec<PathBuf>,
+    graphical_socket_paths: Vec<PathBuf>,
     socket_links: SocketLinks,
-    /// The host user runtime directory, when sockets from it are exposed. Its
-    /// secret-bearing entries (HOST_SECRET_ENTRIES) are masked in the session.
+    /// Runtime parent aliases keep secret-bearing entries masked.
     host_runtime: Option<PathBuf>,
     /// Directories the session sees as empty tmpfs; the host copies stay hidden.
     empty_dirs: Vec<PathBuf>,
@@ -3307,6 +3305,23 @@ impl OverlayPlan {
                 .arg("--ro-bind")
                 .arg(source)
                 .arg(&destination);
+            // Preserve same-name daemon replacement without opening a path
+            // around the HOME and graphical-socket masks elsewhere in the plan.
+            for hidden in &self.empty_dirs {
+                if let Ok(relative) = hidden.strip_prefix(source) {
+                    command.arg("--tmpfs").arg(destination.join(relative));
+                }
+            }
+            for socket in &self.graphical_socket_paths {
+                if let Ok(relative) = socket.strip_prefix(source)
+                    && std::fs::symlink_metadata(socket).is_ok()
+                {
+                    command
+                        .arg("--ro-bind")
+                        .arg("/dev/null")
+                        .arg(destination.join(relative));
+                }
+            }
             if self
                 .host_runtime
                 .as_ref()
@@ -3342,6 +3357,16 @@ impl OverlayPlan {
         let current_uid = procfs::process::Process::myself()?.uid()?;
         self.host_runtime = Some(canonical_runtime.clone());
         let socket_inventory = procfs::net::unix()?;
+        self.graphical_socket_paths = socket_inventory
+            .iter()
+            .filter_map(|entry| {
+                if inventory.graphical_sockets.contains(&entry.inode) {
+                    entry.path.clone().filter(|path| path.is_absolute())
+                } else {
+                    None
+                }
+            })
+            .collect();
         self.sqlite_blocked_sockets = socket_inventory
             .iter()
             // Read-only socket mounts still permit IPC. Data aliases must not
@@ -3452,8 +3477,6 @@ struct HostProcessInventory {
 
 /// Read descriptors once for both graphical socket isolation and live WAL files.
 fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory> {
-    let host_display = std::env::var_os("DISPLAY");
-    let host_wayland = std::env::var_os("WAYLAND_DISPLAY");
     let mut graphical = std::collections::HashSet::new();
     let mut databases = Vec::new();
     let uid = procfs::process::Process::myself()?.uid()?;
@@ -3465,12 +3488,16 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
         let environment = process.environ().unwrap_or_default();
         let cgroup =
             std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
-        let display_attached = host_display
-            .as_ref()
-            .is_some_and(|value| environment.get(std::ffi::OsStr::new("DISPLAY")) == Some(value))
-            || host_wayland.as_ref().is_some_and(|value| {
-                environment.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")) == Some(value)
-            });
+        // Connector processes may lack desktop variables. Classify the socket
+        // owner from its own environment rather than matching the server's.
+        let display_attached =
+            ["DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+                .iter()
+                .any(|name| {
+                    environment
+                        .get(std::ffi::OsStr::new(name))
+                        .is_some_and(|value| !value.is_empty())
+                });
         let desktop_scope = cgroup.contains("/session.slice/")
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
         let descriptors: Vec<procfs::process::FDInfo> =
@@ -3720,6 +3747,7 @@ fn prepare_overlay_plan(
             socket_binds: Vec::new(),
             sqlite_binds: Vec::new(),
             sqlite_blocked_sockets: Vec::new(),
+            graphical_socket_paths: Vec::new(),
             socket_links: SocketLinks::default(),
             host_runtime: None,
             empty_dirs: Vec::new(),
@@ -3773,6 +3801,7 @@ fn prepare_overlay_plan(
         socket_binds: Vec::new(),
         sqlite_binds: Vec::new(),
         sqlite_blocked_sockets: Vec::new(),
+        graphical_socket_paths: Vec::new(),
         socket_links: SocketLinks::default(),
         host_runtime: None,
         empty_dirs: Vec::new(),
@@ -6957,11 +6986,8 @@ struct WindowActivateParams {
 // ── Tool implementations ────────────────────────────────────────────────
 
 fn session_start_log_path() -> Option<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    if runtime.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(runtime).join("kwin-mcp/session-starts.log"))
+    let runtime = host_environment::runtime_dir().ok()?;
+    Some(runtime.join("kwin-mcp/session-starts.log"))
 }
 
 fn append_session_start_outcome(
@@ -7232,6 +7258,12 @@ impl KwinMcp {
             env!("GIT_HASH")
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
+        // Validate inherited overrides and resolve the login runtime before
+        // creating workdirs or spawning any sandbox/proxy children.
+        let host_runtime = host_environment::runtime_dir()
+            .map_err(|error| ver_err(format!("host runtime environment: {error:#}")))?;
+        let host_session_bus = host_environment::session_bus_address(&host_runtime)
+            .map_err(|error| ver_err(format!("host session bus environment: {error:#}")))?;
         // Resolve the virtual display size: tool params > CLI flags > compiled
         // defaults — unless --no-override locked it at the CLI/compiled value.
         let (screen_w, screen_h) = if self.display.locked {
@@ -7359,9 +7391,6 @@ impl KwinMcp {
                 )));
             }
         }
-        let host_runtime = std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .map_err(|error| ver_err(format!("host runtime directory: {error}")))?;
         // Mount, socket, and /proc scans can block in the kernel on a hung
         // FUSE or network mount, or on a process stuck in D state. Run them on
         // a blocking thread so the hard limit can still answer; the handle
@@ -7372,11 +7401,12 @@ impl KwinMcp {
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
         let view_service = self.clone();
+        let view_runtime = host_runtime.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let _ = view_tx.send(prepare_host_view(
                 &view_target,
                 &view_xdg,
-                &host_runtime,
+                &view_runtime,
                 &writable_paths,
                 &view_service,
             ));
@@ -7543,12 +7573,6 @@ impl KwinMcp {
             }
             Err(error) => return cleanup_err(format!("system D-Bus proxy: {error:#}"), &mut startup),
         }
-        let host_session_bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-            Ok(address) => address,
-            Err(error) => {
-                return cleanup_err(format!("host session D-Bus address: {error}"), &mut startup);
-            }
-        };
         // Session apps reach KWallet through a session-local service on a private
         // bus (see wallet_mediator): a one-time guarded snapshot of the host
         // wallet, then answers from memory; the host is never contacted again.
@@ -7596,7 +7620,7 @@ impl KwinMcp {
         // The one and only host contact: a guarded read-only snapshot. The
         // session is then served from memory and never reaches the host wallet.
         let wallet_snapshot = match host_bus {
-            Ok(host_bus) => wallet_mediator::snapshot(&host_bus).await,
+            Ok(host_bus) => wallet_mediator::snapshot(&host_bus, &host_runtime).await,
             Err(error) => wallet_mediator::Snapshot {
                 wallet: None,
                 reason: format!("host session bus unavailable: {error}"),
