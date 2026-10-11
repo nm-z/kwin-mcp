@@ -13,12 +13,11 @@ kwin-mcp-deploy build /absolute/clean/checkout /absolute/new/package
 The source must have a clean, committed HEAD. The command probes **sentry** and
 **archy** concurrently, samples aggregate CPU use for one second, and selects the
 lowest use eligible host (ties choose archy). Unreachable hosts or hosts lacking
-Cargo, librsvg or libpipewire are skipped. **engi never compiles** and **benji is
+Cargo, librsvg or libpipewire are skipped. **engi is excluded by default** and **benji is
 not a builder**. There is no build slot limit or dependency on `dsh build`.
 
 Use `KWIN_MCP_DEPLOY_BUILD_HOSTS=archy` to restrict eligible hosts during a
-maintenance hold. The override accepts only sentry/archy; it cannot enable engi
-or benji builds. Use `KWIN_MCP_DEPLOY_BUILD_ROOT=/tmp/kwin-build-your-name`
+maintenance hold. The override accepts only sentry/archy/engi; it cannot enable benji builds. Use `KWIN_MCP_DEPLOY_BUILD_ROOT=/tmp/kwin-build-your-name`
 to put the unique run directories on another filesystem. Check storage and memory
 before selecting a tmpfs root. For example:
 
@@ -27,6 +26,13 @@ KWIN_MCP_DEPLOY_BUILD_HOSTS=archy \
 KWIN_MCP_DEPLOY_BUILD_ROOT=/tmp/kwin-build-review-248 \
 CARGO_BUILD_JOBS=2 kwin-mcp-deploy build /absolute/checkout /absolute/new/package
 ```
+
+When host policy explicitly permits engi builds, select
+`KWIN_MCP_DEPLOY_BUILD_HOSTS='engi archy'` and a private home build root, such as
+`/home/nate/work/kwin-build-review-248`. Engi builds always invoke Cargo at
+`nice -n 19`; compiler children inherit that priority. Maintenance holds are
+expressed by the operator's host list. Choose jobs and storage using current
+aggregate memory and disk availability, and keep one own compile active.
 
 A Git bundle transfers the exact commit without requiring it to be pushed.
 Each run owns `~/builds/kwin-mcp-deploy/<unique-id>/source`, its separate `target`,

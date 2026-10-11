@@ -245,7 +245,7 @@ Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
 
 The shipped `kwin-mcp-deploy` CLI builds committed source on the least busy eligible
 sentry/archy host, stages checksummed release packages, and explicitly installs
-new release directories on engi, archy or benji. engi never compiles; unreachable
+new release directories on engi, archy or benji. Engi builds require an explicit\nhost override and always use nice 19; unreachable
 benji is skipped. No command activates a release or restarts services. Packages
 include optional OAuth gateway and Cloudflare tunnel user unit templates; the
 gateway executable and credentials are external prerequisites.

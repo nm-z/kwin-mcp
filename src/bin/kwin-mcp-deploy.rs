@@ -14,7 +14,8 @@ const BINARIES: &[&str] = &[
     "kwin-viewer",
     "kwin-mcp-deploy",
 ];
-const BUILD_HOSTS: &[&str] = &["sentry", "archy"];
+const BUILD_HOSTS: &[&str] = &["sentry", "archy", "engi"];
+const DEFAULT_BUILD_HOSTS: &str = "sentry archy";
 const INSTALL_HOSTS: &[&str] = &["engi", "archy", "benji"];
 const USAGE: &str = "kwin-mcp-deploy: build, package and explicitly install a release
 
@@ -24,7 +25,8 @@ Commands:
   inspect PACKAGE_DIR  Verify a package without installing anything
   install PACKAGE_DIR HOST NEW_ABSOLUTE_RELEASE_DIR  Install an immutable release
 
-Build hosts: sentry, archy. Install hosts: engi, archy, benji.
+Default build hosts: sentry, archy. Engi requires an explicit build-host override
+and always compiles at nice 19. Install hosts: engi, archy, benji.
 Unreachable build hosts are skipped; an unreachable benji install is skipped.
 Existing package/release destinations are rejected. Install never changes a live
 symlink, restarts a service, or enables units. Select a private path for evidence.
@@ -169,10 +171,10 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     git.arg("-C").arg(&source).args(["rev-parse", "HEAD"]);
     let commit = String::from_utf8(checked(git)?.stdout)?.trim().to_owned();
     let requested_hosts =
-        env::var("KWIN_MCP_DEPLOY_BUILD_HOSTS").unwrap_or_else(|_| BUILD_HOSTS.join(" "));
+        env::var("KWIN_MCP_DEPLOY_BUILD_HOSTS").unwrap_or_else(|_| DEFAULT_BUILD_HOSTS.to_owned());
     let hosts: Vec<_> = requested_hosts.split_whitespace().collect();
     if hosts.is_empty() || hosts.iter().any(|host| !BUILD_HOSTS.contains(host)) {
-        return Err("KWIN_MCP_DEPLOY_BUILD_HOSTS accepts only sentry and archy".into());
+        return Err("KWIN_MCP_DEPLOY_BUILD_HOSTS accepts only sentry, archy and engi".into());
     }
     let build_root = env::var("KWIN_MCP_DEPLOY_BUILD_ROOT")
         .unwrap_or_else(|_| "builds/kwin-mcp-deploy".to_owned());
@@ -206,6 +208,7 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     }
     candidates.sort_unstable();
     let (_, host) = candidates.first().ok_or("no eligible build host")?;
+    let priority = if host == "engi" { "nice -n 19 " } else { "" };
     let run = format!("{build_root}/{}", nonce()?);
     let temporary = env::temp_dir().join(format!("kwin-mcp-deploy-{}", nonce()?));
     fs::create_dir(&temporary)?;
@@ -229,7 +232,7 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
         ))?;
         copy_remote(host, &bundle, &format!("{run}/source.bundle"))?;
         let script = format!(
-            "set -eu; cd {}; git clone -q source.bundle source; cd source; git checkout -q --detach {}; export CARGO_TARGET_DIR=\"$PWD/../target\"; {jobs}cargo build --locked --release --bins > ../build.log 2>&1 || {{ cat ../build.log >&2; exit 1; }}; cat ../build.log",
+            "set -eu; cd {}; git clone -q source.bundle source; cd source; git checkout -q --detach {}; export CARGO_TARGET_DIR=\"$PWD/../target\"; {jobs}{priority}cargo build --locked --release --bins > ../build.log 2>&1 || {{ cat ../build.log >&2; exit 1; }}; cat ../build.log",
             quote(&run),
             quote(&commit)
         );
