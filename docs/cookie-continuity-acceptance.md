@@ -3,6 +3,25 @@
 PR #257 stays draft until lead review. Its candidate tests do not satisfy this
 acceptance gate, and passing fewer than fourteen elapsed days does not close #245.
 
+## Deletion and expiration semantics
+
+The complete startup jar is retained privately as the session's baseline. If a
+cookie identity present in that baseline is missing when the session stops, a
+private tombstone suppresses that baseline `last_update_utc` and older versions.
+This prevents the frozen host jar or a stale concurrent session from restoring
+the removed row. A cookie with a newer update timestamp wins regardless of stop
+order. Absence alone cannot establish when an unseen concurrent update occurred,
+so tombstones target observed versions instead of assigning a guessed deletion
+timestamp. Tombstones use the complete unique cookie identity, including partition,
+scheme, and port fields, and are published before the saved jar is replaced.
+
+Expired rows with `has_expires` set and an elapsed `expires_utc` are removed during
+restore and save; session-only cookies are retained. A database schema mismatch
+does not trigger a guessed migration. Startup preserves a valid private host
+snapshot if the saved schema is incompatible, while save preserves the prior
+stored jar and reports the incompatibility. Non-cookie SQLite databases inside a
+browser configuration remain private and are skipped by the continuity store.
+
 ## Required observations
 
 Use an immutable, reviewed candidate binary in a private evidence directory on
@@ -23,8 +42,9 @@ Run three times daily, including weekends, for at least fourteen elapsed days.
 Proposed Pacific observation times are 07:30, 15:30, and 23:30. Record actual times;
 a missing run is a missing observation, not a passing result. The final observation
 must occur at least fourteen days after the initial authenticated observation.
-The assigned deadline is October 24, 2026 at 23:30 Pacific. Meeting it therefore
-requires the initial authenticated observation by October 10 at 23:30 Pacific.
+Nate authorized the revised deadline of October 25, 2026 at 03:00 Pacific.
+Meeting it requires the initial authenticated observation by October 11 at 03:00
+Pacific, followed by a final observation at least fourteen elapsed days later.
 If this is not possible, report the deadline risk to kwin-lead without changing it.
 
 ## Preconditions and handoffs

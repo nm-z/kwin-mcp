@@ -3805,7 +3805,11 @@ const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favi
 fn prepare_browser_cookies(
     plan: &mut OverlayPlan,
     target: &Path,
+    baseline_root: &Path,
 ) -> anyhow::Result<Vec<kwin_mcp::browser_cookies::CookieRoot>> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(baseline_root)?;
+    std::fs::set_permissions(baseline_root, std::fs::Permissions::from_mode(0o700))?;
     let state = kwin_mcp::browser_cookies::state_root();
     if state.starts_with(target) {
         plan.empty_dirs.push(state.clone());
@@ -3814,6 +3818,7 @@ fn prepare_browser_cookies(
     for config in BROWSER_CONFIG_DIRS {
         let host = target.join(config);
         let saved = state.join(config);
+        let baseline = baseline_root.join(config);
         let mut profiles = std::collections::BTreeSet::new();
         for directory in [&host, &saved] {
             if let Ok(entries) = std::fs::read_dir(directory) {
@@ -3834,8 +3839,14 @@ fn prepare_browser_cookies(
                 }
                 let upper = upper_file(plan, &database)?;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper)
-                        .and_then(|()| kwin_mcp::browser_cookies::merge(&upper, &previous))
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                            eprintln!(
+                                "session_start: preserving host cookie schema for {}: {error:#}",
+                                database.display()
+                            );
+                        }
+                    })
                 } else {
                     kwin_mcp::browser_cookies::snapshot(&previous, &upper)
                 };
@@ -3855,6 +3866,21 @@ fn prepare_browser_cookies(
                         );
                     }
                 }
+                if !kwin_mcp::browser_cookies::supports_cookie_jar(&upper)? {
+                    eprintln!(
+                        "session_start: skipping non-cookie SQLite database {}",
+                        database.display()
+                    );
+                    continue;
+                }
+                kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                let original = baseline.join(&profile).join(name);
+                std::fs::create_dir_all(
+                    original
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
+                )?;
+                kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
             }
         }
         for overlay in &plan.overlays {
@@ -3862,11 +3888,13 @@ fn prepare_browser_cookies(
                 roots.push(kwin_mcp::browser_cookies::CookieRoot {
                     upper: overlay.upper.join(relative),
                     saved: saved.clone(),
+                    baseline: Some(baseline.clone()),
                 });
             } else if overlay.destination.starts_with(&host) {
                 roots.push(kwin_mcp::browser_cookies::CookieRoot {
                     upper: overlay.upper.clone(),
                     saved: state.join(overlay.destination.strip_prefix(target)?),
+                    baseline: Some(baseline_root.join(overlay.destination.strip_prefix(target)?)),
                 });
             }
         }
@@ -4155,7 +4183,8 @@ fn prepare_host_view(
         }
     }
     empty_session_databases(&overlay_plan, &discarded)?;
-    let cookie_roots = prepare_browser_cookies(&mut overlay_plan, target)?;
+    let cookie_roots =
+        prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);

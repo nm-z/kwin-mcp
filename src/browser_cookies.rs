@@ -39,11 +39,244 @@ fn file_version(path: &Path) -> Result<Option<FileVersion>> {
 pub struct CookieRoot {
     pub upper: PathBuf,
     pub saved: PathBuf,
+    #[serde(default)]
+    pub baseline: Option<PathBuf>,
 }
 
 struct CookieJar {
     upper: PathBuf,
     saved: PathBuf,
+    baseline: Option<PathBuf>,
+}
+
+// Chromium stores microseconds since the Windows epoch (1601-01-01).
+const WINDOWS_EPOCH_MICROSECONDS: i64 = 11_644_473_600_000_000;
+
+fn cookie_time() -> Result<i64> {
+    let elapsed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    Ok(i64::try_from(elapsed.as_micros())? + WINDOWS_EPOCH_MICROSECONDS)
+}
+
+fn columns(connection: &Connection) -> Result<Vec<String>> {
+    Ok(connection
+        .prepare("PRAGMA table_info(cookies)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn identity_columns(connection: &Connection) -> Result<Vec<String>> {
+    let indexes = connection
+        .prepare("PRAGMA index_list(cookies)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (index, unique, partial) in indexes {
+        if !unique || partial {
+            continue;
+        }
+        let keys = connection
+            .prepare(&format!("PRAGMA index_info({})", quote(&index)))?
+            .query_map([], |row| row.get::<_, Option<String>>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<Option<Vec<_>>>();
+        if let Some(keys) = keys
+            && ["host_key", "name", "path"]
+                .iter()
+                .all(|key| keys.iter().any(|name| name == key))
+        {
+            return Ok(keys);
+        }
+    }
+    anyhow::bail!("cookie identity unique index is missing")
+}
+
+/// Other SQLite files named Cookies inside a browser config are kept private,
+/// but are not cookie jars and must not enter the continuity store.
+pub fn supports_cookie_jar(database: &Path) -> Result<bool> {
+    let database = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let names = columns(&database)?;
+    Ok(["host_key", "name", "path", "last_update_utc"]
+        .iter()
+        .all(|name| names.iter().any(|column| column == name))
+        && identity_columns(&database).is_ok())
+}
+
+fn prune_expired(connection: &Connection) -> Result<()> {
+    let names = columns(connection)?;
+    if names.iter().any(|name| name == "expires_utc") {
+        let has_expiry = if names.iter().any(|name| name == "has_expires") {
+            "has_expires != 0 AND "
+        } else {
+            ""
+        };
+        connection.execute(
+            &format!("DELETE FROM cookies WHERE {has_expiry}expires_utc > 0 AND expires_utc <= ?"),
+            [cookie_time()?],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+enum CookieKey {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl From<Value> for CookieKey {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(value) => Self::Integer(value),
+            Value::Real(value) => Self::Real(value),
+            Value::Text(value) => Self::Text(value),
+            Value::Blob(value) => Self::Blob(value),
+        }
+    }
+}
+
+impl From<&CookieKey> for Value {
+    fn from(value: &CookieKey) -> Self {
+        match value {
+            CookieKey::Null => Self::Null,
+            CookieKey::Integer(value) => Self::Integer(*value),
+            CookieKey::Real(value) => Self::Real(*value),
+            CookieKey::Text(value) => Self::Text(value.clone()),
+            CookieKey::Blob(value) => Self::Blob(value.clone()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeletedCookie {
+    key: Vec<CookieKey>,
+    through: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeletedCookies {
+    columns: Vec<String>,
+    rows: Vec<DeletedCookie>,
+}
+
+fn read_deletions(saved: &Path, keys: Vec<String>) -> Result<DeletedCookies> {
+    match std::fs::read(saved.with_extension("deleted.json")) {
+        Ok(bytes) => {
+            let deleted: DeletedCookies = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                deleted.columns == keys,
+                "deleted cookie identity schema differs"
+            );
+            Ok(deleted)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeletedCookies {
+            columns: keys,
+            rows: Vec::new(),
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn apply_deleted(connection: &Connection, deleted: &DeletedCookies) -> Result<()> {
+    let predicate = deleted
+        .columns
+        .iter()
+        .map(|key| format!("{} IS ?", quote(key)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    for row in &deleted.rows {
+        let mut identity = row.key.iter().map(Value::from).collect::<Vec<_>>();
+        identity.push(Value::Integer(row.through));
+        connection.execute(
+            &format!("DELETE FROM cookies WHERE {predicate} AND last_update_utc <= ?"),
+            params_from_iter(identity),
+        )?;
+    }
+    prune_expired(connection)
+}
+
+/// Tombstones remove the baseline version that a session deleted, including
+/// old host rows and stale concurrent sessions. A newer last_update_utc wins
+/// independently of session stop order; absence cannot date an unseen update.
+pub fn apply_deletions(database: &Path, saved: &Path) -> Result<()> {
+    let database = Connection::open(database)?;
+    let deleted = read_deletions(saved, identity_columns(&database)?)?;
+    apply_deleted(&database, &deleted)
+}
+
+fn record_deletions(
+    database: &Path,
+    baseline: Option<&Path>,
+    saved: &Path,
+) -> Result<DeletedCookies> {
+    let current = Connection::open(database)?;
+    let keys = identity_columns(&current)?;
+    let mut deleted = read_deletions(saved, keys.clone())?;
+    if let Some(baseline) = baseline.filter(|path| path.is_file()) {
+        let baseline = Connection::open_with_flags(baseline, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        anyhow::ensure!(
+            identity_columns(&baseline)? == keys,
+            "baseline cookie identity schema differs"
+        );
+        let fields = keys
+            .iter()
+            .map(|key| quote(key))
+            .collect::<Vec<_>>()
+            .join(",");
+        let predicate = keys
+            .iter()
+            .map(|key| format!("{} IS ?", quote(key)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut query =
+            baseline.prepare(&format!("SELECT {fields},last_update_utc FROM cookies"))?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let values = (0..keys.len())
+                .map(|index| row.get::<_, Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let exists: bool = current.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM cookies WHERE {predicate})"),
+                params_from_iter(&values),
+                |row| row.get(0),
+            )?;
+            if !exists {
+                let key = values.into_iter().map(CookieKey::from).collect::<Vec<_>>();
+                let through = row.get(keys.len())?;
+                if let Some(existing) = deleted.rows.iter_mut().find(|row| row.key == key) {
+                    existing.through = existing.through.max(through);
+                } else {
+                    deleted.rows.push(DeletedCookie { key, through });
+                }
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+fn write_deletions(saved: &Path, deleted: &DeletedCookies) -> Result<()> {
+    use std::io::Write;
+    let destination = saved.with_extension("deleted.json");
+    let temporary = saved.with_extension("deleted.pending");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(deleted)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, destination)?;
+    Ok(())
 }
 
 pub fn state_root() -> PathBuf {
@@ -208,51 +441,15 @@ pub fn snapshot_host(source: &Path, destination: &Path) -> Result<()> {
 /// A schema mismatch preserves the destination rather than guessing a migration.
 pub fn merge(destination: &Path, source: &Path) -> Result<()> {
     if !source.is_file() {
-        return Ok(());
+        return prune_expired(&Connection::open(destination)?);
     }
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.busy_timeout(Duration::ZERO)?;
     let mut destination = Connection::open(destination)?;
     destination.busy_timeout(Duration::ZERO)?;
-    let columns = |connection: &Connection| -> Result<Vec<String>> {
-        Ok(connection
-            .prepare("PRAGMA table_info(cookies)")?
-            .query_map([], |row| row.get(1))?
-            .collect::<rusqlite::Result<_>>()?)
-    };
     let names = columns(&destination)?;
     anyhow::ensure!(names == columns(&source)?, "cookie schemas differ");
-    let indexes = destination
-        .prepare("PRAGMA index_list(cookies)")?
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-                row.get::<_, bool>(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut keys = None;
-    for (index, unique, partial) in indexes {
-        if !unique || partial {
-            continue;
-        }
-        let columns = destination
-            .prepare(&format!("PRAGMA index_info({})", quote(&index)))?
-            .query_map([], |row| row.get::<_, Option<String>>(2))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .collect::<Option<Vec<_>>>();
-        if let Some(columns) = columns
-            && ["host_key", "name", "path"]
-                .iter()
-                .all(|key| columns.iter().any(|name| name == key))
-        {
-            keys = Some(columns);
-            break;
-        }
-    }
-    let keys = keys.context("cookie identity unique index is missing")?;
+    let keys = identity_columns(&destination)?;
     let indices = keys
         .iter()
         .map(|key| {
@@ -308,7 +505,7 @@ pub fn merge(destination: &Path, source: &Path) -> Result<()> {
         }
     }
     transaction.commit()?;
-    Ok(())
+    prune_expired(&destination)
 }
 
 pub fn persist(roots: &[CookieRoot]) -> Result<()> {
@@ -326,7 +523,16 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 } else if kind.is_file() && entry.file_name() == "Cookies" {
                     let upper = entry.path();
                     let saved = root.saved.join(upper.strip_prefix(&root.upper)?);
-                    jars.push(CookieJar { upper, saved });
+                    let relative = upper.strip_prefix(&root.upper)?;
+                    let baseline = root
+                        .baseline
+                        .as_ref()
+                        .map(|baseline| baseline.join(relative));
+                    jars.push(CookieJar {
+                        upper,
+                        saved,
+                        baseline,
+                    });
                 }
             }
         }
@@ -356,6 +562,13 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     }
     let mut failures = Vec::new();
     for jar in jars.iter().filter(|jar| jar.upper.is_file()) {
+        if !supports_cookie_jar(&jar.upper)? {
+            eprintln!(
+                "teardown: skipping non-cookie SQLite database {}",
+                jar.upper.display()
+            );
+            continue;
+        }
         let temporary = jar.saved.with_extension("snapshot");
         let result = (|| -> Result<()> {
             let parent = jar.saved.parent().context("cookie state has no parent")?;
@@ -376,7 +589,12 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 .mode(0o600)
                 .open(&temporary)?;
             snapshot(&jar.upper, &temporary)?;
+            let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)?;
             merge(&temporary, &jar.saved)?;
+            apply_deleted(&Connection::open(&temporary)?, &deleted)?;
+            // Publish deletions before the jar: even a crash between renames
+            // must not restore a removed cookie from the old saved jar.
+            write_deletions(&jar.saved, &deleted)?;
             std::fs::rename(&temporary, &jar.saved)?;
             Ok(())
         })();
