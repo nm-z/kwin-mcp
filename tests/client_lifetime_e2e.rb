@@ -13,7 +13,8 @@ FileUtils.mkdir_p(evidence)
 bus = "unix:path=/run/user/#{Process.euid}/bus"
 runtime = "/run/user/#{Process.euid}"
 
-if ARGV[2] == 'controller'
+if ARGV[2]&.start_with?('controller-')
+  mode = ARGV[2].delete_prefix('controller-')
   home = File.join(evidence,'home')
   %w[.config .cache .local/state .local/share .kde].each { |name| FileUtils.mkdir_p(File.join(home,name)) }
   env = {'HOME'=>home,'XDG_CONFIG_HOME'=>File.join(home,'.config'),'XDG_CACHE_HOME'=>File.join(home,'.cache'),
@@ -21,8 +22,9 @@ if ARGV[2] == 'controller'
          'KDEHOME'=>File.join(home,'.kde'),'XDG_RUNTIME_DIR'=>runtime,'DBUS_SESSION_BUS_ADDRESS'=>bus,
          'KWIN_MCP_REPO'=>File.join(evidence,'no-repository'),'CARGO'=>'/usr/bin/false'}
   input, output, error, server = Open3.popen3(env,binary,'--autoclean','--width','800','--height','600')
-  diagnostics = Thread.new { File.write(File.join(evidence,'server.stderr'),error.read) }
+  diagnostics = Thread.new { File.open(File.join(evidence,'server.stderr'),'w') { |log| IO.copy_stream(error,log) } }
   id = 0
+  reloaded = false
   trace = File.open(File.join(evidence,'rpc.jsonl'),'w')
   rpc = lambda do |method,params|
     id += 1
@@ -32,6 +34,7 @@ if ARGV[2] == 'controller'
         line = output.gets or raise 'server EOF'
         reply = JSON.parse(line)
         trace.puts(JSON.generate(reply)); trace.flush
+        reloaded = true if reply['method'] == 'notifications/tools/list_changed'
         next unless reply['id'] == id
         raise reply.inspect if reply['error'] || reply.dig('result','isError')
         break reply.fetch('result')
@@ -62,27 +65,66 @@ if ARGV[2] == 'controller'
     raise 'scope omitted D-Bus' unless names.any? { |_,name| name == 'dbus-daemon' }
     session.merge('scope_unit'=>unit,'cgroup'=>cgroup,'members'=>names)
   end
-  keeper = Process.spawn('sleep','300',3=>input,close_others:true,out:File::NULL,err:File::NULL)
+  keeper = mode == 'eof' ? nil : Process.spawn('sleep','300',3=>input,close_others:true,out:File::NULL,err:File::NULL)
   ready = {controller:Process.pid,server:server.pid,keeper:keeper,sessions:records}
   File.write(File.join(evidence,'ready.pending'),JSON.pretty_generate(ready))
   File.rename(File.join(evidence,'ready.pending'),File.join(evidence,'ready.json'))
+  if mode == 'eof'
+    sleep 0.05 until File.exist?(File.join(evidence,'action'))
+    input.close
+    Timeout.timeout(20) { server.value }
+    diagnostics.join
+    File.write(File.join(evidence,'eof-done'),'server exited')
+  elsif %w[reload upgrade].include?(mode)
+    sleep 0.05 until File.exist?(File.join(evidence,'action'))
+    after = nil
+    Timeout.timeout(30) do
+      loop do
+        after = rpc.call('tools/call',{name:'session_list',arguments:{}}).dig('structuredContent','sessions')
+        break if reloaded
+        sleep 0.1
+      end
+    end
+    raise 'reload changed session identities' unless after.map { |session| session['session_id'] }.sort == sessions.map { |session| session['session_id'] }.sort
+    raise 'reload lost scope identities' unless after.map { |session| session['scope_unit'] }.sort == records.map { |session| session['scope_unit'] }.sort
+    File.write(File.join(evidence,'reload-proof.json'),JSON.pretty_generate(server_pid:server.pid,sessions:after))
+  end
   sleep 300
   exit
 end
 
 controller = nil
 record = nil
+mode = ARGV[2] || 'kill'
+abort 'mode must be kill, eof, reload, or upgrade' unless %w[kill eof reload upgrade].include?(mode)
+replacement = ARGV[3] || binary
+if %w[reload upgrade].include?(mode)
+  private_binary = File.join(evidence,'kwin-mcp')
+  FileUtils.cp(binary,private_binary)
+  binary = private_binary
+end
 begin
-  controller = Process.spawn(RbConfig.ruby,__FILE__,binary,evidence,'controller',out:File.join(evidence,'controller.stdout'),err:File.join(evidence,'controller.stderr'))
+  controller = Process.spawn(RbConfig.ruby,__FILE__,binary,evidence,"controller-#{mode}",out:File.join(evidence,'controller.stdout'),err:File.join(evidence,'controller.stderr'))
   Timeout.timeout(90) do
     sleep 0.05 until File.exist?(File.join(evidence,'ready.json'))
   end
   record = JSON.parse(File.read(File.join(evidence,'ready.json')))
   raise 'controller identity mismatch' unless record['controller'] == controller
-  Process.kill('KILL',controller)
-  Process.wait(controller)
-  controller = nil
-  raise 'inherited writer already ended' unless File.directory?("/proc/#{record.fetch('keeper')}")
+  if %w[reload upgrade].include?(mode)
+    FileUtils.cp(replacement,"#{binary}.next")
+    File.rename("#{binary}.next",binary)
+    File.write(File.join(evidence,'action'),'reload')
+    Timeout.timeout(40) { sleep 0.05 until File.exist?(File.join(evidence,'reload-proof.json')) }
+  end
+  if mode == 'eof'
+    File.write(File.join(evidence,'action'),'close stdin')
+    Timeout.timeout(25) { sleep 0.05 until File.exist?(File.join(evidence,'eof-done')) }
+  else
+    Process.kill('KILL',controller)
+    Process.wait(controller)
+    controller = nil
+    raise 'inherited writer already ended' unless File.directory?("/proc/#{record.fetch('keeper')}")
+  end
   before = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   Timeout.timeout(20) do
     loop do
@@ -105,17 +147,17 @@ begin
     group, = Open3.capture2({'XDG_RUNTIME_DIR'=>runtime,'DBUS_SESSION_BUS_ADDRESS'=>bus},'systemctl','--user','show','-p','ControlGroup','--value',session.fetch('scope_unit'))
     raise 'systemd still reports a populated scope' unless group.strip.empty?
   end
-  raise 'writer was killed with session' unless File.directory?("/proc/#{record.fetch('keeper')}")
+  raise 'writer was killed with session' if record['keeper'] && !File.directory?("/proc/#{record.fetch('keeper')}")
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
-  File.write(File.join(evidence,'verification.json'),JSON.pretty_generate(status:'passed',elapsed:elapsed,writer_still_alive:true,record:record))
-  puts "client_sigkill_with_inherited_writer=PASS (#{elapsed.round(3)}s; two scopes, all members and workdirs gone)"
+  File.write(File.join(evidence,'verification.json'),JSON.pretty_generate(status:'passed',mode:mode,elapsed:elapsed,writer_still_alive:!record['keeper'].nil?,record:record))
+  puts "client_#{mode}=PASS (#{elapsed.round(3)}s; two scopes, members terminated and workdirs gone)"
 ensure
   if controller
     Process.kill('TERM',controller) rescue Errno::ESRCH
     Process.wait(controller) rescue Errno::ECHILD
   end
   if record
-    Process.kill('TERM',record.fetch('keeper')) rescue Errno::ESRCH
+    Process.kill('TERM',record.fetch('keeper')) rescue Errno::ESRCH if record['keeper']
     if File.exist?("/proc/#{record.fetch('server')}/stat") && File.read("/proc/#{record.fetch('server')}/stat").split[2] != 'Z'
       Process.kill('TERM',record.fetch('server')) rescue Errno::ESRCH
     end
