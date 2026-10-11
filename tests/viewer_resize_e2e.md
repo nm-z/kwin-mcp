@@ -12,7 +12,7 @@ CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false
 bash tests/build_viewer_fixtures.sh /path/to/private-fixtures
 ```
 
-The fixtures require GTK 4, Wayland client development files, `wayland-scanner`, and the Plasma `fake-input.xml` protocol. Set `KWIN_MCP_FAKE_INPUT_XML` to a private copy of that XML when the build host does not install it under `/usr/share/plasma-wayland-protocols/`.
+The fixtures require GTK 4, Wayland client development files, `wayland-scanner`, and the Plasma `fake-input.xml` protocol. They use the system XML, falling back to the already-locked `wayland-protocols-plasma` Cargo dependency. Set `KWIN_MCP_FAKE_INPUT_XML` to use another private copy.
 
 Copy `kwin-mcp`, `kwin-viewer`, `viewer-input-probe`, and `viewer-touch` into one private evidence directory on engi. Keep the source script available at a path under `/home`; session `/tmp` is private.
 
