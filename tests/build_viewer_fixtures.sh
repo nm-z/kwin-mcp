@@ -5,6 +5,10 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 out=${1:?usage: build_viewer_fixtures.sh OUTPUT_DIRECTORY}
 mkdir -p "$out"
 protocol=${KWIN_MCP_FAKE_INPUT_XML:-/usr/share/plasma-wayland-protocols/fake-input.xml}
+if [ ! -f "$protocol" ] && [ -z "${KWIN_MCP_FAKE_INPUT_XML:-}" ]; then
+    manifest=$(cargo metadata --locked --offline --format-version 1 | jq -r '.packages[] | select(.name == "wayland-protocols-plasma") | .manifest_path')
+    protocol="$(dirname -- "$manifest")/plasma-wayland-protocols/src/protocols/fake-input.xml"
+fi
 cc -std=c11 -Wall -Wextra -Werror "$repo/tests/fixtures/viewer_input_probe.c" -o "$out/viewer-input-probe" $(pkg-config --cflags --libs gtk4)
 wayland-scanner client-header "$protocol" "$out/fake-input-client.h"
 wayland-scanner private-code "$protocol" "$out/fake-input-code.c"
