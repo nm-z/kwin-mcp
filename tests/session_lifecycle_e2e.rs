@@ -1781,6 +1781,7 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
                     [],
                 )
                 .expect("host delete");
+                thread::sleep(Duration::from_millis(10));
             }
         })
     };
@@ -1899,6 +1900,95 @@ fn session_sqlite_probe() {
         .expect("private cookie count");
     assert_eq!(count, 2);
     std::fs::write(report, "bad=0 readonly=1 private=1\n").expect("probe report");
+}
+
+#[test]
+#[ignore = "helper launched by session_follows_host_sqlite_wal_rotation"]
+fn session_sqlite_rotation_probe() {
+    let database = std::env::var("KWIN_SQLITE_PROBE_DB").expect("probe database");
+    let report = std::env::var("KWIN_SQLITE_PROBE_REPORT").expect("probe report");
+    let reader =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("session reader after WAL rotation");
+    let check: String = reader
+        .query_row("pragma quick_check", [], |row| row.get(0))
+        .expect("rotated database quick check");
+    assert_eq!(check, "ok");
+    let marker: i64 = reader
+        .query_row("select max(marker) from generation", [], |row| row.get(0))
+        .expect("latest host generation");
+    std::fs::write(report, format!("{marker}\n")).expect("rotation report");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
+fn session_follows_host_sqlite_wal_rotation() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let directory = client.home.join(".codex");
+    std::fs::create_dir(&directory).expect("fixture directory");
+    let database = directory.join("rotation.sqlite");
+    let mut host = rusqlite::Connection::open(&database).expect("host database");
+    host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0);")
+        .expect("seed generation");
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    let runtime = workdir(&started);
+    let probe = runtime.join("rotation-probe");
+    std::fs::copy(std::env::current_exe().expect("test executable"), &probe).expect("copy probe");
+    let mut previous_wal = 0;
+    use std::os::unix::fs::MetadataExt;
+    for generation in 1..=3 {
+        host.execute_batch("pragma wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint");
+        drop(host);
+        assert!(
+            !database.with_file_name("rotation.sqlite-wal").exists(),
+            "host WAL was not unlinked"
+        );
+        host = rusqlite::Connection::open(&database).expect("reopen host database");
+        host.execute("insert into generation values(?1)", [generation])
+            .expect("new WAL generation");
+        let wal_inode = std::fs::metadata(database.with_file_name("rotation.sqlite-wal"))
+            .expect("new WAL")
+            .ino();
+        eprintln!(
+            "WAL generation {generation}: previous inode {previous_wal}, current {wal_inode}"
+        );
+        previous_wal = wal_inode;
+        let report = runtime.join(format!("generation-{generation}.txt"));
+        call_tool(
+            &mut client,
+            3 + generation,
+            "launch_app",
+            json!({"command":format!(
+                "KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_rotation_probe --nocapture; konsole",
+                shlex::try_quote(&database.display().to_string()).expect("quote database"),
+                shlex::try_quote(&report.display().to_string()).expect("quote report"),
+                shlex::try_quote(&probe.display().to_string()).expect("quote probe"),
+            )}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !report.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "session failed after WAL rotation {generation}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            std::fs::read_to_string(report).expect("generation report"),
+            format!("{generation}\n")
+        );
+    }
+    call_tool(&mut client, 10, "session_stop", json!({}));
+    assert!(!runtime.exists(), "session workdir remains");
+    client.stop_process();
 }
 
 #[test]
@@ -2629,7 +2719,7 @@ fn session_start_binds_large_live_codex_state_without_copying_it() {
         3,
         "launch_app",
         json!({"command":format!(
-            "findmnt -n -o OPTIONS -T '{}' > '{}'; stat -c '%i' '{}' >> '{}'; konsole",
+            "findmnt -n -o OPTIONS -T '{}' > '{}'; stat -Lc '%i' '{}' >> '{}'; konsole",
             database.display(), report.display(), database.display(), report.display()
         )}),
     );

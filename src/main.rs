@@ -3163,6 +3163,7 @@ fn create_uinput_devices() -> Result<
 // ── Mount-aware overlay ──────────────────────────────────────────────────
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
+const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
 
 /// Nested mounts require private copies of files in their ancestor directories.
 /// Avoid eager bulk copies unless the caller explicitly requests writability.
@@ -3214,6 +3215,8 @@ struct OverlayPlan {
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
+    /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
+    sqlite_binds: Vec<PathBuf>,
     socket_links: SocketLinks,
     /// The host user runtime directory, when sockets from it are exposed. Its
     /// secret-bearing entries (HOST_SECRET_ENTRIES) are masked in the session.
@@ -3274,6 +3277,12 @@ impl OverlayPlan {
         }
         for path in &self.empty_dirs {
             command.arg("--tmpfs").arg(path);
+        }
+        for (index, source) in self.sqlite_binds.iter().enumerate() {
+            command
+                .arg("--ro-bind")
+                .arg(source)
+                .arg(format!("{HOST_SQLITE_ROOT}/{index}"));
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
@@ -3667,6 +3676,7 @@ fn prepare_overlay_plan(
             overlays: vec![overlay],
             read_only_binds: Vec::new(),
             socket_binds: Vec::new(),
+            sqlite_binds: Vec::new(),
             socket_links: SocketLinks::default(),
             host_runtime: None,
             empty_dirs: Vec::new(),
@@ -3717,6 +3727,7 @@ fn prepare_overlay_plan(
         overlays,
         read_only_binds,
         socket_binds: Vec::new(),
+        sqlite_binds: Vec::new(),
         socket_links: SocketLinks::default(),
         host_runtime: None,
         empty_dirs: Vec::new(),
@@ -3727,9 +3738,10 @@ fn prepare_overlay_plan(
 /// Blocking host scan still owned by an in-flight session_start.
 type HostWork = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
-/// Mount live SQLite files and their WAL family directly, read-only. Sharing
-/// the host inodes preserves SQLite locking and avoids a size-dependent backup
-/// or an inconsistent database/WAL copy through the HOME overlay.
+/// Resolve live SQLite databases through read-only directory binds. SQLite
+/// canonicalizes the main database symlink before opening its sidecars, so WAL
+/// checkpoint/unlink/recreation uses the host's current directory entries,
+/// rather than pinned file mounts. Sibling HOME files remain privately writable.
 fn bind_live_sqlite(
     plan: &mut OverlayPlan,
     target: &Path,
@@ -3742,12 +3754,26 @@ fn bind_live_sqlite(
         let name = database
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
-        for suffix in ["", "-wal", "-shm"] {
-            let path = database.with_file_name(format!("{}{suffix}", name.to_string_lossy()));
-            if path.is_file() && !plan.read_only_binds.contains(&path) {
-                plan.read_only_binds.push(path);
-            }
+        if !database.is_file() {
+            continue;
         }
+        let parent = database
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("database has no parent"))?;
+        let index = plan
+            .sqlite_binds
+            .iter()
+            .position(|bind| bind == parent)
+            .unwrap_or_else(|| {
+                let index = plan.sqlite_binds.len();
+                plan.sqlite_binds.push(parent.to_path_buf());
+                index
+            });
+        let upper = upper_file(plan, database)?;
+        std::os::unix::fs::symlink(
+            PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
+            upper,
+        )?;
         eprintln!(
             "session_start: live SQLite database read-only: {}",
             database.display()
