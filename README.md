@@ -101,7 +101,7 @@ cannot create a scope. The limits cover the sandbox and its applications;
 the host viewer and MCP server remain outside that scope.
 
 For a gateway that needs more memory, set all three limits explicitly when
-launching its server or shim:
+launching its server:
 
 ```bash
 kwin-mcp --memory-high 8 --memory-max 10 --memory-swap-max 6
@@ -112,6 +112,29 @@ the RAM and swap limits. `--memory-swap-max 0` prevents new swap use.
 `--memory-max` must be positive and at least `--memory-high`.
 Existing sessions retain their current limits until their owner restarts them
 or changes their scope properties.
+
+`session_start` also accepts `memory_high`, `memory_max`, and
+`memory_swap_max` in whole GiB. Each omitted value inherits the server's
+default; zero disables the throttle or swap, while the RAM hard limit must
+remain positive. For example:
+
+```json
+{"memory_high":8,"memory_max":10,"memory_swap_max":6}
+```
+
+The result and `session_list` report the actual byte limits and owned scope.
+When the sandbox exits, the server tears down its resources and keeps a dead
+entry until `session_stop`. Later calls return the exit cause and recovery
+guidance. An OOM diagnosis includes the scope result, RAM/swap limits and
+systemd's memory peak when available; a signal exit alone is never treated
+as proof of an OOM kill. After upgrading an older server, scope identity and
+limits are recovered from the sandbox PID cgroup; values that cannot be
+recovered remain unknown. Stop the dead handle, start a new desktop without
+`session_id`, and relaunch the applications to continue.
+
+Configure MCP clients to launch the current `kwin-mcp` executable directly.
+The historical `kwin-mcp-shim` has its own session listing and hides these
+structured lifecycle diagnostics; it is no longer built by this repository.
 
 ```
 kwin-mcp (host process)
