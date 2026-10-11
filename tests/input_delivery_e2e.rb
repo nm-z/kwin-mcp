@@ -115,8 +115,10 @@ class InputDeliveryProbe
     assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
                         y: (y + height / 2 - window.fetch('y')).round))
     [550, 250].each do |length|
+      # Replace the complete selection. Chromium turns a cleared contenteditable
+      # into a synthetic newline; deleting first would test that transformation
+      # rather than the exact insertion/selection receipt.
       assert_success(call('keyboard_key', key: 'ctrl+a'))
-      assert_success(call('keyboard_key', key: 'Backspace'))
       text = ("Paced delivery probe: letters AaZz digits 0123456789. " * 11)[0, length]
       File.write(File.join(@artifacts, "expected-#{length}.txt"), text)
       result = assert_success(call('keyboard_type', text: text))
