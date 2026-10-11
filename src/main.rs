@@ -11866,6 +11866,7 @@ mod memory_limit_tests {
             // Exercise the same scope properties with a readback process
             // instead of starting a compositor or application.
             let output = std::process::Command::new(launcher.get_program())
+                .envs(launcher.get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
                 .args(args)
                 .args(["sh", "-c", "cg=$(cut -d: -f3 /proc/self/cgroup); for name in memory.high memory.max memory.swap.max; do cat \"/sys/fs/cgroup$cg/$name\"; done"])
                 .output().map_err(|error| error.to_string())?;
