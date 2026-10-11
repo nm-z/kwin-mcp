@@ -3217,6 +3217,7 @@ struct OverlayPlan {
     socket_binds: Vec<PathBuf>,
     /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
     sqlite_binds: Vec<PathBuf>,
+    sqlite_blocked_sockets: Vec<PathBuf>,
     socket_links: SocketLinks,
     /// The host user runtime directory, when sockets from it are exposed. Its
     /// secret-bearing entries (HOST_SECRET_ENTRIES) are masked in the session.
@@ -3279,10 +3280,24 @@ impl OverlayPlan {
             command.arg("--tmpfs").arg(path);
         }
         for (index, source) in self.sqlite_binds.iter().enumerate() {
-            command
-                .arg("--ro-bind")
-                .arg(source)
-                .arg(format!("{HOST_SQLITE_ROOT}/{index}"));
+            let destination = PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}"));
+            command.arg("--ro-bind").arg(source).arg(&destination);
+            // Aliases must not bypass the HOME paths hidden elsewhere in the plan.
+            for hidden in &self.empty_dirs {
+                if let Ok(relative) = hidden.strip_prefix(source) {
+                    command.arg("--tmpfs").arg(destination.join(relative));
+                }
+            }
+            for socket in &self.sqlite_blocked_sockets {
+                if let Ok(relative) = socket.strip_prefix(source)
+                    && std::fs::symlink_metadata(socket).is_ok()
+                {
+                    command
+                        .arg("--ro-bind")
+                        .arg("/dev/null")
+                        .arg(destination.join(relative));
+                }
+            }
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
@@ -3326,7 +3341,18 @@ impl OverlayPlan {
         let canonical_runtime = std::fs::canonicalize(host_runtime)?;
         let current_uid = procfs::process::Process::myself()?.uid()?;
         self.host_runtime = Some(canonical_runtime.clone());
-        let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?
+        let socket_inventory = procfs::net::unix()?;
+        self.sqlite_blocked_sockets = socket_inventory
+            .iter()
+            .filter_map(|entry| {
+                if inventory.graphical_sockets.contains(&entry.inode) {
+                    entry.path.clone().filter(|path| path.is_absolute())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = socket_inventory
             .into_iter()
             .filter_map(|entry| {
                 if entry.state != procfs::net::UnixState::UNCONNECTED {
@@ -3695,6 +3721,7 @@ fn prepare_overlay_plan(
             read_only_binds: Vec::new(),
             socket_binds: Vec::new(),
             sqlite_binds: Vec::new(),
+            sqlite_blocked_sockets: Vec::new(),
             socket_links: SocketLinks::default(),
             host_runtime: None,
             empty_dirs: Vec::new(),
@@ -3747,6 +3774,7 @@ fn prepare_overlay_plan(
         read_only_binds,
         socket_binds: Vec::new(),
         sqlite_binds: Vec::new(),
+        sqlite_blocked_sockets: Vec::new(),
         socket_links: SocketLinks::default(),
         host_runtime: None,
         empty_dirs: Vec::new(),
@@ -3774,6 +3802,13 @@ fn bind_live_sqlite(
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
         if !database.is_file() {
+            continue;
+        }
+        if plan
+            .empty_dirs
+            .iter()
+            .any(|hidden| database.starts_with(hidden))
+        {
             continue;
         }
         if plan
