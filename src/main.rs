@@ -3319,12 +3319,12 @@ impl OverlayPlan {
         target: &Path,
         host_runtime: &Path,
         isolated_runtime: &Path,
-    ) -> anyhow::Result<Vec<PathBuf>> {
+        inventory: &HostProcessInventory,
+    ) -> anyhow::Result<()> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let canonical_target = std::fs::canonicalize(target)?;
         let canonical_runtime = std::fs::canonicalize(host_runtime)?;
         let current_uid = procfs::process::Process::myself()?.uid()?;
-        let inventory = host_process_inventory(target)?;
         self.host_runtime = Some(canonical_runtime.clone());
         let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?
             .into_iter()
@@ -3417,7 +3417,7 @@ impl OverlayPlan {
             std::os::unix::fs::symlink(&generated, &link)?;
             self.socket_links.0.push((link, generated));
         }
-        Ok(inventory.live_databases)
+        Ok(())
     }
 }
 
@@ -3508,6 +3508,7 @@ struct SplitOverlayContext<'a> {
     mounts: &'a [procfs::process::MountInfo],
     initialize: bool,
     writable_paths: &'a [PathBuf],
+    live_databases: &'a [PathBuf],
 }
 
 fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -3602,6 +3603,22 @@ fn prepare_split_overlay_directory(
                 std::os::unix::fs::symlink(std::fs::read_link(&source)?, &staged)?;
             }
         } else if file_type.is_file() {
+            if context.live_databases.iter().any(|database| {
+                !browser_cookie_database(context.target, database)
+                    && (source == *database
+                        || ["-wal", "-shm"].iter().any(|suffix| {
+                            database.file_name().is_some_and(|name| {
+                                source
+                                    == database.with_file_name(format!(
+                                        "{}{suffix}",
+                                        name.to_string_lossy()
+                                    ))
+                            })
+                        }))
+            }) {
+                // These files will resolve through the read-only live directory.
+                continue;
+            }
             if context.initialize && !staged_exists {
                 let requested_writable = context
                     .writable_paths
@@ -3658,6 +3675,7 @@ fn prepare_overlay_plan(
     session_tmp: &Path,
     mounts: &[procfs::process::MountInfo],
     writable_paths: &[PathBuf],
+    live_databases: &[PathBuf],
 ) -> anyhow::Result<OverlayPlan> {
     let excluded_mounts = mount_descendants(mounts, target);
     if excluded_mounts.is_empty() {
@@ -3700,6 +3718,7 @@ fn prepare_overlay_plan(
         mounts,
         initialize,
         writable_paths,
+        live_databases,
     };
     let mut overlays = Vec::new();
     let mut read_only_binds = excluded_mounts;
@@ -3757,6 +3776,20 @@ fn bind_live_sqlite(
         if !database.is_file() {
             continue;
         }
+        if plan
+            .read_only_binds
+            .iter()
+            .any(|mount| database != mount && database.starts_with(mount))
+        {
+            // A directory bind already provides fresh read-only name lookup.
+            continue;
+        }
+        plan.read_only_binds.retain(|mount| {
+            mount != database
+                && !["-wal", "-shm"].iter().any(|suffix| {
+                    mount == &database.with_file_name(format!("{}{suffix}", name.to_string_lossy()))
+                })
+        });
         let parent = database
             .parent()
             .ok_or_else(|| anyhow::anyhow!("database has no parent"))?;
@@ -3769,7 +3802,14 @@ fn bind_live_sqlite(
                 plan.sqlite_binds.push(parent.to_path_buf());
                 index
             });
-        let upper = upper_file(plan, database)?;
+        let upper = if plan.upper_path(database).is_some() {
+            upper_file(plan, database)?
+        } else {
+            plan.staging_root
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no private layer for live database"))?
+                .join(database.strip_prefix(target)?)
+        };
         std::os::unix::fs::symlink(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
             upper,
@@ -4013,9 +4053,17 @@ fn prepare_host_view(
             gib(free)
         );
     }
+    service.set_start_stage("scanning host sockets and processes");
+    let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
-    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory, writable_paths)
-        .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
+    let mut overlay_plan = prepare_overlay_plan(
+        target,
+        &disk,
+        &mount_inventory,
+        writable_paths,
+        &inventory.live_databases,
+    )
+    .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
     // sees an empty directory there instead.
     let disk_root = session_disk_root();
@@ -4023,11 +4071,11 @@ fn prepare_host_view(
         overlay_plan.empty_dirs.push(disk_root);
     }
     service.set_start_stage("scanning host sockets and processes");
-    let live_databases = overlay_plan
-        .expose_sockets(target, host_runtime, host_xdg_dir)
+    overlay_plan
+        .expose_sockets(target, host_runtime, host_xdg_dir, &inventory)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
     service.set_start_stage("mounting live SQLite databases read-only");
-    bind_live_sqlite(&mut overlay_plan, target, &live_databases)?;
+    bind_live_sqlite(&mut overlay_plan, target, &inventory.live_databases)?;
 
     eprintln!(
         "session_start: overlay plan={} overlays={} read-only-mounts={}",
