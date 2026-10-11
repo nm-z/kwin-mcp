@@ -11,11 +11,14 @@ binary, evidence = ARGV
 abort 'usage: resize_after_maximize_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
 FileUtils.mkdir_p(evidence)
 private_home = File.join(evidence, 'home')
+host_runtime = ENV.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.uid}")
 %w[.config .local/share .cache .local/state .kde].each { |dir| FileUtils.mkdir_p(File.join(private_home, dir)) }
 env = {'HOME'=>private_home, 'XDG_CONFIG_HOME'=>File.join(private_home,'.config'),
        'XDG_DATA_HOME'=>File.join(private_home,'.local/share'), 'XDG_CACHE_HOME'=>File.join(private_home,'.cache'),
        'XDG_STATE_HOME'=>File.join(private_home,'.local/state'), 'KDEHOME'=>File.join(private_home,'.kde'),
-       'KWIN_MCP_REPO'=>File.join(private_home,'no-repository')}
+       'KWIN_MCP_REPO'=>File.join(private_home,'no-repository'),
+       'XDG_RUNTIME_DIR'=>host_runtime,
+       'DBUS_SESSION_BUS_ADDRESS'=>ENV.fetch('DBUS_SESSION_BUS_ADDRESS', "unix:path=#{host_runtime}/bus")}
 log = File.open(File.join(evidence,'server.log'),'w')
 stdin, stdout, stderr, process = Open3.popen3(env, File.expand_path(binary), '--autoclean', '--no-viewer')
 stderr_thread = Thread.new { stderr.each_line { |line| log.write(line); log.flush } }
