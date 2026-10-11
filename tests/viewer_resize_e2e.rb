@@ -145,12 +145,25 @@ begin
   # This KWin belongs exclusively to the outer test session.
   outer.tool('launch_app', { command: "kdotool windowstate --remove MAXIMIZED #{id.shellescape} windowsize #{id.shellescape} 800 600 windowmove #{id.shellescape} 100 100" }, allow_error: true)
   snapshots = []
-  [ [900, 600], [900, 450] ].each_with_index do |(width, height), index|
-    outer.tool('launch_app', { command: "kdotool windowsize #{id.shellescape} #{width} #{height}" }, allow_error: true)
+  [ [900, 600], ['bottom-edge', 100] ].each_with_index do |requested, index|
+    if index.zero?
+      width, height = requested
+      outer.tool('launch_app', { command: "kdotool windowsize #{id.shellescape} #{width} #{height}" }, allow_error: true)
+    else
+      previous = snapshots.last[:actual]
+      from_x = previous.fetch('x') + previous.fetch('w') / 2
+      from_y = previous.fetch('y') + previous.fetch('h') - 20
+      to_y = from_y + requested.last
+      outer.tool('launch_app', { command: "#{TOUCH.shellescape} --resize #{(outer.workdir + '/wayland-0').shellescape} #{from_x} #{from_y} #{from_x} #{to_y}" }, allow_error: true)
+    end
     sleep 0.5
     geometry = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
     raise 'viewer disappeared' unless geometry
-    snapshots << { requested: [width, height], actual: geometry }
+    snapshots << { requested: requested, actual: geometry }
+    if index.positive?
+      previous = snapshots[index - 1][:actual]
+      raise 'compositor did not perform the interactive resize' if geometry['w'] == previous['w'] && geometry['h'] == previous['h']
+    end
     outer.tool('window_activate', { window_id: id })
     shot = outer.tool('screenshot')
     File.write("#{output}/screenshot-#{index}.json", JSON.pretty_generate(shot))
