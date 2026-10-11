@@ -6469,10 +6469,19 @@ impl LevelTree {
     /// How many whole levels fit in A11Y_TREE_MAX_CHARS, counting the child
     /// notes the last one carries. An oversized root level does not fit.
     fn fitting_levels(&self, max_levels: usize) -> usize {
+        self.fitting_partial_levels(max_levels, false)
+    }
+
+    fn fitting_partial_levels(&self, max_levels: usize, incomplete: bool) -> usize {
         let mut cost = vec![0usize; self.levels()];
         let mut notes = vec![0usize; self.levels()];
         for node in &self.nodes {
             cost[node.depth] += Self::line_cost(node);
+            if incomplete {
+                cost[node.depth] += format!("\tmore may follow\troot={}", node.id)
+                    .chars()
+                    .count();
+            }
             if !node.children.is_empty() {
                 notes[node.depth] += Self::suffix(node).chars().count();
             }
@@ -6496,7 +6505,11 @@ impl LevelTree {
     }
 
     fn render(&self, max_levels: usize) -> (String, serde_json::Value) {
-        let fit = self.fitting_levels(max_levels);
+        self.render_partial(max_levels, false)
+    }
+
+    fn render_partial(&self, max_levels: usize, incomplete: bool) -> (String, serde_json::Value) {
+        let fit = self.fitting_partial_levels(max_levels, incomplete);
         let mut out = String::new();
         let mut shown = 0usize;
         let roots: Vec<usize> = (0..self.nodes.len())
@@ -6510,14 +6523,16 @@ impl LevelTree {
             }
             out.push_str(&"\t".repeat(node.depth));
             out.push_str(&node.text);
-            if node.depth + 1 == fit && !node.children.is_empty() {
+            if incomplete {
+                out.push_str(&format!("\tmore may follow\troot={}", node.id));
+            } else if node.depth + 1 == fit && !node.children.is_empty() {
                 out.push_str(&Self::suffix(node));
             }
             out.push('\n');
             shown += 1;
             stack.extend(node.children.iter().rev());
         }
-        let deeper = self.levels() > fit;
+        let deeper = incomplete || self.levels() > fit;
         let chars = out.chars().count();
         (
             out,
@@ -8945,7 +8960,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The tree is read breadth-first and returned as whole levels, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The tree has a 5 second budget and returns gathered nodes with incomplete=true and root=ID continuations if time runs out. The tree is read breadth-first and returned as whole levels, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -8954,23 +8969,36 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        tokio::time::timeout(
+        let mut tree = LevelTree::default();
+        let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
+            usize::try_from(depth)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        });
+        match tokio::time::timeout(
             ATSPI_TRAVERSAL_TIMEOUT,
-            self.accessibility_tree_result(peer, params),
+            self.accessibility_tree_result(peer.clone(), params, &mut tree),
         )
         .await
-        .map_err(|_| {
-            McpError::internal_error(
-                "accessibility_tree: traversal exceeded 5 seconds; the session remains open",
-                None,
-            )
-        })?
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let (text, mut info) = tree.render_partial(max_levels, true);
+                info["incomplete"] = serde_json::json!(true);
+                info["reason"] = serde_json::json!("traversal reached the 5 second limit");
+                info["continuation"] = serde_json::json!(
+                    "Call accessibility_tree with a root=ID shown in this reply and a smaller max_depth. If no nodes were read, use find_ui_elements for a named control or screenshot."
+                );
+                Ok(structured_result(&peer, text, info).await)
+            }
+        }
     }
 
     async fn accessibility_tree_result(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: AccessibilityTreeParams,
+        tree: &mut LevelTree,
     ) -> Result<CallToolResult, McpError> {
         let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
             usize::try_from(depth)
@@ -9035,7 +9063,6 @@ impl KwinMcp {
                     })
                 };
                 // Map the AX tree onto shown nodes; hidden ones pass their children up.
-                let mut tree = LevelTree::default();
                 let starts: Vec<usize> = match &params.root {
                     Some(root) if !root.contains('/') => {
                         let Some(&at) = index.get(root) else { continue };
@@ -9131,7 +9158,6 @@ impl KwinMcp {
             role_ok(&node.role)
                 && (show_elements || (node.is_useful() && node.on_screen(screen.0, screen.1)))
         };
-        let mut tree = LevelTree::default();
         // Level 0: the requested root, or the first shown nodes of each matching app.
         let mut level: Vec<(usize, atspi::proxy::accessible::AccessibleProxy<'static>)> =
             Vec::new();
