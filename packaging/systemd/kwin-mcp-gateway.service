@@ -2,7 +2,7 @@
 Description=kwin-mcp OAuth gateway
 PartOf=graphical-session.target
 After=graphical-session.target
-ConditionPathIsExecutable=%h/.local/bin/kwin-mcp-gateway
+ConditionFileIsExecutable=%h/.local/bin/kwin-mcp-gateway
 ConditionPathExists=%h/.config/kwin-mcp-remote/env
 
 [Service]

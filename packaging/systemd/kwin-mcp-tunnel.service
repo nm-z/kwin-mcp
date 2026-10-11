@@ -3,7 +3,7 @@ Description=Cloudflare tunnel for kwin-mcp
 PartOf=graphical-session.target
 After=kwin-mcp-gateway.service
 BindsTo=kwin-mcp-gateway.service
-ConditionPathIsExecutable=/usr/bin/cloudflared
+ConditionFileIsExecutable=/usr/bin/cloudflared
 ConditionPathExists=%h/.cloudflared/kwin-mcp.yml
 
 [Service]
