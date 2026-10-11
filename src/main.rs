@@ -7682,7 +7682,7 @@ impl KwinMcp {
         // the host does not hold stay private, so concurrent sessions still bind
         // the same port without colliding (#50). The CDP port is excluded so the
         // session's own browser can always bind it.
-        let mut cmd = match sandbox_launcher(self.display) {
+        let mut cmd = match sandbox_launcher(self.display, &host_runtime, &host_session_bus) {
             Ok(command) => command,
             Err(error) => return cleanup_err(error, &mut startup),
         };
@@ -10337,8 +10337,14 @@ fn on_path(program: &str) -> bool {
 
 /// Start the pasta and bwrap tree in a bounded systemd user scope.
 /// Refuse startup when the scope is unavailable instead of running uncapped.
-fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, String> {
+fn sandbox_launcher(
+    config: DisplayConfig,
+    runtime: &Path,
+    session_bus: &str,
+) -> Result<std::process::Command, String> {
     let usable = std::process::Command::new("systemd-run")
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
         .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -10359,6 +10365,8 @@ fn sandbox_launcher(config: DisplayConfig) -> Result<std::process::Command, Stri
     );
     let mut command = std::process::Command::new("systemd-run");
     command
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
         .args(["--user", "--scope", "--quiet", "--collect", "-p"])
         .arg(format!("MemoryHigh={high}"))
         .arg("-p")
@@ -11848,7 +11856,11 @@ mod memory_limit_tests {
             ],
         ] {
             let config = parse_cli_args_from(values.into_iter().map(str::to_owned))?;
-            let launcher = sandbox_launcher(config)?;
+            let runtime =
+                super::host_environment::runtime_dir().map_err(|error| error.to_string())?;
+            let session_bus = super::host_environment::session_bus_address(&runtime)
+                .map_err(|error| error.to_string())?;
+            let launcher = sandbox_launcher(config, &runtime, &session_bus)?;
             let mut args: Vec<_> = launcher.get_args().map(std::ffi::OsStr::to_owned).collect();
             assert_eq!(args.pop().as_deref(), Some(std::ffi::OsStr::new("pasta")));
             // Exercise the same scope properties with a readback process
