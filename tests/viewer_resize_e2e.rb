@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
-# Run with private, already-built binaries on the KDE host. Compilation belongs
-# on a build host. The outer stdio session provides an isolated KWin desktop for
+# Run with private, already-built binaries on the KDE host. The outer stdio
+# session provides an isolated KWin desktop for
 # the viewer; a second production stdio session supplies the picture and input.
 require 'json'
 require 'open3'
@@ -11,13 +11,13 @@ require 'shellwords'
 class Rpc
   attr_reader :home, :session, :workdir
 
-  def initialize(binary, home, log)
+  def initialize(binary, home, log, extra_env = {})
     @home = home
     %w[.config .local/share .cache .local/state .kde].each { |p| FileUtils.mkdir_p(File.join(home, p)) }
     env = { 'HOME' => home, 'XDG_CONFIG_HOME' => "#{home}/.config", 'XDG_DATA_HOME' => "#{home}/.local/share",
             'XDG_CACHE_HOME' => "#{home}/.cache", 'XDG_STATE_HOME' => "#{home}/.local/state", 'KDEHOME' => "#{home}/.kde",
             'KWIN_MCP_REPO' => "#{home}/no-repository", 'KDE_SESSION_VERSION' => '6' }
-    @input, @output, error, @wait = Open3.popen3(env, binary, '--autoclean')
+    @input, @output, error, @wait = Open3.popen3(env.merge(extra_env), binary, '--autoclean')
     @error_reader = Thread.new { File.open(log, 'w') { |f| error.each_line { |line| f.write(line); f.flush } } }
     @id = 0
     @rpc_log = File.open("#{log}.rpc", 'w')
@@ -92,51 +92,24 @@ def wait_until(seconds = 30)
   end
 end
 
-if ARGV.first == '--inner'
-  control = ARGV.fetch(1)
-  FileUtils.mkdir_p(control)
-  inner = nil
-  begin
-    inner = Rpc.new(SERVER, "#{control}/inner-home", "#{control}/inner-server.log")
-    data = inner.start(800, 600)
-    inner.tool('launch_app', { command: "#{PROBE.shellescape} #{(inner.home + '/events.log').shellescape}" })
-    opened = inner.tool('viewer_open')
-    File.write("#{control}/ready.json", JSON.pretty_generate(data.merge('opened' => opened)))
-    wait_until(600) { File.exist?("#{control}/stop") }
-    inner.export("#{inner.home}/events.log", "#{control}/events.log")
-    FileUtils.cp("#{inner.workdir}/viewer.log", "#{control}/viewer.log")
-    FileUtils.cp("#{inner.workdir}/viewer-pipewire.json", "#{control}/viewer-pipewire.json") if File.exist?("#{inner.workdir}/viewer-pipewire.json")
-  rescue StandardError => error
-    File.write("#{control}/error.txt", "#{error.full_message}\n")
-    raise
-  ensure
-    inner&.close
-    File.write("#{control}/finished", 'stopped')
-  end
-  exit
-end
-
 output = File.expand_path(ARGV.fetch(0))
 FileUtils.mkdir_p(output)
 outer = nil
-inner_ready = false
-inner_stopped = false
+inner = nil
 begin
   outer = Rpc.new(SERVER, "#{output}/outer-home", "#{output}/outer-server.log")
   data = outer.start(1600, 1000)
-  control = "#{outer.home}/control"
-  upper = "#{outer.home}/.cache/kwin-mcp/#{File.basename(outer.workdir)}/overlay-upper"
-  inner_state = "#{upper}/control/ready.json"
-  script = File.expand_path(__FILE__)
-  command = "KWIN_MCP_E2E_BIN_DIR=#{BIN.shellescape} ruby #{script.shellescape} --inner #{control.shellescape}"
-  outer.tool('launch_app', { command: command }, allow_error: true)
-  wait_until(60) do
-    error = "#{upper}/control/error.txt"
-    raise File.read(error) if File.exist?(error)
-    File.exist?(inner_state)
-  end
-  inner_ready = true
-  FileUtils.cp(inner_state, "#{output}/inner-state.json")
+  File.write("#{output}/outer-state.json", JSON.pretty_generate(data))
+  # Both servers retain the real host systemd manager for bounded scopes.
+  # The source server's viewer_open uses the outer isolated Wayland socket.
+  inner = Rpc.new(SERVER, "#{output}/inner-home", "#{output}/inner-server.log",
+                  { 'WAYLAND_DISPLAY' => "#{outer.workdir}/wayland-0" })
+  source_data = inner.start(800, 600)
+  inner.tool('launch_app', { command: "#{PROBE.shellescape} #{(inner.home + '/events.log').shellescape}" })
+  opened = inner.tool('viewer_open')
+  viewer_state = opened.fetch('structuredContent').fetch('viewer').fetch('state')
+  raise "viewer_open: #{opened.inspect}" unless %w[ready starting].include?(viewer_state)
+  File.write("#{output}/inner-state.json", JSON.pretty_generate(source_data.merge('opened' => opened)))
   windows = outer.tool('window_list').fetch('structuredContent').fetch('windows')
   viewer = windows.find { |w| w['resourceClass'].include?('kwin-viewer') || w['title'].start_with?('kwin-viewer') }
   raise "viewer missing: #{windows.inspect}" unless viewer
@@ -192,14 +165,11 @@ begin
     outer.tool('launch_app', { command: "#{TOUCH.shellescape} #{(outer.workdir + '/wayland-0').shellescape} #{tx} #{ty}" }, allow_error: true)
   end
   File.write("#{output}/geometry.json", JSON.pretty_generate(snapshots))
-  outer.tool('launch_app', { command: "touch #{(control + '/stop').shellescape}" }, allow_error: true)
-  wait_until(30) { File.exist?("#{upper}/control/finished") }
-  inner_stopped = true
-  %w[events.log viewer.log inner-server.log inner-server.log.rpc error.txt viewer-pipewire.json].each do |file|
-    source = "#{upper}/control/#{file}"
-    FileUtils.cp(source, "#{output}/#{file}") if File.exist?(source)
+  inner.export("#{inner.home}/events.log", "#{output}/events.log")
+  FileUtils.cp("#{inner.workdir}/viewer.log", "#{output}/viewer.log")
+  if File.exist?("#{inner.workdir}/viewer-pipewire.json")
+    FileUtils.cp("#{inner.workdir}/viewer-pipewire.json", "#{output}/viewer-pipewire.json")
   end
-  raise File.read("#{output}/error.txt") if File.exist?("#{output}/error.txt")
   events = File.readlines("#{output}/events.log").map { |line| line.split.map(&:to_f) }
   raise "expected mouse and touch after each resize: #{events.inspect}" unless events.length == 4
   events.each_with_index do |event, index|
@@ -222,17 +192,15 @@ begin
     puts 'PASS: mouse and touch mapping at the compositor-configured geometry'
   end
 ensure
-  if outer && inner_ready && !inner_stopped
-    begin
-      outer.tool('launch_app', { command: "touch #{(control + '/stop').shellescape}" }, allow_error: true)
-      wait_until(30) { File.exist?("#{upper}/control/finished") }
-    rescue StandardError => error
-      File.write("#{output}/cleanup-error.txt", error.full_message)
-    end
-    %w[events.log viewer.log inner-server.log inner-server.log.rpc error.txt].each do |file|
-      source = "#{upper}/control/#{file}"
+  if inner&.workdir
+    %w[viewer.log viewer-pipewire.json].each do |file|
+      source = "#{inner.workdir}/#{file}"
       FileUtils.cp(source, "#{output}/#{file}") if File.exist?(source)
     end
   end
-  outer&.close
+  begin
+    inner&.close
+  ensure
+    outer&.close
+  end
 end

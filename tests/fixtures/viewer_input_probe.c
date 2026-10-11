@@ -13,6 +13,10 @@ static void draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpoin
                         width / 2.0, height / 2.0);
         cairo_fill(cr);
     }
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_arc(cr, width / 2.0, height / 2.0,
+              (width < height ? width : height) / 8.0, 0, 2 * G_PI);
+    cairo_fill(cr);
 }
 
 static void pressed(GtkGestureClick *gesture, int count, double x, double y, gpointer data) {
