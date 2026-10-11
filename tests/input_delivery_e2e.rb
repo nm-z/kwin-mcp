@@ -91,8 +91,14 @@ class InputDeliveryProbe
     debug_port = ElectronTextFixture.free_port
     command = '/usr/lib/chatgpt/ChatGPT --user-data-dir="$HOME/.km-input-e2e-private" --force-renderer-accessibility' + " --remote-debugging-port=#{debug_port}"
     assert_success(call('launch_app', command: command))
-    fixture = ElectronTextFixture.install(debug_port)
-    File.write(File.join(@artifacts, 'electron-document.json'), JSON.pretty_generate(fixture))
+    helper = File.expand_path('electron_text_fixture.rb', __dir__)
+    command = "ruby '#{helper}' #{debug_port} > \"$HOME/electron-document.json\" 2> \"$HOME/electron-document.stderr\""
+    response = call('launch_app', command: command)
+    assert_success(response)
+    destination = File.join(@artifacts, 'electron-document.json')
+    assert_success(call('export_file', session_path: "#{@home}/electron-document.json", host_path: destination))
+    fixture = JSON.parse(File.read(destination))
+    raise 'non-synthetic document' unless fixture['synthetic']
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
     visible = nil
     loop do

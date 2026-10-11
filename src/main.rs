@@ -3003,7 +3003,12 @@ impl Eis {
                     reis::ei::connection::Event::Disconnected { explanation, .. },
                 ) = &event
                 {
-                    anyhow::bail!("EIS disconnected while confirming input: {explanation}");
+                    anyhow::bail!(
+                        "EIS disconnected while confirming input: {}",
+                        explanation
+                            .as_deref()
+                            .unwrap_or("server provided no explanation")
+                    );
                 }
             }
             if tokio::time::Instant::now() >= deadline {

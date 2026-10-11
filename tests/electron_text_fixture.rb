@@ -11,9 +11,9 @@ require 'timeout'
 module ElectronTextFixture
   HTML = <<~HTML.freeze
     <!doctype html><html><head><title>Input delivery fixture</title>
-    <style>body{font:20px sans-serif;padding:28px}textarea{display:block;width:90%;height:440px;font:18px monospace}</style>
+    <style>body{font:20px sans-serif;padding:28px}.entry{display:block;width:90%;height:440px;font:18px monospace;white-space:pre-wrap;border:2px solid;padding:12px}</style>
     </head><body><h1>Private Electron input delivery</h1>
-    <label>Do anything<textarea aria-label="Do anything" autofocus spellcheck="false"></textarea></label>
+    <label>Do anything</label><div class="entry" role="textbox" aria-label="Do anything" contenteditable="true" tabindex="0" autofocus spellcheck="false"></div>
     </body></html>
   HTML
 
@@ -84,4 +84,10 @@ module ElectronTextFixture
   ensure
     socket&.close
   end
+end
+
+if $PROGRAM_NAME == __FILE__
+  port=Integer(ARGV.fetch(0))
+  raise 'invalid debugger port' unless (1..65535).cover?(port)
+  puts JSON.generate(ElectronTextFixture.install(port))
 end
