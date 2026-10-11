@@ -110,13 +110,13 @@ pub fn supports_cookie_jar(database: &Path) -> Result<bool> {
 fn prune_expired(connection: &Connection) -> Result<()> {
     let names = columns(connection)?;
     if names.iter().any(|name| name == "expires_utc") {
-        let has_expiry = if names.iter().any(|name| name == "has_expires") {
-            "has_expires != 0 AND "
+        let predicate = if names.iter().any(|name| name == "has_expires") {
+            "has_expires != 0 AND expires_utc <= ?"
         } else {
-            ""
+            "expires_utc > 0 AND expires_utc <= ?"
         };
         connection.execute(
-            &format!("DELETE FROM cookies WHERE {has_expiry}expires_utc > 0 AND expires_utc <= ?"),
+            &format!("DELETE FROM cookies WHERE {predicate}"),
             [cookie_time()?],
         )?;
     }
@@ -276,6 +276,7 @@ fn write_deletions(saved: &Path, deleted: &DeletedCookies) -> Result<()> {
     file.write_all(&serde_json::to_vec(deleted)?)?;
     file.sync_all()?;
     std::fs::rename(temporary, destination)?;
+    std::fs::File::open(saved.parent().context("cookie state has no parent")?)?.sync_all()?;
     Ok(())
 }
 
@@ -562,15 +563,15 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     }
     let mut failures = Vec::new();
     for jar in jars.iter().filter(|jar| jar.upper.is_file()) {
-        if !supports_cookie_jar(&jar.upper)? {
-            eprintln!(
-                "teardown: skipping non-cookie SQLite database {}",
-                jar.upper.display()
-            );
-            continue;
-        }
         let temporary = jar.saved.with_extension("snapshot");
         let result = (|| -> Result<()> {
+            if !supports_cookie_jar(&jar.upper)? {
+                eprintln!(
+                    "teardown: skipping non-cookie SQLite database {}",
+                    jar.upper.display()
+                );
+                return Ok(());
+            }
             let parent = jar.saved.parent().context("cookie state has no parent")?;
             std::fs::create_dir_all(parent)?;
             // Every directory beneath the private root is private as well.
@@ -596,6 +597,7 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
             // must not restore a removed cookie from the old saved jar.
             write_deletions(&jar.saved, &deleted)?;
             std::fs::rename(&temporary, &jar.saved)?;
+            std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
         if let Err(error) = result {

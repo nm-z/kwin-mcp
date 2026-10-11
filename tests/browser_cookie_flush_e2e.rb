@@ -121,11 +121,27 @@ ensure
   rescue StandardError => error
     warn "cleanup: #{error}"
   end
-  input.close
-  Timeout.timeout(20) { process.value }
-  stderr.join
-  server.kill
-  server.join
-  http.close
-  FileUtils.remove_entry(fixture)
+  begin
+    input.close unless input.closed?
+    begin
+      Timeout.timeout(45) { process.value }
+    rescue Timeout::Error
+      # The server owns this test's sandbox. Give its shutdown handler another
+      # chance before killing the owned server; never leave a test running.
+      Process.kill('TERM', process.pid) if process.alive?
+      begin
+        Timeout.timeout(45) { process.value }
+      rescue Timeout::Error
+        Process.kill('KILL', process.pid) if process.alive?
+        process.value
+        raise 'test server did not finish session cleanup'
+      end
+    end
+  ensure
+    stderr.join unless process.alive?
+    server.kill
+    server.join
+    http.close
+    FileUtils.remove_entry(fixture) unless process.alive?
+  end
 end

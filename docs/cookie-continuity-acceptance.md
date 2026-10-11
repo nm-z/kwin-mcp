@@ -1,7 +1,38 @@
-# Cookie continuity acceptance for #245
+# Automated cookie continuity acceptance for #245
 
-PR #257 stays draft until lead review. Its candidate tests do not satisfy this
-acceptance gate, and passing fewer than fourteen elapsed days does not close #245.
+Nate explicitly replaced the original fourteen-day Gmail `Profile 2` and
+help.openai.com acceptance gate with automated cookie-persistence checks. This
+instruction was communicated through kwin-lead/CEO on October 10, 2026. There is
+no real-site acceptance run, host-browser reservation, or login requirement.
+This change does not claim that either real site stayed signed in for two weeks.
+
+PR #257 stays draft until kwin-lead reviews the exact tested commit, executable
+hashes, logs, and rendered screenshots. Lead marks ready and closes #245 after
+reviewing the authorized automated evidence; the CEO alone reviews and merges.
+The assigned candidate and acceptance deadlines are October 11 at 02:30 Pacific.
+
+## Required automated evidence
+
+All desktop gates use the returned candidate artifacts on engi through the real
+production stdio entrypoint: `session_start`, affected MCP operations, independent
+GUI/system-state checks, and `session_stop`. Compilation and CPU checks use plain
+`dsh build`. No candidate binary is installed or deployed. Each fixture uses a
+private HOME and cookie state; actual host browser profiles are not modified.
+
+| Regression | Required observations |
+| --- | --- |
+| `browser_cookies_continue_across_sessions_without_host_writes` | EXCLUSIVE WAL capture without host SHM access, cookie continuity through two session lifetimes, independent browser profiles, newer host row wins, unchanged lower database/WAL bytes, private file permissions, and rendered screenshot. |
+| `browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints` | Startup during concurrent atomic commits and WAL truncation/checkpoints, coherent transaction generations, full database integrity, a live captured generation, WAL removal/rotation on writer close, unchanged lower bytes after writer stops, and rendered screenshot. |
+| `browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned` | Concurrent session stops preserve deletions and newer rows, complete partition/scheme/port identity is preserved, expired rows including zero expiry are removed, session-only/future cookies remain, unrelated SQLite databases are skipped, the private store is hidden, stale host rows do not resurrect deletions, and genuinely newer host rows can recreate an identity. |
+| `tests/browser_cookie_flush_e2e.rb` | Actual local Google Chrome receives persistent and session-only HTTP cookies; stop is requested less than ten seconds after each Set-Cookie response; subsequent isolated Chrome sessions send both values back over HTTP. Capture rendered set/restored pages, verify the lower fixture profile is unchanged, and stop all sessions. |
+
+Run the three Rust regressions sequentially from the compiled integration test
+artifact with `KWIN_MCP_E2E=1`, `KWIN_MCP_E2E_SERVER` pointing to the exact private
+server artifact, and `KWIN_MCP_TEST_ARTIFACT_DIR` pointing to a private evidence
+directory. Run the Ruby browser regression with the same server/artifact variables.
+Inspect rendered screenshots; a passing process exit alone is insufficient.
+Test clients explicitly track and stop their own session IDs on failure as well
+as success. Independently verify that no test sandbox/server remains afterward.
 
 ## Deletion and expiration semantics
 
@@ -13,7 +44,7 @@ the removed row. A cookie with a newer update timestamp wins regardless of stop
 order. Absence alone cannot establish when an unseen concurrent update occurred,
 so tombstones target observed versions instead of assigning a guessed deletion
 timestamp. Tombstones use the complete unique cookie identity, including partition,
-scheme, and port fields, and are published before the saved jar is replaced.
+scheme, and port fields, and are durably published before the saved jar is replaced.
 
 Expired rows with `has_expires` set and an elapsed `expires_utc` are removed during
 restore and save; session-only cookies are retained. A database schema mismatch
@@ -22,53 +53,13 @@ snapshot if the saved schema is incompatible, while save preserves the prior
 stored jar and reports the incompatibility. Non-cookie SQLite databases inside a
 browser configuration remain private and are skipped by the continuity store.
 
-## Required observations
+## Evidence and failure handling
 
-Use an immutable, reviewed candidate binary in a private evidence directory on
-engi. Keep an independent durable `XDG_STATE_HOME` under that evidence directory
-for the entire run; the same store must be used by all acceptance sessions.
-The isolated desktop may read the real profile through its read-only lower layer.
-All browser writes must remain in the session overlay or the private cookie store.
-Do not install or deploy the candidate, or write into a real browser profile.
+Record the exact commit, executable hashes, artifact provenance, verification
+commands, start/stop times, screenshots, stdio outcomes, stderr, lower-profile
+comparisons, and cleanup results. Do not attach real cookie databases, cookie
+values, credentials, or session tokens to a PR. Local fixture values are synthetic.
 
-At each observation, start the production stdio server, call `session_start`, and
-open Google Chrome with `--profile-directory='Profile 2'` at Gmail. Inspect rendered
-pixels for an authenticated mailbox, then capture a screenshot. Open help.openai.com
-with the corresponding Chrome Default profile, inspect its rendered authenticated
-state, and capture a screenshot. Do not send mail, change support requests, or
-perform account operations. Call `session_stop` and verify teardown after every run.
-
-Run three times daily, including weekends, for at least fourteen elapsed days.
-Proposed Pacific observation times are 07:30, 15:30, and 23:30. Record actual times;
-a missing run is a missing observation, not a passing result. The final observation
-must occur at least fourteen days after the initial authenticated observation.
-Nate authorized the revised deadline of October 25, 2026 at 03:00 Pacific.
-Meeting it requires the initial authenticated observation by October 11 at 03:00
-Pacific, followed by a final observation at least fourteen elapsed days later.
-If this is not possible, report the deadline risk to kwin-lead without changing it.
-
-## Preconditions and handoffs
-
-- Complete remote compilation and real production stdio tests for concurrent WAL
-  snapshots and real-browser immediate-stop cookie flush first.
-- Obtain kwin-lead's review of the exact candidate commit and binary hashes.
-- Obtain CEO/Nate's acceptance decision to leave host Chrome Profile 2 unused for
-  the entire interval, and to avoid using help.openai.com/auth.openai.com in the
-  host Default profile. Host usage would invalidate the session-only control.
-- If either copied login is already signed out, put that login page in the isolated
-  viewer and ask Nate to log in there. Do not read or type credentials. Keep the
-  session open during this handoff; stop it after the user finishes and evidence
-  is captured. The two-week clock starts with successful authenticated pixels.
-
-## Evidence for each run
-
-Record the exact commit, executable hashes, candidate artifact paths, actual start
-and stop timestamps, browser/profile names, cookie store path, screenshots, stdio
-responses, server stderr, authenticated/signed-out outcome, and cleanup outcome.
-Keep screenshots private: mailbox and support-page pixels may contain personal data.
-Never attach cookie databases, cookie values, credentials, or session tokens to a PR.
-
-A signed-out page, interrupted cadence, host use of a controlled profile/site, or
-failed teardown must be reported promptly. Preserve the observation as failure or
-inconclusive; do not silently restart the clock or mark it passing. The CEO decides
-acceptance after reviewing the complete fourteen-day rendered record.
+A failed check remains failed until its concrete cause is corrected and the affected
+real path is verified again. Do not omit a required gate or mark ready without lead
+review. Do not remove board items or extend deadlines before lead authorization.

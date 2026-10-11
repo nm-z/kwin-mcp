@@ -15,6 +15,7 @@ struct RpcClient {
     responses: Receiver<Value>,
     stderr: Receiver<String>,
     pending: HashMap<u64, Value>,
+    sessions: Vec<String>,
     /// Private HOME for this run, removed on drop.
     home: PathBuf,
     notifications: Vec<Value>,
@@ -235,6 +236,7 @@ impl RpcClient {
             responses,
             stderr: stderr_rx,
             pending: HashMap::new(),
+            sessions: Vec::new(),
             home,
             notifications: Vec::new(),
             binary_copy,
@@ -322,8 +324,41 @@ impl RpcClient {
     }
 
     fn stop_process(mut self) {
+        self.cleanup_sessions();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    fn cleanup_sessions(&mut self) {
+        let sessions = std::mem::take(&mut self.sessions);
+        let arguments = if sessions.is_empty() {
+            vec![json!({})]
+        } else {
+            sessions
+                .into_iter()
+                .map(|session| json!({"session_id":session}))
+                .collect()
+        };
+        for (index, arguments) in arguments.into_iter().enumerate() {
+            let Some(stdin) = &mut self.stdin else { break };
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            let id = 9999 + index;
+            let request = json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"session_stop","arguments":arguments}});
+            let _ = writeln!(stdin, "{request}");
+            let _ = stdin.flush();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while let Ok(message) = self
+                .responses
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                if message["id"] == id {
+                    break;
+                }
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -334,26 +369,7 @@ impl RpcClient {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
-        if let Some(stdin) = &mut self.stdin
-            && self.child.try_wait().ok().flatten().is_none()
-        {
-            let request = json!({
-                "jsonrpc":"2.0",
-                "id":9999,
-                "method":"tools/call",
-                "params":{"name":"session_stop","arguments":{}}
-            });
-            let _ = writeln!(stdin, "{request}");
-            let _ = stdin.flush();
-            let deadline = Instant::now() + Duration::from_secs(35);
-            while let Ok(message) = self.responses.recv_timeout(
-                deadline.saturating_duration_since(Instant::now()),
-            ) {
-                if message["id"] == 9999 {
-                    break;
-                }
-            }
-        }
+        self.cleanup_sessions();
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.home);
@@ -379,12 +395,27 @@ fn initialize(client: &mut RpcClient) {
 }
 
 fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> Value {
+    let selected = arguments["session_id"].as_str().map(str::to_owned);
     client.send(
         id,
         "tools/call",
         json!({"name":name, "arguments":arguments}),
     );
-    client.response(id, Duration::from_secs(45))
+    let response = client.response(id, Duration::from_secs(45));
+    if response["error"].is_null() && !response["result"]["isError"].as_bool().unwrap_or(false) {
+        if name == "session_start" {
+            if let Some(session) = response["result"]["structuredContent"]["session_id"].as_str() {
+                client.sessions.push(session.to_owned());
+            }
+        } else if name == "session_stop" {
+            if let Some(selected) = selected {
+                client.sessions.retain(|session| session != &selected);
+            } else if client.sessions.len() == 1 {
+                client.sessions.clear();
+            }
+        }
+    }
+    response
 }
 
 #[cfg(debug_assertions)]
@@ -1736,71 +1767,170 @@ fn browser_cookies_continue_across_sessions_without_host_writes() {
          CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER,
          encrypted_value BLOB, UNIQUE(host_key,name,path));
          INSERT INTO cookies VALUES('.example.test','session','/',10,x'0010');
-         INSERT INTO cookies VALUES('.example.test','host','/',10,x'0010');"
-    ).expect("seed cookies");
+         INSERT INTO cookies VALUES('.example.test','host','/',10,x'0010');",
+    )
+    .expect("seed cookies");
     let wal = profile.join("Cookies-wal");
     let source_database = std::fs::read(&database).expect("host database bytes");
     let source_wal = std::fs::read(&wal).expect("host WAL bytes");
-    assert!(!profile.join("Cookies-shm").exists(), "EXCLUSIVE fixture unexpectedly uses shared memory");
+    assert!(
+        !profile.join("Cookies-shm").exists(),
+        "EXCLUSIVE fixture unexpectedly uses shared memory"
+    );
     initialize(&mut client);
-    let started = call_tool(&mut client, 2, "session_start", json!({"width":800,"height":600}));
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
     let first_workdir = workdir(&started);
     let created = client.home.join(".config/google-chrome/Default/Cookies");
     let sql = "PRAGMA journal_mode=WAL; UPDATE cookies SET last_update_utc=20, encrypted_value=x'0020'; INSERT INTO cookies VALUES('.example.test','new','/',40,x'0040');";
     let new_sql = "CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER, encrypted_value BLOB, UNIQUE(host_key,name,path)); INSERT INTO cookies VALUES('.example.test','session','/',99,x'0099');";
-    let launched = call_tool(&mut client, 3, "launch_app", json!({"command":format!(
-        "sqlite3 {} {} && mkdir -p {} && sqlite3 {} {}; konsole",
-        shlex::try_quote(&database.display().to_string()).expect("database quote"),
-        shlex::try_quote(sql).expect("SQL quote"),
-        shlex::try_quote(&created.parent().expect("profile parent").display().to_string()).expect("profile quote"),
-        shlex::try_quote(&created.display().to_string()).expect("new database quote"),
-        shlex::try_quote(new_sql).expect("new SQL quote")
-    )}));
-    assert!(!launched["result"]["isError"].as_bool().unwrap_or(false), "{launched}");
-    save_session_image(&mut client, 100, started["result"]["structuredContent"]["session_id"].as_str().expect("session ID"), "cookies-first-session.png");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "sqlite3 {} {} && mkdir -p {} && sqlite3 {} {}; konsole",
+            shlex::try_quote(&database.display().to_string()).expect("database quote"),
+            shlex::try_quote(sql).expect("SQL quote"),
+            shlex::try_quote(&created.parent().expect("profile parent").display().to_string()).expect("profile quote"),
+            shlex::try_quote(&created.display().to_string()).expect("new database quote"),
+            shlex::try_quote(new_sql).expect("new SQL quote")
+        )}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "{launched}"
+    );
+    save_session_image(
+        &mut client,
+        100,
+        started["result"]["structuredContent"]["session_id"]
+            .as_str()
+            .expect("session ID"),
+        "cookies-first-session.png",
+    );
     let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
-    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
     assert!(!first_workdir.exists(), "first session was not cleaned");
-    let saved = client.home.join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies");
-    assert_eq!(std::fs::metadata(&saved).expect("saved jar").permissions().mode() & 0o777, 0o600);
+    let saved = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies");
+    assert_eq!(
+        std::fs::metadata(&saved)
+            .expect("saved jar")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     let persisted = rusqlite::Connection::open(&saved).expect("saved cookies");
-    let count: i64 = persisted.query_row("SELECT count(*) FROM cookies", [], |row| row.get(0))
+    let count: i64 = persisted
+        .query_row("SELECT count(*) FROM cookies", [], |row| row.get(0))
         .expect("persisted cookie count");
     assert_eq!(count, 3);
     drop(persisted);
-    let original: i64 = host.query_row("SELECT last_update_utc FROM cookies WHERE name='session'", [], |row| row.get(0))
+    let original: i64 = host
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
         .expect("host timestamp");
     assert_eq!(original, 10, "session changed the host profile");
-    assert_eq!(std::fs::read(&database).expect("host database after session"), source_database);
-    assert_eq!(std::fs::read(&wal).expect("host WAL after session"), source_wal);
-    assert!(!profile.join("Cookies-shm").exists(), "session opened host shared memory");
+    assert_eq!(
+        std::fs::read(&database).expect("host database after session"),
+        source_database
+    );
+    assert_eq!(
+        std::fs::read(&wal).expect("host WAL after session"),
+        source_wal
+    );
+    assert!(
+        !profile.join("Cookies-shm").exists(),
+        "session opened host shared memory"
+    );
     assert!(!created.exists(), "session created a host profile");
-    host.execute("UPDATE cookies SET last_update_utc=30,encrypted_value=x'0030' WHERE name='host'", [])
-        .expect("real browser refresh");
-    let started = call_tool(&mut client, 5, "session_start", json!({"width":800,"height":600}));
+    host.execute(
+        "UPDATE cookies SET last_update_utc=30,encrypted_value=x'0030' WHERE name='host'",
+        [],
+    )
+    .expect("real browser refresh");
+    let started = call_tool(
+        &mut client,
+        5,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
     let second_workdir = workdir(&started);
     let exported = client.home.join("merged-cookies.sqlite");
-    let result = call_tool(&mut client, 6, "export_file", json!({
-        "session_path":database,"host_path":exported
-    }));
-    assert!(!result["result"]["isError"].as_bool().unwrap_or(false), "{result}");
+    let result = call_tool(
+        &mut client,
+        6,
+        "export_file",
+        json!({
+            "session_path":database,"host_path":exported
+        }),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
     let merged = rusqlite::Connection::open(exported).expect("merged jar");
-    let rows = merged.prepare("SELECT name,last_update_utc,hex(encrypted_value) FROM cookies ORDER BY name")
-        .expect("merged query").query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
-        .expect("merged rows").collect::<rusqlite::Result<Vec<_>>>().expect("merged values");
-    assert_eq!(rows, vec![("host".to_owned(),30,"0030".to_owned()),
-        ("new".to_owned(),40,"0040".to_owned()),("session".to_owned(),20,"0020".to_owned())]);
+    let rows = merged
+        .prepare("SELECT name,last_update_utc,hex(encrypted_value) FROM cookies ORDER BY name")
+        .expect("merged query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("merged rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("merged values");
+    assert_eq!(
+        rows,
+        vec![
+            ("host".to_owned(), 30, "0030".to_owned()),
+            ("new".to_owned(), 40, "0040".to_owned()),
+            ("session".to_owned(), 20, "0020".to_owned())
+        ]
+    );
     let new_export = client.home.join("new-profile-cookies.sqlite");
-    let result = call_tool(&mut client, 101, "export_file", json!({
-        "session_path":created,"host_path":new_export
-    }));
-    assert!(!result["result"]["isError"].as_bool().unwrap_or(false), "{result}");
+    let result = call_tool(
+        &mut client,
+        101,
+        "export_file",
+        json!({
+            "session_path":created,"host_path":new_export
+        }),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
     let restored = rusqlite::Connection::open(new_export).expect("new profile jar");
-    let updated: i64 = restored.query_row("SELECT last_update_utc FROM cookies WHERE name='session'", [], |row| row.get(0))
+    let updated: i64 = restored
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
         .expect("new profile cookie");
     assert_eq!(updated, 99, "profiles shared a cookie jar");
     let stopped = call_tool(&mut client, 7, "session_stop", json!({}));
-    assert!(!stopped["result"]["isError"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
     assert!(!second_workdir.exists(), "second session was not cleaned");
     client.stop_process();
 }
@@ -1975,6 +2105,7 @@ fn browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned() {
         INSERT INTO cookies VALUES('.example.test','kept','/','',2,443,10,0,0,x'0010');
         INSERT INTO cookies VALUES('.example.test','kept','/','https://partition.test',2,443,10,0,0,x'0010');
         INSERT INTO cookies VALUES('.example.test','expired','/','',2,443,10,1,1,x'0010');
+        INSERT INTO cookies VALUES('.example.test','zero-expired','/','',2,443,10,0,1,x'0010');
         INSERT INTO cookies VALUES('.example.test','future','/','',2,443,10,{},1,x'0010');
         INSERT INTO cookies VALUES('.example.test','session','/','',2,443,10,0,0,x'0010');", now + 3_600_000_000)).expect("seed jar");
     let unsupported = client.home.join(".config/google-chrome/Other/Cookies");
@@ -2026,18 +2157,25 @@ fn browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned() {
         "{updated}"
     );
     save_session_image(&mut client, 6, &a_id, "cookies-deletion-session-a.png");
+    // Both stops run at once: either lock acquisition order must preserve the
+    // deletion and the other session's newer row/profile partition identities.
     for (id, session) in [(7, &a_id), (8, &b_id)] {
-        let stopped = call_tool(
-            &mut client,
+        client.send(
             id,
-            "session_stop",
-            json!({"session_id":session}),
+            "tools/call",
+            json!({"name":"session_stop","arguments":{"session_id":session}}),
         );
+    }
+    for id in [7, 8] {
+        let stopped = client.response(id, Duration::from_secs(45));
         assert!(
-            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            stopped["error"].is_null() && !stopped["result"]["isError"].as_bool().unwrap_or(false),
             "{stopped}"
         );
     }
+    client
+        .sessions
+        .retain(|session| session != &a_id && session != &b_id);
     assert!(!workdir(&a).exists() && !workdir(&b).exists());
     assert_eq!(std::fs::read(&database).expect("unchanged host"), original);
     assert_eq!(
