@@ -1968,6 +1968,35 @@ fn session_sqlite_rotation_probe() {
             .is_none(),
         "alias exposed session storage"
     );
+    assert!(
+        std::fs::read_dir(parent.join(".cache/google-chrome"))
+            .expect("hidden browser cache")
+            .next()
+            .is_none(),
+        "data alias exposed the hidden browser cache"
+    );
+    for entry in std::fs::read_dir("/run/kwin-mcp-host-sqlite").expect("data aliases") {
+        assert!(
+            !entry
+                .expect("data alias")
+                .path()
+                .join("hidden-cache.sqlite")
+                .exists(),
+            "a data alias below a hidden ancestor exposed its database"
+        );
+    }
+    if let Ok(aliases) = std::fs::read_dir("/run/kwin-mcp-host-sockets") {
+        for entry in aliases {
+            assert!(
+                !entry
+                    .expect("socket alias")
+                    .path()
+                    .join("hidden-helper.sock")
+                    .exists(),
+                "a helper alias below a hidden ancestor exposed its socket"
+            );
+        }
+    }
     use std::os::unix::fs::FileTypeExt;
     assert!(
         !std::fs::metadata(parent.join("host-graphical.sock"))
@@ -2038,6 +2067,15 @@ fn session_follows_host_sqlite_wal_rotation() {
     let mut client = RpcClient::start();
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
+    let hidden_cache = directory.join(".cache/google-chrome/nested");
+    std::fs::create_dir_all(&hidden_cache).expect("nested browser cache");
+    let cache_database = rusqlite::Connection::open(hidden_cache.join("hidden-cache.sqlite"))
+        .expect("hidden cache fixture database");
+    cache_database.execute_batch("pragma journal_mode=wal; create table private_cache(value); insert into private_cache values('synthetic');")
+        .expect("live nested cache fixture");
+    let _hidden_helper =
+        std::os::unix::net::UnixListener::bind(hidden_cache.join("hidden-helper.sock"))
+            .expect("hidden helper socket fixture");
     let _helper_socket = std::os::unix::net::UnixListener::bind(directory.join("host-helper.sock"))
         .expect("host helper socket fixture");
     struct GraphicalFixture(Child);
@@ -2175,6 +2213,7 @@ fn session_follows_host_sqlite_wal_rotation() {
             "host writer never ran during generation {generation}"
         );
     }
+    drop(cache_database);
     call_tool(&mut client, 10, "session_stop", json!({}));
     assert!(!runtime.exists(), "session workdir remains");
     client.stop_process();

@@ -3444,6 +3444,15 @@ impl OverlayPlan {
             command.arg("--tmpfs").arg(path);
         }
         for (index, source) in self.sqlite_binds.iter().enumerate() {
+            // A hidden ancestor may have been added after alias discovery.
+            // Do not recover its descendants through a separate mount.
+            if self
+                .empty_dirs
+                .iter()
+                .any(|hidden| source.starts_with(hidden))
+            {
+                continue;
+            }
             let destination = PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}"));
             command.arg("--ro-bind").arg(source).arg(&destination);
             // Aliases must not bypass the HOME paths hidden elsewhere in the plan.
@@ -3464,6 +3473,13 @@ impl OverlayPlan {
             }
         }
         for (index, source) in self.socket_binds.iter().enumerate() {
+            if self
+                .empty_dirs
+                .iter()
+                .any(|hidden| source.starts_with(hidden))
+            {
+                continue;
+            }
             let destination = PathBuf::from(format!("{HOST_SOCKET_ROOT}/{index}"));
             command
                 .arg("--dir")
