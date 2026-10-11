@@ -3817,9 +3817,10 @@ fn prepare_browser_cookies(
         let mut profiles = std::collections::BTreeSet::new();
         for directory in [&host, &saved] {
             if let Ok(entries) = std::fs::read_dir(directory) {
-                for entry in entries.flatten().filter(|entry| {
-                    entry.file_type().is_ok_and(|kind| kind.is_dir())
-                }) {
+                for entry in entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                {
                     profiles.insert(entry.file_name());
                 }
             }
@@ -3833,15 +3834,26 @@ fn prepare_browser_cookies(
                 }
                 let upper = upper_file(plan, &database)?;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
-                        kwin_mcp::browser_cookies::merge(&upper, &previous)
-                    })
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper)
+                        .and_then(|()| kwin_mcp::browser_cookies::merge(&upper, &previous))
                 } else {
                     kwin_mcp::browser_cookies::snapshot(&previous, &upper)
                 };
                 if let Err(error) = result {
-                    eprintln!("session_start: cookie continuity unavailable for {}: {error:#}",
-                        database.display());
+                    // Never expose a live lower-layer WAL after a failed copy.
+                    // A saved jar is a safe fallback; without one, fail startup
+                    // rather than let the browser open an incoherent profile.
+                    if previous.is_file() {
+                        eprintln!(
+                            "session_start: using saved cookies for {}: {error:#}",
+                            database.display()
+                        );
+                        kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
+                    } else {
+                        return Err(
+                            error.context(format!("snapshot cookies for {}", database.display()))
+                        );
+                    }
                 }
             }
         }
@@ -4126,7 +4138,9 @@ fn prepare_host_view(
         .filter(|database| {
             !discarded.contains(database)
                 && !(database.file_name().is_some_and(|name| name == "Cookies")
-                    && BROWSER_CONFIG_DIRS.iter().any(|config| database.starts_with(target.join(config))))
+                    && BROWSER_CONFIG_DIRS
+                        .iter()
+                        .any(|config| database.starts_with(target.join(config))))
         })
     {
         match snapshot_live_sqlite(&overlay_plan, &database) {
@@ -5183,13 +5197,112 @@ impl WorkdirOwnership {
 }
 
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests. The session-local wallet is
-/// dropped first; nothing on the host is touched.
+/// async workers that answer other MCP requests. Browsers flush before the
+/// session-local wallet and sandbox stop; nothing on the host is touched.
 async fn teardown_blocking(mut sess: Session) {
+    let sandbox_pid = sess.sandbox_child.id();
+    let _ = tokio::task::spawn_blocking(move || close_session_browsers(sandbox_pid)).await;
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
     let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
+}
+
+const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
+/// Chromium's main process handles SIGTERM by running graceful shutdown, which
+/// flushes pending cookies. Signal only browser parents descended from this
+/// sandbox, while their network services, compositor and wallet remain alive.
+/// Group-wide SIGTERM kills those services before the cookie flush completes.
+fn close_session_browsers(sandbox_pid: u32) {
+    let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
+        return;
+    };
+    let Ok(processes) = procfs::process::all_processes() else {
+        return;
+    };
+    let processes = processes
+        .flatten()
+        .filter_map(|process| {
+            let stat = process.stat().ok()?;
+            Some((process, stat))
+        })
+        .collect::<Vec<_>>();
+    let mut descendants = std::collections::HashSet::from([sandbox_pid]);
+    loop {
+        let before = descendants.len();
+        for (process, stat) in &processes {
+            if descendants.contains(&stat.ppid) {
+                descendants.insert(process.pid);
+            }
+        }
+        if before == descendants.len() {
+            break;
+        }
+    }
+    let mut browsers = Vec::new();
+    for (process, stat) in processes {
+        if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
+            continue;
+        }
+        let Ok(command) = process.cmdline() else {
+            continue;
+        };
+        if command
+            .iter()
+            .any(|arg| arg == "--type" || arg.starts_with("--type="))
+        {
+            continue;
+        }
+        let Ok(executable) = process.exe() else {
+            continue;
+        };
+        let Some(name) = executable.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        if !BROWSER_COMMANDS.contains(&name)
+            || matches!(name, "code" | "codium" | "vscodium" | "electron")
+        {
+            continue;
+        }
+        if process
+            .stat()
+            .is_ok_and(|current| current.starttime == stat.starttime)
+        {
+            if let Err(error) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                eprintln!(
+                    "teardown: browser {} shutdown signal failed: {error}",
+                    process.pid
+                );
+            } else {
+                browsers.push((process, stat.starttime));
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + BROWSER_SHUTDOWN_GRACE;
+    while !browsers.is_empty() {
+        browsers.retain(|(process, started)| {
+            process
+                .stat()
+                .is_ok_and(|stat| stat.starttime == *started && stat.state != 'Z')
+        });
+        if browsers.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "teardown: {} browser(s) did not finish cookie flush within {:?}",
+                browsers.len(),
+                BROWSER_SHUTDOWN_GRACE
+            );
+            break;
+        }
+        std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+    }
 }
 
 fn teardown(mut sess: Session) {

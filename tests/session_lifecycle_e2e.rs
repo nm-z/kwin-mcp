@@ -1806,6 +1806,152 @@ fn browser_cookies_continue_across_sessions_without_host_writes() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, input devices, and a live GPU session"]
+fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    struct Writer {
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("WAL writer finished");
+            }
+        }
+    }
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let relative = ".config/google-chrome/Profile 2/Cookies";
+    let database = client.home.join(relative);
+    let saved = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies")
+        .join(relative);
+    let schema = "CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER,
+        encrypted_value BLOB, UNIQUE(host_key,name,path));
+        WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2048)
+        INSERT INTO cookies SELECT '.example.test',printf('cookie%d',x),'/',0,zeroblob(1024) FROM n;";
+    for path in [&database, &saved] {
+        std::fs::create_dir_all(path.parent().expect("jar parent")).expect("jar directory");
+        rusqlite::Connection::open(path)
+            .expect("jar")
+            .execute_batch(schema)
+            .expect("jar schema");
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let generation = Arc::new(AtomicI64::new(0));
+    let writer_stop = stop.clone();
+    let writer_generation = generation.clone();
+    let writer_database = database.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let writer = Writer {
+        stop,
+        thread: Some(thread::spawn(move || {
+            let host = rusqlite::Connection::open(writer_database).expect("writer connection");
+            host.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").expect("exclusive WAL");
+            ready_tx.send(()).expect("writer ready");
+            let mut generation = 0i64;
+            while !writer_stop.load(Ordering::SeqCst) {
+                generation += 1;
+                host.execute(
+                    "UPDATE cookies SET last_update_utc=?1,encrypted_value=CAST(?1 AS BLOB)",
+                    [generation],
+                )
+                .expect("atomic cookie generation");
+                writer_generation.store(generation, Ordering::SeqCst);
+                host.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .expect("concurrent checkpoint");
+                thread::sleep(Duration::from_millis(5));
+            }
+        })),
+    };
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("WAL fixture started");
+    initialize(&mut client);
+    let mut observed_live_generation = false;
+    for cycle in 0..4u64 {
+        let started = call_tool(
+            &mut client,
+            10 + cycle * 10,
+            "session_start",
+            json!({"width":800,"height":600}),
+        );
+        let session_workdir = workdir(&started);
+        let exported = client.home.join(format!("wal-snapshot-{cycle}.sqlite"));
+        let result = call_tool(
+            &mut client,
+            11 + cycle * 10,
+            "export_file",
+            json!({"session_path":database,"host_path":exported}),
+        );
+        assert!(
+            !result["result"]["isError"].as_bool().unwrap_or(false),
+            "{result}"
+        );
+        let snapshot = rusqlite::Connection::open(&exported).expect("snapshot");
+        let check: String = snapshot
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity check");
+        assert_eq!(check, "ok");
+        let (rows, versions, minimum, maximum): (i64, i64, i64, i64) = snapshot.query_row(
+            "SELECT count(*),count(DISTINCT last_update_utc),min(last_update_utc),max(last_update_utc) FROM cookies",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).expect("snapshot generation");
+        assert_eq!(rows, 2048);
+        assert_eq!(versions, 1, "snapshot mixed concurrent transactions");
+        assert_eq!(minimum, maximum);
+        assert!(maximum <= generation.load(Ordering::SeqCst));
+        observed_live_generation |= maximum > 0;
+        if cycle == 0 {
+            let launched = call_tool(&mut client, 12, "launch_app", json!({"command":"konsole"}));
+            assert!(
+                !launched["result"]["isError"].as_bool().unwrap_or(false),
+                "{launched}"
+            );
+            save_session_image(
+                &mut client,
+                13,
+                &session_handle(&started),
+                "cookies-concurrent-wal.png",
+            );
+        }
+        let stopped = call_tool(&mut client, 14 + cycle * 10, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+        assert!(!session_workdir.exists());
+    }
+    drop(writer);
+    assert!(
+        observed_live_generation,
+        "all snapshots fell back to saved state"
+    );
+    assert!(
+        !database.with_file_name("Cookies-shm").exists(),
+        "opened host shared memory"
+    );
+    let host_bytes = std::fs::read(&database).expect("host snapshot after writer stopped");
+    let started = call_tool(
+        &mut client,
+        60,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_workdir = workdir(&started);
+    call_tool(&mut client, 61, "session_stop", json!({}));
+    assert!(!session_workdir.exists());
+    assert_eq!(
+        std::fs::read(&database).expect("unchanged host jar"),
+        host_bytes
+    );
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, python3, input devices, and a live GPU session"]
 fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
     assert_eq!(
