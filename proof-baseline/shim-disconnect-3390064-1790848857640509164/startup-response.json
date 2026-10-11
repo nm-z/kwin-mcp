@@ -1,0 +1,38 @@
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "kwin-mcp v0.1.2.8 (54f4222) — session started bus=:1.1 kwin=:1.7 display=800x600 viewer=closed",
+        "type": "text"
+      },
+      {
+        "text": "session_id: s3390083\nThis is your own isolated session. Pass session_id=\"s3390083\" to every other kwin-mcp tool call you make for it, and to session_stop when done.",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "structuredContent": {
+      "bus": ":1.1",
+      "commit": "54f4222",
+      "height": 600,
+      "kwin_unique": ":1.7",
+      "session_id": "s3390083",
+      "status": "started",
+      "version": "v0.1.2.8",
+      "viewer": {
+        "log": "/tmp/kwin-mcp-3390083/viewer.log",
+        "reason": "viewer not open",
+        "state": "closed"
+      },
+      "wallet": {
+        "entries": 0,
+        "mode": "disabled",
+        "reason": "org.kde.ksecretd is not running on the host; kwin-mcp does not start it"
+      },
+      "width": 800,
+      "workdir": "/tmp/kwin-mcp-3390083"
+    }
+  }
+}

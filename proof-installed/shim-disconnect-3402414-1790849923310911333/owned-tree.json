@@ -1,0 +1,255 @@
+{
+  "live_tmpdir": "/tmp",
+  "private_cli_tmpdir": "/tmp/kmd-3402414-1790849923310911333",
+  "private_home": "/home/nate/builds/kwin-mcp-lifecycle/target/tmp/shim-disconnect-3402414-1790849923310911333",
+  "processes": [
+    {
+      "comm": "kwin-mcp-shim",
+      "pid": 3402467,
+      "starttime": 33564037,
+      "state": null
+    },
+    {
+      "comm": "kwin-mcp",
+      "pid": 3402483,
+      "starttime": 33564052,
+      "state": null
+    },
+    {
+      "comm": "bash",
+      "pid": 3402485,
+      "starttime": 33564055,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402498,
+      "starttime": 33564059,
+      "state": null
+    },
+    {
+      "comm": "xdg-dbus-proxy",
+      "pid": 3402501,
+      "starttime": 33564084,
+      "state": null
+    },
+    {
+      "comm": "dbus-daemon",
+      "pid": 3402508,
+      "starttime": 33564086,
+      "state": null
+    },
+    {
+      "comm": "xdg-dbus-proxy",
+      "pid": 3402511,
+      "starttime": 33564093,
+      "state": null
+    },
+    {
+      "comm": "passt.avx2",
+      "pid": 3402516,
+      "starttime": 33564101,
+      "state": null
+    },
+    {
+      "comm": "bwrap",
+      "pid": 3402517,
+      "starttime": 33564104,
+      "state": null
+    },
+    {
+      "comm": "bwrap",
+      "pid": 3402527,
+      "starttime": 33564107,
+      "state": null
+    },
+    {
+      "comm": "bash",
+      "pid": 3402529,
+      "starttime": 33564110,
+      "state": null
+    },
+    {
+      "comm": "kwin-mcp-exe",
+      "pid": 3402530,
+      "starttime": 33564110,
+      "state": null
+    },
+    {
+      "comm": "fc-cache",
+      "pid": 3402534,
+      "starttime": 33564111,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402536,
+      "starttime": 33564160,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402544,
+      "starttime": 33564261,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402551,
+      "starttime": 33564361,
+      "state": null
+    },
+    {
+      "comm": "dbus-daemon",
+      "pid": 3402559,
+      "starttime": 33564448,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402560,
+      "starttime": 33564448,
+      "state": null
+    },
+    {
+      "comm": "kwin_wayland",
+      "pid": 3402563,
+      "starttime": 33564459,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402565,
+      "starttime": 33564462,
+      "state": null
+    },
+    {
+      "comm": "pipewire",
+      "pid": 3402570,
+      "starttime": 33564494,
+      "state": null
+    },
+    {
+      "comm": "wireplumber",
+      "pid": 3402571,
+      "starttime": 33564494,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402591,
+      "starttime": 33564562,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402610,
+      "starttime": 33564663,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402651,
+      "starttime": 33564763,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402679,
+      "starttime": 33564865,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402685,
+      "starttime": 33564966,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402694,
+      "starttime": 33565067,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402727,
+      "starttime": 33565168,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402734,
+      "starttime": 33565269,
+      "state": null
+    },
+    {
+      "comm": "at-spi-bus-laun",
+      "pid": 3402744,
+      "starttime": 33565349,
+      "state": null
+    },
+    {
+      "comm": "dbus-daemon",
+      "pid": 3402750,
+      "starttime": 33565350,
+      "state": null
+    },
+    {
+      "comm": "dconf-service",
+      "pid": 3402752,
+      "starttime": 33565351,
+      "state": null
+    },
+    {
+      "comm": "at-spi2-registr",
+      "pid": 3402760,
+      "starttime": 33565354,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402765,
+      "starttime": 33565370,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402783,
+      "starttime": 33565471,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402790,
+      "starttime": 33565572,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402797,
+      "starttime": 33565673,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402802,
+      "starttime": 33565773,
+      "state": null
+    },
+    {
+      "comm": "sleep",
+      "pid": 3402809,
+      "starttime": 33565875,
+      "state": null
+    },
+    {
+      "comm": "recording-serve",
+      "pid": 3402818,
+      "starttime": 33566011,
+      "state": null
+    }
+  ],
+  "server_binary": "/home/nate/kwin-mcp/target/release/kwin-mcp",
+  "shim_pid": 3402467
+}

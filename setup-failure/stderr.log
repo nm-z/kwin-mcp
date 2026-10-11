@@ -1,0 +1,55 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/builds/kwin-mcp-lifecycle/target/tmp/shim-disconnect-3386443-1790848527003942659/recording-server.sh; hot reload watching the binary only
+kwin-mcp-shim: started child 3386480
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.8 (54f4222) session_start
+session_start: virtual display 800x600
+session_start: host_xdg_dir ready path=/tmp/kmd-3386443-1790848527003942659/kwin-mcp-3386480
+session_start: stage: scanning host mounts, sockets, and processes
+session_start: mount inventory=33 overlay-exclusions=0
+session_start: overlay plan=whole overlays=1 read-only-mounts=0
+session_start: marked 0 browser profile(s) as cleanly exited in the session copy; 1 saved browser session dir(s) start empty
+session_start: uinput mouse=/dev/input/event7 keyboard=/dev/input/event8
+session_start: stage: starting host D-Bus proxies
+session_start: stage: starting the KWallet mediator
+session_start: KWallet: org.kde.ksecretd is not running on the host; kwin-mcp does not start it
+session_start: MemoryHigh=3221225472 MemoryMax=4294967296 MemorySwapMax=1073741824 bytes
+session_start: FUSE bridge enabled (fusermount, fusermount3)
+session_start: stage: spawning the pasta and bwrap sandbox
+session_start: pasta spawned pid=3386518
+session_start: stage: waiting for the container D-Bus daemon
+session_start: dbus-ready
+session_start: creating proxy_conn
+session_start: proxy_conn owns org.kde.KWin
+session_start: input devices registered on proxy_conn
+session_start: bridge-ready signaled, KWin starting
+session_start: stage: waiting for KWin's Wayland socket
+/tmp/kmd-3386443-1790848527003942659/kwin-mcp-3386480/entrypoint.sh: line 22: at-spi-bus-launcher: command not found
+[W][02:55:38.332043] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][02:55:38.332604] mod.rt       | [     module-rt.c:  995 do_rtkit_setup()] RTKit does not give us MaxRealtimePriority, using 1
+[W][02:55:38.340098] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][02:55:38.340314] mod.rt       | [     module-rt.c: 1000 do_rtkit_setup()] RTKit does not give us MinNiceLevel, using 0
+[W][02:55:38.348021] mod.rt       | [     module-rt.c:  331 translate_error()] RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+[W][02:55:38.348153] mod.rt       | [     module-rt.c: 1005 do_rtkit_setup()] RTKit does not give us RTTimeUSecMax, using -1
+W 02:55:38.392638             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 02:55:38.393326             mod.rt ../pipewire/src/modules/module-rt.c:995:do_rtkit_setup: RTKit does not give us MaxRealtimePriority, using 1
+W 02:55:38.396276             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 02:55:38.396647             mod.rt ../pipewire/src/modules/module-rt.c:1000:do_rtkit_setup: RTKit does not give us MinNiceLevel, using 0
+W 02:55:38.398453             mod.rt ../pipewire/src/modules/module-rt.c:331:translate_error: RTKit error: org.freedesktop.DBus.Error.ServiceUnknown
+W 02:55:38.398580             mod.rt ../pipewire/src/modules/module-rt.c:1005:do_rtkit_setup: RTKit does not give us RTTimeUSecMax, using -1
+N 02:55:38.730788 wp-internal-comp-l ../wireplumber/lib/wp/private/internal-comp-loader.c:588:on_component_loaded: <WpCore:0x55ab485105d0> optional component 'support.logind [module: libwireplumber-module-logind]' failed to load: failed to start systemd logind monitor: -2 (No such file or directory)
+N 02:55:38.730845 wp-internal-comp-l ../wireplumber/lib/wp/private/internal-comp-loader.c:640:wp_component_array_load_task_execute_step: <WpCore:0x55ab485105d0> skipping component 'monitor.bluez.seat-monitoring [virtual]' because some of its dependencies were not loaded
+E 02:55:38.777592            default ../pipewire/spa/plugins/bluez5/upower.c:54:upower_get_percentage_properties_reply: Failed to get percentage from UPower: org.freedesktop.DBus.Error.NameHasNoOwner
+W 02:55:38.782280         spa.bluez5 ../pipewire/spa/plugins/bluez5/bluez5-dbus.c:6590:get_managed_objects_reply: BlueZ system service is not available
+N 02:55:38.817447          wp-device ../wireplumber/lib/wp/device.c:770:wp_spa_device_new_from_spa_factory: SPA handle 'api.libcamera.enum.manager' could not be loaded; is it installed?
+N 02:55:38.817510 s-monitors-libcame enumerate-device.lua:30:chunk: PipeWire's libcamera SPA plugin is missing or broken. Some camera types may not be supported.
+pci id for fd 8: 10de:13f2, driver (null)
+pci id for fd 9: 10de:13f2, driver (null)
+pci id for fd 10: 10de:13f2, driver (null)
+pci id for fd 9: 10de:13f2, driver (null)
+pci id for fd 10: 10de:13f2, driver (null)
+session_start: session_start exceeded 20s hard limit while waiting for KWin's Wayland socket
+session_start: autoclean removed /tmp/kmd-3386443-1790848527003942659/kwin-mcp-3386480
+kwin-mcp-shim: child 3386480 exited (exit status: 0)
+kwin-mcp-shim: client closed; stopping children

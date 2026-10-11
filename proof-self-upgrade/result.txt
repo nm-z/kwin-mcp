@@ -1,0 +1,4 @@
+shim_pid=3392620
+self_upgrade=true
+post_upgrade_ping=true
+shutdown_exit=0

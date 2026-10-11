@@ -1,0 +1,9 @@
+kwin-mcp-shim: v0.1.2 relaying to /home/nate/builds/kwin-mcp-lifecycle/target/release/kwin-mcp; hot reload watching the binary only
+kwin-mcp-shim: started child 3392641
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable
+kwin-mcp-shim: child 3392641 exited (exit status: 0)
+kwin-mcp-shim: kwin-mcp-shim was rebuilt; re-executing it (no live sessions, the client stays connected)
+kwin-mcp-shim: v0.1.2 (re-executed after a rebuild) relaying to /home/nate/builds/kwin-mcp-lifecycle/target/release/kwin-mcp; hot reload watching the binary only
+kwin-mcp-shim: tool list changed; notified the client
+kwin-mcp-shim: client closed; stopping children

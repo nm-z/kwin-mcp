@@ -1,0 +1,24 @@
+
+running 2 tests
+test last_child_exit_then_stdin_eof_drains_its_descendants ... 
+thread 'last_child_exit_then_stdin_eof_drains_its_descendants' (3384815) panicked at tests/shim_disconnect_e2e.rs:401:9:
+assertion `left == right` failed: {"error":{"code":-32603,"data":{"host_call_blocked":false,"reason":"hard_timeout","stage":"waiting for KWin's Wayland socket"},"message":"session_start exceeded 20s hard limit while waiting for KWin's Wayland socket"},"id":2,"jsonrpc":"2.0"}
+  left: Null
+ right: "started"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test stdin_eof_drains_stopped_server_and_term_resistant_descendant ... 
+thread 'stdin_eof_drains_stopped_server_and_term_resistant_descendant' (3385183) panicked at tests/shim_disconnect_e2e.rs:401:9:
+assertion `left == right` failed: {"error":{"code":-32603,"data":{"host_call_blocked":false,"reason":"hard_timeout","stage":"waiting for KWin's Wayland socket"},"message":"session_start exceeded 20s hard limit while waiting for KWin's Wayland socket"},"id":2,"jsonrpc":"2.0"}
+  left: Null
+ right: "started"
+FAILED
+
+failures:
+
+failures:
+    last_child_exit_then_stdin_eof_drains_its_descendants
+    stdin_eof_drains_stopped_server_and_term_resistant_descendant
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 5 filtered out; finished in 46.33s
+

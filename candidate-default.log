@@ -1,0 +1,18 @@
+
+running 7 tests
+test last_child_exit_then_stdin_eof_drains_its_descendants ... ignored, requires KWin, bubblewrap, input devices, and a GPU session; no host viewer
+test launching_client_fixture ... ignored, subprocess fixture for the launching-client regression
+test scoped_workdir_sweep_preserves_other_owners_and_rejects_invalid_pids ... scoped_sweep: selected_owner=4194305 other_owner=4194306 selected_pair_removed=true other_pair_preserved=true invalid_input_rejected=true
+shim disconnect diagnostics: /home/nate/builds/kwin-mcp-drain/proof-candidate/shim-disconnect-3391103-1790848924352417846
+ok
+test shim_exits_when_launching_client_dies_with_stdin_open ... parent_disconnect: client_pid=3391108 shim_pid=3391111 stdin_retained=true stdout_retained=true exited=true
+shim disconnect diagnostics: /home/nate/builds/kwin-mcp-drain/proof-candidate/shim-disconnect-3391103-1790848924866528006
+ok
+test shim_exits_when_stdout_closes_with_stdin_open ... stdout_disconnect: shim_pid=3391136 stdin_retained=true exited=true
+shim disconnect diagnostics: /home/nate/builds/kwin-mcp-drain/proof-candidate/shim-disconnect-3391103-1790848926124626399
+ok
+test stdin_eof_drains_stopped_server_and_term_resistant_descendant ... ignored, requires KWin, bubblewrap, input devices, and a GPU session; no host viewer
+test stdout_disconnect_removes_its_headless_session ... ignored, requires KWin, bubblewrap, input devices, and a GPU session; no host viewer
+
+test result: ok. 3 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
