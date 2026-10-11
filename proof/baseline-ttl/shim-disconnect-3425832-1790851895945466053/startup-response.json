@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": -32603,
+    "data": {
+      "host_call_blocked": false,
+      "reason": "hard_timeout",
+      "stage": "waiting for KWin's Wayland socket"
+    },
+    "message": "session_start exceeded 20s hard limit while waiting for KWin's Wayland socket"
+  },
+  "id": 2,
+  "jsonrpc": "2.0"
+}

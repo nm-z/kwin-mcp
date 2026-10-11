@@ -1,0 +1,112 @@
+{
+  "live_tmpdir": "/tmp",
+  "private_cli_tmpdir": "/tmp/kmd-3416363-1790851256149739445",
+  "private_home": "/home/nate/builds/kwin-mcp-lifecycle/target/tmp/shim-disconnect-3416363-1790851256149739445",
+  "processes": [
+    {
+      "comm": "kwin-mcp-shim",
+      "pid": 3416367,
+      "starttime": 33697321,
+      "state": "S"
+    },
+    {
+      "comm": "kwin-mcp",
+      "pid": 3416383,
+      "starttime": 33697326,
+      "state": null
+    },
+    {
+      "comm": "xdg-dbus-proxy",
+      "pid": 3416403,
+      "starttime": 33697422,
+      "state": null
+    },
+    {
+      "comm": "dbus-daemon",
+      "pid": 3416408,
+      "starttime": 33697444,
+      "state": null
+    },
+    {
+      "comm": "xdg-dbus-proxy",
+      "pid": 3416411,
+      "starttime": 33697461,
+      "state": null
+    },
+    {
+      "comm": "systemd-run",
+      "pid": 3416423,
+      "starttime": 33697514,
+      "state": null
+    },
+    {
+      "comm": "bwrap",
+      "pid": 3416424,
+      "starttime": 33697541,
+      "state": "S"
+    },
+    {
+      "comm": "bwrap",
+      "pid": 3416441,
+      "starttime": 33697569,
+      "state": "S"
+    },
+    {
+      "comm": "bash",
+      "pid": 3416444,
+      "starttime": 33697575,
+      "state": null
+    },
+    {
+      "comm": "kwin-mcp-exe",
+      "pid": 3416445,
+      "starttime": 33697575,
+      "state": null
+    },
+    {
+      "comm": "fc-cache",
+      "pid": 3416450,
+      "starttime": 33697578,
+      "state": null
+    },
+    {
+      "comm": "dbus-daemon",
+      "pid": 3416516,
+      "starttime": 33698269,
+      "state": null
+    },
+    {
+      "comm": "kwin_wayland",
+      "pid": 3416520,
+      "starttime": 33698283,
+      "state": "Z"
+    },
+    {
+      "comm": "sleep",
+      "pid": 3416521,
+      "starttime": 33698283,
+      "state": null
+    },
+    {
+      "comm": "pipewire",
+      "pid": 3416527,
+      "starttime": 33698318,
+      "state": null
+    },
+    {
+      "comm": "wireplumber",
+      "pid": 3416528,
+      "starttime": 33698318,
+      "state": null
+    },
+    {
+      "comm": "kwin_wayland",
+      "pid": 3416578,
+      "starttime": 33698588,
+      "state": null
+    }
+  ],
+  "server_binary": "/home/nate/kwin-mcp/target/release/kwin-mcp",
+  "shim_binary": "/home/nate/kwin-mcp/target/release/kwin-mcp-shim",
+  "shim_pid": 3416367
+}
