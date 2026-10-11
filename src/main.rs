@@ -1740,6 +1740,10 @@ const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 // context window.
 const A11Y_TREE_MAX_CHARS: usize = 30_000;
 
+// KWin Rules::Force and Rules::Apply values persisted in kwinrulesrc.
+const KWIN_RULE_FORCE: u8 = 2;
+const KWIN_RULE_APPLY_INITIALLY: u8 = 3;
+
 // Let KWin publish an activated window before reading its geometry.
 const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
 /// How long an input send may wait for KWin to drain a full EIS socket.
@@ -6062,6 +6066,14 @@ async fn active_window_info(
 }
 
 #[derive(Deserialize, Serialize)]
+struct WindowFrameGeometry {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Deserialize, Serialize)]
 struct WindowSnapshot {
     id: String,
     title: String,
@@ -6082,6 +6094,8 @@ struct WindowSnapshot {
     y: f64,
     w: f64,
     h: f64,
+    #[serde(rename = "frameGeometry")]
+    frame_geometry: WindowFrameGeometry,
     #[serde(rename = "stackingOrder")]
     stacking_order: i32,
 }
@@ -6155,7 +6169,9 @@ async fn window_snapshots(
              active:w.active,minimized:w.minimized,modal:w.modal,transient:w.transient,\
              dialog:w.dialog,popup:w.popupWindow,\
              transientFor:w.transientFor ? w.transientFor.internalId.toString() : null,\
-             x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder\
+             x:g.x,y:g.y,w:g.width,h:g.height,\
+             frameGeometry:{x:w.frameGeometry.x,y:w.frameGeometry.y,\
+             width:w.frameGeometry.width,height:w.frameGeometry.height},stackingOrder:w.stackingOrder\
            });\
          }",
     )
@@ -7080,7 +7096,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
                 Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
-                {size_line} Windows are auto-maximized.",
+                {size_line} Windows start maximized and can be restored and resized later. Use keyboard_key super+Backspace to toggle maximization. To resize a restored window, hold super with keyboard_press, mouse_drag with button=right from inside its lower-right corner to the desired corner, then keyboard_release super. Verify window_list geometry and screenshot dimensions after resizing.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -7270,9 +7286,9 @@ impl KwinMcp {
         let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
         std::fs::write(
             &kwinrulesrc_path,
-            "[1]\nDescription=No decorations, maximized\nnoborder=true\nnoborderrule=2\n\
-             maximizehoriz=true\nmaximizehorizrule=2\nmaximizevert=true\nmaximizevertrule=2\n\
-             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n",
+            format!("[1]\nDescription=No decorations, initially maximized\nnoborder=true\nnoborderrule={KWIN_RULE_FORCE}\n\
+             maximizehoriz=true\nmaximizehorizrule={KWIN_RULE_APPLY_INITIALLY}\nmaximizevert=true\nmaximizevertrule={KWIN_RULE_APPLY_INITIALLY}\n\
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"),
         )
         .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
         let kscreenlockerrc_path = host_xdg_dir.join("kscreenlockerrc");
@@ -8611,7 +8627,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "window_list",
-        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized state, and modal/transient relationships. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
+        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, client geometry and actual frameGeometry, active/minimized state, and modal/transient relationships. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
         annotations(read_only_hint = true)
     )]
     async fn window_list(
