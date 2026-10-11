@@ -1907,6 +1907,27 @@ fn session_sqlite_probe() {
 fn session_sqlite_rotation_probe() {
     let database = std::env::var("KWIN_SQLITE_PROBE_DB").expect("probe database");
     let report = std::env::var("KWIN_SQLITE_PROBE_REPORT").expect("probe report");
+    let alias = std::fs::canonicalize(&database).expect("live database alias");
+    let parent = alias.parent().expect("alias directory");
+    assert!(
+        alias.starts_with("/run/kwin-mcp-host-sqlite"),
+        "missing read-only directory alias"
+    );
+    assert!(
+        std::fs::read_dir(parent.join(".cache/kwin-mcp"))
+            .expect("hidden disk root")
+            .next()
+            .is_none(),
+        "alias exposed session storage"
+    );
+    use std::os::unix::fs::FileTypeExt;
+    assert!(
+        !std::fs::metadata(parent.join("host-graphical.sock"))
+            .expect("masked host socket")
+            .file_type()
+            .is_socket(),
+        "alias exposed a graphical host socket"
+    );
     let reader =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("session reader after WAL rotation");
@@ -1925,9 +1946,10 @@ fn session_sqlite_rotation_probe() {
 fn session_follows_host_sqlite_wal_rotation() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
-    let directory = client.home.join(".codex");
-    std::fs::create_dir(&directory).expect("fixture directory");
+    let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
+    let _graphical = std::os::unix::net::UnixListener::bind(directory.join("host-graphical.sock"))
+        .expect("graphical socket fixture");
     let mut host = rusqlite::Connection::open(&database).expect("host database");
     host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0);")
         .expect("seed generation");
