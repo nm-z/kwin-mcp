@@ -80,7 +80,9 @@ begin
     end
     members=Dir.glob(cgroup+'/**/cgroup.procs').flat_map {|f| File.readlines(f).map(&:to_i)}.uniq
     if mode=='oom'
-      manager.call('set-property',unit,'MemoryOOMGroup=yes')
+      # Linux cgroup-v2 memory.oom.group applies only to this owned scope.
+      File.write(cgroup+'/memory.oom.group', "1\n")
+      raise 'group OOM control not applied' unless File.read(cgroup+'/memory.oom.group').strip=='1'
       tool.call('launch_app',{session_id:started['session_id'],command:"ruby -e 'sleep 2; data=[]; 40.times { data << (\"x\" * (64 * 1024 * 1024)); sleep 0.05 }; sleep 30'"})
     else
       manager.call('kill','--signal=KILL',unit)
