@@ -348,9 +348,32 @@ impl Drop for RpcClient {
             let _ = writeln!(stdin, "{request}");
             let _ = stdin.flush();
         }
-        let _ = self.child.kill();
+        // Closing the transport lets the production server stop its scopes.
+        // Killing it immediately after writing session_stop races that cleanup.
+        drop(self.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let clean_exit = loop {
+            if self.child.try_wait().ok().flatten().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if !clean_exit {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.home);
+        if clean_exit {
+            let _ = std::fs::remove_dir_all(&self.home);
+        } else {
+            eprintln!(
+                "retaining {} after uncertain server {} cleanup",
+                self.home.display(),
+                self.child.id()
+            );
+        }
     }
 }
 
@@ -1768,6 +1791,18 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         .expect("seed host cookie fixture");
 
     // A host app keeps writing its thread store for the whole session.
+    struct LiveWriter {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for LiveWriter {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(writer) = self.thread.take() {
+                let _ = writer.join();
+            }
+        }
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = {
         let (stop, database) = (stop.clone(), database.clone());
@@ -1786,6 +1821,10 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
                 thread::sleep(Duration::from_millis(10));
             }
         })
+    };
+    let mut writer = LiveWriter {
+        stop,
+        thread: Some(writer),
     };
     thread::sleep(Duration::from_millis(300));
 
@@ -1836,8 +1875,15 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         );
         thread::sleep(Duration::from_millis(200));
     };
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    writer.join().expect("host writer");
+    writer
+        .stop
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    writer
+        .thread
+        .take()
+        .expect("host writer thread")
+        .join()
+        .expect("host writer");
     assert_eq!(
         result.trim(),
         "bad=0 readonly=1 private=1",
