@@ -18,6 +18,10 @@ production stdio entrypoint: `session_start`, affected MCP operations, independe
 GUI/system-state checks, and `session_stop`. Compilation and CPU checks use plain
 `dsh build`. No candidate binary is installed or deployed. Each fixture uses a
 private HOME and cookie state; actual host browser profiles are not modified.
+Each private child server receives `XDG_RUNTIME_DIR=/run/user/1000` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus` explicitly. The fixtures
+preserve their private HOME/XDG data/config/cache/state and no-repository setting;
+they do not change the agent's global environment or host application state.
 
 | Regression | Required observations |
 | --- | --- |

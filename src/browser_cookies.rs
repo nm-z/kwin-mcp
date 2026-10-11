@@ -471,7 +471,7 @@ pub fn merge(destination: &Path, source: &Path) -> Result<()> {
         .join(",");
     let predicate = keys
         .iter()
-        .map(|key| format!("{} = ?", quote(key)))
+        .map(|key| format!("{} IS ?", quote(key)))
         .collect::<Vec<_>>()
         .join(" AND ");
     let placeholders = vec!["?"; names.len()].join(",");

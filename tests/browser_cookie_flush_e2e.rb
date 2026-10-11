@@ -49,9 +49,12 @@ environment = {
   'XDG_CACHE_HOME' => File.join(fixture, '.cache'),
   'XDG_DATA_HOME' => File.join(fixture, '.local/share'),
   'XDG_STATE_HOME' => File.join(fixture, '.local/state'),
-  'KWIN_MCP_REPO' => File.join(fixture, 'no-repository')
+  'KWIN_MCP_REPO' => File.join(fixture, 'no-repository'),
+  'XDG_RUNTIME_DIR' => '/run/user/1000',
+  'DBUS_SESSION_BUS_ADDRESS' => 'unix:path=/run/user/1000/bus',
+  'WAYLAND_DISPLAY' => ENV.fetch('WAYLAND_DISPLAY', 'wayland-0')
 }
-environment.each_value { |path| FileUtils.mkdir_p(path) }
+environment.values_at('HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'KWIN_MCP_REPO').each { |path| FileUtils.mkdir_p(path) }
 input, output, errors, process = Open3.popen3(environment, binary, '--autoclean', '--no-viewer')
 stderr = Thread.new { File.open(File.join(evidence, 'browser-flush.stderr.log'), 'w') { |log| errors.each_line { |line| log.write(line); log.flush } } }
 serial = 0

@@ -170,16 +170,8 @@ impl RpcClient {
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("KDEHOME", home.join(".kde"))
-            .env(
-                "XDG_RUNTIME_DIR",
-                std::env::var_os("XDG_RUNTIME_DIR")
-                    .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
-            )
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
-                    .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus")),
-            )
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
             .env(
                 "WAYLAND_DISPLAY",
                 std::env::var_os("WAYLAND_DISPLAY")
