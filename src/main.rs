@@ -1,5 +1,4 @@
 mod input_bridge;
-mod launch_command;
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1256,6 +1255,7 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
     ];
     const STALE_DIRS: &[&str] = &[
         "at-spi",
+        "browser-bin",
         "dbus-1",
         "dconf",
         "doc",
@@ -1480,6 +1480,58 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+const BROWSER_COMMANDS: &[&str] = &[
+    "google-chrome-stable", "google-chrome", "chrome", "chromium", "chromium-browser",
+    "brave", "brave-browser", "vivaldi", "vivaldi-stable", "microsoft-edge",
+    "microsoft-edge-stable", "msedge", "code", "codium", "vscodium", "electron",
+];
+
+// Bash resolves the browser itself, so compound commands and wrappers need no
+// second shell parser in the MCP server.
+const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
+set -e
+name=${0##*/}
+real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
+ozone=0 wallet=0 a11y=0 debug_port=0
+for arg in "$@"; do
+  case "$arg" in
+    --ozone-platform|--ozone-platform=*) ozone=1 ;;
+    --password-store|--password-store=*) wallet=1 ;;
+    --force-renderer-accessibility|--force-renderer-accessibility=*) a11y=1 ;;
+    --remote-debugging-port|--remote-debugging-port=*) debug_port=1 ;;
+  esac
+done
+flags=()
+(( ozone )) || flags+=(--ozone-platform=wayland)
+(( wallet )) || flags+=(--password-store=kwallet6)
+(( a11y )) || flags+=(--force-renderer-accessibility)
+case "$name" in
+  google-chrome*|chrome|microsoft-edge*|msedge*) ;;
+  *)
+    if [[ -n ${KWIN_MCP_CDP_PORT:-} ]]; then
+      (( debug_port )) || flags+=("--remote-debugging-port=$KWIN_MCP_CDP_PORT")
+      [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] || printf cdp > "$KWIN_MCP_BROWSER_MARKER"
+    fi
+    ;;
+esac
+exec "$real" "${flags[@]}" "$@"
+"#;
+
+fn create_browser_wrappers(workdir: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let bin = workdir.join("browser-bin");
+    std::fs::create_dir_all(&bin)?;
+    let wrapper = bin.join("kwin-browser");
+    std::fs::write(&wrapper, BROWSER_WRAPPER)?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    for name in BROWSER_COMMANDS {
+        symlink("kwin-browser", bin.join(name))?;
+    }
+    Ok(bin)
+}
+
+static NEXT_BROWSER_LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Browser launch commands we know how to detect. The container mounts the host
 /// root read-only, so anything on the host's PATH is runnable inside the session
 /// by the same command. Ordered most- to least-common so the injected hint reads
@@ -1676,8 +1728,7 @@ async fn active_window_info(conn: &zbus::Connection, kwin_unique: &str, host_xdg
          var result = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
          w:w.clientGeometry.width,h:w.clientGeometry.height,\
          title:w.caption,id:w.internalId.toString(),\
-         resourceClass:w.resourceClass,resourceName:w.resourceName,\
-         pid:w.pid,cx:c.x,cy:c.y} : null;",
+         cx:c.x,cy:c.y} : null;",
     )
     .await?;
     if json == "null" {
@@ -1858,12 +1909,6 @@ struct WindowGeometry {
     y: f64,
     #[serde(default)]
     id: String,
-    #[serde(default, rename = "resourceClass")]
-    resource_class: String,
-    #[serde(default, rename = "resourceName")]
-    resource_name: String,
-    #[serde(default)]
-    pid: i32,
     #[serde(default)]
     cx: f64,
     #[serde(default)]
@@ -2177,6 +2222,7 @@ impl KwinMcp {
         std::fs::create_dir_all(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
         cleanup_stale_session_files(&host_xdg_dir);
         std::fs::create_dir_all(host_xdg_dir.join("tmp")).map_err(|e| ver_err(e.to_string()))?;
+        create_browser_wrappers(&host_xdg_dir).map_err(|e| ver_err(format!("browser wrappers: {e}")))?;
         eprintln!(
             "session_start: host_xdg_dir ready path={}",
             host_xdg_dir.display()
@@ -3552,7 +3598,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Launch a program inside the container by shell command (e.g. 'chromium https://example.com', 'kate /tmp/file.txt', 'konsole'). Blocks up to ~15s for a new window and returns its ID. Chromium-family apps (chromium, brave, vivaldi, electron, VS Code) get CDP auto-wired for DOM-based element discovery; Google Chrome and Edge block CDP on the default profile, so use chromium when you need CDP. Chromium-family browsers are started with --password-store=kwallet6 so saved logins and cookies decrypt from the host wallet, unless the command already passes --password-store. Injected switches go into the browser's own arguments, so compound commands like 'google-chrome-stable URL && echo done' still configure the browser. The launched app inherits the container's isolated HOME — its $HOME writes land in the session's overlay-upper on host tmpfs, never on real host files."
+        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay."
     )]
     async fn launch_app(
         &self,
@@ -3562,26 +3608,9 @@ impl KwinMcp {
         use std::io::Write;
         use futures::StreamExt;
 
-        // Locate the Chromium-family browser inside the shell command line and
-        // learn which switches its own argv already sets. Scanning the whole
-        // line instead put injected switches on a later command (`chrome URL &&
-        // echo done` handed them to echo) and let any text elsewhere in the
-        // line suppress an injection Chrome needed.
-        let browser = launch_command::find_browser_invocation(&params.command)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        // Google Chrome and Edge block CDP without --user-data-dir, so skip them
-        let cmd_chromium = browser
-            .as_ref()
-            .is_some_and(|found| found.kind == launch_command::BrowserKind::CdpCapable);
-
-        let cdp_port = if cmd_chromium {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
-            let port = listener.local_addr().map_err(KwinError::from)?.port();
-            drop(listener);
-            Some(port)
-        } else {
-            None
-        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(KwinError::from)?;
+        let cdp_port = listener.local_addr().map_err(KwinError::from)?.port();
+        drop(listener);
 
         // Record current active window ID before launching
         let (conn, kwin_unique, xdg, service_bus_address, atspi_bus_address) = {
@@ -3601,42 +3630,18 @@ impl KwinMcp {
             .map(|(_, _, geo)| geo.id)
             .ok();
 
-        let launch_cmd = {
-            let command = match &browser {
-                // Switches go into the browser's own argv, right after the
-                // program word: --ozone-platform=wayland so xdg_popup menus
-                // composite, and --password-store=kwallet6 so credentials come
-                // from the host kwalletd6 reachable on the session service bus.
-                Some(found) => {
-                    let mut switches = Vec::new();
-                    if let Some(port) = cdp_port {
-                        switches.push(format!("--remote-debugging-port={port}"));
-                    }
-                    if !found.has_ozone_platform {
-                        switches.push("--ozone-platform=wayland".to_owned());
-                    }
-                    if !found.has_password_store {
-                        switches.push("--password-store=kwallet6".to_owned());
-                    }
-                    if !found.has_renderer_accessibility {
-                        switches.push("--force-renderer-accessibility".to_owned());
-                    }
-                    eprintln!(
-                        "launch_app: browser={} switches=[{}]",
-                        found.program,
-                        switches.join(" ")
-                    );
-                    found.with_switches(&params.command, &switches)
-                }
-                None => params.command.clone(),
-            };
-            format!(
-                "env DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} bash -c {}",
-                shell_quote(&service_bus_address),
-                shell_quote(&atspi_bus_address),
-                shell_quote(&command),
-            )
-        };
+        let browser_marker = xdg.join(format!(
+            "browser-launch-{}",
+            NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let launch_cmd = format!(
+            "env PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}",
+            shell_quote(&xdg.join("browser-bin").display().to_string()),
+            shell_quote(&service_bus_address),
+            shell_quote(&atspi_bus_address),
+            shell_quote(&browser_marker.display().to_string()),
+            shell_quote(&params.command),
+        );
         {
             let mut guard = self.session.lock().await;
             let sess = guard.as_mut().ok_or_else(|| {
@@ -3657,18 +3662,12 @@ impl KwinMcp {
             }
         }
 
-        // Connect CDP if command hinted Chromium OR window confirms it (5s timeout)
+        // The browser wrapper records CDP intent only when it actually ran.
+        let cdp_requested = std::fs::read(&browser_marker).is_ok_and(|value| value == b"cdp");
+        let _ = std::fs::remove_file(&browser_marker);
         let mut cdp_connected = false;
-        let win_chromium = win_geo.as_ref().map(|g| {
-            let rc = g.resource_class.to_lowercase();
-            let rn = g.resource_name.to_lowercase();
-            eprintln!("launch_app: resourceClass={rc} resourceName={rn} pid={}", g.pid);
-            rc.contains("electron") || rn.contains("electron")
-                || rc.contains("chromium") || rn.contains("chromium")
-                || rc.contains("chrome") || rn.contains("chrome")
-        }).unwrap_or(false);
-        if let Some(port) = cdp_port.filter(|_| cmd_chromium || win_chromium) {
-            let cdp_url = format!("http://127.0.0.1:{port}");
+        if cdp_requested && win_geo.is_some() {
+            let cdp_url = format!("http://127.0.0.1:{cdp_port}");
             for _ in 0..CDP_CONNECT_POLLS {
                 match chromiumoxide::Browser::connect(&cdp_url).await {
                     Ok((browser, mut handler)) => {
