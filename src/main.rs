@@ -10158,6 +10158,33 @@ impl KwinMcp {
     }
 }
 
+const CLI_USAGE: &str = "Usage: kwin-mcp [OPTIONS]\n       kwin-mcp --describe [OPTIONS]\n       kwin-mcp --stats [SECONDS]";
+
+fn print_cli_help() {
+    println!(
+        "kwin-mcp — isolated KDE desktop automation over MCP stdio\n\n\
+{CLI_USAGE}\n\n\
+Options:\n\
+  -h, --help             Print this help and exit\n\
+  --describe             Print MCP initialization and tool schemas as JSON, then exit\n\
+  --width N              Default session width in pixels (default: {VIRTUAL_SCREEN_WIDTH})\n\
+  --height N             Default session height in pixels (default: {VIRTUAL_SCREEN_HEIGHT})\n\
+  --no-override          Prevent session_start from overriding display dimensions\n\
+  --no-viewer            Compatibility option; the viewer already starts on demand\n\
+  --autoclean            Clean up orphaned session workdirs\n\
+  --ttl MINUTES          Expire the session after MINUTES; implies --autoclean\n\
+  --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
+  --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
+  --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
+  --stats [SECONDS]      Print recent session_start statistics (default: {DEFAULT_STATS_SECONDS}s)\n\n\
+With no mode flag, serve MCP requests on stdin/stdout. Display dimensions must\n\
+be {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}; --memory-high must not exceed --memory-max.",
+        DEFAULT_MEMORY_HIGH / GIB_BYTES,
+        DEFAULT_MEMORY_MAX / GIB_BYTES,
+        DEFAULT_MEMORY_SWAP_MAX / GIB_BYTES,
+    );
+}
+
 fn parse_cli_args() -> Result<DisplayConfig, String> {
     parse_cli_args_from(std::env::args().skip(1))
 }
@@ -10199,7 +10226,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
             }
             other => {
                 return Err(format!(
-                    "unknown argument '{other}': usage: kwin-mcp [--describe] [--width N] [--height N] [--no-override] [--no-viewer] [--autoclean] [--ttl MINUTES] [--memory-high GIB] [--memory-max GIB] [--memory-swap-max GIB] | kwin-mcp --stats [SECONDS]"
+                    "unknown argument '{other}'\n{CLI_USAGE}\nTry 'kwin-mcp --help' for options."
                 ));
             }
         }
@@ -10359,6 +10386,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(fuse_bridge::run_client(program));
     }
     match argv.next().as_deref() {
+        Some("-h" | "--help") => {
+            print_cli_help();
+            return Ok(());
+        }
         Some("--describe") => {
             let display = parse_cli_args_from(argv)?;
             let server = SessionRouter::new(display);
