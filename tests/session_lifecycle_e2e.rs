@@ -1594,13 +1594,19 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
-    let host_display = std::env::var_os("XDG_RUNTIME_DIR")
-        .zip(std::env::var_os("WAYLAND_DISPLAY"))
-        .map(|(runtime, display)| PathBuf::from(runtime).join(display));
-    if !host_display.as_deref().is_some_and(std::path::Path::exists) {
-        eprintln!("no host Wayland display; skipping");
-        return;
-    }
+    let host_display = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
+    )
+    .join(
+        std::env::var_os("WAYLAND_DISPLAY")
+            .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
+    );
+    assert!(
+        host_display.exists(),
+        "host Wayland display unavailable: {}",
+        host_display.display()
+    );
     // The default starts without a host viewer.
     let mut client = RpcClient::start();
     initialize(&mut client);
@@ -1616,6 +1622,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         !workdir(&started).join("viewer.log").exists(),
         "session_start launched a viewer"
     );
+    assert!(!workdir(&started).join("pipewire-0").exists(), "default startup launched private media services");
     let launched = call_tool(
         &mut client,
         3,
@@ -1644,6 +1651,10 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         "{opened}\n{viewer_log}"
     );
     assert_eq!(viewer["state"], json!("ready"), "{opened}\n{viewer_log}");
+    assert!(
+        workdir(&started).join("pipewire-0").exists(),
+        "viewer did not start private media services"
+    );
     assert!(
         viewer_log.contains("first frame submitted for presentation"),
         "viewer did not submit its first frame: {opened}\n{viewer_log}"
@@ -4063,6 +4074,85 @@ fn session_overlay_lives_on_disk_and_is_removed_at_stop() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
+fn session_start_defers_media_and_uses_eis_without_uinput() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let runtime = workdir(&started);
+    assert!(
+        !runtime.join("pipewire-0").exists(),
+        "eager PipeWire startup"
+    );
+    let descriptors =
+        std::fs::read_dir(format!("/proc/{}/fd", client.child.id())).expect("server descriptors");
+    assert!(
+        !descriptors
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path())
+                .is_ok_and(|path| path == std::path::Path::new("/dev/uinput"))),
+        "server owns uinput"
+    );
+    let launched = call_tool(&mut client, 3, "launch_app", json!({"command":"konsole"}));
+    assert!(launched["error"].is_null(), "{launched}");
+    let report = runtime.join("eis-proof.txt");
+    let typed = call_tool(
+        &mut client,
+        4,
+        "keyboard_type",
+        json!({"text":format!(
+            "test ! -e /dev/uinput && test ! -d /dev/input && printf EIS_PASS > {}",
+            shlex::try_quote(&report.display().to_string()).expect("quote report"),
+        )}),
+    );
+    assert!(typed["error"].is_null(), "{typed}");
+    call_tool(&mut client, 5, "keyboard_key", json!({"key":"Return"}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("EIS_PASS") {
+        assert!(
+            Instant::now() < deadline,
+            "EIS input or input-device isolation failed"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !runtime.join("pipewire-0").exists(),
+        "input started media services"
+    );
+    call_tool(&mut client, 6, "session_stop", json!({}));
+    assert!(!runtime.exists(), "session workdir remains");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, and a live GPU session"]
+fn session_start_can_opt_in_to_private_media() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480,"audio":true}),
+    );
+    let runtime = workdir(&started);
+    assert!(
+        runtime.join("pipewire-0").exists(),
+        "audio opt-in did not start private PipeWire"
+    );
+    call_tool(&mut client, 3, "session_stop", json!({}));
+    assert!(!runtime.exists(), "session workdir remains");
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
 fn keyboard_key_warns_when_the_browser_page_lacks_focus() {
     assert_eq!(
@@ -4685,7 +4775,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, squashfuse, mksquashfs, input devices, and a live GPU session"]
-fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
+fn session_uses_one_overlay_with_read_only_nested_mounts() {
     use base64::Engine;
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::MetadataExt;
@@ -4781,16 +4871,6 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         file.seek(SeekFrom::End(-9)).expect("fixture tail position");
         file.write_all(b"host-tail").expect("fixture tail");
     }
-    let clone_probe = fixture.join("clone-probe");
-    let reflink = Command::new("cp")
-        .args(["--reflink=always", "--"])
-        .arg(&large)
-        .arg(&clone_probe)
-        .stderr(Stdio::null())
-        .status()
-        .expect("reflink probe")
-        .success();
-    let _ = std::fs::remove_file(&clone_probe);
     let quote =
         |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
     let home_text = home.display().to_string();
@@ -4825,47 +4905,33 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
-    if !reflink {
-        // bwrap creates an empty mountpoint file beneath the read-only bind.
-        let staged = std::fs::metadata(disk.join("overlay-root/project/large.bin"))
-            .expect("bind mountpoint");
-        assert_eq!(staged.len(), 0, "eager oversized copy");
-        assert_eq!(
-            staged.blocks(),
-            0,
-            "oversized file data allocated in staging"
-        );
-    }
-    let fallback = started["result"]["structuredContent"]["oversized_read_only_files"]
-        .as_array()
-        .expect("fallback report");
-    assert_eq!(fallback.contains(&json!(large)), !reflink, "{started}");
     assert!(
-        !fallback.contains(&json!(ordinary)) && !fallback.contains(&json!(explicit)),
-        "{started}"
+        !disk.join("overlay-root").exists(),
+        "split staging was created"
     );
     assert!(
-        disk.join("overlay-root/project/explicit.bin").is_file(),
-        "explicit writable copy missing"
+        !disk.join("overlay-upper/project/ordinary.bin").exists(),
+        "eager ordinary copy"
     );
-    let repeat = call_tool(&mut client, 3, "session_start", json!({}));
+    assert!(
+        !disk.join("overlay-upper/project/large.bin").exists(),
+        "eager oversized copy"
+    );
     assert_eq!(
-        repeat["result"]["structuredContent"]["oversized_read_only_files"],
-        json!(fallback)
+        started["result"]["structuredContent"]["oversized_read_only_files"],
+        json!([])
+    );
+    let bwrap = child_named_process(client.child.id(), "bwrap");
+    let argv = std::fs::read(format!("/proc/{bwrap}/cmdline")).expect("bwrap argv");
+    assert_eq!(
+        argv.split(|byte| *byte == 0)
+            .filter(|arg| *arg == b"--overlay")
+            .count(),
+        1,
+        "multiple overlays"
     );
     let report = dir.join("ancestor-check.txt");
     let script = dir.join("ancestor-check.sh");
-    let oversized_write = if reflink {
-        format!(
-            "printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none\n",
-            quote(&large)
-        )
-    } else {
-        format!(
-            "if printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none 2>/dev/null; then exit 1; fi\n",
-            quote(&large)
-        )
-    };
     std::fs::write(
         &script,
         format!(
@@ -4875,18 +4941,20 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
            test \"$(head -c 9 \"$path\")\" = host-data\n\
            test \"$(tail -c 9 \"$path\")\" = host-tail\n\
          done\n\
-         for path in {} {}; do\n\
+         for path in {} {} {}; do\n\
            printf sessionxx | dd of=\"$path\" bs=9 count=1 conv=notrunc status=none\n\
            test \"$(head -c 9 \"$path\")\" = sessionxx\n\
          done\n\
-         {oversized_write}\
+         if printf forbidden > {} 2>/dev/null; then exit 1; fi\n\
          printf 'ANCESTOR_COPY_PASS\\n' | tee {}\n",
             quote(&home.join("project/portal/visible.txt")),
             quote(&ordinary),
             quote(&large),
             quote(&explicit),
             quote(&ordinary),
+            quote(&large),
             quote(&explicit),
+            quote(&home.join("project/portal/visible.txt")),
             quote(&report)
         ),
     )
@@ -4947,7 +5015,7 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
     println!(
-        "PASS: nested mount, 64 MiB writable boundary, oversized readable/private, explicit writable copy, rendered output, host files unchanged, cleanup; reflink={reflink}"
+        "PASS: one HOME overlay, read-only nested mount, no eager ancestor copies, all ordinary files privately writable, rendered output, host files unchanged, cleanup"
     );
 }
 
