@@ -1949,10 +1949,13 @@ fn session_sqlite_rotation_probe() {
     let reader =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("session reader after WAL rotation");
-    let check: String = reader
-        .query_row("pragma quick_check", [], |row| row.get(0))
-        .expect("rotated database quick check");
-    assert_eq!(check, "ok");
+    for _ in 0..20 {
+        let check: String = reader
+            .query_row("pragma quick_check", [], |row| row.get(0))
+            .expect("rotated database quick check under concurrent writes");
+        assert_eq!(check, "ok");
+        thread::sleep(Duration::from_millis(10));
+    }
     let marker: i64 = reader
         .query_row("select max(marker) from generation", [], |row| row.get(0))
         .expect("latest host generation");
@@ -2010,7 +2013,7 @@ fn session_follows_host_sqlite_wal_rotation() {
     )
     .expect("runtime symlink fixture");
     let mut host = rusqlite::Connection::open(&database).expect("host database");
-    host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0);")
+    host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0); create table churn(body blob);")
         .expect("seed generation");
     initialize(&mut client);
     let started = call_tool(
@@ -2045,6 +2048,37 @@ fn session_follows_host_sqlite_wal_rotation() {
             "WAL generation {generation}: previous inode {previous_wal}, current {wal_inode}"
         );
         previous_wal = wal_inode;
+        struct Writer {
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            thread: Option<thread::JoinHandle<()>>,
+        }
+        impl Drop for Writer {
+            fn drop(&mut self) {
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(writer) = self.thread.take() {
+                    let _ = writer.join();
+                }
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = {
+            let (stop, writes, database) = (stop.clone(), writes.clone(), database.clone());
+            thread::spawn(move || {
+                let connection =
+                    rusqlite::Connection::open(database).expect("concurrent host writer");
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    connection.execute_batch("insert into churn values(randomblob(128)); delete from churn where rowid < (select max(rowid)-32 from churn);")
+                        .expect("concurrent host mutation");
+                    writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let writer = Writer {
+            stop,
+            thread: Some(writer),
+        };
         let report = runtime.join(format!("generation-{generation}.txt"));
         call_tool(
             &mut client,
@@ -2068,6 +2102,11 @@ fn session_follows_host_sqlite_wal_rotation() {
         assert_eq!(
             std::fs::read_to_string(report).expect("generation report"),
             format!("{generation}\n")
+        );
+        drop(writer);
+        assert!(
+            writes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "host writer never ran during generation {generation}"
         );
     }
     call_tool(&mut client, 10, "session_stop", json!({}));
