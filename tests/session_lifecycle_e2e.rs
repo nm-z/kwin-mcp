@@ -1121,10 +1121,18 @@ fn blocked_host_scan_answers_within_hard_limit_and_cleans_later() {
         "{first}"
     );
 
-    // The blocked scan still owns the gate and the workdir, so the next
-    // lifecycle call reports busy within the limit rather than hanging.
+    // Each session_start creates a new desktop. Address the timed-out handle
+    // to exercise its still-owned lifecycle gate instead of starting another.
+    let failed_id = first["error"]["data"]["session_id"]
+        .as_str()
+        .expect("timed-out startup handle");
     let started = Instant::now();
-    let second = call_tool(&mut client, 3, "session_start", json!({}));
+    let second = call_tool(
+        &mut client,
+        3,
+        "session_stop",
+        json!({"session_id":failed_id}),
+    );
     assert!(
         started.elapsed() < Duration::from_secs(22),
         "second start: {second}"
