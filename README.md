@@ -1,6 +1,6 @@
 # kwin-mcp
 
-MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC) + `evdev` (uinput virtual devices). Container isolation via bubblewrap and pasta.
+MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `reis` (EIS input) + `atspi` (accessibility tree) + `zbus` (D-Bus/KWin IPC). Container isolation via bubblewrap and pasta.
 
 The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose between this server's isolated desktop and the user's current desktop. It requires a separately configured KWin MCP server.
 
@@ -76,16 +76,18 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
-Nested mounts under HOME require separate overlays. Regular files directly in
-their ancestor directories are copied into the private session. For files larger
-than 64 MiB, kwin-mcp first tries a copy-on-write reflink. If the filesystem cannot
-clone the file, it uses a read-only bind instead of copying its data during
-startup. Other files and directory overlays keep their existing write behavior.
-`session_start` reports these fallback files in `oversized_read_only_files`.
-To require private writable copies for specific files or directories, pass their
-absolute paths under HOME in `writable_paths` when starting a new session.
-Explicit copies still share the 20-second startup deadline; this option does not
-make existing read-only host mounts writable or change a running session.
+HOME uses one disk-backed overlay, including when it contains nested host
+mounts. The nested mounts are bound read-only over their locations in that
+overlay. Ordinary files remain privately writable without eager ancestor-file
+copies or a separate overlay for each directory. `writable_paths` is accepted
+for compatibility; it no longer requests startup copies and does not make
+nested host mounts writable. `oversized_read_only_files` is empty for new sessions.
+
+Default startup creates no uinput devices and starts no private PipeWire or
+WirePlumber processes. Input uses KWin's EIS connection. The D-Bus input settings
+devices remain available with stable virtual names. `session_start` with
+`audio: true` starts the private media services immediately; `viewer_open`
+starts them on demand for video capture. Host sound devices remain hidden.
 
 ### Session memory limits
 
@@ -147,17 +149,18 @@ kwin-mcp (host process)
         └── bwrap container (bubblewrap, overlayfs on $HOME)
               ├── dbus-daemon        (isolated session bus, anonymous auth)
               ├── kwin_wayland       (virtual display 1000x1000, XWayland)
-              ├── pipewire + wireplumber
+              ├── pipewire + wireplumber (on demand for viewer capture or audio opt-in)
               ├── at-spi-bus-launcher
-              └── uinput devices     (virtual mouse + keyboard, bind-mounted)
+              └── EIS input          (virtual mouse + keyboard, no host devices)
 ```
 
 Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
-Live host SQLite databases with open WAL files are mounted read-only with their
-WAL and shared-memory files, except browser cookie jars. Startup mounts these
-databases without copying their contents, and reads use the host inodes and
-SQLite locks. Session applications cannot write them. Browser history databases
+Live host SQLite databases with open WAL files resolve through read-only
+directory binds, except browser cookie jars. Their private main-file symlinks
+let SQLite find fresh WAL and shared-memory files after host checkpoints and
+sidecar replacement. Startup does not copy their contents; reads use the host
+inodes and SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
 Live database directory aliases also expose their siblings read-only under
@@ -181,7 +184,7 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 
 ### HID isolation
 
-Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
+MCP mouse and keyboard events use the isolated KWin's EIS connection. New sessions create no kernel uinput devices and expose no host input devices. D-Bus input settings devices store their properties in memory. Sessions inherited from an older binary retain their existing uinput descriptors until they stop.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
