@@ -21,6 +21,7 @@ const USAGE: &str = "kwin-mcp-deploy: build, package and explicitly install a re
 Commands:
   build SOURCE_DIR NEW_PACKAGE_DIR  Build committed HEAD on the lowest CPU host
   package ARTIFACT_DIR NEW_PACKAGE_DIR  Package already compiled release binaries
+  inspect PACKAGE_DIR  Verify a package without installing anything
   install PACKAGE_DIR HOST NEW_ABSOLUTE_RELEASE_DIR  Install an immutable release
 
 Build hosts: sentry, archy. Install hosts: engi, archy, benji.
@@ -144,6 +145,17 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         return Err("package destination already exists".into());
     }
+    let jobs = match env::var("CARGO_BUILD_JOBS") {
+        Ok(value) => {
+            let count: u32 = value.parse()?;
+            if count == 0 {
+                return Err("CARGO_BUILD_JOBS must be positive".into());
+            }
+            format!("export CARGO_BUILD_JOBS={count}; ")
+        }
+        Err(env::VarError::NotPresent) => String::new(),
+        Err(error) => return Err(error.into()),
+    };
     let source = fs::canonicalize(source)?;
     let mut status = Command::new("git");
     status
@@ -205,7 +217,7 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
         ))?;
         copy_remote(host, &bundle, &format!("{run}/source.bundle"))?;
         let script = format!(
-            "set -eu; cd {}; git clone -q source.bundle source; cd source; git checkout -q --detach {}; export CARGO_TARGET_DIR=\"$PWD/../target\"; cargo build --locked --release --bins > ../build.log 2>&1 || {{ cat ../build.log >&2; exit 1; }}; cat ../build.log",
+            "set -eu; cd {}; git clone -q source.bundle source; cd source; git checkout -q --detach {}; export CARGO_TARGET_DIR=\"$PWD/../target\"; {jobs}cargo build --locked --release --bins > ../build.log 2>&1 || {{ cat ../build.log >&2; exit 1; }}; cat ../build.log",
             quote(&run),
             quote(&commit)
         );
@@ -300,6 +312,13 @@ fn main() -> Result<()> {
         }
         [help] if help == "--help" || help == "-h" => {
             print!("{USAGE}");
+            Ok(())
+        }
+        [action, directory] if action == "inspect" => {
+            let directory = Path::new(directory);
+            verify_package(directory)?;
+            print!("{}", fs::read_to_string(directory.join("release.txt"))?);
+            println!("verified={}", directory.display());
             Ok(())
         }
         [action, source, destination] if action == "build" => {

@@ -19,7 +19,8 @@ not a builder**. There is no build slot limit or dependency on `dsh build`.
 A Git bundle transfers the exact commit without requiring it to be pushed.
 Each run owns `~/builds/kwin-mcp-deploy/<unique-id>/source`, its separate `target`,
 and `build.log`. Builds use `cargo build --locked --release --bins` and the
-builder's normal Cargo parallelism. Source, target and logs remain on the builder
+caller's `CARGO_BUILD_JOBS` when set (positive integer), or the builder's
+normal Cargo parallelism otherwise. Source, target and logs remain on the builder
 for review; remove only that run directory when its evidence is no longer needed.
 The command returns the log and packages all four binaries with the units, this
 guide, source identity and SHA256SUMS. It does not install anything.
@@ -34,6 +35,16 @@ This checks executable files and records that artifact provenance needs separate
 verification. Packaging preserves the input binaries. Missing files and existing
 package destinations fail; an incomplete package is retained for diagnosis and
 cannot be installed until its manifest is complete.
+
+## Inspect without installing
+
+```bash
+kwin-mcp-deploy inspect /absolute/package
+```
+
+This verifies the fixed checksum list and prints release identity. It performs no
+remote operation and writes no files, so reviewers can inspect a staged package
+before deciding whether to install it.
 
 ## Explicit installation
 

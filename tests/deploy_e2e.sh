@@ -18,6 +18,7 @@ expect_failure() {
 }
 "$cli" --help > "$run/help.log"
 "$cli" package "$artifacts" "$run/package" > "$run/package.log" 2>&1
+"$cli" inspect "$run/package" > "$run/inspect.log"
 (cd "$run/package" && sha256sum -c SHA256SUMS) > "$run/checksums.log"
 expect_failure existing-package "$cli" package "$artifacts" "$run/package"
 expect_failure missing-artifacts "$cli" package "$run/nonexistent" "$run/missing-package"
