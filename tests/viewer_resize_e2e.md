@@ -19,11 +19,11 @@ Copy `kwin-mcp`, `kwin-viewer`, `viewer-input-probe`, and `viewer-touch` into on
 ## Run
 
 ```bash
-XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
-  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-  KWIN_MCP_E2E_BIN_DIR=/path/to/private-bin \
+KWIN_MCP_E2E_BIN_DIR=/path/to/private-bin \
   ruby tests/viewer_resize_e2e.rb /path/to/new-evidence-directory
 ```
+
+The fixture explicitly supplies `/run/user/<uid>` and its D-Bus address only to each private server process. `viewer_open` receives the outer isolated Wayland socket. It does not change the agent's global environment.
 
 The runtime also needs `ruby`, `kdotool`, and ImageMagick `magick` on the KDE host. The test performs these real operations:
 

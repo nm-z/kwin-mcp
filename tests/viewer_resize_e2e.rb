@@ -14,9 +14,12 @@ class Rpc
   def initialize(binary, home, log, extra_env = {})
     @home = home
     %w[.config .local/share .cache .local/state .kde].each { |p| FileUtils.mkdir_p(File.join(home, p)) }
+    runtime = "/run/user/#{Process.uid}"
     env = { 'HOME' => home, 'XDG_CONFIG_HOME' => "#{home}/.config", 'XDG_DATA_HOME' => "#{home}/.local/share",
             'XDG_CACHE_HOME' => "#{home}/.cache", 'XDG_STATE_HOME' => "#{home}/.local/state", 'KDEHOME' => "#{home}/.kde",
-            'KWIN_MCP_REPO' => "#{home}/no-repository", 'KDE_SESSION_VERSION' => '6' }
+            'KWIN_MCP_REPO' => "#{home}/no-repository", 'KDE_SESSION_VERSION' => '6',
+            'XDG_RUNTIME_DIR' => runtime, 'DBUS_SESSION_BUS_ADDRESS' => "unix:path=#{runtime}/bus",
+            'WAYLAND_DISPLAY' => 'wayland-0' }
     @input, @output, error, @wait = Open3.popen3(env.merge(extra_env), binary, '--autoclean')
     @error_reader = Thread.new { File.open(log, 'w') { |f| error.each_line { |line| f.write(line); f.flush } } }
     @id = 0
