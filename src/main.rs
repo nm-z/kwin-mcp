@@ -1752,6 +1752,7 @@ const LINUX_KEY_LEFTSHIFT: u32 = 42;
 // bit 0 (0b001) = keyboard, bit 1 (0b010) = pointer, bit 2 (0b100) = touch.
 // 0b011 = keyboard + pointer (what this server needs).
 const EIS_CAPS_KBD_POINTER: i32 = 0b011;
+const EIS_CALLBACK_VERSION: u32 = 1;
 
 // ── Timings ──────────────────────────────────────────────────────────────
 
@@ -2317,12 +2318,51 @@ impl Drop for SentInput<'_> {
     }
 }
 
+fn typing_log_failure(
+    result: Result<CallToolResult, McpError>,
+    log_error: std::io::Error,
+) -> McpError {
+    match result {
+        Err(mut error) => {
+            error.message = format!(
+                "{}. Input log summary also failed: {log_error}",
+                error.message
+            )
+            .into();
+            let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(data) = data.as_object_mut() {
+                data.insert(
+                    "input_log_summary_error".to_owned(),
+                    serde_json::json!(log_error.to_string()),
+                );
+            }
+            error
+        }
+        Ok(result) => {
+            let input = result
+                .structured_content
+                .unwrap_or_else(|| serde_json::json!({}));
+            McpError::internal_error(
+                format!(
+                    "Typing key submission completed, but its input log summary failed: {log_error}. Inspect the field and retained input_result before sending or retrying; do not retype blindly."
+                ),
+                Some(serde_json::json!({
+                    "submitted_characters": input["submitted_characters"],
+                    "submission_complete": true, "retry_safe": false,
+                    "compositor_acknowledged": input["delivery"]["compositor_acknowledged"],
+                    "input_result": input, "input_log_summary_error": log_error.to_string(),
+                })),
+            )
+        }
+    }
+}
+
 async fn type_with_profile(
     eis: &Eis,
     text: &str,
     keys: &[(u32, bool)],
     pace: InputPace,
-) -> anyhow::Result<()> {
+) -> Result<(), McpError> {
     let characters: Vec<char> = text.chars().collect();
     let mut held = SentInput::new(eis);
     let began = tokio::time::Instant::now();
@@ -2330,6 +2370,7 @@ async fn type_with_profile(
     let mut pending: Vec<(Duration, u32, char)> = Vec::new();
     let mut shifted = false;
     let mut submitted = 0;
+    let mut attempted = 0;
     let result: anyhow::Result<()> = async {
         for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
             let (hold, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
@@ -2351,10 +2392,14 @@ async fn type_with_profile(
                 held.key(LINUX_KEY_LEFTSHIFT, shift, None)?;
                 shifted = shift;
             }
+            attempted += 1;
             held.key(code, true, Some(character))?;
             submitted += 1;
-            pending.push((next_down + hold, code, character));
-            next_down += interval;
+            // Socket backpressure or scheduler delay must not turn the rest of
+            // the text into a burst of overdue events. Pace from the actual send.
+            let sent_at = began.elapsed();
+            pending.push((sent_at + hold, code, character));
+            next_down = sent_at + interval;
         }
         pending.sort_by_key(|event| event.0);
         for (up, key, c) in pending {
@@ -2367,7 +2412,14 @@ async fn type_with_profile(
         Ok(())
     }
     .await;
-    result.map_err(|error|anyhow::anyhow!("keyboard_type stopped after submitting {submitted} of {} characters: {error}. The next character may be partly sent; check the input log before retrying.",characters.len()))
+    result.map_err(|error| McpError::internal_error(
+        format!("keyboard_type stopped after completing {submitted} character presses and attempting {attempted} of {} characters: {error}. Some or all attempted text may still arrive. Inspect the field and input log before sending or retrying; do not retype blindly.", characters.len()),
+        Some(serde_json::json!({
+            "submitted_characters": submitted, "attempted_characters": attempted,
+            "requested_characters": characters.len(), "submission_complete": false,
+            "compositor_acknowledged": false, "application_text": "unverified", "retry_safe": false,
+        })),
+    ))
 }
 
 // ── EIS input ───────────────────────────────────────────────────────────
@@ -2735,6 +2787,7 @@ impl Drop for InputLogGuard {
 struct Eis {
     audit: Option<Arc<InputLog>>,
     context: reis::ei::Context,
+    connection: reis::ei::Connection,
     abs_ptr: reis::ei::PointerAbsolute,
     btn: reis::ei::Button,
     scroll: reis::ei::Scroll,
@@ -2765,6 +2818,7 @@ impl Eis {
         )
         .map_err(|e| anyhow::anyhow!("EIS handshake: {e:?}"))?;
         context.flush()?;
+        let connection = resp.connection.clone();
         let mut conv = reis::event::EiEventConverter::new(&context, resp);
         let serial = conv.connection().serial();
         let (mut dev, mut kbd_d) = (None, None);
@@ -2859,6 +2913,7 @@ impl Eis {
         Ok(Self {
             audit: None,
             context,
+            connection,
             abs_ptr: abs.ok_or_else(|| anyhow::anyhow!("no EIS pointer"))?,
             btn: bt.ok_or_else(|| anyhow::anyhow!("no EIS button"))?,
             scroll: sc.ok_or_else(|| anyhow::anyhow!("no EIS scroll"))?,
@@ -2911,6 +2966,59 @@ impl Eis {
             })?;
         }
         delivery
+    }
+
+    /// A successful socket write only queues input. Wait for KWin to process
+    /// all earlier requests before checking what the application received.
+    async fn roundtrip(&self) -> anyhow::Result<()> {
+        let callback = self.connection.sync(EIS_CALLBACK_VERSION);
+        self.flush()?;
+        let deadline = tokio::time::Instant::now() + EIS_FLUSH_TIMEOUT;
+        loop {
+            self.context.read()?;
+            while let Some(pending) = self.context.pending_event() {
+                let event = match pending {
+                    reis::PendingRequestResult::Request(event) => event,
+                    reis::PendingRequestResult::ParseError(error) => {
+                        anyhow::bail!("EIS parse while confirming input: {error}");
+                    }
+                    reis::PendingRequestResult::InvalidObject(id) => {
+                        anyhow::bail!("EIS invalid object while confirming input: {id}");
+                    }
+                };
+                if let reis::ei::Event::Callback(object, reis::ei::callback::Event::Done { .. }) =
+                    &event
+                    && *object == callback
+                {
+                    return Ok(());
+                }
+                if let reis::ei::Event::Connection(_, reis::ei::connection::Event::Ping { ping }) =
+                    &event
+                {
+                    ping.done(0);
+                    self.flush()?;
+                }
+                if let reis::ei::Event::Connection(
+                    _,
+                    reis::ei::connection::Event::Disconnected { explanation, .. },
+                ) = &event
+                {
+                    anyhow::bail!(
+                        "EIS disconnected while confirming input: {}",
+                        explanation
+                            .as_deref()
+                            .unwrap_or("server provided no explanation")
+                    );
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "KWin did not acknowledge submitted input within {}s; text may still arrive. Inspect the field before retrying.",
+                    EIS_FLUSH_TIMEOUT.as_secs()
+                );
+            }
+            tokio::time::sleep(EIS_NEGOTIATION_POLL).await;
+        }
     }
     fn pointer_origin(&self, wx: i32, wy: i32, geometry: &WindowGeometry) -> anyhow::Result<()> {
         if let Some(log) = &self.audit {
@@ -10061,7 +10169,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) into whatever currently has keyboard focus. Click or Tab into the target field first — this tool never focuses anything. For key combinations (Ctrl+A, Return, Escape, arrows, function keys) use keyboard_key instead. Non-ASCII chars are not supported and will error."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility when available. delivery.status=verified confirms the field text; unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -10081,19 +10189,62 @@ impl KwinMcp {
             .chars()
             .map(char_key)
             .collect::<Result<Vec<_>, _>>()?;
-        type_with_profile(&sess.eis, &params.text, &keys, pace)
-            .await
-            .map_err(KwinError::from)?;
+        let active =
+            active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+                .await
+                .map(|(_, _, geometry)| geometry);
+        let receipt = match active {
+            Ok(geometry) => {
+                input_bridge::TextReceipt::capture(
+                    &sess.atspi_bus_address,
+                    &geometry.title,
+                    [geometry.x, geometry.y, geometry.w, geometry.h],
+                    &params.text,
+                )
+                .await
+            }
+            Err(error) => Err(anyhow::anyhow!(error)),
+        };
+        let started = std::time::Instant::now();
+        type_with_profile(&sess.eis, &params.text, &keys, pace).await?;
+        sess.eis.roundtrip().await.map_err(|error| {
+            McpError::internal_error(
+                format!("All {} characters were submitted, but compositor acknowledgement failed: {error}. Text may still arrive; inspect the field before sending or retrying, and do not retype blindly.", keys.len()),
+                Some(serde_json::json!({
+                    "submitted_characters": keys.len(), "submission_complete": true,
+                    "compositor_acknowledged": false,
+                    "application_text": "unverified", "retry_safe": false,
+                })),
+            )
+        })?;
+        let delivery = match receipt {
+            Ok(receipt) => receipt.confirm().await,
+            Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
+        };
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(
+        let mut result = structured_result(
             &peer,
-            format!("typed: {}", params.text),
+            format!(
+                "typing {}: {}{}",
+                delivery.status,
+                params.text,
+                delivery
+                    .warning
+                    .as_ref()
+                    .map(|warning| format!(". {warning}"))
+                    .unwrap_or_default()
+            ),
             serde_json::json!({
                 "action": "type", "text": params.text,
+                "submitted_characters": keys.len(), "submission_complete": true,
+                "retry_safe": false, "delivery": delivery,
+                "elapsed_ms": started.elapsed().as_millis(),
             }),
         )
-        .await)
+        .await;
+        result.is_error = Some(delivery.status == "pending_or_mismatched");
+        Ok(result)
     }
 
     #[rmcp::tool(
@@ -10988,6 +11139,7 @@ impl tower::Service<SessionCall> for KwinMcp {
     fn call(&mut self, call: SessionCall) -> Self::Future {
         let session = self.clone();
         Box::pin(async move {
+            let typing = call.request.name == "keyboard_type";
             let audit = if input_tool(&call.request.name) {
                 session
                     .input_log
@@ -11020,7 +11172,12 @@ impl tower::Service<SessionCall> for KwinMcp {
                 } else {
                     "error"
                 };
-                audit.finish(outcome).map_err(KwinError::from)?;
+                if let Err(error) = audit.finish(outcome) {
+                    if typing {
+                        return Err(typing_log_failure(result, error));
+                    }
+                    return Err(KwinError::from(error).into());
+                }
             }
             result
         })
@@ -11339,13 +11496,27 @@ impl rmcp::ServerHandler for SessionRouter {
             .await;
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
-                Some(death) => Err(McpError::internal_error(
-                    format!(
-                        "Session {id} died: {}; call session_stop then session_start without session_id to resume in a new desktop",
-                        death["reason"]
-                    ),
-                    Some(death),
-                )),
+                Some(mut death) => result.map_err(|error| {
+                    if operation == "keyboard_type"
+                        && let Some(data) = death.as_object_mut()
+                    {
+                            data.insert("typing_error".to_owned(), serde_json::json!(error.message));
+                            data.insert("typing_error_data".to_owned(), error.data.clone().unwrap_or_default());
+                            if let Some(original) = error.data.as_ref().and_then(serde_json::Value::as_object) {
+                                for (key, value) in original {
+                                    data.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
+                            }
+                            data.insert("retry_safe".to_owned(), serde_json::json!(false));
+                    }
+                    let original = if operation == "keyboard_type" {
+                        format!(". Typing report: {}. Some input may have arrived; do not retype blindly", error.message)
+                    } else { String::new() };
+                    McpError::internal_error(
+                        format!("Session {id} died: {}{original}; call session_stop then session_start without session_id to resume in a new desktop", death["reason"]),
+                        Some(death),
+                    )
+                }),
                 None => result.map_err(|error| describe_channel_failure(error, &id, &operation)),
             }
         } else {
