@@ -8,7 +8,7 @@ require 'timeout'
 require 'shellwords'
 
 binary, evidence = ARGV
-abort 'usage: accessibility_partial_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
+abort 'usage: resize_after_maximize_e2e.rb SERVER EVIDENCE_DIR' unless binary && evidence
 FileUtils.mkdir_p(evidence)
 private_home = File.join(evidence, 'home')
 %w[.config .local/share .cache .local/state .kde].each { |dir| FileUtils.mkdir_p(File.join(private_home, dir)) }
