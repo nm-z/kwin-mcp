@@ -3455,12 +3455,6 @@ impl OverlayPlan {
             }
             let destination = PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}"));
             command.arg("--ro-bind").arg(source).arg(&destination);
-            // Aliases must not bypass the HOME paths hidden elsewhere in the plan.
-            for hidden in &self.empty_dirs {
-                if let Ok(relative) = hidden.strip_prefix(source) {
-                    command.arg("--tmpfs").arg(destination.join(relative));
-                }
-            }
             for socket in &self.sqlite_blocked_sockets {
                 if let Ok(relative) = socket.strip_prefix(source)
                     && std::fs::symlink_metadata(socket).is_ok()
@@ -3469,6 +3463,13 @@ impl OverlayPlan {
                         .arg("--ro-bind")
                         .arg("/dev/null")
                         .arg(destination.join(relative));
+                }
+            }
+            // Apply directory masks last: individual socket placeholders must
+            // not recreate entries inside an intentionally empty directory.
+            for hidden in &self.empty_dirs {
+                if let Ok(relative) = hidden.strip_prefix(source) {
+                    command.arg("--tmpfs").arg(destination.join(relative));
                 }
             }
         }
@@ -3487,7 +3488,7 @@ impl OverlayPlan {
                 .arg("--ro-bind")
                 .arg(source)
                 .arg(&destination);
-            for path in self.empty_dirs.iter().chain(&self.graphical_socket_paths) {
+            for path in self.graphical_socket_paths.iter().chain(&self.empty_dirs) {
                 let Ok(relative) = path.strip_prefix(source) else {
                     continue;
                 };
