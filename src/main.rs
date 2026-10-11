@@ -1,3 +1,12 @@
+// A stdio client's exit also closes its diagnostic reader. Cleanup must not
+// panic on EPIPE while stopping the client's scopes and deleting workdirs.
+macro_rules! eprintln {
+    ($($arguments:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arguments)*);
+    }};
+}
+
 mod fuse_bridge {
     //! FUSE inside the isolated session.
     //!
@@ -12169,12 +12178,4 @@ mod launch_warning_tests {
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
     }
-}
-// A stdio client's exit also closes its diagnostic reader. Cleanup must not
-// panic on EPIPE while stopping the client's scopes and deleting workdirs.
-macro_rules! eprintln {
-    ($($arguments:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock(), $($arguments)*);
-    }};
 }
