@@ -1715,7 +1715,7 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, python3, input devices, and a live GPU session"]
-fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
+fn session_reads_host_live_sqlite_through_read_only_mounts() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
         Ok("1"),
@@ -1791,10 +1791,10 @@ fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
     );
     let workdir = workdir(&started);
     let report = workdir.join("sqlite-check.txt");
-    // Read-only and long-lived read-write connections, then a session write.
+    // Read the shared WAL family while the host writes it, then reject a session write.
     let script = format!(
         "import sqlite3,time\n\
-         db='{db}'; out=open('{out}','w'); bad=0\n\
+         db='{db}'; out=open('{out}','w'); bad=0; readonly=0\n\
          for i in range(20):\n\
          \x20   c=sqlite3.connect('file:'+db+'?mode=ro',uri=True)\n\
          \x20   c.execute('select count(*),sum(length(body)) from threads').fetchone()\n\
@@ -1802,8 +1802,11 @@ fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
          w=sqlite3.connect(db)\n\
          for i in range(20):\n\
          \x20   bad+=w.execute('pragma quick_check').fetchone()[0]!='ok'; time.sleep(0.05)\n\
-         w.execute(\"insert into threads(body) values (x'73657373696f6e')\"); w.commit()\n\
-         out.write('bad=%d\\n' % bad); out.close()\n",
+         try:\n\
+         \x20   w.execute(\"insert into threads(body) values (x'73657373696f6e')\"); w.commit()\n\
+         except sqlite3.OperationalError as e:\n\
+         \x20   readonly=int('readonly' in str(e))\n\
+         out.write('bad=%d readonly=%d\\n' % (bad,readonly)); out.close()\n",
         db = database.display(),
         out = report.display()
     );
@@ -1829,7 +1832,11 @@ fn session_reads_a_consistent_copy_of_a_host_live_sqlite_database() {
     };
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().expect("host writer");
-    assert_eq!(result.trim(), "bad=0", "session saw a malformed database");
+    assert_eq!(
+        result.trim(),
+        "bad=0 readonly=1",
+        "live database reads or read-only protection failed"
+    );
 
     let host = rusqlite::Connection::open(&database).expect("reopen host database");
     let check: String = host
@@ -2529,58 +2536,91 @@ fn parallel_sessions_hold_no_host_user_bus_connections() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
-fn session_start_preserves_live_codex_state_database() {
+fn session_start_binds_large_live_codex_state_without_copying_it() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
     let codex_home = client.home.join(".codex");
     std::fs::create_dir(&codex_home).expect("create fixture directory");
-    let source = rusqlite::Connection::open(codex_home.join("state_5.sqlite"))
-        .expect("open host state fixture");
+    let database = codex_home.join("state_5.sqlite");
+    let source = rusqlite::Connection::open(&database).expect("open host state fixture");
     source
         .execute_batch(
             "PRAGMA journal_mode=WAL;
-             CREATE TABLE retained_state (value TEXT NOT NULL);
-             INSERT INTO retained_state VALUES ('host-state');",
+         CREATE TABLE retained_state (value BLOB NOT NULL);
+         INSERT INTO retained_state VALUES (zeroblob(67108864));",
         )
-        .expect("write live WAL fixture");
+        .expect("write large live WAL fixture");
     initialize(&mut client);
+    let timer = Instant::now();
     let started = call_tool(
         &mut client,
         2,
         "session_start",
-        json!({"width":800,"height":600}),
+        json!({"width":640,"height":480}),
     );
     assert_eq!(
         started["result"]["structuredContent"]["status"], "started",
         "{started}"
     );
+    let elapsed = timer.elapsed();
     let directory = workdir(&started);
-    let snapshot_path = client
+    let upper = client
         .home
         .join(".cache/kwin-mcp")
         .join(directory.file_name().expect("workdir name"))
-        .join("overlay-upper/.codex/state_5.sqlite");
-    let snapshot = rusqlite::Connection::open_with_flags(
-        &snapshot_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("open isolated state snapshot");
-    source
-        .execute("UPDATE retained_state SET value = 'host-changed'", [])
-        .expect("change host fixture after session start");
-    let value: String = snapshot
-        .query_row("SELECT value FROM retained_state", [], |row| row.get(0))
-        .expect("read preserved state");
-    assert_eq!(value, "host-state");
-    drop(snapshot);
+        .join("overlay-upper/.codex");
+    assert!(
+        !upper.join("state_5.sqlite").exists(),
+        "startup copied the database"
+    );
+    assert!(
+        !upper.join("state_5.sqlite-wal").exists(),
+        "startup copied the WAL"
+    );
+    let report = directory.join("database-mount.txt");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "findmnt -n -o OPTIONS -T '{}' > '{}'; stat -c '%i' '{}' >> '{}'; konsole",
+            database.display(), report.display(), database.display(), report.display()
+        )}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let evidence = std::fs::read_to_string(&report).expect("database mount report");
+    let mut lines = evidence.lines();
+    assert!(
+        lines
+            .next()
+            .expect("mount options")
+            .split(',')
+            .any(|option| option == "ro"),
+        "{evidence}"
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        lines
+            .next()
+            .expect("inode")
+            .parse::<u64>()
+            .expect("inode number"),
+        std::fs::metadata(&database)
+            .expect("host database metadata")
+            .ino()
+    );
     drop(source);
-    let stopped = call_tool(&mut client, 3, "session_stop", json!({}));
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
     assert_eq!(
         stopped["result"]["structuredContent"]["status"], "stopped",
         "{stopped}"
     );
-    assert!(!snapshot_path.exists(), "state snapshot remains after stop");
+    assert!(!directory.exists(), "workdir remains after stop");
     client.stop_process();
+    println!(
+        "PASS: 64 MiB live WAL database shares the host inode read-only, no database/WAL copy, startup {:?}, stopped session",
+        elapsed
+    );
 }
 
 #[test]

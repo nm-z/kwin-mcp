@@ -3315,7 +3315,7 @@ impl OverlayPlan {
         let canonical_target = std::fs::canonicalize(target)?;
         let canonical_runtime = std::fs::canonicalize(host_runtime)?;
         let current_uid = procfs::process::Process::myself()?.uid()?;
-        let graphical_inodes = graphical_socket_inodes()?;
+        let inventory = host_process_inventory(target)?;
         self.host_runtime = Some(canonical_runtime.clone());
         let mut sockets: Vec<(PathBuf, PathBuf, PathBuf)> = procfs::net::unix()?
             .into_iter()
@@ -3328,7 +3328,7 @@ impl OverlayPlan {
                 let metadata = std::fs::metadata(&path).ok()?;
                 if metadata.uid() != current_uid
                     || !metadata.file_type().is_socket()
-                    || graphical_inodes.contains(&entry.inode)
+                    || inventory.graphical_sockets.contains(&entry.inode)
                 {
                     return None;
                 }
@@ -3408,15 +3408,28 @@ impl OverlayPlan {
             std::os::unix::fs::symlink(&generated, &link)?;
             self.socket_links.0.push((link, generated));
         }
+        bind_live_sqlite(self, target, &inventory.live_databases)?;
         Ok(())
     }
 }
 
-fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
+struct HostProcessInventory {
+    graphical_sockets: std::collections::HashSet<u64>,
+    live_databases: Vec<PathBuf>,
+}
+
+/// Read descriptors once for both graphical socket isolation and live WAL files.
+fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory> {
     let host_display = std::env::var_os("DISPLAY");
     let host_wayland = std::env::var_os("WAYLAND_DISPLAY");
     let mut graphical = std::collections::HashSet::new();
+    let mut databases = Vec::new();
+    let uid = procfs::process::Process::myself()?.uid()?;
+    let canonical_target = std::fs::canonicalize(target)?;
     for process in procfs::process::all_processes()?.flatten() {
+        if process.uid().ok() != Some(uid) {
+            continue;
+        }
         let environment = process.environ().unwrap_or_default();
         let cgroup =
             std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
@@ -3430,6 +3443,17 @@ fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
         let descriptors: Vec<procfs::process::FDInfo> =
             process.fd().into_iter().flatten().flatten().collect();
+        for descriptor in &descriptors {
+            if let procfs::process::FDTarget::Path(path) = &descriptor.target
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+                && let Some(database) = name.strip_suffix("-wal")
+                && let Ok(relative) = path
+                    .with_file_name(database)
+                    .strip_prefix(&canonical_target)
+            {
+                databases.push(target.join(relative));
+            }
+        }
         let input_attached = descriptors.iter().any(|descriptor| {
             if let procfs::process::FDTarget::Path(path) = &descriptor.target {
                 path == Path::new("/dev/uinput") || path.starts_with("/dev/input")
@@ -3447,7 +3471,12 @@ fn graphical_socket_inodes() -> anyhow::Result<std::collections::HashSet<u64>> {
             }));
         }
     }
-    Ok(graphical)
+    databases.sort();
+    databases.dedup();
+    Ok(HostProcessInventory {
+        graphical_sockets: graphical,
+        live_databases: databases,
+    })
 }
 
 fn create_staging_directory(
@@ -3699,70 +3728,38 @@ fn prepare_overlay_plan(
 /// Blocking host scan still owned by an in-flight session_start.
 type HostWork = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
-/// SQLite databases a host process is writing in WAL mode under `target`,
-/// found by their open `-wal` files. Largest-first order is not needed; the
-/// list is sorted for stable logs.
-fn live_sqlite_databases(target: &Path) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(canonical_target) = std::fs::canonicalize(target) else {
-        return Vec::new();
-    };
-    let uid = std::fs::metadata("/proc/self")
-        .map(|meta| meta.uid())
-        .unwrap_or(u32::MAX);
-    let mut databases = Vec::new();
-    for process in procfs::process::all_processes()
-        .into_iter()
-        .flatten()
-        .flatten()
+/// Mount live SQLite files and their WAL family directly, read-only. Sharing
+/// the host inodes preserves SQLite locking and avoids a size-dependent backup
+/// or an inconsistent database/WAL copy through the HOME overlay.
+fn bind_live_sqlite(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    databases: &[PathBuf],
+) -> anyhow::Result<()> {
+    let discarded = discarded_session_databases(target);
+    for database in databases
+        .iter()
+        .filter(|database| !discarded.contains(database))
     {
-        if process.uid().ok() != Some(uid) {
-            continue;
+        let name = database
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
+        for suffix in ["", "-wal", "-shm"] {
+            let path = database.with_file_name(format!("{}{suffix}", name.to_string_lossy()));
+            if path.is_file() && !plan.read_only_binds.contains(&path) {
+                plan.read_only_binds.push(path);
+            }
         }
-        for descriptor in process.fd().into_iter().flatten().flatten() {
-            let procfs::process::FDTarget::Path(path) = descriptor.target else {
-                continue;
-            };
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(database) = name.strip_suffix("-wal") else {
-                continue;
-            };
-            let Ok(relative) = path
-                .with_file_name(database)
-                .strip_prefix(&canonical_target)
-                .map(Path::to_path_buf)
-            else {
-                continue;
-            };
-            databases.push(target.join(relative));
-        }
+        eprintln!(
+            "session_start: live SQLite database read-only: {}",
+            database.display()
+        );
     }
-    databases.sort();
-    databases.dedup();
-    databases.retain(|database| database.is_file());
-    databases
+    Ok(())
 }
 
-/// Largest live database session_start snapshots; bigger ones stay shared
-/// with the host (and may read as malformed while the host writes them).
-const SQLITE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Give the session a consistent copy of a host-live SQLite WAL database.
-///
-/// The HOME overlay's lower layer is the live host HOME. When a host app keeps
-/// writing a WAL database, the session sees the database, -wal, and -shm files
-/// change underneath it (or copied up at different moments), and SQLite
-/// locking does not coordinate across the overlay, so reads in the session
-/// fail with "database disk image is malformed" although the host copy is
-/// intact. SQLite's online backup takes a consistent snapshot through the
-/// host's own locking; it lands in the upper layer with an empty WAL and
-/// shared-memory index, so the session owns a self-consistent database.
-/// The upper-layer path that shadows `path` in the HOME overlay, with any
-/// missing upper parents recreated using the lower directories' modes (a merged
-/// directory shows its upper attributes). Writes there land in the session's
-/// tmpfs, never on the host file.
+/// Recreate missing upper parents using the lower directories' permissions.
+/// Writes land in the session's disk overlay, never on the host file.
 fn upper_file(plan: &OverlayPlan, path: &Path) -> anyhow::Result<PathBuf> {
     let (upper, overlay) = plan
         .upper_path(path)
@@ -3932,63 +3929,6 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
     marked
 }
 
-fn snapshot_live_sqlite(plan: &OverlayPlan, database: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let size = std::fs::metadata(database)?.len();
-    anyhow::ensure!(
-        size <= SQLITE_SNAPSHOT_MAX_BYTES,
-        "{size} bytes exceeds the {SQLITE_SNAPSHOT_MAX_BYTES}-byte snapshot limit"
-    );
-    let upper = upper_file(plan, database)?;
-    let temporary = upper.with_file_name(format!(
-        ".{}.kwin-mcp-snapshot",
-        upper
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("db")
-    ));
-    let result = (|| -> anyhow::Result<()> {
-        let source = rusqlite::Connection::open_with_flags(
-            database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        source.busy_timeout(Duration::ZERO)?;
-        let mut copy = rusqlite::Connection::open(&temporary)?;
-        // One step copies every page under a single read lock. A WAL reader is
-        // refused only while the host holds the database exclusively, as
-        // Chromium-based apps do for as long as they run, so waiting cannot help.
-        let step = rusqlite::backup::Backup::new(&source, &mut copy)?.step(-1)?;
-        anyhow::ensure!(
-            step == rusqlite::backup::StepResult::Done,
-            "the host process holds it exclusively ({step:?})"
-        );
-        drop(copy);
-        let mode = std::fs::metadata(database)?.permissions().mode();
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))?;
-        std::fs::rename(&temporary, &upper)?;
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = upper.with_file_name(format!(
-                "{}{suffix}",
-                upper
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-            ));
-            std::fs::write(&sidecar, b"")?;
-            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(mode))?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-        let _ = std::fs::remove_file(temporary.with_file_name(format!(
-            "{}-journal",
-            temporary.file_name().and_then(|name| name.to_str()).unwrap_or_default()
-        )));
-    }
-    result
-}
-
 /// Host state session_start reads before it spawns the sandbox.
 struct HostView {
     overlay_plan: OverlayPlan,
@@ -4002,7 +3942,9 @@ fn prepare_host_view(
     host_xdg_dir: &Path,
     host_runtime: &Path,
     writable_paths: &[PathBuf],
+    service: &KwinMcp,
 ) -> anyhow::Result<HostView> {
+    service.set_start_stage("scanning host mounts");
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
         .and_then(|process| process.mountinfo())
@@ -4038,6 +3980,7 @@ fn prepare_host_view(
             gib(free)
         );
     }
+    service.set_start_stage("preparing HOME overlays");
     let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory, writable_paths)
         .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
@@ -4046,6 +3989,7 @@ fn prepare_host_view(
     if disk_root.starts_with(target) {
         overlay_plan.empty_dirs.push(disk_root);
     }
+    service.set_start_stage("scanning host sockets and processes");
     overlay_plan
         .expose_sockets(target, host_runtime, host_xdg_dir)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
@@ -4059,22 +4003,8 @@ fn prepare_host_view(
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
+    service.set_start_stage("preparing browser profiles");
     let discarded = discarded_session_databases(target);
-    for database in live_sqlite_databases(target)
-        .into_iter()
-        .filter(|database| !discarded.contains(database))
-    {
-        match snapshot_live_sqlite(&overlay_plan, &database) {
-            Ok(()) => eprintln!(
-                "session_start: snapshotted live SQLite database {}",
-                database.display()
-            ),
-            Err(error) => eprintln!(
-                "session_start: live SQLite database {} left shared: {error:#}",
-                database.display()
-            ),
-        }
-    }
     empty_session_databases(&overlay_plan, &discarded)?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
@@ -7324,12 +7254,14 @@ impl KwinMcp {
         let (view_tx, view_rx) = tokio::sync::oneshot::channel();
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
+        let view_service = self.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let _ = view_tx.send(prepare_host_view(
                 &view_target,
                 &view_xdg,
                 &host_runtime,
                 &writable_paths,
+                &view_service,
             ));
         });
         if let Ok(mut slot) = host_work.lock() {

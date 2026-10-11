@@ -125,6 +125,13 @@ kwin-mcp (host process)
 
 Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
+Live host SQLite databases with open WAL files are mounted read-only with their
+WAL and shared-memory files. Startup does not copy their contents, and reads use
+the host inodes and SQLite locks. Session applications cannot write these live
+databases. Browser history databases still start empty in the private overlay.
+Startup timeout errors name the active preparation stage: host mounts, HOME
+overlays, host sockets and processes, or browser profiles.
+
 ### Two-phase D-Bus startup
 
 1. bwrap starts, dbus-daemon creates session bus
