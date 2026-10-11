@@ -154,6 +154,7 @@ class RuntimeProof
   ensure
     @nongraphical_socket&.close
     @nongraphical_thread&.join(2)
+    @hidden_socket&.close
     if @graphical_pid
       Process.kill('TERM', @graphical_pid)
       Timeout.timeout(5) { Process.wait(@graphical_pid) }
@@ -164,6 +165,12 @@ class RuntimeProof
     nongraphical = File.join(@private_home, 'nongraphical.sock')
     graphical = File.join(@private_home, 'graphical.sock')
     start_nongraphical_listener(1)
+    # An allowed socket whose parent is itself a hidden root must not expose
+    # that parent's sibling files through the internal alias directory.
+    hidden_root = File.join(@private_home, '.cache', 'kwin-mcp')
+    FileUtils.mkdir_p(hidden_root)
+    File.write(File.join(hidden_root, 'runtime-proof-private-marker'), 'private fixture')
+    @hidden_socket = UNIXServer.new(File.join(hidden_root, 'runtime-proof-control.sock'))
     reader, writer = IO.pipe
     child = 'server = UNIXServer.new(ARGV.fetch(0)); ready = IO.new(3); ready.puts("ready"); ready.close; loop { peer = server.accept; peer.write("graphical-proof"); peer.close }'
     @graphical_pid = Process.spawn({'WAYLAND_DISPLAY' => 'runtime-proof-host-wayland'}, RbConfig.ruby, '-rsocket', '-e', child, graphical, 3 => writer, out: File::NULL, err: File.join(@directory, 'graphical.stderr'))
@@ -214,7 +221,8 @@ class RuntimeProof
         end,
         'startup_hidden_roots_masked' => mounts.all? do |mount|
           hidden = File.join(mount, '.cache', 'kwin-mcp')
-          !File.directory?(hidden) || Dir.empty?(hidden)
+          (!File.directory?(hidden) || Dir.empty?(hidden)) &&
+            !File.exist?(File.join(mount, 'runtime-proof-private-marker'))
         end,
         'host_secret_paths_hidden' => secrets.all? { |secret| identity.call(secret.fetch('path')) != secret.fetch('identity') },
         'private_runtime_secrets_isolated' => secrets.all? do |secret|

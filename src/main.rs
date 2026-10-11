@@ -3287,9 +3287,6 @@ impl OverlayPlan {
                 let Ok(relative) = path.strip_prefix(source) else {
                     continue;
                 };
-                if relative.as_os_str().is_empty() {
-                    continue;
-                }
                 let Ok(metadata) = std::fs::symlink_metadata(path) else {
                     continue;
                 };
