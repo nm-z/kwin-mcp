@@ -3,6 +3,7 @@ require 'json'
 require 'open3'
 require 'fileutils'
 require 'timeout'
+require 'rbconfig'
 
 binary, evidence = ARGV
 abort 'usage: client_lifetime_e2e.rb SERVER EVIDENCE' unless binary && evidence
