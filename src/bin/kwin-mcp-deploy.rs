@@ -168,14 +168,25 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     let mut git = Command::new("git");
     git.arg("-C").arg(&source).args(["rev-parse", "HEAD"]);
     let commit = String::from_utf8(checked(git)?.stdout)?.trim().to_owned();
-    let probes: Vec<_> = BUILD_HOSTS
+    let requested_hosts =
+        env::var("KWIN_MCP_DEPLOY_BUILD_HOSTS").unwrap_or_else(|_| BUILD_HOSTS.join(" "));
+    let hosts: Vec<_> = requested_hosts.split_whitespace().collect();
+    if hosts.is_empty() || hosts.iter().any(|host| !BUILD_HOSTS.contains(host)) {
+        return Err("KWIN_MCP_DEPLOY_BUILD_HOSTS accepts only sentry and archy".into());
+    }
+    let build_root = env::var("KWIN_MCP_DEPLOY_BUILD_ROOT")
+        .unwrap_or_else(|_| "builds/kwin-mcp-deploy".to_owned());
+    if build_root != "builds/kwin-mcp-deploy" && !valid_absolute_path(&build_root) {
+        return Err("KWIN_MCP_DEPLOY_BUILD_ROOT requires a simple absolute path".into());
+    }
+    let probes: Vec<_> = hosts
         .iter()
         .map(|host| {
-            let host = *host;
+            let host = host.to_string();
             (
-                host,
+                host.clone(),
                 thread::spawn(move || -> Option<u32> {
-                    match checked(ssh(host, CPU_PROBE)) {
+                    match checked(ssh(&host, CPU_PROBE)) {
                         Ok(output) => String::from_utf8(output.stdout).ok()?.trim().parse().ok(),
                         Err(error) => {
                             eprintln!("{host}: unavailable: {error}");
@@ -195,7 +206,7 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     }
     candidates.sort_unstable();
     let (_, host) = candidates.first().ok_or("no eligible build host")?;
-    let run = format!("builds/kwin-mcp-deploy/{}", nonce()?);
+    let run = format!("{build_root}/{}", nonce()?);
     let temporary = env::temp_dir().join(format!("kwin-mcp-deploy-{}", nonce()?));
     fs::create_dir(&temporary)?;
     let result = (|| -> Result<()> {
@@ -211,7 +222,8 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
         checked(ssh(
             host,
             &format!(
-                "set -eu; umask 077; mkdir -p builds/kwin-mcp-deploy; mkdir {}",
+                "set -eu; umask 077; mkdir -p {}; mkdir {}",
+                quote(&build_root),
                 quote(&run)
             ),
         ))?;
@@ -242,14 +254,10 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     result
 }
 
-fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
-    if !INSTALL_HOSTS.contains(&host) {
-        return Err("install host must be engi, archy or benji".into());
-    }
-    // SFTP/scp and shell paths share this conservative grammar. No ~ or option ambiguity.
-    if !destination.starts_with('/')
-        || destination.ends_with('/')
-        || destination.split('/').skip(1).any(|part| {
+fn valid_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.split('/').skip(1).any(|part| {
             part.is_empty()
                 || part == "."
                 || part == ".."
@@ -257,7 +265,14 @@ fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         })
-    {
+}
+
+fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
+    if !INSTALL_HOSTS.contains(&host) {
+        return Err("install host must be engi, archy or benji".into());
+    }
+    // SFTP/scp and shell paths share this conservative grammar. No ~ or option ambiguity.
+    if !valid_absolute_path(destination) {
         return Err(
             "release destination must be an absolute path with simple path components".into(),
         );
