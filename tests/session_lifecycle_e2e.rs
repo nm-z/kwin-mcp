@@ -4860,33 +4860,39 @@ fn human_input_matches_published_timing_profile_on_stdio() {
     assert!(
         measured[1] > measured[0] && measured[1] > measured[2] && measured[1] > measured[3] * 1.5
     );
-    for (id, discrete) in [(60, true), (61, false)] {
+    for (id, discrete, delta, reports, total) in [
+        (60, true, 4, 4, 480.0),
+        (61, false, 60, 4, 60.0),
+        (62, false, -9000, 32, -9000.0),
+    ] {
+        let started = std::time::Instant::now();
         let result = call_tool(
             &mut client,
             id,
             "mouse_scroll",
-            json!({"session_id":session,"x":100,"y":100,"delta":4,"discrete":discrete}),
+            json!({"session_id":session,"x":100,"y":100,"delta":delta,"discrete":discrete}),
         );
         assert!(result["error"].is_null(), "{result}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
         let records = read_records();
         let events: Vec<_> = records
             .iter()
             .filter(|r| r["event"] == "scroll" && r["tool"]["request_id"] == id)
             .collect();
-        assert_eq!(events.len(), if discrete { 4 } else { 12 });
+        assert_eq!(events.len(), reports);
         assert_eq!(
             events
                 .iter()
                 .map(|r| r["dy"].as_f64().expect("delta"))
                 .sum::<f64>(),
-            if discrete { 480.0 } else { 60.0 }
+            total
         );
         assert!(
             events.last().expect("last")["monotonic_ns"]
                 .as_u64()
                 .expect("time")
                 - events[0]["monotonic_ns"].as_u64().expect("time")
-                > 100_000_000
+                >= (u64::try_from(reports).expect("reports") - 1) * 16_000_000
         );
     }
     let text = "the little red fox sees the green tree and the blue sky. ".repeat(5);

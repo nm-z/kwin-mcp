@@ -1800,8 +1800,12 @@ const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
 /// How long an input send may wait for KWin to drain a full EIS socket.
 const EIS_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Pixels per smooth-scroll tick.
-const SCROLL_SMOOTH_PIXELS_PER_TICK: f32 = 15.0;
+// mouse_scroll splits its delta (pixels when smooth, notches when discrete) into one
+// report per 15 pixels or per notch, at most SCROLL_MAX_REPORTS of them, sent
+// SCROLL_REPORT_INTERVAL_MS apart, so a call's duration is bounded whatever its delta.
+const SCROLL_SMOOTH_PIXELS_PER_REPORT: u32 = 15;
+const SCROLL_MAX_REPORTS: u32 = 32;
+const SCROLL_REPORT_INTERVAL_MS: f64 = 16.0;
 // EIS scroll_discrete takes value120 units: 120 = one wheel notch.
 const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 
@@ -10102,7 +10106,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_scroll",
-        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then a wheel event fires. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll (per-pixel, good for documents and web); set discrete=true for notch-style single clicks (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
+        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
     )]
     async fn mouse_scroll(
         &self,
@@ -10139,32 +10143,38 @@ impl KwinMcp {
         .await
         .map_err(KwinError::from)?;
         let horiz = params.horizontal.unwrap_or_default();
-        let ticks = delta.unsigned_abs();
-        for index in 0..ticks {
-            if index > 0 {
-                tokio::time::sleep(pace.key_timing(' ', Some(' ')).map_err(KwinError::from)?.1)
-                    .await;
+        let discrete = params.discrete.unwrap_or_default();
+        let reports = if discrete {
+            delta.unsigned_abs()
+        } else {
+            delta
+                .unsigned_abs()
+                .div_ceil(SCROLL_SMOOTH_PIXELS_PER_REPORT)
+        }
+        .min(SCROLL_MAX_REPORTS);
+        let interval = pace
+            .delay(SCROLL_REPORT_INTERVAL_MS)
+            .map_err(KwinError::from)?;
+        let mut sent = 0;
+        for index in 1..=reports {
+            if index > 1 {
+                tokio::time::sleep(interval).await;
             }
-            if params.discrete.unwrap_or_default() {
-                let (dx, dy) = if horiz {
-                    (delta.signum(), 0)
-                } else {
-                    (0, delta.signum())
-                };
+            // Cumulative rounding keeps the reports within one unit of each other and their sum exact.
+            let total = i32::try_from(i64::from(delta) * i64::from(index) / i64::from(reports))
+                .map_err(KwinError::from)?;
+            let part = total - sent;
+            sent = total;
+            let (dx, dy) = if horiz { (part, 0) } else { (0, part) };
+            if discrete {
                 sess.eis.scroll_discrete(dx, dy).map_err(KwinError::from)?;
             } else {
-                let d = f32::from(i16::try_from(delta.signum()).map_err(KwinError::from)?)
-                    * SCROLL_SMOOTH_PIXELS_PER_TICK;
-                // Smooth wheel ticks use three reports whose sum is exactly the requested delta.
-                for part in [0.25, 0.5, 0.25] {
-                    let (dx, dy) = if horiz {
-                        (d * part, 0.0)
-                    } else {
-                        (0.0, d * part)
-                    };
-                    sess.eis.scroll_smooth(dx, dy).map_err(KwinError::from)?;
-                    tokio::time::sleep(POINTER_REPORT_INTERVAL).await;
-                }
+                sess.eis
+                    .scroll_smooth(
+                        f32::from(i16::try_from(dx).map_err(KwinError::from)?),
+                        f32::from(i16::try_from(dy).map_err(KwinError::from)?),
+                    )
+                    .map_err(KwinError::from)?;
             }
         }
         drop(guard);
