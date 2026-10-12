@@ -953,7 +953,34 @@ pub struct TextDelivery {
     pub warning: Option<String>,
 }
 
+/// Accessibility shows keyboard focus on a control that is not editable text.
+#[derive(Debug)]
+pub struct FocusNotEditable(pub String);
+
+impl std::fmt::Display for FocusNotEditable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "keyboard focus is on {}, not an editable field", self.0)
+    }
+}
+
+impl std::error::Error for FocusNotEditable {}
+
 impl TextDelivery {
+    /// Focus was on a control that is not editable text before and after the
+    /// keys were sent, so no field received the text.
+    pub fn not_in_field(focus: &FocusNotEditable) -> Self {
+        Self {
+            status: "not_in_field",
+            method: "atspi_focus",
+            compositor_acknowledged: true,
+            expected_field_characters: None,
+            observed_field_characters: None,
+            warning: Some(format!(
+                "{focus}, so the text did not go into a field. Click the field first (a disabled field cannot take focus), then type again."
+            )),
+        }
+    }
+
     pub fn unavailable(reason: String) -> Self {
         Self {
             status: "unverified",
@@ -1007,6 +1034,7 @@ impl TextReceipt {
             .build()
             .await?;
         let mut visited = 0;
+        let mut focus = None;
         for app in root.get_children().await? {
             let app = app.as_accessible_proxy(&bus).await?;
             for frame in app.get_children().await? {
@@ -1041,6 +1069,18 @@ impl TextReceipt {
                     }
                     let node = object.as_accessible_proxy(&bus).await?;
                     let states = node.get_state().await?;
+                    if focus.is_none()
+                        && states.contains(atspi::State::Focused)
+                        && states.contains(atspi::State::Showing)
+                        && !states.contains(atspi::State::Editable)
+                        && node.get_role().await? != atspi::Role::Terminal
+                    {
+                        focus = Some(format!(
+                            "{} \"{}\"",
+                            node.get_role_name().await.unwrap_or_default(),
+                            node.name().await.unwrap_or_default()
+                        ));
+                    }
                     if states.contains(atspi::State::Focused)
                         && states.contains(atspi::State::Editable)
                         && states.contains(atspi::State::Showing)
@@ -1096,6 +1136,9 @@ impl TextReceipt {
                     stack.extend(node.get_children().await?);
                 }
             }
+        }
+        if let Some(focus) = focus {
+            return Err(FocusNotEditable(focus).into());
         }
         anyhow::bail!("the active window exposes no focused editable text through accessibility");
     }

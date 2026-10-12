@@ -4862,8 +4862,9 @@ fn human_input_matches_published_timing_profile_on_stdio() {
     );
     for (id, discrete, delta, reports, total) in [
         (60, true, 4, 4, 480.0),
-        (61, false, 60, 4, 60.0),
-        (62, false, -9000, 32, -9000.0),
+        // Smooth totals are axis units, 12 pixels each.
+        (61, false, 600, 5, 50.0),
+        (62, false, -9000, 32, -750.0),
     ] {
         let started = std::time::Instant::now();
         let result = call_tool(
@@ -4880,12 +4881,14 @@ fn human_input_matches_published_timing_profile_on_stdio() {
             .filter(|r| r["event"] == "scroll" && r["tool"]["request_id"] == id)
             .collect();
         assert_eq!(events.len(), reports);
-        assert_eq!(
-            events
+        assert!(
+            (events
                 .iter()
                 .map(|r| r["dy"].as_f64().expect("delta"))
-                .sum::<f64>(),
-            total
+                .sum::<f64>()
+                - total)
+                .abs()
+                < 1e-3
         );
         assert!(
             events.last().expect("last")["monotonic_ns"]

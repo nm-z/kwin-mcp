@@ -1801,9 +1801,12 @@ const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
 const EIS_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // mouse_scroll splits its delta (pixels when smooth, notches when discrete) into one
-// report per 15 pixels or per notch, at most SCROLL_MAX_REPORTS of them, sent
-// SCROLL_REPORT_INTERVAL_MS apart, so a call's duration is bounded whatever its delta.
-const SCROLL_SMOOTH_PIXELS_PER_REPORT: u32 = 15;
+// report per notch, at most SCROLL_MAX_REPORTS of them, sent SCROLL_REPORT_INTERVAL_MS
+// apart, so a call's duration is bounded whatever its delta. Wayland axis values carry
+// 10 per wheel notch and Chromium scrolls 120 px per notch, so a smooth pixel is 1/12
+// of an axis unit.
+const SCROLL_PIXELS_PER_NOTCH: u32 = 120;
+const SCROLL_PIXELS_PER_AXIS_UNIT: f32 = 12.0;
 const SCROLL_MAX_REPORTS: u32 = 32;
 const SCROLL_REPORT_INTERVAL_MS: f64 = 16.0;
 // EIS scroll_discrete takes value120 units: 120 = one wheel notch.
@@ -5007,6 +5010,27 @@ impl KwinMcp {
             )),
         }
     }
+    /// Wait, as a screenshot does, until the screen has stopped changing after
+    /// recent input. Chromium updates accessible bounds as it paints, so bounds
+    /// read during a scroll animation describe a position the page has left.
+    async fn settle_input(&self) -> Result<(), McpError> {
+        let Some(last_input) = self
+            .last_input()
+            .await
+            .filter(|at| at.elapsed() < SCREENSHOT_SETTLE_LIMIT)
+        else {
+            return Ok(());
+        };
+        let conn = self.kwin_conn().await?;
+        let proxy = KWinScreenShot2Proxy::builder(&conn)
+            .destination(self.kwin_unique_name().await?)
+            .map_err(KwinError::from)?
+            .build()
+            .await
+            .map_err(KwinError::from)?;
+        capture_settled_frame(&proxy, Some(last_input)).await?;
+        Ok(())
+    }
     async fn host_xdg_dir(&self) -> Result<std::path::PathBuf, McpError> {
         let guard = self.session.read().await;
         match &*guard {
@@ -6767,7 +6791,11 @@ impl AtspiNode {
 
     fn is_useful(&self) -> bool {
         let (x, y, w, h) = self.bounds;
-        w > 1 && h > 1 && x > -1000000 && y > -1000000 && !self.name.is_empty()
+        w > 1
+            && h > 1
+            && x > -1000000
+            && y > -1000000
+            && (!self.name.is_empty() || ATSPI_CONTROL_ROLES.contains(&self.role.as_str()))
     }
 
     /// Whether any part of the node lies on the virtual screen. Pages expose
@@ -6799,11 +6827,28 @@ fn state_labels(states: &[String]) -> Vec<String> {
     .collect()
 }
 
+/// AT-SPI role names of controls that take input, which can be disabled and
+/// can be named by a placeholder alone.
+const ATSPI_CONTROL_ROLES: [&str; 12] = [
+    "entry",
+    "password text",
+    "spin button",
+    "text",
+    "combo box",
+    "push button",
+    "toggle button",
+    "check box",
+    "radio button",
+    "slider",
+    "link",
+    "menu item",
+];
+
 async fn atspi_node(
     acc: &atspi::proxy::accessible::AccessibleProxy<'_>,
 ) -> Result<AtspiNode, KwinError> {
     use atspi::proxy::proxy_ext::ProxyExt;
-    let name = acc.name().await.unwrap_or_default();
+    let mut name = acc.name().await.unwrap_or_default();
     let role = acc.get_role_name().await.unwrap_or_default();
     let raw_states = acc
         .get_state()
@@ -6812,7 +6857,21 @@ async fn atspi_node(
         .into_iter()
         .map(|s| format!("{s:?}"))
         .collect::<Vec<_>>();
-    let states = state_labels(&raw_states);
+    let mut states = state_labels(&raw_states);
+    let control = ATSPI_CONTROL_ROLES.contains(&role.as_str());
+    // A field labelled only by its placeholder has no accessible name in Chromium,
+    // which exposes the placeholder as an object attribute instead.
+    if name.is_empty() && control {
+        name = acc
+            .get_attributes()
+            .await
+            .unwrap_or_default()
+            .remove("placeholder-text")
+            .unwrap_or_default();
+    }
+    if control && !states.iter().any(|state| state == "enabled") {
+        states.push("disabled".to_owned());
+    }
     let bounds = match acc.proxies().await?.component().await {
         Ok(c) => c
             .get_extents(atspi::CoordType::Screen)
@@ -9545,6 +9604,7 @@ impl KwinMcp {
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.settle_input().await?;
         let mut tree = LevelTree::default();
         let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
             usize::try_from(depth)
@@ -9833,7 +9893,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text, and bounding box for mouse_click/mouse_move. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
+        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -9842,6 +9902,7 @@ impl KwinMcp {
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.settle_input().await?;
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
 
@@ -9950,8 +10011,14 @@ impl KwinMcp {
                                 || node.role.to_lowercase().contains(&query))
                         {
                             let (x, y, w, h) = node.bounds;
+                            let flags = node
+                                .states
+                                .iter()
+                                .filter(|state| *state == "disabled" || *state == "focused")
+                                .map(|state| format!("\t{state}"))
+                                .collect::<String>();
                             results.push(format!(
-                                "{}\t{}\t({}, {}, {}x{})",
+                                "{}\t{}\t({}, {}, {}x{}){flags}",
                                 node.role, node.name, x, y, w, h
                             ));
                         }
@@ -10106,7 +10173,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_scroll",
-        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
+        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels in Chromium-family browsers and 120 is one wheel notch in other apps (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
     )]
     async fn mouse_scroll(
         &self,
@@ -10147,9 +10214,7 @@ impl KwinMcp {
         let reports = if discrete {
             delta.unsigned_abs()
         } else {
-            delta
-                .unsigned_abs()
-                .div_ceil(SCROLL_SMOOTH_PIXELS_PER_REPORT)
+            delta.unsigned_abs().div_ceil(SCROLL_PIXELS_PER_NOTCH)
         }
         .min(SCROLL_MAX_REPORTS);
         let interval = pace
@@ -10171,8 +10236,10 @@ impl KwinMcp {
             } else {
                 sess.eis
                     .scroll_smooth(
-                        f32::from(i16::try_from(dx).map_err(KwinError::from)?),
-                        f32::from(i16::try_from(dy).map_err(KwinError::from)?),
+                        f32::from(i16::try_from(dx).map_err(KwinError::from)?)
+                            / SCROLL_PIXELS_PER_AXIS_UNIT,
+                        f32::from(i16::try_from(dy).map_err(KwinError::from)?)
+                            / SCROLL_PIXELS_PER_AXIS_UNIT,
                     )
                     .map_err(KwinError::from)?;
             }
@@ -10252,7 +10319,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility when available. delivery.status=verified confirms the field text; unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility when available. delivery.status=verified confirms the field text; unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. not_in_field means accessibility showed focus on a non-editable control before and after the keys, so no field got the text and retry_safe is true; the warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -10276,7 +10343,7 @@ impl KwinMcp {
             active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
                 .await
                 .map(|(_, _, geometry)| geometry);
-        let receipt = match active {
+        let receipt = match &active {
             Ok(geometry) => {
                 input_bridge::TextReceipt::capture(
                     &sess.atspi_bus_address,
@@ -10286,7 +10353,7 @@ impl KwinMcp {
                 )
                 .await
             }
-            Err(error) => Err(anyhow::anyhow!(error)),
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
         };
         let started = std::time::Instant::now();
         type_with_profile(&sess.eis, &params.text, &keys, pace).await?;
@@ -10302,8 +10369,35 @@ impl KwinMcp {
         })?;
         let delivery = match receipt {
             Ok(receipt) => receipt.confirm().await,
+            // Focus read before typing can lag a click that just moved it, so the
+            // text counts as outside any field only if focus is still not editable.
+            Err(error) if error.is::<input_bridge::FocusNotEditable>() => {
+                let after = match &active {
+                    Ok(geometry) => {
+                        input_bridge::TextReceipt::capture(
+                            &sess.atspi_bus_address,
+                            &geometry.title,
+                            [geometry.x, geometry.y, geometry.w, geometry.h],
+                            "",
+                        )
+                        .await
+                    }
+                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                };
+                match after {
+                    Err(after) => match after.downcast_ref::<input_bridge::FocusNotEditable>() {
+                        Some(focus) => input_bridge::TextDelivery::not_in_field(focus),
+                        None => input_bridge::TextDelivery::unavailable(after.to_string()),
+                    },
+                    Ok(_) => input_bridge::TextDelivery::unavailable(
+                        "keyboard focus moved into an editable field while the keys were sent"
+                            .to_owned(),
+                    ),
+                }
+            }
             Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
         };
+        let retry_safe = delivery.status == "not_in_field";
         drop(guard);
         self.mark_input().await;
         let mut result = structured_result(
@@ -10321,12 +10415,15 @@ impl KwinMcp {
             serde_json::json!({
                 "action": "type", "text": params.text,
                 "submitted_characters": keys.len(), "submission_complete": true,
-                "retry_safe": false, "delivery": delivery,
+                "retry_safe": retry_safe, "delivery": delivery,
                 "elapsed_ms": started.elapsed().as_millis(),
             }),
         )
         .await;
-        result.is_error = Some(delivery.status == "pending_or_mismatched");
+        result.is_error = Some(matches!(
+            delivery.status,
+            "pending_or_mismatched" | "not_in_field"
+        ));
         Ok(result)
     }
 
