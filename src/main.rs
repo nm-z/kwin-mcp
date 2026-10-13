@@ -5790,6 +5790,7 @@ const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 async fn request_cdp_browser_close(sess: &Session) -> bool {
     let Some(browser) = sess.cdp_browser.as_ref() else {
+        eprintln!("teardown: no CDP browser handle for graceful close");
         return false;
     };
     use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
@@ -5844,6 +5845,7 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
             break;
         }
     }
+    let trace = std::env::var_os("KWIN_MCP_TEST_BROWSER_SHUTDOWN_TRACE").is_some();
     let mut browsers = Vec::new();
     for (process, stat) in processes {
         if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
@@ -5852,10 +5854,20 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         let Ok(command) = process.cmdline() else {
             continue;
         };
-        if command
-            .iter()
-            .any(|arg| arg == "--type" || arg.starts_with("--type="))
-        {
+        let process_type = command.iter().enumerate().find_map(|(index, argument)| {
+            if argument == "--type" {
+                command.get(index + 1).map(String::as_str)
+            } else {
+                argument.strip_prefix("--type=")
+            }
+        });
+        if let Some(process_type) = process_type {
+            if trace {
+                eprintln!(
+                    "teardown: browser child pid={} type={process_type}",
+                    process.pid
+                );
+            }
             continue;
         }
         let Ok(executable) = process.exe() else {
@@ -5868,6 +5880,12 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
             || matches!(name, "code" | "codium" | "vscodium" | "electron")
         {
             continue;
+        }
+        if trace {
+            eprintln!(
+                "teardown: browser main candidate pid={} name={name}",
+                process.pid
+            );
         }
         if process
             .stat()
