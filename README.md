@@ -160,6 +160,18 @@ databases without copying their contents, and reads use the host inodes and
 SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
+
+When copying an app profile inside the session to use as a separate writable
+`--user-data-dir`, make the copy dereference symlinks and keep its directories
+writable. A live SQLite database in HOME may be a symlink to the read-only
+`/run/kwin-mcp-host-sqlite` alias; `rsync -a` preserves that symlink, so the
+copied profile still points at the read-only database. For example:
+
+```bash
+rsync -aL --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \
+  "$HOME/.config/Codex/" "$HOME/.codex-kwin/"
+```
+
 Live database directory aliases also expose their siblings read-only under
 `/run/kwin-mcp-host-sqlite/`. Ordinary sibling paths under HOME remain privately
 writable. The aliases mirror hidden session directories and mask known host
