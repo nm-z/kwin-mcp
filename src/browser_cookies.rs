@@ -565,7 +565,7 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     for jar in jars.iter().filter(|jar| jar.upper.is_file()) {
         let temporary = jar.saved.with_extension("snapshot");
         let result = (|| -> Result<()> {
-            if !supports_cookie_jar(&jar.upper)? {
+            if !supports_cookie_jar(&jar.upper).context("inspect session cookie database")? {
                 eprintln!(
                     "teardown: skipping non-cookie SQLite database {}",
                     jar.upper.display()
@@ -573,11 +573,12 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 return Ok(());
             }
             let parent = jar.saved.parent().context("cookie state has no parent")?;
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).context("create private cookie state directory")?;
             // Every directory beneath the private root is private as well.
             let mut directory = parent;
             while directory.starts_with(&root) {
-                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .context("protect private cookie state directory")?;
                 let Some(next) = directory.parent() else {
                     break;
                 };
@@ -588,7 +589,8 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&temporary)?;
+                .open(&temporary)
+                .context("create temporary cookie database")?;
             snapshot(&jar.upper, &temporary).context("snapshot private cookie jar")?;
             let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
                 .context("record cookie deletions")?;
