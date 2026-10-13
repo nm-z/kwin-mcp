@@ -27,6 +27,8 @@ Use the user's active desktop only when the requested result inherently belongs 
 - The user asks about or asks the agent to manipulate a window, tab, focus state, or application already open on their active desktop.
 - The result must remain visible or usable on the user's active desktop after the agent finishes.
 
+For a user-requested host window inventory or exact activation, the isolated-session `window_list` and `window_activate` tools do not apply. On KDE Plasma 6, follow the host-side `kdotool` fallback documented in the repository README. It queries or activates the host window directly, so use it only for an explicitly requested host-desktop task.
+
 "My session" means the user's active desktop. "KWin MCP," "your session," and "your KWin MCP session" mean the carbon-copy live desktop.
 
 ## Operate and prove the path
