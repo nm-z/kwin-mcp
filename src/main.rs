@@ -4168,22 +4168,15 @@ fn prepare_browser_cookies(
                 let upper = upper_file(plan, &database)?;
                 let mut merge_failed = false;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
-                        match kwin_mcp::browser_cookies::merge(&upper, &previous) {
-                            Ok(()) => Ok(()),
-                            Err(error) => {
-                                merge_failed = true;
-                                let message = format!(
-                                    "{}: {error:#}",
-                                    database.display()
-                                );
-                                eprintln!(
-                                    "session_start: preserving host cookie schema for {}: {error:#}",
-                                    database.display()
-                                );
-                                cookie_errors.push(message);
-                                Ok(())
-                            }
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                            merge_failed = true;
+                            let message = format!("{}: {error:#}", database.display());
+                            eprintln!(
+                                "session_start: preserving host cookie schema for {}: {error:#}",
+                                database.display()
+                            );
+                            cookie_errors.push(message);
                         }
                     })
                 } else {
