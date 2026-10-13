@@ -42,7 +42,8 @@ use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_uns
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1::{
     Pointer as ScPointer, ZkdeScreencastUnstableV1,
 };
-use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::keyboard::PhysicalKey;
 
 // Bindings ceilings — the wayland-protocols-plasma 0.3.12 XMLs cap here even
@@ -75,6 +76,8 @@ const PASTE_SETTLE: Duration = Duration::from_millis(200);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+const INITIAL_VIEWER_WIDTH: f64 = 1920.0;
+const INITIAL_VIEWER_HEIGHT: f64 = 1080.0;
 
 fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
     let state = session
@@ -549,7 +552,9 @@ fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u
             None => Ok(default),
         }
     };
-    Ok((next(3840, "width")?, next(2160, "height")?))
+    let size = (next(3840, "width")?, next(2160, "height")?);
+    anyhow::ensure!(size.0 > 0 && size.1 > 0, "viewer dimensions must be positive");
+    Ok(size)
 }
 
 // The link to a session's compositor: its fake_input, the PipeWire loop that
@@ -736,6 +741,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         out: InputOut::Local(gate),
         last_pos: None,
         held_buttons: 0,
+        active_touch: None,
         held_keys: HashSet::new(),
         clipboard: Some(clipboard),
     };
@@ -792,8 +798,15 @@ fn window_loop(
 ) -> anyhow::Result<()> {
     let status_dir = match &title {ViewerTitle::Local(path) => Some(*path), ViewerTitle::Remote(_,_) => None};
     let initial_title = title.text();
+    let initial_scale = (INITIAL_VIEWER_WIDTH / f64::from(virt.0))
+        .min(INITIAL_VIEWER_HEIGHT / f64::from(virt.1))
+        .min(1.0);
+    let initial_size = LogicalSize::new(
+        f64::from(virt.0) * initial_scale,
+        f64::from(virt.1) * initial_scale,
+    );
     let window = WindowBuilder::default()
-        .window(|wa| wa.with_title(&initial_title).with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
+        .window(|wa| wa.with_title(&initial_title).with_inner_size(initial_size))
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -807,6 +820,7 @@ fn window_loop(
     let started = Instant::now();
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
+    let mut aspect = ViewerAspect::new(virt);
 
     window.run(|mut frame| {
         // Leave as soon as anything the viewer depends on has ended, so the
@@ -839,7 +853,20 @@ fn window_loop(
             next_title_check = Instant::now() + Duration::from_millis(250);
         }
         for event in frame.events {
-            forward_input(event, (frame.width, frame.height), virt, input_state, numlock);
+            if let Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } = event
+            {
+                aspect.resize(frame.window, *size);
+            }
+            forward_input(
+                event,
+                (frame.width, frame.height),
+                virt,
+                input_state,
+                numlock,
+            );
         }
 
         // Consume the latest frame if one arrived; upload into src_image.
@@ -898,6 +925,64 @@ fn window_loop(
     })?;
     if let Some(error)=startup_error {anyhow::bail!(error);}
     Ok(())
+}
+
+// Follow the changed edge instead of undoing a vertical drag with a width-only
+// correction. Window and input dimensions remain physical pixels.
+struct ViewerAspect {
+    source: (u32, u32),
+    previous: Option<PhysicalSize<u32>>,
+    requested: Option<(PhysicalSize<u32>, PhysicalSize<u32>)>,
+}
+
+impl ViewerAspect {
+    fn new(source: (u32, u32)) -> Self {
+        Self {
+            source,
+            previous: None,
+            requested: None,
+        }
+    }
+
+    fn resize(&mut self, window: &winit::window::Window, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let previous = self.previous.replace(size);
+        let height = (u64::from(size.width) * u64::from(self.source.1)
+            + u64::from(self.source.0) / 2)
+            / u64::from(self.source.0);
+        let width = (u64::from(size.height) * u64::from(self.source.0)
+            + u64::from(self.source.1) / 2)
+            / u64::from(self.source.1);
+        let height = u32::try_from(height.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        let width = u32::try_from(width.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        if height == size.height || width == size.width {
+            self.requested = None;
+            return;
+        }
+        let follow_width = match previous {
+            Some(old) => {
+                u64::from(size.width.abs_diff(old.width)) * u64::from(old.height)
+                    >= u64::from(size.height.abs_diff(old.height)) * u64::from(old.width)
+            }
+            None => height <= size.height,
+        };
+        let target = if follow_width {
+            PhysicalSize::new(size.width, height)
+        } else {
+            PhysicalSize::new(width, size.height)
+        };
+        if self.requested == Some((size, target)) {
+            return;
+        }
+        self.requested = Some((size, target));
+        let applied = window.request_inner_size(target);
+        eprintln!(
+            "kwin-viewer: aspect resize configured={}x{} requested={}x{} applied={applied:?}",
+            size.width, size.height, target.width, target.height
+        );
+    }
 }
 
 // Wire format between `--serve` (on the host that runs the session) and
@@ -1108,6 +1193,7 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         out: InputOut::Remote(Arc::new(Mutex::new(stdin))),
         last_pos: None,
         held_buttons: 0,
+        active_touch: None,
         held_keys: HashSet::new(),
         clipboard: None,
     };
@@ -1390,6 +1476,8 @@ struct InputState {
     // Currently-held mouse buttons. Non-empty means we're in a drag and
     // pointer motions should be forwarded so the drag actually drags.
     held_buttons: u32,
+    // One touch controls the same pointer used by local and remote mouse input.
+    active_touch: Option<u64>,
     // Evdev keycodes currently held inside the container. We forcibly
     // release them on focus loss; otherwise a missed Released event (e.g.
     // user releases Shift outside the viewer window) leaves a modifier
@@ -1424,6 +1512,9 @@ fn forward_input(
         eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
     }
     if let WindowEvent::Focused(false) = event {
+        if state.active_touch.take().is_some() {
+            state.out.send(Op::Button(BTN_LEFT, 0));
+        }
         // Drain any keys that were forwarded as pressed but whose Released
         // event we may not see — release them all so no modifier stays
         // stuck inside the container while the user is elsewhere on host.
@@ -1439,6 +1530,38 @@ fn forward_input(
         }
     }
     match event {
+        WindowEvent::Touch(touch) => {
+            let begin = touch.phase == TouchPhase::Started
+                && state.active_touch.is_none()
+                && state.held_buttons == 0;
+            let mapped = map_window_to_virtual(
+                (touch.location.x, touch.location.y),
+                window_size.0,
+                window_size.1,
+                virt,
+            );
+            if begin {
+                if mapped.is_none() {
+                    return;
+                }
+                state.active_touch = Some(touch.id);
+            }
+            if state.active_touch != Some(touch.id) {
+                return;
+            }
+            if touch.phase != TouchPhase::Cancelled
+                && let Some((x, y)) = mapped
+            {
+                state.last_pos = Some((touch.location.x, touch.location.y));
+                state.out.send(Op::Motion(x, y));
+            }
+            if begin {
+                state.out.send(Op::Button(BTN_LEFT, 1));
+            } else if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                state.out.send(Op::Button(BTN_LEFT, 0));
+                state.active_touch = None;
+            }
+        }
         WindowEvent::CursorMoved { position, .. } => {
             // Always record the latest cursor position locally so a subsequent
             // click can snap the container's cursor to it. Only forward the
@@ -1452,7 +1575,14 @@ fn forward_input(
                 state.out.send(Op::Motion(x, y));
             }
         }
-        WindowEvent::MouseInput { state: btn_state, button, .. } => {
+        WindowEvent::MouseInput {
+            state: btn_state,
+            button,
+            ..
+        } => {
+            if state.active_touch.is_some() {
+                return;
+            }
             let code = match button {
                 MouseButton::Left => BTN_LEFT,
                 MouseButton::Right => BTN_RIGHT,
