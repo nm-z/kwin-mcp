@@ -14,10 +14,13 @@ class Rpc
   def initialize(binary, home, log, extra_env = {})
     @home = home
     %w[.config .local/share .cache .local/state .kde].each { |p| FileUtils.mkdir_p(File.join(home, p)) }
+    tmpdir = ENV.fetch('KWIN_MCP_E2E_TMPDIR', '/tmp')
+    FileUtils.mkdir_p(tmpdir)
     runtime = "/run/user/#{Process.uid}"
     env = { 'HOME' => home, 'XDG_CONFIG_HOME' => "#{home}/.config", 'XDG_DATA_HOME' => "#{home}/.local/share",
             'XDG_CACHE_HOME' => "#{home}/.cache", 'XDG_STATE_HOME' => "#{home}/.local/state", 'KDEHOME' => "#{home}/.kde",
             'KWIN_MCP_REPO' => "#{home}/no-repository", 'KDE_SESSION_VERSION' => '6',
+            'TMPDIR' => tmpdir,
             'XDG_RUNTIME_DIR' => runtime, 'DBUS_SESSION_BUS_ADDRESS' => "unix:path=#{runtime}/bus",
             'WAYLAND_DISPLAY' => 'wayland-0' }
     @input, @output, error, @wait = Open3.popen3(env.merge(extra_env), binary, '--autoclean')
@@ -99,14 +102,22 @@ output = File.expand_path(ARGV.fetch(0))
 FileUtils.mkdir_p(output)
 outer = nil
 inner = nil
+touch_holder_pid = nil
 begin
-  outer = Rpc.new(SERVER, "#{output}/outer-home", "#{output}/outer-server.log")
+  outer = Rpc.new(SERVER, "#{output}/outer-home", "#{output}/outer-server.log",
+                  { 'KWIN_MCP_TEST_RESIZABLE_WINDOWS' => '1' })
   data = outer.start(1600, 1000)
   File.write("#{output}/outer-state.json", JSON.pretty_generate(data))
+  touch_ready = "#{output}/touch-holder.ready"
+  holder_log = File.open("#{output}/touch-holder.log", 'w')
+  touch_holder_pid = Process.spawn(TOUCH, '--hold', "#{outer.workdir}/wayland-0", '120', touch_ready,
+                                  out: holder_log, err: holder_log)
+  holder_log.close
+  wait_until(5) { true if File.file?(touch_ready) }
   # Both servers retain the real host systemd manager for bounded scopes.
   # The source server's viewer_open uses the outer isolated Wayland socket.
   inner = Rpc.new(SERVER, "#{output}/inner-home", "#{output}/inner-server.log",
-                  { 'WAYLAND_DISPLAY' => "#{outer.workdir}/wayland-0" })
+                  { 'WAYLAND_DISPLAY' => "#{outer.workdir}/wayland-0", 'KWIN_MCP_TEST_TOUCH_LOG' => '1' })
   source_data = inner.start(800, 600)
   inner.tool('launch_app', { command: "#{PROBE.shellescape} #{(inner.home + '/events.log').shellescape}" })
   opened = inner.tool('viewer_open')
@@ -118,33 +129,50 @@ begin
   raise "viewer missing: #{windows.inspect}" unless viewer
   id = viewer.fetch('id')
   outer.tool('window_activate', { window_id: id })
-  # This KWin belongs exclusively to the outer test session.
-  outer.tool('launch_app', { command: "kdotool windowstate --remove MAXIMIZED #{id.shellescape} windowsize #{id.shellescape} 800 600 windowmove #{id.shellescape} 100 100" }, allow_error: true)
+  initial = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
+  raise 'viewer disappeared before resize' unless initial
+  raise "viewer did not open at the session ratio: #{initial.inspect}" unless (initial['w'] * 600 - initial['h'] * 800).abs <= 800
+  before = outer.tool('screenshot')
+  File.write("#{output}/screenshot-before.json", JSON.pretty_generate(before))
+  FileUtils.cp(before.fetch('structuredContent').fetch('path'), "#{output}/screenshot-before.png")
   snapshots = []
-  [ [900, 600], ['bottom-edge', 100] ].each_with_index do |requested, index|
-    if index.zero?
-      width, height = requested
-      outer.tool('launch_app', { command: "kdotool windowsize #{id.shellescape} #{width} #{height}" }, allow_error: true)
-    else
-      previous = snapshots.last[:actual]
+  [{ edge: 'bottom', delta: -100 }, { edge: 'horizontal', delta: 100 }].each_with_index do |requested, index|
+    previous = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
+    raise 'viewer disappeared before interactive resize' unless previous
+    if requested[:edge] == 'bottom'
       from_x = previous.fetch('x') + previous.fetch('w') / 2
       from_y = previous.fetch('y') + previous.fetch('h') - 20
-      to_y = from_y + requested.last
-      outer.tool('launch_app', { command: "#{TOUCH.shellescape} --resize #{(outer.workdir + '/wayland-0').shellescape} #{from_x} #{from_y} #{from_x} #{to_y}" }, allow_error: true)
+      to_x = from_x
+      to_y = from_y + requested[:delta]
+    else
+      delta = requested[:delta]
+      if previous.fetch('x') + previous.fetch('w') + delta < 1600
+        from_x = previous.fetch('x') + previous.fetch('w') - 20
+      else
+        from_x = previous.fetch('x') + 20
+        delta = -delta
+      end
+      from_y = previous.fetch('y') + previous.fetch('h') / 2
+      to_x = from_x + delta
+      to_y = from_y
+    end
+    resize = "#{TOUCH.shellescape} --resize #{(outer.workdir + '/wayland-0').shellescape} #{from_x} #{from_y} #{to_x} #{to_y}"
+    outer.tool('launch_app', { command: resize }, allow_error: true)
+    changed = wait_until do
+      current = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
+      current if current && (current['w'] != previous['w'] || current['h'] != previous['h'])
     end
     sleep 0.5
     geometry = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
-    raise 'viewer disappeared' unless geometry
-    snapshots << { requested: requested, actual: geometry }
-    if index.positive?
-      previous = snapshots[index - 1][:actual]
-      raise 'compositor did not perform the interactive resize' if geometry['w'] == previous['w'] && geometry['h'] == previous['h']
-    end
+    raise 'viewer disappeared after resize' unless geometry
+    raise 'compositor did not perform the interactive resize' if geometry['w'] == previous['w'] && geometry['h'] == previous['h']
+    snapshots << { requested: requested.merge('dragged_by' => changed.slice('x', 'y', 'w', 'h')), actual: geometry }
     outer.tool('window_activate', { window_id: id })
     shot = outer.tool('screenshot')
     File.write("#{output}/screenshot-#{index}.json", JSON.pretty_generate(shot))
     capture = shot.fetch('structuredContent')
-    image = "#{output}/screenshot-#{index}.png"
+    screenshot_name = index.zero? ? 'screenshot-after-vertical' : 'screenshot-after-horizontal'
+    image = "#{output}/#{screenshot_name}.png"
     FileUtils.cp(capture.fetch('path'), image)
     image_width = capture.fetch('width')
     image_height = capture.fetch('height')
@@ -158,22 +186,26 @@ begin
     raise "picture does not fill viewer corners: #{colors.inspect}" unless colors == expected_colors
     snapshots.last[:corners] = colors
     # The tool's screenshot and mouse coordinates describe the client area.
-    x = geometry.fetch('w') * 0.25
-    y = geometry.fetch('h') * 0.75
+    x = (geometry.fetch('w') * 0.25).round
+    y = (geometry.fetch('h') * 0.75).round
     outer.tool('mouse_click', { x: x, y: y })
-    # Send a real wl_touch sequence to this isolated KWin, at the same
-    # window-relative point. The viewer forwards it to the inner pointer.
+    # Send a touch sequence through KWin's fake-input Wayland protocol to this
+    # isolated compositor. The viewer forwards it to the inner pointer.
     tx = geometry.fetch('x') + geometry.fetch('w') * 0.75
     ty = geometry.fetch('y') + geometry.fetch('h') * 0.25
     outer.tool('launch_app', { command: "#{TOUCH.shellescape} #{(outer.workdir + '/wayland-0').shellescape} #{tx} #{ty}" }, allow_error: true)
   end
-  File.write("#{output}/geometry.json", JSON.pretty_generate(snapshots))
-  inner.export("#{inner.home}/events.log", "#{output}/events.log")
+  File.write("#{output}/geometry.json", JSON.pretty_generate({ before: initial, resizes: snapshots }))
+  observed_events = wait_until(5) do
+    inner.export("#{inner.home}/events.log", "#{output}/events.log")
+    lines = File.readlines("#{output}/events.log")
+    lines if lines.length >= 4
+  end
   FileUtils.cp("#{inner.workdir}/viewer.log", "#{output}/viewer.log")
   if File.exist?("#{inner.workdir}/viewer-pipewire.json")
     FileUtils.cp("#{inner.workdir}/viewer-pipewire.json", "#{output}/viewer-pipewire.json")
   end
-  events = File.readlines("#{output}/events.log").map { |line| line.split.map(&:to_f) }
+  events = observed_events.map { |line| line.split.map(&:to_f) }
   raise "expected mouse and touch after each resize: #{events.inspect}" unless events.length == 4
   events.each_with_index do |event, index|
     expected = index.even? ? [200, 450] : [600, 150]
@@ -183,7 +215,7 @@ begin
   log = File.read("#{output}/viewer.log")
   failures = snapshots.reject { |s| (s[:actual]['w'] * 600 - s[:actual]['h'] * 800).abs <= 800 }
   if failures.empty?
-    puts 'PASS: viewer ratio, mouse and touch mapping after horizontal and vertical changes'
+    puts 'PASS: viewer ratio, mouse and touch mapping after vertical and horizontal drags'
   else
     failures.each do |failure|
       width = failure[:actual]['w'].to_i
@@ -195,6 +227,16 @@ begin
     puts 'PASS: mouse and touch mapping at the compositor-configured geometry'
   end
 ensure
+  if touch_holder_pid
+    begin
+      Process.kill('TERM', touch_holder_pid)
+    rescue Errno::ESRCH
+    end
+    begin
+      Process.wait(touch_holder_pid)
+    rescue Errno::ECHILD
+    end
+  end
   if inner&.workdir
     %w[viewer.log viewer-pipewire.json].each do |file|
       source = "#{inner.workdir}/#{file}"
