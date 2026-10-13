@@ -7900,10 +7900,12 @@ impl KwinMcp {
         )
         .map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
         let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
+        // Apply maximize only at window creation, so KWin doesn't force the
+        // window to stay maximized after later resize requests.
         std::fs::write(
             &kwinrulesrc_path,
-            "[1]\nDescription=No decorations, maximized\nnoborder=true\nnoborderrule=2\n\
-             maximizehoriz=true\nmaximizehorizrule=2\nmaximizevert=true\nmaximizevertrule=2\n\
+            "[1]\nDescription=No decorations, initially maximized\nnoborder=true\nnoborderrule=2\n\
+             maximizehoriz=true\nmaximizehorizrule=3\nmaximizevert=true\nmaximizevertrule=3\n\
              wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n",
         )
         .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
