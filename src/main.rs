@@ -7900,12 +7900,19 @@ impl KwinMcp {
         )
         .map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
         let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
-        std::fs::write(
-            &kwinrulesrc_path,
+        // The real viewer resize regression needs an unmaximized toplevel in
+        // its isolated outer KWin. Keep this opt-in hook off for normal sessions.
+        let test_resizable_windows =
+            std::env::var("KWIN_MCP_TEST_RESIZABLE_WINDOWS").is_ok_and(|value| value == "1");
+        let kwinrules = if test_resizable_windows {
+            "[1]\nDescription=No decorations\nnoborder=true\nnoborderrule=2\n\
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+        } else {
             "[1]\nDescription=No decorations, maximized\nnoborder=true\nnoborderrule=2\n\
              maximizehoriz=true\nmaximizehorizrule=2\nmaximizevert=true\nmaximizevertrule=2\n\
-             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n",
-        )
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+        };
+        std::fs::write(&kwinrulesrc_path, kwinrules)
         .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
         let kscreenlockerrc_path = host_xdg_dir.join("kscreenlockerrc");
         std::fs::write(

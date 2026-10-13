@@ -1531,6 +1531,17 @@ fn forward_input(
     }
     match event {
         WindowEvent::Touch(touch) => {
+            if std::env::var("KWIN_MCP_TEST_TOUCH_LOG").is_ok_and(|value| value == "1") {
+                eprintln!(
+                    "kwin-viewer: test touch phase={:?} id={} location={:.3},{:.3} window={}x{}",
+                    touch.phase,
+                    touch.id,
+                    touch.location.x,
+                    touch.location.y,
+                    window_size.0,
+                    window_size.1
+                );
+            }
             let begin = touch.phase == TouchPhase::Started
                 && state.active_touch.is_none()
                 && state.held_buttons == 0;

@@ -18,14 +18,28 @@ static void removed(void *data, struct wl_registry *registry, uint32_t name) {
 static const struct wl_registry_listener listener = {global, removed};
 int main(int argc, char **argv) {
     const int resize = argc == 7 && strcmp(argv[1], "--resize") == 0;
-    if (argc != 4 && !resize) return 2;
-    struct wl_display *display = wl_display_connect(argv[resize ? 2 : 1]);
+    const int hold = argc == 5 && strcmp(argv[1], "--hold") == 0;
+    if (argc != 4 && !resize && !hold) return 2;
+    struct wl_display *display = wl_display_connect(argv[resize || hold ? 2 : 1]);
     if (!display) { perror("wl_display_connect"); return 1; }
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &listener, NULL);
     if (wl_display_roundtrip(display) < 0 || !input) return 1;
     org_kde_kwin_fake_input_authenticate(input, "kwin-mcp viewer regression", "isolated viewer touch mapping");
     wl_display_roundtrip(display);
+    if (hold) {
+        const long seconds = strtol(argv[3], NULL, 10);
+        if (seconds < 1 || seconds > 120) return 2;
+        FILE *ready = fopen(argv[4], "w");
+        if (!ready) { perror("touch-ready"); return 1; }
+        fclose(ready);
+        for (long step = 0; step < seconds * 10; ++step) {
+            if (wl_display_roundtrip(display) < 0) break;
+            usleep(100000);
+        }
+        wl_display_disconnect(display);
+        return 0;
+    }
     if (resize) {
         const double x = strtod(argv[3], NULL), y = strtod(argv[4], NULL);
         const double to_x = strtod(argv[5], NULL), to_y = strtod(argv[6], NULL);
