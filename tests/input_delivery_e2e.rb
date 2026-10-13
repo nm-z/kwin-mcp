@@ -146,6 +146,7 @@ class InputDeliveryProbe
     rich_contenteditable
     nested_rich_contenteditable
     unverified_password_field
+    unverified_embedded_rich_text
   end
 
   def rich_contenteditable
@@ -196,6 +197,30 @@ class InputDeliveryProbe
     File.write(File.join(@artifacts, 'electron-nested-rich-contenteditable.tree.txt'), visible)
     raise 'nested rich contenteditable accessibility tree lacks complete text' unless visible.include?(text)
     screen('electron-nested-rich-after-return')
+  end
+
+  def unverified_embedded_rich_text
+    visible = tree
+    match = visible.match(/entry\tUnverified embedded rich text\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'unverified embedded rich-text bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('electron-unverified-embedded-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    text = 'Unverified embedded delivery probe'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    raise 'embedded rich text omitted completed submission' unless result['submission_complete']
+    raise 'embedded rich text lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise "embedded rich text suggested retry: #{delivery}" unless result['retry_safe'] == false
+    raise "embedded rich text did not report unverified: #{delivery}" unless delivery['status'] == 'unverified'
+    raise "embedded rich text used the wrong method: #{delivery}" unless delivery['method'] == 'atspi_rich_text'
+    raise "wrong embedded rich-text expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
+    raise "embedded rich-text focused node was not the single object character: #{delivery}" unless delivery['observed_field_characters'] == 1
+    visible = tree
+    File.write(File.join(@artifacts, 'electron-unverified-embedded.tree.txt'), visible)
+    raise 'opaque embedded object unexpectedly exposed the typed text' if visible.include?(text)
+    screen('electron-unverified-embedded-after-return')
   end
 
   def terminal

@@ -957,7 +957,6 @@ fn normalize_accessible_offset(text: &str, offset: usize) -> usize {
 
 struct DescendantTextSnapshot {
     text: String,
-    has_children: bool,
     has_embedded_object: bool,
     matches_expected: bool,
 }
@@ -979,7 +978,6 @@ async fn descendant_text_snapshot(
     let mut visited = 0;
     let mut text = String::new();
     let mut text_characters: usize = 0;
-    let mut has_children = !stack.is_empty();
     let mut has_embedded_object = false;
 
     while let Some(object) = stack.pop() {
@@ -989,7 +987,6 @@ async fn descendant_text_snapshot(
         }
         let node = object.as_accessible_proxy(bus).await?;
         let children = node.get_children().await?;
-        has_children |= !children.is_empty();
         let node_text = match node.proxies().await?.text().await {
             Ok(text) => {
                 let count = text.character_count().await?;
@@ -1002,13 +999,13 @@ async fn descendant_text_snapshot(
                 }
                 value
             }
-            Err(_) => String::new(),
+            Err(atspi::AtspiError::InterfaceNotAvailable(_)) => String::new(),
+            Err(error) => return Err(error.into()),
         };
         has_embedded_object |= node_text.contains(EMBEDDED_OBJECT_CHARACTER);
         if !expected.is_empty() && normalize_accessible_text(&node_text) == expected {
             return Ok(DescendantTextSnapshot {
                 text,
-                has_children,
                 has_embedded_object,
                 matches_expected: true,
             });
@@ -1028,7 +1025,6 @@ async fn descendant_text_snapshot(
 
     Ok(DescendantTextSnapshot {
         text,
-        has_children,
         has_embedded_object,
         matches_expected: false,
     })
@@ -1091,17 +1087,24 @@ impl TextDelivery {
         }
     }
 
-    fn rich_text_unavailable(expected_count: usize, observed_count: Option<usize>) -> Self {
+    fn rich_text_unavailable(
+        expected_count: usize,
+        observed_count: Option<usize>,
+        last_snapshot_error: Option<&str>,
+    ) -> Self {
+        let warning = match last_snapshot_error {
+            Some(error) => format!(
+                "KWin acknowledged all key events, but AT-SPI did not expose a complete value for the focused rich-text editor. The last descendant snapshot failed: {error}. Inspect the field before sending or retrying; do not retype blindly."
+            ),
+            None => "KWin acknowledged all key events, but AT-SPI did not expose a complete value for the focused rich-text editor. Inspect the field before sending or retrying; do not retype blindly.".to_owned(),
+        };
         Self {
             status: "unverified",
             method: "atspi_rich_text",
             compositor_acknowledged: true,
             expected_field_characters: Some(expected_count),
             observed_field_characters: observed_count,
-            warning: Some(
-                "KWin acknowledged all key events, but AT-SPI did not expose a complete value for the focused rich-text editor. Inspect the field before sending or retrying; do not retype blindly."
-                    .to_owned(),
-            ),
+            warning: Some(warning),
         }
     }
 }
@@ -1262,7 +1265,8 @@ impl TextReceipt {
     pub async fn confirm(self) -> TextDelivery {
         let expected_count = self.expected.chars().count();
         let mut observed_count = None;
-        let mut rich_text_unreadable = false;
+        let mut has_embedded_object = false;
+        let mut last_snapshot_error = None;
         let check = async {
             use atspi::proxy::accessible::ObjectRefExt;
             use atspi::proxy::proxy_ext::ProxyExt;
@@ -1282,16 +1286,19 @@ impl TextReceipt {
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
                 }
-                rich_text_unreadable |= observed.contains(EMBEDDED_OBJECT_CHARACTER);
+                has_embedded_object |= observed.contains(EMBEDDED_OBJECT_CHARACTER);
                 if poll_count == 0 || poll_count % 5 == 4 {
-                    let snapshot =
-                        descendant_text_snapshot(&self.object, &self.bus, &self.expected).await?;
-                    rich_text_unreadable |= snapshot.has_children || snapshot.has_embedded_object;
-                    let flattened = normalize_accessible_text(&snapshot.text);
-                    if snapshot.matches_expected || flattened == self.expected {
-                        // Keep this as the focused node's actual count. The
-                        // method identifies descendant-based verification.
-                        return Ok("atspi_rich_text");
+                    match descendant_text_snapshot(&self.object, &self.bus, &self.expected).await {
+                        Ok(snapshot) => {
+                            has_embedded_object |= snapshot.has_embedded_object;
+                            let flattened = normalize_accessible_text(&snapshot.text);
+                            if snapshot.matches_expected || flattened == self.expected {
+                                // Keep this as the focused node's actual count. The
+                                // method identifies descendant-based verification.
+                                return Ok("atspi_rich_text");
+                            }
+                        }
+                        Err(error) => last_snapshot_error = Some(error.to_string()),
                     }
                 }
                 poll_count += 1;
@@ -1308,17 +1315,28 @@ impl TextReceipt {
                 warning: None,
             },
             Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
-            Err(_) if rich_text_unreadable => {
-                TextDelivery::rich_text_unavailable(expected_count, observed_count)
+            Err(_) if has_embedded_object => TextDelivery::rich_text_unavailable(
+                expected_count,
+                observed_count,
+                last_snapshot_error.as_deref(),
+            ),
+            Err(_) => {
+                let mut warning = "KWin acknowledged the keys, but the focused field did not contain the complete expected text within 10s. Input may still arrive or the application may have transformed it.".to_owned();
+                if let Some(error) = last_snapshot_error {
+                    warning.push_str(&format!(" The last descendant snapshot failed: {error}."));
+                }
+                warning.push_str(
+                    " Inspect the field before sending or retrying; do not retype blindly.",
+                );
+                TextDelivery {
+                    status: "pending_or_mismatched",
+                    method: "atspi_focused_text",
+                    compositor_acknowledged: true,
+                    expected_field_characters: Some(expected_count),
+                    observed_field_characters: observed_count,
+                    warning: Some(warning),
+                }
             }
-            Err(_) => TextDelivery {
-                status: "pending_or_mismatched",
-                method: "atspi_focused_text",
-                compositor_acknowledged: true,
-                expected_field_characters: Some(expected_count),
-                observed_field_characters: observed_count,
-                warning: Some("KWin acknowledged the keys, but the focused field did not contain the complete expected text within 10s. Input may still arrive or the application may have transformed it. Inspect the field before sending or retrying; do not retype blindly.".to_owned()),
-            },
         }
     }
 }
