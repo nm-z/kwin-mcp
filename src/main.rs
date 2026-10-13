@@ -5845,8 +5845,12 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
             break;
         }
     }
+    let parents = processes
+        .iter()
+        .map(|(process, stat)| (process.pid, stat.ppid))
+        .collect::<std::collections::HashMap<_, _>>();
     let trace = std::env::var_os("KWIN_MCP_TEST_BROWSER_SHUTDOWN_TRACE").is_some();
-    let mut browsers = Vec::new();
+    let mut candidates = Vec::new();
     for (process, stat) in processes {
         if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
             continue;
@@ -5856,20 +5860,11 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         };
         let process_type = command.iter().enumerate().find_map(|(index, argument)| {
             if argument == "--type" {
-                command.get(index + 1).map(String::as_str)
+                command.get(index + 1).cloned()
             } else {
-                argument.strip_prefix("--type=")
+                argument.strip_prefix("--type=").map(str::to_owned)
             }
         });
-        if let Some(process_type) = process_type {
-            if trace {
-                eprintln!(
-                    "teardown: browser child pid={} type={process_type}",
-                    process.pid
-                );
-            }
-            continue;
-        }
         let Ok(executable) = process.exe() else {
             continue;
         };
@@ -5881,22 +5876,57 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         {
             continue;
         }
-        if trace {
-            eprintln!(
-                "teardown: browser main candidate pid={} name={name}",
-                process.pid
-            );
-        }
         if process
             .stat()
             .is_ok_and(|current| current.starttime == stat.starttime)
         {
-            browsers.push((process, stat.starttime));
+            candidates.push((
+                process,
+                stat.starttime,
+                stat.ppid,
+                name.to_owned(),
+                process_type,
+            ));
         }
     }
+    let candidate_pids = candidates
+        .iter()
+        .map(|(process, _, _, _, _)| process.pid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut main_pids = std::collections::HashSet::new();
+    let mut browsers = Vec::new();
+    for (process, started, parent, name, process_type) in candidates {
+        let mut ancestor = parent;
+        let mut seen = std::collections::HashSet::new();
+        let mut has_browser_ancestor = false;
+        while ancestor > 0 && ancestor != sandbox_pid && seen.insert(ancestor) {
+            if candidate_pids.contains(&ancestor) {
+                has_browser_ancestor = true;
+                break;
+            }
+            ancestor = *parents.get(&ancestor).unwrap_or(&0);
+        }
+        let is_main = match process_type.as_deref() {
+            Some("browser") => true,
+            Some(_) => false,
+            None => !has_browser_ancestor,
+        };
+        if trace {
+            eprintln!(
+                "teardown: browser process pid={} name={name} type={} main={is_main}",
+                process.pid,
+                process_type.as_deref().unwrap_or("none")
+            );
+        }
+        if is_main {
+            main_pids.insert(process.pid);
+        }
+        browsers.push((process, started));
+    }
     let requested = browsers.len();
+    let main_count = main_pids.len();
     eprintln!(
-        "teardown: graceful browser shutdown candidates={requested} cdp_close_attempted={cdp_close_attempted}"
+        "teardown: graceful browser shutdown candidates={requested} mains={main_count} cdp_close_attempted={cdp_close_attempted}"
     );
     if cdp_close_attempted && !browsers.is_empty() {
         let deadline = std::time::Instant::now() + CDP_BROWSER_CLOSE_TIMEOUT;
@@ -5918,6 +5948,9 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         return;
     }
     for (process, started) in &browsers {
+        if !main_pids.contains(&process.pid) {
+            continue;
+        }
         if process
             .stat()
             .is_ok_and(|current| current.starttime == *started)
