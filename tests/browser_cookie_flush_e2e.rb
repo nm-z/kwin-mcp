@@ -147,8 +147,8 @@ begin
       Thread.pass
     end
     shutdown_count = Integer(shutdown_lines[cycle][/mains=(\d+)/, 1])
-    cdp_close_attempted = shutdown_lines[cycle][/cdp_close_attempted=(true|false)/, 1] == 'true'
-    raise 'session_stop did not detect the private Chrome browser' if shutdown_count.zero? && !cdp_close_attempted
+    graceful_close_attempted = shutdown_lines[cycle][/graceful_close_attempted=(true|false)/, 1] == 'true'
+    raise 'session_stop did not detect the private Chrome browser' if shutdown_count.zero? && !graceful_close_attempted
     shutdown_completed = []
     completion_deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
     loop do

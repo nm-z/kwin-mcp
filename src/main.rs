@@ -5772,10 +5772,12 @@ impl WorkdirOwnership {
 /// async workers that answer other MCP requests. Browsers flush before the
 /// session-local wallet and sandbox stop; nothing on the host is touched.
 async fn teardown_blocking(mut sess: Session) {
+    let kwin_windows_closed = request_kwin_browser_close(&sess).await;
     let cdp_close_attempted = request_cdp_browser_close(&sess).await;
+    let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
     let sandbox_pid = sess.sandbox_child.id();
     let _ = tokio::task::spawn_blocking(move || {
-        close_session_browsers(sandbox_pid, cdp_close_attempted)
+        close_session_browsers(sandbox_pid, graceful_close_attempted)
     })
     .await;
     if let Some(wallet) = sess.wallet.take() {
@@ -5787,6 +5789,54 @@ async fn teardown_blocking(mut sess: Session) {
 const CDP_BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
+async fn request_kwin_browser_close(sess: &Session) -> usize {
+    let script = r#"
+        var browserNames = ["google-chrome-stable", "google-chrome", "chrome",
+            "chromium", "chromium-browser", "brave", "brave-browser", "vivaldi",
+            "vivaldi-stable", "microsoft-edge", "microsoft-edge-stable", "msedge"];
+        var matched = 0;
+        var closed = 0;
+        var windows = workspace.stackingOrder;
+        for (var i = windows.length - 1; i >= 0; --i) {
+            var w = windows[i];
+            if (!w.managed || w.deleted || w.desktopWindow || w.dock || w.outline) continue;
+            var resourceClass = (w.resourceClass || "").toLowerCase();
+            var resourceName = (w.resourceName || "").toLowerCase();
+            if (browserNames.indexOf(resourceClass) < 0 && browserNames.indexOf(resourceName) < 0) continue;
+            matched++;
+            if (w.closeable) {
+                w.closeWindow();
+                closed++;
+            }
+        }
+        var result = {matched: matched, closed: closed};
+    "#;
+    let report = match run_kwin_script(
+        &sess.kwin_conn,
+        &sess.kwin_unique_name,
+        &sess.host_xdg_dir,
+        script,
+    )
+    .await
+    {
+        Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("teardown: cannot parse KWin browser-close report: {error}");
+                return 0;
+            }
+        },
+        Err(error) => {
+            eprintln!("teardown: KWin browser-window close failed: {error}");
+            return 0;
+        }
+    };
+    let matched = report["matched"].as_u64().unwrap_or_default();
+    let closed = report["closed"].as_u64().unwrap_or_default();
+    eprintln!("teardown: KWin close requested for {closed}/{matched} Chromium window(s)");
+    usize::try_from(closed).unwrap_or_default()
+}
 
 async fn request_cdp_browser_close(sess: &Session) -> bool {
     let Some(browser) = sess.cdp_browser.as_ref() else {
@@ -5819,7 +5869,7 @@ async fn request_cdp_browser_close(sess: &Session) -> bool {
 /// Ask Chromium to close through CDP first, then signal only browser parents
 /// descended from this sandbox if any remain. The session's network services,
 /// compositor, and wallet stay alive until its cookie flush has completed.
-fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
+fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
     let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
         return;
     };
@@ -5926,9 +5976,9 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
     let requested = browsers.len();
     let main_count = main_pids.len();
     eprintln!(
-        "teardown: graceful browser shutdown candidates={requested} mains={main_count} cdp_close_attempted={cdp_close_attempted}"
+        "teardown: graceful browser shutdown candidates={requested} mains={main_count} graceful_close_attempted={graceful_close_attempted}"
     );
-    if cdp_close_attempted && !browsers.is_empty() {
+    if graceful_close_attempted && !browsers.is_empty() {
         let deadline = std::time::Instant::now() + CDP_BROWSER_CLOSE_TIMEOUT;
         while !browsers.is_empty() && std::time::Instant::now() < deadline {
             browsers.retain(|(process, started)| {
@@ -5942,7 +5992,7 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         }
     }
     if browsers.is_empty() {
-        if requested > 0 || cdp_close_attempted {
+        if requested > 0 || graceful_close_attempted {
             eprintln!("teardown: graceful browser shutdown completed");
         }
         return;
@@ -5985,7 +6035,7 @@ fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
         }
         std::thread::sleep(BROWSER_SHUTDOWN_POLL);
     }
-    if browsers.is_empty() && requested > 0 {
+    if browsers.is_empty() && (requested > 0 || graceful_close_attempted) {
         eprintln!("teardown: graceful browser shutdown completed");
     }
 }
