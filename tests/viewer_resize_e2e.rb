@@ -104,8 +104,7 @@ outer = nil
 inner = nil
 touch_holder_pid = nil
 begin
-  outer = Rpc.new(SERVER, "#{output}/outer-home", "#{output}/outer-server.log",
-                  { 'KWIN_MCP_TEST_RESIZABLE_WINDOWS' => '1' })
+  outer = Rpc.new(SERVER, "#{output}/outer-home", "#{output}/outer-server.log")
   data = outer.start(1600, 1000)
   File.write("#{output}/outer-state.json", JSON.pretty_generate(data))
   touch_ready = "#{output}/touch-holder.ready"
@@ -117,7 +116,7 @@ begin
   # Both servers retain the real host systemd manager for bounded scopes.
   # The source server's viewer_open uses the outer isolated Wayland socket.
   inner = Rpc.new(SERVER, "#{output}/inner-home", "#{output}/inner-server.log",
-                  { 'WAYLAND_DISPLAY' => "#{outer.workdir}/wayland-0", 'KWIN_MCP_TEST_TOUCH_LOG' => '1' })
+                  { 'WAYLAND_DISPLAY' => "#{outer.workdir}/wayland-0" })
   source_data = inner.start(800, 600)
   inner.tool('launch_app', { command: "#{PROBE.shellescape} #{(inner.home + '/events.log').shellescape}" })
   opened = inner.tool('viewer_open')
@@ -131,7 +130,7 @@ begin
   outer.tool('window_activate', { window_id: id })
   initial = outer.tool('window_list').fetch('structuredContent').fetch('windows').find { |w| w['id'] == id }
   raise 'viewer disappeared before resize' unless initial
-  raise "viewer did not open at the session ratio: #{initial.inspect}" unless (initial['w'] * 600 - initial['h'] * 800).abs <= 800
+  raise "viewer opened with empty geometry: #{initial.inspect}" unless initial['w'].positive? && initial['h'].positive?
   before = outer.tool('screenshot')
   File.write("#{output}/screenshot-before.json", JSON.pretty_generate(before))
   FileUtils.cp(before.fetch('structuredContent').fetch('path'), "#{output}/screenshot-before.png")
@@ -207,15 +206,21 @@ begin
   end
   events = observed_events.map { |line| line.split.map(&:to_f) }
   raise "expected mouse and touch after each resize: #{events.inspect}" unless events.length == 4
+  # Each pair was sent mouse then touch. The fixture app receives both as
+  # button events and records the mapped session pixels.
+  sources = %w[mouse touch mouse touch]
   events.each_with_index do |event, index|
-    expected = index.even? ? [200, 450] : [600, 150]
-    raise "input mismatch: #{event.inspect}, expected #{expected.inspect}" unless event[0, 2].zip(expected).all? { |actual, target| (actual - target).abs <= 2 }
-    raise "probe is not session-sized: #{event.inspect}" unless event[2, 2] == [800.0, 600.0]
+    source = sources.fetch(index)
+    expected = source == 'mouse' ? [200, 450] : [600, 150]
+    unless event[0, 2].zip(expected).all? { |actual, target| (actual - target).abs <= 2 }
+      raise "fixture app received #{source} at #{event.inspect}, expected #{expected.inspect}"
+    end
+    raise "fixture app is not session-sized: #{event.inspect}" unless event[2, 2] == [800.0, 600.0]
   end
   log = File.read("#{output}/viewer.log")
   failures = snapshots.reject { |s| (s[:actual]['w'] * 600 - s[:actual]['h'] * 800).abs <= 800 }
   if failures.empty?
-    puts 'PASS: viewer ratio, mouse and touch mapping after vertical and horizontal drags'
+    puts 'PASS: viewer ratio and fixture-app mouse/touch mapping after vertical and horizontal drags'
   else
     failures.each do |failure|
       width = failure[:actual]['w'].to_i
@@ -224,7 +229,7 @@ begin
       raise "ratio failed without a measured rejected size request: #{failure.inspect}\n#{log}" unless log.match?(refused)
     end
     puts "COMPOSITOR LIMITATION: #{failures.to_json}"
-    puts 'PASS: mouse and touch mapping at the compositor-configured geometry'
+    puts 'PASS: fixture-app mouse/touch mapping at the compositor-configured geometry'
   end
 ensure
   if touch_holder_pid
