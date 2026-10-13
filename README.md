@@ -373,11 +373,18 @@ applications. Check the previous application state before repeating input.
 acknowledgement. Its `delivery` separates that acknowledgement from application
 text verification. When the focused editable field exposes accessible text,
 `verified` confirms the complete expected insertion; expected/observed character
-counts accompany the receipt. Otherwise `unverified` warns that the application
-text has not been confirmed. A field that still differs after the bounded wait
-reports `pending_or_mismatched` as an error. Inspect the field before sending or
-retrying: delayed input can otherwise be duplicated. Passwords, terminals and
-Tab/Return actions do not expose an application-text receipt.
+counts accompany the receipt. For `atspi_rich_text`, the expected value is
+verified in accessible descendants while `observed_field_characters` continues
+to report the focused node's text length; an embedded-object placeholder can
+therefore report one observed character alongside a verified full value.
+Otherwise `unverified` warns that the application text has not been confirmed.
+When a timed-out check has seen U+FFFC in the focused text or a descendant, it
+reports `unverified` because embedded rich-text content may not be fully
+exposed through AT-SPI. Otherwise, a field that still differs after the
+bounded wait reports `pending_or_mismatched` as an error. Inspect the field
+before sending or retrying: delayed input can otherwise be duplicated.
+Passwords, terminals and Tab/Return actions do not expose an application-text
+receipt.
 
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
