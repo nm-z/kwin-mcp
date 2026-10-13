@@ -3387,7 +3387,7 @@ fn call_without_session_creates_no_processes() {
     let mut client = RpcClient::start();
     initialize(&mut client);
     let result = call_tool(&mut client, 2, "window_list", json!({}));
-    assert!(result.to_string().contains("no session"), "{result}");
+    assert!(result.to_string().contains("no live session"), "{result}");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !direct_children(client.child.id()).is_empty() {
         assert!(Instant::now() < deadline, "unbound server did not exit");
@@ -3400,6 +3400,48 @@ fn call_without_session_creates_no_processes() {
         client.response(3, Duration::from_secs(2))["result"],
         json!({})
     );
+    client.stop_process();
+}
+
+#[test]
+fn unknown_session_from_another_server_reports_recovery_guidance() {
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let next_pid = server_pid.saturating_add(1);
+    let session_server_pid = if next_pid == server_pid {
+        server_pid - 1
+    } else {
+        next_pid
+    };
+    let session_id = format!("s{session_server_pid}-1");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert_eq!(
+        response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert_eq!(response["error"]["data"]["session_id"], session_id);
+    assert_eq!(response["error"]["data"]["server_pid"], server_pid);
+    assert_eq!(
+        response["error"]["data"]["session_server_pid"],
+        session_server_pid
+    );
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("server restart"), "{message}");
+    assert!(
+        message.contains("session_start without session_id"),
+        "{message}"
+    );
+    assert!(direct_children(server_pid).is_empty());
     client.stop_process();
 }
 
