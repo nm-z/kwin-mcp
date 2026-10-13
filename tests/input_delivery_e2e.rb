@@ -143,6 +143,35 @@ class InputDeliveryProbe
     raise 'invalid input changed field' if tree.include?('valid prefix')
     assert_success(call('keyboard_key', key: 'ctrl+a'))
     assert_success(call('keyboard_key', key: 'Backspace'))
+    rich_contenteditable
+  end
+
+  def rich_contenteditable
+    visible = tree
+    match = visible.match(/entry\tRich contenteditable\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'rich contenteditable bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('electron-rich-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    text = 'Rich contenteditable delivery probe: alpha beta 12345.'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    raise 'rich contenteditable omitted completed submission' unless result['submission_complete']
+    raise 'rich contenteditable lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise "rich contenteditable suggested retry: #{delivery}" unless result['retry_safe'] == false
+    unless %w[verified unverified].include?(delivery['status'])
+      raise "unexpected rich contenteditable receipt: #{delivery}"
+    end
+    if delivery['status'] == 'verified'
+      raise "wrong rich-text expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
+      raise "wrong rich-text observed length: #{delivery}" unless delivery['observed_field_characters'] == text.length
+    end
+    visible = tree
+    File.write(File.join(@artifacts, 'electron-rich-contenteditable.tree.txt'), visible)
+    raise 'rich contenteditable lacks complete text after acknowledged input' unless visible.include?(text)
+    screen('electron-rich-after-return')
   end
 
   def terminal
