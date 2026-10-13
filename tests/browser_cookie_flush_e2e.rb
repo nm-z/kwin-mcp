@@ -141,13 +141,14 @@ begin
     shutdown_deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
     shutdown_lines = []
     loop do
-      shutdown_lines = File.readlines(server_stderr).grep(/teardown: graceful browser shutdown requested/)
+      shutdown_lines = File.readlines(server_stderr).grep(/teardown: graceful browser shutdown candidates=/)
       break if shutdown_lines.length >= cycle + 1
       raise 'session_stop did not report graceful browser shutdown' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= shutdown_deadline
       Thread.pass
     end
-    shutdown_count = Integer(shutdown_lines[cycle][/for (\d+) Chromium/, 1])
-    raise 'session_stop did not detect the private Chrome browser' if shutdown_count.zero?
+    shutdown_count = Integer(shutdown_lines[cycle][/candidates=(\d+)/, 1])
+    cdp_close_attempted = shutdown_lines[cycle][/cdp_close_attempted=(true|false)/, 1] == 'true'
+    raise 'session_stop did not detect the private Chrome browser' if shutdown_count.zero? && !cdp_close_attempted
     shutdown_completed = []
     completion_deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
     loop do

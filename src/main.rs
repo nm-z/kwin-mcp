@@ -5772,22 +5772,53 @@ impl WorkdirOwnership {
 /// async workers that answer other MCP requests. Browsers flush before the
 /// session-local wallet and sandbox stop; nothing on the host is touched.
 async fn teardown_blocking(mut sess: Session) {
+    let cdp_close_attempted = request_cdp_browser_close(&sess).await;
     let sandbox_pid = sess.sandbox_child.id();
-    let _ = tokio::task::spawn_blocking(move || close_session_browsers(sandbox_pid)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        close_session_browsers(sandbox_pid, cdp_close_attempted)
+    })
+    .await;
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
     let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
 }
 
+const CDP_BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
-/// Chromium's main process handles SIGTERM by running graceful shutdown, which
-/// flushes pending cookies. Signal only browser parents descended from this
-/// sandbox, while their network services, compositor and wallet remain alive.
-/// Group-wide SIGTERM kills those services before the cookie flush completes.
-fn close_session_browsers(sandbox_pid: u32) {
+async fn request_cdp_browser_close(sess: &Session) -> bool {
+    let Some(browser) = sess.cdp_browser.as_ref() else {
+        return false;
+    };
+    use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
+    eprintln!("teardown: requesting graceful Chrome close through CDP");
+    match tokio::time::timeout(
+        CDP_BROWSER_CLOSE_TIMEOUT,
+        browser.execute(CloseParams::default()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            eprintln!("teardown: CDP graceful browser close accepted");
+            true
+        }
+        Ok(Err(error)) => {
+            eprintln!("teardown: CDP graceful browser close failed: {error}");
+            true
+        }
+        Err(_) => {
+            eprintln!("teardown: CDP graceful browser close timed out");
+            true
+        }
+    }
+}
+
+/// Ask Chromium to close through CDP first, then signal only browser parents
+/// descended from this sandbox if any remain. The session's network services,
+/// compositor, and wallet stay alive until its cookie flush has completed.
+fn close_session_browsers(sandbox_pid: u32, cdp_close_attempted: bool) {
     let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
         return;
     };
@@ -5842,23 +5873,47 @@ fn close_session_browsers(sandbox_pid: u32) {
             .stat()
             .is_ok_and(|current| current.starttime == stat.starttime)
         {
-            if let Err(error) = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(process.pid),
-                nix::sys::signal::Signal::SIGTERM,
-            ) {
-                eprintln!(
-                    "teardown: browser {} shutdown signal failed: {error}",
-                    process.pid
-                );
-            } else {
-                browsers.push((process, stat.starttime));
-            }
+            browsers.push((process, stat.starttime));
         }
     }
     let requested = browsers.len();
     eprintln!(
-        "teardown: graceful browser shutdown requested for {requested} Chromium main process(es)"
+        "teardown: graceful browser shutdown candidates={requested} cdp_close_attempted={cdp_close_attempted}"
     );
+    if cdp_close_attempted && !browsers.is_empty() {
+        let deadline = std::time::Instant::now() + CDP_BROWSER_CLOSE_TIMEOUT;
+        while !browsers.is_empty() && std::time::Instant::now() < deadline {
+            browsers.retain(|(process, started)| {
+                process
+                    .stat()
+                    .is_ok_and(|stat| stat.starttime == *started && stat.state != 'Z')
+            });
+            if !browsers.is_empty() {
+                std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+            }
+        }
+    }
+    if browsers.is_empty() {
+        if requested > 0 || cdp_close_attempted {
+            eprintln!("teardown: graceful browser shutdown completed");
+        }
+        return;
+    }
+    for (process, started) in &browsers {
+        if process
+            .stat()
+            .is_ok_and(|current| current.starttime == *started)
+            && let Err(error) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+        {
+            eprintln!(
+                "teardown: browser {} shutdown signal failed: {error}",
+                process.pid
+            );
+        }
+    }
     let deadline = std::time::Instant::now() + BROWSER_SHUTDOWN_GRACE;
     while !browsers.is_empty() {
         browsers.retain(|(process, started)| {
