@@ -3278,7 +3278,6 @@ const VIRTUAL_KEYBOARD_SYSNAME: &str = "kwin_mcp_keyboard";
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
-const HOME_LOWER_ALIAS: &str = "/run/kwin-mcp-home-lower";
 
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
@@ -3322,7 +3321,6 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
-    lower_alias: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
@@ -3341,9 +3339,7 @@ struct OverlayPlan {
 }
 
 impl OverlayPlan {
-    /// Overlay upper-layer path that shadows `path` (under `target`), or None
-    /// when the path is not under a writable overlay (read-only bind or a
-    /// file copied into the split-overlay staging root).
+    /// Overlay upper-layer path that shadows a HOME path, or None when the path is beneath a read-only nested mount.
     fn upper_path(&self, path: &Path) -> Option<(PathBuf, &OverlayMount)> {
         if self
             .read_only_binds
@@ -3365,33 +3361,16 @@ impl OverlayPlan {
         ))
     }
 
-    fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
+    fn add_bwrap_args(&self, command: &mut std::process::Command) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
-        if let Some(lower_alias) = &self.lower_alias {
-            command
-                .arg("--dir")
-                .arg(lower_alias)
-                .arg("--ro-bind")
-                .arg(target)
-                .arg(lower_alias);
-            // If overlay storage lives beneath HOME, hide it from the lower
-            // alias so the lower tree cannot expose the storage back into itself.
-            let disk_root = session_disk_root();
-            if let Ok(relative) = disk_root.strip_prefix(target) {
-                command.arg("--tmpfs").arg(lower_alias.join(relative));
-            }
-        }
         // The plan is made seconds before bwrap runs. HOME entries that vanished
         // since (lock directories such as ~/.claude.json.lock) would make bwrap
         // fail, so skip the overlay when its host lower path has vanished.
-        for overlay in self.overlays.iter().filter(|overlay| {
-            let lower = if self.lower_alias.as_ref() == Some(&overlay.lower) {
-                &overlay.destination
-            } else {
-                &overlay.lower
-            };
-            std::fs::symlink_metadata(lower).is_ok()
-        }) {
+        for overlay in self
+            .overlays
+            .iter()
+            .filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok())
+        {
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -3401,12 +3380,7 @@ impl OverlayPlan {
                 .arg(&overlay.destination);
         }
         for path in &self.read_only_binds {
-            let source = self
-                .lower_alias
-                .as_ref()
-                .and_then(|alias| path.strip_prefix(target).ok().map(|path| alias.join(path)))
-                .unwrap_or_else(|| path.clone());
-            command.arg("--ro-bind-try").arg(source).arg(path);
+            command.arg("--ro-bind-try").arg(path).arg(path);
         }
         for path in &self.empty_dirs {
             command.arg("--tmpfs").arg(path);
@@ -3701,11 +3675,7 @@ fn prepare_overlay_plan(
     std::fs::create_dir_all(&upper)?;
     std::fs::create_dir_all(&work)?;
     let mut read_only_binds = mount_descendants(mounts, target);
-    let lower_alias = (!read_only_binds.is_empty()).then(|| PathBuf::from(HOME_LOWER_ALIAS));
-    let lower = lower_alias
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| target.to_path_buf());
+    let lower = target.to_path_buf();
     read_only_binds.sort_by(|left, right| {
         left.components()
             .count()
@@ -3714,7 +3684,6 @@ fn prepare_overlay_plan(
     });
     read_only_binds.dedup();
     Ok(OverlayPlan {
-        lower_alias,
         overlays: vec![OverlayMount {
             lower,
             upper,
@@ -4168,12 +4137,7 @@ fn prepare_host_view(
     bind_live_sqlite(&mut overlay_plan, target, &inventory.live_databases)?;
 
     eprintln!(
-        "session_start: overlay plan={} overlays={} read-only-mounts={}",
-        if overlay_plan.lower_alias.is_some() {
-            "live-alias"
-        } else {
-            "whole"
-        },
+        "session_start: overlay plan=live-home overlays={} read-only-mounts={}",
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
@@ -8778,7 +8742,7 @@ impl KwinMcp {
             host_name,
             "--unshare-ipc",
         ]);
-        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
+        overlay_plan.add_bwrap_args(&mut cmd);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();

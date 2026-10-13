@@ -107,7 +107,7 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
-HOME uses one disk-backed overlay with the live host HOME as its lower layer. If nested host mounts exist below HOME, the server binds HOME read-only at /run/kwin-mcp-home-lower, masks the session overlay storage from that alias, and uses it as the lower layer. It then binds each nested mount read-only over the overlay. This avoids walking or copying HOME during startup; ordinary HOME entries remain live, and writes stay in the overlay upper layer. Large files use normal overlay copy-on-write when a session writes them.
+HOME uses one disk-backed overlay with the live host HOME as its lower layer. If nested host mounts exist below HOME, the server rebinds each nested mount read-only over the overlay. This avoids walking or copying HOME during startup; ordinary HOME entries remain live, and writes stay in the overlay upper layer. Large files use normal overlay copy-on-write when a session writes them.
 
 Default startup creates no uinput devices and starts no private PipeWire or
 WirePlumber processes. Input uses KWin's EIS connection. The D-Bus input settings
@@ -180,7 +180,7 @@ kwin-mcp (host process)
               └── EIS input          (virtual mouse + keyboard, no host devices)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper and work directories are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
 Live host SQLite databases with open WAL files resolve through read-only
 directory binds, except browser cookie jars. Their private main-file symlinks
