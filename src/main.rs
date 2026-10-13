@@ -4852,7 +4852,6 @@ struct KwinMcp {
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
     input_order: Arc<InputOrder>,
-    tool_calls: Arc<std::sync::Mutex<usize>>,
     session: Arc<tokio::sync::RwLock<Option<Session>>>,
     /// Cleanup ownership of the session workdir under --autoclean. Claimed
     /// before session_start creates the directory and released only once the
@@ -4915,6 +4914,25 @@ impl KwinMcp {
         Some(diagnostic)
     }
 
+    async fn refresh_viewer_active(&self) -> bool {
+        let mut guard = self.session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(_))) => {
+                session.viewer_child.take();
+                false
+            }
+            Some(Err(error)) => {
+                eprintln!("viewer liveness: {error}");
+                true
+            }
+            None => false,
+        }
+    }
+
     fn new(display: DisplayConfig) -> Self {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
@@ -4925,7 +4943,6 @@ impl KwinMcp {
             path: session_workdir_path(),
             input_gate: Arc::new(tokio::sync::Mutex::new(())),
             input_order: Arc::new(InputOrder::default()),
-            tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
@@ -6399,55 +6416,6 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
-/// FIFO in the session workdir that the viewer reads tool-call starts ("B")
-/// and ends ("E") from, so it holds the user's input while a call runs (see
-/// src/bin/kwin-viewer.rs ToolGate).
-const TOOL_CALLS_FIFO: &str = "tool-calls";
-
-/// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
-/// Non-blocking and best effort: with no viewer reading the FIFO the open
-/// fails with ENXIO and nothing is sent, so tool calls never wait on it.
-fn signal_tool_call(dir: &Path, mark: u8) {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join(TOOL_CALLS_FIFO);
-    if let Ok(mut fifo) = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-    {
-        let _ = std::io::Write::write_all(&mut fifo, &[mark]);
-    }
-}
-
-/// Marks one tool call in flight for the viewer; the end is sent on drop, so
-/// it goes out whether the call returns, errors or is cancelled.
-struct ToolCallMark(PathBuf, Arc<std::sync::Mutex<usize>>);
-
-impl ToolCallMark {
-    fn begin(dir: &Path, calls: &Arc<std::sync::Mutex<usize>>) -> Self {
-        let mut active = calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *active == 0 {
-            signal_tool_call(dir, b'B');
-        }
-        *active += 1;
-        Self(dir.to_owned(), calls.clone())
-    }
-}
-
-impl Drop for ToolCallMark {
-    fn drop(&mut self) {
-        let mut active = self
-            .1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active -= 1;
-        if *active == 0 {
-            signal_tool_call(&self.0, b'E');
-        }
-    }
-}
 /// How long viewer_open waits for the viewer to show a frame
 /// before reporting it as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
@@ -9233,7 +9201,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after a frame is presented, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. Agent mouse and keyboard tools are paused while the viewer is open; close it to resume agent input. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after a frame is presented, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -9247,6 +9215,7 @@ impl KwinMcp {
                 "viewer_open",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let reason = params
             .reason
             .as_deref()
@@ -9409,6 +9378,7 @@ impl KwinMcp {
                 "viewer_close",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let mut guard = self.session.write().await;
         let sess = guard.as_mut().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -11587,17 +11557,6 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
             .unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
-    // Every tool call is bracketed for the viewer's input gate.
-    for route in tool_router.map.values_mut() {
-        let inner = std::sync::Arc::clone(&route.call);
-        route.call = std::sync::Arc::new(move |context| {
-            let inner = std::sync::Arc::clone(&inner);
-            Box::pin(async move {
-                let _mark = ToolCallMark::begin(&context.service.path, &context.service.tool_calls);
-                inner(context).await
-            })
-        });
-    }
     tool_router
 }
 
@@ -12096,17 +12055,23 @@ impl rmcp::ServerHandler for SessionRouter {
                 Some(death),
             ));
         }
-        let input = ordered_tool(&request.name);
+        let agent_input = input_tool(&request.name);
         // Queued input waits outside the global limit so it cannot starve reads.
         let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
         if let Some(turn) = &turn {
             turn.wait().await;
         }
-        let _input = if input && turn.is_none() {
+        let _input = if agent_input {
             Some(session.input_gate.clone().lock_owned().await)
         } else {
             None
         };
+        if agent_input && session.refresh_viewer_active().await {
+            return Err(McpError::internal_error(
+                "Agent input is paused while the live viewer is open so it cannot interfere with the user's input. Close the viewer to resume agent input.",
+                Some(serde_json::json!({"reason":"viewer_open","retry_safe":true})),
+            ));
+        }
         let execution = session.clone();
         let operation = request.name.to_string();
         let result = self

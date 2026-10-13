@@ -15,15 +15,13 @@
 //! window. Mouse/keyboard events on the window are forwarded back into the
 //! container via org_kde_kwin_fake_input.
 
-use nix::poll::{PollFd, PollFlags, PollTimeout};
+use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
 use screen_13_window::WindowBuilder;
-use kwin_mcp::clipboard::{Clipboard, DispatchThread, Shutdown, DISPATCH_POLL_INTERVAL};
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
-use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -735,10 +733,11 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
     numlock.apply(&link.fake_input, &link.conn)?;
 
-    let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
-    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
     let mut input_state = InputState {
-        out: InputOut::Local(gate),
+        out: InputOut::Local {
+            fake_input: link.fake_input.clone(),
+            conn: link.conn.clone(),
+        },
         last_pos: None,
         held_buttons: 0,
         active_touch: None,
@@ -763,9 +762,6 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     // threads and closes their sockets.
     shutdown.request();
     link.close();
-    if gate_thread.join().is_err() {
-        eprintln!("kwin-viewer: tool-gate thread panicked");
-    }
     run_result
 }
 
@@ -1066,8 +1062,7 @@ fn read_frame(
 }
 
 // Run on the host that owns the session: no window. Streams the session's
-// frames to stdout and applies the input records read from stdin, through the
-// same tool-call gate a local viewer uses.
+// frames to stdout and applies each input record read from stdin immediately.
 fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let virt = parse_size(&mut argv)?;
@@ -1077,14 +1072,16 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
-    let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
-    let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
+    let input = InputOut::Local {
+        fake_input: link.fake_input.clone(),
+        conn: link.conn.clone(),
+    };
 
     let presented=Arc::new(AtomicBool::new(false));
     // Input records come in until the client's ssh pipe closes. The thread
     // blocks in read, so it is left to end with the process.
     {
-        let (gate, shutdown) = (gate.clone(), shutdown.clone());
+        let (input, shutdown) = (input, shutdown.clone());
         let presented=presented.clone();
         let session_path=session_path.clone();
         std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
@@ -1093,7 +1090,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
                 if matches!(op,Op::Presented) {
                     presented.store(true,Ordering::Release);
                     write_status(&session_path,"ready","remote viewer presented its first frame");
-                } else { gate.send(op); }
+                } else { input.send(op); }
             }
             shutdown.request();
         })?;
@@ -1129,9 +1126,6 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     }
     shutdown.request();
     link.close();
-    if gate_thread.join().is_err() {
-        eprintln!("kwin-viewer: tool-gate thread panicked");
-    }
     match &result {
         Ok(()) => write_status(&session_path,"closed","remote viewer disconnected"),
         Err(error) => write_status(&session_path,"failed",&error.to_string()),
@@ -1209,17 +1203,6 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     result
 }
 
-// FIFO in the session dir the server writes tool-call starts ("B") and ends
-// ("E") to (see TOOL_CALLS_FIFO in src/main.rs).
-const TOOL_CALLS_FIFO: &str = "tool-calls";
-// Upper and lower bound of the flush window after a tool call returns.
-const GATE_WINDOW_MAX: Duration = Duration::from_millis(300);
-const GATE_WINDOW_MIN: Duration = Duration::from_millis(50);
-// With no tool call for this long, the user's input goes through live.
-const GATE_IDLE: Duration = Duration::from_secs(2);
-// Recent gaps between one call's end and the next call's start.
-const GATE_GAP_SAMPLES: usize = 64;
-
 #[derive(Clone, Copy)]
 enum Op {
     Motion(f64, f64),
@@ -1272,190 +1255,34 @@ impl Op {
         })
     }
 
-    // A release of a key or button whose press already reached the session.
-    fn releases(self, down: &HashSet<(bool, u32)>) -> bool {
-        match self {
-            Op::Button(code, 0) => down.contains(&(false, code)),
-            Op::Key(code, 0) => down.contains(&(true, code)),
-            Op::Button(..) | Op::Key(..) | Op::Motion(..) | Op::Axis(..) | Op::Presented => false,
-        }
-    }
-
-    fn emit(self, fake_input: &OrgKdeKwinFakeInput, down: &mut HashSet<(bool, u32)>) {
-        match self {
-            Op::Button(code, 1) => { down.insert((false, code)); }
-            Op::Button(code, _) => { down.remove(&(false, code)); }
-            Op::Key(code, 1) => { down.insert((true, code)); }
-            Op::Key(code, _) => { down.remove(&(true, code)); }
-            Op::Motion(..) | Op::Axis(..) | Op::Presented => {}
-        }
+    fn emit(self, fake_input: &OrgKdeKwinFakeInput) {
         match self {
             Op::Motion(x, y) => fake_input.pointer_motion_absolute(x, y),
             Op::Button(code, state) => fake_input.button(code, state),
             Op::Axis(axis, value) => fake_input.axis(axis, value),
             Op::Key(code, state) => fake_input.keyboard_key(code, state),
-            Op::Presented => {},
+            Op::Presented => {}
         }
     }
 }
 
-// When the user's input may reach the session. The agent and the user share
-// one session, so input the user makes while an agent tool call runs would
-// land in the middle of it. It is held instead, and goes out in order right
-// after the call returns, inside the gap before the agent's next call. After
-// that window it is held again until the next call returns, and once no call
-// has come for GATE_IDLE it goes through live.
-struct GateState {
-    busy: bool,
-    last_end: Option<Instant>,
-    window: Duration,
-    gaps: std::collections::VecDeque<Duration>,
-    held: Vec<Op>,
-    // Keys and buttons whose press reached the session and whose release has
-    // not. Their release is never held: holding it would keep the key down
-    // through the call, and the session would auto-repeat it.
-    down: HashSet<(bool, u32)>,
-    calls: u64,
-}
-
-impl GateState {
-    fn holding(&self, now: Instant) -> bool {
-        if self.busy { return true }
-        match self.last_end {
-            None => false,
-            Some(end) => {
-                let since = now.saturating_duration_since(end);
-                since >= self.window && since < GATE_IDLE
-            }
-        }
-    }
-
-    // The window is a margin under the shortest gaps this session's agent
-    // leaves between calls, so a flush never runs into its next call.
-    fn record_gap(&mut self, gap: Duration) {
-        if self.gaps.len() == GATE_GAP_SAMPLES { self.gaps.pop_front(); }
-        self.gaps.push_back(gap);
-        let mut sorted: Vec<Duration> = self.gaps.iter().copied().collect();
-        sorted.sort();
-        let low = sorted[sorted.len() * 5 / 100];
-        self.window = (low * 3 / 4).clamp(GATE_WINDOW_MIN, GATE_WINDOW_MAX);
-    }
-}
-
-#[derive(Clone)]
-struct ToolGate {
-    state: Arc<Mutex<GateState>>,
-    fake_input: OrgKdeKwinFakeInput,
-    conn: Connection,
-}
-
-impl ToolGate {
-    fn new(fake_input: OrgKdeKwinFakeInput, conn: Connection) -> Self {
-        let state = GateState {
-            busy: false, last_end: None, window: GATE_WINDOW_MAX,
-            gaps: std::collections::VecDeque::new(), held: Vec::new(), down: HashSet::new(), calls: 0,
-        };
-        Self { state: Arc::new(Mutex::new(state)), fake_input, conn }
-    }
-
-    // Forward one input op now, or hold it while a tool call runs.
-    fn send(&self, op: Op) {
-        let Ok(mut state) = self.state.lock() else { return };
-        // A release of a key already down goes out at once when nothing is held
-        // ahead of it; with held input ahead it waits its turn to keep order.
-        let completes = op.releases(&state.down) && state.held.is_empty();
-        if state.holding(Instant::now()) && !completes {
-            state.held.push(op);
-            return;
-        }
-        self.release(&mut state);
-        op.emit(&self.fake_input, &mut state.down);
-        let _ = self.conn.flush();
-    }
-
-    // Send everything held, in the order it was made.
-    fn release(&self, state: &mut GateState) {
-        if state.held.is_empty() { return }
-        for op in std::mem::take(&mut state.held) {
-            op.emit(&self.fake_input, &mut state.down);
-        }
-        let _ = self.conn.flush();
-    }
-
-    // Follow the server's tool-call marks until shutdown. Reads block in
-    // poll, waking only for a mark or for the idle deadline that releases
-    // held input.
-    fn spawn(&self, session: &std::path::Path, shutdown: Shutdown) -> anyhow::Result<JoinHandle<()>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let path = session.join(TOOL_CALLS_FIFO);
-        match nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR) {
-            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
-            Err(error) => anyhow::bail!("mkfifo {}: {error}", path.display()),
-        }
-        // Opened read-write so the FIFO never reads end-of-file between calls.
-        let mut fifo = std::fs::OpenOptions::new().read(true).write(true)
-            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits()).open(&path)?;
-        let gate = self.clone();
-        Ok(std::thread::Builder::new().name("tool-gate".to_owned()).spawn(move || {
-            let mut buffer = [0u8; 64];
-            while !shutdown.requested() {
-                let wait = gate.next_deadline().unwrap_or(DISPATCH_POLL_INTERVAL).min(DISPATCH_POLL_INTERVAL);
-                let timeout = PollTimeout::try_from(wait).unwrap_or(PollTimeout::ZERO);
-                let mut fds = [PollFd::new(fifo.as_fd(), PollFlags::POLLIN)];
-                if nix::poll::poll(&mut fds, timeout).unwrap_or(0) > 0 {
-                    let count = Read::read(&mut fifo, &mut buffer).unwrap_or(0);
-                    for &mark in &buffer[..count] { gate.mark(mark); }
-                }
-                let Ok(mut state) = gate.state.lock() else { return };
-                if !state.holding(Instant::now()) { gate.release(&mut state); }
-            }
-        })?)
-    }
-
-    fn next_deadline(&self) -> Option<Duration> {
-        let state = self.state.lock().ok()?;
-        let end = state.last_end?;
-        let remaining = (end + GATE_IDLE).checked_duration_since(Instant::now())?;
-        (!state.busy).then_some(remaining)
-    }
-
-    fn mark(&self, mark: u8) {
-        let Ok(mut state) = self.state.lock() else { return };
-        let now = Instant::now();
-        match mark {
-            b'B' => {
-                if let Some(end) = state.last_end && !state.busy {
-                    state.record_gap(now.saturating_duration_since(end));
-                }
-                state.busy = true;
-                state.calls += 1;
-            }
-            b'E' => {
-                let held = state.held.len();
-                state.busy = false;
-                state.last_end = Some(now);
-                self.release(&mut state);
-                if held > 0 {
-                    eprintln!("kwin-viewer: tool call {} returned; released {held} held input op(s), window {} ms",
-                        state.calls, state.window.as_millis());
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-// Where forwarded input goes: the local tool gate, or the ssh pipe to a `--serve`
-// on the host that owns the session (whose own gate then applies).
+// Where forwarded input goes: directly to the local compositor, or to the ssh
+// pipe for a `--serve` process that forwards it to its local compositor.
 enum InputOut {
-    Local(ToolGate),
+    Local {
+        fake_input: OrgKdeKwinFakeInput,
+        conn: Connection,
+    },
     Remote(Arc<Mutex<std::process::ChildStdin>>),
 }
 
 impl InputOut {
     fn send(&self, op: Op) {
         match self {
-            InputOut::Local(gate) => gate.send(op),
+            InputOut::Local { fake_input, conn } => {
+                op.emit(fake_input);
+                let _ = conn.flush();
+            }
             InputOut::Remote(pipe) => {
                 let Ok(mut pipe) = pipe.lock() else { return };
                 if pipe.write_all(&op.encode()).and_then(|()| pipe.flush()).is_err() {
@@ -1504,7 +1331,9 @@ fn forward_input(
     state: &mut InputState,
     numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
 ) {
-    let Event::WindowEvent { event, .. } = event else { return };
+    let Event::WindowEvent { event, .. } = event else {
+        return;
+    };
     if let WindowEvent::Focused(true) = event
         && let Some((numlock, fake_input, conn)) = numlock
         && let Err(error) = numlock.apply(fake_input, conn)
@@ -1563,12 +1392,13 @@ fn forward_input(
             }
         }
         WindowEvent::CursorMoved { position, .. } => {
-            // Always record the latest cursor position locally so a subsequent
-            // click can snap the container's cursor to it. Only forward the
-            // motion over the wire when the user is actively clicking/dragging
-            // — idle hover must not touch the agent's session.
+            // Keep the latest host cursor position for a subsequent click,
+            // while forwarding motion only during an active drag. Idle hover
+            // does not change the agent's session pointer.
             state.last_pos = Some((position.x, position.y));
-            if state.held_buttons == 0 { return }
+            if state.held_buttons == 0 {
+                return;
+            }
             if let Some((x, y)) =
                 map_window_to_virtual((position.x, position.y), window_size.0, window_size.1, virt)
             {
@@ -1591,9 +1421,8 @@ fn forward_input(
             };
             let pressed = matches!(btn_state, ElementState::Pressed);
             if pressed {
-                // Snap the container's cursor to the window position first
-                // so the press lands where the user's eyes are, not wherever
-                // the container cursor happened to stop last session.
+                // Snap the session cursor to the latest host position before
+                // the button press so the click lands where the user expects.
                 if let Some(pos) = state.last_pos
                     && let Some((x, y)) =
                         map_window_to_virtual(pos, window_size.0, window_size.1, virt)
@@ -1604,23 +1433,34 @@ fn forward_input(
             } else {
                 state.held_buttons = state.held_buttons.saturating_sub(1);
             }
-            state.out.send(Op::Button(code, if pressed { 1 } else { 0 }));
+            state
+                .out
+                .send(Op::Button(code, if pressed { 1 } else { 0 }));
         }
         WindowEvent::MouseWheel { delta, .. } => {
             let (dx, dy) = match delta {
                 MouseScrollDelta::LineDelta(x, y) => (f64::from(*x) * 15.0, f64::from(*y) * 15.0),
                 MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
             };
-            if dy != 0.0 { state.out.send(Op::Axis(AXIS_VERTICAL, -dy)); }
-            if dx != 0.0 { state.out.send(Op::Axis(AXIS_HORIZONTAL, -dx)); }
+            if dy != 0.0 {
+                state.out.send(Op::Axis(AXIS_VERTICAL, -dy));
+            }
+            if dx != 0.0 {
+                state.out.send(Op::Axis(AXIS_HORIZONTAL, -dx));
+            }
         }
         WindowEvent::KeyboardInput { event: key, .. } => {
-            let PhysicalKey::Code(kc) = key.physical_key else { return };
-            let Some(evdev) = key_code_to_evdev(kc) else { return };
-            let Some(op) = key_op(evdev, key.state, key.repeat) else { return };
+            let PhysicalKey::Code(kc) = key.physical_key else {
+                return;
+            };
+            let Some(evdev) = key_code_to_evdev(kc) else {
+                return;
+            };
+            let op = key_op(evdev, key.state, key.repeat);
             if matches!(key.state, ElementState::Pressed) {
-                state.held_keys.insert(evdev);
-                if let Some(chord) = clipboard_chord(evdev, &state.held_keys)
+                let first_press = state.held_keys.insert(evdev);
+                if first_press
+                    && let Some(chord) = clipboard_chord(evdev, &state.held_keys)
                     && let Some(bridge) = state.clipboard.as_mut()
                     && let Err(error) = bridge.before(chord)
                 {
@@ -1635,10 +1475,9 @@ fn forward_input(
     }
 }
 
-/// The record for one host key event. Host auto-repeats send nothing: the
-/// session's clients repeat a held key themselves from wl_keyboard.repeat_info.
-fn key_op(evdev: u32, state: ElementState, repeat: bool) -> Option<Op> {
-    (!repeat).then(|| Op::Key(evdev, u32::from(matches!(state, ElementState::Pressed))))
+/// Preserve each host key press and release, including the host's repeat events.
+fn key_op(evdev: u32, state: ElementState, _repeat: bool) -> Op {
+    Op::Key(evdev, u32::from(matches!(state, ElementState::Pressed)))
 }
 
 fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
@@ -1908,12 +1747,19 @@ mod wire_tests {
     }
 
     #[test]
-    fn host_auto_repeat_sends_nothing() {
-        let held = key_op(30, ElementState::Pressed, false);
-        assert!(held.is_some_and(|op| same(op, Op::Key(30, 1))));
-        assert!(key_op(30, ElementState::Pressed, true).is_none());
-        let released = key_op(30, ElementState::Released, false);
-        assert!(released.is_some_and(|op| same(op, Op::Key(30, 0))));
+    fn host_auto_repeat_is_forwarded() {
+        assert!(same(
+            key_op(30, ElementState::Pressed, false),
+            Op::Key(30, 1)
+        ));
+        assert!(same(
+            key_op(30, ElementState::Pressed, true),
+            Op::Key(30, 1)
+        ));
+        assert!(same(
+            key_op(30, ElementState::Released, false),
+            Op::Key(30, 0)
+        ));
     }
 
     #[test]
