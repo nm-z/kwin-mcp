@@ -6713,13 +6713,14 @@ async fn window_snapshots(
     Ok(serde_json::from_str(&json)?)
 }
 
-async fn activate_window(
+async fn request_window_activation(
     conn: &zbus::Connection,
     kwin_unique: &str,
     host_xdg_dir: &Path,
     window_id: &str,
-) -> Result<WindowSnapshot, KwinError> {
+) -> Result<(), KwinError> {
     let window_id_json = serde_json::to_string(window_id)?;
+
     let script = format!(
         "var targetId = {window_id_json};\
          var result = false;\
@@ -6739,15 +6740,60 @@ async fn activate_window(
     if !activated {
         return Err(KwinError::Msg(format!("no window with id {window_id}")));
     }
+    Ok(())
+}
+
+async fn activate_window(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    window_id: &str,
+) -> Result<WindowSnapshot, KwinError> {
+    // Restore the parent first: KWin can also minimize its transient dialogs.
+    request_window_activation(conn, kwin_unique, host_xdg_dir, window_id).await?;
     tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
+    // KWin can raise a chooser along with its parent while leaving keyboard
+    // focus on the parent. Resolve the topmost visible dialog descendant before
+    // activation so the returned target agrees with what the user will see.
+    let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
+    if !windows.iter().any(|window| window.id == window_id) {
+        return Err(KwinError::Msg(format!("no window with id {window_id}")));
+    }
+    let target_id = windows
+        .iter()
+        .find(|candidate| {
+            if candidate.minimized || candidate.popup {
+                return false;
+            }
+            let mut ancestor = candidate.transient_for.as_deref();
+            let mut visited = std::collections::HashSet::new();
+            while let Some(id) = ancestor {
+                if id == window_id {
+                    return true;
+                }
+                if !visited.insert(id) {
+                    break;
+                }
+                ancestor = windows
+                    .iter()
+                    .find(|window| window.id == id)
+                    .and_then(|window| window.transient_for.as_deref());
+            }
+            false
+        })
+        .map_or(window_id, |window| window.id.as_str());
+    if target_id != window_id {
+        request_window_activation(conn, kwin_unique, host_xdg_dir, target_id).await?;
+        tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
+    }
     let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
     let window = windows
         .into_iter()
-        .find(|window| window.id == window_id)
-        .ok_or_else(|| KwinError::Msg(format!("window {window_id} disappeared")))?;
+        .find(|window| window.id == target_id)
+        .ok_or_else(|| KwinError::Msg(format!("window {target_id} disappeared")))?;
     if !window.active {
         return Err(KwinError::Msg(format!(
-            "KWin did not activate window {window_id}"
+            "KWin did not activate window {target_id}"
         )));
     }
     Ok(window)
@@ -9278,7 +9324,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "window_activate",
-        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
+        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. If a visible non-popup transient descendant belongs to that window, activate the topmost such descendant instead so keyboard input reaches the displayed chooser. The returned window identifies the actual focused target; requested_window_id identifies the request. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
     )]
     async fn window_activate(
         &self,
@@ -9295,7 +9341,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             text,
-            serde_json::json!({"status": "activated", "window": window}),
+            serde_json::json!({"status": "activated", "requested_window_id": params.window_id, "window": window}),
         )
         .await)
     }
