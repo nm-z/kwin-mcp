@@ -10,6 +10,7 @@ use std::time::Duration;
 const HOST_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const HOST_COPY_ATTEMPTS: usize = 5;
 const HOST_COPY_RETRY_DELAY: Duration = Duration::from_millis(20);
+const COOKIE_DATABASE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct FileVersion {
@@ -296,6 +297,51 @@ fn cookie_path_metadata(path: &Path) -> String {
     }
 }
 
+/// Stage a private overlay-upper jar into a clean directory before opening it
+/// with SQLite. Overlayfs can leave a character-device whiteout for a removed
+/// lower-layer WAL; SQLite cannot open that sidecar by its pathname.
+fn stage_private_cookie_jar(source: &Path, directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "private cookie database is not a regular file"
+    );
+    let mut total = metadata.len();
+    anyhow::ensure!(
+        total <= COOKIE_DATABASE_MAX_BYTES,
+        "cookie database exceeds the 512 MiB staging limit"
+    );
+    std::fs::create_dir(directory)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    let staged = directory.join("Cookies");
+    std::fs::copy(source, &staged)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+    for suffix in ["-wal", "-journal"] {
+        let mut source_sidecar = source.as_os_str().to_os_string();
+        source_sidecar.push(suffix);
+        let source_sidecar = PathBuf::from(source_sidecar);
+        match std::fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                total = total.saturating_add(metadata.len());
+                anyhow::ensure!(
+                    total <= COOKIE_DATABASE_MAX_BYTES,
+                    "cookie database and sidecars exceed the 512 MiB staging limit"
+                );
+                let mut staged_sidecar = staged.as_os_str().to_os_string();
+                staged_sidecar.push(suffix);
+                let staged_sidecar = PathBuf::from(staged_sidecar);
+                std::fs::copy(source_sidecar, &staged_sidecar)?;
+                std::fs::set_permissions(staged_sidecar, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(staged)
+}
+
 pub fn state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -312,7 +358,7 @@ fn quote(name: &str) -> String {
 /// Copy through SQLite so committed WAL changes are included.
 pub fn snapshot(source: &Path, destination: &Path) -> Result<()> {
     anyhow::ensure!(
-        std::fs::metadata(source)?.len() <= 512 * 1024 * 1024,
+        std::fs::metadata(source)?.len() <= COOKIE_DATABASE_MAX_BYTES,
         "cookie database exceeds the 512 MiB snapshot limit"
     );
     // `source` is a private copy, never a host database. SQLite needs a
@@ -584,30 +630,6 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     for jar in jars.iter().filter(|jar| jar.upper.is_file()) {
         let temporary = jar.saved.with_extension("snapshot");
         let result = (|| -> Result<()> {
-            let cookie_jar = match supports_cookie_jar(&jar.upper) {
-                Ok(cookie_jar) => cookie_jar,
-                Err(error) => {
-                    let mut wal = jar.upper.as_os_str().to_os_string();
-                    wal.push("-wal");
-                    let mut shm = jar.upper.as_os_str().to_os_string();
-                    shm.push("-shm");
-                    return Err(error).context(format!(
-                        "inspect session cookie database {} (file {}; parent {}; WAL {}; SHM {})",
-                        jar.upper.display(),
-                        cookie_path_metadata(&jar.upper),
-                        cookie_path_metadata(jar.upper.parent().unwrap_or(Path::new("."))),
-                        cookie_path_metadata(Path::new(&wal)),
-                        cookie_path_metadata(Path::new(&shm))
-                    ));
-                }
-            };
-            if !cookie_jar {
-                eprintln!(
-                    "teardown: skipping non-cookie SQLite database {}",
-                    jar.upper.display()
-                );
-                return Ok(());
-            }
             let parent = jar.saved.parent().context("cookie state has no parent")?;
             std::fs::create_dir_all(parent).context("create private cookie state directory")?;
             // Every directory beneath the private root is private as well.
@@ -620,27 +642,61 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 };
                 directory = next;
             }
-            let _ = std::fs::remove_file(&temporary);
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)
-                .context("create temporary cookie database")?;
-            snapshot(&jar.upper, &temporary).context("snapshot private cookie jar")?;
-            let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
-                .context("record cookie deletions")?;
-            merge(&temporary, &jar.saved).context("merge persisted cookie jar")?;
-            apply_deleted(&Connection::open(&temporary)?, &deleted)
-                .context("apply cookie deletion tombstones")?;
-            // Publish deletions before the jar: even a crash between renames
-            // must not restore a removed cookie from the old saved jar.
-            write_deletions(&jar.saved, &deleted).context("persist cookie deletion tombstones")?;
-            std::fs::rename(&temporary, &jar.saved).context("publish persisted cookie jar")?;
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .context("sync cookie state directory")?;
-            Ok(())
+            let stage_directory = parent.join(".kwin-mcp-cookie-stage");
+            let _ = std::fs::remove_dir_all(&stage_directory);
+            let _ = std::fs::remove_file(&stage_directory);
+            let result = (|| -> Result<()> {
+                let staged = stage_private_cookie_jar(&jar.upper, &stage_directory)
+                    .context("stage private session cookie database")?;
+                let cookie_jar = match supports_cookie_jar(&staged) {
+                    Ok(cookie_jar) => cookie_jar,
+                    Err(error) => {
+                        let mut wal = jar.upper.as_os_str().to_os_string();
+                        wal.push("-wal");
+                        let mut shm = jar.upper.as_os_str().to_os_string();
+                        shm.push("-shm");
+                        return Err(error).context(format!(
+                            "inspect session cookie database {} (file {}; parent {}; WAL {}; SHM {})",
+                            jar.upper.display(),
+                            cookie_path_metadata(&jar.upper),
+                            cookie_path_metadata(jar.upper.parent().unwrap_or(Path::new("."))),
+                            cookie_path_metadata(Path::new(&wal)),
+                            cookie_path_metadata(Path::new(&shm))
+                        ));
+                    }
+                };
+                if !cookie_jar {
+                    eprintln!(
+                        "teardown: skipping non-cookie SQLite database {}",
+                        jar.upper.display()
+                    );
+                    return Ok(());
+                }
+                let _ = std::fs::remove_file(&temporary);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temporary)
+                    .context("create temporary cookie database")?;
+                snapshot(&staged, &temporary).context("snapshot private cookie jar")?;
+                let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
+                    .context("record cookie deletions")?;
+                merge(&temporary, &jar.saved).context("merge persisted cookie jar")?;
+                apply_deleted(&Connection::open(&temporary)?, &deleted)
+                    .context("apply cookie deletion tombstones")?;
+                // Publish deletions before the jar: even a crash between renames
+                // must not restore a removed cookie from the old saved jar.
+                write_deletions(&jar.saved, &deleted)
+                    .context("persist cookie deletion tombstones")?;
+                std::fs::rename(&temporary, &jar.saved).context("publish persisted cookie jar")?;
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .context("sync cookie state directory")?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_dir_all(&stage_directory);
+            result
         })();
         if let Err(error) = result {
             failures.push(format!("{}: {error:#}", jar.saved.display()));
