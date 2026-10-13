@@ -5855,6 +5855,10 @@ fn close_session_browsers(sandbox_pid: u32) {
             }
         }
     }
+    let requested = browsers.len();
+    eprintln!(
+        "teardown: graceful browser shutdown requested for {requested} Chromium main process(es)"
+    );
     let deadline = std::time::Instant::now() + BROWSER_SHUTDOWN_GRACE;
     while !browsers.is_empty() {
         browsers.retain(|(process, started)| {
@@ -5874,6 +5878,9 @@ fn close_session_browsers(sandbox_pid: u32) {
             break;
         }
         std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+    }
+    if browsers.is_empty() && requested > 0 {
+        eprintln!("teardown: graceful browser shutdown completed");
     }
 }
 
