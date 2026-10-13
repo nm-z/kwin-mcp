@@ -11374,6 +11374,46 @@ fn ordered_tool(name: &str) -> bool {
 
 const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls.";
 
+fn unknown_session_error(id: &str) -> McpError {
+    let server_pid = std::process::id();
+    let session_server_pid = id
+        .strip_prefix('s')
+        .and_then(|id| id.split_once('-'))
+        .and_then(|(pid, _)| pid.parse::<u32>().ok());
+    let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
+    let (reason, message, recovery) = if let Some(other_server_pid) = other_server_pid {
+        let recovery = format!(
+            "If process {other_server_pid} is still running, retry this request with that server. Otherwise call session_start without session_id and relaunch your applications."
+        );
+        (
+            "different_server_process",
+            format!(
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them and cannot be reattached by a fresh server. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
+            ),
+            recovery,
+        )
+    } else {
+        let recovery = "Call session_list to check this server. If the desktop is absent, call session_start without session_id and relaunch your applications.".to_owned();
+        (
+            "session_not_found",
+            format!(
+                "session_id '{id}' is not known to kwin-mcp process {server_pid}; it may have been stopped, expired, or created by another server. {recovery}"
+            ),
+            recovery,
+        )
+    };
+    McpError::invalid_params(
+        message,
+        Some(serde_json::json!({
+            "reason": reason,
+            "session_id": id,
+            "server_pid": server_pid,
+            "session_server_pid": session_server_pid,
+            "recovery": recovery,
+        })),
+    )
+}
+
 #[derive(Clone)]
 struct SessionRouter {
     clipboards: Arc<std::sync::Mutex<ClipboardStore>>,
@@ -11476,7 +11516,7 @@ impl SessionRouter {
         let session = sessions
             .get(&id)
             .cloned()
-            .ok_or_else(|| McpError::invalid_params(format!("unknown session_id '{id}'"), None))?;
+            .ok_or_else(|| unknown_session_error(&id))?;
         Ok((id, session))
     }
     async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
