@@ -280,6 +280,19 @@ fn write_deletions(saved: &Path, deleted: &DeletedCookies) -> Result<()> {
     Ok(())
 }
 
+fn cookie_path_metadata(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(metadata) => format!(
+            "present(file={},dir={},mode={:04o},size={})",
+            metadata.is_file(),
+            metadata.is_dir(),
+            metadata.permissions().mode() & 0o7777,
+            metadata.len()
+        ),
+        Err(error) => format!("unavailable({error})"),
+    }
+}
+
 pub fn state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -565,7 +578,24 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     for jar in jars.iter().filter(|jar| jar.upper.is_file()) {
         let temporary = jar.saved.with_extension("snapshot");
         let result = (|| -> Result<()> {
-            if !supports_cookie_jar(&jar.upper).context("inspect session cookie database")? {
+            let cookie_jar = match supports_cookie_jar(&jar.upper) {
+                Ok(cookie_jar) => cookie_jar,
+                Err(error) => {
+                    let mut wal = jar.upper.as_os_str().to_os_string();
+                    wal.push("-wal");
+                    let mut shm = jar.upper.as_os_str().to_os_string();
+                    shm.push("-shm");
+                    return Err(error).context(format!(
+                        "inspect session cookie database {} (file {}; parent {}; WAL {}; SHM {})",
+                        jar.upper.display(),
+                        cookie_path_metadata(&jar.upper),
+                        cookie_path_metadata(jar.upper.parent().unwrap_or(Path::new("."))),
+                        cookie_path_metadata(Path::new(&wal)),
+                        cookie_path_metadata(Path::new(&shm))
+                    ));
+                }
+            };
+            if !cookie_jar {
                 eprintln!(
                     "teardown: skipping non-cookie SQLite database {}",
                     jar.upper.display()
