@@ -143,6 +143,7 @@ class InputDeliveryProbe
     raise 'invalid input changed field' if tree.include?('valid prefix')
     assert_success(call('keyboard_key', key: 'ctrl+a'))
     assert_success(call('keyboard_key', key: 'Backspace'))
+    stale_descendant_rich_text
     rich_contenteditable
     nested_rich_contenteditable
     unverified_password_field
@@ -221,6 +222,30 @@ class InputDeliveryProbe
     File.write(File.join(@artifacts, 'electron-unverified-embedded.tree.txt'), visible)
     raise 'opaque embedded object unexpectedly exposed the typed text' if visible.include?(text)
     screen('electron-unverified-embedded-after-return')
+  end
+
+  def stale_descendant_rich_text
+    visible = tree
+    match = visible.match(/entry\tStale descendant rich text\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'stale descendant rich-text bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('electron-stale-descendant-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    text = 'Stale descendant delivery probe'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    raise 'stale descendant omitted completed submission' unless result['submission_complete']
+    raise 'stale descendant lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise "stale descendant suggested retry: #{delivery}" unless result['retry_safe'] == false
+    raise "stale descendant falsely reported verified: #{delivery}" if delivery['status'] == 'verified'
+    raise "stale descendant did not report rich-text unverified: #{delivery}" unless delivery['status'] == 'unverified' && delivery['method'] == 'atspi_rich_text'
+    raise "wrong stale descendant expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
+    visible = tree
+    File.write(File.join(@artifacts, 'electron-stale-descendant.tree.txt'), visible)
+    raise 'stale note was not exposed in the independent accessibility tree' unless visible.include?(text)
+    raise 'stale note appeared more than once in the independent accessibility tree' unless visible.scan(text).length == 1
+    screen('electron-stale-descendant-after-return')
   end
 
   def terminal
