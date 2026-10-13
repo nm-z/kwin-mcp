@@ -3091,6 +3091,10 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         missing["result"]["structuredContent"]["exit_status"], 127,
         "{missing}"
     );
+    assert_eq!(
+        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
+        "{missing}"
+    );
     assert!(
         begun.elapsed() < Duration::from_secs(5),
         "missing command took {:?}",
@@ -3159,7 +3163,7 @@ fn launch_app_waits_for_a_delayed_window() {
         &mut client,
         3,
         "launch_app",
-        json!({"command":"sleep 18; konsole --separate --hold -e bash -c 'printf delayed-window-proof'"}),
+        json!({"command":"sleep 18; konsole --separate --hold -e bash -c 'printf delayed-window-proof'","window_timeout_seconds":30}),
     );
     assert_ne!(launched["result"]["isError"], true, "{launched}");
     let elapsed = begun.elapsed();
@@ -3171,6 +3175,10 @@ fn launch_app_waits_for_a_delayed_window() {
         .as_str()
         .expect("window ID");
     assert!(window_id.starts_with('{'), "{launched}");
+    assert_eq!(
+        launched["result"]["structuredContent"]["window_timeout_seconds"], 30,
+        "{launched}"
+    );
     let windows = call_tool(&mut client, 4, "window_list", json!({}));
     assert!(
         windows["result"]["structuredContent"]["windows"]

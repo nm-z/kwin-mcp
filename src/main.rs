@@ -1814,7 +1814,7 @@ const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 
 // launch_app: window-appear polling.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(75);
+const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
 const LAUNCH_PRECHECK_TIMEOUT: Duration = Duration::from_secs(20);
 // The call deadline leaves room for the prelaunch KWin check and CDP retries.
@@ -7414,7 +7414,7 @@ struct ExportFileParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
-    /// Seconds to wait for a new window. Defaults to 75; accepted range is 1–120.
+    /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
     window_timeout_seconds: Option<u64>,
 }
 
@@ -10653,7 +10653,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window; set window_timeout_seconds from 1 to 120 (default 75). Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
