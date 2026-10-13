@@ -331,7 +331,8 @@ or writing the input summary fails. No partially submitted text is restarted.
 The shipped `kwin-mcp-deploy` CLI builds committed source on the least busy eligible
 sentry/archy host, stages checksummed release packages, and explicitly installs
 new release directories on engi, archy or benji. Engi builds require an explicit
-host override and always use nice 19; unreachable benji is skipped. No command
+host override and always use nice 19; selected engi builds and installs run
+locally when invoked on engi, without an SSH listener. Unreachable benji is skipped. No command
 activates a release or restarts services. Packages include optional OAuth gateway
 and Cloudflare tunnel user unit templates; the gateway executable and credentials
 are external prerequisites.

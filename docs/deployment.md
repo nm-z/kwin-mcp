@@ -13,8 +13,12 @@ kwin-mcp-deploy build /absolute/clean/checkout /absolute/new/package
 The source must have a clean, committed HEAD. The command probes **sentry** and
 **archy** concurrently, samples aggregate CPU use for one second, and selects the
 lowest use eligible host (ties choose archy). Unreachable hosts or hosts lacking
-Cargo, librsvg or libpipewire are skipped. **engi is excluded by default** and **benji is
-not a builder**. There is no build slot limit or dependency on `dsh build`.
+Cargo, librsvg or libpipewire are skipped. **engi is excluded by default** and
+**benji is not a builder**. There is no build slot limit or dependency on `dsh build`.
+
+When the current machine is engi and engi is eligible, its probe, build, and
+artifact copies run directly through the local shell and filesystem. This works
+without an SSH listener on engi. Other selected builders continue to use SSH/SCP.
 
 Use `KWIN_MCP_DEPLOY_BUILD_HOSTS=archy` to restrict eligible hosts during a
 maintenance hold. The override accepts only sentry/archy/engi; it cannot enable benji builds. Use `KWIN_MCP_DEPLOY_BUILD_ROOT=/tmp/kwin-build-your-name`
@@ -28,16 +32,18 @@ CARGO_BUILD_JOBS=2 kwin-mcp-deploy build /absolute/checkout /absolute/new/packag
 ```
 
 When host policy explicitly permits engi builds, select
-`KWIN_MCP_DEPLOY_BUILD_HOSTS='engi archy'` and a private home build root, such as
+`KWIN_MCP_DEPLOY_BUILD_HOSTS='engi archy'` and a private build root, such as
 `/home/nate/work/kwin-build-review-248`. Engi builds always invoke Cargo at
 `nice -n 19`; compiler children inherit that priority. Maintenance holds are
 expressed by the operator's host list. Choose jobs and storage using current
 aggregate memory and disk availability, and keep one own compile active.
 
-A Git bundle transfers the exact commit without requiring it to be pushed.
-Each run owns `~/builds/kwin-mcp-deploy/<unique-id>/source`, its separate `target`,
-and `build.log`. Builds use `cargo build --locked --release --bins` and the
-caller's `CARGO_BUILD_JOBS` when set (positive integer), or the builder's
+A Git bundle transfers the exact commit without requiring it to be pushed when
+the selected builder is remote; a local engi build reads the bundle from its
+private run directory. Each run owns `~/builds/kwin-mcp-deploy/<unique-id>/source`,
+its separate `target`, and `build.log`. Builds use
+`cargo build --locked --release --bins` and the caller's `CARGO_BUILD_JOBS` when
+set (positive integer), or the builder's
 normal Cargo parallelism otherwise. Source, target and logs remain on the builder
 for review; remove only that run directory when its evidence is no longer needed.
 The command returns the log and packages all four binaries with the units, this
@@ -75,17 +81,21 @@ kwin-mcp-deploy install /absolute/package archy /home/nate/releases/kwin-mcp-rev
 kwin-mcp-deploy install /absolute/package benji /home/nate/releases/kwin-mcp-review-248
 ```
 
-Allowed destinations are engi, archy and benji. An unreachable benji is reported
-and skipped successfully; other connectivity failures fail the operation. There
-is no implicit fleet install. SSH uses BatchMode and a five second connection
-timeout; it never asks for credentials. Release paths must be absolute and use
-letters, digits, `_`, `-` and `.` in each component, without `.` or `..` components.
+Allowed destinations are engi, archy and benji. When run on the target machine,
+installation stages, verifies, and renames the package using local filesystem
+operations, without opening SSH. Other destinations use SSH/SCP; an unreachable
+benji is reported and skipped successfully, while other connectivity failures
+fail the operation. Nonlocal SSH uses BatchMode and a five second connection
+timeout; it never asks for credentials. There is no implicit fleet install.
+Release paths must be absolute and use letters, digits, `_`, `-` and `.` in each
+component, without `.` or `..` components.
 
-The CLI checks the local fixed file manifest, transfers into a private sibling
-staging directory, checks the remote checksums, and renames the whole directory
-without replacing an existing release. Failed transfers remove their own staging
-directory. Existing releases, live symlinks and services are never changed. This
-allows review and removal of a private release without affecting production.
+The CLI checks the local fixed file manifest, copies package files into a private
+sibling staging directory, checks the staged checksums, and renames the whole
+directory without replacing an existing release. Failed copies remove their own
+staging directory. Existing releases, live symlinks and services are never
+changed. This allows review and removal of a private release without affecting
+production.
 Inspect `release.txt` and `SHA256SUMS` before selecting a release in your client's
 stdio configuration. Hosts must have compatible architecture, glibc and runtime
 libraries; checksums do not establish ABI compatibility. Run a real stdio session

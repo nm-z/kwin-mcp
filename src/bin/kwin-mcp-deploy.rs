@@ -27,11 +27,13 @@ Commands:
 
 Default build hosts: sentry, archy. Engi requires an explicit build-host override
 and always compiles at nice 19. Install hosts: engi, archy, benji.
-Unreachable build hosts are skipped; an unreachable benji install is skipped.
+On engi, its build and install paths run locally without an SSH listener; other
+hosts use SSH. Unreachable build hosts are skipped; an unreachable benji install is skipped.
 Existing package/release destinations are rejected. Install never changes a live
 symlink, restarts a service, or enables units. Select a private path for evidence.
-Requirements: git, ssh, scp, sha256sum; builders also need Cargo, pkg-config,
-libpipewire-0.3 and rsvg-convert. SSH uses BatchMode and a 5 second connect timeout.
+Requirements: git, hostname and sha256sum; remote hosts also need SSH/SCP.
+Builders need Cargo, pkg-config, libpipewire-0.3 and rsvg-convert. Remote SSH
+uses BatchMode and a 5 second connect timeout.
 ";
 const CPU_PROBE: &str = r#"set -eu
 command -v cargo >/dev/null
@@ -72,10 +74,57 @@ fn ssh(host: &str, script: &str) -> Command {
     command
 }
 
-fn copy_remote(host: &str, source: &Path, remote: &str) -> Result<()> {
+fn local_hostname() -> Result<String> {
+    let mut command = Command::new("hostname");
+    command.arg("-s");
+    let hostname = String::from_utf8(checked(command)?.stdout)?
+        .trim()
+        .to_owned();
+    if hostname.is_empty() {
+        return Err("hostname -s returned an empty hostname".into());
+    }
+    Ok(hostname)
+}
+
+fn host_command(host: &str, local: &str, script: &str) -> Command {
+    if host == local {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(format!("cd \"$HOME\" && {script}"));
+        command
+    } else {
+        ssh(host, script)
+    }
+}
+
+fn local_path(path: &str) -> Result<std::path::PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(Path::new(&env::var("HOME")?).join(path))
+    }
+}
+
+fn copy_to_host(host: &str, local: &str, source: &Path, target: &str) -> Result<()> {
+    if host == local {
+        fs::copy(source, local_path(target)?)?;
+        return Ok(());
+    }
     let mut command = Command::new("scp");
     command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
-    command.arg(source).arg(format!("{host}:{remote}"));
+    command.arg(source).arg(format!("{host}:{target}"));
+    checked(command)?;
+    Ok(())
+}
+
+fn copy_from_host(host: &str, local: &str, source: &str, target: &Path) -> Result<()> {
+    if host == local {
+        fs::copy(local_path(source)?, target)?;
+        return Ok(());
+    }
+    let mut command = Command::new("scp");
+    command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    command.arg(format!("{host}:{source}")).arg(target);
     checked(command)?;
     Ok(())
 }
@@ -181,14 +230,16 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     if build_root != "builds/kwin-mcp-deploy" && !valid_absolute_path(&build_root) {
         return Err("KWIN_MCP_DEPLOY_BUILD_ROOT requires a simple absolute path".into());
     }
+    let local = local_hostname()?;
     let probes: Vec<_> = hosts
         .iter()
         .map(|host| {
             let host = host.to_string();
+            let local = local.clone();
             (
                 host.clone(),
                 thread::spawn(move || -> Option<u32> {
-                    match checked(ssh(&host, CPU_PROBE)) {
+                    match checked(host_command(&host, &local, CPU_PROBE)) {
                         Ok(output) => String::from_utf8(output.stdout).ok()?.trim().parse().ok(),
                         Err(error) => {
                             eprintln!("{host}: unavailable: {error}");
@@ -209,6 +260,7 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
     candidates.sort_unstable();
     let (_, host) = candidates.first().ok_or("no eligible build host")?;
     let priority = if host == "engi" { "nice -n 19 " } else { "" };
+    let mode = if host == &local { "local" } else { "ssh" };
     let run = format!("{build_root}/{}", nonce()?);
     let temporary = env::temp_dir().join(format!("kwin-mcp-deploy-{}", nonce()?));
     fs::create_dir(&temporary)?;
@@ -222,35 +274,39 @@ fn build(source: &Path, destination: &Path) -> Result<()> {
             .arg(&bundle)
             .arg("HEAD");
         checked(git)?;
-        checked(ssh(
+        checked(host_command(
             host,
+            &local,
             &format!(
                 "set -eu; umask 077; mkdir -p {}; mkdir {}",
                 quote(&build_root),
                 quote(&run)
             ),
         ))?;
-        copy_remote(host, &bundle, &format!("{run}/source.bundle"))?;
+        copy_to_host(host, &local, &bundle, &format!("{run}/source.bundle"))?;
         let script = format!(
             "set -eu; cd {}; git clone -q source.bundle source; cd source; git checkout -q --detach {}; export CARGO_TARGET_DIR=\"$PWD/../target\"; {jobs}{priority}cargo build --locked --release --bins > ../build.log 2>&1 || {{ cat ../build.log >&2; exit 1; }}; cat ../build.log",
             quote(&run),
             quote(&commit)
         );
-        eprintln!("builder={host} source={run}/source target={run}/target commit={commit}");
-        // Keep all compiler output in the private remote build.log, then return it to the caller.
-        let output = checked(ssh(host, &script))?;
+        eprintln!(
+            "builder={host} mode={mode} source={run}/source target={run}/target commit={commit}"
+        );
+        // Keep compiler output in the private build.log, then return it to the caller.
+        let output = checked(host_command(host, &local, &script))?;
         eprintln!("{}", String::from_utf8_lossy(&output.stdout));
         for name in BINARIES {
-            let mut scp = Command::new("scp");
-            scp.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
-            scp.arg(format!("{host}:{run}/target/release/{name}"))
-                .arg(&temporary);
-            checked(scp)?;
+            copy_from_host(
+                host,
+                &local,
+                &format!("{run}/target/release/{name}"),
+                &temporary.join(name),
+            )?;
         }
         package(
             &temporary,
             destination,
-            &format!("commit={commit}\nbuilder={host}\nremote_build={run}\n"),
+            &format!("commit={commit}\nbuilder={host}\nbuild_run={run}\n"),
         )
     })();
     fs::remove_dir_all(&temporary)?;
@@ -270,17 +326,82 @@ fn valid_absolute_path(path: &str) -> bool {
         })
 }
 
-fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
-    if !INSTALL_HOSTS.contains(&host) {
-        return Err("install host must be engi, archy or benji".into());
+fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    // SFTP/scp and shell paths share this conservative grammar. No ~ or option ambiguity.
-    if !valid_absolute_path(destination) {
-        return Err(
-            "release destination must be an absolute path with simple path components".into(),
-        );
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            fs::create_dir(&target)?;
+            copy_directory(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            return Err(format!("unsupported package entry: {}", entry.path().display()).into());
+        }
     }
-    verify_package(directory)?;
+    Ok(())
+}
+
+fn copy_package(directory: &Path, stage: &Path) -> Result<()> {
+    for name in ["bin", "systemd"] {
+        let source = directory.join(name);
+        let target = stage.join(name);
+        fs::create_dir(&target)?;
+        copy_directory(&source, &target)?;
+    }
+    for name in ["SHA256SUMS", "DEPLOYMENT.md", "release.txt"] {
+        fs::copy(directory.join(name), stage.join(name))?;
+    }
+    Ok(())
+}
+
+fn install_local(directory: &Path, host: &str, destination: &str) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let stage = format!("{destination}.incoming-{}", nonce()?);
+    let stage_path = Path::new(&stage);
+    let destination_path = Path::new(destination);
+    if path_exists(destination_path)? {
+        return Err(format!("release destination already exists: {destination}").into());
+    }
+    if path_exists(stage_path)? {
+        return Err(format!("release staging path already exists: {stage}").into());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(stage_path)?;
+    let result = (|| -> Result<()> {
+        copy_package(directory, stage_path)?;
+        verify_package(stage_path)?;
+        let mut rename = Command::new("mv");
+        rename
+            .args(["-T", "-n", "--"])
+            .arg(stage_path)
+            .arg(destination_path);
+        checked(rename)?;
+        if path_exists(stage_path)? {
+            return Err("release destination appeared during install".into());
+        }
+        println!("installed={host}:{destination} mode=local");
+        Ok(())
+    })();
+    if result.is_err() && path_exists(stage_path)? {
+        if let Err(error) = fs::remove_dir_all(stage_path) {
+            eprintln!("could not remove local staging path {stage}: {error}");
+        }
+    }
+    result
+}
+
+fn install_remote(directory: &Path, host: &str, destination: &str) -> Result<()> {
     if let Err(error) = checked(ssh(host, "true")) {
         if host == "benji" {
             eprintln!("benji unreachable; skipped: {error}");
@@ -312,13 +433,32 @@ fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
         );
         let output = checked(ssh(host, &script))?;
         print!("{}", String::from_utf8_lossy(&output.stdout));
-        println!("installed={host}:{destination}");
+        println!("installed={host}:{destination} mode=ssh");
         Ok(())
     })();
     if result.is_err() {
         let _cleanup = checked(ssh(host, &format!("rm -rf -- {}", quote(&stage))));
     }
     result
+}
+
+fn install(directory: &Path, host: &str, destination: &str) -> Result<()> {
+    if !INSTALL_HOSTS.contains(&host) {
+        return Err("install host must be engi, archy or benji".into());
+    }
+    // Local and remote paths share this conservative grammar. No ~ or option ambiguity.
+    if !valid_absolute_path(destination) {
+        return Err(
+            "release destination must be an absolute path with simple path components".into(),
+        );
+    }
+    verify_package(directory)?;
+    let local = local_hostname()?;
+    if host == local {
+        install_local(directory, host, destination)
+    } else {
+        install_remote(directory, host, destination)
+    }
 }
 
 fn main() -> Result<()> {
