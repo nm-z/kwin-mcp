@@ -1278,7 +1278,7 @@ impl TextReceipt {
                 }
                 let observed = text.get_text(0, -1).await?;
                 let normalized_observed = normalize_accessible_text(&observed);
-                observed_count = Some(normalized_observed.chars().count());
+                observed_count = Some(observed.chars().count());
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
                 }
@@ -1289,7 +1289,8 @@ impl TextReceipt {
                     rich_text_unreadable |= snapshot.has_children || snapshot.has_embedded_object;
                     let flattened = normalize_accessible_text(&snapshot.text);
                     if snapshot.matches_expected || flattened == self.expected {
-                        observed_count = Some(expected_count);
+                        // Keep this as the focused node's actual count. The
+                        // method identifies descendant-based verification.
                         return Ok("atspi_rich_text");
                     }
                 }

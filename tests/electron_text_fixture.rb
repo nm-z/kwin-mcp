@@ -11,10 +11,13 @@ require 'timeout'
 module ElectronTextFixture
   HTML = <<~HTML.freeze
     <!doctype html><html><head><title>Input delivery fixture</title>
-    <style>body{font:20px sans-serif;padding:28px}.entry{display:block;width:90%;height:440px;font:18px monospace;white-space:pre-wrap;border:2px solid;padding:12px}.entry.rich{height:180px}</style>
+    <style>body{font:20px sans-serif;padding:28px}.entry{display:block;width:90%;height:260px;font:18px monospace;white-space:pre-wrap;border:2px solid;padding:12px}.entry.rich{height:130px}.entry.nested{height:110px}.embedded-editor{display:block;width:100%;height:80px;padding:8px;border:1px solid #888}.protected-entry{display:block;width:90%;height:44px;font:18px monospace;border:2px solid;padding:8px}</style>
     </head><body><h1>Private Electron input delivery</h1>
     <label>Do anything</label><div class="entry" role="textbox" aria-label="Do anything" contenteditable="true" tabindex="0" autofocus spellcheck="false"></div>
     <label>Rich contenteditable</label><div class="entry rich" role="textbox" aria-label="Rich contenteditable" contenteditable="true" tabindex="0" spellcheck="false"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div>
+    <!-- The focused parent exposes an embedded-object character; child text exposes the value. -->
+    <label>Nested rich contenteditable</label><div class="entry rich nested" role="textbox" aria-label="Nested rich contenteditable" contenteditable="true" tabindex="0" spellcheck="false"><div class="embedded-editor" role="textbox" aria-label="Embedded rich text" contenteditable="true" tabindex="0"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div></div>
+    <label>Unverified password field</label><input class="protected-entry" type="password" aria-label="Unverified password field" autocomplete="off" tabindex="0">
     </body></html>
   HTML
 
