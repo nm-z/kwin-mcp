@@ -160,12 +160,12 @@ begin
     jars = Dir.glob(File.join(fixture, '.local/state/kwin-mcp/browser-cookies/.config/google-chrome/Default/**/Cookies'))
     raise 'no private persisted Chrome jar' if jars.empty?
     saved_counts = jars.map do |jar|
-      output, status = Open3.capture2(
+      count_output, status = Open3.capture2(
         'sqlite3', jar,
         "SELECT count(*) FROM cookies WHERE name IN ('kwin_immediate','kwin_session')"
       )
       raise 'could not count synthetic persisted cookie rows' unless status.success?
-      Integer(output.strip)
+      Integer(count_output.strip)
     end
     puts "cycle #{cycle}: persisted synthetic cookie row counts #{saved_counts.inspect}"
     raise 'Chrome did not persist both synthetic cookies' unless saved_counts.include?(2)
