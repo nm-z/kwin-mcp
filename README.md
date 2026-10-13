@@ -263,14 +263,9 @@ the data; it does not confirm that an application consumed it.
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
 
-Sessions run concurrently. Input requests retain arrival order within a desktop, reads run concurrently, and a shared Tower concurrency limit matches the machine thread count. App launches use a Tower timeout.
+Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops. An in-place source reload preserves its PID, pipes, and live sessions. The replacement server's `session_list` covers only its own process. The previous server records completed shutdown cleanup in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle.jsonl`; the log is capped at 1 MiB and retains recent records, so older cleanup details may be absent. An unavailable-ID error reports the previous process and cleanup record when available, and reports malformed records as errors. If an ID belongs to another process, retry the request there while it is running; otherwise call `session_start` without `session_id`, relaunch the applications, and restore the task.
 
-Session IDs belong to the server process that returned them. An in-place source
-reload preserves sessions, but a newly launched server process cannot reattach
-to them. If a tool reports that an ID belongs to another process, send the call
-to the original server if it is still running. Otherwise, call `session_start`
-without `session_id` and relaunch the application; the error includes the
-server process IDs and recovery steps.
+Sessions run concurrently. Input requests retain arrival order within a desktop, reads run concurrently, and a shared Tower concurrency limit matches the machine thread count. App launches use a Tower timeout.
 
 The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its executable. A source change triggers a rebuild. A rebuilt executable replaces the server in place while preserving its PID, client pipes, and live desktops. The client receives `notifications/tools/list_changed`. Build diagnostics are in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/build.log`. Set `KWIN_MCP_REPO` when the source is elsewhere.
 

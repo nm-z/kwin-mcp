@@ -9,6 +9,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const SESSION_LIFECYCLE_LOG_MAX_BYTES: usize = 1024 * 1024;
+
 struct RpcClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -3361,7 +3363,16 @@ fn direct_children(pid: u32) -> Vec<i32> {
 
 #[test]
 fn discovery_creates_no_session_processes() {
-    let mut client = RpcClient::start();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-discovery-state-{nonce}"));
+    std::fs::create_dir_all(&state_home).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
     thread::sleep(Duration::from_secs(2));
     assert!(direct_children(client.child.id()).is_empty());
     initialize(&mut client);
@@ -3379,10 +3390,49 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    call_tool(&mut client, 3, "session_list", json!({}));
-    client.send(4, "ping", json!({}));
+    let session_server_pid = if client.child.id() == u32::MAX {
+        client.child.id() - 1
+    } else {
+        client.child.id() + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let unavailable = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
     assert_eq!(
-        client.response(4, Duration::from_secs(2))["result"],
+        unavailable["error"]["data"]["reason"], "different_server_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["previous_server_cleanup"],
+        "not_confirmed_from_current_process",
+        "{unavailable}"
+    );
+    assert!(
+        unavailable["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("session_start without session_id")
+                    && message.contains("relaunch")
+            ),
+        "{unavailable}"
+    );
+    let no_live = call_tool(&mut client, 4, "window_list", json!({}));
+    assert_eq!(
+        no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    let sessions = call_tool(&mut client, 5, "session_list", json!({}));
+    assert_eq!(
+        sessions["result"]["structuredContent"]["scope"], "current_process",
+        "{sessions}"
+    );
+    client.send(6, "ping", json!({}));
+    assert_eq!(
+        client.response(6, Duration::from_secs(2))["result"],
         json!({})
     );
     for (index, method) in [
@@ -3394,7 +3444,7 @@ fn discovery_creates_no_session_processes() {
     .iter()
     .enumerate()
     {
-        let id = 5 + u64::try_from(index).expect("index");
+        let id = 7 + u64::try_from(index).expect("index");
         client.send(id, method, json!({"ref":{"type":"ref/prompt","name":"unused"},"argument":{"name":"unused","value":""}}));
         assert!(
             client.response(id, Duration::from_secs(2))["result"].is_object(),
@@ -3413,6 +3463,7 @@ fn discovery_creates_no_session_processes() {
             .any(|line| line.contains("started child"))
     );
     client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
 
 #[test]
@@ -3472,7 +3523,16 @@ fn call_without_session_creates_no_processes() {
 
 #[test]
 fn unknown_session_from_another_server_reports_recovery_guidance() {
-    let mut client = RpcClient::start();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-other-server-state-{nonce}"));
+    std::fs::create_dir_all(&state_home).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let server_pid = client.child.id();
     let next_pid = server_pid.saturating_add(1);
@@ -3510,6 +3570,133 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     );
     assert!(direct_children(server_pid).is_empty());
     client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn malformed_session_lifecycle_record_is_an_error() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-malformed-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let session_server_pid = if server_pid == u32::MAX {
+        server_pid - 1
+    } else {
+        server_pid + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let malformed = format!(
+        "{}\n",
+        json!({
+            "session_id": session_id,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    std::fs::write(log_dir.join("session-lifecycle.jsonl"), malformed)
+        .expect("write malformed lifecycle record");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(response["error"]["code"], -32603, "{response}");
+    assert_eq!(
+        response["error"]["data"]["reason"], "malformed_session_lifecycle_record",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["unknown_session_error"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("malformed session-lifecycle record")),
+        "{response}"
+    );
+    assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-oversized-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let lifecycle_log = log_dir.join("session-lifecycle.jsonl");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let session_server_pid = if server_pid == u32::MAX {
+        server_pid - 1
+    } else {
+        server_pid + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let seed_record = format!(
+        "{}\n",
+        json!({
+            "session_id": session_id,
+            "server_pid": session_server_pid,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    let mut seed_log = Vec::new();
+    while seed_log.len() <= SESSION_LIFECYCLE_LOG_MAX_BYTES {
+        seed_log.extend_from_slice(seed_record.as_bytes());
+    }
+    std::fs::write(&lifecycle_log, seed_log).expect("seed oversized lifecycle log");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["previous_server_cleanup_record"]["session_id"], session_id,
+        "{response}"
+    );
+    assert!(
+        std::fs::metadata(&lifecycle_log)
+            .expect("read capped lifecycle log metadata")
+            .len()
+            <= u64::try_from(SESSION_LIFECYCLE_LOG_MAX_BYTES).expect("lifecycle cap fits u64"),
+        "session-lifecycle.jsonl exceeded its cap"
+    );
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
 
 fn child_compositor(server: u32) -> i32 {
@@ -4420,9 +4607,37 @@ fn check_reexecution(source_reload: bool) {
 #[ignore = "requires private KWin sessions, bubblewrap, and input devices"]
 fn transport_eof_cleans_every_owned_session() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    let mut client = RpcClient::start();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-eof-state-{nonce}"));
+    let lifecycle_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&lifecycle_dir).expect("create shared lifecycle state");
+    let lifecycle_log = lifecycle_dir.join("session-lifecycle.jsonl");
+    let seed_record = format!(
+        "{}\n",
+        json!({
+            "session_id": "s1-1",
+            "server_pid": 1,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    let mut seed_log = Vec::new();
+    while seed_log.len() <= SESSION_LIFECYCLE_LOG_MAX_BYTES {
+        seed_log.extend_from_slice(seed_record.as_bytes());
+    }
+    std::fs::write(&lifecycle_log, seed_log).expect("seed bounded lifecycle log");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let mut directories = Vec::new();
+    let mut sessions = Vec::new();
     for request in [2, 3] {
         let response = call_tool(
             &mut client,
@@ -4433,6 +4648,12 @@ fn transport_eof_cleans_every_owned_session() {
         assert_eq!(
             response["result"]["structuredContent"]["status"], "started",
             "{response}"
+        );
+        sessions.push(
+            response["result"]["structuredContent"]["session_id"]
+                .as_str()
+                .expect("session ID")
+                .to_owned(),
         );
         directories.push(workdir(&response));
     }
@@ -4452,6 +4673,45 @@ fn transport_eof_cleans_every_owned_session() {
             directory.display()
         );
     }
+    assert!(
+        std::fs::metadata(&lifecycle_log)
+            .expect("read bounded lifecycle log metadata")
+            .len()
+            <= u64::try_from(SESSION_LIFECYCLE_LOG_MAX_BYTES).expect("lifecycle cap fits u64"),
+        "session-lifecycle.jsonl exceeded its cap"
+    );
+    let mut replacement = RpcClient::start_with_env(&extra_env);
+    initialize(&mut replacement);
+    for (index, session_id) in sessions.iter().enumerate() {
+        let request = 2 + u64::try_from(index).expect("index");
+        let unavailable = call_tool(
+            &mut replacement,
+            request,
+            "window_list",
+            json!({"session_id":session_id}),
+        );
+        assert_eq!(
+            unavailable["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+            "{unavailable}"
+        );
+        let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
+        assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
+        assert_eq!(record["reason"], "server_shutdown", "{record}");
+        assert_eq!(
+            record["session_id"].as_str(),
+            Some(session_id.as_str()),
+            "{record}"
+        );
+        assert_eq!(record["workdir_cleanup"], "removed", "{record}");
+        assert!(
+            unavailable["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("shutdown cleanup finished")),
+            "{unavailable}"
+        );
+    }
+    replacement.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove shared lifecycle state");
 }
 
 #[test]
