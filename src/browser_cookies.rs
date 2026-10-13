@@ -99,7 +99,10 @@ fn identity_columns(connection: &Connection) -> Result<Vec<String>> {
 /// Other SQLite files named Cookies inside a browser config are kept private,
 /// but are not cookie jars and must not enter the continuity store.
 pub fn supports_cookie_jar(database: &Path) -> Result<bool> {
-    let database = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Callers pass only session-owned or persisted private copies. Opening
+    // read-write lets SQLite create the WAL shared-memory file when Chrome has
+    // left the jar in WAL mode but removed its sidecars after shutdown.
+    let database = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let names = columns(&database)?;
     Ok(["host_key", "name", "path", "last_update_utc"]
         .iter()
@@ -312,7 +315,10 @@ pub fn snapshot(source: &Path, destination: &Path) -> Result<()> {
         std::fs::metadata(source)?.len() <= 512 * 1024 * 1024,
         "cookie database exceeds the 512 MiB snapshot limit"
     );
-    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // `source` is a private copy, never a host database. SQLite needs a
+    // read-write connection to recover a WAL-mode jar whose `-shm` was removed
+    // when its last browser connection exited.
+    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     source.busy_timeout(Duration::ZERO)?;
     let mut copy = Connection::open(destination)?;
     std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
