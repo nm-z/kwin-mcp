@@ -2113,6 +2113,35 @@ fn browser_cookies_continue_across_sessions_without_host_writes() {
         "{stopped}"
     );
     assert!(!fifth_workdir.exists(), "refreshed session was not cleaned");
+
+    let started = call_tool(
+        &mut client,
+        16,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let sixth_workdir = workdir(&started);
+    let cookie_state = client.home.join(".local/state/kwin-mcp/browser-cookies");
+    let displaced_state = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies.saved");
+    std::fs::rename(&cookie_state, &displaced_state).expect("displace private cookie state");
+    std::fs::write(&cookie_state, b"occupied").expect("block cookie state directory");
+    let stopped = call_tool(&mut client, 17, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        stopped["result"]["structuredContent"]["cookie_errors"]
+            .as_array()
+            .is_some_and(|errors| !errors.is_empty()),
+        "cookie save failure was not returned from session_stop: {stopped}"
+    );
+    assert!(
+        !sixth_workdir.exists(),
+        "save-failure session was not cleaned"
+    );
     client.stop_process();
 }
 
