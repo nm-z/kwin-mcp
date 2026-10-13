@@ -1815,7 +1815,10 @@ const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 // launch_app: window-appear polling.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
-const LAUNCH_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
+const LAUNCH_PRECHECK_TIMEOUT: Duration = Duration::from_secs(20);
+// The call deadline leaves room for the prelaunch KWin check and CDP retries.
+const LAUNCH_CALL_OVERHEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 // KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
 // it when a non-blocking pipe is full at close. Frames are captured into a
@@ -7457,6 +7460,8 @@ struct ExportFileParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
+    /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
+    window_timeout_seconds: Option<u64>,
 }
 
 async fn poll_launch_window(
@@ -10696,7 +10701,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait up to 15s for a new window. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The whole call has a 20s deadline; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -10704,15 +10709,28 @@ impl KwinMcp {
         Parameters(params): Parameters<LaunchAppParams>,
     ) -> Result<CallToolResult, McpError> {
         use tower::ServiceExt;
+        let window_timeout_seconds = params
+            .window_timeout_seconds
+            .unwrap_or(LAUNCH_WINDOW_TIMEOUT.as_secs());
+        if !(1..=LAUNCH_WINDOW_TIMEOUT_MAX_SECS).contains(&window_timeout_seconds) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "window_timeout_seconds must be between 1 and {LAUNCH_WINDOW_TIMEOUT_MAX_SECS}"
+                ),
+                None,
+            ));
+        }
+        let window_timeout = Duration::from_secs(window_timeout_seconds);
+        let call_timeout = window_timeout + LAUNCH_CALL_OVERHEAD_TIMEOUT;
         let progress = Arc::new(std::sync::Mutex::new(LaunchProgress {
             stage: "waiting for the session",
             command_submitted: false,
         }));
         let observed = progress.clone();
         let service = tower::service_fn(|(peer, params)| {
-            self.launch_app_inner(peer, params, progress.clone())
+            self.launch_app_inner(peer, params, progress.clone(), window_timeout)
         });
-        match tower::timeout::Timeout::new(service, LAUNCH_CALL_TIMEOUT)
+        match tower::timeout::Timeout::new(service, call_timeout)
             .oneshot((peer, params))
             .await
         {
@@ -10722,7 +10740,7 @@ impl KwinMcp {
                     let progress = observed.lock().map_err(|_| {
                         McpError::internal_error("launch progress lock poisoned", None)
                     })?;
-                    Err(launch_timeout(&progress, LAUNCH_CALL_TIMEOUT))
+                    Err(launch_timeout(&progress, call_timeout))
                 } else {
                     Err(McpError::internal_error(error.to_string(), None))
                 }
@@ -10735,6 +10753,7 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         params: LaunchAppParams,
         progress: Arc<std::sync::Mutex<LaunchProgress>>,
+        window_timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         use futures::StreamExt;
@@ -10771,10 +10790,20 @@ impl KwinMcp {
         if let Ok(mut progress) = progress.lock() {
             progress.stage = "reading the active window before launch";
         }
-        let prev_window_id = active_window_info(&conn, &kwin_unique, &xdg)
-            .await
-            .map(|(_, _, geo)| geo.id)
-            .ok();
+        let prev_window_id = match tokio::time::timeout(
+            LAUNCH_PRECHECK_TIMEOUT,
+            active_window_info(&conn, &kwin_unique, &xdg),
+        )
+        .await
+        {
+            Ok(result) => result.map(|(_, _, geo)| geo.id).ok(),
+            Err(_) => {
+                let progress = progress
+                    .lock()
+                    .map_err(|_| McpError::internal_error("launch progress lock poisoned", None))?;
+                return Err(launch_timeout(&progress, LAUNCH_PRECHECK_TIMEOUT));
+            }
+        };
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
@@ -10866,7 +10895,7 @@ impl KwinMcp {
                 exit_file.clone(),
             )
         });
-        let win_geo = match tower::timeout::Timeout::new(waiting, LAUNCH_WINDOW_TIMEOUT)
+        let win_geo = match tower::timeout::Timeout::new(waiting, window_timeout)
             .oneshot(())
             .await
         {
@@ -10932,23 +10961,26 @@ impl KwinMcp {
             (Some(geo), _) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
                 "action": "launch", "command": params.command, "window": geo.id,
                 "cdp": cdp_connected, "warning": warning,
+                "window_timeout_seconds": window_timeout.as_secs(),
             })).await),
             (None, Some(status)) => {
                 let text = match status {
-                    0 => format!("launched: {} (exited with status 0; no window after 15s){suffix}", params.command),
+                    0 => format!("launched: {} (exited with status 0; no window after {}s){suffix}", params.command, window_timeout.as_secs()),
                     127 => format!("{} failed: command not found (exit status 127)", params.command),
                     _ => format!("{} exited with status {status} without opening a window", params.command),
                 };
                 let mut result = structured_result(&peer, text, serde_json::json!({
                     "action": "launch", "command": params.command, "window": "exited",
                     "exit_status": status, "cdp": false, "warning": warning,
+                    "window_timeout_seconds": window_timeout.as_secs(),
                 })).await;
                 result.is_error = Some(status != 0);
                 Ok(result)
             }
-            (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after 15s){suffix}", params.command), serde_json::json!({
+            (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
                 "cdp": false, "warning": warning, "stage": "waiting for a new window", "command_submitted": true,
+                "window_timeout_seconds": window_timeout.as_secs(),
             })).await),
         }
     }

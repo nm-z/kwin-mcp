@@ -3091,6 +3091,10 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         missing["result"]["structuredContent"]["exit_status"], 127,
         "{missing}"
     );
+    assert_eq!(
+        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
+        "{missing}"
+    );
     assert!(
         begun.elapsed() < Duration::from_secs(5),
         "missing command took {:?}",
@@ -3104,7 +3108,12 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{failed}"
     );
 
-    let finished = call_tool(&mut client, 5, "launch_app", json!({"command":"true"}));
+    let finished = call_tool(
+        &mut client,
+        5,
+        "launch_app",
+        json!({"command":"true","window_timeout_seconds":1}),
+    );
     assert_ne!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(
         finished["result"]["structuredContent"]["exit_status"], 0,
@@ -3121,6 +3130,64 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     assert_eq!(retained, 0, "launch command files were retained");
 
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn launch_app_waits_for_a_delayed_window() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+
+    let begun = Instant::now();
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"sleep 18; konsole --separate --hold -e bash -c 'printf delayed-window-proof'","window_timeout_seconds":30}),
+    );
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    let elapsed = begun.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(17),
+        "launch_app returned before the delayed window appeared: {elapsed:?}"
+    );
+    let window_id = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("window ID");
+    assert!(window_id.starts_with('{'), "{launched}");
+    assert_eq!(
+        launched["result"]["structuredContent"]["window_timeout_seconds"], 30,
+        "{launched}"
+    );
+    let windows = call_tool(&mut client, 4, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|window| window["id"] == window_id)),
+        "delayed window missing from window_list: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
     assert!(
         !stopped["result"]["isError"].as_bool().unwrap_or(false),
         "{stopped}"
