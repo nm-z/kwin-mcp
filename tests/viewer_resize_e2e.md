@@ -4,17 +4,16 @@
 
 ## Build
 
-On the currently authorized build host, use an owned source and target directory and the team’s current CPU/memory policy:
+From the repository root, build the production binaries and the C fixtures:
 
 ```bash
-CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false \
-  CARGO_TARGET_DIR=/path/to/private-target cargo build --locked --bins
-bash tests/build_viewer_fixtures.sh /path/to/private-fixtures
+cargo build --locked --bins
+bash tests/build_viewer_fixtures.sh /path/to/private-bin
 ```
 
 The fixtures require GTK 4, Wayland client development files, `wayland-scanner`, and the Plasma `fake-input.xml` protocol. They use the system XML, falling back to the already-locked `wayland-protocols-plasma` Cargo dependency. Set `KWIN_MCP_FAKE_INPUT_XML` to use another private copy.
 
-Copy `kwin-mcp`, `kwin-viewer`, `viewer-input-probe`, and `viewer-touch` into one private evidence directory on engi. Keep the source script available at a path under `/home`; session `/tmp` is private.
+Copy `target/debug/kwin-mcp`, `target/debug/kwin-viewer`, and the two fixture binaries into one private evidence directory on the KDE host. Keep the source script available at a path under `/home`; session `/tmp` is private.
 
 ## Run
 
