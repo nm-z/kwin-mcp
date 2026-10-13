@@ -164,6 +164,8 @@ impl RpcClient {
         if let Some(path) = &binary_copy {
             command.env("KWIN_MCP_BINARY", path);
         }
+        let session_bus = std::env::var_os("KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS")
+            .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus"));
         command
             .args(["--autoclean"])
             .env("HOME", &home)
@@ -173,7 +175,7 @@ impl RpcClient {
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("KDEHOME", home.join(".kde"))
             .env("XDG_RUNTIME_DIR", "/run/user/1000")
-            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+            .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
             .env(
                 "WAYLAND_DISPLAY",
                 std::env::var_os("WAYLAND_DISPLAY")
@@ -4448,10 +4450,10 @@ fn copy_source(source: &std::path::Path, target: &std::path::Path) {
 }
 
 fn session_handle(response: &Value) -> String {
-    response["result"]["structuredContent"]["session_id"]
-        .as_str()
-        .expect("session id")
-        .to_owned()
+    let Some(session_id) = response["result"]["structuredContent"]["session_id"].as_str() else {
+        panic!("session_start did not return a session ID: {response}");
+    };
+    session_id.to_owned()
 }
 fn save_session_image(client: &mut RpcClient, request: u64, session: &str, name: &str) {
     use base64::Engine;

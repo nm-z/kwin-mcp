@@ -589,15 +589,19 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 .create_new(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            snapshot(&jar.upper, &temporary)?;
-            let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)?;
-            merge(&temporary, &jar.saved)?;
-            apply_deleted(&Connection::open(&temporary)?, &deleted)?;
+            snapshot(&jar.upper, &temporary).context("snapshot private cookie jar")?;
+            let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
+                .context("record cookie deletions")?;
+            merge(&temporary, &jar.saved).context("merge persisted cookie jar")?;
+            apply_deleted(&Connection::open(&temporary)?, &deleted)
+                .context("apply cookie deletion tombstones")?;
             // Publish deletions before the jar: even a crash between renames
             // must not restore a removed cookie from the old saved jar.
-            write_deletions(&jar.saved, &deleted)?;
-            std::fs::rename(&temporary, &jar.saved)?;
-            std::fs::File::open(parent)?.sync_all()?;
+            write_deletions(&jar.saved, &deleted).context("persist cookie deletion tombstones")?;
+            std::fs::rename(&temporary, &jar.saved).context("publish persisted cookie jar")?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .context("sync cookie state directory")?;
             Ok(())
         })();
         if let Err(error) = result {

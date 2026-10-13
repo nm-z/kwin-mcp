@@ -20,11 +20,17 @@ private `CARGO_TARGET_DIR` under the checkout. Do not build on archy. If
 `session_start` fails the 2 GiB overlay-space gate, identify the full filesystem
 and its space consumers before reporting the failure. No candidate binary is
 installed or deployed. Each fixture uses a private HOME and cookie state; actual
-host browser profiles are not modified.
-Each private child server receives `XDG_RUNTIME_DIR=/run/user/1000` and
-`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus` explicitly. The fixtures
-preserve their private HOME/XDG data/config/cache/state and no-repository setting;
-they do not change the agent's global environment or host application state.
+host browser profiles are not modified. Each private child server receives
+`XDG_RUNTIME_DIR=/run/user/1000` and a filtered session-bus address through
+`KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS`. The proxy must allow
+`org.freedesktop.DBus` and `org.freedesktop.systemd1`, and deny
+`org.kde.kwalletd6` and Secret Service so these checks do not copy the host
+wallet. For example, use `xdg-dbus-proxy` with the user bus as its upstream,
+`--filter`, `--see=org.freedesktop.DBus`, `--see=org.freedesktop.systemd1`, and
+`--talk=org.freedesktop.systemd1`, then set the test variable to that proxy's
+Unix socket. The fixtures preserve their private HOME/XDG data/config/cache/state
+and no-repository setting; they do not change the agent's global environment or
+host application state.
 
 | Regression | Required observations |
 | --- | --- |
