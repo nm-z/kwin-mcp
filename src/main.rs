@@ -4129,6 +4129,106 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
+fn prepare_browser_cookies(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    baseline_root: &Path,
+) -> anyhow::Result<Vec<kwin_mcp::browser_cookies::CookieRoot>> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(baseline_root)?;
+    std::fs::set_permissions(baseline_root, std::fs::Permissions::from_mode(0o700))?;
+    let state = kwin_mcp::browser_cookies::state_root();
+    if state.starts_with(target) {
+        plan.empty_dirs.push(state.clone());
+    }
+    let mut roots = Vec::new();
+    for config in BROWSER_CONFIG_DIRS {
+        let host = target.join(config);
+        let saved = state.join(config);
+        let baseline = baseline_root.join(config);
+        let mut profiles = std::collections::BTreeSet::new();
+        for directory in [&host, &saved] {
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                {
+                    profiles.insert(entry.file_name());
+                }
+            }
+        }
+        for profile in profiles {
+            for name in ["Cookies", "Network/Cookies"] {
+                let database = host.join(&profile).join(name);
+                let previous = saved.join(&profile).join(name);
+                if !database.is_file() && !previous.is_file() {
+                    continue;
+                }
+                let upper = upper_file(plan, &database)?;
+                let result = if database.is_file() {
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                            eprintln!(
+                                "session_start: preserving host cookie schema for {}: {error:#}",
+                                database.display()
+                            );
+                        }
+                    })
+                } else {
+                    kwin_mcp::browser_cookies::snapshot(&previous, &upper)
+                };
+                if let Err(error) = result {
+                    // Never expose a live lower-layer WAL after a failed copy.
+                    // A saved jar is a safe fallback; without one, fail startup
+                    // rather than let the browser open an incoherent profile.
+                    if previous.is_file() {
+                        eprintln!(
+                            "session_start: using saved cookies for {}: {error:#}",
+                            database.display()
+                        );
+                        kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
+                    } else {
+                        return Err(
+                            error.context(format!("snapshot cookies for {}", database.display()))
+                        );
+                    }
+                }
+                if !kwin_mcp::browser_cookies::supports_cookie_jar(&upper)? {
+                    eprintln!(
+                        "session_start: skipping non-cookie SQLite database {}",
+                        database.display()
+                    );
+                    continue;
+                }
+                kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                let original = baseline.join(&profile).join(name);
+                std::fs::create_dir_all(
+                    original
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
+                )?;
+                kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
+            }
+        }
+        for overlay in &plan.overlays {
+            if let Ok(relative) = host.strip_prefix(&overlay.destination) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.join(relative),
+                    saved: saved.clone(),
+                    baseline: Some(baseline.clone()),
+                });
+            } else if overlay.destination.starts_with(&host) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.clone(),
+                    saved: state.join(overlay.destination.strip_prefix(target)?),
+                    baseline: Some(baseline_root.join(overlay.destination.strip_prefix(target)?)),
+                });
+            }
+        }
+    }
+    Ok(roots)
+}
+
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
@@ -4263,6 +4363,7 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
 struct HostView {
     overlay_plan: OverlayPlan,
     kdeglobals: String,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
 }
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
@@ -4347,6 +4448,8 @@ fn prepare_host_view(
     service.set_start_stage("preparing browser profiles");
     let discarded = discarded_session_databases(target);
     empty_session_databases(&overlay_plan, &discarded)?;
+    let cookie_roots =
+        prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
@@ -4361,6 +4464,7 @@ fn prepare_host_view(
     Ok(HostView {
         overlay_plan,
         kdeglobals,
+        cookie_roots,
     })
 }
 
@@ -4641,6 +4745,7 @@ struct Session {
     /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
     oversized_read_only_files: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -5664,13 +5769,112 @@ impl WorkdirOwnership {
 }
 
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests. The session-local wallet is
-/// dropped first; nothing on the host is touched.
+/// async workers that answer other MCP requests. Browsers flush before the
+/// session-local wallet and sandbox stop; nothing on the host is touched.
 async fn teardown_blocking(mut sess: Session) {
+    let sandbox_pid = sess.sandbox_child.id();
+    let _ = tokio::task::spawn_blocking(move || close_session_browsers(sandbox_pid)).await;
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
     let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
+}
+
+const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
+/// Chromium's main process handles SIGTERM by running graceful shutdown, which
+/// flushes pending cookies. Signal only browser parents descended from this
+/// sandbox, while their network services, compositor and wallet remain alive.
+/// Group-wide SIGTERM kills those services before the cookie flush completes.
+fn close_session_browsers(sandbox_pid: u32) {
+    let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
+        return;
+    };
+    let Ok(processes) = procfs::process::all_processes() else {
+        return;
+    };
+    let processes = processes
+        .flatten()
+        .filter_map(|process| {
+            let stat = process.stat().ok()?;
+            Some((process, stat))
+        })
+        .collect::<Vec<_>>();
+    let mut descendants = std::collections::HashSet::from([sandbox_pid]);
+    loop {
+        let before = descendants.len();
+        for (process, stat) in &processes {
+            if descendants.contains(&stat.ppid) {
+                descendants.insert(process.pid);
+            }
+        }
+        if before == descendants.len() {
+            break;
+        }
+    }
+    let mut browsers = Vec::new();
+    for (process, stat) in processes {
+        if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
+            continue;
+        }
+        let Ok(command) = process.cmdline() else {
+            continue;
+        };
+        if command
+            .iter()
+            .any(|arg| arg == "--type" || arg.starts_with("--type="))
+        {
+            continue;
+        }
+        let Ok(executable) = process.exe() else {
+            continue;
+        };
+        let Some(name) = executable.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        if !BROWSER_COMMANDS.contains(&name)
+            || matches!(name, "code" | "codium" | "vscodium" | "electron")
+        {
+            continue;
+        }
+        if process
+            .stat()
+            .is_ok_and(|current| current.starttime == stat.starttime)
+        {
+            if let Err(error) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                eprintln!(
+                    "teardown: browser {} shutdown signal failed: {error}",
+                    process.pid
+                );
+            } else {
+                browsers.push((process, stat.starttime));
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + BROWSER_SHUTDOWN_GRACE;
+    while !browsers.is_empty() {
+        browsers.retain(|(process, started)| {
+            process
+                .stat()
+                .is_ok_and(|stat| stat.starttime == *started && stat.state != 'Z')
+        });
+        if browsers.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "teardown: {} browser(s) did not finish cookie flush within {:?}",
+                browsers.len(),
+                BROWSER_SHUTDOWN_GRACE
+            );
+            break;
+        }
+        std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+    }
 }
 
 fn teardown(mut sess: Session) {
@@ -5686,6 +5890,9 @@ fn teardown(mut sess: Session) {
     terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
+    }
+    if let Err(error) = kwin_mcp::browser_cookies::persist(&sess.cookie_roots) {
+        eprintln!("teardown: browser cookies were not saved: {error:#}");
     }
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
@@ -7992,6 +8199,7 @@ impl KwinMcp {
         let HostView {
             mut overlay_plan,
             kdeglobals: mut kdeglobals_content,
+            cookie_roots,
         } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(
@@ -8813,6 +9021,7 @@ impl KwinMcp {
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
+            cookie_roots,
             oversized_read_only_files: oversized_read_only_files.clone(),
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -12099,6 +12308,8 @@ struct SessionRestore {
     height: u32,
     cdp_port: u16,
     overlay_work_paths: Vec<PathBuf>,
+    #[serde(default)]
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
     oversized_files: Vec<PathBuf>,
     socket_links: Vec<(PathBuf, PathBuf)>,
     idle_millis: u64,
@@ -12272,6 +12483,7 @@ impl SessionRouter {
                 viewer_child: saved.viewer.map(|pid| SessionProcess { pid, status: None }),
                 viewer_unavailable: None,
                 overlay_work_paths: saved.overlay_work_paths,
+                cookie_roots: saved.cookie_roots,
                 oversized_read_only_files: saved.oversized_files,
                 _socket_links: SocketLinks(saved.socket_links),
                 screen_width: saved.width,
@@ -12386,6 +12598,7 @@ impl SessionRouter {
                 height: session.screen_height,
                 cdp_port: session.cdp_forward_port,
                 overlay_work_paths: session.overlay_work_paths.clone(),
+                cookie_roots: session.cookie_roots.clone(),
                 oversized_files: session.oversized_read_only_files.clone(),
                 socket_links: session._socket_links.0.clone(),
                 idle_millis: u64::try_from(session.last_activity.elapsed().as_millis())?,
