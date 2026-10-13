@@ -9,8 +9,10 @@ require 'base64'
 
 binary = File.expand_path(ENV.fetch('KWIN_MCP_E2E_SERVER'))
 evidence = File.expand_path(ENV.fetch('KWIN_MCP_TEST_ARTIFACT_DIR'))
+runtime_dir = ENV.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.uid}")
 test_bus = ENV.fetch('KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS')
-raise 'cookie session checks require a filtered test D-Bus proxy' if test_bus.include?('/run/user/1000/bus')
+host_bus = ENV.fetch('DBUS_SESSION_BUS_ADDRESS', "unix:path=#{runtime_dir}/bus")
+raise 'cookie session checks require a filtered test D-Bus proxy' if test_bus == host_bus
 FileUtils.mkdir_p(evidence)
 fixture = Dir.mktmpdir('kwin-cookie-flush-', File.join(ENV.fetch('HOME'), '.cache'))
 profile = File.join(fixture, '.config/google-chrome')
@@ -35,7 +37,7 @@ environment = {
   'XDG_DATA_HOME' => File.join(fixture, '.local/share'),
   'XDG_STATE_HOME' => File.join(fixture, '.local/state'),
   'KWIN_MCP_REPO' => File.join(fixture, 'no-repository'),
-  'XDG_RUNTIME_DIR' => '/run/user/1000',
+  'XDG_RUNTIME_DIR' => runtime_dir,
   'DBUS_SESSION_BUS_ADDRESS' => test_bus,
   'WAYLAND_DISPLAY' => ENV.fetch('WAYLAND_DISPLAY', 'wayland-0')
 }

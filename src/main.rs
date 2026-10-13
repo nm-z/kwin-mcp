@@ -4133,7 +4133,7 @@ fn prepare_browser_cookies(
     plan: &mut OverlayPlan,
     target: &Path,
     baseline_root: &Path,
-) -> anyhow::Result<Vec<kwin_mcp::browser_cookies::CookieRoot>> {
+) -> anyhow::Result<(Vec<kwin_mcp::browser_cookies::CookieRoot>, Vec<String>)> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(baseline_root)?;
     std::fs::set_permissions(baseline_root, std::fs::Permissions::from_mode(0o700))?;
@@ -4142,6 +4142,7 @@ fn prepare_browser_cookies(
         plan.empty_dirs.push(state.clone());
     }
     let mut roots = Vec::new();
+    let mut cookie_errors = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
         let host = target.join(config);
         let saved = state.join(config);
@@ -4165,13 +4166,24 @@ fn prepare_browser_cookies(
                     continue;
                 }
                 let upper = upper_file(plan, &database)?;
+                let mut merge_failed = false;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
-                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
-                            eprintln!(
-                                "session_start: preserving host cookie schema for {}: {error:#}",
-                                database.display()
-                            );
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
+                        match kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                merge_failed = true;
+                                let message = format!(
+                                    "{}: {error:#}",
+                                    database.display()
+                                );
+                                eprintln!(
+                                    "session_start: preserving host cookie schema for {}: {error:#}",
+                                    database.display()
+                                );
+                                cookie_errors.push(message);
+                                Ok(())
+                            }
                         }
                     })
                 } else {
@@ -4200,7 +4212,9 @@ fn prepare_browser_cookies(
                     );
                     continue;
                 }
-                kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                if !merge_failed {
+                    kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                }
                 let original = baseline.join(&profile).join(name);
                 std::fs::create_dir_all(
                     original
@@ -4226,7 +4240,7 @@ fn prepare_browser_cookies(
             }
         }
     }
-    Ok(roots)
+    Ok((roots, cookie_errors))
 }
 
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
@@ -4364,6 +4378,7 @@ struct HostView {
     overlay_plan: OverlayPlan,
     kdeglobals: String,
     cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    cookie_errors: Vec<String>,
 }
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
@@ -4448,7 +4463,7 @@ fn prepare_host_view(
     service.set_start_stage("preparing browser profiles");
     let discarded = discarded_session_databases(target);
     empty_session_databases(&overlay_plan, &discarded)?;
-    let cookie_roots =
+    let (cookie_roots, cookie_errors) =
         prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
@@ -4465,6 +4480,7 @@ fn prepare_host_view(
         overlay_plan,
         kdeglobals,
         cookie_roots,
+        cookie_errors,
     })
 }
 
@@ -4746,6 +4762,7 @@ struct Session {
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
     cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    cookie_errors: Vec<String>,
     oversized_read_only_files: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -5771,19 +5788,29 @@ impl WorkdirOwnership {
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
 /// async workers that answer other MCP requests. Browsers flush before the
 /// session-local wallet and sandbox stop; nothing on the host is touched.
-async fn teardown_blocking(mut sess: Session) {
+async fn teardown_blocking(mut sess: Session) -> Vec<String> {
     let kwin_windows_closed = request_kwin_browser_close(&sess).await;
     let cdp_close_attempted = request_cdp_browser_close(&sess).await;
     let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
     let sandbox_pid = sess.sandbox_child.id();
-    let _ = tokio::task::spawn_blocking(move || {
+    if let Err(error) = tokio::task::spawn_blocking(move || {
         close_session_browsers(sandbox_pid, graceful_close_attempted)
     })
-    .await;
+    .await
+    {
+        eprintln!("teardown: browser shutdown worker failed: {error}");
+    }
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
-    let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
+    match tokio::task::spawn_blocking(move || teardown(sess)).await {
+        Ok(cookie_errors) => cookie_errors,
+        Err(error) => {
+            let message = format!("session cleanup worker failed: {error}");
+            eprintln!("teardown: {message}");
+            vec![message]
+        }
+    }
 }
 
 const CDP_BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -5871,10 +5898,15 @@ async fn request_cdp_browser_close(sess: &Session) -> bool {
 /// compositor, and wallet stay alive until its cookie flush has completed.
 fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
     let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
+        eprintln!("teardown: sandbox PID does not fit the process ID type");
         return;
     };
-    let Ok(processes) = procfs::process::all_processes() else {
-        return;
+    let processes = match procfs::process::all_processes() {
+        Ok(processes) => processes,
+        Err(error) => {
+            eprintln!("teardown: cannot enumerate processes for browser shutdown: {error}");
+            return;
+        }
     };
     let processes = processes
         .flatten()
@@ -5899,7 +5931,6 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
         .iter()
         .map(|(process, stat)| (process.pid, stat.ppid))
         .collect::<std::collections::HashMap<_, _>>();
-    let trace = std::env::var_os("KWIN_MCP_TEST_BROWSER_SHUTDOWN_TRACE").is_some();
     let mut candidates = Vec::new();
     for (process, stat) in processes {
         if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
@@ -5961,13 +5992,11 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
             Some(_) => false,
             None => !has_browser_ancestor,
         };
-        if trace {
-            eprintln!(
-                "teardown: browser process pid={} name={name} type={} main={is_main}",
-                process.pid,
-                process_type.as_deref().unwrap_or("none")
-            );
-        }
+        eprintln!(
+            "teardown: browser process pid={} name={name} type={} main={is_main}",
+            process.pid,
+            process_type.as_deref().unwrap_or("none")
+        );
         if is_main {
             main_pids.insert(process.pid);
         }
@@ -6040,7 +6069,8 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
     }
 }
 
-fn teardown(mut sess: Session) {
+fn teardown(mut sess: Session) -> Vec<String> {
+    let mut cookie_errors = std::mem::take(&mut sess.cookie_errors);
     drop(sess.cdp_browser);
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
@@ -6055,7 +6085,9 @@ fn teardown(mut sess: Session) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
     if let Err(error) = kwin_mcp::browser_cookies::persist(&sess.cookie_roots) {
+        let message = format!("{error:#}");
         eprintln!("teardown: browser cookies were not saved: {error:#}");
+        cookie_errors.push(message);
     }
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
@@ -6071,6 +6103,7 @@ fn teardown(mut sess: Session) {
         eprintln!("teardown: retained {}: {error}", disk.display());
     }
     cleanup_stale_session_files(&sess.host_xdg_dir);
+    cookie_errors
 }
 
 /// Linux quotactl command for reading one user's quota (Q_GETQUOTA) and the
@@ -8363,6 +8396,7 @@ impl KwinMcp {
             mut overlay_plan,
             kdeglobals: mut kdeglobals_content,
             cookie_roots,
+            cookie_errors,
         } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(
@@ -9185,6 +9219,7 @@ impl KwinMcp {
             viewer_unavailable: None,
             overlay_work_paths,
             cookie_roots,
+            cookie_errors: cookie_errors.clone(),
             oversized_read_only_files: oversized_read_only_files.clone(),
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -9209,6 +9244,7 @@ impl KwinMcp {
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
+            "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
@@ -9548,13 +9584,14 @@ impl KwinMcp {
             .await?;
         let stopped = self.session.write().await.take();
         let had_session = stopped.is_some();
+        let mut cookie_errors = Vec::new();
         if let Some(sess) = stopped {
             if let Ok(mut clipboards) = self.clipboards.lock() {
                 clipboards
                     .entries
                     .remove(&sess.host_xdg_dir.join("wayland-0"));
             }
-            teardown_blocking(sess).await;
+            cookie_errors = teardown_blocking(sess).await;
         }
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
@@ -9562,14 +9599,14 @@ impl KwinMcp {
                     structured_result(
                         &peer,
                         "session stopped",
-                        serde_json::json!({"status": "stopped"}),
+                        serde_json::json!({"status": "stopped", "cookie_errors": cookie_errors}),
                     )
                     .await
                 } else {
                     structured_result(
                         &peer,
                         "no session running",
-                        serde_json::json!({"status": "none"}),
+                        serde_json::json!({"status": "none", "cookie_errors": cookie_errors}),
                     )
                     .await
                 });
@@ -9584,12 +9621,17 @@ impl KwinMcp {
                 } else {
                     ""
                 };
+                let cookie_note = if cookie_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Cookie save errors: {}.", cookie_errors.join("; "))
+                };
                 return Err(McpError::internal_error(
                     format!(
-                        "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
+                        "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.{cookie_note}",
                         dir.display()
                     ),
-                    None,
+                    Some(serde_json::json!({"cookie_errors": cookie_errors})),
                 ));
             }
         };
@@ -9611,6 +9653,7 @@ impl KwinMcp {
             serde_json::json!({
                 "status": status,
                 "workdir_removed": workdir,
+                "cookie_errors": cookie_errors,
             }),
         )
         .await)
@@ -12473,6 +12516,8 @@ struct SessionRestore {
     overlay_work_paths: Vec<PathBuf>,
     #[serde(default)]
     cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    #[serde(default)]
+    cookie_errors: Vec<String>,
     oversized_files: Vec<PathBuf>,
     socket_links: Vec<(PathBuf, PathBuf)>,
     idle_millis: u64,
@@ -12647,6 +12692,7 @@ impl SessionRouter {
                 viewer_unavailable: None,
                 overlay_work_paths: saved.overlay_work_paths,
                 cookie_roots: saved.cookie_roots,
+                cookie_errors: saved.cookie_errors,
                 oversized_read_only_files: saved.oversized_files,
                 _socket_links: SocketLinks(saved.socket_links),
                 screen_width: saved.width,
@@ -12762,6 +12808,7 @@ impl SessionRouter {
                 cdp_port: session.cdp_forward_port,
                 overlay_work_paths: session.overlay_work_paths.clone(),
                 cookie_roots: session.cookie_roots.clone(),
+                cookie_errors: session.cookie_errors.clone(),
                 oversized_files: session.oversized_read_only_files.clone(),
                 socket_links: session._socket_links.0.clone(),
                 idle_millis: u64::try_from(session.last_activity.elapsed().as_millis())?,

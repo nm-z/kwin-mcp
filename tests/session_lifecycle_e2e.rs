@@ -63,6 +63,11 @@ impl RpcClient {
         )
     }
 
+    fn start_with_cookie_test_bus() -> Self {
+        let address = require_filtered_cookie_test_bus();
+        Self::start_with_env(&[("DBUS_SESSION_BUS_ADDRESS", address.as_str())])
+    }
+
     fn start_program(
         program: &str,
         delay_stage: Option<&str>,
@@ -164,8 +169,8 @@ impl RpcClient {
         if let Some(path) = &binary_copy {
             command.env("KWIN_MCP_BINARY", path);
         }
-        let session_bus = std::env::var_os("KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS")
-            .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus"));
+        let runtime_dir = host_runtime_dir();
+        let session_bus = host_session_bus_address(&runtime_dir);
         command
             .args(["--autoclean"])
             .env("HOME", &home)
@@ -174,7 +179,7 @@ impl RpcClient {
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("KDEHOME", home.join(".kde"))
-            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
             .env(
                 "WAYLAND_DISPLAY",
@@ -499,13 +504,34 @@ fn workdir(response: &Value) -> PathBuf {
         .unwrap_or_else(|| panic!("session_start did not return a workdir: {response}"))
 }
 
-fn require_filtered_cookie_test_bus() {
+fn host_runtime_dir() -> std::ffi::OsString {
+    use std::os::unix::fs::MetadataExt;
+    std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| {
+        let uid = std::fs::metadata("/proc/self")
+            .expect("inspect current process owner")
+            .uid();
+        std::ffi::OsString::from(format!("/run/user/{uid}"))
+    })
+}
+
+fn host_session_bus_address(runtime_dir: &std::ffi::OsStr) -> std::ffi::OsString {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|| {
+        let mut address = std::ffi::OsString::from("unix:path=");
+        address.push(runtime_dir);
+        address.push("/bus");
+        address
+    })
+}
+
+fn require_filtered_cookie_test_bus() -> String {
     let address = std::env::var("KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS")
         .expect("cookie session checks require a filtered test D-Bus proxy");
+    let host_bus = host_session_bus_address(&host_runtime_dir());
     assert!(
-        !address.contains("/run/user/1000/bus"),
+        std::ffi::OsStr::new(&address) != host_bus.as_os_str(),
         "cookie session checks must not connect directly to the host user bus"
     );
+    address
 }
 
 #[test]
@@ -1793,8 +1819,7 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
 fn browser_cookies_continue_across_sessions_without_host_writes() {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    require_filtered_cookie_test_bus();
-    let mut client = RpcClient::start();
+    let mut client = RpcClient::start_with_cookie_test_bus();
     let profile = client.home.join(".config/google-chrome/Profile 2");
     std::fs::create_dir_all(&profile).expect("profile directory");
     let database = profile.join("Cookies");
@@ -1969,6 +1994,125 @@ fn browser_cookies_continue_across_sessions_without_host_writes() {
         "{stopped}"
     );
     assert!(!second_workdir.exists(), "second session was not cleaned");
+
+    let started = call_tool(
+        &mut client,
+        8,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let third_workdir = workdir(&started);
+    let migrate_schema = "ALTER TABLE cookies ADD COLUMN source_scheme INTEGER NOT NULL DEFAULT 0; UPDATE cookies SET source_scheme=1;";
+    let migrated = call_tool(
+        &mut client,
+        9,
+        "launch_app",
+        json!({"command":format!(
+            "sqlite3 {} {}; konsole",
+            shlex::try_quote(&database.display().to_string()).expect("database quote"),
+            shlex::try_quote(migrate_schema).expect("migration SQL quote")
+        )}),
+    );
+    assert!(
+        !migrated["result"]["isError"].as_bool().unwrap_or(false),
+        "{migrated}"
+    );
+    let stopped = call_tool(&mut client, 10, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        !third_workdir.exists(),
+        "schema migration session was not cleaned"
+    );
+    let persisted = rusqlite::Connection::open(&saved).expect("schema-updated saved jar");
+    let columns = persisted
+        .prepare("PRAGMA table_info(cookies)")
+        .expect("schema query")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("schema columns")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("schema names");
+    assert!(columns.iter().any(|column| column == "source_scheme"));
+    let migrated_value: i64 = persisted
+        .query_row(
+            "SELECT source_scheme FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migrated session cookie");
+    assert_eq!(migrated_value, 1);
+    drop(persisted);
+
+    let started = call_tool(
+        &mut client,
+        11,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let startup_cookie_errors = started["result"]["structuredContent"]["cookie_errors"]
+        .as_array()
+        .expect("session_start cookie errors");
+    assert!(
+        startup_cookie_errors.iter().any(|error| error
+            .as_str()
+            .is_some_and(|message| message.contains("cookie schemas differ"))),
+        "schema mismatch was not returned from session_start: {started}"
+    );
+    let fourth_workdir = workdir(&started);
+    let stopped = call_tool(&mut client, 12, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        !fourth_workdir.exists(),
+        "schema fallback session was not cleaned"
+    );
+
+    host.execute(
+        "UPDATE cookies SET last_update_utc=50,encrypted_value=x'0050' WHERE name='host'",
+        [],
+    )
+    .expect("host cookie update after schema fallback");
+    let started = call_tool(
+        &mut client,
+        13,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let fifth_workdir = workdir(&started);
+    let refreshed = client.home.join("refreshed-host-cookie.sqlite");
+    let result = call_tool(
+        &mut client,
+        14,
+        "export_file",
+        json!({"session_path":database,"host_path":refreshed}),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let refreshed_jar = rusqlite::Connection::open(refreshed).expect("refreshed session jar");
+    let host_timestamp: i64 = refreshed_jar
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='host'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("refreshed host cookie");
+    assert_eq!(
+        host_timestamp, 50,
+        "schema mismatch froze the old host cookie"
+    );
+    drop(refreshed_jar);
+    let stopped = call_tool(&mut client, 15, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(!fifth_workdir.exists(), "refreshed session was not cleaned");
     client.stop_process();
 }
 
@@ -1990,8 +2134,7 @@ fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
         }
     }
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    require_filtered_cookie_test_bus();
-    let mut client = RpcClient::start();
+    let mut client = RpcClient::start_with_cookie_test_bus();
     let relative = ".config/google-chrome/Profile 2/Cookies";
     let database = client.home.join(relative);
     let saved = client
@@ -2123,8 +2266,7 @@ fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
 fn browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    require_filtered_cookie_test_bus();
-    let mut client = RpcClient::start();
+    let mut client = RpcClient::start_with_cookie_test_bus();
     let database = client.home.join(".config/google-chrome/Profile 2/Cookies");
     std::fs::create_dir_all(database.parent().expect("profile parent")).expect("profile");
     let host = rusqlite::Connection::open(&database).expect("host jar");
@@ -2693,12 +2835,8 @@ fn session_follows_host_sqlite_wal_rotation() {
         assert!(Instant::now() < deadline, "graphical fixture did not start");
         thread::sleep(Duration::from_millis(20));
     }
-    std::os::unix::fs::symlink(
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
-        directory.join("host-runtime-link"),
-    )
-    .expect("runtime symlink fixture");
+    std::os::unix::fs::symlink(host_runtime_dir(), directory.join("host-runtime-link"))
+        .expect("runtime symlink fixture");
     let mut host = rusqlite::Connection::open(&database).expect("host database");
     host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0); create table churn(body blob);")
         .expect("seed generation");

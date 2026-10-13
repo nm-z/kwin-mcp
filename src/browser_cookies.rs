@@ -578,6 +578,54 @@ pub fn merge(destination: &Path, source: &Path) -> Result<()> {
     prune_expired(&destination)
 }
 
+fn cookie_schema_matches(left: &Path, right: &Path) -> Result<bool> {
+    let left = Connection::open_with_flags(left, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let right = Connection::open_with_flags(right, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(
+        columns(&left)? == columns(&right)?
+            && identity_columns(&left)? == identity_columns(&right)?,
+    )
+}
+
+fn deletion_schema_matches(saved: &Path, keys: &[String]) -> Result<bool> {
+    match std::fs::read(saved.with_extension("deleted.json")) {
+        Ok(bytes) => {
+            let deleted: DeletedCookies = serde_json::from_slice(&bytes)?;
+            Ok(deleted.columns == keys)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn session_schema_changed(session: &Path, baseline: Option<&Path>, saved: &Path) -> Result<bool> {
+    for previous in baseline
+        .into_iter()
+        .chain([saved].into_iter().filter(|path| path.is_file()))
+    {
+        if previous.is_file() && !cookie_schema_matches(session, previous)? {
+            return Ok(true);
+        }
+    }
+    let session = Connection::open_with_flags(session, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    deletion_schema_matches(saved, &identity_columns(&session)?).map(|matches| !matches)
+}
+
+fn publish_session_jar(temporary: &Path, saved: &Path) -> Result<()> {
+    let parent = saved.parent().context("cookie state has no parent")?;
+    let deletions = saved.with_extension("deleted.json");
+    match std::fs::remove_file(&deletions) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove stale cookie deletion tombstones"),
+    }
+    std::fs::rename(temporary, saved).context("publish session cookie jar after schema change")?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync cookie state directory")?;
+    Ok(())
+}
+
 pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     let mut jars = Vec::new();
     for root in roots {
@@ -684,6 +732,15 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                     .open(&temporary)
                     .context("create temporary cookie database")?;
                 snapshot(&staged, &temporary).context("snapshot private cookie jar")?;
+                if session_schema_changed(&temporary, jar.baseline.as_deref(), &jar.saved)
+                    .context("compare session cookie schema with persisted state")?
+                {
+                    eprintln!(
+                        "teardown: cookie schema changed for {}; replacing persisted jar with the session jar",
+                        jar.saved.display()
+                    );
+                    return publish_session_jar(&temporary, &jar.saved);
+                }
                 let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
                     .context("record cookie deletions")?;
                 merge(&temporary, &jar.saved).context("merge persisted cookie jar")?;
