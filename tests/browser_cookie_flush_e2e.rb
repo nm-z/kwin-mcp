@@ -19,7 +19,7 @@ FileUtils.mkdir_p(File.join(profile, 'Default'))
 File.write(File.join(profile, 'Default/Preferences'), JSON.generate(session: { restore_on_startup: 1 }))
 baseline = Dir.glob(File.join(profile, '**/*')).select { |path| File.file?(path) }.to_h { |path| [path, File.binread(path)] }
 requests = Queue.new
-http = TCPServer.new('0.0.0.0', 0)
+http = TCPServer.new('127.0.0.1', 0)
 port = http.addr[1]
 server = Thread.new do
   loop do
@@ -96,8 +96,16 @@ begin
     started = tool.call('session_start', { width: 1000, height: 700 })
     live = started.fetch('structuredContent').fetch('session_id')
     route = cycle.zero? ? '/set/0' : '/check'
-    tool.call('launch_app', { command: "google-chrome-stable --password-store=basic --no-first-run --disable-background-mode http://127.0.0.1:#{port}#{route}" })
-    request = wait_route.call(route)
+    launched = tool.call('launch_app', { command: "google-chrome-stable --password-store=basic --no-first-run --disable-background-mode http://127.0.0.1:#{port}#{route}" })
+    puts "cycle #{cycle}: launch window #{JSON.generate(launched.dig('structuredContent', 'window'))}"
+    begin
+      request = wait_route.call(route)
+    rescue Timeout::Error
+      screenshot.call("browser-cookie-timeout-#{cycle}.png")
+      windows = tool.call('window_list')
+      warn "windows after HTTP timeout: #{JSON.generate(windows.dig('structuredContent', 'windows'))}"
+      raise
+    end
     if cycle.positive?
       expected = ["kwin_immediate=#{cycle - 1}", "kwin_session=#{cycle - 1}"]
       raise "cookie lost after immediate stop: #{request.inspect}" unless expected.all? { |cookie| request[1].include?(cookie) }
