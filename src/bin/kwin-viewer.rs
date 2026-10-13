@@ -1507,15 +1507,24 @@ fn forward_input(
             } else {
                 state.held_keys.remove(&evdev);
             }
-            state.out.send(op);
+            if let Some(op) = op {
+                state.out.send(op);
+            }
         }
         _ => {}
     }
 }
 
-/// Preserve each host key press and release, including the host's repeat events.
-fn key_op(evdev: u32, state: ElementState, _repeat: bool) -> Op {
-    Op::Key(evdev, u32::from(matches!(state, ElementState::Pressed)))
+/// Forward initial key presses and releases. The session generates its own
+/// repeats for a held key, so forwarding the host's repeats would double them.
+fn key_op(evdev: u32, state: ElementState, repeat: bool) -> Option<Op> {
+    if repeat {
+        return None;
+    }
+    Some(Op::Key(
+        evdev,
+        u32::from(matches!(state, ElementState::Pressed)),
+    ))
 }
 
 fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
@@ -1785,19 +1794,14 @@ mod wire_tests {
     }
 
     #[test]
-    fn host_auto_repeat_is_forwarded() {
-        assert!(same(
-            key_op(30, ElementState::Pressed, false),
-            Op::Key(30, 1)
-        ));
-        assert!(same(
-            key_op(30, ElementState::Pressed, true),
-            Op::Key(30, 1)
-        ));
-        assert!(same(
-            key_op(30, ElementState::Released, false),
-            Op::Key(30, 0)
-        ));
+    fn host_auto_repeat_sends_nothing() {
+        assert!(key_op(30, ElementState::Pressed, true).is_none());
+        assert!(
+            key_op(30, ElementState::Pressed, false).is_some_and(|op| same(op, Op::Key(30, 1)))
+        );
+        assert!(
+            key_op(30, ElementState::Released, false).is_some_and(|op| same(op, Op::Key(30, 0)))
+        );
     }
 
     #[test]

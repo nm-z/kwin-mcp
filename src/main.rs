@@ -12102,7 +12102,7 @@ impl rmcp::ServerHandler for SessionRouter {
         if let Some(turn) = &turn {
             turn.wait().await;
         }
-        let _input = if agent_input {
+        let _input = if ordered_tool(&request.name) {
             Some(session.input_gate.clone().lock_owned().await)
         } else {
             None
