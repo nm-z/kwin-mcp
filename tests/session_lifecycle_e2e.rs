@@ -461,6 +461,38 @@ fn wait_for_viewer_windows(pid: u32, expected: usize) -> Vec<String> {
     }
 }
 
+fn wait_for_recent_viewer_input(path: &std::path::Path) -> SystemTime {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("viewer input activity timestamp");
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if modified > UNIX_EPOCH && age <= Duration::from_secs(1) {
+            return modified;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "viewer input did not update {} recently",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct OwnedChild(Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
 fn workdir(response: &Value) -> PathBuf {
     response["result"]["structuredContent"]["workdir"]
         .as_str()
@@ -1516,6 +1548,290 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
     );
     call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, viewer GPU, and a host Wayland session"]
+fn viewer_input_only_pauses_agent_input_for_the_recent_quiet_period() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let desktop_started = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":1024,"height":768}),
+    );
+    assert!(desktop_started["error"].is_null(), "{desktop_started}");
+    let desktop_id = desktop_started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("desktop session id");
+    let display = workdir(&desktop_started).join("wayland-0");
+    let display = display.to_str().expect("desktop Wayland socket").to_owned();
+
+    // Run the viewer as a real window on the outer KWin desktop. Input sent
+    // through the outer MCP session reaches that window as viewer input.
+    let mut client = RpcClient::start_with_env(&[("WAYLAND_DISPLAY", &display)]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert!(started["error"].is_null(), "{started}");
+    let session_id = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session id");
+    let session_dir = workdir(&started);
+    let opened = call_tool(
+        &mut client,
+        3,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["status"],
+        json!("opened"),
+        "{opened}"
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"],
+        json!("ready"),
+        "{opened}"
+    );
+
+    let viewer_window = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let listed = call_tool(
+                &mut desktop,
+                3,
+                "window_list",
+                json!({"session_id":desktop_id}),
+            );
+            assert!(listed["error"].is_null(), "{listed}");
+            let rows = listed["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("desktop windows");
+            if let Some(viewer) = rows.iter().find(|row| {
+                row["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with("kwin-viewer"))
+                    || row["resourceClass"]
+                        .as_str()
+                        .is_some_and(|class| class.contains("kwin-viewer"))
+            }) {
+                break viewer.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "viewer window did not appear: {rows:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let activated = call_tool(
+        &mut desktop,
+        4,
+        "window_activate",
+        json!({"session_id":desktop_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(activated["error"].is_null(), "{activated}");
+
+    thread::sleep(Duration::from_millis(1100));
+    let idle_input = call_tool(
+        &mut client,
+        4,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert!(idle_input["error"].is_null(), "{idle_input}");
+
+    let viewer_input = call_tool(
+        &mut desktop,
+        5,
+        "keyboard_key",
+        json!({"session_id":desktop_id,"key":"Escape"}),
+    );
+    assert!(viewer_input["error"].is_null(), "{viewer_input}");
+    let activity_path = session_dir.join("viewer-input-activity");
+    wait_for_recent_viewer_input(&activity_path);
+    let paused = call_tool(
+        &mut client,
+        5,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert_eq!(
+        paused["error"]["data"]["reason"],
+        json!("recent_viewer_input"),
+        "{paused}"
+    );
+    assert_eq!(
+        paused["error"]["data"]["retry_safe"],
+        json!(true),
+        "{paused}"
+    );
+
+    thread::sleep(Duration::from_millis(1100));
+    let resumed_input = call_tool(
+        &mut client,
+        6,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert!(resumed_input["error"].is_null(), "{resumed_input}");
+    let still_open = call_tool(
+        &mut client,
+        7,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        still_open["result"]["structuredContent"]["status"],
+        json!("already_open"),
+        "{still_open}"
+    );
+
+    let closed = call_tool(
+        &mut client,
+        8,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert!(closed["error"].is_null(), "{closed}");
+
+    // A remote --serve relay has no local viewer_child. Send the same key
+    // records --remote writes so the server sees activity through its actual
+    // relay input path rather than a test-written marker timestamp.
+    thread::sleep(Duration::from_millis(1100));
+    let quiet_input = call_tool(
+        &mut client,
+        9,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert!(quiet_input["error"].is_null(), "{quiet_input}");
+
+    let mut relay = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_kwin-viewer"))
+            .args(["--serve"])
+            .arg(&session_dir)
+            .args(["800", "600"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start remote viewer relay"),
+    );
+    let relay_pid = u64::from(relay.0.id());
+    let relay_status = session_dir.join("viewer-status.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&relay_status)
+            && let Ok(status) = serde_json::from_str::<Value>(&contents)
+            && status["pid"].as_u64() == Some(relay_pid)
+            && (status["state"] == "starting" || status["state"] == "ready")
+        {
+            break;
+        }
+        if let Some(status) = relay.0.try_wait().expect("check remote relay") {
+            panic!("remote relay exited before input: {status}");
+        }
+        assert!(Instant::now() < deadline, "remote relay did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let quiet_remote_input = call_tool(
+        &mut client,
+        10,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert!(
+        quiet_remote_input["error"].is_null(),
+        "{quiet_remote_input}"
+    );
+    let activity_before_remote_input = std::fs::metadata(&activity_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("activity timestamp before remote input");
+    let relay_stdin = relay.0.stdin.as_mut().expect("remote relay input");
+    for pressed in [1_u64, 0] {
+        let mut record = [0_u8; 17];
+        record[0] = 4; // Op::Key
+        record[1..9].copy_from_slice(&1_u64.to_le_bytes()); // Escape
+        record[9..17].copy_from_slice(&pressed.to_le_bytes());
+        relay_stdin
+            .write_all(&record)
+            .expect("send key through remote relay");
+    }
+    relay_stdin.flush().expect("flush remote relay input");
+    let remote_deadline = Instant::now() + Duration::from_secs(3);
+    let remote_activity = loop {
+        let modified = std::fs::metadata(&activity_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("remote viewer activity timestamp");
+        if modified > activity_before_remote_input {
+            break modified;
+        }
+        assert!(
+            Instant::now() < remote_deadline,
+            "remote relay did not update input activity"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        SystemTime::now()
+            .duration_since(remote_activity)
+            .unwrap_or_default()
+            <= Duration::from_secs(1),
+        "remote viewer activity was not recent"
+    );
+    let remote_paused = call_tool(
+        &mut client,
+        11,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert_eq!(
+        remote_paused["error"]["data"]["reason"],
+        json!("recent_viewer_input"),
+        "{remote_paused}"
+    );
+    assert_eq!(
+        remote_paused["error"]["data"]["retry_safe"],
+        json!(true),
+        "{remote_paused}"
+    );
+    thread::sleep(Duration::from_millis(1100));
+    let remote_resumed = call_tool(
+        &mut client,
+        12,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    assert!(remote_resumed["error"].is_null(), "{remote_resumed}");
+
+    drop(relay);
+    call_tool(
+        &mut client,
+        13,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    client.stop_process();
+    call_tool(
+        &mut desktop,
+        6,
+        "session_stop",
+        json!({"session_id":desktop_id}),
+    );
+    desktop.stop_process();
 }
 
 #[test]

@@ -91,6 +91,30 @@ fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
 /// Status file kwin-mcp reads to report the viewer outcome; the name is shared
 /// with src/main.rs.
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
+const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
+
+fn open_input_activity(session: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let path = session.join(VIEWER_INPUT_ACTIVITY_FILE);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+            )?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Atomically publish the viewer's lifecycle state: starting,
 /// ready (a frame is on the host window), closed, or failed.
@@ -737,6 +761,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         out: InputOut::Local {
             fake_input: link.fake_input.clone(),
             conn: link.conn.clone(),
+            activity: open_input_activity(&session_path)?,
         },
         last_pos: None,
         held_buttons: 0,
@@ -1075,6 +1100,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let input = InputOut::Local {
         fake_input: link.fake_input.clone(),
         conn: link.conn.clone(),
+        activity: open_input_activity(&session_path)?,
     };
 
     let presented=Arc::new(AtomicBool::new(false));
@@ -1272,6 +1298,7 @@ enum InputOut {
     Local {
         fake_input: OrgKdeKwinFakeInput,
         conn: Connection,
+        activity: std::fs::File,
     },
     Remote(Arc<Mutex<std::process::ChildStdin>>),
 }
@@ -1279,7 +1306,18 @@ enum InputOut {
 impl InputOut {
     fn send(&self, op: Op) {
         match self {
-            InputOut::Local { fake_input, conn } => {
+            InputOut::Local {
+                fake_input,
+                conn,
+                activity,
+            } => {
+                if !matches!(op, Op::Presented)
+                    && let Err(error) = activity.set_times(
+                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+                    )
+                {
+                    eprintln!("kwin-viewer: update input activity marker: {error}");
+                }
                 op.emit(fake_input);
                 let _ = conn.flush();
             }
