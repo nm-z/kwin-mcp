@@ -61,3 +61,7 @@ wildcard_imports = "deny"
 
 [lints.rust]
 dead_code = "deny"
+
+[[bin]]
+name = "kwin-mcp-deploy"
+path = "src/bin/kwin-mcp-deploy.rs"

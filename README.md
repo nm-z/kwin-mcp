@@ -325,3 +325,16 @@ Tab/Return actions do not expose an application-text receipt.
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+## Release packaging and deployment
+
+The shipped `kwin-mcp-deploy` CLI builds committed source on the least busy eligible
+sentry/archy host, stages checksummed release packages, and explicitly installs
+new release directories on engi, archy or benji. Engi builds require an explicit
+host override and always use nice 19; unreachable benji is skipped. No command
+activates a release or restarts services. Packages include optional OAuth gateway
+and Cloudflare tunnel user unit templates; the gateway executable and credentials
+are external prerequisites.
+
+See [deployment instructions](docs/deployment.md) for commands, private build and
+install paths, runtime compatibility requirements and unit configuration.
