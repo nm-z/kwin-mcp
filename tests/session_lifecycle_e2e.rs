@@ -499,6 +499,15 @@ fn workdir(response: &Value) -> PathBuf {
         .unwrap_or_else(|| panic!("session_start did not return a workdir: {response}"))
 }
 
+fn require_filtered_cookie_test_bus() {
+    let address = std::env::var("KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS")
+        .expect("cookie session checks require a filtered test D-Bus proxy");
+    assert!(
+        !address.contains("/run/user/1000/bus"),
+        "cookie session checks must not connect directly to the host user bus"
+    );
+}
+
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, input devices, and a live GPU session"]
 fn autoclean_sweeps_only_a_crashed_owned_session() {
@@ -1784,6 +1793,7 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
 fn browser_cookies_continue_across_sessions_without_host_writes() {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    require_filtered_cookie_test_bus();
     let mut client = RpcClient::start();
     let profile = client.home.join(".config/google-chrome/Profile 2");
     std::fs::create_dir_all(&profile).expect("profile directory");
@@ -1980,6 +1990,7 @@ fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
         }
     }
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    require_filtered_cookie_test_bus();
     let mut client = RpcClient::start();
     let relative = ".config/google-chrome/Profile 2/Cookies";
     let database = client.home.join(relative);
@@ -2112,6 +2123,7 @@ fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
 fn browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    require_filtered_cookie_test_bus();
     let mut client = RpcClient::start();
     let database = client.home.join(".config/google-chrome/Profile 2/Cookies");
     std::fs::create_dir_all(database.parent().expect("profile parent")).expect("profile");
