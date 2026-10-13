@@ -4895,6 +4895,15 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         file.seek(SeekFrom::End(-9)).expect("fixture tail position");
         file.write_all(b"host-tail").expect("fixture tail");
     }
+    let populated = home.join(".local/share/populated");
+    std::fs::create_dir_all(&populated).expect("populated HOME directory");
+    for index in 0..4096 {
+        std::fs::write(
+            populated.join(format!("entry-{index:04}.txt")),
+            format!("home-entry-{index}"),
+        )
+        .expect("populate HOME fixture");
+    }
     let quote =
         |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
     let home_text = home.display().to_string();
@@ -4919,70 +4928,40 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
             eprintln!("{line}");
         }
     }
+    let startup = started_at.elapsed();
     assert!(
-        started_at.elapsed() < Duration::from_secs(20),
+        startup < Duration::from_secs(20),
         "startup exceeded deadline: {started}"
     );
     let dir = workdir(&started);
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
-    let lower = disk.join("overlay-root");
-    assert!(lower.is_dir(), "mount-free lower tree was not staged");
-    for path in [&ordinary, &large] {
-        let staged = lower.join(path.strip_prefix(&home).expect("fixture under HOME"));
-        assert_ne!(
-            std::fs::metadata(path)
-                .expect("host fixture metadata")
-                .ino(),
-            std::fs::metadata(staged)
-                .expect("staged private inode")
-                .ino(),
-            "staging hard-linked a host file: {}",
-            path.display()
-        );
-    }
+    assert!(
+        !disk.join("overlay-root").exists(),
+        "nested-mount startup copied HOME into a staged lower tree"
+    );
     assert!(
         !disk.join("overlay-upper/project/ordinary.bin").exists(),
-        "eager ordinary copy"
+        "ordinary HOME file was copied up during startup"
     );
     assert!(
         !disk.join("overlay-upper/project/large.bin").exists(),
-        "eager oversized copy"
+        "large HOME file was copied up during startup"
+    );
+    assert!(
+        !disk
+            .join("overlay-upper/.local/share/populated/entry-0000.txt")
+            .exists(),
+        "populated HOME entry was copied up during startup"
     );
     let oversized = started["result"]["structuredContent"]["oversized_read_only_files"]
         .as_array()
         .expect("oversized_read_only_files");
-    let large_text = large.display().to_string();
-    let ordinary_text = ordinary.display().to_string();
     assert!(
-        oversized
-            .iter()
-            .all(|path| path.as_str() == Some(large_text.as_str())),
+        oversized.is_empty(),
         "unexpected read-only lower files: {oversized:?}"
     );
-    assert!(
-        !oversized
-            .iter()
-            .any(|path| path.as_str() == Some(ordinary_text.as_str())),
-        "ordinary file unexpectedly stayed read-only"
-    );
-    let large_write_check = if oversized
-        .iter()
-        .any(|path| path.as_str() == Some(large_text.as_str()))
-    {
-        format!(
-            "if printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none; then exit 1; fi\n",
-            quote(&large)
-        )
-    } else {
-        format!(
-            "printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none\n\
-             test \"$(head -c 9 {})\" = sessionxx\n",
-            quote(&large),
-            quote(&large)
-        )
-    };
     let overlay_counts: Vec<_> = child_named_processes(client.child.id(), "bwrap")
         .into_iter()
         .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
@@ -4998,29 +4977,35 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         overlay_counts.iter().all(|count| *count == 1),
         "multiple overlay mounts in a bwrap command: {overlay_counts:?}"
     );
-    let report = dir.join("ancestor-check.txt");
-    let script = dir.join("ancestor-check.sh");
+    let report = dir.join("live-home-check.txt");
+    let script = dir.join("live-home-check.sh");
     std::fs::write(
         &script,
         format!(
-            "set -eu\n\
-         test \"$(cat {})\" = mounted-data\n\
-         for path in {} {}; do\n\
-           test \"$(head -c 9 \"$path\")\" = host-data\n\
-           test \"$(tail -c 9 \"$path\")\" = host-tail\n\
-         done\n\
-         for path in {}; do\n\
-           printf sessionxx | dd of=\"$path\" bs=9 count=1 conv=notrunc status=none\n\
-           test \"$(head -c 9 \"$path\")\" = sessionxx\n\
-         done\n\
-         {}\n\
-         if printf forbidden > {}; then exit 1; fi\n\
-         printf 'ANCESTOR_COPY_PASS\\n' | tee {}\n",
+            r#"set -eu
+test "$(cat {})" = mounted-data
+test "$(find {} -type f | wc -l)" -eq 4096
+test "$(cat {})" = home-entry-0
+test "$(cat {})" = home-entry-2048
+for path in {} {}; do
+  test "$(head -c 9 "$path")" = host-data
+  test "$(tail -c 9 "$path")" = host-tail
+done
+for path in {} {}; do
+  printf sessionxx | dd of="$path" bs=9 count=1 conv=notrunc status=none
+  test "$(head -c 9 "$path")" = sessionxx
+done
+if printf forbidden > {}; then exit 1; fi
+printf 'LIVE_HOME_LOWER_PASS\n' | tee {}
+"#,
             quote(&home.join("project/portal/visible.txt")),
+            quote(&populated),
+            quote(&populated.join("entry-0000.txt")),
+            quote(&populated.join("entry-2048.txt")),
             quote(&ordinary),
             quote(&large),
             quote(&ordinary),
-            large_write_check,
+            quote(&large),
             quote(&home.join("project/portal/visible.txt")),
             quote(&report)
         ),
@@ -5036,7 +5021,7 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
     );
     assert!(launched["error"].is_null(), "{launched}");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n") {
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("LIVE_HOME_LOWER_PASS\n") {
         assert!(
             Instant::now() < deadline,
             "session file checks did not pass: {launched}"
@@ -5071,6 +5056,10 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
             "host file changed: {}",
             path.display()
         );
+        file.seek(SeekFrom::End(-9)).expect("host tail position");
+        let mut tail = [0; 9];
+        file.read_exact(&mut tail).expect("host tail");
+        assert_eq!(&tail, b"host-tail", "host tail changed: {}", path.display());
         assert_eq!(
             file.metadata().expect("host metadata").nlink(),
             1,
@@ -5082,7 +5071,8 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
     println!(
-        "PASS: one HOME overlay, read-only nested mount, reflink/copy staging, oversized fallback, rendered output, host files unchanged, cleanup"
+        "PASS: live HOME lower with 4096 populated files, read-only nested mount, visible bytes, copy-on-write, one overlay, session_start={}ms, rendered output, host files unchanged, cleanup",
+        startup.as_millis()
     );
 }
 

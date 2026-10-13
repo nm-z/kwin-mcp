@@ -3278,7 +3278,7 @@ const VIRTUAL_KEYBOARD_SYSNAME: &str = "kwin_mcp_keyboard";
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
-const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const HOME_LOWER_ALIAS: &str = "/run/kwin-mcp-home-lower";
 
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
@@ -3322,7 +3322,7 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
-    staging_root: Option<PathBuf>,
+    lower_alias: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
@@ -3367,17 +3367,31 @@ impl OverlayPlan {
 
     fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
-        if let Some(staging_root) = &self.staging_root {
-            command.arg("--bind").arg(staging_root).arg(target);
+        if let Some(lower_alias) = &self.lower_alias {
+            command
+                .arg("--dir")
+                .arg(lower_alias)
+                .arg("--ro-bind")
+                .arg(target)
+                .arg(lower_alias);
+            // If overlay storage lives beneath HOME, hide it from the lower
+            // alias so the lower tree cannot expose the storage back into itself.
+            let disk_root = session_disk_root();
+            if let Ok(relative) = disk_root.strip_prefix(target) {
+                command.arg("--tmpfs").arg(lower_alias.join(relative));
+            }
         }
         // The plan is made seconds before bwrap runs. HOME entries that vanished
         // since (lock directories such as ~/.claude.json.lock) would make bwrap
-        // fail, so skip them; their staging stub stays an empty directory.
-        for overlay in self
-            .overlays
-            .iter()
-            .filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok())
-        {
+        // fail, so skip the overlay when its host lower path has vanished.
+        for overlay in self.overlays.iter().filter(|overlay| {
+            let lower = if self.lower_alias.as_ref() == Some(&overlay.lower) {
+                &overlay.destination
+            } else {
+                &overlay.lower
+            };
+            std::fs::symlink_metadata(lower).is_ok()
+        }) {
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -3387,7 +3401,12 @@ impl OverlayPlan {
                 .arg(&overlay.destination);
         }
         for path in &self.read_only_binds {
-            command.arg("--ro-bind-try").arg(path).arg(path);
+            let source = self
+                .lower_alias
+                .as_ref()
+                .and_then(|alias| path.strip_prefix(target).ok().map(|path| alias.join(path)))
+                .unwrap_or_else(|| path.clone());
+            command.arg("--ro-bind-try").arg(source).arg(path);
         }
         for path in &self.empty_dirs {
             command.arg("--tmpfs").arg(path);
@@ -3580,10 +3599,7 @@ impl OverlayPlan {
                 if let Some(overlay) = mount {
                     overlay.upper.join(path.strip_prefix(&overlay.destination)?)
                 } else {
-                    self.staging_root
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?
-                        .join(path.strip_prefix(target)?)
+                    anyhow::bail!("no overlay for {}", path.display())
                 }
             } else {
                 destination
@@ -3675,209 +3691,18 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
     })
 }
 
-fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let source_file = std::fs::File::open(source)?;
-    let destination_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    // SAFETY: both descriptors remain open for the FICLONE ioctl, which reads
-    // from source_file and initializes destination_file as a copy-on-write clone.
-    if unsafe {
-        nix::libc::ioctl(
-            destination_file.as_raw_fd(),
-            nix::libc::FICLONE,
-            source_file.as_raw_fd(),
-        )
-    } == -1
-    {
-        let error = std::io::Error::last_os_error();
-        drop(destination_file);
-        let _ = std::fs::remove_file(destination);
-        return Err(error);
-    }
-    destination_file.set_permissions(source_file.metadata()?.permissions())
-}
-
-fn create_staging_stub(destination: &Path, file_type: std::fs::FileType) -> anyhow::Result<()> {
-    if file_type.is_dir() {
-        std::fs::create_dir_all(destination)?;
-    } else if file_type.is_file() {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(destination)?;
-    }
-    Ok(())
-}
-
-fn is_live_database_file(target: &Path, source: &Path, live_databases: &[PathBuf]) -> bool {
-    live_databases.iter().any(|database| {
-        if browser_cookie_database(target, database) {
-            return false;
-        }
-        source == database
-            || ["-wal", "-shm"].iter().any(|suffix| {
-                database.file_name().is_some_and(|name| {
-                    source == database.with_file_name(format!("{}{suffix}", name.to_string_lossy()))
-                })
-            })
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stage_home_entry(
-    source: &Path,
-    destination: &Path,
-    file_type: std::fs::FileType,
-    target: &Path,
-    disk_root: Option<&Path>,
-    mounts: &std::collections::HashSet<PathBuf>,
-    live_databases: &[PathBuf],
-    read_only_binds: &mut Vec<PathBuf>,
-    oversized_read_only_files: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    if disk_root.is_some_and(|disk_root| source == disk_root) {
-        create_staging_stub(destination, file_type)?;
-        return Ok(());
-    }
-    if mounts.contains(source) {
-        // Do not stat or descend into a mount while building the lower tree. A
-        // FUSE or network mount may block here; bwrap binds it back read-only
-        // after the single HOME overlay has been mounted.
-        create_staging_stub(destination, file_type)?;
-        read_only_binds.push(source.to_path_buf());
-        return Ok(());
-    }
-    if std::fs::symlink_metadata(destination).is_ok() {
-        return Ok(());
-    }
-    if file_type.is_dir() {
-        std::fs::create_dir_all(destination)?;
-        let entries = match std::fs::read_dir(source) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                read_only_binds.push(source.to_path_buf());
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut entries: Vec<_> = entries.collect::<Result<_, _>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let child = entry.path();
-            let staged = destination.join(entry.file_name());
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            stage_home_entry(
-                &child,
-                &staged,
-                kind,
-                target,
-                disk_root,
-                mounts,
-                live_databases,
-                read_only_binds,
-                oversized_read_only_files,
-            )?;
-        }
-        if let Ok(metadata) = std::fs::metadata(source) {
-            std::fs::set_permissions(destination, metadata.permissions())?;
-        }
-        return Ok(());
-    }
-    if file_type.is_symlink() {
-        match std::fs::read_link(source) {
-            Ok(link) => std::os::unix::fs::symlink(link, destination)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        return Ok(());
-    }
-    if file_type.is_file() {
-        if is_live_database_file(target, source, live_databases) {
-            return Ok(());
-        }
-        let size = match std::fs::metadata(source) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        if clone_staging_file(source, destination).is_ok() {
-            return Ok(());
-        }
-        if size > STAGING_COPY_MAX_BYTES {
-            create_staging_stub(destination, file_type)?;
-            eprintln!(
-                "session_start: oversized file {} ({size} bytes) stays read-only; reflink is unavailable",
-                source.display()
-            );
-            read_only_binds.push(source.to_path_buf());
-            oversized_read_only_files.push(source.to_path_buf());
-            return Ok(());
-        }
-        match std::fs::copy(source, destination) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let _ = std::fs::remove_file(destination);
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                let _ = std::fs::remove_file(destination);
-                create_staging_stub(destination, file_type)?;
-                read_only_binds.push(source.to_path_buf());
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        }
-        return Ok(());
-    }
-    read_only_binds.push(source.to_path_buf());
-    Ok(())
-}
-
 fn prepare_overlay_plan(
     target: &Path,
     session_tmp: &Path,
     mounts: &[procfs::process::MountInfo],
-    live_databases: &[PathBuf],
 ) -> anyhow::Result<OverlayPlan> {
     let upper = session_tmp.join("overlay-upper");
     let work = session_tmp.join("overlay-work");
     std::fs::create_dir_all(&upper)?;
     std::fs::create_dir_all(&work)?;
     let mut read_only_binds = mount_descendants(mounts, target);
-    let mut oversized_read_only_files = Vec::new();
-    let staging_root = if read_only_binds.is_empty() {
-        None
-    } else {
-        let staging_root = session_tmp.join("overlay-root");
-        let hidden_disk_root = session_disk_root();
-        let hidden_disk_root = hidden_disk_root
-            .starts_with(target)
-            .then_some(hidden_disk_root);
-        let mountpoints: std::collections::HashSet<_> = read_only_binds.iter().cloned().collect();
-        let root_type = std::fs::metadata(target)?.file_type();
-        stage_home_entry(
-            target,
-            &staging_root,
-            root_type,
-            target,
-            hidden_disk_root.as_deref(),
-            &mountpoints,
-            live_databases,
-            &mut read_only_binds,
-            &mut oversized_read_only_files,
-        )?;
-        Some(staging_root)
-    };
-    let lower = staging_root
+    let lower_alias = (!read_only_binds.is_empty()).then(|| PathBuf::from(HOME_LOWER_ALIAS));
+    let lower = lower_alias
         .as_ref()
         .cloned()
         .unwrap_or_else(|| target.to_path_buf());
@@ -3889,7 +3714,7 @@ fn prepare_overlay_plan(
     });
     read_only_binds.dedup();
     Ok(OverlayPlan {
-        staging_root,
+        lower_alias,
         overlays: vec![OverlayMount {
             lower,
             upper,
@@ -3904,7 +3729,7 @@ fn prepare_overlay_plan(
         socket_links: SocketLinks::default(),
         host_runtime: None,
         empty_dirs: Vec::new(),
-        oversized_read_only_files,
+        oversized_read_only_files: Vec::new(),
     })
 }
 
@@ -3966,10 +3791,10 @@ fn bind_live_sqlite(
         let upper = if plan.upper_path(database).is_some() {
             upper_file(plan, database)?
         } else {
-            plan.staging_root
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no private layer for live database"))?
-                .join(database.strip_prefix(target)?)
+            anyhow::bail!(
+                "no writable overlay for live database {}",
+                database.display()
+            )
         };
         std::os::unix::fs::symlink(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
@@ -4327,9 +4152,8 @@ fn prepare_host_view(
     service.set_start_stage("scanning host sockets and processes");
     let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
-    let mut overlay_plan =
-        prepare_overlay_plan(target, &disk, &mount_inventory, &inventory.live_databases)
-            .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
+    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory)
+        .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
     // sees an empty directory there instead.
     let disk_root = session_disk_root();
@@ -4345,8 +4169,8 @@ fn prepare_host_view(
 
     eprintln!(
         "session_start: overlay plan={} overlays={} read-only-mounts={}",
-        if overlay_plan.staging_root.is_some() {
-            "staged"
+        if overlay_plan.lower_alias.is_some() {
+            "live-alias"
         } else {
             "whole"
         },
@@ -5284,8 +5108,7 @@ fn session_disk_root() -> std::path::PathBuf {
         .join("kwin-mcp")
 }
 
-/// The disk-backed twin of a session workdir: its overlay upper, work and
-/// staging layers.
+/// The disk-backed twin of a session workdir: its overlay upper and work dirs.
 fn session_disk_path(workdir: &Path) -> std::path::PathBuf {
     session_disk_root().join(workdir.file_name().unwrap_or_default())
 }
