@@ -4262,6 +4262,16 @@ fn discovery_creates_no_session_processes() {
     let tools = listed["result"]["tools"].as_array().expect("tools");
     assert!(tools.iter().any(|tool| tool["name"] == "session_start"));
     assert!(tools.iter().any(|tool| tool["name"] == "session_list"));
+    let session_start = tools
+        .iter()
+        .find(|tool| tool["name"] == "session_start")
+        .expect("session_start tool");
+    assert!(
+        session_start["inputSchema"]["properties"]
+            .get("writable_paths")
+            .is_none(),
+        "removed writable_paths remains in the session_start schema"
+    );
     for tool in tools
         .iter()
         .filter(|tool| tool["name"] != "session_list" && tool["name"] != "session_start")
@@ -4332,6 +4342,20 @@ fn discovery_creates_no_session_processes() {
             "{method} failed"
         );
     }
+    let rejected = call_tool(
+        &mut client,
+        9,
+        "session_start",
+        json!({"writable_paths":["/tmp/ignored"]}),
+    );
+    assert!(
+        !rejected["error"].is_null() || rejected["result"]["isError"] == true,
+        "removed writable_paths was silently accepted: {rejected}"
+    );
+    assert!(
+        direct_children(client.child.id()).is_empty(),
+        "invalid session_start parameters launched a child"
+    );
     thread::sleep(Duration::from_secs(4));
     assert!(
         direct_children(client.child.id()).is_empty(),
@@ -4585,6 +4609,16 @@ fn child_compositor(server: u32) -> i32 {
 }
 
 fn child_named_process(server: u32, name: &str) -> i32 {
+    let owned = child_named_processes(server, name);
+    assert_eq!(
+        owned.len(),
+        1,
+        "expected one {name} below server {server}: {owned:?}"
+    );
+    owned[0]
+}
+
+fn child_named_processes(server: u32, name: &str) -> Vec<i32> {
     let server = i32::try_from(server).expect("server pid");
     let stats: Vec<_> = procfs::process::all_processes()
         .expect("process inventory")
@@ -4612,12 +4646,7 @@ fn child_named_process(server: u32, name: &str) -> i32 {
         })
         .map(|stat| stat.pid)
         .collect();
-    assert_eq!(
-        owned.len(),
-        1,
-        "expected one {name} below server {server}: {owned:?}"
-    );
-    owned[0]
+    owned
 }
 
 struct ResumeProcess(nix::unistd::Pid);
@@ -4858,13 +4887,8 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
     }
     let ordinary = home.join("project/ordinary.bin");
     let large = home.join("project/large.bin");
-    let explicit = home.join("project/explicit.bin");
     let threshold = 64 * 1024 * 1024;
-    for (path, length) in [
-        (&ordinary, threshold),
-        (&large, threshold + 1),
-        (&explicit, threshold + 1),
-    ] {
+    for (path, length) in [(&ordinary, threshold), (&large, threshold + 1)] {
         let mut file = std::fs::File::create(path).expect("fixture file");
         file.set_len(length).expect("sparse fixture size");
         file.write_all(b"host-data").expect("fixture header");
@@ -4888,9 +4912,7 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         &mut client,
         2,
         "session_start",
-        json!({
-            "width":800, "height":600, "writable_paths":[explicit]
-        }),
+        json!({"width":800, "height":600}),
     );
     if !started["error"].is_null() {
         for line in client.stderr.try_iter() {
@@ -4905,10 +4927,21 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
-    assert!(
-        !disk.join("overlay-root").exists(),
-        "split staging was created"
-    );
+    let lower = disk.join("overlay-root");
+    assert!(lower.is_dir(), "mount-free lower tree was not staged");
+    for path in [&ordinary, &large] {
+        let staged = lower.join(path.strip_prefix(&home).expect("fixture under HOME"));
+        assert_ne!(
+            std::fs::metadata(path)
+                .expect("host fixture metadata")
+                .ino(),
+            std::fs::metadata(staged)
+                .expect("staged private inode")
+                .ino(),
+            "staging hard-linked a host file: {}",
+            path.display()
+        );
+    }
     assert!(
         !disk.join("overlay-upper/project/ordinary.bin").exists(),
         "eager ordinary copy"
@@ -4917,18 +4950,53 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         !disk.join("overlay-upper/project/large.bin").exists(),
         "eager oversized copy"
     );
-    assert_eq!(
-        started["result"]["structuredContent"]["oversized_read_only_files"],
-        json!([])
+    let oversized = started["result"]["structuredContent"]["oversized_read_only_files"]
+        .as_array()
+        .expect("oversized_read_only_files");
+    let large_text = large.display().to_string();
+    let ordinary_text = ordinary.display().to_string();
+    assert!(
+        oversized
+            .iter()
+            .all(|path| path.as_str() == Some(large_text.as_str())),
+        "unexpected read-only lower files: {oversized:?}"
     );
-    let bwrap = child_named_process(client.child.id(), "bwrap");
-    let argv = std::fs::read(format!("/proc/{bwrap}/cmdline")).expect("bwrap argv");
-    assert_eq!(
-        argv.split(|byte| *byte == 0)
-            .filter(|arg| *arg == b"--overlay")
-            .count(),
-        1,
-        "multiple overlays"
+    assert!(
+        !oversized
+            .iter()
+            .any(|path| path.as_str() == Some(ordinary_text.as_str())),
+        "ordinary file unexpectedly stayed read-only"
+    );
+    let large_write_check = if oversized
+        .iter()
+        .any(|path| path.as_str() == Some(large_text.as_str()))
+    {
+        format!(
+            "if printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none; then exit 1; fi\n",
+            quote(&large)
+        )
+    } else {
+        format!(
+            "printf sessionxx | dd of={} bs=9 count=1 conv=notrunc status=none\n\
+             test \"$(head -c 9 {})\" = sessionxx\n",
+            quote(&large),
+            quote(&large)
+        )
+    };
+    let overlay_counts: Vec<_> = child_named_processes(client.child.id(), "bwrap")
+        .into_iter()
+        .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .map(|argv| {
+            argv.split(|byte| *byte == 0)
+                .filter(|arg| *arg == b"--overlay")
+                .count()
+        })
+        .filter(|count| *count > 0)
+        .collect();
+    assert!(!overlay_counts.is_empty(), "missing overlay bwrap command");
+    assert!(
+        overlay_counts.iter().all(|count| *count == 1),
+        "multiple overlay mounts in a bwrap command: {overlay_counts:?}"
     );
     let report = dir.join("ancestor-check.txt");
     let script = dir.join("ancestor-check.sh");
@@ -4937,23 +5005,22 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         format!(
             "set -eu\n\
          test \"$(cat {})\" = mounted-data\n\
-         for path in {} {} {}; do\n\
+         for path in {} {}; do\n\
            test \"$(head -c 9 \"$path\")\" = host-data\n\
            test \"$(tail -c 9 \"$path\")\" = host-tail\n\
          done\n\
-         for path in {} {} {}; do\n\
+         for path in {}; do\n\
            printf sessionxx | dd of=\"$path\" bs=9 count=1 conv=notrunc status=none\n\
            test \"$(head -c 9 \"$path\")\" = sessionxx\n\
          done\n\
-         if printf forbidden > {} 2>/dev/null; then exit 1; fi\n\
+         {}\n\
+         if printf forbidden > {}; then exit 1; fi\n\
          printf 'ANCESTOR_COPY_PASS\\n' | tee {}\n",
             quote(&home.join("project/portal/visible.txt")),
             quote(&ordinary),
             quote(&large),
-            quote(&explicit),
             quote(&ordinary),
-            quote(&large),
-            quote(&explicit),
+            large_write_check,
             quote(&home.join("project/portal/visible.txt")),
             quote(&report)
         ),
@@ -4994,7 +5061,7 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         )
         .expect("retain start response");
     }
-    for path in [&ordinary, &large, &explicit] {
+    for path in [&ordinary, &large] {
         let mut file = std::fs::File::open(path).expect("host fixture");
         let mut header = [0; 9];
         file.read_exact(&mut header).expect("host header");
@@ -5015,7 +5082,7 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
     println!(
-        "PASS: one HOME overlay, read-only nested mount, no eager ancestor copies, all ordinary files privately writable, rendered output, host files unchanged, cleanup"
+        "PASS: one HOME overlay, read-only nested mount, reflink/copy staging, oversized fallback, rendered output, host files unchanged, cleanup"
     );
 }
 

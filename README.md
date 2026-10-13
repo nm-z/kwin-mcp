@@ -107,12 +107,13 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
-HOME uses one disk-backed overlay, including when it contains nested host
-mounts. The nested mounts are bound read-only over their locations in that
-overlay. Ordinary files remain privately writable without eager ancestor-file
-copies or a separate overlay for each directory. `writable_paths` is accepted
-for compatibility; it no longer requests startup copies and does not make
-nested host mounts writable. `oversized_read_only_files` is empty for new sessions.
+HOME uses one disk-backed overlay. If nested host mounts exist below HOME,
+startup stages a mount-free lower tree and binds those mounts read-only over the
+overlay. Files are reflinked when supported; small files are copied when
+reflinking is unavailable, while large files that cannot be cloned remain
+read-only and appear in `oversized_read_only_files`.
+The staged tree records HOME's directory entries at startup, so host-side
+renames and new files may require a new session to become visible.
 
 Default startup creates no uinput devices and starts no private PipeWire or
 WirePlumber processes. Input uses KWin's EIS connection. The D-Bus input settings
