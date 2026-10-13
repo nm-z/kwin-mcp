@@ -342,13 +342,17 @@ fn stage_private_cookie_jar(source: &Path, directory: &Path) -> Result<PathBuf> 
     Ok(staged)
 }
 
-pub fn state_root() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("kwin-mcp/browser-cookies")
+pub fn state_root() -> Result<PathBuf> {
+    let state_home = match std::env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .context("HOME must be set when XDG_STATE_HOME is unset")?;
+            PathBuf::from(home).join(".local/state")
+        }
+    };
+    Ok(state_home.join("kwin-mcp/browser-cookies"))
 }
 
 fn quote(name: &str) -> String {
@@ -606,7 +610,7 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
     if jars.is_empty() {
         return Ok(());
     }
-    let root = state_root();
+    let root = state_root()?;
     std::fs::create_dir_all(&root)?;
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
     let lock = std::fs::OpenOptions::new()

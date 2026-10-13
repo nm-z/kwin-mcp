@@ -4137,7 +4137,7 @@ fn prepare_browser_cookies(
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(baseline_root)?;
     std::fs::set_permissions(baseline_root, std::fs::Permissions::from_mode(0o700))?;
-    let state = kwin_mcp::browser_cookies::state_root();
+    let state = kwin_mcp::browser_cookies::state_root()?;
     if state.starts_with(target) {
         plan.empty_dirs.push(state.clone());
     }
