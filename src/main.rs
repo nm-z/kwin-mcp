@@ -4187,10 +4187,12 @@ fn prepare_browser_cookies(
                     // A saved jar is a safe fallback; without one, fail startup
                     // rather than let the browser open an incoherent profile.
                     if previous.is_file() {
-                        eprintln!(
-                            "session_start: using saved cookies for {}: {error:#}",
+                        let message = format!(
+                            "{}: host cookie snapshot failed; using saved cookies instead: {error:#}",
                             database.display()
                         );
+                        eprintln!("session_start: {message}");
+                        cookie_errors.push(message);
                         kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
                     } else {
                         return Err(
@@ -5786,22 +5788,31 @@ async fn teardown_blocking(mut sess: Session) -> Vec<String> {
     let cdp_close_attempted = request_cdp_browser_close(&sess).await;
     let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
     let sandbox_pid = sess.sandbox_child.id();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
+    let mut cookie_errors = match tokio::task::spawn_blocking(move || {
         close_session_browsers(sandbox_pid, graceful_close_attempted)
     })
     .await
     {
-        eprintln!("teardown: browser shutdown worker failed: {error}");
-    }
+        Ok(errors) => errors,
+        Err(error) => {
+            let message = format!("browser shutdown worker failed: {error}");
+            eprintln!("teardown: {message}");
+            vec![message]
+        }
+    };
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
     match tokio::task::spawn_blocking(move || teardown(sess)).await {
-        Ok(cookie_errors) => cookie_errors,
+        Ok(mut teardown_errors) => {
+            cookie_errors.append(&mut teardown_errors);
+            cookie_errors
+        }
         Err(error) => {
             let message = format!("session cleanup worker failed: {error}");
             eprintln!("teardown: {message}");
-            vec![message]
+            cookie_errors.push(message);
+            cookie_errors
         }
     }
 }
@@ -5889,16 +5900,18 @@ async fn request_cdp_browser_close(sess: &Session) -> bool {
 /// Ask Chromium to close through CDP first, then signal only browser parents
 /// descended from this sandbox if any remain. The session's network services,
 /// compositor, and wallet stay alive until its cookie flush has completed.
-fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
+fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) -> Vec<String> {
     let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
-        eprintln!("teardown: sandbox PID does not fit the process ID type");
-        return;
+        let message = "sandbox PID does not fit the process ID type".to_owned();
+        eprintln!("teardown: {message}");
+        return vec![message];
     };
     let processes = match procfs::process::all_processes() {
         Ok(processes) => processes,
         Err(error) => {
-            eprintln!("teardown: cannot enumerate processes for browser shutdown: {error}");
-            return;
+            let message = format!("cannot enumerate processes for browser shutdown: {error}");
+            eprintln!("teardown: {message}");
+            return vec![message];
         }
     };
     let processes = processes
@@ -5997,6 +6010,7 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
     }
     let requested = browsers.len();
     let main_count = main_pids.len();
+    let mut cookie_errors = Vec::new();
     eprintln!(
         "teardown: graceful browser shutdown candidates={requested} mains={main_count} graceful_close_attempted={graceful_close_attempted}"
     );
@@ -6017,7 +6031,7 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
         if requested > 0 || graceful_close_attempted {
             eprintln!("teardown: graceful browser shutdown completed");
         }
-        return;
+        return cookie_errors;
     }
     for (process, started) in &browsers {
         if !main_pids.contains(&process.pid) {
@@ -6048,11 +6062,13 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!(
-                "teardown: {} browser(s) did not finish cookie flush within {:?}",
+            let message = format!(
+                "{} browser(s) did not finish cookie flush within {:?}",
                 browsers.len(),
                 BROWSER_SHUTDOWN_GRACE
             );
+            eprintln!("teardown: {message}");
+            cookie_errors.push(message);
             break;
         }
         std::thread::sleep(BROWSER_SHUTDOWN_POLL);
@@ -6060,6 +6076,7 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) {
     if browsers.is_empty() && (requested > 0 || graceful_close_attempted) {
         eprintln!("teardown: graceful browser shutdown completed");
     }
+    cookie_errors
 }
 
 fn teardown(mut sess: Session) -> Vec<String> {

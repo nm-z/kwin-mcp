@@ -243,10 +243,15 @@ Cookies keep their existing encryption and require the copied host wallet key.
 Host cookie snapshots read only the database and WAL files, verify two identical
 observations, and check the resulting private SQLite copy. The host database and
 WAL together must fit within 64 MiB. If the files keep changing during the bounded
-copy attempts, an active rollback journal remains, or the saved schema differs,
-kwin-mcp reports that cookie continuity is unavailable for that profile in stderr.
-Remove the profile's saved database from this directory to discard its session
-cookie history. This does not sign out the host browser.
+copy attempts, an active rollback journal remains, a host snapshot fails while a
+saved jar is available, or the saved schema differs, kwin-mcp reports the cookie
+problem in `session_start`'s `cookie_errors` when startup can continue. If a saved
+jar has an incompatible schema, `session_start` uses the host snapshot; at
+`session_stop`, kwin-mcp replaces the incompatible saved jar with the session
+jar. Browser flush timeouts and cookie save failures are returned in
+`session_stop`'s `cookie_errors`; a browser process enumeration failure is
+reported there as well. Remove the profile's saved database from this directory
+to discard its session cookie history. This does not sign out the host browser.
 
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
