@@ -58,6 +58,31 @@ target/release/kwin-mcp-strict --allow-host-gui --
 
 This guards against accidental host GUI control; it is not a security sandbox for hostile code that deliberately reconstructs host socket paths. See the official [Codex MCP configuration](https://developers.openai.com/codex/mcp) and [CLI configuration overrides](https://developers.openai.com/codex/config-advanced) documentation for the underlying settings.
 
+## Host window inventory and exact activation
+
+`window_list` and `window_activate` operate only on this server's isolated KWin session. They cannot inspect or activate windows on the host desktop. When a task explicitly concerns an existing host window, use [kdotool](https://github.com/jinliu/kdotool) from a shell attached to that user's KDE Plasma 6 session. It uses KWin's scripting interface over the session D-Bus; it is a separate host utility and is not installed by kwin-mcp.
+
+List every host window with its KWin ID, process ID, class, title, and geometry:
+
+```bash
+for id in $(kdotool search --id '.*'); do
+  printf '\nID: %s\nPID: %s\nClass: %s\nTitle: %s\nGeometry:\n%s\n' \
+    "$id" \
+    "$(kdotool getwindowpid "$id")" \
+    "$(kdotool getwindowclassname "$id")" \
+    "$(kdotool getwindowname "$id")" \
+    "$(kdotool getwindowgeometry "$id")"
+done
+```
+
+The unfiltered search includes windows that are not currently visible, and the returned UUIDs are KWin window IDs, not X11 IDs. Process IDs are best-effort because some applications do not publish them. After matching the title/class/process information, pass the exact UUID from that inventory to activate one window:
+
+```bash
+kdotool windowactivate '{window-uuid}'
+```
+
+Activation switches to the window's virtual desktop when needed. Run these commands only when the requested task is about the host desktop: they query and activate real host windows. They require an installed kdotool and access to the active Plasma 6 session bus. See the [kdotool command reference](https://github.com/jinliu/kdotool/blob/master/README.md) and [KWin scripting API](https://develop.kde.org/docs/plasma/kwin/api/).
+
 ## Codex plugin
 
 The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Configure the MCP server separately; the plugin does not install a binary or declare an endpoint.
