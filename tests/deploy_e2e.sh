@@ -10,6 +10,7 @@ run=$(mktemp -d "$proof/deploy-e2e-XXXXXX")
 printf 'evidence=%s\n' "$run"
 transport_log="$run/transport.log"
 no_remote="$run/no-remote"
+real_sha256sum=$(command -v sha256sum)
 mkdir "$no_remote"
 for transport in ssh scp; do
   cat > "$no_remote/$transport" <<'SH'
@@ -19,7 +20,16 @@ exit 70
 SH
   chmod +x "$no_remote/$transport"
 done
+cat > "$no_remote/sha256sum" <<'SH'
+#!/bin/bash
+case $(pwd -P) in
+  *.incoming-*) sleep 1 ;;
+esac
+exec "$KWIN_MCP_DEPLOY_REAL_SHA256SUM" "$@"
+SH
+chmod +x "$no_remote/sha256sum"
 export KWIN_MCP_DEPLOY_TRANSPORT_LOG="$transport_log"
+export KWIN_MCP_DEPLOY_REAL_SHA256SUM="$real_sha256sum"
 export PATH="$no_remote:$PATH"
 expect_failure() {
   local label=$1
@@ -49,16 +59,24 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=5 benji true > "$run/benji-probe.log
   rg -q 'benji unreachable; skipped' "$run/benji-skip.log"
 fi
 : > "$transport_log"
-KWIN_MCP_DEPLOY_BUILD_HOSTS='engi archy' \
-KWIN_MCP_DEPLOY_BUILD_ROOT="$run/build-root" \
-CARGO_BUILD_JOBS=1 \
-  "$cli" build "$source_root" "$run/local-build-package" > "$run/local-build.log" 2>&1
-rg -q 'builder=engi mode=local' "$run/local-build.log"
-if rg -q 'engi' "$transport_log"; then
-  printf 'Local engi build invoked SSH/SCP: %s\n' "$transport_log" >&2
-  exit 1
+# Reuse an earlier local build package to run the remaining checks quickly.
+local_build_result=PASS
+if [[ -n ${KWIN_MCP_DEPLOY_LOCAL_BUILD_PACKAGE:-} ]]; then
+  cp -a -- "$KWIN_MCP_DEPLOY_LOCAL_BUILD_PACKAGE" "$run/local-build-package"
+  local_build_result=REUSED
+else
+  KWIN_MCP_DEPLOY_BUILD_HOSTS='engi archy' \
+  KWIN_MCP_DEPLOY_BUILD_ROOT="$run/build-root" \
+  CARGO_BUILD_JOBS=1 \
+    "$cli" build "$source_root" "$run/local-build-package" > "$run/local-build.log" 2>&1
+  rg -q 'builder=engi mode=local' "$run/local-build.log"
+  if rg -q 'engi' "$transport_log"; then
+    printf 'Local engi build invoked SSH/SCP: %s\n' "$transport_log" >&2
+    exit 1
+  fi
 fi
 [[ -x "$run/local-build-package/bin/kwin-mcp" ]]
+rg -q '^builder=engi$' "$run/local-build-package/release.txt"
 : > "$transport_log"
 "$cli" install "$run/local-build-package" engi "$run/local-build-install" > "$run/local-build-install.log" 2>&1
 (cd "$run/local-build-install" && sha256sum -c SHA256SUMS) > "$run/local-build-install-checksums.log"
@@ -86,7 +104,6 @@ expect_failure corrupted-package "$cli" install "$run/package" engi "$run/corrup
 cmp "$run/old-before.txt" "$run/old-after.txt"
 [[ -z $(find "$run" -maxdepth 1 -name '*.incoming-*' -print -quit) ]]
 # Occupy the final path after local staging begins; install must preserve it and clean its stage.
-cp "$artifacts/kwin-mcp" "$run/package/bin/kwin-mcp"
 (
   for attempt in {1..2000}; do
     if compgen -G "$run/raced-release.incoming-*" > /dev/null; then
@@ -99,7 +116,7 @@ cp "$artifacts/kwin-mcp" "$run/package/bin/kwin-mcp"
   exit 1
 ) > "$run/transfer-interruption.log" 2>&1 &
 interrupter=$!
-if "$cli" install "$run/package" engi "$run/raced-release" > "$run/destination-race.log" 2>&1; then
+if "$cli" install "$run/local-build-package" engi "$run/raced-release" > "$run/destination-race.log" 2>&1; then
   wait "$interrupter"
   printf 'Unexpected success: destination-race\n' >&2
   exit 1
@@ -111,4 +128,4 @@ cmp "$run/raced-release-expected.txt" "$run/raced-release/sentinel"
 [[ -z $(find "$run" -maxdepth 1 -name 'raced-release.incoming-*' -print -quit) ]]
 sha256sum "$run/old-release/kwin-mcp" > "$run/old-after-failure.txt"
 cmp "$run/old-before.txt" "$run/old-after-failure.txt"
-printf 'local_build=PASS\nlocal_install=PASS\npackage=PASS\nchecksums=PASS\nreject_existing=PASS\ninvalid_arguments=PASS\ncorruption=PASS\ndestination_race_cleanup=PASS\nold_release_preserved=PASS\n' | tee "$run/results.txt"
+printf 'local_build=%s\nlocal_install=PASS\npackage=PASS\nchecksums=PASS\nreject_existing=PASS\ninvalid_arguments=PASS\ncorruption=PASS\ndestination_race_cleanup=PASS\nold_release_preserved=PASS\n' "$local_build_result" | tee "$run/results.txt"
