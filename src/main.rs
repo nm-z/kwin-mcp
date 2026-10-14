@@ -3383,6 +3383,8 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
+    /// Explicitly shared application state; writes reach these host directories.
+    host_write_paths: Vec<PathBuf>,
     staging_root: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
@@ -3449,6 +3451,15 @@ impl OverlayPlan {
         }
         for path in &self.read_only_binds {
             command.arg("--ro-bind-try").arg(path).arg(path);
+        }
+        for path in &self.host_write_paths {
+            command.arg("--bind").arg(path).arg(path);
+            // Sharing state must not also reconnect host application sockets.
+            for socket in &self.sqlite_blocked_sockets {
+                if socket.starts_with(path) && std::fs::symlink_metadata(socket).is_ok() {
+                    command.arg("--ro-bind").arg("/dev/null").arg(socket);
+                }
+            }
         }
         for path in &self.empty_dirs {
             command.arg("--tmpfs").arg(path);
@@ -3614,9 +3625,13 @@ impl OverlayPlan {
             })
             .filter(|(path, _, _)| {
                 !self
-                    .read_only_binds
+                    .host_write_paths
                     .iter()
-                    .any(|mount| path != mount && path.starts_with(mount))
+                    .any(|shared| path.starts_with(shared))
+                    && !self
+                        .read_only_binds
+                        .iter()
+                        .any(|mount| path != mount && path.starts_with(mount))
             })
             .collect();
         sockets.sort();
@@ -3757,6 +3772,7 @@ struct SplitOverlayContext<'a> {
     mounts: &'a [procfs::process::MountInfo],
     initialize: bool,
     writable_paths: &'a [PathBuf],
+    host_write_paths: &'a [PathBuf],
     live_databases: &'a [PathBuf],
 }
 
@@ -3803,6 +3819,13 @@ fn prepare_split_overlay_directory(
         let staged = context.staging_root.join(relative);
         let file_type = entry.file_type()?;
         let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
+
+        if context.host_write_paths.contains(&source) {
+            // The live directory bind supplies this subtree, including WAL
+            // sidecars and nested mounts. Never stage its potentially huge files.
+            std::fs::create_dir_all(&staged)?;
+            continue;
+        }
 
         if context
             .mounts
@@ -3924,6 +3947,7 @@ fn prepare_overlay_plan(
     session_tmp: &Path,
     mounts: &[procfs::process::MountInfo],
     writable_paths: &[PathBuf],
+    host_write_paths: &[PathBuf],
     live_databases: &[PathBuf],
 ) -> anyhow::Result<OverlayPlan> {
     let excluded_mounts = mount_descendants(mounts, target);
@@ -3939,6 +3963,7 @@ fn prepare_overlay_plan(
             destination: target.to_path_buf(),
         };
         return Ok(OverlayPlan {
+            host_write_paths: host_write_paths.to_vec(),
             staging_root: None,
             overlays: vec![overlay],
             read_only_binds: Vec::new(),
@@ -3969,6 +3994,7 @@ fn prepare_overlay_plan(
         mounts,
         initialize,
         writable_paths,
+        host_write_paths,
         live_databases,
     };
     let mut overlays = Vec::new();
@@ -3993,6 +4019,7 @@ fn prepare_overlay_plan(
     }
 
     Ok(OverlayPlan {
+        host_write_paths: host_write_paths.to_vec(),
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
@@ -4020,9 +4047,16 @@ fn bind_live_sqlite(
     databases: &[PathBuf],
 ) -> anyhow::Result<()> {
     let discarded = discarded_session_databases(target);
-    for database in databases.iter().filter(|database| {
-        !discarded.contains(database) && !browser_cookie_database(target, database)
-    }) {
+    for database in databases {
+        if discarded.contains(database)
+            || browser_cookie_database(target, database)
+            || plan
+                .host_write_paths
+                .iter()
+                .any(|path| database.starts_with(path))
+        {
+            continue;
+        }
         let name = database
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("database has no name"))?;
@@ -4379,6 +4413,68 @@ struct HostView {
     cookie_errors: Vec<String>,
 }
 
+/// Validate explicit host writes on the bounded blocking preparation thread.
+fn validate_host_write_paths(
+    target: &Path,
+    host_runtime: &Path,
+    writable_paths: &[PathBuf],
+    paths: &[PathBuf],
+) -> anyhow::Result<Vec<PathBuf>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut host_write_paths = paths.to_vec();
+    let canonical_home =
+        std::fs::canonicalize(target).map_err(|error| anyhow::anyhow!("resolve HOME: {error}"))?;
+    for path in &host_write_paths {
+        let relative = path.strip_prefix(target).ok();
+        let resolved = std::fs::canonicalize(path).ok();
+        if !path.is_absolute()
+            || relative.is_none_or(|relative| {
+                relative.as_os_str().is_empty()
+                    || relative
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            })
+            || !path.is_dir()
+            || resolved.as_ref()
+                != relative
+                    .map(|relative| canonical_home.join(relative))
+                    .as_ref()
+            || BROWSER_CONFIG_DIRS.iter().any(|config| {
+                let browser = target.join(config);
+                path.starts_with(&browser) || browser.starts_with(path)
+            })
+            || [session_disk_root(), host_runtime.to_path_buf()]
+                .iter()
+                .any(|private| path.starts_with(private) || private.starts_with(path))
+        {
+            anyhow::bail!(
+                "host_write_paths requires existing directories strictly under HOME, without symlinks, '.', '..', browser profiles, session storage or host runtime: {}",
+                path.display()
+            );
+        }
+        if writable_paths
+            .iter()
+            .any(|private| private.starts_with(path) || path.starts_with(private))
+        {
+            anyhow::bail!(
+                "host_write_paths conflicts with private writable_paths: {}",
+                path.display()
+            );
+        }
+    }
+    host_write_paths.sort();
+    host_write_paths.dedup();
+    let requested = host_write_paths.clone();
+    host_write_paths.retain(|path| {
+        !requested
+            .iter()
+            .any(|parent| parent != path && path.starts_with(parent))
+    });
+    Ok(host_write_paths)
+}
+
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
 /// host socket exposure, and the host kdeglobals.
 fn prepare_host_view(
@@ -4386,8 +4482,12 @@ fn prepare_host_view(
     host_xdg_dir: &Path,
     host_runtime: &Path,
     writable_paths: &[PathBuf],
+    host_write_paths: &[PathBuf],
     service: &KwinMcp,
 ) -> anyhow::Result<HostView> {
+    service.set_start_stage("validating host_write_paths");
+    let host_write_paths =
+        validate_host_write_paths(target, host_runtime, writable_paths, host_write_paths)?;
     service.set_start_stage("scanning host mounts");
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
@@ -4432,6 +4532,7 @@ fn prepare_host_view(
         &disk,
         &mount_inventory,
         writable_paths,
+        &host_write_paths,
         &inventory.live_databases,
     )
     .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
@@ -4737,6 +4838,7 @@ impl SessionScope {
 }
 
 struct Session {
+    host_write_paths: Vec<PathBuf>,
     scope: SessionScope,
     kwin_conn: zbus::Connection, // talks to KWin via its unique name
     _proxy_socket: std::os::fd::OwnedFd,
@@ -7984,6 +8086,12 @@ struct SessionStartParams {
     /// private copies. Default: files over 64 MiB use reflink or a read-only
     /// bind. Explicit copies still share the 20-second startup deadline.
     writable_paths: Option<Vec<PathBuf>>,
+    /// Existing application state directories under HOME to share with the host.
+    /// Writes persist on the host, including SQLite databases and WAL sidecars.
+    /// For live Codex state, pass the absolute path to ~/.codex. Omit for isolation.
+    /// HOME itself, symlinked paths, browser profiles and session storage are rejected.
+    /// Existing host Unix sockets in these directories remain blocked.
+    host_write_paths: Option<Vec<PathBuf>>,
 }
 
 impl SessionStartParams {
@@ -8408,7 +8516,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. By default, writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory. To operate an application against live host state, explicitly set host_write_paths to its existing state directory under HOME (for Codex, ~/.codex as an absolute path). This skips copies and read-only SQLite mounts for that subtree; all writes and deletions there persist on the host, including after session_stop. session_start and session_list report the shared directories."
     )]
     async fn session_start(
         &self,
@@ -8650,6 +8758,7 @@ impl KwinMcp {
                 )));
             }
         }
+        let host_write_paths = params.host_write_paths.unwrap_or_default();
         // Mount, socket, and /proc scans can block in the kernel on a hung
         // FUSE or network mount, or on a process stuck in D state. Run them on
         // a blocking thread so the hard limit can still answer; the handle
@@ -8667,6 +8776,7 @@ impl KwinMcp {
                 &view_xdg,
                 &view_runtime,
                 &writable_paths,
+                &host_write_paths,
                 &view_service,
             ));
         });
@@ -9460,6 +9570,19 @@ impl KwinMcp {
         );
         let viewer = viewer_report(&host_xdg_dir, None, None);
         let msg = format!("{msg} {}", viewer_summary(&viewer));
+        let host_write_paths = std::mem::take(&mut overlay_plan.host_write_paths);
+        let msg = if host_write_paths.is_empty() {
+            msg
+        } else {
+            format!(
+                "{msg}; writes reach the host in host_write_paths: {}",
+                host_write_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         let oversized_read_only_files = std::mem::take(&mut overlay_plan.oversized_read_only_files);
         let msg = if oversized_read_only_files.is_empty() {
             msg
@@ -9478,6 +9601,7 @@ impl KwinMcp {
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
+            host_write_paths: host_write_paths.clone(),
             scope: scope.clone(),
             kwin_conn,
             _proxy_conn: proxy_conn,
@@ -9534,6 +9658,7 @@ impl KwinMcp {
             "viewer": viewer,
             "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
+            "host_write_paths": host_write_paths,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
@@ -11272,7 +11397,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "export_file",
-        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
+        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Except in explicitly shared host_write_paths, session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
     )]
     async fn export_file(
         &self,
@@ -12356,6 +12481,7 @@ impl SessionRouter {
                 records.push(serde_json::json!({
                     "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":session.scope.report(), "input_log":service.input_log.as_ref().map(|log| &log.path),
                     "workdir": session.host_xdg_dir, "width": session.screen_width,
+                    "host_write_paths": session.host_write_paths,
                     "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
                 }));
             }
@@ -12941,6 +13067,8 @@ const RESUME_DESCRIPTOR: &str = "KWIN_MCP_RESUME_FD";
 #[derive(Serialize, Deserialize)]
 struct SessionRestore {
     #[serde(default)]
+    host_write_paths: Vec<PathBuf>,
+    #[serde(default)]
     scope: SessionScope,
     #[serde(default)]
     scope_unit: String,
@@ -13111,6 +13239,7 @@ impl SessionRouter {
                 service.workdir.inherit_lease(&saved.path, saved.lease_fd)?;
             }
             *service.session.write().await = Some(Session {
+                host_write_paths: saved.host_write_paths,
                 scope: {
                     let mut scope = saved.scope;
                     if scope.unit.is_empty() {
@@ -13225,6 +13354,7 @@ impl SessionRouter {
                 continue;
             };
             saved.push(SessionRestore {
+                host_write_paths: session.host_write_paths.clone(),
                 scope_unit: session.scope.unit.clone(),
                 scope: session.scope.clone(),
                 input_log_path: service.input_log.as_ref().map(|log| log.path.clone()),
