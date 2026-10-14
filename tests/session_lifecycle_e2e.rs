@@ -3890,6 +3890,83 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, ChatGPT, input devices, and a live GPU session"]
+fn launch_chatgpt_with_disk_backed_host_tmpdir() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let temp_root = PathBuf::from("/var/tmp").join(format!(
+        "kwin-mcp-e2e-tmpdir-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp_root).expect("create disk-backed host TMPDIR");
+    let host_tmpdir = temp_root.display().to_string();
+    let mut client = RpcClient::start_with_env(&[("TMPDIR", &host_tmpdir)]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let directory = workdir(&started);
+    assert!(
+        directory.starts_with(&temp_root),
+        "session workdir {} did not use host TMPDIR {}",
+        directory.display(),
+        temp_root.display()
+    );
+
+    let debug_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve a free ChatGPT debug port")
+        .local_addr()
+        .expect("read reserved ChatGPT debug port")
+        .port();
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "printf '%s\\n' \"$TMPDIR\" > \"$XDG_RUNTIME_DIR/tmpdir-proof\" && touch \"$TMPDIR/kwin-mcp-tmpdir-probe\" && /usr/lib/chatgpt/ChatGPT --user-data-dir=\"$HOME/.km-input-e2e-private\" --force-renderer-accessibility --remote-debugging-port={debug_port}"
+        )}),
+    );
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("tmpdir-proof"))
+            .expect("read TMPDIR proof")
+            .trim(),
+        "/tmp",
+        "launched processes should use the sandbox's writable private /tmp"
+    );
+    let window_id = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("ChatGPT window ID");
+    let windows = call_tool(&mut client, 4, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|window| window["id"] == window_id)),
+        "ChatGPT window missing from window_list: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
+    assert_ne!(stopped["result"]["isError"], true, "{stopped}");
+    assert!(!directory.exists(), "session workdir remains");
+    client.stop_process();
+    std::fs::remove_dir_all(&temp_root).expect("remove disk-backed host TMPDIR");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
 fn launch_app_waits_for_a_delayed_window() {
     assert_eq!(
