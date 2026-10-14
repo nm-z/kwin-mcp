@@ -12719,7 +12719,21 @@ impl SessionStdio {
                 nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
             nix::fcntl::fcntl(descriptor.as_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))
                 .map_err(std::io::Error::other)?;
-            tokio::io::unix::AsyncFd::new(std::fs::File::from(descriptor))
+            let name = match number {
+                0 => "stdin",
+                1 => "stdout",
+                _ => "stdio",
+            };
+            tokio::io::unix::AsyncFd::new(std::fs::File::from(descriptor)).map_err(|error| {
+                let detail = if error.raw_os_error() == Some(nix::libc::EPERM) {
+                    format!(
+                        "MCP {name} (fd {number}) is not pollable by epoll; connect stdio through a pipe or terminal: {error}"
+                    )
+                } else {
+                    format!("cannot monitor MCP {name} (fd {number}) with epoll: {error}")
+                };
+                std::io::Error::new(error.kind(), detail)
+            })
         };
         Ok(Self {
             client: Arc::new(tokio::io::unix::AsyncFd::new(client)?),
