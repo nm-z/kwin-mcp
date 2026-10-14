@@ -381,8 +381,13 @@ Otherwise `unverified` warns that the application text has not been confirmed.
 When a timed-out check has seen U+FFFC in the focused text or a descendant, it
 reports `unverified` because embedded rich-text content may not be fully
 exposed through AT-SPI. Otherwise, a field that still differs after the
-bounded wait reports `pending_or_mismatched` as an error. Inspect the field
-before sending or retrying: delayed input can otherwise be duplicated.
+bounded wait reports `pending_or_mismatched` as an error, except when the
+Chromium focus probe finds that the browser page has no keyboard focus. In that
+case, `delivery.status` is `unverified` with method
+`chromium_browser_ui`: page accessibility cannot establish whether the browser
+UI, such as the address bar, accepted the text. Inspect the browser state before
+retrying; the result does not mean retry is safe, because retyping can duplicate
+navigation.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 

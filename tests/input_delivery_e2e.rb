@@ -262,6 +262,57 @@ class InputDeliveryProbe
     screen('terminal-after-return')
   end
 
+  def browser_address_bar
+    command = <<~'SHELL'
+      cat > "$HOME/browser-address-bar-probe.html" <<'HTML'
+      <!doctype html>
+      <html>
+        <head><title>Address Bar Receipt Probe</title></head>
+        <body>
+          <input aria-label="Address bar receipt target" value="stale page text" autofocus>
+        </body>
+      </html>
+      HTML
+      google-chrome --guest --no-first-run --no-default-browser-check "file://$HOME/browser-address-bar-probe.html"
+    SHELL
+    assert_success(call('launch_app', command: command))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    visible = nil
+    loop do
+      visible = tree
+      break if visible.include?('Address bar receipt target')
+      raise 'Chrome address-bar probe page did not become accessible' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.5
+    end
+    match = visible.match(/entry\tAddress bar receipt target\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'Chrome address-bar probe target bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('browser-address-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    assert_success(call('keyboard_key', key: 'ctrl+l'))
+    typing = call('keyboard_type', text: 'chrome://extensions')
+    delivery = typing.dig('result', 'structuredContent', 'delivery')
+    raise "Chrome address-bar typing omitted its delivery receipt: #{typing}" unless delivery
+    raise "Chrome address-bar typing lacks compositor acknowledgement: #{delivery}" unless delivery['compositor_acknowledged']
+    return_key = assert_success(call('keyboard_key', key: 'Return'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    after = nil
+    loop do
+      after = screen('browser-address-after')
+      break if after.fetch('window').fetch('title').include?('Extensions')
+      raise "Chrome did not navigate to Extensions: #{after.fetch('window')}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.5
+    end
+    if return_key['warning']
+      unsafe_status = %w[pending_or_mismatched not_in_field]
+      retry_safe = typing.dig('result', 'structuredContent', 'retry_safe')
+      if unsafe_status.include?(delivery['status']) || typing.dig('result', 'isError') || retry_safe == true
+        raise "Chrome browser UI focus was misreported as failed or safely retryable text: #{typing}"
+      end
+    end
+  end
+
   def unverified_password_field
     visible = tree
     line = visible.lines.find do |candidate|
@@ -321,7 +372,7 @@ artifacts = File.expand_path(ENV.fetch('KWIN_MCP_TEST_ARTIFACT_DIR'))
 probe = nil
 begin
   probe = InputDeliveryProbe.new(server, artifacts)
-  modes = ARGV.empty? ? %w[electron terminal] : ARGV
+  modes = ARGV.empty? ? %w[electron terminal browser_address_bar] : ARGV
   modes.each { |mode| probe.public_send(mode) }
   puts "PASS: #{modes.join(', ')}; evidence #{artifacts}"
 ensure
