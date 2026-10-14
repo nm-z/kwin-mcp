@@ -84,7 +84,7 @@ fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
         .and_then(|path| std::fs::read_to_string(path.join("viewer-pipewire.json")).ok())
         .unwrap_or_else(|| "not connected".to_owned());
     format!(
-        "viewer did not present a frame within {} seconds; last PipeWire state: {}",
+        "viewer did not submit a frame within {} seconds; last PipeWire state: {}",
         FIRST_FRAME_TIMEOUT.as_secs(),
         state.trim()
     )
@@ -95,7 +95,7 @@ fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 
 /// Atomically publish the viewer's lifecycle state: starting,
-/// ready (a frame is on the host window), closed, or failed.
+/// ready (the first frame is queued for host-window presentation), closed, or failed.
 fn write_status(session: &std::path::Path, state: &str, detail: &str) {
     let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
     let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id()});
@@ -116,7 +116,46 @@ struct Frame {
 // draw_fn reads. No queue, no backpressure: at <60fps the window simply
 // redraws the last frame. Wrapped in Mutex instead of a channel of 1 so the
 // producer never blocks if the consumer is slow.
-type FrameMailbox = Arc<Mutex<Option<Frame>>>;
+type FrameMailbox = Arc<(Mutex<Option<Frame>>, Condvar)>;
+
+fn store_frame(mailbox: &FrameMailbox, frame: Frame) {
+    let (latest, ready) = &**mailbox;
+    if let Ok(mut latest) = latest.lock() {
+        *latest = Some(frame);
+        ready.notify_one();
+    }
+}
+
+fn take_frame(mailbox: &FrameMailbox) -> Option<Frame> {
+    let (latest, _) = &**mailbox;
+    latest.lock().ok().and_then(|mut latest| latest.take())
+}
+
+fn wait_for_first_frame(
+    mailbox: &FrameMailbox,
+    shutdown: &Shutdown,
+    deadline: Instant,
+) -> Option<Frame> {
+    let (latest, ready) = &**mailbox;
+    let mut latest = latest.lock().ok()?;
+    loop {
+        if let Some(frame) = latest.take() {
+            return Some(frame);
+        }
+        if shutdown.requested() {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        // Shutdown is an atomic flag rather than a condition-variable event;
+        // bounded waits make teardown responsive without spinning the UI thread.
+        let wait = remaining.min(DISPATCH_POLL_INTERVAL);
+        let (next, _) = ready.wait_timeout(latest, wait).ok()?;
+        latest = next;
+    }
+}
 
 // Cooperative stop signal shared by every thread the viewer owns. Whatever
 // ends first sets it: the user closing the window, a compositor dropping a
@@ -731,7 +770,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         restore: None,
     };
 
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
     numlock.apply(&link.fake_input, &link.conn)?;
 
@@ -816,6 +855,8 @@ fn window_loop(
     let mut src_dims: (u32, u32) = (0, 0);
     let mut ready_reported = false;
     let mut first_frame_submitted = false;
+    let mut first_host_redraw = false;
+    let mut first_frame_consumed = false;
     let mut startup_error = None;
     let started = Instant::now();
     let mut shown_title = initial_title;
@@ -830,12 +871,11 @@ fn window_loop(
             return;
         }
 
-        if first_frame_submitted && !ready_reported {
-            ready_reported = true;
-            eprintln!("kwin-viewer: first frame presented");
-            if let Some(dir) = status_dir {write_status(dir,"ready","host window is showing the session");}
-            if matches!(input_state.out,InputOut::Remote(_)) { input_state.out.send(Op::Presented); }
+        if !first_host_redraw {
+            first_host_redraw = true;
+            eprintln!("kwin-viewer: first host window redraw");
         }
+
         if !ready_reported && started.elapsed() >= FIRST_FRAME_TIMEOUT {
             let reason=frame_timeout_reason(status_dir);
             if let Some(dir)=status_dir {write_status(dir,"failed",&reason);}
@@ -873,8 +913,36 @@ fn window_loop(
         // Retain src_image across frames so when the mailbox is momentarily
         // empty we still re-blit the last known picture instead of flashing
         // black.
-        let latest = mailbox.lock().ok().and_then(|mut g| g.take());
+        let latest = if first_frame_submitted {
+            take_frame(mailbox)
+        } else {
+            match wait_for_first_frame(
+                mailbox,
+                shutdown,
+                started + FIRST_FRAME_TIMEOUT,
+            ) {
+                Some(frame) => Some(frame),
+                None if shutdown.requested() => {
+                    frame.exit();
+                    return;
+                }
+                None => {
+                    let reason = frame_timeout_reason(status_dir);
+                    if let Some(dir) = status_dir {
+                        write_status(dir, "failed", &reason);
+                    }
+                    startup_error = Some(reason);
+                    shutdown.request();
+                    frame.exit();
+                    return;
+                }
+            }
+        };
         if let Some(f) = latest {
+            if !first_frame_consumed {
+                first_frame_consumed = true;
+                eprintln!("kwin-viewer: first PipeWire frame consumed by host window");
+            }
             if src_dims != (f.width, f.height) {
                 let info = ImageInfo::image_2d(
                     f.width,
@@ -911,7 +979,17 @@ fn window_loop(
             frame
                 .render_graph
                 .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
-            first_frame_submitted = true;
+            if !first_frame_submitted {
+                first_frame_submitted = true;
+                ready_reported = true;
+                eprintln!("kwin-viewer: first frame submitted for presentation");
+                if let Some(dir) = status_dir {
+                    write_status(dir, "ready", "first frame submitted to the host window");
+                }
+                if matches!(input_state.out, InputOut::Remote(_)) {
+                    input_state.out.send(Op::Presented);
+                }
+            }
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
         }
@@ -1075,38 +1153,44 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     write_status(&session_path, "starting", "remote viewer");
     pipewire::init();
     let shutdown = Shutdown::default();
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
     let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
     let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
 
-    let presented=Arc::new(AtomicBool::new(false));
+    let submitted = Arc::new(AtomicBool::new(false));
     // Input records come in until the client's ssh pipe closes. The thread
     // blocks in read, so it is left to end with the process.
     {
         let (gate, shutdown) = (gate.clone(), shutdown.clone());
-        let presented=presented.clone();
-        let session_path=session_path.clone();
+        let submitted = submitted.clone();
+        let session_path = session_path.clone();
         std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
             let mut stdin = std::io::stdin().lock();
             while let Ok(Some(op)) = Op::decode(&mut stdin) {
-                if matches!(op,Op::Presented) {
-                    presented.store(true,Ordering::Release);
-                    write_status(&session_path,"ready","remote viewer presented its first frame");
-                } else { gate.send(op); }
+                if matches!(op, Op::Presented) {
+                    submitted.store(true, Ordering::Release);
+                    write_status(
+                        &session_path,
+                        "ready",
+                        "remote viewer submitted its first frame for presentation",
+                    );
+                } else {
+                    gate.send(op);
+                }
             }
             shutdown.request();
         })?;
     }
 
-    write_status(&session_path, "starting", "waiting for remote first-frame presentation");
+    write_status(&session_path, "starting", "waiting for remote first-frame submission");
     let started=Instant::now();
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     let mut result = Ok(());
     let mut sent_title = String::new();
     while !shutdown.requested() {
-        if !presented.load(Ordering::Acquire) && started.elapsed()>=FIRST_FRAME_TIMEOUT {
-            result=Err(anyhow::anyhow!(frame_timeout_reason(Some(&session_path))));
+        if !submitted.load(Ordering::Acquire) && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+            result = Err(anyhow::anyhow!(frame_timeout_reason(Some(&session_path))));
             shutdown.request();
             break;
         }
@@ -1115,7 +1199,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
             if let Err(error) = write_title(&mut stdout,&title) { result=Err(error); break; }
             sent_title=title;
         }
-        let latest = mailbox.lock().ok().and_then(|mut g| g.take());
+        let latest = take_frame(&mailbox);
         match latest {
             Some(frame) => {
                 if let Err(error) = write_frame(&mut stdout, &frame) {
@@ -1152,6 +1236,9 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         .or_else(|| std::env::current_exe().ok().map(|path| path.display().to_string()))
         .ok_or_else(|| anyhow::anyhow!("cannot locate the remote kwin-viewer; set KWIN_VIEWER_REMOTE_BIN"))?;
     anyhow::ensure!(plain(&remote_bin), "remote kwin-viewer path must be a plain name");
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
     let mut child = std::process::Command::new("ssh")
         .args(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
         .arg(&host)
@@ -1164,9 +1251,6 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("ssh stdin missing"))?;
     let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("ssh stdout missing"))?;
 
-    let shutdown = Shutdown::default();
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
-    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
     let reader = {
         let title = Arc::clone(&title);
         let (mailbox, shutdown) = (Arc::clone(&mailbox), shutdown.clone());
@@ -1174,9 +1258,7 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
             loop {
                 match read_frame(&mut stdout,Some(&title)) {
                     Ok(Some(frame)) => {
-                        if let Ok(mut slot) = mailbox.lock() {
-                            *slot = Some(frame);
-                        }
+                        store_frame(&mailbox, frame);
                     }
                     Ok(None) => break,
                     Err(error) => {
@@ -1197,7 +1279,14 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         held_keys: HashSet::new(),
         clipboard: None,
     };
-    let result = window_loop(ViewerTitle::Remote(&title,&host), &mailbox, &shutdown, virt, &mut input_state, None);
+    let result = window_loop(
+        ViewerTitle::Remote(&title, &host),
+        &mailbox,
+        &shutdown,
+        virt,
+        &mut input_state,
+        None,
+    );
     shutdown.request();
     // Closing the pipe ends `--serve` on the far side; ssh then exits.
     drop(input_state);
@@ -1226,6 +1315,7 @@ enum Op {
     Button(u32, u32),
     Axis(u32, f64),
     Key(u32, u32),
+    // The remote viewer has queued its first rendered frame for presentation.
     Presented,
 }
 
@@ -1724,10 +1814,12 @@ fn run_pipewire(
     struct UserData {
         format: spa::param::video::VideoInfoRaw,
         mailbox: FrameMailbox,
+        first_frame_received: bool,
     }
     let data = UserData {
         format: spa::param::video::VideoInfoRaw::default(),
         mailbox,
+        first_frame_received: false,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -1787,9 +1879,18 @@ fn run_pipewire(
             let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
             convert_to_rgba(raw, &mut rgba, w as usize, h as usize, stride, src_fmt);
 
-            if let Ok(mut g) = ud.mailbox.lock() {
-                *g = Some(Frame { width: w, height: h, rgba });
+            if !ud.first_frame_received {
+                eprintln!(
+                    "kwin-viewer: first PipeWire frame received: {}x{}, chunk={}, stride={}, mapped={}",
+                    w,
+                    h,
+                    size,
+                    stride,
+                    raw.len()
+                );
+                ud.first_frame_received = true;
             }
+            store_frame(&ud.mailbox, Frame { width: w, height: h, rgba });
         })
         .register()?;
 
