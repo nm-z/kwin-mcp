@@ -7053,13 +7053,18 @@ const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
 set -e
 name=${0##*/}
 real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
-ozone=0 wallet=0 a11y=0 debug_port=0 silent_debugger=0 test_type=0
+ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
 for arg in "$@"; do
+  if (( profile_value )); then
+    [[ -n "$arg" ]] && custom_profile=1
+    profile_value=0
+  fi
   case "$arg" in
     --ozone-platform|--ozone-platform=*) ozone=1 ;;
     --password-store|--password-store=*) wallet=1 ;;
     --force-renderer-accessibility|--force-renderer-accessibility=*) a11y=1 ;;
-    --remote-debugging-port|--remote-debugging-port=*) debug_port=1 ;;
+    --user-data-dir) profile_value=1 ;;
+    --user-data-dir=*) [[ -n "${arg#*=}" ]] && custom_profile=1 ;;
     --silent-debugger-extension-api) silent_debugger=1 ;;
     --test-type) test_type=1 ;;
   esac
@@ -7078,15 +7083,30 @@ case "$name" in
     (( test_type )) || flags+=(--test-type)
     ;;
 esac
+cdp=1
 case "$name" in
-  google-chrome*|chrome|microsoft-edge*|msedge*) ;;
-  *)
-    if [[ -n ${KWIN_MCP_CDP_PORT:-} ]]; then
-      (( debug_port )) || flags+=("--remote-debugging-port=$KWIN_MCP_CDP_PORT")
-      [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] || printf cdp > "$KWIN_MCP_BROWSER_MARKER"
-    fi
-    ;;
+  google-chrome*|chrome|microsoft-edge*|msedge*) (( custom_profile )) || cdp=0 ;;
 esac
+if [[ -n ${KWIN_MCP_CDP_PORT:-} ]] && (( cdp )); then
+  # The server connects through the port reserved and forwarded for this
+  # session. Replace caller-supplied ports so the browser and server agree.
+  browser_args=()
+  skip_debug_port_value=0
+  for arg in "$@"; do
+    if (( skip_debug_port_value )); then
+      skip_debug_port_value=0
+      continue
+    fi
+    case "$arg" in
+      --remote-debugging-port) skip_debug_port_value=1 ;;
+      --remote-debugging-port=*) ;;
+      *) browser_args+=("$arg") ;;
+    esac
+  done
+  flags+=("--remote-debugging-port=$KWIN_MCP_CDP_PORT")
+  [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] || printf cdp > "$KWIN_MCP_BROWSER_MARKER"
+  set -- "${browser_args[@]}"
+fi
 exec "$real" "${flags[@]}" "$@"
 "#;
 
@@ -12110,7 +12130,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get session CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. KWin assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -12457,7 +12477,7 @@ impl KwinMcp {
                     "action": "launch", "command": params.command, "window": geo.id,
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_title": geo.title,
-                    "cdp": cdp_connected, "warning": warning,
+                    "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                 })).await)
             }
@@ -12483,7 +12503,7 @@ impl KwinMcp {
                     "action": "launch", "command": params.command,
                     "window": if browser_unattributed { "unattributed" } else { "exited" },
                     "window_outcome": window_outcome,
-                    "exit_status": status, "cdp": false, "warning": warning,
+                    "exit_status": status, "cdp": false, "cdp_port": null, "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                 });
                 if browser_unattributed {
@@ -12500,7 +12520,7 @@ impl KwinMcp {
             (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
                 "window_outcome": "timeout",
-                "cdp": false, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
+                "cdp": false, "cdp_port": null, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
                 "window_timeout_seconds": window_timeout.as_secs(),
             })).await),
         }
@@ -12870,8 +12890,10 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
         } else {
             format!(
                 "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
-                 Only 'chromium' exposes CDP DOM queries on its default profile; the others still \
-                 launch, screenshot, and accept input normally.",
+                 CDP-capable Chromium-family commands receive a session-managed CDP port. Google \
+                 Chrome and Edge require a non-default --user-data-dir; any explicit \
+                 --remote-debugging-port is replaced with the session port. Successful CDP launches \
+                 return cdp_port. Firefox still supports launch, screenshots, and input.",
                 browsers.join(", ")
             )
         };
