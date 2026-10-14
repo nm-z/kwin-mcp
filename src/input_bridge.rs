@@ -1088,6 +1088,19 @@ impl TextDelivery {
         }
     }
 
+    pub fn chromium_browser_ui_unverified() -> Self {
+        Self {
+            status: "unverified",
+            method: "chromium_browser_ui",
+            compositor_acknowledged: true,
+            expected_field_characters: None,
+            observed_field_characters: None,
+            warning: Some(
+                "KWin acknowledged all key events, but Chromium's page did not have keyboard focus, so page accessibility could not verify whether the browser UI accepted the text. Inspect the address bar or resulting page before retrying; retyping can duplicate navigation.".to_owned(),
+            ),
+        }
+    }
+
     fn rich_text_unavailable(
         expected_count: usize,
         observed_count: Option<usize>,

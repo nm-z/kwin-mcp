@@ -11774,7 +11774,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. If Chromium's page has no keyboard focus after a pending text mismatch, the result is unverified browser UI text, not a failed delivery or safe retry. Other unverified or pending_or_mismatched results require inspecting before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -11858,6 +11858,22 @@ impl KwinMcp {
                 }
             }
             Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
+        };
+        // Chromium can keep AT-SPI's Focused state on the page's stale text
+        // node after keyboard focus moves into browser UI. Page text then
+        // cannot distinguish an address-bar delivery from a failed insertion.
+        let browser_ui_has_focus = if delivery.status == "pending_or_mismatched" {
+            match &active {
+                Ok(geometry) => browser_page_unfocused(&sess.kwin_conn, &geometry.title).await,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        let delivery = if browser_ui_has_focus {
+            input_bridge::TextDelivery::chromium_browser_ui_unverified()
+        } else {
+            delivery
         };
         let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
         drop(guard);
