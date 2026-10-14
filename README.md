@@ -26,6 +26,16 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `launch_app` | Launch an application and wait for its window. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 
+## Browser CDP
+
+`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port. Google Chrome and Edge need a non-default user data directory; for example:
+
+```text
+google-chrome-stable --user-data-dir="$HOME/.cache/kwin-mcp/cdp-profile" https://example.com/
+```
+
+The session assigns the CDP port. Do not pass `--remote-debugging-port`; if supplied, `launch_app` replaces it with the session port. A successful connection returns `cdp_port` in the structured result, and that port is forwarded to the host on `127.0.0.1`. Chrome 136 and later ignore remote-debugging switches for the default data directory, so use a private, non-default profile as shown in [Chrome's remote debugging guidance](https://developer.chrome.com/blog/remote-debugging-port).
+
 ## Resize a maximized session window
 
 To resize a maximized window with KWin's native controls, restore it with the session's configured restore/maximize shortcut through `keyboard_key` (the regression proof binds this to `super+Backspace`). Read its `x`, `y`, `w`, and `h` with `window_list`, then hold Super with `keyboard_press` (`key: "super"`) and call `mouse_drag` with `button: "right"` from ten pixels inside the lower-right corner to the desired lower-right point. `mouse_drag` coordinates are relative to the active window. Release Super with `keyboard_release` (`key: "super"`), then verify the geometry with `window_list` or screenshot metadata.
