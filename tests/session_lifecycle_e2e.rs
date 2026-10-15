@@ -4944,9 +4944,17 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "launch_app",
         json!({"command":"true","window_timeout_seconds":1}),
     );
-    assert_ne!(finished["result"]["isError"], true, "{finished}");
+    assert_eq!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(
         finished["result"]["structuredContent"]["exit_status"], 0,
+        "{finished}"
+    );
+    assert_eq!(
+        finished["result"]["structuredContent"]["reason"], "window_not_observed",
+        "{finished}"
+    );
+    assert_eq!(
+        finished["result"]["structuredContent"]["retry_safe"], false,
         "{finished}"
     );
     let retained = std::fs::read_dir(workdir(&started))
@@ -5172,6 +5180,15 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         "launch_app",
         json!({"command":same_title_command,"window_timeout_seconds":1}),
     );
+    assert_eq!(ambiguous["result"]["isError"], true, "{ambiguous}");
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["reason"], "window_not_observed",
+        "{ambiguous}"
+    );
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["retry_safe"], false,
+        "{ambiguous}"
+    );
     assert_eq!(
         ambiguous["result"]["structuredContent"]["window_outcome"], "unattributed",
         "{ambiguous}"
@@ -5218,6 +5235,83 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         "{stopped}"
     );
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn launch_app_timeout_reports_failure_and_keeps_session_live() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let gate = workdir(&started).join("release-delayed-window");
+    let command = format!(
+        "while [ ! -e '{}' ]; do sleep 0.1; done; exec konsole --separate --hold -e bash -c 'printf window-after-timeout-proof'",
+        gate.display()
+    );
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":command,"window_timeout_seconds":1}),
+    );
+    assert_eq!(launched["result"]["isError"], true, "{launched}");
+    let detail = &launched["result"]["structuredContent"];
+    assert_eq!(detail["window"], "timeout", "{launched}");
+    assert_eq!(detail["reason"], "window_not_observed", "{launched}");
+    assert_eq!(detail["command_submitted"], true, "{launched}");
+    assert_eq!(detail["retry_safe"], false, "{launched}");
+    assert_eq!(detail["window_timeout_seconds"], 1, "{launched}");
+    assert!(
+        detail["recovery"]
+            .as_str()
+            .is_some_and(|text| text.contains("window_list")),
+        "{launched}"
+    );
+    let windows = call_tool(&mut client, 4, "window_list", json!({}));
+    assert_eq!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "{windows}"
+    );
+    std::fs::write(&gate, b"ready").expect("release the delayed window after checking the timeout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut request_id = 5;
+    loop {
+        let windows = call_tool(&mut client, request_id, "window_list", json!({}));
+        request_id += 1;
+        if windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| entries.len() == 1)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "delayed window never appeared: {windows}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let stopped = call_tool(&mut client, request_id, "session_stop", json!({}));
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    client.stop_process();
+    println!(
+        "PASS: window timeout is an error; submitted command later opens a window without retrying"
+    );
 }
 
 #[test]

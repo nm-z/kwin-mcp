@@ -26,6 +26,14 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `launch_app` | Launch an application and wait for its window. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 
+`launch_app` waits 15 seconds for a new window by default; callers can set
+`window_timeout_seconds` from 1 to 120. If no new or attributable reused browser
+window is observed, a timeout or zero process exit returns `isError: true` with
+`reason: "window_not_observed"`. A zero exit may mean the command handed off to
+an existing instance. The session stays open, and the submitted command may
+still be running: inspect `window_list` for a delayed or existing window before
+retrying (`retry_safe: false`).
+
 ## Resize a maximized session window
 
 To resize a maximized window with KWin's native controls, restore it with the session's configured restore/maximize shortcut through `keyboard_key` (the regression proof binds this to `super+Backspace`). Read its `x`, `y`, `w`, and `h` with `window_list`, then hold Super with `keyboard_press` (`key: "super"`) and call `mouse_drag` with `button: "right"` from ten pixels inside the lower-right corner to the desired lower-right point. `mouse_drag` coordinates are relative to the active window. Release Super with `keyboard_release` (`key: "super"`), then verify the geometry with `window_list` or screenshot metadata.

@@ -1847,6 +1847,7 @@ const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
 const LAUNCH_PRECHECK_TIMEOUT: Duration = Duration::from_secs(20);
 // The call deadline leaves room for the prelaunch KWin check and CDP retries.
 const LAUNCH_CALL_OVERHEAD_TIMEOUT: Duration = Duration::from_secs(30);
+const LAUNCH_NO_WINDOW_RECOVERY: &str = "The session remains open. Check window_list for a delayed or existing window before retrying; the submitted command may still be running or have handed off to another process.";
 
 // KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
 // it when a non-blocking pipe is full at close. Frames are captured into a
@@ -12110,7 +12111,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. A wait timeout or a zero exit without a new or attributable reused browser window is an error; a zero exit may mean the command handed off to an existing instance. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -12453,26 +12454,43 @@ impl KwinMcp {
                 } else {
                     ("new", format!("window: {}", geo.id))
                 };
-                Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), serde_json::json!({
-                    "action": "launch", "command": params.command, "window": geo.id,
-                    "window_outcome": outcome, "window_reused": window_reused,
-                    "window_title": geo.title,
-                    "cdp": cdp_connected, "warning": warning,
-                    "window_timeout_seconds": window_timeout.as_secs(),
-                })).await)
+                Ok(structured_result(
+                    &peer,
+                    format!("launched: {} {description}{suffix}", params.command),
+                    serde_json::json!({
+                        "action": "launch", "command": params.command, "window": geo.id,
+                        "window_outcome": outcome, "window_reused": window_reused,
+                        "window_title": geo.title,
+                        "cdp": cdp_connected, "warning": warning,
+                        "window_timeout_seconds": window_timeout.as_secs(),
+                    }),
+                )
+                .await)
             }
             (None, Some(status)) => {
                 let browser_unattributed = status == 0 && chromium_launch;
                 let text = match status {
                     0 if browser_unattributed => format!(
-                        "launched: {} (browser launch returned status 0, but no matching existing window could be attributed: {} after {}s){suffix}",
+                        "No attributable browser window observed for {} after {}s. KWin reported: {}. {LAUNCH_NO_WINDOW_RECOVERY}{suffix}",
                         params.command,
-                        handoff_reason.as_deref().unwrap_or("KWin reported no attributable window change"),
                         window_timeout.as_secs(),
+                        handoff_reason
+                            .as_deref()
+                            .unwrap_or("no attributable window change"),
                     ),
-                    0 => format!("launched: {} (exited with status 0; no window after {}s){suffix}", params.command, window_timeout.as_secs()),
-                    127 => format!("{} failed: command not found (exit status 127)", params.command),
-                    _ => format!("{} exited with status {status} without opening a window", params.command),
+                    0 => format!(
+                        "No new window observed for {} after {}s; command exited with status 0. {LAUNCH_NO_WINDOW_RECOVERY}{suffix}",
+                        params.command,
+                        window_timeout.as_secs()
+                    ),
+                    127 => format!(
+                        "{} failed: command not found (exit status 127)",
+                        params.command
+                    ),
+                    _ => format!(
+                        "{} exited with status {status} without opening a window",
+                        params.command
+                    ),
                 };
                 let window_outcome = if browser_unattributed {
                     "unattributed"
@@ -12485,6 +12503,9 @@ impl KwinMcp {
                     "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
+                    "reason": if status == 0 { "window_not_observed" } else { "command_exited" },
+                    "command_submitted": true, "retry_safe": false,
+                    "recovery": if status == 0 { Some(LAUNCH_NO_WINDOW_RECOVERY) } else { None },
                 });
                 if browser_unattributed {
                     payload["handoff"] = serde_json::json!({
@@ -12494,15 +12515,20 @@ impl KwinMcp {
                     });
                 }
                 let mut result = structured_result(&peer, text, payload).await;
-                result.is_error = Some(status != 0);
+                result.is_error = Some(true);
                 Ok(result)
             }
-            (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
-                "action": "launch", "command": params.command, "window": "timeout",
-                "window_outcome": "timeout",
-                "cdp": false, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
-                "window_timeout_seconds": window_timeout.as_secs(),
-            })).await),
+            (None, None) => {
+                let mut result = structured_result(&peer, format!("No new or attributable existing window observed for {} after {}s. {LAUNCH_NO_WINDOW_RECOVERY}{suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
+                    "action": "launch", "command": params.command, "window": "timeout",
+                    "window_outcome": "timeout",
+                    "cdp": false, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
+                    "window_timeout_seconds": window_timeout.as_secs(), "reason": "window_not_observed",
+                    "retry_safe": false, "recovery": LAUNCH_NO_WINDOW_RECOVERY,
+                })).await;
+                result.is_error = Some(true);
+                Ok(result)
+            }
         }
     }
 }
