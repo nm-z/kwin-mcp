@@ -3415,7 +3415,9 @@ impl OverlayPlan {
             // Apply directory masks last: individual socket placeholders must
             // not recreate entries inside an intentionally empty directory.
             for hidden in &self.empty_dirs {
-                if let Ok(relative) = hidden.strip_prefix(source) {
+                if let Ok(relative) = hidden.strip_prefix(source)
+                    && std::fs::symlink_metadata(hidden).is_ok_and(|metadata| metadata.is_dir())
+                {
                     command.arg("--tmpfs").arg(destination.join(relative));
                 }
             }
