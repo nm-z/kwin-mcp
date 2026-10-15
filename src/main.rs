@@ -9122,16 +9122,12 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
-        // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
-        // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
-        // them the NVIDIA render node (often the primary GBM device) loads as
-        // driver=(null) → eglInitialize fails → KWin's virtual backend can't composite
-        // → ScreenShot2 returns Error.Cancelled. Glob so we pick up whatever this host
-        // exposes; -try so non-NVIDIA hosts (no matches) still start.
-        if trimmed_dri.is_none() {
-            for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
-                cmd.arg("--dev-bind-try").arg(&path).arg(&path);
-            }
+        // NVIDIA GPUs expose character devices outside /dev/dri (/dev/nvidia0,
+        // nvidiactl, nvidia-modeset, nvidia-uvm, …). Vulkan clients may need these
+        // even when /dev/dri is trimmed to selected render nodes. Bind whatever this
+        // host exposes; --dev-bind-try keeps non-NVIDIA hosts working without matches.
+        for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
+            cmd.arg("--dev-bind-try").arg(&path).arg(&path);
         }
         // FUSE: /dev/fuse, CAP_SYS_ADMIN in the sandbox's user namespace for
         // the helper only, and fusermount shims over the real binaries.
