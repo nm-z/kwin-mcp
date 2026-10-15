@@ -3273,6 +3273,75 @@ fn terminate_with_parent(command: &mut std::process::Command) {
 
 // ── uinput virtual devices ──────────────────────────────────────────────
 
+const UINPUT_PATH: &str = "/dev/uinput";
+
+fn uinput_error(
+    device: &str,
+    operation: &str,
+    path: &Path,
+    error: impl std::fmt::Display,
+) -> KwinError {
+    // Capture the failing process's credentials and namespaces, not those of
+    // the login shell: an enclosing user namespace can change device access.
+    let credentials = std::fs::read_to_string("/proc/self/status")
+        .map(|status| {
+            status
+                .lines()
+                .filter(|line| {
+                    line.starts_with("Uid:")
+                        || line.starts_with("Gid:")
+                        || line.starts_with("Groups:")
+                })
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|error| format!("credentials unavailable: {error}"));
+    let namespace = |name| {
+        std::fs::read_link(format!("/proc/self/ns/{name}"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("unavailable ({error})"))
+    };
+    KwinError::Msg(format!(
+        "{device}: {operation} {}: {error}; {credentials}; user_namespace={}; mount_namespace={}",
+        path.display(),
+        namespace("user"),
+        namespace("mnt"),
+    ))
+}
+
+fn uinput_devnode(
+    device: &mut evdev::uinput::VirtualDevice,
+    name: &str,
+) -> Result<PathBuf, KwinError> {
+    let syspath = device.get_syspath().map_err(|error| {
+        uinput_error(
+            name,
+            "query sysfs path (UI_GET_SYSNAME) via",
+            Path::new(UINPUT_PATH),
+            error,
+        )
+    })?;
+    // Match evdev's enumeration, keeping the sysfs path at each fallible step.
+    let entries = std::fs::read_dir(&syspath)
+        .map_err(|error| uinput_error(name, "read evdev directory", &syspath, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            uinput_error(name, "read evdev directory entry in", &syspath, error)
+        })?;
+        let filename = entry.file_name();
+        if filename.as_encoded_bytes().starts_with(b"event") {
+            return Ok(Path::new("/dev/input").join(filename));
+        }
+    }
+    Err(uinput_error(
+        name,
+        "locate evdev node in",
+        &syspath,
+        "no event* entry for /dev/input",
+    ))
+}
+
 fn create_uinput_devices() -> Result<
     (
         evdev::uinput::VirtualDevice,
@@ -3294,16 +3363,24 @@ fn create_uinput_devices() -> Result<
     mouse_axes.insert(evdev::RelativeAxisCode::REL_WHEEL);
     mouse_axes.insert(evdev::RelativeAxisCode::REL_HWHEEL);
 
-    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()?
+    let mouse_error =
+        |operation, error| uinput_error("mouse", operation, Path::new(UINPUT_PATH), error);
+    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()
+        .map_err(|error| mouse_error("open read/write", error))?
         .name("kwin-mcp-virtual-mouse")
-        .with_keys(&mouse_keys)?
-        .with_relative_axes(&mouse_axes)?
-        .build()?;
+        .with_keys(&mouse_keys)
+        .map_err(|error| mouse_error("configure key capabilities on", error))?
+        .with_relative_axes(&mouse_axes)
+        .map_err(|error| mouse_error("configure relative axes on", error))?
+        .build()
+        .map_err(|error| {
+            mouse_error(
+                "create virtual device (UI_DEV_SETUP/UI_DEV_CREATE) via",
+                error,
+            )
+        })?;
 
-    let mouse_path = mouse_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput mouse: no devnode".to_owned()))??;
+    let mouse_path = uinput_devnode(&mut mouse_dev, "mouse")?;
 
     // Keyboard: all standard keys (KEY_ESC=1 through KEY_MAX=0x2ff)
     let mut kbd_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
@@ -3319,15 +3396,22 @@ fn create_uinput_devices() -> Result<
         };
     }
 
-    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()?
+    let keyboard_error =
+        |operation, error| uinput_error("keyboard", operation, Path::new(UINPUT_PATH), error);
+    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()
+        .map_err(|error| keyboard_error("open read/write", error))?
         .name("kwin-mcp-virtual-keyboard")
-        .with_keys(&kbd_keys)?
-        .build()?;
+        .with_keys(&kbd_keys)
+        .map_err(|error| keyboard_error("configure key capabilities on", error))?
+        .build()
+        .map_err(|error| {
+            keyboard_error(
+                "create virtual device (UI_DEV_SETUP/UI_DEV_CREATE) via",
+                error,
+            )
+        })?;
 
-    let kbd_path = kbd_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput keyboard: no devnode".to_owned()))??;
+    let kbd_path = uinput_devnode(&mut kbd_dev, "keyboard")?;
 
     Ok((mouse_dev, mouse_path, kbd_dev, kbd_path))
 }
