@@ -4633,7 +4633,8 @@ async fn start_home_overlay(
     }
     std::fs::create_dir(merged)?;
     let log = std::fs::File::create(merged.with_extension("log"))?;
-    let child = std::process::Command::new("fuse-overlayfs")
+    let mut command = std::process::Command::new("fuse-overlayfs");
+    command
         .arg("-f")
         .arg("-o")
         .arg(format!(
@@ -4645,12 +4646,12 @@ async fn start_home_overlay(
         .arg(merged)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(log)
-        .spawn()
-        .map_err(|error| {
-            anyhow::anyhow!("nested HOME mounts require fuse-overlayfs and /dev/fuse: {error}")
-        })?;
+        .stderr(log);
+    terminate_with_parent(&mut command);
     startup.fuse_home = Some(merged.clone());
+    let child = spawn_session_child(command, false).await.map_err(|error| {
+        anyhow::anyhow!("nested HOME mounts require fuse-overlayfs and /dev/fuse: {error}")
+    })?;
     startup.add_proxy(child);
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     loop {

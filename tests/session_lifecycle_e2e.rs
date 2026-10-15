@@ -4911,6 +4911,7 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
     let home_text = home.display().to_string();
     let mut client = RpcClient::start_with_env(&[
+        ("KWIN_MCP_E2E_COPY_BINARY", "1"),
         ("HOME", &home_text),
         ("XDG_CONFIG_HOME", &format!("{home_text}/.config")),
         ("XDG_DATA_HOME", &format!("{home_text}/.local/share")),
@@ -4988,12 +4989,29 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
         !disk.join("overlay-upper/.local/share/populated").exists(),
         "populated files were staged into upper"
     );
+    let fuse_pids = child_named_processes(client.child.id(), "fuse-overlayfs");
+    let binary = client
+        .binary_copy
+        .as_ref()
+        .expect("private server executable");
+    let replacement = binary.with_extension("next");
+    std::fs::copy(binary, &replacement).expect("stage reload executable");
+    std::fs::rename(replacement, binary).expect("publish reload executable");
+    client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+    client.wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+    assert_eq!(
+        child_named_processes(client.child.id(), "fuse-overlayfs"),
+        fuse_pids,
+        "HOME helper did not survive reload"
+    );
     let report = dir.join("live-home-check.txt");
+
     let script = dir.join("live-home-check.sh");
     std::fs::write(
         &script,
         format!(
             r#"set -eu
+test -z "$(ls -A {})"
 test "$(cat {})" = mounted-data
 test "$(find {} -type f | wc -l)" -eq 4096
 test "$(cat {})" = home-entry-0
@@ -5009,6 +5027,7 @@ done
 if printf forbidden > {}; then exit 1; fi
 printf 'LIVE_HOME_LOWER_PASS\n' | tee {}
 "#,
+            quote(&dir.join("home-merged")),
             quote(&home.join("project/portal/visible.txt")),
             quote(&populated),
             quote(&populated.join("entry-0000.txt")),
@@ -5082,7 +5101,7 @@ printf 'LIVE_HOME_LOWER_PASS\n' | tee {}
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
     println!(
-        "PASS: FUSE live HOME lower, staged_bytes=0, 4096 populated files, read-only nested mount, visible bytes, copy-on-write, one overlay, session_start={}ms, rendered output, host files unchanged, cleanup",
+        "PASS: FUSE live HOME lower, staged_bytes=0, 4096 populated files, read-only nested mount, visible bytes, copy-on-write, one overlay, session_start={}ms, reload preserves the helper and files, source alias hidden, rendered output, host files unchanged, cleanup",
         startup.as_millis()
     );
 }
