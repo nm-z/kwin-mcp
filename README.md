@@ -162,14 +162,30 @@ still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
 
 When copying an app profile inside the session to use as a separate writable
-`--user-data-dir`, make the copy dereference symlinks and keep its directories
-writable. A live SQLite database in HOME may be a symlink to the read-only
+`--user-data-dir`, keep copied directories writable and materialize only live
+SQLite alias links. A live database in HOME may be a symlink to the read-only
 `/run/kwin-mcp-host-sqlite` alias; `rsync -a` preserves that symlink, so the
-copied profile still points at the read-only database. For example:
+copied profile still points at the read-only database. This copies the profile
+while preserving its other symlinks, then replaces links only when their
+resolved targets remain inside the read-only SQLite alias:
 
 ```bash
-rsync -aL --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \
+rsync -a --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \
   "$HOME/.config/Codex/" "$HOME/.codex-kwin/"
+find "$HOME/.codex-kwin" -type l -lname '/run/kwin-mcp-host-sqlite/*' \
+  -exec sh -c '
+    for link do
+      target=$(readlink -f -- "$link") || exit
+      case "$target" in
+        /run/kwin-mcp-host-sqlite/*) ;;
+        *) continue ;;
+      esac
+      copy=$(mktemp "${link}.kwin-mcp-copy.XXXXXX") || exit
+      cp -- "$target" "$copy" || exit
+      chmod u+rw -- "$copy" || exit
+      mv -f -- "$copy" "$link" || exit
+    done
+  ' sh {} +
 ```
 
 Live database directory aliases also expose their siblings read-only under

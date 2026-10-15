@@ -1830,6 +1830,12 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
          INSERT INTO retained_set VALUES ('host-set');",
         )
         .expect("seed host Codex database fixture");
+    let profile_marker = home.join(".config/Codex/Default/profile-marker.txt");
+    std::fs::write(&profile_marker, "synthetic profile marker\n")
+        .expect("write profile marker fixture");
+    let profile_link = home.join(".config/Codex/Default/profile-link.txt");
+    std::os::unix::fs::symlink("profile-marker.txt", &profile_link)
+        .expect("create unrelated profile symlink fixture");
 
     // A host app keeps writing its thread store for the whole session.
     struct LiveWriter {
@@ -1894,13 +1900,14 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
     let link_preserving_copy =
         home.join(".codex-kwin-link-preserving/Default/First Party Sets/first_party_sets.db");
     let writable_copy = home.join(".codex-kwin/Default/First Party Sets/first_party_sets.db");
-    let copied_codex_cookies = home.join(".codex-kwin-link-preserving/Default/Network/Cookies");
+    let copied_codex_cookies = home.join(".codex-kwin/Default/Network/Cookies");
+    let profile_link_copy = home.join(".codex-kwin/Default/profile-link.txt");
     call_tool(
         &mut client,
         3,
         "launch_app",
         json!({"command":format!(
-            "rsync -a --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin-link-preserving/\" && rsync -aL --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin/\" && KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_COOKIES={} KWIN_SQLITE_PROBE_CODEX_COOKIES={} KWIN_SQLITE_PROBE_LINK_PRESERVING_COPY={} KWIN_SQLITE_PROBE_WRITABLE_COPY={} KWIN_SQLITE_PROBE_COPIED_CODEX_COOKIES={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_probe --nocapture; konsole",
+            "rsync -a --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin-link-preserving/\" && rsync -a --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin/\" && find \"$HOME/.codex-kwin\" -type l -lname '/run/kwin-mcp-host-sqlite/*' -exec sh -c 'for link do target=$(readlink -f -- \"$link\") || exit; case \"$target\" in /run/kwin-mcp-host-sqlite/*) ;; *) continue ;; esac; copy=$(mktemp \"${{link}}.kwin-mcp-copy.XXXXXX\") || exit; cp -- \"$target\" \"$copy\" || exit; chmod u+rw -- \"$copy\" || exit; mv -f -- \"$copy\" \"$link\" || exit; done' sh {{}} + && KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_COOKIES={} KWIN_SQLITE_PROBE_CODEX_COOKIES={} KWIN_SQLITE_PROBE_LINK_PRESERVING_COPY={} KWIN_SQLITE_PROBE_WRITABLE_COPY={} KWIN_SQLITE_PROBE_COPIED_CODEX_COOKIES={} KWIN_SQLITE_PROBE_PROFILE_LINK={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_probe --nocapture; konsole",
             shlex::try_quote(&database.display().to_string()).expect("quote database"),
             shlex::try_quote(&cookie_database.display().to_string()).expect("quote cookies"),
             shlex::try_quote(&codex_cookie_database.display().to_string())
@@ -1910,6 +1917,8 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
             shlex::try_quote(&writable_copy.display().to_string()).expect("quote writable copy"),
             shlex::try_quote(&copied_codex_cookies.display().to_string())
                 .expect("quote copied Codex cookies"),
+            shlex::try_quote(&profile_link_copy.display().to_string())
+                .expect("quote unrelated profile link"),
             shlex::try_quote(&report.display().to_string()).expect("quote report"),
             shlex::try_quote(&probe.display().to_string()).expect("quote probe"),
         )}),
@@ -1938,7 +1947,7 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         .expect("host writer");
     assert_eq!(
         result.trim(),
-        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1",
+        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1 unrelated_link_preserved=1",
         "live database reads or read-only protection failed"
     );
 
@@ -1995,6 +2004,7 @@ fn session_sqlite_probe() {
     let writable_copy = std::env::var("KWIN_SQLITE_PROBE_WRITABLE_COPY").expect("writable copy");
     let copied_codex_cookies =
         std::env::var("KWIN_SQLITE_PROBE_COPIED_CODEX_COOKIES").expect("copied Codex cookies");
+    let profile_link = std::env::var("KWIN_SQLITE_PROBE_PROFILE_LINK").expect("profile symlink");
     let report = std::env::var("KWIN_SQLITE_PROBE_REPORT").expect("probe report");
     for flags in [
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2066,9 +2076,19 @@ fn session_sqlite_probe() {
         )
         .expect("read private profile copy");
     assert_eq!(private_rows, 1);
+    assert!(
+        std::fs::symlink_metadata(&profile_link)
+            .expect("unrelated profile symlink")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&profile_link).expect("read unrelated profile symlink"),
+        "synthetic profile marker\n"
+    );
     std::fs::write(
         report,
-        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1\n",
+        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1 unrelated_link_preserved=1\n",
     )
     .expect("probe report");
 }
