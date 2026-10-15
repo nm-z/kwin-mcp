@@ -118,6 +118,60 @@ absolute paths under HOME in `writable_paths` when starting a new session.
 Explicit copies still share the 20-second startup deadline; this option does not
 make existing read-only host mounts writable or change a running session.
 
+### Dedicated persistent application directories
+
+`session_start` accepts an optional `persistent_paths` array of existing absolute
+directory paths under the server's HOME. Each directory is mounted directly
+read-write at the same path in the session. Its files remain in that directory
+after `session_stop`, autoclean, TTL expiry, or server replacement. Pass the same
+paths when creating the replacement session. The start result reports the
+accepted `persistent_paths`; omitting the parameter keeps storage disposable.
+
+For example, a browser gateway can start its server with an empty, dedicated
+HOME and create a private profile directory there:
+
+```bash
+mkdir -p "$HOME/.local/share/ai-mux/gateway-chrome"
+chmod 700 "$HOME/.local/share/ai-mux/gateway-chrome"
+```
+
+Then pass that absolute path (MCP arguments do not expand `$HOME`):
+
+```json
+{"persistent_paths":["/absolute/private-home/.local/share/ai-mux/gateway-chrome"]}
+```
+
+Launch Chrome with `--user-data-dir` pointing to that directory. Authentication
+stays browser-owned: kwin-mcp does not inspect, copy, merge, or export the
+directory's cookies or tokens. This mount is excluded from overlay staging,
+live SQLite handling, host socket aliases, and automatic browser cookie
+persistence. Sign in through the viewer as needed. The supervisor must stop its
+browser and exclusively own the directory before reusing it; kwin-mcp does not
+arbitrate concurrent browser instances. The supervisor also owns deletion of
+the persistent directory.
+
+Directories must belong to the server's effective UID with mode `0700`, and
+every ancestor must belong to that UID or root and must not be writable by
+group or others. Symlinks in the path, `..`, overlapping or duplicate paths,
+overlap with `writable_paths`, nested mounted filesystems, standard browser profile locations, desktop config
+overrides, cookie state, and session storage are rejected. Use a dedicated
+profile rather than a normal host browser directory. The validated source inode
+is pinned until the mount is installed, so replacing its pathname during startup
+does not redirect the writable mount. The option does not hide other host HOME
+contents: gateways requiring a clean HOME must supply that HOME and their XDG
+directories when launching the server.
+
+Run the real-system regression check with a built binary and an evidence
+directory beneath a private, non-shared ancestor:
+
+```bash
+ruby tests/persistent_paths_e2e.rb target/debug/kwin-mcp /absolute/private/evidence
+```
+
+It uses a fresh HOME and a filtered user bus that denies host wallet access,
+checks path rejection, source replacement during startup, two mounts, session/server replacement, autoclean, and
+the default disposable behavior. It never opens a real browser profile.
+
 ### Session memory limits
 
 Each stdio server watches its launching client with a Linux pidfd. When that
