@@ -11,6 +11,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_LIFECYCLE_LOG_MAX_BYTES: usize = 1024 * 1024;
 
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to clean test directory {}: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
 struct RpcClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -3905,7 +3920,13 @@ fn launch_chatgpt_with_disk_backed_host_tmpdir() {
         "kwin-mcp-e2e-tmpdir-{}-{nonce}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&temp_root).expect("create disk-backed host TMPDIR");
+    use std::os::unix::fs::DirBuilderExt;
+    let mut temp_dir = std::fs::DirBuilder::new();
+    temp_dir
+        .mode(0o700)
+        .create(&temp_root)
+        .expect("create disk-backed host TMPDIR");
+    let _temp_root_cleanup = RemoveDirOnDrop(temp_root.clone());
     let host_tmpdir = temp_root.display().to_string();
     let mut client = RpcClient::start_with_env(&[("TMPDIR", &host_tmpdir)]);
     initialize(&mut client);
