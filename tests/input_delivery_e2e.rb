@@ -124,7 +124,7 @@ class InputDeliveryProbe
     puts JSON.generate(proof)
   end
 
-  def electron
+  def launch_electron_fixture
     debug_port = ElectronTextFixture.free_port
     command = '/usr/lib/chatgpt/ChatGPT --user-data-dir="$HOME/.km-input-e2e-private" --force-renderer-accessibility' + " --remote-debugging-port=#{debug_port}"
     assert_success(call('launch_app', command: command))
@@ -144,6 +144,11 @@ class InputDeliveryProbe
       raise 'Electron composer did not become accessible' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
       sleep 0.5
     end
+    visible
+  end
+
+  def electron
+    visible = launch_electron_fixture
     # The composer starts focused; an explicit click verifies active-window routing.
     match = visible.match(/entry\tDo anything\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
     raise 'composer bounds missing' unless match
@@ -185,6 +190,70 @@ class InputDeliveryProbe
     nested_rich_contenteditable
     unverified_password_field
     unverified_embedded_rich_text
+  end
+
+  # Fast coverage for #376: initial text/selection, verified embedded text, and
+  # an opaque one-character rich editor whose contents cannot be verified.
+  def context
+    launch_electron_fixture
+    focus_entry('Do anything', 'context-empty')
+    text = 'Reply with only the number: 17*23'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    raise "empty composer was not verified: #{delivery}" unless delivery['status'] == 'verified'
+    assert_field_context(delivery, initial: [0, 0, 0], range: [0, 0], observed: [33, 0, 0])
+    raise 'independent tree lacks composer text' unless tree.include?(text)
+
+    # Select five ASCII characters in the middle, preserving both surrounding parts.
+    assert_success(call('keyboard_key', key: 'Home'))
+    5.times { assert_success(call('keyboard_key', key: 'Right')) }
+    5.times { assert_success(call('keyboard_key', key: 'shift+Right')) }
+    replacement = 'selection'
+    result = assert_success(call('keyboard_type', text: replacement))
+    delivery = result.fetch('delivery')
+    expected = text[0, 5] + replacement + text[10..]
+    raise "selection replacement was not verified: #{delivery}" unless delivery['status'] == 'verified'
+    assert_field_context(delivery, initial: [33, 0, 0], range: [5, 10], observed: [expected.length, 0, 0])
+    raise 'independent tree lacks replaced composer text' unless tree.include?(expected)
+
+    # A cleared Chromium contenteditable exposes a newline before input.
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    assert_success(call('keyboard_key', key: 'Backspace'))
+    response = call('keyboard_type', text: text)
+    raise "unexpected protocol error: #{response}" if response['error']
+    delivery = response.fetch('result').fetch('structuredContent').fetch('delivery')
+    File.write(File.join(@artifacts, 'cleared-composer.json'), JSON.pretty_generate(response))
+    raise "cleared composer did not preserve mismatch: #{delivery}" unless delivery['status'] == 'pending_or_mismatched' && response.dig('result', 'isError')
+    raise "wrong cleared expected count: #{delivery}" unless delivery['expected_field_characters'] == 34
+    assert_field_context(delivery, initial: [1, 0, 1], range: [0, 0], observed: [33, 0, 0])
+    result = response.fetch('result').fetch('structuredContent')
+    raise 'cleared composer suggested blind retry' unless result['retry_safe'] == false && result['submission_complete']
+    raise 'cleared composer lacks independent complete text' unless tree.include?(text)
+
+    nested_rich_contenteditable
+    unverified_embedded_rich_text
+    unverified_password_field
+  end
+
+  def focus_entry(label, tag)
+    match = tree.match(/entry\t#{Regexp.escape(label)}\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise "entry bounds missing: #{label}" unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen(tag).fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+  end
+
+  def assert_field_context(delivery, initial:, range:, observed:)
+    field = delivery.fetch('field')
+    raise "wrong field role: #{field}" unless field['role'] == 'Entry'
+    raise "wrong insertion range: #{field}" unless field.values_at('insertion_start', 'insertion_end') == range
+    keys = %w[characters embedded_object_characters line_break_characters]
+    raise "wrong initial snapshot: #{field}" unless field.fetch('initial').values_at(*keys) == initial
+    raise "wrong observed snapshot: #{field}" unless field.fetch('observed').values_at(*keys) == observed
+    # The receipt ID is usable with the public accessibility tool to inspect the target.
+    response = assert_success(call('accessibility_tree', root: field.fetch('node_id')))
+    raise "field ID returned no accessible nodes: #{response}" unless response.fetch('nodes').positive?
   end
 
   def rich_contenteditable
@@ -231,6 +300,7 @@ class InputDeliveryProbe
     raise "nested rich contenteditable used the wrong method: #{delivery}" unless delivery['method'] == 'atspi_rich_text'
     raise "wrong nested rich expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
     raise "nested rich focused node was not the single embedded-object character: #{delivery}" unless delivery['observed_field_characters'] == 1
+    assert_field_context(delivery, initial: [1, 1, 0], range: [0, 1], observed: [1, 1, 0])
     visible = tree
     File.write(File.join(@artifacts, 'electron-nested-rich-contenteditable.tree.txt'), visible)
     raise 'nested rich contenteditable accessibility tree lacks complete text' unless visible.include?(text)
@@ -255,6 +325,10 @@ class InputDeliveryProbe
     raise "embedded rich text used the wrong method: #{delivery}" unless delivery['method'] == 'atspi_rich_text'
     raise "wrong embedded rich-text expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
     raise "embedded rich-text focused node was not the single object character: #{delivery}" unless delivery['observed_field_characters'] == 1
+    field = delivery.fetch('field')
+    raise "opaque field did not identify the embedded object: #{field}" unless field.fetch('observed').values_at('characters', 'embedded_object_characters', 'line_break_characters') == [1, 1, 0]
+    raise 'opaque field omitted initial snapshot or insertion range' unless field['initial'] && field['insertion_start'] && field['insertion_end']
+    raise 'opaque field lost retry guidance' unless delivery.fetch('warning').include?('do not retype blindly')
     visible = tree
     File.write(File.join(@artifacts, 'electron-unverified-embedded.tree.txt'), visible)
     raise 'opaque embedded object unexpectedly exposed the typed text' if visible.include?(text)
@@ -361,6 +435,7 @@ class InputDeliveryProbe
     raise "password field did not report unverified: #{delivery}" unless delivery['status'] == 'unverified'
     raise "password field used an unexpected fallback method: #{delivery}" unless delivery['method'] == 'eis_roundtrip'
     raise "password field exposed text character counts: #{delivery}" unless delivery['expected_field_characters'].nil? && delivery['observed_field_characters'].nil?
+    raise 'password field exposed field details' if delivery.key?('field')
     screen('electron-password-after-return')
   end
 

@@ -1028,10 +1028,43 @@ async fn descendant_text_snapshot(
     })
 }
 
+// Counts explain placeholder-only snapshots without returning existing field text.
+#[derive(serde::Serialize)]
+pub struct TextFieldSnapshot {
+    characters: usize,
+    embedded_object_characters: usize,
+    line_break_characters: usize,
+}
+
+impl TextFieldSnapshot {
+    fn capture(text: &str) -> Self {
+        Self {
+            characters: text.chars().count(),
+            embedded_object_characters: text
+                .chars()
+                .filter(|c| *c == EMBEDDED_OBJECT_CHARACTER)
+                .count(),
+            line_break_characters: text.chars().filter(|c| matches!(*c, '\r' | '\n')).count(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct TextFieldReceipt {
+    node_id: String,
+    role: String,
+    initial: TextFieldSnapshot,
+    // Raw AT-SPI character offsets, before embedded-object normalization.
+    insertion_start: usize,
+    insertion_end: usize,
+    observed: Option<TextFieldSnapshot>,
+}
+
 pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    field: TextFieldReceipt,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
 }
@@ -1044,6 +1077,8 @@ pub struct TextDelivery {
     pub expected_field_characters: Option<usize>,
     pub observed_field_characters: Option<usize>,
     pub warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<TextFieldReceipt>,
 }
 
 /// Accessibility shows keyboard focus on a control that is not editable text.
@@ -1069,6 +1104,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: None,
             observed_field_characters: None,
+            field: None,
             warning: Some(format!(
                 "{focus}, so the text did not go into a field. Click the field first (a disabled field cannot take focus), then type again."
             )),
@@ -1082,6 +1118,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: None,
             observed_field_characters: None,
+            field: None,
             warning: Some(format!(
                 "KWin acknowledged all key events, but field text could not be verified: {reason}. Inspect the field before sending or retrying; retyping can duplicate text."
             )),
@@ -1105,6 +1142,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: Some(expected_count),
             observed_field_characters: observed_count,
+            field: None,
             warning: Some(warning),
         }
     }
@@ -1244,6 +1282,18 @@ impl TextReceipt {
                         if start < 0 || end < start || end > count {
                             anyhow::bail!("focused field supplied invalid insertion offsets");
                         }
+                        let field = TextFieldReceipt {
+                            node_id: format!(
+                                "{}{}",
+                                node.inner().destination(),
+                                node.inner().path()
+                            ),
+                            role: format!("{role:?}"),
+                            initial: TextFieldSnapshot::capture(&before),
+                            insertion_start: usize::try_from(start)?,
+                            insertion_end: usize::try_from(end)?,
+                            observed: None,
+                        };
                         let start = normalize_accessible_offset(&before, usize::try_from(start)?);
                         let end = normalize_accessible_offset(&before, usize::try_from(end)?);
                         let before = normalize_accessible_text(&before);
@@ -1268,6 +1318,7 @@ impl TextReceipt {
                             bus: bus.clone(),
                             object,
                             expected,
+                            field,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
                         });
@@ -1286,6 +1337,7 @@ impl TextReceipt {
         let expected_count = self.expected.chars().count();
         let initial_descendant_snapshot_error = self.initial_descendant_snapshot_error.clone();
         let mut observed_count = None;
+        let mut field = self.field;
         let mut has_embedded_object = false;
         let mut last_snapshot_error = None;
         let check = async {
@@ -1304,6 +1356,7 @@ impl TextReceipt {
                 let observed = text.get_text(0, -1).await?;
                 let normalized_observed = normalize_accessible_text(&observed);
                 observed_count = Some(observed.chars().count());
+                field.observed = Some(TextFieldSnapshot::capture(&observed));
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
                 }
@@ -1345,13 +1398,14 @@ impl TextReceipt {
                 tokio::time::sleep(TEXT_DELIVERY_POLL).await;
             }
         };
-        match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
+        let mut delivery = match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
             Ok(Ok(method)) => TextDelivery {
                 status: "verified",
                 method,
                 compositor_acknowledged: true,
                 expected_field_characters: Some(expected_count),
                 observed_field_characters: observed_count,
+                field: None,
                 warning: None,
             },
             Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
@@ -1379,9 +1433,12 @@ impl TextReceipt {
                     compositor_acknowledged: true,
                     expected_field_characters: Some(expected_count),
                     observed_field_characters: observed_count,
+                    field: None,
                     warning: Some(warning),
                 }
             }
-        }
+        };
+        delivery.field = Some(field);
+        delivery
     }
 }

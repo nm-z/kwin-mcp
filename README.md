@@ -493,8 +493,20 @@ reports `unverified` because embedded rich-text content may not be fully
 exposed through AT-SPI. Otherwise, a field that still differs after the
 bounded wait reports `pending_or_mismatched` as an error. Inspect the field
 before sending or retrying: delayed input can otherwise be duplicated.
+
+When a field was captured before input, `delivery.field` identifies its AT-SPI
+`node_id` (usable as the `accessibility_tree` root) and role. Its `initial` and
+last `observed` snapshots report `characters`, `embedded_object_characters`
+(U+FFFC) and `line_break_characters` (CR/LF), without returning the field's
+existing text. `insertion_start` and `insertion_end` are the original AT-SPI
+character offsets before placeholder normalization: equal offsets mean a caret
+insertion, while a nonempty range means replacement of a selection. These
+snapshots describe the captured target and do not establish that it retained
+focus. `observed: null` means no post-input text snapshot was available. Use
+these details to distinguish a one-character placeholder from a line break and
+to understand why the expected field length exceeds the submitted length.
 Passwords, terminals and Tab/Return actions do not expose an application-text
-receipt.
+receipt or field details.
 
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
