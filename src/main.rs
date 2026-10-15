@@ -12114,6 +12114,8 @@ fn unavailable_session_error() -> McpError {
         message,
         Some(serde_json::json!({
             "reason": "session_handle_unavailable",
+            "session_status": "none_running",
+            "session_available_here": false,
             "session_id": null,
             "server_pid": server_pid,
             "session_list_scope": "current_process",
@@ -12150,7 +12152,7 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
     match record {
         Some(record) => {
             error.message = format!(
-                "{} The previous server (PID {}) recorded shutdown cleanup finished at Unix time {} (workdir cleanup: {}).",
+                "{} Session status is stopped. The previous server (PID {}) recorded shutdown cleanup finished at Unix time {} (workdir cleanup: {}).",
                 error.message,
                 record.server_pid,
                 record.finished_at_unix_seconds,
@@ -12164,6 +12166,15 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
             data.insert(
                 "previous_server_cleanup".to_owned(),
                 serde_json::json!(SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED),
+            );
+            data.insert("session_status".to_owned(), serde_json::json!("stopped"));
+            data.insert(
+                "session_stopped_at_unix_seconds".to_owned(),
+                serde_json::json!(record.finished_at_unix_seconds),
+            );
+            data.insert(
+                "session_end_reason".to_owned(),
+                serde_json::json!(record.reason.as_str()),
             );
             data.insert(
                 "previous_server_cleanup_record".to_owned(),
@@ -12209,12 +12220,15 @@ fn unknown_session_error(id: &str) -> McpError {
         .and_then(|id| id.split_once('-'))
         .and_then(|(pid, _)| pid.parse::<u32>().ok());
     let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
-    let (reason, message, recovery) = if let Some(other_server_pid) = other_server_pid {
+    let (reason, session_status, message, recovery) = if let Some(other_server_pid) =
+        other_server_pid
+    {
         let recovery = format!(
             "If process {other_server_pid} is still running, retry this request with that server. Otherwise call session_start without session_id and relaunch your applications."
         );
         (
             "different_server_process",
+            "owned_by_another_process",
             format!(
                 "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them and cannot be reattached by a fresh server. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
             ),
@@ -12224,6 +12238,7 @@ fn unknown_session_error(id: &str) -> McpError {
         let recovery = "Call session_list to check this server. If the desktop is absent, call session_start without session_id and relaunch your applications.".to_owned();
         (
             "session_not_found",
+            "not_found",
             format!(
                 "session_id '{id}' is not known to kwin-mcp process {server_pid}; it may have been stopped, expired, or created by another server. {recovery}"
             ),
@@ -12234,6 +12249,8 @@ fn unknown_session_error(id: &str) -> McpError {
         message,
         Some(serde_json::json!({
             "reason": reason,
+            "session_status": session_status,
+            "session_available_here": false,
             "session_id": id,
             "server_pid": server_pid,
             "session_server_pid": session_server_pid,
@@ -12450,7 +12467,7 @@ impl SessionRouter {
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            format!("List live isolated sessions owned by this kwin-mcp process. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports its previous server's shutdown record when available. {SESSION_OWNERSHIP_NOTICE}"),
+            format!("List live isolated sessions owned by this kwin-mcp process. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, previous shutdown details when available, and recovery guidance. {SESSION_OWNERSHIP_NOTICE}"),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -12469,7 +12486,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. session_list covers only this kwin-mcp process and may include other agents' sessions. After DSH/client migration or a server restart, an old handle cannot be resumed in the replacement process; its unavailable-handle error reports previous shutdown cleanup when recorded, otherwise says cleanup is unconfirmed. Start a new session and relaunch the applications.",
+            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. session_list covers only this kwin-mcp process and may include other agents' sessions. After DSH/client migration or a server restart, an old handle cannot be resumed in the replacement process. Its unavailable-handle error includes session_status: stopped when shutdown is recorded, owned_by_another_process when the final state is unknown, or not_found; start a new session and relaunch the applications when the old server has stopped.",
             info.instructions.unwrap_or_default()
         ));
         info

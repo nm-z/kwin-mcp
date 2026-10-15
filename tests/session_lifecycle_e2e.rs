@@ -4157,6 +4157,14 @@ fn discovery_creates_no_session_processes() {
         "{unavailable}"
     );
     assert_eq!(
+        unavailable["error"]["data"]["session_status"], "owned_by_another_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_available_here"], false,
+        "{unavailable}"
+    );
+    assert_eq!(
         unavailable["error"]["data"]["previous_server_cleanup"],
         "not_confirmed_from_current_process",
         "{unavailable}"
@@ -4173,6 +4181,10 @@ fn discovery_creates_no_session_processes() {
     let no_live = call_tool(&mut client, 4, "window_list", json!({}));
     assert_eq!(
         no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    assert_eq!(
+        no_live["error"]["data"]["session_status"], "none_running",
         "{no_live}"
     );
     let sessions = call_tool(&mut client, 5, "session_list", json!({}));
@@ -4304,6 +4316,14 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
         response["error"]["data"]["reason"], "different_server_process",
         "{response}"
     );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "owned_by_another_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_available_here"], false,
+        "{response}"
+    );
     assert_eq!(response["error"]["data"]["session_id"], session_id);
     assert_eq!(response["error"]["data"]["server_pid"], server_pid);
     assert_eq!(
@@ -4317,6 +4337,26 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     assert!(
         message.contains("session_start without session_id"),
         "{message}"
+    );
+
+    let local_missing_id = format!("s{server_pid}-999999");
+    let local_missing = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":local_missing_id}),
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["reason"], "session_not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_status"], "not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_available_here"], false,
+        "{local_missing}"
     );
     assert!(direct_children(server_pid).is_empty());
     client.stop_process();
@@ -4432,6 +4472,24 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     );
     assert_eq!(
         response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "stopped",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_stopped_at_unix_seconds"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_end_reason"], "server_shutdown",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is stopped")),
         "{response}"
     );
     assert_eq!(
