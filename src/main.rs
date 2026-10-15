@@ -310,6 +310,7 @@ mod kwin_script {
     const KWIN_SCRIPT_INTERFACE: &str = "org.kde.kwin.Script";
     const KWIN_CALLBACK_INTERFACE: &str = "org.kde.KWinMCP";
     const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+    pub(crate) const SCRIPT_DIRECTORY: &str = "kwin-scripts";
 
     static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -340,7 +341,20 @@ mod kwin_script {
         callDBus({our_name_json},{callback_path_json},'{KWIN_CALLBACK_INTERFACE}','result',JSON.stringify(result));"
         );
         let object_path = zbus::zvariant::ObjectPath::try_from(callback_path.clone())?;
-        let script_file = host_xdg_dir.join(format!("{marker}.js"));
+        let disk_scripts = crate::session_disk_path(host_xdg_dir).join(SCRIPT_DIRECTORY);
+        // Sessions created before this directory was introduced can survive a
+        // source reload, but their mount namespace has no disk-backed alias.
+        let (script_directory, container_directory) = if disk_scripts.is_dir() {
+            (disk_scripts, host_xdg_dir.join(SCRIPT_DIRECTORY))
+        } else {
+            (host_xdg_dir.to_owned(), host_xdg_dir.to_owned())
+        };
+        let filename = format!("{marker}.js");
+        let script_file = script_directory.join(&filename);
+        let container_script_path = container_directory
+            .join(filename)
+            .to_string_lossy()
+            .to_string();
         let mut cleanup = ScriptCleanup {
             conn: conn.clone(),
             kwin_unique: kwin_unique.to_owned(),
@@ -355,15 +369,20 @@ mod kwin_script {
         };
 
         let result = async {
-            {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&cleanup.script_file)?;
-                cleanup.file_created = true;
-                file.write_all(script.as_bytes())?;
-            }
-            let container_script_path = cleanup.script_file.to_string_lossy().to_string();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cleanup.script_file)
+                .and_then(|mut file| {
+                    cleanup.file_created = true;
+                    file.write_all(script.as_bytes())
+                })
+                .map_err(|error| {
+                    KwinError::Msg(format!(
+                        "prepare KWin script: {}",
+                        crate::describe_write_failure(&cleanup.script_file, &error)
+                    ))
+                })?;
             let (tx, rx) = tokio::sync::oneshot::channel::<String>();
             let callback = KWinCallback {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -4424,6 +4443,9 @@ fn prepare_host_view(
             gib(free)
         );
     }
+    let scripts = disk.join(kwin_script::SCRIPT_DIRECTORY);
+    std::fs::create_dir(&scripts)
+        .map_err(|e| anyhow::anyhow!("create KWin script storage {}: {e}", scripts.display()))?;
     service.set_start_stage("scanning host sockets and processes");
     let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
@@ -5396,7 +5418,7 @@ fn session_disk_root() -> std::path::PathBuf {
 }
 
 /// The disk-backed twin of a session workdir: its overlay upper, work and
-/// staging layers.
+/// staging layers, and temporary KWin scripts.
 fn session_disk_path(workdir: &Path) -> std::path::PathBuf {
     session_disk_root().join(workdir.file_name().unwrap_or_default())
 }
@@ -6203,7 +6225,7 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
     if let Ok(stat) = nix::sys::statvfs::statvfs(directory) {
         let free = stat.blocks_available().saturating_mul(stat.fragment_size());
         message.push_str(&format!(
-            "; the filesystem itself has {} free. The session workdir, including its HOME overlay upper layer, counts against this limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
+            "; the filesystem itself has {} free. Files owned by this user on this filesystem count against its limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
             gib(free)
         ));
     }
@@ -9054,6 +9076,8 @@ impl KwinMcp {
         let home_kscreenlockerrc = format!("{home}/.config/kscreenlockerrc");
         let home_kcmfonts = format!("{home}/.config/kcmfonts");
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
+        let script_directory = session_disk_path(&host_xdg_dir).join(kwin_script::SCRIPT_DIRECTORY);
+        let container_script_directory = host_xdg_dir.join(kwin_script::SCRIPT_DIRECTORY);
         cmd.args(["--dev", "/dev"]);
         let trimmed_dri = usable_dri_nodes(nvidia_gbm_installed());
         match &trimmed_dri {
@@ -9091,6 +9115,11 @@ impl KwinMcp {
             "--bind",
             &xdg_dir_str,
             &xdg_dir_str,
+            // Geometry/window inspection must not need a free page on /tmp
+            // before screenshot's PNG-save error or inline fallback can run.
+            "--ro-bind",
+            &script_directory.display().to_string(),
+            &container_script_directory.display().to_string(),
             // System config overrides (read-only)
             "--ro-bind",
             &atspi_conf_path.display().to_string(),
