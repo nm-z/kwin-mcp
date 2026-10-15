@@ -32,7 +32,7 @@ To resize a maximized window with KWin's native controls, restore it with the se
 
 A successful `org.kde.kwin.Script.run` response does not verify the resulting window geometry. Check `window_list` or screenshot metadata before reporting a resize as successful.
 
-`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete. Viewer input is forwarded immediately. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer may remain open while agent input resumes, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after a frame is presented, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). The old `--no-viewer` argument remains accepted for existing server commands.
+`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete. Viewer input is forwarded immediately. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer may remain open while agent input resumes, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after the host renderer successfully submits the first PipeWire frame for presentation, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). This reports renderer submission, not compositor acknowledgement. The old `--no-viewer` argument remains accepted for existing server commands.
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
@@ -260,6 +260,30 @@ the data; it does not confirm that an application consumed it.
 
 ## Sessions and reloads
 
+### Browser cookie continuity
+
+When a session stops, kwin-mcp saves its Chromium profile cookie databases under
+`${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/browser-cookies`, keyed by browser and
+profile. The directory is private (`0700`), and the databases are private (`0600`).
+The next session merges these cookies into its isolated copy of the host profile.
+For each cookie identity, the row with the newer `last_update_utc` wins; partitioned
+cookies retain their partition identity. The host browser profile stays read-only.
+History, cached pages, saved tabs, and other profile changes remain disposable.
+
+Cookies keep their existing encryption and require the copied host wallet key.
+Host cookie snapshots read only the database and WAL files, verify two identical
+observations, and check the resulting private SQLite copy. The host database and
+WAL together must fit within 64 MiB. If the files keep changing during the bounded
+copy attempts, an active rollback journal remains, a host snapshot fails while a
+saved jar is available, or the saved schema differs, kwin-mcp reports the cookie
+problem in `session_start`'s `cookie_errors` when startup can continue. If a saved
+jar has an incompatible schema, `session_start` uses the host snapshot; at
+`session_stop`, kwin-mcp replaces the incompatible saved jar with the session
+jar. Browser flush timeouts and cookie save failures are returned in
+`session_stop`'s `cookie_errors`; a browser process enumeration failure is
+reported there as well. Remove the profile's saved database from this directory
+to discard its session cookie history. This does not sign out the host browser.
+
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
 
@@ -349,11 +373,18 @@ applications. Check the previous application state before repeating input.
 acknowledgement. Its `delivery` separates that acknowledgement from application
 text verification. When the focused editable field exposes accessible text,
 `verified` confirms the complete expected insertion; expected/observed character
-counts accompany the receipt. Otherwise `unverified` warns that the application
-text has not been confirmed. A field that still differs after the bounded wait
-reports `pending_or_mismatched` as an error. Inspect the field before sending or
-retrying: delayed input can otherwise be duplicated. Passwords, terminals and
-Tab/Return actions do not expose an application-text receipt.
+counts accompany the receipt. For `atspi_rich_text`, the expected value is
+verified in accessible descendants while `observed_field_characters` continues
+to report the focused node's text length; an embedded-object placeholder can
+therefore report one observed character alongside a verified full value.
+Otherwise `unverified` warns that the application text has not been confirmed.
+When a timed-out check has seen U+FFFC in the focused text or a descendant, it
+reports `unverified` because embedded rich-text content may not be fully
+exposed through AT-SPI. Otherwise, a field that still differs after the
+bounded wait reports `pending_or_mismatched` as an error. Inspect the field
+before sending or retrying: delayed input can otherwise be duplicated.
+Passwords, terminals and Tab/Return actions do not expose an application-text
+receipt.
 
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies

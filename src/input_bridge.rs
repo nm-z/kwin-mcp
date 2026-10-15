@@ -934,13 +934,106 @@ const TEXT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const TEXT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TEXT_DELIVERY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const TEXT_DISCOVERY_MAX_NODES: usize = 5000;
+const TEXT_RICH_SNAPSHOT_MAX_NODES: usize = 512;
 const TEXT_SNAPSHOT_MAX_CHARS: i32 = 262_144;
+const TEXT_SNAPSHOT_MAX_CHARS_USIZE: usize = 262_144;
 const TEXT_WINDOW_BOUNDS_TOLERANCE: f64 = 2.0;
+const EMBEDDED_OBJECT_CHARACTER: char = '\u{fffc}';
+
+// AT-SPI represents some inline rich-text objects with U+FFFC. Ignore that
+// placeholder in text comparisons; the object's text may be exposed by children.
+fn normalize_accessible_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| *character != EMBEDDED_OBJECT_CHARACTER)
+        .collect()
+}
+
+fn normalize_accessible_offset(text: &str, offset: usize) -> usize {
+    text.chars()
+        .take(offset)
+        .filter(|character| *character != EMBEDDED_OBJECT_CHARACTER)
+        .count()
+}
+
+struct DescendantTextSnapshot {
+    text: String,
+    normalized_node_texts: std::collections::HashMap<String, String>,
+    has_embedded_object: bool,
+}
+
+async fn descendant_text_snapshot(
+    object: &atspi::ObjectRefOwned,
+    bus: &zbus::Connection,
+) -> anyhow::Result<DescendantTextSnapshot> {
+    use atspi::proxy::accessible::ObjectRefExt;
+    use atspi::proxy::proxy_ext::ProxyExt;
+
+    let root = object.as_accessible_proxy(bus).await?;
+    let root_children = root.get_children().await?;
+    let mut stack = Vec::with_capacity(root_children.len());
+    for child in root_children.into_iter().rev() {
+        stack.push(child);
+    }
+    let mut visited = 0;
+    let mut text = String::new();
+    let mut normalized_node_texts = std::collections::HashMap::new();
+    let mut text_characters: usize = 0;
+    let mut has_embedded_object = false;
+
+    while let Some(object) = stack.pop() {
+        visited += 1;
+        if visited > TEXT_RICH_SNAPSHOT_MAX_NODES {
+            anyhow::bail!("rich-text accessibility snapshot exceeded its node limit");
+        }
+        let node = object.as_accessible_proxy(bus).await?;
+        let children = node.get_children().await?;
+        let node_text = match node.proxies().await?.text().await {
+            Ok(text) => {
+                let count = text.character_count().await?;
+                if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {
+                    anyhow::bail!("rich-text descendant exceeds the text snapshot limit");
+                }
+                let value = text.get_text(0, -1).await?;
+                if value.chars().count() != usize::try_from(count)? {
+                    anyhow::bail!("rich-text descendant offsets do not match its text snapshot");
+                }
+                value
+            }
+            Err(atspi::AtspiError::InterfaceNotAvailable(_)) => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        has_embedded_object |= node_text.contains(EMBEDDED_OBJECT_CHARACTER);
+        let normalized_node_text = normalize_accessible_text(&node_text);
+        normalized_node_texts.insert(
+            node.inner().path().to_string(),
+            normalized_node_text.clone(),
+        );
+        if children.is_empty() && !node_text.is_empty() {
+            let count = node_text.chars().count();
+            text_characters = text_characters.saturating_add(count);
+            if text_characters > TEXT_SNAPSHOT_MAX_CHARS_USIZE {
+                anyhow::bail!("rich-text accessibility snapshot exceeds the text limit");
+            }
+            text.push_str(&normalized_node_text);
+        }
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+
+    Ok(DescendantTextSnapshot {
+        text,
+        normalized_node_texts,
+        has_embedded_object,
+    })
+}
 
 pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    initial_descendant_snapshot: Option<DescendantTextSnapshot>,
+    initial_descendant_snapshot_error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -991,6 +1084,27 @@ impl TextDelivery {
             warning: Some(format!(
                 "KWin acknowledged all key events, but field text could not be verified: {reason}. Inspect the field before sending or retrying; retyping can duplicate text."
             )),
+        }
+    }
+
+    fn rich_text_unavailable(
+        expected_count: usize,
+        observed_count: Option<usize>,
+        last_snapshot_error: Option<&str>,
+    ) -> Self {
+        let warning = match last_snapshot_error {
+            Some(error) => format!(
+                "KWin acknowledged all key events, but AT-SPI did not expose a complete value for the focused rich-text editor. A descendant snapshot failed: {error}. Inspect the field before sending or retrying; do not retype blindly."
+            ),
+            None => "KWin acknowledged all key events, but AT-SPI did not expose a complete value for the focused rich-text editor. Inspect the field before sending or retrying; do not retype blindly.".to_owned(),
+        };
+        Self {
+            status: "unverified",
+            method: "atspi_rich_text",
+            compositor_acknowledged: true,
+            expected_field_characters: Some(expected_count),
+            observed_field_characters: observed_count,
+            warning: Some(warning),
         }
     }
 }
@@ -1117,20 +1231,32 @@ impl TextReceipt {
                         if start < 0 || end < start || end > count {
                             anyhow::bail!("focused field supplied invalid insertion offsets");
                         }
-                        let start = usize::try_from(start)?;
-                        let end = usize::try_from(end)?;
+                        let start = normalize_accessible_offset(&before, usize::try_from(start)?);
+                        let end = normalize_accessible_offset(&before, usize::try_from(end)?);
+                        let before = normalize_accessible_text(&before);
+                        let before_count = before.chars().count();
+                        if start > before_count || end > before_count {
+                            anyhow::bail!("focused field supplied invalid text insertion offsets");
+                        }
                         let expected = before
                             .chars()
                             .take(start)
                             .chain(input.chars())
                             .chain(before.chars().skip(end))
                             .collect();
+                        let (initial_descendant_snapshot, initial_descendant_snapshot_error) =
+                            match descendant_text_snapshot(&object, &bus).await {
+                                Ok(snapshot) => (Some(snapshot), None),
+                                Err(error) => (None, Some(error.to_string())),
+                            };
                         drop(text);
                         drop(node);
                         return Ok(Self {
                             bus: bus.clone(),
                             object,
                             expected,
+                            initial_descendant_snapshot,
+                            initial_descendant_snapshot_error,
                         });
                     }
                     stack.extend(node.get_children().await?);
@@ -1145,12 +1271,16 @@ impl TextReceipt {
 
     pub async fn confirm(self) -> TextDelivery {
         let expected_count = self.expected.chars().count();
+        let initial_descendant_snapshot_error = self.initial_descendant_snapshot_error.clone();
         let mut observed_count = None;
+        let mut has_embedded_object = false;
+        let mut last_snapshot_error = None;
         let check = async {
             use atspi::proxy::accessible::ObjectRefExt;
             use atspi::proxy::proxy_ext::ProxyExt;
             let node = self.object.as_accessible_proxy(&self.bus).await?;
             let text = node.proxies().await?.text().await?;
+            let mut poll_count = 0;
             loop {
                 let states = node.get_state().await?;
                 if !states.contains(atspi::State::Focused)
@@ -1159,28 +1289,86 @@ impl TextReceipt {
                     anyhow::bail!("the target field lost focus or became hidden");
                 }
                 let observed = text.get_text(0, -1).await?;
+                let normalized_observed = normalize_accessible_text(&observed);
                 observed_count = Some(observed.chars().count());
-                if observed == self.expected {
-                    return Ok::<(), anyhow::Error>(());
+                if normalized_observed == self.expected {
+                    return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
                 }
+                has_embedded_object |= observed.contains(EMBEDDED_OBJECT_CHARACTER);
+                if poll_count == 0 || poll_count % 5 == 4 {
+                    match descendant_text_snapshot(&self.object, &self.bus).await {
+                        Ok(snapshot) => {
+                            has_embedded_object |= snapshot.has_embedded_object;
+                            let changed_descendant_matches =
+                                self.initial_descendant_snapshot
+                                    .as_ref()
+                                    .is_some_and(|initial| {
+                                        snapshot.normalized_node_texts.iter().any(
+                                            |(path, current)| {
+                                                current == &self.expected
+                                                    && initial
+                                                        .normalized_node_texts
+                                                        .get(path)
+                                                        .is_some_and(|before| current != before)
+                                            },
+                                        )
+                                    });
+                            let joined_text_matches = self
+                                .initial_descendant_snapshot
+                                .as_ref()
+                                .is_some_and(|initial| {
+                                    snapshot.text == self.expected && initial.text != self.expected
+                                });
+                            if changed_descendant_matches || joined_text_matches {
+                                // Keep this as the focused node's actual count. The
+                                // method identifies descendant-based verification.
+                                return Ok("atspi_rich_text");
+                            }
+                        }
+                        Err(error) => last_snapshot_error = Some(error.to_string()),
+                    }
+                }
+                poll_count += 1;
                 tokio::time::sleep(TEXT_DELIVERY_POLL).await;
             }
         };
         match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
-            Ok(Ok(())) => TextDelivery {
-                status: "verified", method: "atspi_focused_text", compositor_acknowledged: true,
-                expected_field_characters: Some(expected_count), observed_field_characters: observed_count,
-                warning: None,
-            },
-            Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
-            Err(_) => TextDelivery {
-                status: "pending_or_mismatched",
-                method: "atspi_focused_text",
+            Ok(Ok(method)) => TextDelivery {
+                status: "verified",
+                method,
                 compositor_acknowledged: true,
                 expected_field_characters: Some(expected_count),
                 observed_field_characters: observed_count,
-                warning: Some("KWin acknowledged the keys, but the focused field did not contain the complete expected text within 10s. Input may still arrive or the application may have transformed it. Inspect the field before sending or retrying; do not retype blindly.".to_owned()),
+                warning: None,
             },
+            Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
+            Err(_) if has_embedded_object => {
+                let snapshot_error = last_snapshot_error
+                    .as_deref()
+                    .or(initial_descendant_snapshot_error.as_deref());
+                TextDelivery::rich_text_unavailable(expected_count, observed_count, snapshot_error)
+            }
+            Err(_) => {
+                let mut warning = "KWin acknowledged the keys, but the focused field did not contain the complete expected text within 10s. Input may still arrive or the application may have transformed it.".to_owned();
+                if let Some(error) = last_snapshot_error {
+                    warning.push_str(&format!(" The last descendant snapshot failed: {error}."));
+                } else if let Some(error) = initial_descendant_snapshot_error {
+                    warning.push_str(&format!(
+                        " The pre-input descendant snapshot failed: {error}."
+                    ));
+                }
+                warning.push_str(
+                    " Inspect the field before sending or retrying; do not retype blindly.",
+                );
+                TextDelivery {
+                    status: "pending_or_mismatched",
+                    method: "atspi_focused_text",
+                    compositor_acknowledged: true,
+                    expected_field_characters: Some(expected_count),
+                    observed_field_characters: observed_count,
+                    warning: Some(warning),
+                }
+            }
         }
     }
 }

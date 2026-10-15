@@ -4132,6 +4132,115 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
+fn prepare_browser_cookies(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    baseline_root: &Path,
+) -> anyhow::Result<(Vec<kwin_mcp::browser_cookies::CookieRoot>, Vec<String>)> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(baseline_root)?;
+    std::fs::set_permissions(baseline_root, std::fs::Permissions::from_mode(0o700))?;
+    let state = kwin_mcp::browser_cookies::state_root()?;
+    if state.starts_with(target) {
+        plan.empty_dirs.push(state.clone());
+    }
+    let mut roots = Vec::new();
+    let mut cookie_errors = Vec::new();
+    for config in BROWSER_CONFIG_DIRS {
+        let host = target.join(config);
+        let saved = state.join(config);
+        let baseline = baseline_root.join(config);
+        let mut profiles = std::collections::BTreeSet::new();
+        for directory in [&host, &saved] {
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                {
+                    profiles.insert(entry.file_name());
+                }
+            }
+        }
+        for profile in profiles {
+            for name in ["Cookies", "Network/Cookies"] {
+                let database = host.join(&profile).join(name);
+                let previous = saved.join(&profile).join(name);
+                if !database.is_file() && !previous.is_file() {
+                    continue;
+                }
+                let upper = upper_file(plan, &database)?;
+                let mut merge_failed = false;
+                let result = if database.is_file() {
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                            merge_failed = true;
+                            let message = format!("{}: {error:#}", database.display());
+                            eprintln!(
+                                "session_start: preserving host cookie schema for {}: {error:#}",
+                                database.display()
+                            );
+                            cookie_errors.push(message);
+                        }
+                    })
+                } else {
+                    kwin_mcp::browser_cookies::snapshot(&previous, &upper)
+                };
+                if let Err(error) = result {
+                    // Never expose a live lower-layer WAL after a failed copy.
+                    // A saved jar is a safe fallback; without one, fail startup
+                    // rather than let the browser open an incoherent profile.
+                    if previous.is_file() {
+                        let message = format!(
+                            "{}: host cookie snapshot failed; using saved cookies instead: {error:#}",
+                            database.display()
+                        );
+                        eprintln!("session_start: {message}");
+                        cookie_errors.push(message);
+                        kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
+                    } else {
+                        return Err(
+                            error.context(format!("snapshot cookies for {}", database.display()))
+                        );
+                    }
+                }
+                if !kwin_mcp::browser_cookies::supports_cookie_jar(&upper)? {
+                    eprintln!(
+                        "session_start: skipping non-cookie SQLite database {}",
+                        database.display()
+                    );
+                    continue;
+                }
+                if !merge_failed {
+                    kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                }
+                let original = baseline.join(&profile).join(name);
+                std::fs::create_dir_all(
+                    original
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
+                )?;
+                kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
+            }
+        }
+        for overlay in &plan.overlays {
+            if let Ok(relative) = host.strip_prefix(&overlay.destination) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.join(relative),
+                    saved: saved.clone(),
+                    baseline: Some(baseline.clone()),
+                });
+            } else if overlay.destination.starts_with(&host) {
+                roots.push(kwin_mcp::browser_cookies::CookieRoot {
+                    upper: overlay.upper.clone(),
+                    saved: state.join(overlay.destination.strip_prefix(target)?),
+                    baseline: Some(baseline_root.join(overlay.destination.strip_prefix(target)?)),
+                });
+            }
+        }
+    }
+    Ok((roots, cookie_errors))
+}
+
 fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
@@ -4266,6 +4375,8 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
 struct HostView {
     overlay_plan: OverlayPlan,
     kdeglobals: String,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    cookie_errors: Vec<String>,
 }
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
@@ -4350,6 +4461,8 @@ fn prepare_host_view(
     service.set_start_stage("preparing browser profiles");
     let discarded = discarded_session_databases(target);
     empty_session_databases(&overlay_plan, &discarded)?;
+    let (cookie_roots, cookie_errors) =
+        prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
@@ -4364,6 +4477,8 @@ fn prepare_host_view(
     Ok(HostView {
         overlay_plan,
         kdeglobals,
+        cookie_roots,
+        cookie_errors,
     })
 }
 
@@ -4644,6 +4759,8 @@ struct Session {
     /// Why a requested viewer could not start when viewer_child is None.
     viewer_unavailable: Option<String>,
     overlay_work_paths: Vec<PathBuf>,
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    cookie_errors: Vec<String>,
     oversized_read_only_files: Vec<PathBuf>,
     _socket_links: SocketLinks,
     screen_width: u32,
@@ -5738,16 +5855,306 @@ impl WorkdirOwnership {
 }
 
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests. The session-local wallet is
-/// dropped first; nothing on the host is touched.
-async fn teardown_blocking(mut sess: Session) {
+/// async workers that answer other MCP requests. Browsers flush before the
+/// session-local wallet and sandbox stop; nothing on the host is touched.
+async fn teardown_blocking(mut sess: Session) -> Vec<String> {
+    let kwin_windows_closed = request_kwin_browser_close(&sess).await;
+    let cdp_close_attempted = request_cdp_browser_close(&sess).await;
+    let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
+    let sandbox_pid = sess.sandbox_child.id();
+    let mut cookie_errors = match tokio::task::spawn_blocking(move || {
+        close_session_browsers(sandbox_pid, graceful_close_attempted)
+    })
+    .await
+    {
+        Ok(errors) => errors,
+        Err(error) => {
+            let message = format!("browser shutdown worker failed: {error}");
+            eprintln!("teardown: {message}");
+            vec![message]
+        }
+    };
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
     }
-    let _ = tokio::task::spawn_blocking(move || teardown(sess)).await;
+    match tokio::task::spawn_blocking(move || teardown(sess)).await {
+        Ok(mut teardown_errors) => {
+            cookie_errors.append(&mut teardown_errors);
+            cookie_errors
+        }
+        Err(error) => {
+            let message = format!("session cleanup worker failed: {error}");
+            eprintln!("teardown: {message}");
+            cookie_errors.push(message);
+            cookie_errors
+        }
+    }
 }
 
-fn teardown(mut sess: Session) {
+const CDP_BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
+async fn request_kwin_browser_close(sess: &Session) -> usize {
+    let script = r#"
+        var browserNames = ["google-chrome-stable", "google-chrome", "chrome",
+            "chromium", "chromium-browser", "brave", "brave-browser", "vivaldi",
+            "vivaldi-stable", "microsoft-edge", "microsoft-edge-stable", "msedge"];
+        var matched = 0;
+        var closed = 0;
+        var windows = workspace.stackingOrder;
+        for (var i = windows.length - 1; i >= 0; --i) {
+            var w = windows[i];
+            if (!w.managed || w.deleted || w.desktopWindow || w.dock || w.outline) continue;
+            var resourceClass = (w.resourceClass || "").toLowerCase();
+            var resourceName = (w.resourceName || "").toLowerCase();
+            if (browserNames.indexOf(resourceClass) < 0 && browserNames.indexOf(resourceName) < 0) continue;
+            matched++;
+            if (w.closeable) {
+                w.closeWindow();
+                closed++;
+            }
+        }
+        var result = {matched: matched, closed: closed};
+    "#;
+    let report = match run_kwin_script(
+        &sess.kwin_conn,
+        &sess.kwin_unique_name,
+        &sess.host_xdg_dir,
+        script,
+    )
+    .await
+    {
+        Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("teardown: cannot parse KWin browser-close report: {error}");
+                return 0;
+            }
+        },
+        Err(error) => {
+            eprintln!("teardown: KWin browser-window close failed: {error}");
+            return 0;
+        }
+    };
+    let matched = report["matched"].as_u64().unwrap_or_default();
+    let closed = report["closed"].as_u64().unwrap_or_default();
+    eprintln!("teardown: KWin close requested for {closed}/{matched} Chromium window(s)");
+    usize::try_from(closed).unwrap_or_default()
+}
+
+async fn request_cdp_browser_close(sess: &Session) -> bool {
+    let Some(browser) = sess.cdp_browser.as_ref() else {
+        eprintln!("teardown: no CDP browser handle for graceful close");
+        return false;
+    };
+    use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
+    eprintln!("teardown: requesting graceful Chrome close through CDP");
+    match tokio::time::timeout(
+        CDP_BROWSER_CLOSE_TIMEOUT,
+        browser.execute(CloseParams::default()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            eprintln!("teardown: CDP graceful browser close accepted");
+            true
+        }
+        Ok(Err(error)) => {
+            eprintln!("teardown: CDP graceful browser close failed: {error}");
+            true
+        }
+        Err(_) => {
+            eprintln!("teardown: CDP graceful browser close timed out");
+            true
+        }
+    }
+}
+
+/// Ask Chromium to close through CDP first, then signal only browser parents
+/// descended from this sandbox if any remain. The session's network services,
+/// compositor, and wallet stay alive until its cookie flush has completed.
+fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) -> Vec<String> {
+    let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
+        let message = "sandbox PID does not fit the process ID type".to_owned();
+        eprintln!("teardown: {message}");
+        return vec![message];
+    };
+    let processes = match procfs::process::all_processes() {
+        Ok(processes) => processes,
+        Err(error) => {
+            let message = format!("cannot enumerate processes for browser shutdown: {error}");
+            eprintln!("teardown: {message}");
+            return vec![message];
+        }
+    };
+    let processes = processes
+        .flatten()
+        .filter_map(|process| {
+            let stat = process.stat().ok()?;
+            Some((process, stat))
+        })
+        .collect::<Vec<_>>();
+    let mut descendants = std::collections::HashSet::from([sandbox_pid]);
+    loop {
+        let before = descendants.len();
+        for (process, stat) in &processes {
+            if descendants.contains(&stat.ppid) {
+                descendants.insert(process.pid);
+            }
+        }
+        if before == descendants.len() {
+            break;
+        }
+    }
+    let parents = processes
+        .iter()
+        .map(|(process, stat)| (process.pid, stat.ppid))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut candidates = Vec::new();
+    for (process, stat) in processes {
+        if !descendants.contains(&process.pid) || process.pid == sandbox_pid {
+            continue;
+        }
+        let Ok(command) = process.cmdline() else {
+            continue;
+        };
+        let process_type = command.iter().enumerate().find_map(|(index, argument)| {
+            if argument == "--type" {
+                command.get(index + 1).cloned()
+            } else {
+                argument.strip_prefix("--type=").map(str::to_owned)
+            }
+        });
+        let Ok(executable) = process.exe() else {
+            continue;
+        };
+        let Some(name) = executable.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        if !BROWSER_COMMANDS.contains(&name)
+            || matches!(name, "code" | "codium" | "vscodium" | "electron")
+        {
+            continue;
+        }
+        if process
+            .stat()
+            .is_ok_and(|current| current.starttime == stat.starttime)
+        {
+            candidates.push((
+                process,
+                stat.starttime,
+                stat.ppid,
+                name.to_owned(),
+                process_type,
+            ));
+        }
+    }
+    let candidate_pids = candidates
+        .iter()
+        .map(|(process, _, _, _, _)| process.pid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut main_pids = std::collections::HashSet::new();
+    let mut browsers = Vec::new();
+    for (process, started, parent, name, process_type) in candidates {
+        let mut ancestor = parent;
+        let mut seen = std::collections::HashSet::new();
+        let mut has_browser_ancestor = false;
+        while ancestor > 0 && ancestor != sandbox_pid && seen.insert(ancestor) {
+            if candidate_pids.contains(&ancestor) {
+                has_browser_ancestor = true;
+                break;
+            }
+            ancestor = *parents.get(&ancestor).unwrap_or(&0);
+        }
+        let is_main = match process_type.as_deref() {
+            Some("browser") => true,
+            Some(_) => false,
+            None => !has_browser_ancestor,
+        };
+        eprintln!(
+            "teardown: browser process pid={} name={name} type={} main={is_main}",
+            process.pid,
+            process_type.as_deref().unwrap_or("none")
+        );
+        if is_main {
+            main_pids.insert(process.pid);
+        }
+        browsers.push((process, started));
+    }
+    let requested = browsers.len();
+    let main_count = main_pids.len();
+    let mut cookie_errors = Vec::new();
+    eprintln!(
+        "teardown: graceful browser shutdown candidates={requested} mains={main_count} graceful_close_attempted={graceful_close_attempted}"
+    );
+    if graceful_close_attempted && !browsers.is_empty() {
+        let deadline = std::time::Instant::now() + CDP_BROWSER_CLOSE_TIMEOUT;
+        while !browsers.is_empty() && std::time::Instant::now() < deadline {
+            browsers.retain(|(process, started)| {
+                process
+                    .stat()
+                    .is_ok_and(|stat| stat.starttime == *started && stat.state != 'Z')
+            });
+            if !browsers.is_empty() {
+                std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+            }
+        }
+    }
+    if browsers.is_empty() {
+        if requested > 0 || graceful_close_attempted {
+            eprintln!("teardown: graceful browser shutdown completed");
+        }
+        return cookie_errors;
+    }
+    for (process, started) in &browsers {
+        if !main_pids.contains(&process.pid) {
+            continue;
+        }
+        if process
+            .stat()
+            .is_ok_and(|current| current.starttime == *started)
+            && let Err(error) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+        {
+            eprintln!(
+                "teardown: browser {} shutdown signal failed: {error}",
+                process.pid
+            );
+        }
+    }
+    let deadline = std::time::Instant::now() + BROWSER_SHUTDOWN_GRACE;
+    while !browsers.is_empty() {
+        browsers.retain(|(process, started)| {
+            process
+                .stat()
+                .is_ok_and(|stat| stat.starttime == *started && stat.state != 'Z')
+        });
+        if browsers.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let message = format!(
+                "{} browser(s) did not finish cookie flush within {:?}",
+                browsers.len(),
+                BROWSER_SHUTDOWN_GRACE
+            );
+            eprintln!("teardown: {message}");
+            cookie_errors.push(message);
+            break;
+        }
+        std::thread::sleep(BROWSER_SHUTDOWN_POLL);
+    }
+    if browsers.is_empty() && (requested > 0 || graceful_close_attempted) {
+        eprintln!("teardown: graceful browser shutdown completed");
+    }
+    cookie_errors
+}
+
+fn teardown(mut sess: Session) -> Vec<String> {
+    let mut cookie_errors = std::mem::take(&mut sess.cookie_errors);
     drop(sess.cdp_browser);
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
@@ -5760,6 +6167,11 @@ fn teardown(mut sess: Session) {
     terminate_child(sess.sandbox_child, true, "sandbox");
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
+    }
+    if let Err(error) = kwin_mcp::browser_cookies::persist(&sess.cookie_roots) {
+        let message = format!("{error:#}");
+        eprintln!("teardown: browser cookies were not saved: {error:#}");
+        cookie_errors.push(message);
     }
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
@@ -5775,6 +6187,7 @@ fn teardown(mut sess: Session) {
         eprintln!("teardown: retained {}: {error}", disk.display());
     }
     cleanup_stale_session_files(&sess.host_xdg_dir);
+    cookie_errors
 }
 
 /// Linux quotactl command for reading one user's quota (Q_GETQUOTA) and the
@@ -6457,8 +6870,8 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
 const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
-/// How long viewer_open waits for the viewer to show a frame
-/// before reporting it as still starting.
+/// How long viewer_open waits for the first successful host render submission
+/// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
 
@@ -6531,8 +6944,8 @@ async fn spawn_viewer(
     }
 }
 
-/// The viewer outcome: ready (a frame is showing in a host window), starting,
-/// unavailable with a reason, or closed.
+/// The viewer outcome: ready (the first session frame was submitted by the
+/// host renderer), starting, unavailable with a reason, or closed.
 fn viewer_report(
     host_xdg_dir: &Path,
     child: Option<&mut SessionProcess>,
@@ -8279,6 +8692,8 @@ impl KwinMcp {
         let HostView {
             mut overlay_plan,
             kdeglobals: mut kdeglobals_content,
+            cookie_roots,
+            cookie_errors,
         } = host_view;
         let ui_regular = qt_font_spec(UI_FONT_FAMILY, UI_FONT_SIZE, FONT_WEIGHT_REGULAR, false);
         let ui_small = qt_font_spec(
@@ -9100,6 +9515,8 @@ impl KwinMcp {
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
+            cookie_roots,
+            cookie_errors: cookie_errors.clone(),
             oversized_read_only_files: oversized_read_only_files.clone(),
             _socket_links: socket_links,
             screen_width: screen_w,
@@ -9124,6 +9541,7 @@ impl KwinMcp {
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
+            "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
@@ -9242,7 +9660,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after a frame is presented, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -9345,7 +9763,7 @@ impl KwinMcp {
             let pipewire = std::fs::read_to_string(host_xdg_dir.join("viewer-pipewire.json"))
                 .unwrap_or_else(|_| "not connected".to_owned());
             let reason = format!(
-                "viewer did not present a frame within {} seconds; last PipeWire state: {}",
+                "viewer did not submit a frame within {} seconds; last PipeWire state: {}",
                 VIEWER_READY_WAIT.as_secs(),
                 pipewire.trim()
             );
@@ -9465,13 +9883,14 @@ impl KwinMcp {
             .await?;
         let stopped = self.session.write().await.take();
         let had_session = stopped.is_some();
+        let mut cookie_errors = Vec::new();
         if let Some(sess) = stopped {
             if let Ok(mut clipboards) = self.clipboards.lock() {
                 clipboards
                     .entries
                     .remove(&sess.host_xdg_dir.join("wayland-0"));
             }
-            teardown_blocking(sess).await;
+            cookie_errors = teardown_blocking(sess).await;
         }
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
@@ -9479,14 +9898,14 @@ impl KwinMcp {
                     structured_result(
                         &peer,
                         "session stopped",
-                        serde_json::json!({"status": "stopped"}),
+                        serde_json::json!({"status": "stopped", "cookie_errors": cookie_errors}),
                     )
                     .await
                 } else {
                     structured_result(
                         &peer,
                         "no session running",
-                        serde_json::json!({"status": "none"}),
+                        serde_json::json!({"status": "none", "cookie_errors": cookie_errors}),
                     )
                     .await
                 });
@@ -9501,12 +9920,17 @@ impl KwinMcp {
                 } else {
                     ""
                 };
+                let cookie_note = if cookie_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Cookie save errors: {}.", cookie_errors.join("; "))
+                };
                 return Err(McpError::internal_error(
                     format!(
-                        "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.",
+                        "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.{cookie_note}",
                         dir.display()
                     ),
-                    None,
+                    Some(serde_json::json!({"cookie_errors": cookie_errors})),
                 ));
             }
         };
@@ -9528,6 +9952,7 @@ impl KwinMcp {
             serde_json::json!({
                 "status": status,
                 "workdir_removed": workdir,
+                "cookie_errors": cookie_errors,
             }),
         )
         .await)
@@ -10608,7 +11033,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility when available. delivery.status=verified confirms the field text; unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. not_in_field means accessibility showed focus on a non-editable control before and after the keys, so no field got the text and retry_safe is true; the warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. not_in_field means accessibility showed focus on a non-editable control before and after the keys, so no field got the text and retry_safe is true; the warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -12568,6 +12993,10 @@ struct SessionRestore {
     height: u32,
     cdp_port: u16,
     overlay_work_paths: Vec<PathBuf>,
+    #[serde(default)]
+    cookie_roots: Vec<kwin_mcp::browser_cookies::CookieRoot>,
+    #[serde(default)]
+    cookie_errors: Vec<String>,
     oversized_files: Vec<PathBuf>,
     socket_links: Vec<(PathBuf, PathBuf)>,
     idle_millis: u64,
@@ -12741,6 +13170,8 @@ impl SessionRouter {
                 viewer_child: saved.viewer.map(|pid| SessionProcess { pid, status: None }),
                 viewer_unavailable: None,
                 overlay_work_paths: saved.overlay_work_paths,
+                cookie_roots: saved.cookie_roots,
+                cookie_errors: saved.cookie_errors,
                 oversized_read_only_files: saved.oversized_files,
                 _socket_links: SocketLinks(saved.socket_links),
                 screen_width: saved.width,
@@ -12855,6 +13286,8 @@ impl SessionRouter {
                 height: session.screen_height,
                 cdp_port: session.cdp_forward_port,
                 overlay_work_paths: session.overlay_work_paths.clone(),
+                cookie_roots: session.cookie_roots.clone(),
+                cookie_errors: session.cookie_errors.clone(),
                 oversized_files: session.oversized_read_only_files.clone(),
                 socket_links: session._socket_links.0.clone(),
                 idle_millis: u64::try_from(session.last_activity.elapsed().as_millis())?,
