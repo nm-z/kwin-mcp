@@ -5351,12 +5351,12 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 // ── Session workdir autoclean ────────────────────────────────────────────
 //
-// --autoclean owns exactly one directory, the session workdir of this server
-// process, and moves through one explicit state machine:
+// --autoclean owns the session workdir and its disk-backed overlay twin, and
+// moves through one explicit state machine:
 //
 //   Idle  --claim (session_start, before the directory is created)--> Owned
-//   Owned --remove succeeded (workdir gone)--------------------------> Idle
-//   Owned --remove failed (workdir still there)---------------------> Owned
+//   Owned --remove succeeded (both directories gone)----------------> Idle
+//   Owned --remove failed (either directory still there)------------> Owned
 //
 // `claim` and `remove` are synchronous and each runs under a single lock
 // acquisition, so no await, cancellation, or hard timeout can split a
@@ -5479,7 +5479,22 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             ),
         ));
     }
-    remove_verified_workdir(dir)
+    remove_verified_session_storage(dir)
+}
+
+/// The caller has proved ownership of the workdir and its same-named disk
+/// twin. Remove the disk layers first, retaining the workdir and lease marker
+/// if that fails so a later stop or orphan sweep can retry the whole cleanup.
+/// An interrupted startup may have created the layers without publishing a
+/// Session, so its teardown cannot be relied on to remove them.
+fn remove_verified_session_storage(dir: &Path) -> std::io::Result<()> {
+    let disk = session_disk_path(dir);
+    for path in [&disk, dir] {
+        remove_verified_workdir(path).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("remove {}: {error}", path.display()))
+        })?;
+    }
+    Ok(())
 }
 
 /// Remove a directory after the caller has proved its ownership. This helper
@@ -5577,16 +5592,19 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
         {
             continue;
         }
-        let dir_text = dir.to_string_lossy();
-        let mount_prefix = format!("{dir_text}/");
-        if mounts
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(4))
-            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
-        {
+        let disk = session_disk_path(&dir);
+        let storage_mounted = [&dir, &disk].iter().any(|path| {
+            let dir_text = path.to_string_lossy();
+            let mount_prefix = format!("{dir_text}/");
+            mounts
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(4))
+                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
+        });
+        if storage_mounted {
             continue;
         }
-        match remove_verified_workdir(&dir) {
+        match remove_verified_session_storage(&dir) {
             Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
             Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
         }
