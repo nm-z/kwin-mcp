@@ -7917,12 +7917,25 @@ async fn poll_launch_window(
     }
 }
 
-fn launch_stderr_note(stderr: &str, capture_limit_reached: bool) -> String {
+fn launch_program_name(command: &str) -> Option<String> {
+    shlex::split(command)?
+        .into_iter()
+        .find(|word| !word.is_empty() && !word.contains('='))
+}
+
+fn launch_stderr_note(
+    stderr: &str,
+    capture_limit_reached: bool,
+    command_resolution: Option<&str>,
+) -> String {
     let mut note = if stderr.is_empty() {
         "no stderr output was captured; check the executable resolved inside the session and any required startup flags".to_owned()
     } else {
         format!("stderr:\n{}", stderr.trim_end())
     };
+    if let Some(resolution) = command_resolution {
+        note.push_str(&format!("\nfirst command token resolution: {resolution}"));
+    }
     if capture_limit_reached {
         note.push_str(&format!(
             "\nstderr capture reached its {} byte limit",
@@ -11375,7 +11388,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. If no window opens, stderr is returned with invalid UTF-8 replaced and a 16 KiB capture limit; raw bytes remain in sandbox.log. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. If no window opens, stderr is returned with invalid UTF-8 replaced and a 16 KiB capture limit, along with the first command token's session PATH resolution; raw bytes remain in sandbox.log. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -11484,6 +11497,8 @@ impl KwinMcp {
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
         let stderr_file = xdg.join(format!("launch-{launch_id}.stderr"));
+        let resolution_file = xdg.join(format!("launch-{launch_id}.resolution"));
+        let program_name = launch_program_name(&params.command);
         drop(
             std::fs::OpenOptions::new()
                 .write(true)
@@ -11493,7 +11508,27 @@ impl KwinMcp {
                 .map_err(KwinError::from)?,
         );
         let _stderr_file = LaunchDiagnosticFile(stderr_file.clone());
+        let _resolution_file = if program_name.is_some() {
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&resolution_file)
+                    .map_err(KwinError::from)?,
+            );
+            Some(LaunchDiagnosticFile(resolution_file.clone()))
+        } else {
+            None
+        };
         let mut checked_command = String::new();
+        if let Some(program_name) = program_name.as_deref() {
+            let quoted_resolution = shell_quote(&resolution_file.display().to_string());
+            checked_command.push_str(&format!(
+                "_kwin_mcp_launch_name={}; _kwin_mcp_launch_kind=$(type -t -- \"$_kwin_mcp_launch_name\"); case \"$_kwin_mcp_launch_kind\" in file) printf '%s -> %s' \"$_kwin_mcp_launch_name\" \"$(type -P -- \"$_kwin_mcp_launch_name\")\" > {quoted_resolution} ;; builtin|keyword|function|alias) printf '%s -> shell %s' \"$_kwin_mcp_launch_name\" \"$_kwin_mcp_launch_kind\" > {quoted_resolution} ;; *) printf '%s -> not found in session PATH' \"$_kwin_mcp_launch_name\" > {quoted_resolution} ;; esac\n",
+                shell_quote(program_name),
+            ));
+        }
         for path in launch_host_paths(&params.command) {
             let quoted = shell_quote(&path.display().to_string());
             checked_command.push_str(&format!(
@@ -11599,6 +11634,7 @@ impl KwinMcp {
         let stderr_bytes = std::fs::read(&stderr_file).unwrap_or_default();
         let stderr_capture_limit_reached = stderr_bytes.len() >= LAUNCH_STDERR_CAPTURE_LIMIT_BYTES;
         let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let command_resolution = std::fs::read_to_string(&resolution_file).ok();
         let invisible_path = std::fs::read_to_string(&path_error_file).ok();
         let _ = std::fs::remove_file(&path_error_file);
         if let Some(path) = invisible_path {
@@ -11678,12 +11714,17 @@ impl KwinMcp {
                 };
                 let text = format!(
                     "{text}\n{}",
-                    launch_stderr_note(&stderr, stderr_capture_limit_reached)
+                    launch_stderr_note(
+                        &stderr,
+                        stderr_capture_limit_reached,
+                        command_resolution.as_deref()
+                    )
                 );
                 let mut result = structured_result(&peer, text, serde_json::json!({
                     "action": "launch", "command": params.command, "window": "exited",
                     "exit_status": status, "cdp": false, "warning": warning,
                     "stderr": stderr, "stderr_capture_limit_reached": stderr_capture_limit_reached,
+                    "command_resolution": command_resolution,
                     "window_timeout_seconds": window_timeout.as_secs(),
                 })).await;
                 result.is_error = Some(status != 0);
@@ -11694,12 +11735,17 @@ impl KwinMcp {
                     "launched: {} (no window after {}s){suffix}\n{}",
                     params.command,
                     window_timeout.as_secs(),
-                    launch_stderr_note(&stderr, stderr_capture_limit_reached)
+                    launch_stderr_note(
+                        &stderr,
+                        stderr_capture_limit_reached,
+                        command_resolution.as_deref()
+                    )
                 );
                 Ok(structured_result(&peer, text, serde_json::json!({
                     "action": "launch", "command": params.command, "window": "timeout",
                     "cdp": false, "warning": warning, "stage": "waiting for a new window", "command_submitted": true,
                     "stderr": stderr, "stderr_capture_limit_reached": stderr_capture_limit_reached,
+                    "command_resolution": command_resolution,
                     "window_timeout_seconds": window_timeout.as_secs(),
                 })).await)
             }
