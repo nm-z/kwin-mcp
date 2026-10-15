@@ -15,7 +15,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
-| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
+| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). |
 | `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
@@ -25,6 +25,10 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+
+## Large accessibility trees
+
+`accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
 
 ## Resize a maximized session window
 
