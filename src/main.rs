@@ -9525,6 +9525,14 @@ impl KwinMcp {
             .iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
+        // Keep the startup guard responsible for the sandbox and staged FUSE
+        // image until every fallible session resource has been acquired.
+        let uinput_mouse_fd = std::os::fd::AsFd::as_fd(&uinput_mouse)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
+        let uinput_keyboard_fd = std::os::fd::AsFd::as_fd(&uinput_keyboard)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
@@ -9539,12 +9547,8 @@ impl KwinMcp {
             sandbox_child: sandbox_child.into(),
             sandbox_stdin: sandbox_stdin.into(),
             host_xdg_dir,
-            _uinput_mouse: std::os::fd::AsFd::as_fd(&uinput_mouse)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
-            _uinput_keyboard: std::os::fd::AsFd::as_fd(&uinput_keyboard)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
+            _uinput_mouse: uinput_mouse_fd,
+            _uinput_keyboard: uinput_keyboard_fd,
             cdp_browser: None,
             cdp_forward_port,
             service_proxy_children: service_proxy_children
