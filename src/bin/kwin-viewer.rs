@@ -15,12 +15,13 @@
 //! window. Mouse/keyboard events on the window are forwarded back into the
 //! container via org_kde_kwin_fake_input.
 
+use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
-use screen_13_window::WindowBuilder;
-use kwin_mcp::clipboard::{Clipboard, DispatchThread, Shutdown, DISPATCH_POLL_INTERVAL};
+use screen_13_window::{FrameContext, WindowBuilder};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
 use std::os::fd::AsFd;
@@ -95,7 +96,7 @@ fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 
 /// Atomically publish the viewer's lifecycle state: starting,
-/// ready (the first frame is queued for host-window presentation), closed, or failed.
+/// ready (the first session frame's render graph was submitted successfully), closed, or failed.
 fn write_status(session: &std::path::Path, state: &str, detail: &str) {
     let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
     let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id()});
@@ -853,8 +854,8 @@ fn window_loop(
     // Starting as None so the first frame triggers allocation.
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
-    let mut ready_reported = false;
-    let mut first_frame_submitted = false;
+    let ready_reported = Cell::new(false);
+    let first_frame_queued = Cell::new(false);
     let mut first_host_redraw = false;
     let mut first_frame_consumed = false;
     let mut startup_error = None;
@@ -863,7 +864,11 @@ fn window_loop(
     let mut next_title_check = Instant::now();
     let mut aspect = ViewerAspect::new(virt);
 
-    window.run(|mut frame| {
+    let remote_output = match &input_state.out {
+        InputOut::Local(_) => None,
+        InputOut::Remote(pipe) => Some(Arc::clone(pipe)),
+    };
+    let mut draw_frame = |mut frame: FrameContext<'_>| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
         if shutdown.requested() {
@@ -876,7 +881,7 @@ fn window_loop(
             eprintln!("kwin-viewer: first host window redraw");
         }
 
-        if !ready_reported && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+        if !ready_reported.get() && started.elapsed() >= FIRST_FRAME_TIMEOUT {
             let reason=frame_timeout_reason(status_dir);
             if let Some(dir)=status_dir {write_status(dir,"failed",&reason);}
             startup_error=Some(reason);
@@ -892,7 +897,7 @@ fn window_loop(
             }
             next_title_check = Instant::now() + Duration::from_millis(250);
         }
-        for event in frame.events {
+        for event in frame.events.iter() {
             if let Event::WindowEvent {
                 event: WindowEvent::Resized(size),
                 ..
@@ -913,7 +918,7 @@ fn window_loop(
         // Retain src_image across frames so when the mailbox is momentarily
         // empty we still re-blit the last known picture instead of flashing
         // black.
-        let latest = if first_frame_submitted {
+        let latest = if first_frame_queued.get() {
             take_frame(mailbox)
         } else {
             match wait_for_first_frame(
@@ -938,6 +943,7 @@ fn window_loop(
                 }
             }
         };
+        let mut session_frame_queued = false;
         if let Some(f) = latest {
             if !first_frame_consumed {
                 first_frame_consumed = true;
@@ -968,6 +974,7 @@ fn window_loop(
                         let staging_node = frame.render_graph.bind_node(staging);
                         let image_node = frame.render_graph.bind_node(image);
                         frame.render_graph.copy_buffer_to_image(staging_node, image_node);
+                        session_frame_queued = true;
                     }
                     Err(e) => eprintln!("kwin-viewer: staging buffer failed: {e:?}"),
                 }
@@ -979,16 +986,8 @@ fn window_loop(
             frame
                 .render_graph
                 .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
-            if !first_frame_submitted {
-                first_frame_submitted = true;
-                ready_reported = true;
-                eprintln!("kwin-viewer: first frame submitted for presentation");
-                if let Some(dir) = status_dir {
-                    write_status(dir, "ready", "first frame submitted to the host window");
-                }
-                if matches!(input_state.out, InputOut::Remote(_)) {
-                    input_state.out.send(Op::Presented);
-                }
+            if session_frame_queued {
+                first_frame_queued.set(true);
             }
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
@@ -1000,6 +999,22 @@ fn window_loop(
         // are arriving. Explicitly requesting a redraw each frame guarantees
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
+    };
+    window.run_with_submission_callback(&mut draw_frame, || {
+        if !ready_reported.get() && first_frame_queued.get() {
+            ready_reported.set(true);
+            eprintln!("kwin-viewer: first frame submitted for presentation");
+            if let Some(dir) = status_dir {
+                write_status(
+                    dir,
+                    "ready",
+                    "first session frame render submitted to the host window",
+                );
+            }
+            if let Some(pipe) = remote_output.as_ref() {
+                send_remote_op(pipe, Op::Presented);
+            }
+        }
     })?;
     if let Some(error)=startup_error {anyhow::bail!(error);}
     Ok(())
@@ -1546,13 +1561,19 @@ impl InputOut {
     fn send(&self, op: Op) {
         match self {
             InputOut::Local(gate) => gate.send(op),
-            InputOut::Remote(pipe) => {
-                let Ok(mut pipe) = pipe.lock() else { return };
-                if pipe.write_all(&op.encode()).and_then(|()| pipe.flush()).is_err() {
-                    eprintln!("kwin-viewer: remote input pipe closed");
-                }
-            }
+            InputOut::Remote(pipe) => send_remote_op(pipe, op),
         }
+    }
+}
+
+fn send_remote_op(pipe: &Arc<Mutex<std::process::ChildStdin>>, op: Op) {
+    let Ok(mut pipe) = pipe.lock() else { return };
+    if pipe
+        .write_all(&op.encode())
+        .and_then(|()| pipe.flush())
+        .is_err()
+    {
+        eprintln!("kwin-viewer: remote input pipe closed");
     }
 }
 

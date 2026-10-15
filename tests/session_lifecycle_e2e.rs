@@ -1660,6 +1660,14 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         viewer_log.contains("first PipeWire frame consumed by host window"),
         "viewer did not consume its first PipeWire frame: {opened}\n{viewer_log}"
     );
+    let consumed = viewer_log.find("first PipeWire frame consumed by host window");
+    let submitted = viewer_log.find("first frame submitted for presentation");
+    assert!(
+        consumed
+            .zip(submitted)
+            .is_some_and(|(consumed, submitted)| consumed < submitted),
+        "viewer reported submission before consuming its first PipeWire frame: {opened}\n{viewer_log}"
+    );
     let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
     assert!(
         process_alive(pid).unwrap_or(false),

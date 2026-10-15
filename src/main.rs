@@ -6861,7 +6861,7 @@ impl Drop for ToolCallMark {
         }
     }
 }
-/// How long viewer_open waits for the first frame to be queued for presentation
+/// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
@@ -6935,8 +6935,8 @@ async fn spawn_viewer(
     }
 }
 
-/// The viewer outcome: ready (the first frame is queued for host-window
-/// presentation), starting, unavailable with a reason, or closed.
+/// The viewer outcome: ready (the first session frame was submitted by the
+/// host renderer), starting, unavailable with a reason, or closed.
 fn viewer_report(
     host_xdg_dir: &Path,
     child: Option<&mut SessionProcess>,
@@ -9651,7 +9651,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready once the first PipeWire frame is queued for host-window presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,

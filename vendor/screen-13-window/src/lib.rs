@@ -57,16 +57,31 @@ impl Window {
     where
         F: FnMut(FrameContext),
     {
-        struct Application<F> {
+        self.run_with_submission_callback(draw_fn, || {})
+    }
+
+    /// Runs the window and calls `on_submission` after a render graph has been
+    /// accepted by `Display::present_image`.
+    pub fn run_with_submission_callback<F, P>(
+        self,
+        draw_fn: F,
+        on_submission: P,
+    ) -> Result<(), WindowError>
+    where
+        F: FnMut(FrameContext),
+        P: FnMut(),
+    {
+        struct Application<F, P> {
             active_window: Option<ActiveWindow>,
             data: WindowData,
             device: Arc<Device>,
             draw_fn: F,
+            on_submission: P,
             error: Option<WindowError>,
             primary_monitor: Option<MonitorHandle>,
         }
 
-        impl<F> Application<F> {
+        impl<F, P> Application<F, P> {
             fn create_display(
                 &mut self,
                 window: &winit::window::Window,
@@ -183,9 +198,10 @@ impl Window {
             }
         }
 
-        impl<F> ApplicationHandler for Application<F>
+        impl<F, P> ApplicationHandler for Application<F, P>
         where
             F: FnMut(FrameContext),
+            P: FnMut(),
         {
             fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
                 // Wait for Wayland's initial xdg configure before requesting a
@@ -281,7 +297,11 @@ impl Window {
                                 return;
                             }
 
-                            let draw = active_window.draw(&self.device, &mut self.draw_fn);
+                            let draw = active_window.draw(
+                                &self.device,
+                                &mut self.draw_fn,
+                                &mut self.on_submission,
+                            );
 
                             profiling::finish_frame!();
 
@@ -324,7 +344,8 @@ impl Window {
             fn draw(
                 &mut self,
                 device: &Arc<Device>,
-                mut f: impl FnMut(FrameContext),
+                f: &mut impl FnMut(FrameContext),
+                on_submission: &mut impl FnMut(),
             ) -> Result<bool, DisplayError> {
                 if let Some((width, height)) = self.display_resize.take() {
                     let mut swapchain_info = self.display.swapchain_info();
@@ -367,6 +388,7 @@ impl Window {
                         .inspect_err(|err| {
                             warn!("unable to present swapchain image: {err}");
                         })?;
+                    on_submission();
                 } else {
                     warn!("unable to acquire swapchain image");
                 }
@@ -382,6 +404,7 @@ impl Window {
             data: self.data,
             device: self.device,
             draw_fn,
+            on_submission,
             error: None,
             primary_monitor: None,
         };
