@@ -3929,7 +3929,7 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         4,
         "launch_app",
         json!({
-            "command":"google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-school-profile\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-school-window</title>School profile'"
+            "command":"google-chrome-stable --profile-directory=School --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-school-window</title>School profile'"
         }),
     );
     assert_ne!(school["result"]["isError"], true, "{school}");
@@ -3960,11 +3960,23 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         "handoff title was not reported: {handed_off}"
     );
 
-    let ambiguous = call_tool(
+    let focused_school = call_tool(
         &mut client,
         6,
+        "window_activate",
+        json!({"window_id":school_window}),
+    );
+    assert_ne!(
+        focused_school["result"]["isError"], true,
+        "{focused_school}"
+    );
+
+    let same_title_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, another tab'";
+    let ambiguous = call_tool(
+        &mut client,
+        7,
         "launch_app",
-        json!({"command":handoff_command,"window_timeout_seconds":1}),
+        json!({"command":same_title_command,"window_timeout_seconds":1}),
     );
     assert_eq!(
         ambiguous["result"]["structuredContent"]["window_outcome"], "unattributed",
@@ -3977,11 +3989,21 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
     assert!(
         ambiguous["result"]["structuredContent"]["handoff"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("no existing Chromium window changed")),
+            .is_some_and(|reason| reason.contains("activation or minimized state")),
         "missing attribution reason: {ambiguous}"
     );
+    assert!(
+        ambiguous["result"]["structuredContent"]["handoff"]["candidate_windows"]
+            .as_array()
+            .is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["window"] == first_window)
+            }),
+        "the focused existing window was not reported as a candidate: {ambiguous}"
+    );
 
-    let windows = call_tool(&mut client, 7, "window_list", json!({}));
+    let windows = call_tool(&mut client, 8, "window_list", json!({}));
     assert!(
         windows["result"]["structuredContent"]["windows"]
             .as_array()
@@ -3996,7 +4018,7 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         "the reused Chrome window did not show the handed-off tab: {windows}"
     );
 
-    let stopped = call_tool(&mut client, 8, "session_stop", json!({}));
+    let stopped = call_tool(&mut client, 9, "session_stop", json!({}));
     assert!(
         !stopped["result"]["isError"].as_bool().unwrap_or(false),
         "{stopped}"
