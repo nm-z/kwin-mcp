@@ -4903,6 +4903,54 @@ impl SessionMemoryWarning {
     }
 }
 
+fn screenshot_timeout_error(message: &str) -> bool {
+    message.contains("compositor did not finish a frame within 10 seconds")
+        || message.starts_with("screenshot: capture exceeded ")
+}
+
+fn attach_memory_warning_to_result(
+    result: Result<CallToolResult, McpError>,
+    warning: SessionMemoryWarning,
+    screenshot: bool,
+) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(mut result) => {
+            result.content.push(Content::text(warning.message.clone()));
+            if let Some(data) = result
+                .structured_content
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                data.insert("memory_warning".to_owned(), warning.as_json());
+            }
+            Ok(result)
+        }
+        Err(mut error) => {
+            let mut data = match error.data.take() {
+                Some(serde_json::Value::Object(data)) => data,
+                Some(value) => serde_json::Map::from_iter([("original_data".to_owned(), value)]),
+                None => serde_json::Map::new(),
+            };
+            data.insert("memory_warning".to_owned(), warning.as_json());
+            let message = if screenshot && screenshot_timeout_error(&error.message) {
+                format!(
+                    "{}; likely cause: {}",
+                    error.message,
+                    warning
+                        .message
+                        .strip_prefix("warning: ")
+                        .unwrap_or(&warning.message)
+                )
+            } else {
+                format!("{}; {}", error.message, warning.message)
+            };
+            error.message = message.into();
+            error.data = Some(serde_json::Value::Object(data));
+            Err(error)
+        }
+    }
+}
+
 fn session_scope_cgroup_directory(pid: u32, unit: &str) -> Option<PathBuf> {
     if !owned_session_scope(unit) {
         return None;
@@ -5345,44 +5393,7 @@ impl KwinMcp {
         else {
             return result;
         };
-        match result {
-            Ok(mut result) => {
-                result.content.push(Content::text(warning.message.clone()));
-                if let Some(data) = result
-                    .structured_content
-                    .as_mut()
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    data.insert("memory_warning".to_owned(), warning.as_json());
-                }
-                Ok(result)
-            }
-            Err(mut error) => {
-                let mut data = match error.data.take() {
-                    Some(serde_json::Value::Object(data)) => data,
-                    Some(value) => {
-                        serde_json::Map::from_iter([("original_data".to_owned(), value)])
-                    }
-                    None => serde_json::Map::new(),
-                };
-                data.insert("memory_warning".to_owned(), warning.as_json());
-                let message = if screenshot {
-                    format!(
-                        "{}; likely cause: {}",
-                        error.message,
-                        warning
-                            .message
-                            .strip_prefix("warning: ")
-                            .unwrap_or(&warning.message)
-                    )
-                } else {
-                    format!("{}; {}", error.message, warning.message)
-                };
-                error.message = message.into();
-                error.data = Some(serde_json::Value::Object(data));
-                Err(error)
-            }
-        }
+        attach_memory_warning_to_result(result, warning, screenshot)
     }
     async fn kwin_conn(&self) -> Result<zbus::Connection, McpError> {
         let guard = self.session.read().await;
@@ -8668,7 +8679,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
                 Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
-                {size_line} Windows are auto-maximized. Input and screenshot results include a warning in text and, when structured content is available, structuredContent.memory_warning if memory.high is reached, memory.high events increase, or memory PSI full avg10 reaches 10%. Screenshot errors name active memory pressure as a likely cause.",
+                {size_line} Windows are auto-maximized. Input and screenshot results include a warning in text and, when structured content is available, structuredContent.memory_warning if memory.high is reached, memory.high events increase, or memory PSI full avg10 reaches 10%. Screenshot timeout errors name active memory pressure as a likely cause.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -14086,7 +14097,8 @@ mod launch_warning_tests {
 #[cfg(test)]
 mod session_memory_warning_tests {
     use super::{
-        BYTES_PER_GIB, SessionMemorySnapshot, SessionMemoryWarning, parse_memory_event,
+        BYTES_PER_GIB, CallToolResult, Content, McpError, SessionMemorySnapshot,
+        SessionMemoryWarning, attach_memory_warning_to_result, parse_memory_event,
         parse_pressure_avg10,
     };
 
@@ -14104,6 +14116,19 @@ mod session_memory_warning_tests {
             pressure_full_avg10,
             high_events,
         }
+    }
+
+    fn memory_warning() -> Result<SessionMemoryWarning, String> {
+        SessionMemoryWarning::from_snapshots(
+            None,
+            Some(snapshot(
+                4 * BYTES_PER_GIB,
+                Some(3 * BYTES_PER_GIB),
+                Some(67.18),
+                Some(12),
+            )),
+        )
+        .ok_or_else(|| "expected a memory warning".to_owned())
     }
 
     #[test]
@@ -14216,5 +14241,73 @@ mod session_memory_warning_tests {
             Some(540602)
         );
         assert_eq!(parse_memory_event("low 0\nhigh 0\n", "oom_kill"), None);
+    }
+
+    #[test]
+    fn structured_results_include_warning_data_and_text() -> Result<(), String> {
+        let mut result = CallToolResult::success(vec![Content::text("clicked")]);
+        result.structured_content = Some(serde_json::json!({"action": "click"}));
+        let reported = attach_memory_warning_to_result(Ok(result), memory_warning()?, false)
+            .map_err(|error| error.message.to_string())?;
+        let data = reported
+            .structured_content
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "structured result was lost".to_owned())?;
+        assert_eq!(data["memory_warning"]["reason"], "memory_high");
+        assert_eq!(reported.content.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_screenshot_keeps_image_and_adds_warning_text() -> Result<(), String> {
+        let result = CallToolResult::success(vec![Content::image("encoded", "image/png")]);
+        let reported = attach_memory_warning_to_result(Ok(result), memory_warning()?, true)
+            .map_err(|error| error.message.to_string())?;
+        assert!(reported.structured_content.is_none());
+        let serialized = serde_json::to_value(reported).map_err(|error| error.to_string())?;
+        assert!(
+            serialized["content"][1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("warning: session memory throttled"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn screenshot_timeouts_name_pressure_but_other_errors_do_not() -> Result<(), String> {
+        let timeout = McpError::internal_error(
+            "screenshot: compositor did not finish a frame within 10 seconds",
+            None,
+        );
+        let timeout = match attach_memory_warning_to_result(Err(timeout), memory_warning()?, true) {
+            Err(error) => error,
+            Ok(_) => return Err("screenshot timeout unexpectedly succeeded".to_owned()),
+        };
+        assert!(
+            timeout
+                .message
+                .contains("likely cause: session memory throttled")
+        );
+
+        let invalid = McpError::invalid_params("region and cursor are mutually exclusive", None);
+        let invalid = match attach_memory_warning_to_result(Err(invalid), memory_warning()?, true) {
+            Err(error) => error,
+            Ok(_) => return Err("invalid screenshot parameters unexpectedly succeeded".to_owned()),
+        };
+        assert!(!invalid.message.contains("likely cause"));
+        assert!(
+            invalid
+                .message
+                .contains("warning: session memory throttled")
+        );
+        let warning = invalid
+            .data
+            .as_ref()
+            .and_then(|data| data.get("memory_warning"))
+            .and_then(|warning| warning.get("reason"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(warning, Some("memory_high"));
+        Ok(())
     }
 }
