@@ -2825,6 +2825,18 @@ fn host_graphical_socket_fixture() {
 }
 
 #[test]
+#[ignore = "helper launched by session_start_bounds_large_ancestor_copies_with_a_nested_mount"]
+fn session_graphical_home_socket_probe() {
+    let socket = std::env::var("KWIN_GRAPHICAL_HOME_SOCKET").expect("graphical socket path");
+    let report = std::env::var("KWIN_GRAPHICAL_HOME_REPORT").expect("graphical socket report");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_err(),
+        "split HOME exposed a graphical host socket through its ordinary path"
+    );
+    std::fs::write(report, "GRAPHICAL_SOCKET_BLOCKED\n").expect("graphical socket report");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
 fn session_follows_host_sqlite_wal_rotation() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
@@ -4725,6 +4737,33 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    let graphical_socket = home.join("project/host-graphical.sock");
+    struct GraphicalFixture(Child);
+    impl Drop for GraphicalFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _graphical = GraphicalFixture(
+        Command::new(std::env::current_exe().expect("fixture executable"))
+            .args(["--ignored", "--exact", "host_graphical_socket_fixture"])
+            .env("KWIN_GRAPHICAL_SOCKET_FIXTURE", &graphical_socket)
+            // Only this owned helper is marked graphical; no host connection is made.
+            .env("WAYLAND_DISPLAY", "wayland-0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start graphical fixture"),
+    );
+    let socket_deadline = Instant::now() + Duration::from_secs(5);
+    while !graphical_socket.exists() {
+        assert!(
+            Instant::now() < socket_deadline,
+            "graphical fixture did not start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let ordinary = home.join("project/ordinary.bin");
     let large = home.join("project/large.bin");
     let explicit = home.join("project/explicit.bin");
@@ -4781,6 +4820,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         "startup exceeded deadline: {started}"
     );
     let dir = workdir(&started);
+    let socket_probe = dir.join("graphical-socket-probe");
+    std::fs::copy(
+        std::env::current_exe().expect("probe executable"),
+        &socket_probe,
+    )
+    .expect("copy graphical socket probe");
+    let socket_report = dir.join("graphical-socket-report.txt");
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
@@ -4850,6 +4896,15 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         ),
     )
     .expect("session check script");
+    let script_contents = std::fs::read_to_string(&script).expect("read session check script");
+    let socket_check = format!(
+        "KWIN_GRAPHICAL_HOME_SOCKET={} KWIN_GRAPHICAL_HOME_REPORT={} {} --ignored --exact session_graphical_home_socket_probe --nocapture\n",
+        quote(&graphical_socket),
+        quote(&socket_report),
+        quote(&socket_probe)
+    );
+    std::fs::write(&script, format!("{script_contents}{socket_check}"))
+        .expect("add graphical socket check");
     let launched = call_tool(
         &mut client,
         4,
@@ -4860,10 +4915,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     );
     assert!(launched["error"].is_null(), "{launched}");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n") {
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n")
+        || std::fs::read_to_string(&socket_report).ok().as_deref()
+            != Some("GRAPHICAL_SOCKET_BLOCKED\n")
+    {
         assert!(
             Instant::now() < deadline,
-            "session file checks did not pass: {launched}"
+            "session file or graphical socket checks did not pass: {launched}"
         );
         thread::sleep(Duration::from_millis(100));
     }
