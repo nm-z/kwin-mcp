@@ -4164,6 +4164,8 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
     ".config/vivaldi",
 ];
 
+const BROWSER_CACHE_DIR: &str = ".cache/google-chrome";
+
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
 fn prepare_browser_cookies(
@@ -4426,6 +4428,14 @@ fn validate_host_write_paths(
     let mut host_write_paths = paths.to_vec();
     let canonical_home =
         std::fs::canonicalize(target).map_err(|error| anyhow::anyhow!("resolve HOME: {error}"))?;
+    // These paths are hidden by later tmpfs mounts. Sharing any part of them
+    // would report live host writes while silently masking the selected state.
+    let private_dirs = [
+        session_disk_root(),
+        host_runtime.to_path_buf(),
+        kwin_mcp::browser_cookies::state_root()?,
+        target.join(BROWSER_CACHE_DIR),
+    ];
     for path in &host_write_paths {
         let relative = path.strip_prefix(target).ok();
         let resolved = std::fs::canonicalize(path).ok();
@@ -4445,12 +4455,12 @@ fn validate_host_write_paths(
                 let browser = target.join(config);
                 path.starts_with(&browser) || browser.starts_with(path)
             })
-            || [session_disk_root(), host_runtime.to_path_buf()]
+            || private_dirs
                 .iter()
                 .any(|private| path.starts_with(private) || private.starts_with(path))
         {
             anyhow::bail!(
-                "host_write_paths requires existing directories strictly under HOME, without symlinks, '.', '..', browser profiles, session storage or host runtime: {}",
+                "host_write_paths requires existing directories strictly under HOME, without symlinks, '.', '..', browser profiles/cache, saved browser cookies, session storage or host runtime (including their ancestors and descendants): {}",
                 path.display()
             );
         }
@@ -4564,7 +4574,7 @@ fn prepare_host_view(
     empty_session_databases(&overlay_plan, &discarded)?;
     let (cookie_roots, cookie_errors) =
         prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
-    let browser_cache = target.join(".cache/google-chrome");
+    let browser_cache = target.join(BROWSER_CACHE_DIR);
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
     }
@@ -8089,7 +8099,8 @@ struct SessionStartParams {
     /// Existing application state directories under HOME to share with the host.
     /// Writes persist on the host, including SQLite databases and WAL sidecars.
     /// For live Codex state, pass the absolute path to ~/.codex. Omit for isolation.
-    /// HOME itself, symlinked paths, browser profiles and session storage are rejected.
+    /// HOME itself and symlinked paths are rejected. Selections cannot overlap
+    /// browser profiles/cache, saved browser cookies, session storage or host runtime.
     /// Existing host Unix sockets in these directories remain blocked.
     host_write_paths: Option<Vec<PathBuf>>,
 }

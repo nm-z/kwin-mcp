@@ -140,11 +140,13 @@ limit. Writes, messages and deletions in these directories persist on the host,
 including after `session_stop`. Do not use this option for disposable work.
 
 `host_write_paths` accepts existing directories strictly beneath HOME. It rejects
-symlinked paths, parent traversal, HOME itself, browser profile directories,
-session storage and the host runtime directory, and cannot overlap private
-`writable_paths`. Existing host Unix sockets within shared directories remain
-blocked. Other HOME paths retain their private overlays. `session_start` and
-`session_list` report the selected directories; the setting survives server reload.
+symlinked paths, parent traversal and HOME itself. Selections cannot overlap
+browser profile directories, Chrome's cache, saved browser-cookie state, session
+storage or the host runtime directory, including their ancestors and descendants.
+They also cannot overlap private `writable_paths`. Existing host Unix sockets
+within shared directories remain blocked. Other HOME paths retain their private
+overlays. `session_start` and `session_list` report the selected directories; the
+setting survives server reload.
 Omitting the option retains the default isolation.
 
 ### Session memory limits

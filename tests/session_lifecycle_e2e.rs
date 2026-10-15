@@ -3765,7 +3765,11 @@ fn session_start_binds_large_live_codex_state_without_copying_it() {
 #[ignore = "requires KDE, bubblewrap, Konsole, squashfuse, mksquashfs, input devices and a filtered test D-Bus proxy; set KWIN_MCP_TEST_TMPDIR under /var/tmp"]
 fn session_can_explicitly_share_live_codex_state() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    let mut client = RpcClient::start_with_cookie_test_bus();
+    let address = require_filtered_cookie_test_bus();
+    let mut client = RpcClient::start_with_env(&[
+        ("DBUS_SESSION_BUS_ADDRESS", address.as_str()),
+        ("KWIN_MCP_E2E_COPY_BINARY", "1"),
+    ]);
     assert!(
         client.home.starts_with("/var/tmp"),
         "mount fixture must stay outside the real HOME"
@@ -3842,6 +3846,12 @@ fn session_can_explicitly_share_live_codex_state() {
 
     let alias = client.home.join("state-alias");
     std::os::unix::fs::symlink(&codex, &alias).expect("fixture symlink");
+    for private in [
+        ".cache/google-chrome",
+        ".local/state/kwin-mcp/browser-cookies",
+    ] {
+        std::fs::create_dir_all(client.home.join(private)).expect("private state fixture");
+    }
     for (index, paths) in [
         json!([client.home]),
         json!([client.home.join("missing")]),
@@ -3850,6 +3860,10 @@ fn session_can_explicitly_share_live_codex_state() {
         json!([codex.join("..")]),
         json!([client.home.join(".config")]),
         json!([client.home.join(".cache")]),
+        json!([client.home.join(".cache/google-chrome")]),
+        json!([client.home.join(".local")]),
+        json!([client.home.join(".local/state")]),
+        json!([client.home.join(".local/state/kwin-mcp/browser-cookies")]),
         json!(["/var/tmp"]),
     ]
     .into_iter()
@@ -3857,7 +3871,7 @@ fn session_can_explicitly_share_live_codex_state() {
     {
         let rejected = call_tool(
             &mut client,
-            10 + u64::try_from(index).expect("request ID"),
+            100 + u64::try_from(index).expect("request ID"),
             "session_start",
             json!({"host_write_paths":paths}),
         );
@@ -3889,6 +3903,15 @@ fn session_can_explicitly_share_live_codex_state() {
         }
         let started = call_tool(&mut client, request, "session_start", params);
         let directory = workdir(&started);
+        if shared {
+            let binary = client.binary_copy.as_ref().expect("private executable");
+            let replacement = binary.with_extension("next");
+            std::fs::copy(binary, &replacement).expect("stage replacement executable");
+            std::fs::rename(&replacement, binary).expect("publish replacement executable");
+            client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+            client
+                .wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+        }
         let layers = client
             .home
             .join(".cache/kwin-mcp")
