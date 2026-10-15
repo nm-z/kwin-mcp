@@ -4734,6 +4734,225 @@ impl SessionScope {
     fn stop(&self) {
         stop_session_scope(&self.unit);
     }
+
+    fn memory_snapshot(&self, pid: u32) -> Option<SessionMemorySnapshot> {
+        let directory = session_scope_cgroup_directory(pid, &self.unit)?;
+        let current = std::fs::read_to_string(directory.join("memory.current"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let high = read_cgroup_limit(&directory, "memory.high");
+        let swap_current = std::fs::read_to_string(directory.join("memory.swap.current"))
+            .ok()
+            .and_then(|value| value.trim().parse().ok());
+        let swap_max = read_cgroup_limit(&directory, "memory.swap.max");
+        let pressure_full_avg10 = std::fs::read_to_string(directory.join("memory.pressure"))
+            .ok()
+            .and_then(|pressure| parse_pressure_avg10(&pressure, "full"));
+        let high_events = std::fs::read_to_string(directory.join("memory.events"))
+            .ok()
+            .and_then(|events| parse_memory_event(&events, "high"));
+        Some(SessionMemorySnapshot {
+            current,
+            high,
+            swap_current,
+            swap_max,
+            pressure_full_avg10,
+            high_events,
+        })
+    }
+}
+
+const SESSION_MEMORY_PSI_WARNING_PERCENT: f64 = 10.0;
+const SESSION_MEMORY_SWAP_NEAR_FULL_PERCENT: u32 = 99;
+const BYTES_PER_GIB: u64 = 1_073_741_824;
+
+#[derive(Clone, Copy)]
+struct SessionMemorySnapshot {
+    current: u64,
+    high: Option<u64>,
+    swap_current: Option<u64>,
+    swap_max: Option<u64>,
+    pressure_full_avg10: Option<f64>,
+    high_events: Option<u64>,
+}
+
+impl SessionMemorySnapshot {
+    fn high_reached(self) -> bool {
+        self.high
+            .is_some_and(|limit| limit > 0 && self.current >= limit)
+    }
+
+    fn full_pressure_high(self) -> bool {
+        self.pressure_full_avg10
+            .is_some_and(|percent| percent >= SESSION_MEMORY_PSI_WARNING_PERCENT)
+    }
+}
+
+struct SessionMemoryWarning {
+    message: String,
+    reason: &'static str,
+    memory_current_bytes: u64,
+    memory_high_bytes: Option<u64>,
+    memory_swap_current_bytes: Option<u64>,
+    memory_swap_max_bytes: Option<u64>,
+    memory_pressure_full_avg10_percent: Option<f64>,
+    memory_high_events_delta: Option<u64>,
+}
+
+impl SessionMemoryWarning {
+    fn from_snapshots(
+        before: Option<SessionMemorySnapshot>,
+        after: Option<SessionMemorySnapshot>,
+    ) -> Option<Self> {
+        let latest = after.or(before)?;
+        let high_events_delta = before
+            .and_then(|before| before.high_events)
+            .zip(latest.high_events)
+            .and_then(|(before, after)| after.checked_sub(before))
+            .filter(|delta| *delta > 0);
+        let high_reached_before = before.is_some_and(SessionMemorySnapshot::high_reached);
+        let throttled_now = latest.high_reached();
+        let pressure_high_now = latest.full_pressure_high();
+        let pressure_high_before = before.is_some_and(SessionMemorySnapshot::full_pressure_high);
+        let full_pressure_high = pressure_high_now || pressure_high_before;
+        let throttled = throttled_now || high_reached_before || high_events_delta.is_some();
+        if !throttled && !full_pressure_high {
+            return None;
+        }
+        let reported = if throttled_now || pressure_high_now {
+            latest
+        } else if high_reached_before || pressure_high_before {
+            before.unwrap_or(latest)
+        } else {
+            latest
+        };
+
+        let mut details = vec![match reported.high {
+            Some(high) => format!(
+                "RAM {}/{} GiB",
+                format_gib(reported.current),
+                format_gib(high)
+            ),
+            None => format!("RAM {} GiB", format_gib(reported.current)),
+        }];
+        if let (Some(current), Some(max)) = (reported.swap_current, reported.swap_max) {
+            let near_full = max > 0
+                && u128::from(current) * 100
+                    >= u128::from(max) * u128::from(SESSION_MEMORY_SWAP_NEAR_FULL_PERCENT);
+            details.push(format!(
+                "swap {}/{} GiB{}",
+                format_gib(current),
+                format_gib(max),
+                if current >= max {
+                    " full"
+                } else if near_full {
+                    " nearly full"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if let Some(percent) = reported.pressure_full_avg10 {
+            details.push(format!("memory PSI full avg10={percent:.2}%"));
+        }
+        if let Some(delta) = high_events_delta {
+            details.push(format!("memory.high events +{delta} during this call"));
+        }
+
+        let message = if throttled_now {
+            "warning: session memory throttled"
+        } else if high_events_delta.is_some() {
+            "warning: session memory was throttled during this call"
+        } else if pressure_high_now {
+            "warning: session memory pressure is high"
+        } else if high_reached_before {
+            "warning: session memory was at memory.high when this call started"
+        } else {
+            "warning: session memory pressure was high when this call started"
+        };
+
+        Some(Self {
+            message: format!("{message} ({})", details.join(", ")),
+            reason: if throttled {
+                "memory_high"
+            } else {
+                "memory_pressure_full"
+            },
+            memory_current_bytes: reported.current,
+            memory_high_bytes: reported.high,
+            memory_swap_current_bytes: reported.swap_current,
+            memory_swap_max_bytes: reported.swap_max,
+            memory_pressure_full_avg10_percent: reported.pressure_full_avg10,
+            memory_high_events_delta: high_events_delta,
+        })
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason": self.reason,
+            "message": self.message,
+            "memory_current_bytes": self.memory_current_bytes,
+            "memory_high_bytes": self.memory_high_bytes,
+            "memory_swap_current_bytes": self.memory_swap_current_bytes,
+            "memory_swap_max_bytes": self.memory_swap_max_bytes,
+            "memory_pressure_full_avg10_percent": self.memory_pressure_full_avg10_percent,
+            "memory_high_events_delta": self.memory_high_events_delta,
+        })
+    }
+}
+
+fn session_scope_cgroup_directory(pid: u32, unit: &str) -> Option<PathBuf> {
+    if !owned_session_scope(unit) {
+        return None;
+    }
+    let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let group = groups.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let relative = group.strip_prefix('/')?;
+    let mut directory = PathBuf::from("/sys/fs/cgroup");
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+        directory.push(component);
+        if component == unit {
+            return Some(directory);
+        }
+    }
+    None
+}
+
+fn read_cgroup_limit(directory: &Path, name: &str) -> Option<u64> {
+    let value = std::fs::read_to_string(directory.join(name)).ok()?;
+    value.trim().parse().ok()
+}
+
+fn parse_pressure_avg10(pressure: &str, kind: &str) -> Option<f64> {
+    let line = pressure
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(kind))?;
+    let value = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("avg10="))?
+        .parse::<f64>()
+        .ok()?;
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
+}
+
+fn parse_memory_event(events: &str, name: &str) -> Option<u64> {
+    events.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let event = fields.next()?;
+        let value = fields.next()?;
+        (event == name).then_some(value.parse().ok()).flatten()
+    })
+}
+
+fn format_gib(bytes: u64) -> String {
+    let hundredths =
+        (u128::from(bytes) * 100 + u128::from(BYTES_PER_GIB) / 2) / u128::from(BYTES_PER_GIB);
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
 struct Session {
@@ -5108,6 +5327,61 @@ impl KwinMcp {
                 "no session — call session_start first",
                 None,
             )),
+        }
+    }
+    async fn session_memory_snapshot(&self) -> Option<SessionMemorySnapshot> {
+        let guard = self.session.read().await;
+        let session = guard.as_ref()?;
+        session.scope.memory_snapshot(session.sandbox_child.id())
+    }
+    async fn attach_memory_warning(
+        &self,
+        result: Result<CallToolResult, McpError>,
+        before: Option<SessionMemorySnapshot>,
+        screenshot: bool,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(warning) =
+            SessionMemoryWarning::from_snapshots(before, self.session_memory_snapshot().await)
+        else {
+            return result;
+        };
+        match result {
+            Ok(mut result) => {
+                result.content.push(Content::text(warning.message.clone()));
+                if let Some(data) = result
+                    .structured_content
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    data.insert("memory_warning".to_owned(), warning.as_json());
+                }
+                Ok(result)
+            }
+            Err(mut error) => {
+                let mut data = match error.data.take() {
+                    Some(serde_json::Value::Object(data)) => data,
+                    Some(value) => {
+                        serde_json::Map::from_iter([("original_data".to_owned(), value)])
+                    }
+                    None => serde_json::Map::new(),
+                };
+                data.insert("memory_warning".to_owned(), warning.as_json());
+                let message = if screenshot {
+                    format!(
+                        "{}; likely cause: {}",
+                        error.message,
+                        warning
+                            .message
+                            .strip_prefix("warning: ")
+                            .unwrap_or(&warning.message)
+                    )
+                } else {
+                    format!("{}; {}", error.message, warning.message)
+                };
+                error.message = message.into();
+                error.data = Some(serde_json::Value::Object(data));
+                Err(error)
+            }
         }
     }
     async fn kwin_conn(&self) -> Result<zbus::Connection, McpError> {
@@ -8394,7 +8668,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
                 Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
-                {size_line} Windows are auto-maximized.",
+                {size_line} Windows are auto-maximized. Input and screenshot results include a warning in text and, when structured content is available, structuredContent.memory_warning if memory.high is reached, memory.high events increase, or memory PSI full avg10 reaches 10%. Screenshot errors name active memory pressure as a likely cause.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -12049,23 +12323,26 @@ impl tower::Service<SessionCall> for KwinMcp {
     fn call(&mut self, call: SessionCall) -> Self::Future {
         let session = self.clone();
         Box::pin(async move {
-            let typing = call.request.name == "keyboard_type";
-            let audit = if input_tool(&call.request.name) {
+            let operation = call.request.name.to_string();
+            let typing = operation == "keyboard_type";
+            let screenshot = operation == "screenshot";
+            let report_memory = screenshot || input_tool(&operation);
+            let audit = if input_tool(&operation) {
                 session
                     .input_log
                     .as_ref()
-                    .map(|log| {
-                        log.begin(
-                            call.request.name.to_string(),
-                            serde_json::json!(call.context.id),
-                        )
-                    })
+                    .map(|log| log.begin(operation.clone(), serde_json::json!(call.context.id)))
                     .transpose()
                     .map_err(KwinError::from)?
             } else {
                 None
             };
-            let result = call
+            let memory_before = if report_memory {
+                session.session_memory_snapshot().await
+            } else {
+                None
+            };
+            let mut result = call
                 .routes
                 .call(rmcp::handler::server::tool::ToolCallContext::new(
                     &session,
@@ -12084,10 +12361,16 @@ impl tower::Service<SessionCall> for KwinMcp {
                 };
                 if let Err(error) = audit.finish(outcome) {
                     if typing {
-                        return Err(typing_log_failure(result, error));
+                        result = Err(typing_log_failure(result, error));
+                    } else {
+                        result = Err(KwinError::from(error).into());
                     }
-                    return Err(KwinError::from(error).into());
                 }
+            }
+            if report_memory {
+                result = session
+                    .attach_memory_warning(result, memory_before, screenshot)
+                    .await;
             }
             result
         })
@@ -13797,5 +14080,141 @@ mod launch_warning_tests {
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
+    }
+}
+
+#[cfg(test)]
+mod session_memory_warning_tests {
+    use super::{
+        BYTES_PER_GIB, SessionMemorySnapshot, SessionMemoryWarning, parse_memory_event,
+        parse_pressure_avg10,
+    };
+
+    fn snapshot(
+        current: u64,
+        high: Option<u64>,
+        pressure_full_avg10: Option<f64>,
+        high_events: Option<u64>,
+    ) -> SessionMemorySnapshot {
+        SessionMemorySnapshot {
+            current,
+            high,
+            swap_current: Some(BYTES_PER_GIB),
+            swap_max: Some(BYTES_PER_GIB),
+            pressure_full_avg10,
+            high_events,
+        }
+    }
+
+    #[test]
+    fn reaching_memory_high_reports_ram_swap_and_psi() -> Result<(), String> {
+        let mut pressured = snapshot(
+            4 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(67.18),
+            Some(12),
+        );
+        pressured.swap_current = Some(BYTES_PER_GIB - 24_576);
+        let warning = SessionMemoryWarning::from_snapshots(None, Some(pressured))
+            .ok_or_else(|| "expected a memory warning".to_owned())?;
+        assert_eq!(warning.reason, "memory_high");
+        assert!(warning.message.contains("RAM 4.00/3.00 GiB"));
+        assert!(warning.message.contains("swap 1.00/1.00 GiB nearly full"));
+        assert!(warning.message.contains("memory PSI full avg10=67.18%"));
+        assert_eq!(warning.as_json()["memory_current_bytes"], 4 * BYTES_PER_GIB);
+        Ok(())
+    }
+
+    #[test]
+    fn full_psi_pressure_warns_below_memory_high() -> Result<(), String> {
+        let warning = SessionMemoryWarning::from_snapshots(
+            None,
+            Some(snapshot(
+                2 * BYTES_PER_GIB,
+                Some(3 * BYTES_PER_GIB),
+                Some(10.0),
+                Some(0),
+            )),
+        )
+        .ok_or_else(|| "expected a PSI warning".to_owned())?;
+        assert_eq!(warning.reason, "memory_pressure_full");
+        assert!(warning.message.contains("session memory pressure is high"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_at_call_start_is_reported_after_recovery() -> Result<(), String> {
+        let before = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(20.0),
+            Some(4),
+        );
+        let after = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(0.0),
+            Some(4),
+        );
+        let warning = SessionMemoryWarning::from_snapshots(Some(before), Some(after))
+            .ok_or_else(|| "expected a warning for pressure at call start".to_owned())?;
+        assert_eq!(warning.reason, "memory_pressure_full");
+        assert!(warning.message.contains("memory PSI full avg10=20.00%"));
+        assert!(
+            warning
+                .message
+                .contains("pressure was high when this call started")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_high_event_warns_after_memory_recovers() -> Result<(), String> {
+        let before = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(0.0),
+            Some(4),
+        );
+        let after = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(0.0),
+            Some(7),
+        );
+        let warning = SessionMemoryWarning::from_snapshots(Some(before), Some(after))
+            .ok_or_else(|| "expected a warning for new memory.high events".to_owned())?;
+        assert_eq!(warning.memory_high_events_delta, Some(3));
+        assert!(warning.message.contains("memory.high events +3"));
+        Ok(())
+    }
+
+    #[test]
+    fn low_memory_and_psi_do_not_warn() {
+        let before = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(9.99),
+            Some(4),
+        );
+        let after = snapshot(
+            2 * BYTES_PER_GIB,
+            Some(3 * BYTES_PER_GIB),
+            Some(9.99),
+            Some(4),
+        );
+        assert!(SessionMemoryWarning::from_snapshots(Some(before), Some(after)).is_none());
+    }
+
+    #[test]
+    fn cgroup_pressure_and_event_files_are_parsed() {
+        let pressure = "some avg10=99.00 avg60=1.00 avg300=0.00 total=5\nfull avg10=67.18 avg60=56.57 avg300=12.40 total=9\n";
+        assert_eq!(parse_pressure_avg10(pressure, "full"), Some(67.18));
+        assert_eq!(parse_pressure_avg10(pressure, "some"), Some(99.0));
+        assert_eq!(
+            parse_memory_event("low 0\nhigh 540602\nmax 1\n", "high"),
+            Some(540602)
+        );
+        assert_eq!(parse_memory_event("low 0\nhigh 0\n", "oom_kill"), None);
     }
 }
