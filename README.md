@@ -303,14 +303,18 @@ Build this checkout, then install its server and viewer together:
 cargo build --release --bins
 bash scripts/install.sh
 hash -r
+kwin-mcp --version
 kwin-mcp --help
 kwin-mcp --describe
 ```
 
 The installer requires Bash, GNU coreutils, and `jq`. It defaults to `~/.local/bin`
-and checks that the source server prints help and valid MCP schemas before
-installing either executable. Use `--bin-dir DIR` for a different destination,
-or `--source-dir DIR` for a different build output directory.
+and checks that the source server prints help, valid MCP schemas, and identical
+`--version` / `-V` identities before installing either executable. Both version
+flags must print one line with the Rust package version, build number, and Git
+commit, such as `kwin-mcp v0.1.2.651 (a34524a)`. Installation reports this identity
+along with the selected PATH executable. Use `--bin-dir DIR` for a different
+destination, or `--source-dir DIR` for a different build output directory.
 Put the destination first in `PATH`. If another directory still supplies the
 `kwin-mcp` command, installation reports an actionable error after copying the
 executables; use their absolute paths or fix `PATH` and clear the shell command cache.
@@ -321,6 +325,7 @@ An existing destination requires explicit replacement:
 type -a kwin-mcp
 bash scripts/install.sh --replace
 hash -r
+kwin-mcp --version
 kwin-mcp --help
 kwin-mcp --describe
 ```
@@ -329,9 +334,9 @@ kwin-mcp --describe
 target of an old symlink, including a uv-managed console script. The separately
 published Python/PyPI package also named `kwin-mcp` belongs to
 [isac322/kwin-mcp](https://github.com/isac322/kwin-mcp); `uv tool install kwin-mcp`
-does not install this Rust server. If `--help` and `--describe` both succeed with
-empty output, inspect `type -a kwin-mcp` for that conflicting command and install
-the Rust executables with the steps above. If you no longer need the Python
+does not install this Rust server. If `--version`, `--help`, or `--describe`
+succeeds with empty output, inspect `type -a kwin-mcp` for that conflicting
+command and install the Rust executables with the steps above. If you no longer need the Python
 tool, run `uv tool uninstall kwin-mcp` before installing the Rust executables.
 To keep both projects, use separate installation directories and absolute
 commands: uv can recreate or remove its console entry point during later package
@@ -340,7 +345,8 @@ as `~/.local/bin/kwin-mcp` expanded to your home directory.
 
 To check installation behavior against built artifacts without changing your
 real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
-It installs into temporary directories and exercises both flags through `PATH`.
+It installs into temporary directories and exercises help, schemas, and both
+version flags through `PATH`, including rejection of silent version entrypoints.
 
 ### Host runtime environment
 

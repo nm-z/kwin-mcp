@@ -14,7 +14,8 @@ Install the built Rust server and viewer as real executables.
 
 Build first with: cargo build --release --bins
 Requires Bash, GNU coreutils, and jq.
-The installer checks --help and --describe before replacing any executable.
+The installer checks --help, --describe, and both version flags before replacing
+any executable. It reports the installed package version, build, and Git commit.
 It exits unsuccessfully if PATH still selects a different kwin-mcp afterward.
 EOF
 }
@@ -80,6 +81,17 @@ fi
 if ! jq -e '.initialize.capabilities.tools and (.tools | type == "array") and (.tools | length > 0)' "$stage/describe.stdout" > /dev/null 2> "$stage/describe.validation.stderr"; then
     fail 'the source executable did not print valid MCP tool schemas; build the Rust server from nm-z/kwin-mcp'
 fi
+for flag in --version -V; do
+    if ! timeout 10 "$stage/kwin-mcp" "$flag" </dev/null > "$stage/$flag.stdout" 2> "$stage/$flag.stderr"; then
+        fail "the source executable failed $flag; build the Rust server from nm-z/kwin-mcp"
+    fi
+    version_text=$(<"$stage/$flag.stdout")
+    version_pattern='^kwin-mcp v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ \([[:xdigit:]]+\)$'
+    [[ ! -s "$stage/$flag.stderr" && $(wc -l < "$stage/$flag.stdout") -eq 1 && $version_text =~ $version_pattern ]] ||
+        fail "the source executable did not print an identifiable Rust version/build/commit for $flag; a same-named uv/PyPI entrypoint may be selected. Build the Rust server from nm-z/kwin-mcp"
+done
+cmp -s "$stage/--version.stdout" "$stage/-V.stdout" ||
+    fail 'the source executable printed different --version and -V identities; build the Rust server from nm-z/kwin-mcp'
 
 for name in kwin-viewer kwin-mcp; do
     if $replace; then
@@ -95,3 +107,4 @@ if [[ -z $resolved || ! $resolved -ef "$bin_dir/kwin-mcp" ]]; then
     fail "installed successfully, but PATH selects ${resolved:-no kwin-mcp command}. Put $bin_dir first in PATH, clear your shell command cache (hash -r in Bash), or invoke $bin_dir/kwin-mcp by its absolute path"
 fi
 printf 'PATH selects %s. Clear any caller shell command cache (hash -r in Bash).\n' "$resolved"
+printf 'Version: %s\n' "$version_text"

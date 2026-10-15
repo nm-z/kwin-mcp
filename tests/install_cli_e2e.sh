@@ -39,6 +39,15 @@ PATH="$bin_dir:$PATH" timeout 10 kwin-mcp --help > "$evidence/help.stdout" 2> "$
 rg -q '^Usage: kwin-mcp' "$evidence/help.stdout"
 PATH="$bin_dir:$PATH" timeout 20 kwin-mcp --describe > "$evidence/describe.json" 2> "$evidence/describe.stderr"
 jq -e '.initialize.capabilities.tools and (.tools | type == "array") and (.tools | length > 0)' "$evidence/describe.json" > /dev/null
+timeout 10 "$source_dir/kwin-mcp" --version > "$evidence/source-version.stdout" 2> "$evidence/source-version.stderr"
+for flag in --version -V; do
+    PATH="$bin_dir:$PATH" timeout 10 kwin-mcp "$flag" > "$evidence/$flag.stdout" 2> "$evidence/$flag.stderr"
+    [[ ! -s "$evidence/$flag.stderr" ]]
+    cmp "$evidence/source-version.stdout" "$evidence/$flag.stdout"
+done
+[[ $(wc -l < "$evidence/--version.stdout") -eq 1 ]]
+rg -q '^kwin-mcp v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ \([[:xdigit:]]+\)$' "$evidence/--version.stdout"
+rg -Fx "Version: $(<"$evidence/--version.stdout")" "$evidence/install.stdout"
 
 # Reject a silent source launcher before publishing either file.
 mkdir -p -- "$scratch/silent-source"
@@ -71,6 +80,42 @@ fi
 rg -q 'did not print valid MCP tool schemas' "$evidence/invalid-schemas.stderr"
 [[ ! -e "$scratch/rejected/kwin-mcp" && ! -e "$scratch/rejected/kwin-viewer" ]]
 
+# Preserve the existing entries when a source serves real help and schemas but
+# has a broken version mode, including the silent success reported in #362.
+cat > "$scratch/silent-source/kwin-mcp" <<'EOF'
+#!/usr/bin/env bash
+case $1 in
+    --version|-V)
+        case $KWIN_MCP_VERSION_FAILURE in
+            silent) exit 0 ;;
+            silent-short) if [[ $1 == --version ]]; then "$KWIN_MCP_VERSION_BINARY" --version; fi ;;
+            malformed) printf 'kwin-mcp 0.9.1\n' ;;
+            failed) "$KWIN_MCP_VERSION_BINARY" --version; exit 1 ;;
+            stderr) printf 'unexpected diagnostic\n' >&2; "$KWIN_MCP_VERSION_BINARY" --version ;;
+            multiline) "$KWIN_MCP_VERSION_BINARY" --version; "$KWIN_MCP_VERSION_BINARY" --version ;;
+            mismatch)
+                if [[ $1 == -V ]]; then printf 'kwin-mcp v0.0.0.0 (0000000)\n'; else "$KWIN_MCP_VERSION_BINARY" --version; fi
+                ;;
+        esac
+        ;;
+    *) exec "$KWIN_MCP_VERSION_BINARY" "$@" ;;
+esac
+EOF
+ln -s -- "$scratch/other-package/kwin-mcp" "$scratch/rejected/kwin-mcp"
+ln -s -- "$scratch/other-package/viewer" "$scratch/rejected/kwin-viewer"
+for failure in silent silent-short malformed failed stderr multiline mismatch; do
+    if KWIN_MCP_VERSION_BINARY="$source_dir/kwin-mcp" KWIN_MCP_VERSION_FAILURE="$failure" PATH="$scratch/rejected:$PATH" \
+        bash "$repo_dir/scripts/install.sh" --source-dir "$scratch/silent-source" --bin-dir "$scratch/rejected" --replace \
+        > "$evidence/version-$failure.stdout" 2> "$evidence/version-$failure.stderr"; then
+        printf 'installer unexpectedly accepted %s version output\n' "$failure" >&2
+        exit 1
+    fi
+    rg -q 'version|identities' "$evidence/version-$failure.stderr"
+    [[ $(readlink -- "$scratch/rejected/kwin-mcp") == "$scratch/other-package/kwin-mcp" ]]
+    [[ $(readlink -- "$scratch/rejected/kwin-viewer") == "$scratch/other-package/viewer" ]]
+done
+sha256sum --check "$evidence/original-package.sha256"
+
 # A completed copy must still report a different executable earlier on PATH.
 if PATH="$scratch/other-package:$scratch/shadowed:$PATH" bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" --bin-dir "$scratch/shadowed" > "$evidence/shadowed.stdout" 2> "$evidence/shadowed.stderr"; then
     printf 'installer unexpectedly ignored PATH shadowing\n' >&2
@@ -79,4 +124,4 @@ fi
 rg -q 'installed successfully, but PATH selects' "$evidence/shadowed.stderr"
 rg -q 'first in PATH' "$evidence/shadowed.stderr"
 cmp "$source_dir/kwin-mcp" "$scratch/shadowed/kwin-mcp"
-printf 'conflict=PASS\nsymlink_targets_preserved=PASS\ninstalled_help=PASS\ninstalled_describe=PASS\nsilent_source_rejected=PASS\ninvalid_schemas_rejected=PASS\nshadowing_reported=PASS\n' | tee "$evidence/results.txt"
+printf 'conflict=PASS\nsymlink_targets_preserved=PASS\ninstalled_help=PASS\ninstalled_describe=PASS\ninstalled_version=PASS\ninstalled_short_version=PASS\nversion_identity_reported=PASS\nsilent_source_rejected=PASS\ninvalid_schemas_rejected=PASS\ninvalid_versions_rejected=PASS (silent, silent-short, malformed, failed, stderr, multiline, mismatch)\nshadowing_reported=PASS\n' | tee "$evidence/results.txt"
