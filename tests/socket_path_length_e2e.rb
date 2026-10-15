@@ -51,8 +51,9 @@ Dir.mktmpdir('k353-', '/tmp') do |root|
       'KWIN_MCP_REPO' => File.join(root, 'no-repository'),
       'CARGO' => '/usr/bin/false',
     }
-    cases = [['long-ascii', 180, 'ascii'], ['service-one-over', 108, 'ascii'], ['long-utf8', 108, 'utf8']]
-    cases += [['boundary', 107, 'ascii'], ['short', 80, 'ascii']] unless reject_only
+    cases = [['long-ascii', 180, 'ascii'], ['linux-one-over', 108, 'ascii'], ['linux-boundary', 107, 'ascii'],
+             ['dbus-one-over', 100, 'ascii'], ['long-utf8', 100, 'utf8']]
+    cases += [['dbus-boundary', 99, 'ascii'], ['short', 80, 'ascii']] unless reject_only
     cases.each do |name, bytes, encoding|
       directory = File.join(evidence, name)
       FileUtils.mkdir_p(directory)
@@ -68,7 +69,7 @@ Dir.mktmpdir('k353-', '/tmp') do |root|
           workdir = File.join(tmpdir, "kwin-mcp-#{process.pid}-1")
           socket = File.join(workdir, 'service_bus_socket')
           raise 'wrong fixture byte length' unless socket.bytesize == bytes
-          raise 'UTF-8 fixture does not distinguish bytes from characters' if encoding == 'utf8' && socket.length >= 108
+          raise 'UTF-8 fixture does not distinguish bytes from characters' if encoding == 'utf8' && socket.length >= 100
           id = 0
           trace = File.open(File.join(directory, 'rpc.jsonl'), 'w')
           rpc = lambda do |method, params|
@@ -96,13 +97,14 @@ Dir.mktmpdir('k353-', '/tmp') do |root|
             started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
             response = call.call('session_start')
             elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
-            if bytes >= 108
+            if bytes > 99
               message = response.dig('error', 'message') || response.dig('result', 'content')&.map { |item| item['text'] }.join(' ')
               raise "expected path-length rejection, got #{response.inspect}" unless response['error'] || response.dig('result', 'isError')
-              %w[TMPDIR sockaddr_un.sun_path bytes].each do |fragment|
+              fragments = ['TMPDIR', 'bytes', bytes >= 109 ? 'sockaddr_un.sun_path' : 'libdbus pathname limit of 99 bytes']
+              fragments.each do |fragment|
                 raise "missing #{fragment}: #{response.inspect}" unless message&.include?(fragment)
               end
-              rejected = bytes == 108 ? socket : File.join(workdir, 'system_bus_socket')
+              rejected = bytes == 100 ? socket : File.join(workdir, 'system_bus_socket')
               raise "missing offending path/byte count: #{message}" unless message.include?(rejected) && message.include?("#{rejected.bytesize} bytes")
               raise "proxy timeout concealed validation (#{elapsed}s)" if elapsed >= 3
               raise 'failed startup created runtime workdir' if File.exist?(workdir)

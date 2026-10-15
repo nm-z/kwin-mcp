@@ -1778,6 +1778,11 @@ const EIS_NEGOTIATION_POLL: Duration = Duration::from_millis(50);
 const DBUS_PROXY_TIMEOUT: Duration = Duration::from_secs(3);
 const DBUS_PROXY_POLL: Duration = Duration::from_millis(20);
 
+// libdbus uses this portable limit even on Linux, whose sun_path is larger.
+// https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html
+// (_DBUS_MAX_SUN_PATH_LENGTH). Session apps also connect through libdbus.
+const DBUS_SOCKET_PATH_MAX: usize = 99;
+
 // KWin unique-name discovery: per-candidate introspect probe timeout.
 const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -3171,6 +3176,13 @@ fn validate_session_socket_path(socket: &Path) -> anyhow::Result<()> {
             socket.as_os_str().len(),
         )
     })?;
+    if socket.as_os_str().len() > DBUS_SOCKET_PATH_MAX {
+        anyhow::bail!(
+            "D-Bus Unix socket path {} ({} bytes) exceeds the libdbus pathname limit of {DBUS_SOCKET_PATH_MAX} bytes; choose a shorter TMPDIR before starting kwin-mcp",
+            socket.display(),
+            socket.as_os_str().len(),
+        );
+    }
     Ok(())
 }
 
