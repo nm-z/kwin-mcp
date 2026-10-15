@@ -5351,12 +5351,12 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 // ── Session workdir autoclean ────────────────────────────────────────────
 //
-// --autoclean owns exactly one directory, the session workdir of this server
-// process, and moves through one explicit state machine:
+// --autoclean owns the session workdir and its disk-backed overlay twin, and
+// moves through one explicit state machine:
 //
 //   Idle  --claim (session_start, before the directory is created)--> Owned
-//   Owned --remove succeeded (workdir gone)--------------------------> Idle
-//   Owned --remove failed (workdir still there)---------------------> Owned
+//   Owned --remove succeeded (both directories gone)----------------> Idle
+//   Owned --remove failed (either directory remains)----------------> Owned
 //
 // `claim` and `remove` are synchronous and each runs under a single lock
 // acquisition, so no await, cancellation, or hard timeout can split a
@@ -5479,6 +5479,16 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             ),
         ));
     }
+    // Startup can fail before a Session exists, so teardown cannot be the only
+    // owner of the disk overlay's cleanup. Remove it before the temporary
+    // workdir: a failure must keep the lease and ownership reachable for retry.
+    let disk = session_disk_path(dir);
+    remove_verified_workdir(&disk).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("disk overlay {} not removed: {error}", disk.display()),
+        )
+    })?;
     remove_verified_workdir(dir)
 }
 
@@ -5779,8 +5789,8 @@ impl WorkdirOwnership {
     fn owned(&self) -> Option<std::path::PathBuf> {
         self.lock().as_ref().map(|claim| claim.dir.clone())
     }
-    /// The terminal transition: delete the owned workdir and release ownership
-    /// only once it is actually gone. Both the delete and the release happen
+    /// The terminal transition: delete the owned workdir and its disk twin,
+    /// releasing ownership only once both are gone. The deletes and release happen
     /// under one lock acquisition, so concurrent callers cannot observe or lose
     /// a half-finished transition.
     fn remove(&self) -> WorkdirCleanup {
