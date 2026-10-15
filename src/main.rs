@@ -5714,9 +5714,7 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             ),
         ));
     }
-    // Startup can fail before a Session exists, so teardown cannot be the only
-    // owner of the disk overlay's cleanup. Remove it before the temporary
-    // workdir: a failure must keep the lease and ownership reachable for retry.
+    // Failed startup may not publish a Session to clean its disk overlay.
     let disk = session_disk_path(dir);
     remove_verified_workdir(&disk).map_err(|error| {
         std::io::Error::new(
@@ -5822,16 +5820,19 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
         {
             continue;
         }
-        let dir_text = dir.to_string_lossy();
-        let mount_prefix = format!("{dir_text}/");
-        if mounts
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(4))
-            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
-        {
+        let disk = session_disk_path(&dir);
+        let storage_mounted = [&dir, &disk].iter().any(|path| {
+            let dir_text = path.to_string_lossy();
+            let mount_prefix = format!("{dir_text}/");
+            mounts
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(4))
+                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
+        });
+        if storage_mounted {
             continue;
         }
-        match remove_verified_workdir(&dir) {
+        match remove_verified_session_storage(&dir) {
             Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
             Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
         }
