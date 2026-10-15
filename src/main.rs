@@ -3341,6 +3341,100 @@ const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
 /// Avoid eager bulk copies unless the caller explicitly requests writability.
 const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Keep the validated directory inode alive until bwrap has mounted it. The
+/// launcher reopens it after pasta and checks its identity before mounting its fd.
+struct PersistentDirectory {
+    path: PathBuf,
+    directory: std::fs::File,
+}
+
+fn persistent_directories(
+    home: &Path,
+    paths: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PersistentDirectory>> {
+    use std::os::unix::fs::MetadataExt;
+    // geteuid has no preconditions and does not change process state.
+    let uid = unsafe { nix::libc::geteuid() };
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut directories: Vec<PersistentDirectory> = Vec::new();
+    let mut reserved: Vec<PathBuf> = BROWSER_CONFIG_DIRS.iter().map(|p| home.join(p)).collect();
+    reserved.extend([
+        home.join(".cache/google-chrome"),
+        home.join(".config/kwinrc"),
+        home.join(".config/kdeglobals"),
+        home.join(".config/kwinrulesrc"),
+        home.join(".config/kscreenlockerrc"),
+        home.join(".config/kcmfonts"),
+        home.join(".config/fontconfig"),
+        session_disk_root(),
+        session_workdir_path(),
+        kwin_mcp::browser_cookies::state_root()?,
+    ]);
+    // A standard browser root may itself be a symlink to a dedicated path.
+    // Reject that alias too, before any browser preparation can read it.
+    reserved.extend(
+        reserved
+            .clone()
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok()),
+    );
+    for path in paths {
+        if !path.is_absolute()
+            || path == home
+            || !path.starts_with(home)
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || reserved
+                .iter()
+                .any(|p| path.starts_with(p) || p.starts_with(&path))
+            || directories
+                .iter()
+                .any(|p| path.starts_with(&p.path) || p.path.starts_with(&path))
+        {
+            anyhow::bail!(
+                "persistent_paths requires non-overlapping dedicated directories under HOME, outside browser config, desktop config, cookie state and session storage: {}",
+                path.display()
+            );
+        }
+        // Open each component relative to the previous descriptor: no symlink
+        // (including an ancestor) can redirect validation to another directory.
+        let mut directory = std::fs::File::open("/")?;
+        for component in path.components() {
+            if let std::path::Component::Normal(name) = component {
+                directory = nix::fcntl::openat(
+                    &directory,
+                    Path::new(name),
+                    nix::fcntl::OFlag::O_PATH
+                        | nix::fcntl::OFlag::O_DIRECTORY
+                        | nix::fcntl::OFlag::O_NOFOLLOW
+                        | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )?
+                .into();
+                let metadata = directory.metadata()?;
+                if (metadata.uid() != uid && metadata.uid() != 0) || metadata.mode() & 0o022 != 0 {
+                    anyhow::bail!(
+                        "persistent_paths ancestors must be owned by this user or root and not writable by other users: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let metadata = directory.metadata()?;
+        if metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
+            anyhow::bail!(
+                "persistent_paths directory must be owned by UID {uid} with mode 0700: {}",
+                path.display()
+            );
+        }
+        directories.push(PersistentDirectory { path, directory });
+    }
+    Ok(directories)
+}
+
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
 /// gnome-keyring's control and PKCS#11 sockets, and p11-kit's. Sockets from
@@ -3383,6 +3477,7 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
+    persistent: Vec<PersistentDirectory>,
     staging_root: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
@@ -3536,6 +3631,29 @@ impl OverlayPlan {
         }
     }
 
+    fn persistent_launcher(&self) -> std::io::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        // Pasta closes inherited descriptors. Open after it, compare against
+        // the still-pinned inode, then let bwrap consume --bind-fd. Mounts go
+        // last, after /proc and other sandbox paths have been configured.
+        let mut script = String::from(
+            "set -e\nargs=()\nwhile (( $# )) && [[ $1 != -- ]]; do args+=(\"$1\"); shift; done\n",
+        );
+        for (index, mount) in self.persistent.iter().enumerate() {
+            let metadata = mount.directory.metadata()?;
+            let path = shell_quote(&mount.path.to_string_lossy());
+            // Pasta maps the caller to its namespace's effective UID.
+            let identity = format!("{}:{}:$EUID:700", metadata.dev(), metadata.ino());
+            script.push_str(&format!(
+                "exec {{mount_fd_{index}}}<{path}\n\
+                 [[ $(stat -Lc '%d:%i:%u:%a' /proc/self/fd/$mount_fd_{index}) == {identity} ]] || {{ echo 'persistent_paths directory changed during startup' >&2; exit 1; }}\n\
+                 args+=(--bind-fd \"$mount_fd_{index}\" {path})\n"
+            ));
+        }
+        script.push_str("exec bwrap \"${args[@]}\" \"$@\"\n");
+        Ok(script)
+    }
+
     fn expose_sockets(
         &mut self,
         target: &Path,
@@ -3614,9 +3732,13 @@ impl OverlayPlan {
             })
             .filter(|(path, _, _)| {
                 !self
-                    .read_only_binds
+                    .persistent
                     .iter()
-                    .any(|mount| path != mount && path.starts_with(mount))
+                    .any(|mount| path.starts_with(&mount.path))
+                    && !self
+                        .read_only_binds
+                        .iter()
+                        .any(|mount| path != mount && path.starts_with(mount))
             })
             .collect();
         sockets.sort();
@@ -3755,6 +3877,7 @@ struct SplitOverlayContext<'a> {
     upper_root: &'a Path,
     work_root: &'a Path,
     mounts: &'a [procfs::process::MountInfo],
+    persistent: &'a [PersistentDirectory],
     initialize: bool,
     writable_paths: &'a [PathBuf],
     live_databases: &'a [PathBuf],
@@ -3804,10 +3927,11 @@ fn prepare_split_overlay_directory(
         let file_type = entry.file_type()?;
         let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
 
-        if context
-            .mounts
-            .iter()
-            .any(|mount| mount.mount_point == source)
+        if context.persistent.iter().any(|mount| mount.path == source)
+            || context
+                .mounts
+                .iter()
+                .any(|mount| mount.mount_point == source)
         {
             // Only a stub for bwrap's bind: the mount shadows its mode. Never
             // stat the mount itself; a hung FUSE or network mount would block
@@ -3820,9 +3944,12 @@ fn prepare_split_overlay_directory(
 
         if file_type.is_dir() {
             if context
-                .mounts
+                .persistent
                 .iter()
-                .any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source))
+                .any(|mount| mount.path.starts_with(&source))
+                || context.mounts.iter().any(|mount| {
+                    mount.mount_point != source && mount.mount_point.starts_with(&source)
+                })
             {
                 prepare_split_overlay_directory(
                     &source,
@@ -3925,9 +4052,10 @@ fn prepare_overlay_plan(
     mounts: &[procfs::process::MountInfo],
     writable_paths: &[PathBuf],
     live_databases: &[PathBuf],
+    persistent: Vec<PersistentDirectory>,
 ) -> anyhow::Result<OverlayPlan> {
     let excluded_mounts = mount_descendants(mounts, target);
-    if excluded_mounts.is_empty() {
+    if excluded_mounts.is_empty() && persistent.is_empty() {
         let upper = session_tmp.join("overlay-upper");
         let work = session_tmp.join("overlay-work");
         std::fs::create_dir_all(&upper)?;
@@ -3939,6 +4067,7 @@ fn prepare_overlay_plan(
             destination: target.to_path_buf(),
         };
         return Ok(OverlayPlan {
+            persistent,
             staging_root: None,
             overlays: vec![overlay],
             read_only_binds: Vec::new(),
@@ -3967,6 +4096,7 @@ fn prepare_overlay_plan(
         upper_root: &upper_root,
         work_root: &work_root,
         mounts,
+        persistent: &persistent,
         initialize,
         writable_paths,
         live_databases,
@@ -3993,6 +4123,7 @@ fn prepare_overlay_plan(
     }
 
     Ok(OverlayPlan {
+        persistent,
         staging_root: Some(staging_root),
         overlays,
         read_only_binds,
@@ -4386,8 +4517,18 @@ fn prepare_host_view(
     host_xdg_dir: &Path,
     host_runtime: &Path,
     writable_paths: &[PathBuf],
+    persistent_paths: Vec<PathBuf>,
     service: &KwinMcp,
 ) -> anyhow::Result<HostView> {
+    let persistent = persistent_directories(target, persistent_paths)
+        .map_err(|error| anyhow::anyhow!("validate persistent_paths: {error:#}"))?;
+    if persistent.iter().any(|directory| {
+        writable_paths
+            .iter()
+            .any(|path| path.starts_with(&directory.path) || directory.path.starts_with(path))
+    }) {
+        anyhow::bail!("persistent_paths must not overlap private-copy writable_paths");
+    }
     service.set_start_stage("scanning host mounts");
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
@@ -4395,6 +4536,17 @@ fn prepare_host_view(
         .map(|mounts| mounts.0)
         .map_err(|e| anyhow::anyhow!("read mount inventory: {e:#}"))?;
     let overlay_exclusions = mount_descendants(&mount_inventory, target);
+    for directory in &persistent {
+        if overlay_exclusions
+            .iter()
+            .any(|mount| mount != &directory.path && mount.starts_with(&directory.path))
+        {
+            anyhow::bail!(
+                "persistent_paths must not contain mounted filesystems: {}",
+                directory.path.display()
+            );
+        }
+    }
     eprintln!(
         "session_start: mount inventory={} overlay-exclusions={}",
         mount_inventory.len(),
@@ -4425,7 +4577,10 @@ fn prepare_host_view(
         );
     }
     service.set_start_stage("scanning host sockets and processes");
-    let inventory = host_process_inventory(target)?;
+    let mut inventory = host_process_inventory(target)?;
+    inventory
+        .live_databases
+        .retain(|path| !persistent.iter().any(|mount| path.starts_with(&mount.path)));
     service.set_start_stage("preparing HOME overlays");
     let mut overlay_plan = prepare_overlay_plan(
         target,
@@ -4433,6 +4588,7 @@ fn prepare_host_view(
         &mount_inventory,
         writable_paths,
         &inventory.live_databases,
+        persistent,
     )
     .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
@@ -4441,6 +4597,14 @@ fn prepare_host_view(
     if disk_root.starts_with(target) {
         overlay_plan.empty_dirs.push(disk_root);
     }
+    // Hide these directories through all read-only host aliases as well. The
+    // explicit writable mounts are applied after the primary-path masks.
+    overlay_plan.empty_dirs.extend(
+        overlay_plan
+            .persistent
+            .iter()
+            .map(|mount| mount.path.clone()),
+    );
     service.set_start_stage("scanning host sockets and processes");
     overlay_plan
         .expose_sockets(target, host_runtime, host_xdg_dir, &inventory)
@@ -7984,6 +8148,12 @@ struct SessionStartParams {
     /// private copies. Default: files over 64 MiB use reflink or a read-only
     /// bind. Explicit copies still share the 20-second startup deadline.
     writable_paths: Option<Vec<PathBuf>>,
+    /// Existing dedicated directories under HOME, owned by this user with mode
+    /// 0700 and no symlink ancestors. Mounted directly read-write at the same
+    /// path; contents survive session_stop and are never copied or merged.
+    /// Excludes standard browser profiles and session storage. The caller must
+    /// exclusively own the directory and stop its browser before reuse.
+    persistent_paths: Option<Vec<PathBuf>>,
 }
 
 impl SessionStartParams {
@@ -8637,6 +8807,7 @@ impl KwinMcp {
             )));
         }
         let writable_paths = params.writable_paths.unwrap_or_default();
+        let persistent_paths = params.persistent_paths.unwrap_or_default();
         for path in &writable_paths {
             if !path.is_absolute()
                 || !path.starts_with(&overlay_target)
@@ -8667,6 +8838,7 @@ impl KwinMcp {
                 &view_xdg,
                 &view_runtime,
                 &writable_paths,
+                persistent_paths,
                 &view_service,
             ));
         });
@@ -9014,8 +9186,20 @@ impl KwinMcp {
             "--udp-ns",
             &host_ports_spec,
             "--",
-            "bwrap",
         ]);
+        if overlay_plan.persistent.is_empty() {
+            cmd.arg("bwrap");
+        } else {
+            let launcher = overlay_plan
+                .persistent_launcher()
+                .map_err(|error| ver_err(format!("prepare persistent_paths launcher: {error}")))?;
+            // systemd-run expands environment references in argv, including
+            // Bash array syntax. Keep the shell source in a private file.
+            let launcher_path = host_xdg_dir.join("persistent-mounts.sh");
+            std::fs::write(&launcher_path, launcher)
+                .map_err(|error| ver_err(format!("write persistent_paths launcher: {error}")))?;
+            cmd.arg("bash").arg(launcher_path);
+        }
         // FUSE needs a process holding CAP_SYS_ADMIN in the user namespace that
         // owns the sandbox's mount namespace. With --uid other than 0, bwrap
         // (needing root for devpts) nests a second user namespace, where the
@@ -9533,6 +9717,7 @@ impl KwinMcp {
             "height": screen_h,
             "viewer": viewer,
             "cookie_errors": cookie_errors,
+            "persistent_paths": overlay_plan.persistent.iter().map(|mount| &mount.path).collect::<Vec<_>>(),
             "oversized_read_only_files": oversized_read_only_files,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
