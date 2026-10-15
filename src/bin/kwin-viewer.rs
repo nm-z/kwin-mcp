@@ -77,6 +77,7 @@ const PASTE_SETTLE: Duration = Duration::from_millis(200);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+const VIEWER_STATUS_HEARTBEAT: Duration = Duration::from_secs(1);
 const INITIAL_VIEWER_WIDTH: f64 = 1920.0;
 const INITIAL_VIEWER_HEIGHT: f64 = 1080.0;
 
@@ -860,6 +861,8 @@ fn window_loop(
     let mut first_frame_consumed = false;
     let mut startup_error = None;
     let started = Instant::now();
+    let mut last_status_heartbeat = started;
+    let window_closed = Cell::new(false);
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
     let mut aspect = ViewerAspect::new(virt);
@@ -897,7 +900,22 @@ fn window_loop(
             }
             next_title_check = Instant::now() + Duration::from_millis(250);
         }
+        let mut close_requested = false;
         for event in frame.events.iter() {
+            if matches!(
+                event,
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                }
+            ) {
+                window_closed.set(true);
+                if let Some(dir) = status_dir {
+                    write_status(dir, "closed", "host window closed");
+                }
+                close_requested = true;
+                break;
+            }
             if let Event::WindowEvent {
                 event: WindowEvent::Resized(size),
                 ..
@@ -912,6 +930,11 @@ fn window_loop(
                 input_state,
                 numlock,
             );
+        }
+        if close_requested {
+            shutdown.request();
+            frame.exit();
+            return;
         }
 
         // Consume the latest frame if one arrived; upload into src_image.
@@ -1011,9 +1034,18 @@ fn window_loop(
                     "first session frame render submitted to the host window",
                 );
             }
+            last_status_heartbeat = Instant::now();
             if let Some(pipe) = remote_output.as_ref() {
                 send_remote_op(pipe, Op::Presented);
             }
+        } else if ready_reported.get()
+            && !window_closed.get()
+            && last_status_heartbeat.elapsed() >= VIEWER_STATUS_HEARTBEAT
+        {
+            if let Some(dir) = status_dir {
+                write_status(dir, "ready", "host window is showing the session");
+            }
+            last_status_heartbeat = Instant::now();
         }
     })?;
     if let Some(error)=startup_error {anyhow::bail!(error);}
