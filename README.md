@@ -107,7 +107,7 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
-HOME uses one disk-backed overlay with the live host HOME as its lower layer. If nested host mounts exist below HOME, the server rebinds each nested mount read-only over the overlay. This avoids walking or copying HOME during startup; ordinary HOME entries remain live, and writes stay in the overlay upper layer. Large files use normal overlay copy-on-write when a session writes them.
+HOME uses one disk-backed overlay with the live host HOME as its lower layer. If nested host mounts exist below HOME, the server uses one `fuse-overlayfs` mount and rebinds each nested mount read-only over it; otherwise it uses one kernel overlay. The FUSE fallback requires `fuse-overlayfs`, `fusermount3`, and `/dev/fuse`: kernel overlayfs cannot clone a lower tree containing mounts locked by its user namespace. This avoids walking or copying HOME during startup; ordinary HOME entries remain live, and writes stay in the overlay upper layer. Large files use normal overlay copy-on-write when a session writes them.
 
 Default startup creates no uinput devices and starts no private PipeWire or
 WirePlumber processes. Input uses KWin's EIS connection. The D-Bus input settings

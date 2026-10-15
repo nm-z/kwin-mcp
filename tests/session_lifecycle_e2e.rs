@@ -1622,7 +1622,10 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         !workdir(&started).join("viewer.log").exists(),
         "session_start launched a viewer"
     );
-    assert!(!workdir(&started).join("pipewire-0").exists(), "default startup launched private media services");
+    assert!(
+        !workdir(&started).join("pipewire-0").exists(),
+        "default startup launched private media services"
+    );
     let launched = call_tool(
         &mut client,
         3,
@@ -4970,12 +4973,20 @@ fn session_uses_one_overlay_with_read_only_nested_mounts() {
                 .filter(|arg| *arg == b"--overlay")
                 .count()
         })
-        .filter(|count| *count > 0)
         .collect();
-    assert!(!overlay_counts.is_empty(), "missing overlay bwrap command");
+    assert!(!overlay_counts.is_empty(), "missing bwrap command");
     assert!(
-        overlay_counts.iter().all(|count| *count == 1),
-        "multiple overlay mounts in a bwrap command: {overlay_counts:?}"
+        overlay_counts.iter().all(|count| *count == 0),
+        "nested HOME unexpectedly uses kernel overlays: {overlay_counts:?}"
+    );
+    assert_eq!(
+        child_named_processes(client.child.id(), "fuse-overlayfs").len(),
+        1,
+        "expected one FUSE HOME overlay"
+    );
+    assert!(
+        !disk.join("overlay-upper/.local/share/populated").exists(),
+        "populated files were staged into upper"
     );
     let report = dir.join("live-home-check.txt");
     let script = dir.join("live-home-check.sh");
@@ -5071,7 +5082,7 @@ printf 'LIVE_HOME_LOWER_PASS\n' | tee {}
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
     println!(
-        "PASS: live HOME lower with 4096 populated files, read-only nested mount, visible bytes, copy-on-write, one overlay, session_start={}ms, rendered output, host files unchanged, cleanup",
+        "PASS: FUSE live HOME lower, staged_bytes=0, 4096 populated files, read-only nested mount, visible bytes, copy-on-write, one overlay, session_start={}ms, rendered output, host files unchanged, cleanup",
         startup.as_millis()
     );
 }

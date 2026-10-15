@@ -3321,6 +3321,7 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
+    fuse_home: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
@@ -3371,6 +3372,10 @@ impl OverlayPlan {
             .iter()
             .filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok())
         {
+            if let Some(merged) = &self.fuse_home {
+                command.arg("--bind").arg(merged).arg(&overlay.destination);
+                continue;
+            }
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -3668,6 +3673,7 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
 fn prepare_overlay_plan(
     target: &Path,
     session_tmp: &Path,
+    host_xdg_dir: &Path,
     mounts: &[procfs::process::MountInfo],
 ) -> anyhow::Result<OverlayPlan> {
     let upper = session_tmp.join("overlay-upper");
@@ -3684,6 +3690,7 @@ fn prepare_overlay_plan(
     });
     read_only_binds.dedup();
     Ok(OverlayPlan {
+        fuse_home: (!read_only_binds.is_empty()).then(|| host_xdg_dir.join("home-merged")),
         overlays: vec![OverlayMount {
             lower,
             upper,
@@ -4121,7 +4128,7 @@ fn prepare_host_view(
     service.set_start_stage("scanning host sockets and processes");
     let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
-    let mut overlay_plan = prepare_overlay_plan(target, &disk, &mount_inventory)
+    let mut overlay_plan = prepare_overlay_plan(target, &disk, host_xdg_dir, &mount_inventory)
         .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
     // sees an empty directory there instead.
@@ -4527,6 +4534,7 @@ fn terminate_child(child: impl Into<SessionProcess>, process_group: bool, label:
 /// them until the Session takes them, so cancelling the startup future cannot
 /// detach a process or task that has no reachable cleanup path.
 struct StartupResources {
+    fuse_home: Option<PathBuf>,
     scope_unit: Option<String>,
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
@@ -4536,6 +4544,7 @@ struct StartupResources {
 impl StartupResources {
     fn new() -> Self {
         Self {
+            fuse_home: None,
             scope_unit: None,
             sandbox_child: None,
             sandbox_stdin: None,
@@ -4555,6 +4564,9 @@ impl StartupResources {
         if let Some(sandbox) = self.sandbox_child.take() {
             terminate_child(sandbox, true, "startup sandbox");
         }
+        if let Some(merged) = self.fuse_home.take() {
+            unmount_home_overlay(&merged);
+        }
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
         }
@@ -4568,6 +4580,7 @@ impl StartupResources {
         Vec<std::process::Child>,
     ) {
         self.scope_unit.take();
+        self.fuse_home.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -4585,6 +4598,96 @@ impl StartupResources {
 impl Drop for StartupResources {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+/// A nested mount is locked when bwrap enters its user namespace. Kernel
+/// overlayfs cannot clone that lower mount, and ignores newly bound submounts
+/// in a staged lower tree. FUSE resolves the live lower paths without copying
+/// HOME or creating an overlay for each of its entries.
+async fn start_home_overlay(
+    plan: &OverlayPlan,
+    startup: &mut StartupResources,
+) -> anyhow::Result<()> {
+    let Some(merged) = &plan.fuse_home else {
+        return Ok(());
+    };
+    let overlay = plan
+        .overlays
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing HOME overlay"))?;
+    for path in [&overlay.lower, &overlay.upper, &overlay.work] {
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| b",:\\\n".contains(byte))
+        {
+            anyhow::bail!(
+                "nested HOME overlay path contains an unsupported separator: {}",
+                path.display()
+            );
+        }
+    }
+    std::fs::create_dir(merged)?;
+    let log = std::fs::File::create(merged.with_extension("log"))?;
+    let child = std::process::Command::new("fuse-overlayfs")
+        .arg("-f")
+        .arg("-o")
+        .arg(format!(
+            "lowerdir={},upperdir={},workdir={}",
+            overlay.lower.display(),
+            overlay.upper.display(),
+            overlay.work.display()
+        ))
+        .arg(merged)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn()
+        .map_err(|error| {
+            anyhow::anyhow!("nested HOME mounts require fuse-overlayfs and /dev/fuse: {error}")
+        })?;
+    startup.fuse_home = Some(merged.clone());
+    startup.add_proxy(child);
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if procfs::process::Process::myself()?
+            .mountinfo()?
+            .0
+            .iter()
+            .any(|mount| mount.mount_point == *merged)
+        {
+            return Ok(());
+        }
+        if let Some(child) = startup.service_proxy_children.last_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            anyhow::bail!(
+                "fuse-overlayfs exited with {status}; see {}",
+                merged.with_extension("log").display()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out mounting the nested HOME overlay");
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+}
+
+fn unmount_home_overlay(merged: &Path) {
+    let mounted = procfs::process::Process::myself()
+        .and_then(|process| process.mountinfo())
+        .is_ok_and(|mounts| mounts.0.iter().any(|mount| mount.mount_point == merged));
+    if mounted {
+        match std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(merged)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            status => eprintln!("HOME overlay unmount {}: {status:?}", merged.display()),
+        }
     }
 }
 
@@ -5161,6 +5264,21 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Remove a directory after the caller has proved its ownership. This helper
 /// never follows a symlink while repairing nested permissions.
 fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
+    // Never traverse a mounted HOME view if unmounting failed. Repairing or
+    // removing it would operate on session files rather than owned storage.
+    let mounts = procfs::process::Process::myself()
+        .and_then(|process| process.mountinfo())
+        .map_err(std::io::Error::other)?;
+    if mounts
+        .0
+        .iter()
+        .any(|mount| mount.mount_point.starts_with(dir))
+    {
+        return Err(std::io::Error::other(format!(
+            "mount remains inside {}",
+            dir.display()
+        )));
+    }
     let flags =
         nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC;
     if let Ok(root) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) {
@@ -5785,6 +5903,7 @@ fn teardown(mut sess: Session) -> Vec<String> {
     sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
     terminate_child(sess.sandbox_child, true, "sandbox");
+    unmount_home_overlay(&sess.host_xdg_dir.join("home-merged"));
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
@@ -8814,6 +8933,11 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
+        if let Some(merged) = &overlay_plan.fuse_home {
+            // The source alias bypasses HOME's socket and nested-mount masks.
+            // Keep the mounted view reachable only through the sandbox HOME.
+            cmd.arg("--tmpfs").arg(merged);
+        }
         // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
         // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
         // them the NVIDIA render node (often the primary GBM device) loads as
@@ -8908,6 +9032,10 @@ impl KwinMcp {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
+        self.set_start_stage("mounting the HOME overlay");
+        start_home_overlay(&overlay_plan, &mut startup)
+            .await
+            .map_err(|error| ver_err(format!("HOME overlay: {error:#}")))?;
         self.set_start_stage("spawning the pasta and bwrap sandbox");
         let sandbox_child = match spawn_session_child(cmd, true).await {
             Ok(child) => child,
