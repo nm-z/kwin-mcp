@@ -328,8 +328,7 @@ impl RpcClient {
 
     fn stop_process(mut self) {
         self.cleanup_sessions();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.stdin.take());
     }
 
     fn cleanup_sessions(&mut self) {
@@ -4181,11 +4180,7 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    let session_server_pid = if client.child.id() == u32::MAX {
-        client.child.id() - 1
-    } else {
-        client.child.id() + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let unavailable = call_tool(
         &mut client,
@@ -4326,12 +4321,7 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let server_pid = client.child.id();
-    let next_pid = server_pid.saturating_add(1);
-    let session_server_pid = if next_pid == server_pid {
-        server_pid - 1
-    } else {
-        next_pid
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
 
     let response = call_tool(
@@ -4365,6 +4355,109 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
 }
 
 #[test]
+fn unknown_session_from_a_live_server_is_checked_by_its_owner() {
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let owner_pid = owner.child.id();
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let session_id = format!("s{owner_pid}-999999");
+
+    let response = call_tool(
+        &mut caller,
+        2,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "session_not_found",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["server_pid"], owner_pid,
+        "{response}"
+    );
+    assert_ne!(response["error"]["data"]["server_pid"], caller.child.id());
+
+    drop(caller);
+    drop(owner);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, input devices, and a live GPU session"]
+fn live_session_tools_are_forwarded_to_the_owner_process() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert!(started["error"].is_null(), "{started}");
+    let session_id = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session ID")
+        .to_owned();
+
+    let windows = call_tool(
+        &mut caller,
+        2,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert!(windows["error"].is_null(), "{windows}");
+    assert!(
+        !windows["result"]["isError"].as_bool().unwrap_or(false),
+        "{windows}"
+    );
+    let closed = call_tool(
+        &mut caller,
+        3,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert!(closed["error"].is_null(), "{closed}");
+    assert!(
+        !closed["result"]["isError"].as_bool().unwrap_or(false),
+        "{closed}"
+    );
+    let stopped = call_tool(
+        &mut caller,
+        4,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    owner.sessions.retain(|owned| owned != &session_id);
+
+    let listed = call_tool(&mut owner, 3, "session_list", json!({}));
+    assert!(listed["error"].is_null(), "{listed}");
+    assert!(
+        listed["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{listed}"
+    );
+
+    drop(caller);
+    drop(owner);
+}
+
+#[test]
 fn malformed_session_lifecycle_record_is_an_error() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4380,11 +4473,7 @@ fn malformed_session_lifecycle_record_is_an_error() {
     initialize(&mut client);
 
     let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let malformed = format!(
         "{}\n",
@@ -4441,12 +4530,7 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let seed_record = format!(
         "{}\n",
