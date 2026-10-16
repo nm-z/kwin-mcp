@@ -7721,10 +7721,12 @@ struct ClipboardRestore {
     socket: PathBuf,
     text: String,
     secret: bool,
+    #[serde(default)]
+    primary: bool,
 }
 struct ClipboardEntry {
     clipboard: kwin_mcp::clipboard::Clipboard,
-    saved: Option<(u64, ClipboardRestore)>,
+    saved: Option<(u64, Option<u64>, ClipboardRestore)>,
 }
 #[derive(Default)]
 struct ClipboardStore {
@@ -7756,6 +7758,7 @@ impl ClipboardStore {
         label: &'static str,
         text: String,
         secret: bool,
+        primary: bool,
     ) -> anyhow::Result<usize> {
         let length = text.chars().count();
         let mut contents = vec![(CLIPBOARD_TEXT_MIME.to_owned(), text.as_bytes().to_vec())];
@@ -7766,13 +7769,23 @@ impl ClipboardStore {
             ));
         }
         let entry = self.entry(&socket, label)?;
-        entry.clipboard.write(Arc::new(contents))?;
+        let contents = Arc::new(contents);
+        entry.clipboard.write(Arc::clone(&contents))?;
+        if primary {
+            entry.clipboard.write_primary(contents)?;
+        }
+        let generation = entry.clipboard.generation()?;
+        let primary_generation = primary
+            .then(|| entry.clipboard.primary_generation())
+            .transpose()?;
         entry.saved = Some((
-            entry.clipboard.generation()?,
+            generation,
+            primary_generation,
             ClipboardRestore {
                 socket,
                 text,
                 secret,
+                primary,
             },
         ));
         Ok(length)
@@ -7780,10 +7793,15 @@ impl ClipboardStore {
     fn saved(&self) -> anyhow::Result<Vec<ClipboardRestore>> {
         let mut saved = Vec::new();
         for entry in self.entries.values() {
-            if let Some((generation, contents)) = &entry.saved
-                && entry.clipboard.generation()? == *generation
-            {
-                saved.push(contents.clone());
+            if let Some((generation, primary_generation, contents)) = &entry.saved {
+                let clipboard_unchanged = entry.clipboard.generation()? == *generation;
+                let primary_unchanged = match primary_generation {
+                    Some(generation) => entry.clipboard.primary_generation()? == *generation,
+                    None => true,
+                };
+                if clipboard_unchanged && primary_unchanged {
+                    saved.push(contents.clone());
+                }
             }
         }
         Ok(saved)
@@ -8390,7 +8408,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 "KDE Wayland automation in an isolated desktop. Call session_start to create it; pass session_id to later tools. Call session_stop when finished. \
                 Flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify. Prefer find_ui_elements for named controls, accessibility_tree for structure, and screenshots if either is empty or costly. If an app is missing, use window_list and window_activate. \
                 Work without a viewer by default. When the user must see or act (password, OTP, Duo, CAPTCHA, choice, result), put the relevant entry on screen, then call viewer_open; never assume it is open or stop the session for this step. You can poll screenshots without ending your turn. Continue when the page advances. The viewer can stay open; the user can close it. \
-                Clipboards are separate. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes from the host. Use clipboard_write target=host for user paste through the viewer, target=session for agent input. clipboard_read reads session text only. generate_secret values are withheld. \
+                Clipboards are separate. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes from the host. Use clipboard_write target=host for user paste through the viewer, target=session for agent input. Session writes also populate PRIMARY for X11 clients such as XTerm that use Shift+Insert by default. clipboard_read reads session text only. generate_secret values are withheld. \
                 At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
                 Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
@@ -9544,7 +9562,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "clipboard_write",
-        description = "Write UTF-8 text to the session or host clipboard. Specify target (session or host) and exactly one of text or generate_secret. Host means this server's desktop; use host for anything the user should paste through the local viewer, because viewer Ctrl+V and Shift+Insert read the host clipboard. The session has its own clipboard for agent input. generate_secret takes length (1..4096) and character_classes (lowercase, uppercase, digits, symbols); generation uses operating-system randomness and includes every selected class. The result contains only target and character length. Generated values are marked as secrets and are withheld by clipboard_read."
+        description = "Write UTF-8 text to the session or host clipboard. Specify target (session or host) and exactly one of text or generate_secret. Host means this server's desktop; use host for anything the user should paste through the local viewer, because viewer Ctrl+V and Shift+Insert read the host clipboard. Session writes also populate PRIMARY for X11 clients such as XTerm that use Shift+Insert by default. generate_secret takes length (1..4096) and character_classes (lowercase, uppercase, digits, symbols); generation uses operating-system randomness and includes every selected class. The result contains only target and character length. Generated values are marked as secrets and are withheld by clipboard_read."
     )]
     async fn clipboard_write(
         &self,
@@ -9579,11 +9597,12 @@ impl KwinMcp {
         };
         let store = self.clipboards.clone();
         let label = params.target.label();
+        let primary = matches!(params.target, ClipboardTarget::Session);
         let length = tokio::task::spawn_blocking(move || {
             store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
-                .write(socket, label, text, secret)
+                .write(socket, label, text, secret, primary)
         })
         .await
         .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
@@ -13057,6 +13076,7 @@ impl SessionRouter {
                     "restored",
                     clipboard.text,
                     clipboard.secret,
+                    clipboard.primary,
                 )?;
         }
         for saved in state.sessions {

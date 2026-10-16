@@ -6520,7 +6520,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
 }
 
 #[test]
-#[ignore = "requires private KWin desktops, kdialog, and wl-paste"]
+#[ignore = "requires private KWin desktops, kdialog, wl-paste, and xterm"]
 fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut desktop = RpcClient::start();
@@ -6574,6 +6574,49 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     assert_eq!(
         run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
         agent_text
+    );
+    let long_command = format!("{}printf 'paste probe';", "echo x;".repeat(82));
+    assert_eq!(long_command.chars().count(), 595);
+    assert_eq!(
+        run(
+            &mut client,
+            "clipboard_write",
+            json!({"session_id":id,"target":"session","text":&long_command})
+        ),
+        json!({"target":"session","length":595})
+    );
+    let xterm_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_command}),
+    );
+    let paste_started = Instant::now();
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&dir.join("xterm.txt")),
+        format!("{long_command}\n")
+    );
+    assert!(
+        paste_started.elapsed() < Duration::from_secs(5),
+        "595-character XTerm paste exceeded five seconds"
+    );
+    run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"session","text":agent_text}),
     );
     run(
         &mut client,
@@ -6736,6 +6779,35 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
             json!({"target":"session","length":32,"text":null,"protected":true})
         );
     }
+    let xterm_secret_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm-secret.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_secret_command}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    let restored_secret = submitted_text(&dir.join("xterm-secret.txt"));
+    let restored_secret = restored_secret.trim_end_matches('\n');
+    assert!(
+        restored_secret.len() == 32
+            && restored_secret.bytes().any(|b| b.is_ascii_lowercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_uppercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_digit())
+            && restored_secret.bytes().any(|b| b.is_ascii_punctuation()),
+        "reloaded PRIMARY selection must retain the protected generated value"
+    );
     // Replacing a selection from an app must prevent reload from resurrecting it.
     run(
         &mut client,
@@ -6777,7 +6849,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     run(&mut desktop, "session_stop", json!({"session_id":host_id}));
     desktop.stop_process();
     println!(
-        "PASS: separate clipboards; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
+        "PASS: separate clipboards; 595-character XTerm Shift+Insert paste; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
     );
 }
 
