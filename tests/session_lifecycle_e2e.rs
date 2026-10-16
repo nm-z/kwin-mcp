@@ -3931,6 +3931,143 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Google Chrome, input devices, and a live GPU session"]
+fn launch_app_reports_existing_chrome_window_after_url_handoff() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+
+    let first = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "command":"google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-handoff-before</title>Before handoff'"
+        }),
+    );
+    assert_ne!(first["result"]["isError"], true, "{first}");
+    let first_window = first["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("initial Chrome window ID")
+        .to_owned();
+
+    let school = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({
+            "command":"google-chrome-stable --profile-directory=School --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-school-window</title>School profile'"
+        }),
+    );
+    assert_ne!(school["result"]["isError"], true, "{school}");
+    let school_window = school["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("School Chrome window ID")
+        .to_owned();
+    assert_ne!(school_window, first_window, "{school}");
+
+    let handoff_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>After handoff'";
+    let handed_off = call_tool(
+        &mut client,
+        5,
+        "launch_app",
+        json!({
+            "command":handoff_command
+        }),
+    );
+    assert_ne!(handed_off["result"]["isError"], true, "{handed_off}");
+    let result = &handed_off["result"]["structuredContent"];
+    assert_eq!(result["window"], first_window, "{handed_off}");
+    assert_eq!(result["window_outcome"], "reused_existing", "{handed_off}");
+    assert_eq!(result["window_reused"], true, "{handed_off}");
+    assert!(
+        result["window_title"]
+            .as_str()
+            .is_some_and(|title| title.contains("kwin-mcp-handoff-after")),
+        "handoff title was not reported: {handed_off}"
+    );
+
+    let focused_school = call_tool(
+        &mut client,
+        6,
+        "window_activate",
+        json!({"window_id":school_window}),
+    );
+    assert_ne!(
+        focused_school["result"]["isError"], true,
+        "{focused_school}"
+    );
+
+    let same_title_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, another tab'";
+    let ambiguous = call_tool(
+        &mut client,
+        7,
+        "launch_app",
+        json!({"command":same_title_command,"window_timeout_seconds":1}),
+    );
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["window_outcome"], "unattributed",
+        "{ambiguous}"
+    );
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["exit_status"], 0,
+        "{ambiguous}"
+    );
+    assert!(
+        ambiguous["result"]["structuredContent"]["handoff"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("activation or minimized state")),
+        "missing attribution reason: {ambiguous}"
+    );
+    assert!(
+        ambiguous["result"]["structuredContent"]["handoff"]["candidate_windows"]
+            .as_array()
+            .is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["window"] == first_window)
+            }),
+        "the focused existing window was not reported as a candidate: {ambiguous}"
+    );
+
+    let windows = call_tool(&mut client, 8, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|window| {
+                    window["id"] == first_window
+                        && window["title"]
+                            .as_str()
+                            .is_some_and(|title| title.contains("kwin-mcp-handoff-after"))
+                })
+            }),
+        "the reused Chrome window did not show the handed-off tab: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 9, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
 fn launch_app_waits_for_a_delayed_window() {
     assert_eq!(
