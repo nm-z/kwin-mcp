@@ -6919,3 +6919,334 @@ fn launch_rejects_host_tmp_file_before_opening_app() {
         "PASS: host /tmp path and --file path rejected before app launch; ordinary launch still opens a private window"
     );
 }
+
+#[test]
+#[ignore = "requires private KWin desktops, Chrome, PipeWire, and Vulkan viewer rendering"]
+fn viewer_reuses_and_reopens_after_presenting_a_frame() {
+    use base64::Engine;
+
+    const WIDTH: u32 = 1400;
+    const HEIGHT: u32 = 1000;
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const COLOR_TOLERANCE: u8 = 16;
+
+    fn tool(client: &mut RpcClient, request: &mut u64, name: &str, args: Value) -> Value {
+        let response = call_tool(client, *request, name, args);
+        *request += 1;
+        assert!(response["error"].is_null(), "{response}");
+        assert!(
+            !response["result"]["isError"].as_bool().unwrap_or(false),
+            "{response}"
+        );
+        response
+    }
+
+    fn matches_palette(response: &Value, colors: &[[u8; 3]; 4]) -> bool {
+        if inline_png(response).is_empty() {
+            return false;
+        }
+        let image = decode_rgba(response);
+        let height = u32::try_from(image.1.len() / 4 / usize::try_from(image.0).expect("width"))
+            .expect("height");
+        [(1, 1), (3, 1), (1, 3), (3, 3)]
+            .into_iter()
+            .zip(colors)
+            .all(|((x, y), expected)| {
+                let actual = pixel(&image, image.0 * x / 4, height * y / 4);
+                actual[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(*expected) <= COLOR_TOLERANCE)
+            })
+    }
+
+    fn save(response: &Value, name: &str) {
+        if let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).expect("artifact directory");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(response))
+                .expect("screenshot base64");
+            std::fs::write(root.join(name), bytes).expect("save screenshot");
+        }
+    }
+
+    fn write_fixture(path: &std::path::Path, colors: &[[u8; 3]; 4], label: &str) {
+        let swatches =
+            colors.map(|[r, g, b]| format!("<div style='background:rgb({r},{g},{b})'></div>"));
+        std::fs::write(path, format!(
+            "<!doctype html><style>html,body{{margin:0;width:100%;height:100%;overflow:hidden}}\
+             body{{display:grid;grid-template:1fr 1fr/1fr 1fr}}\
+             p{{position:absolute;top:45%;left:30%;background:white;padding:12px;font:28px sans-serif}}</style>\
+             {}<p>Same session, frame {}</p>", swatches.join(""), label
+        )).expect("write private HTML fixture");
+    }
+
+    fn navigate(
+        client: &mut RpcClient,
+        request: &mut u64,
+        session: &str,
+        fixture: &std::path::Path,
+    ) {
+        tool(
+            client,
+            request,
+            "keyboard_key",
+            json!({"session_id":session,"key":"ctrl+l"}),
+        );
+        tool(
+            client,
+            request,
+            "keyboard_type",
+            json!({"session_id":session,"text":format!("file://{}",fixture.display())}),
+        );
+        tool(
+            client,
+            request,
+            "keyboard_key",
+            json!({"session_id":session,"key":"Return"}),
+        );
+    }
+
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // The viewer renders into an owned outer desktop, so the proof captures
+    // compositor pixels without reading or operating the user's desktop.
+    let bus = require_filtered_cookie_test_bus();
+    let mut desktop = RpcClient::start_with_env(&[("DBUS_SESSION_BUS_ADDRESS", &bus)]);
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    let mut client = RpcClient::start_with_env(&[
+        ("WAYLAND_DISPLAY", display.to_str().expect("display")),
+        ("DBUS_SESSION_BUS_ADDRESS", &bus),
+    ]);
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let mut request = 2;
+    let mut host_request = 3;
+    let started = tool(
+        &mut client,
+        &mut request,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let session = session_handle(&started);
+    let palettes = [
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]],
+        [[0, 255, 255], [255, 0, 255], [255, 255, 0], [0, 0, 255]],
+    ];
+    let mut previous_pid = None;
+    let mut browser_id = None;
+    for (round, colors) in palettes.iter().enumerate() {
+        let fixture = client.home.join(format!("viewer-reuse-{round}.html"));
+        write_fixture(&fixture, colors, &format!("{} opened", round + 1));
+        if round == 0 {
+            tool(
+                &mut client,
+                &mut request,
+                "launch_app",
+                json!({"session_id":session,"command":format!(
+                    "google-chrome-stable --user-data-dir=/tmp/viewer-reuse --no-first-run --no-default-browser-check 'file://{}'", fixture.display()
+                )}),
+            );
+            let windows = tool(
+                &mut client,
+                &mut request,
+                "window_list",
+                json!({"session_id":session}),
+            );
+            browser_id = Some(
+                windows["result"]["structuredContent"]["windows"]
+                    .as_array()
+                    .expect("browser windows")
+                    .iter()
+                    .find(|window| {
+                        window["resourceClass"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("chrome")
+                    })
+                    .expect("Chrome window")["id"]
+                    .clone(),
+            );
+        } else {
+            navigate(&mut client, &mut request, &session, &fixture);
+        }
+        let deadline = Instant::now() + FRAME_TIMEOUT;
+        loop {
+            let source = tool(
+                &mut client,
+                &mut request,
+                "screenshot",
+                json!({"session_id":session,"inline":true}),
+            );
+            if matches_palette(&source, colors) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source palette did not appear");
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let opened = tool(
+            &mut client,
+            &mut request,
+            "viewer_open",
+            json!({"session_id":session,"reason":"Inspect the current frame"}),
+        );
+        let viewer = &opened["result"]["structuredContent"]["viewer"];
+        let log = std::fs::read_to_string(workdir(&started).join("viewer.log")).unwrap_or_default();
+        assert_eq!(viewer["state"], "ready", "{opened}\n{log}");
+        let pid = viewer["pid"].as_u64().expect("viewer PID");
+        assert_ne!(
+            previous_pid,
+            Some(pid),
+            "reopen did not create a new viewer"
+        );
+        let mut window_id = None;
+        for (phase, reason) in [
+            ("opened", "Inspect the current frame"),
+            ("reused", "Enter the verification code"),
+        ] {
+            let current_colors = if phase == "reused" {
+                colors.map(|[r, g, b]| [b, r, g])
+            } else {
+                *colors
+            };
+            if phase == "reused" {
+                // Change the live browser before updating the viewer's reason:
+                // stale pixels and a stale ready file must not satisfy reuse.
+                let live = client.home.join(format!("viewer-reuse-{round}-live.html"));
+                write_fixture(&live, &current_colors, &format!("{} reused", round + 1));
+                navigate(&mut client, &mut request, &session, &live);
+                let reused = tool(
+                    &mut client,
+                    &mut request,
+                    "viewer_open",
+                    json!({"session_id":session,"reason":reason}),
+                );
+                let data = &reused["result"]["structuredContent"];
+                assert_eq!(data["status"], "already_open", "{reused}");
+                assert_eq!(data["viewer"]["state"], "ready", "{reused}");
+                assert_eq!(
+                    data["viewer"]["pid"], pid,
+                    "reuse replaced a working viewer"
+                );
+            }
+            let title = format!("kwin-viewer {session}: {reason}");
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            loop {
+                let windows = tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "window_list",
+                    json!({"session_id":host_id}),
+                );
+                let viewers: Vec<_> = windows["result"]["structuredContent"]["windows"]
+                    .as_array()
+                    .expect("outer windows")
+                    .iter()
+                    .filter(|window| {
+                        window["title"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .starts_with(&format!("kwin-viewer {session}:"))
+                    })
+                    .collect();
+                assert!(viewers.len() <= 1, "duplicate viewers: {viewers:?}");
+                if let Some(window) = viewers.first().filter(|window| window["title"] == title) {
+                    if let Some(id) = &window_id {
+                        assert_eq!(&window["id"], id, "reuse replaced the window");
+                    }
+                    window_id = Some(window["id"].clone());
+                    tool(
+                        &mut desktop,
+                        &mut host_request,
+                        "window_activate",
+                        json!({"session_id":host_id,"window_id":window["id"]}),
+                    );
+                    let displayed = tool(
+                        &mut desktop,
+                        &mut host_request,
+                        "screenshot",
+                        json!({"session_id":host_id,"inline":true}),
+                    );
+                    if matches_palette(&displayed, &current_colors) {
+                        save(&displayed, &format!("viewer-reuse-{round}-{phase}.png"));
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "viewer did not show current pixels/title: {windows}"
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+        assert_eq!(client.child.id(), server_pid, "server restarted");
+        let windows = tool(
+            &mut client,
+            &mut request,
+            "window_list",
+            json!({"session_id":session}),
+        );
+        assert!(
+            windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("source windows")
+                .iter()
+                .any(|window| Some(&window["id"]) == browser_id.as_ref()),
+            "browser was replaced: {windows}"
+        );
+        let closed = tool(
+            &mut client,
+            &mut request,
+            "viewer_close",
+            json!({"session_id":session}),
+        );
+        assert_eq!(closed["result"]["structuredContent"]["status"], "closed");
+        assert!(
+            !process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(true),
+            "viewer process survived close"
+        );
+        let windows = tool(
+            &mut desktop,
+            &mut host_request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        assert!(
+            !windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("outer windows")
+                .iter()
+                .any(|window| Some(&window["id"]) == window_id.as_ref()),
+            "viewer window survived close"
+        );
+        previous_pid = Some(pid);
+        println!(
+            "PASS: round {} opened, reused with updated title/current pixels, and closed; browser/session unchanged",
+            round + 1
+        );
+    }
+    tool(
+        &mut client,
+        &mut request,
+        "session_stop",
+        json!({"session_id":session}),
+    );
+    client.stop_process();
+    tool(
+        &mut desktop,
+        &mut host_request,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
+}
