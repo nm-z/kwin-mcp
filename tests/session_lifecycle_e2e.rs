@@ -3337,6 +3337,20 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         json!({"width":800,"height":600}),
     );
     let workdir = workdir(&started);
+    let bridge_exe = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(workdir.file_name().expect("session workdir name"))
+        .join("kwin-mcp-exe");
+    assert!(
+        bridge_exe.is_file(),
+        "FUSE bridge image was not staged in the disk-backed session twin: {}",
+        bridge_exe.display()
+    );
+    assert!(
+        !workdir.join("kwin-mcp-exe").exists(),
+        "FUSE bridge image consumed space in the /tmp workdir"
+    );
     std::fs::create_dir_all(workdir.join("src")).expect("source dir");
     std::fs::write(workdir.join("src/hello.txt"), "over fuse\n").expect("source file");
     // sshfs over a local sftp-server: a real libfuse3 client going through
@@ -3388,6 +3402,10 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         );
     }
     call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !bridge_exe.exists(),
+        "session_stop retained its disk-backed FUSE bridge image"
+    );
     client.stop_process();
 }
 
