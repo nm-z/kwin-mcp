@@ -6515,18 +6515,7 @@ fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
         if kind.is_dir() {
             continue;
         }
-        let name = entry.file_name();
-        let driver = std::fs::read_link(
-            Path::new("/sys/class/drm")
-                .join(&name)
-                .join("device/driver"),
-        )
-        .ok();
-        let owned_by_nvidia = driver
-            .as_deref()
-            .and_then(Path::file_name)
-            .is_some_and(|driver| driver == "nvidia");
-        if owned_by_nvidia {
+        if is_nvidia_dri_node(&entry.path()) {
             nvidia.push(entry.path())
         } else {
             other.push(entry.path())
@@ -6544,6 +6533,17 @@ fn usable_dri_nodes(nvidia_gbm_installed: bool) -> Option<Vec<PathBuf>> {
         other.extend(nvidia.into_iter().find(is_render));
     }
     Some(other)
+}
+
+fn is_nvidia_dri_node(node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return false;
+    };
+    std::fs::read_link(Path::new("/sys/class/drm").join(name).join("device/driver"))
+        .ok()
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|driver| driver == "nvidia")
 }
 
 fn nvidia_gbm_installed() -> bool {
@@ -9122,13 +9122,14 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
-        // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
-        // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
-        // them the NVIDIA render node (often the primary GBM device) loads as
-        // driver=(null) → eglInitialize fails → KWin's virtual backend can't composite
-        // → ScreenShot2 returns Error.Cancelled. Glob so we pick up whatever this host
-        // exposes; -try so non-NVIDIA hosts (no matches) still start.
-        if trimmed_dri.is_none() {
+        // NVIDIA Vulkan clients need character devices outside /dev/dri. Keep them
+        // available when all DRM nodes are exposed or a selected node is NVIDIA-backed,
+        // without granting them to sessions selecting only another renderer.
+        let nvidia_dri_exposed = match &trimmed_dri {
+            None => true,
+            Some(nodes) => nodes.iter().any(|node| is_nvidia_dri_node(node)),
+        };
+        if nvidia_dri_exposed {
             for path in glob::glob("/dev/nvidia*").into_iter().flatten().flatten() {
                 cmd.arg("--dev-bind-try").arg(&path).arg(&path);
             }
