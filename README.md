@@ -185,6 +185,16 @@ kwin-mcp (host process)
 
 Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
+`TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
+at most 107 bytes, excluding the terminating NUL, for the entire socket path.
+The session's D-Bus sockets have a stricter 99-byte limit imposed by
+[libdbus](https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html).
+`session_start` checks both constraints before creating its workdir or starting
+processes. If a path is too long, the error names it, reports its byte length,
+and asks for a shorter `TMPDIR`; set that variable before launching the server.
+The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
+filename, and counts UTF-8 bytes rather than characters.
+
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these
 databases without copying their contents, and reads use the host inodes and
