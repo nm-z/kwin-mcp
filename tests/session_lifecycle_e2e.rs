@@ -3889,15 +3889,42 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{missing}"
     );
     assert!(
+        missing["result"]["structuredContent"]["stderr"]
+            .as_str()
+            .is_some_and(|stderr| {
+                stderr.contains("kwin-mcp-e2e-no-such-command")
+                    && stderr.contains("command not found")
+            }),
+        "missing command stderr was not returned: {missing}"
+    );
+    assert_eq!(
+        missing["result"]["structuredContent"]["command_resolution"],
+        "kwin-mcp-e2e-no-such-command -> not found in session PATH",
+        "{missing}"
+    );
+    assert!(
         begun.elapsed() < Duration::from_secs(5),
         "missing command took {:?}",
         begun.elapsed()
     );
 
-    let failed = call_tool(&mut client, 4, "launch_app", json!({"command":"exit 3"}));
+    let failed = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"command":"printf 'synthetic Obsidian startup failure\\n' >&2; exit 3"}),
+    );
     assert_eq!(failed["result"]["isError"], true, "{failed}");
     assert_eq!(
         failed["result"]["structuredContent"]["exit_status"], 3,
+        "{failed}"
+    );
+    assert_eq!(
+        failed["result"]["structuredContent"]["stderr"], "synthetic Obsidian startup failure\n",
+        "{failed}"
+    );
+    assert_eq!(
+        failed["result"]["structuredContent"]["command_resolution"], "printf -> shell builtin",
         "{failed}"
     );
 
@@ -3905,12 +3932,30 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         &mut client,
         5,
         "launch_app",
-        json!({"command":"true","window_timeout_seconds":1}),
+        json!({"command":"bash -c 'exit 0'","window_timeout_seconds":1}),
     );
     assert_ne!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(
         finished["result"]["structuredContent"]["exit_status"], 0,
         "{finished}"
+    );
+    assert_eq!(
+        finished["result"]["structuredContent"]["stderr"], "",
+        "{finished}"
+    );
+    assert!(
+        finished["result"]["structuredContent"]["command_resolution"]
+            .as_str()
+            .is_some_and(
+                |resolution| resolution.starts_with("bash -> ") && resolution.ends_with("/bash")
+            ),
+        "first command PATH resolution was not returned: {finished}"
+    );
+    assert!(
+        finished
+            .to_string()
+            .contains("no stderr output was captured"),
+        "empty diagnostics were not explained: {finished}"
     );
     let retained = std::fs::read_dir(workdir(&started))
         .expect("workdir")
@@ -3921,6 +3966,27 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         })
         .count();
     assert_eq!(retained, 0, "launch command files were retained");
+    let retained_diagnostics = std::fs::read_dir(workdir(&started))
+        .expect("workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("launch-")
+                && entry.path().extension().is_some_and(|ext| ext == "stderr")
+        })
+        .count();
+    assert_eq!(retained_diagnostics, 0, "launch diagnostics were retained");
+    let retained_resolutions = std::fs::read_dir(workdir(&started))
+        .expect("workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("launch-")
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "resolution")
+        })
+        .count();
+    assert_eq!(retained_resolutions, 0, "launch resolutions were retained");
 
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
     assert!(
