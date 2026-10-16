@@ -191,6 +191,34 @@ databases without copying their contents, and reads use the host inodes and
 SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
+
+When copying an app profile inside the session to use as a separate writable
+`--user-data-dir`, keep copied directories writable and materialize only live
+SQLite alias links. A live database in HOME may be a symlink to the read-only
+`/run/kwin-mcp-host-sqlite` alias; `rsync -a` preserves that symlink, so the
+copied profile still points at the read-only database. This copies the profile
+while preserving its other symlinks, then replaces links only when their
+resolved targets remain inside the read-only SQLite alias:
+
+```bash
+rsync -a --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \
+  "$HOME/.config/Codex/" "$HOME/.codex-kwin/"
+find "$HOME/.codex-kwin" -type l -lname '/run/kwin-mcp-host-sqlite/*' \
+  -exec sh -c '
+    for link do
+      target=$(readlink -f -- "$link") || exit
+      case "$target" in
+        /run/kwin-mcp-host-sqlite/*) ;;
+        *) continue ;;
+      esac
+      copy=$(mktemp "${link}.kwin-mcp-copy.XXXXXX") || exit
+      cp -- "$target" "$copy" || exit
+      chmod u+rw -- "$copy" || exit
+      mv -f -- "$copy" "$link" || exit
+    done
+  ' sh {} +
+```
+
 Live database directory aliases also expose their siblings read-only under
 `/run/kwin-mcp-host-sqlite/`. Ordinary sibling paths under HOME remain privately
 writable. The aliases mirror hidden session directories and mask known host

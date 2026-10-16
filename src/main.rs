@@ -4121,6 +4121,7 @@ fn upper_file(plan: &OverlayPlan, path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Chromium-family config directories whose profiles are copied into sessions.
 const BROWSER_CONFIG_DIRS: &[&str] = &[
+    ".config/Codex",
     ".config/google-chrome",
     ".config/google-chrome-beta",
     ".config/google-chrome-unstable",

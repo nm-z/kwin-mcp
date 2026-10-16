@@ -2595,6 +2595,45 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         )
         .expect("seed host cookie fixture");
 
+    // ChatGPT uses a Chromium profile under ~/.config/Codex. Its live cookie
+    // database needs the same private-session treatment as browser cookies.
+    let codex_cookie_database = home.join(".config/Codex/Default/Network/Cookies");
+    std::fs::create_dir_all(
+        codex_cookie_database
+            .parent()
+            .expect("Codex cookie directory"),
+    )
+    .expect("create Codex cookie directory");
+    let codex_cookie_host =
+        rusqlite::Connection::open(&codex_cookie_database).expect("open host Codex cookie fixture");
+    codex_cookie_host
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE retained_cookie (value TEXT);
+         INSERT INTO retained_cookie VALUES ('host-cookie');",
+        )
+        .expect("seed host Codex cookie fixture");
+
+    // The ChatGPT app profile can contain live SQLite databases outside the
+    // browser-cookie exception. An archive copy must dereference the session's
+    // read-only database alias to make a private profile database.
+    let codex_database = home.join(".config/Codex/Default/First Party Sets/first_party_sets.db");
+    std::fs::create_dir_all(codex_database.parent().expect("Codex database directory"))
+        .expect("create Codex profile directory");
+    let codex_host =
+        rusqlite::Connection::open(&codex_database).expect("open host Codex database fixture");
+    codex_host
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE retained_set (value TEXT);
+         INSERT INTO retained_set VALUES ('host-set');",
+        )
+        .expect("seed host Codex database fixture");
+    let profile_marker = home.join(".config/Codex/Default/profile-marker.txt");
+    std::fs::write(&profile_marker, "synthetic profile marker\n")
+        .expect("write profile marker fixture");
+    let profile_link = home.join(".config/Codex/Default/profile-link.txt");
+    std::os::unix::fs::symlink("profile-marker.txt", &profile_link)
+        .expect("create unrelated profile symlink fixture");
+
     // A host app keeps writing its thread store for the whole session.
     struct LiveWriter {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2655,14 +2694,28 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
     let probe = workdir.join("sqlite-probe");
     std::fs::copy(std::env::current_exe().expect("test executable"), &probe)
         .expect("copy session probe");
+    let link_preserving_copy =
+        home.join(".codex-kwin-link-preserving/Default/First Party Sets/first_party_sets.db");
+    let writable_copy = home.join(".codex-kwin/Default/First Party Sets/first_party_sets.db");
+    let copied_codex_cookies = home.join(".codex-kwin/Default/Network/Cookies");
+    let profile_link_copy = home.join(".codex-kwin/Default/profile-link.txt");
     call_tool(
         &mut client,
         3,
         "launch_app",
         json!({"command":format!(
-            "KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_COOKIES={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_probe --nocapture; konsole",
+            "rsync -a --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin-link-preserving/\" && rsync -a --chmod=u+rwX --exclude='*Cache*' --exclude='Singleton*' \"$HOME/.config/Codex/\" \"$HOME/.codex-kwin/\" && find \"$HOME/.codex-kwin\" -type l -lname '/run/kwin-mcp-host-sqlite/*' -exec sh -c 'for link do target=$(readlink -f -- \"$link\") || exit; case \"$target\" in /run/kwin-mcp-host-sqlite/*) ;; *) continue ;; esac; copy=$(mktemp \"${{link}}.kwin-mcp-copy.XXXXXX\") || exit; cp -- \"$target\" \"$copy\" || exit; chmod u+rw -- \"$copy\" || exit; mv -f -- \"$copy\" \"$link\" || exit; done' sh {{}} + && KWIN_SQLITE_PROBE_DB={} KWIN_SQLITE_PROBE_COOKIES={} KWIN_SQLITE_PROBE_CODEX_COOKIES={} KWIN_SQLITE_PROBE_LINK_PRESERVING_COPY={} KWIN_SQLITE_PROBE_WRITABLE_COPY={} KWIN_SQLITE_PROBE_COPIED_CODEX_COOKIES={} KWIN_SQLITE_PROBE_PROFILE_LINK={} KWIN_SQLITE_PROBE_REPORT={} {} --ignored --exact session_sqlite_probe --nocapture; konsole",
             shlex::try_quote(&database.display().to_string()).expect("quote database"),
             shlex::try_quote(&cookie_database.display().to_string()).expect("quote cookies"),
+            shlex::try_quote(&codex_cookie_database.display().to_string())
+                .expect("quote Codex cookies"),
+            shlex::try_quote(&link_preserving_copy.display().to_string())
+                .expect("quote link-preserving copy"),
+            shlex::try_quote(&writable_copy.display().to_string()).expect("quote writable copy"),
+            shlex::try_quote(&copied_codex_cookies.display().to_string())
+                .expect("quote copied Codex cookies"),
+            shlex::try_quote(&profile_link_copy.display().to_string())
+                .expect("quote unrelated profile link"),
             shlex::try_quote(&report.display().to_string()).expect("quote report"),
             shlex::try_quote(&probe.display().to_string()).expect("quote probe"),
         )}),
@@ -2691,7 +2744,7 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         .expect("host writer");
     assert_eq!(
         result.trim(),
-        "bad=0 readonly=1 private=1",
+        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1 unrelated_link_preserved=1",
         "live database reads or read-only protection failed"
     );
 
@@ -2713,6 +2766,26 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
         .expect("read host cookie fixture");
     assert_eq!(host_cookies, 1, "session cookie write reached the host jar");
     drop(cookie_host);
+    let host_codex_cookies: i64 = codex_cookie_host
+        .query_row("SELECT count(*) FROM retained_cookie", [], |row| row.get(0))
+        .expect("read host Codex cookie fixture");
+    assert_eq!(
+        host_codex_cookies, 1,
+        "session Codex cookie write reached the host jar"
+    );
+    drop(codex_cookie_host);
+    let host_codex_rows: i64 = codex_host
+        .query_row(
+            "SELECT count(*) FROM retained_set WHERE value = 'session-copy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read host Codex fixture");
+    assert_eq!(
+        host_codex_rows, 0,
+        "profile copy write reached the host database"
+    );
+    drop(codex_host);
     call_tool(&mut client, 4, "session_stop", json!({}));
     client.stop_process();
 }
@@ -2722,6 +2795,13 @@ fn session_reads_host_live_sqlite_through_read_only_mounts() {
 fn session_sqlite_probe() {
     let database = std::env::var("KWIN_SQLITE_PROBE_DB").expect("probe database");
     let cookies = std::env::var("KWIN_SQLITE_PROBE_COOKIES").expect("probe cookie jar");
+    let codex_cookies = std::env::var("KWIN_SQLITE_PROBE_CODEX_COOKIES").expect("Codex cookie jar");
+    let link_preserving_copy =
+        std::env::var("KWIN_SQLITE_PROBE_LINK_PRESERVING_COPY").expect("link-preserving copy");
+    let writable_copy = std::env::var("KWIN_SQLITE_PROBE_WRITABLE_COPY").expect("writable copy");
+    let copied_codex_cookies =
+        std::env::var("KWIN_SQLITE_PROBE_COPIED_CODEX_COOKIES").expect("copied Codex cookies");
+    let profile_link = std::env::var("KWIN_SQLITE_PROBE_PROFILE_LINK").expect("profile symlink");
     let report = std::env::var("KWIN_SQLITE_PROBE_REPORT").expect("probe report");
     for flags in [
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2752,7 +2832,62 @@ fn session_sqlite_probe() {
         .query_row("select count(*) from retained_cookie", [], |row| row.get(0))
         .expect("private cookie count");
     assert_eq!(count, 2);
-    std::fs::write(report, "bad=0 readonly=1 private=1\n").expect("probe report");
+    let codex_jar = rusqlite::Connection::open(&codex_cookies).expect("session Codex cookie jar");
+    codex_jar
+        .execute("INSERT INTO retained_cookie VALUES ('session-cookie')", [])
+        .expect("private Codex cookie write");
+    let copied_codex_jar =
+        rusqlite::Connection::open(&copied_codex_cookies).expect("copied Codex cookie jar");
+    copied_codex_jar
+        .execute("INSERT INTO retained_cookie VALUES ('copied-cookie')", [])
+        .expect("copied Codex cookie write");
+
+    let linked_metadata =
+        std::fs::symlink_metadata(&link_preserving_copy).expect("link-preserving profile database");
+    assert!(linked_metadata.file_type().is_symlink());
+    assert!(
+        std::fs::read_link(&link_preserving_copy)
+            .expect("profile database link")
+            .starts_with("/run/kwin-mcp-host-sqlite")
+    );
+    let linked_error = match rusqlite::Connection::open(&link_preserving_copy) {
+        Ok(linked) => linked
+            .execute("INSERT INTO retained_set VALUES ('session-copy')", [])
+            .expect_err("preserved live database link must reject writes"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        linked_error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ReadOnly)
+    );
+
+    let private_copy = rusqlite::Connection::open(&writable_copy).expect("private profile copy");
+    private_copy
+        .execute("INSERT INTO retained_set VALUES ('session-copy')", [])
+        .expect("write private profile copy");
+    let private_rows: i64 = private_copy
+        .query_row(
+            "SELECT count(*) FROM retained_set WHERE value = 'session-copy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read private profile copy");
+    assert_eq!(private_rows, 1);
+    assert!(
+        std::fs::symlink_metadata(&profile_link)
+            .expect("unrelated profile symlink")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&profile_link).expect("read unrelated profile symlink"),
+        "synthetic profile marker\n"
+    );
+    std::fs::write(
+        report,
+        "bad=0 readonly=1 private=1 codex_cookie_private=1 clone_link_readonly=1 clone_copy_writable=1 unrelated_link_preserved=1\n",
+    )
+    .expect("probe report");
 }
 
 #[test]
