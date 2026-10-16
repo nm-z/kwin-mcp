@@ -185,6 +185,15 @@ kwin-mcp (host process)
 
 Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
 
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
+
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these
 databases without copying their contents, and reads use the host inodes and
