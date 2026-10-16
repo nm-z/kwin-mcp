@@ -154,6 +154,12 @@ remain positive. For example:
 ```
 
 The result and `session_list` report the actual byte limits and owned scope.
+Input and screenshot calls sample the session cgroup before and after the
+operation. When RAM reaches `memory.high`, the cgroup's `memory.events high`
+counter increases during the call, or `memory.pressure full avg10` reaches 10%,
+the result includes warning text and a `memory_warning` field when structured
+content is available, with the RAM, swap, and pressure values available.
+Screenshot timeout errors name active memory pressure as a likely cause.
 When the sandbox exits, the server tears down its resources and keeps a dead
 entry until `session_stop`. Later calls return the exit cause and recovery
 guidance. An OOM diagnosis includes the scope result, RAM/swap limits and
