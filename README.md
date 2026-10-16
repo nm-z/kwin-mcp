@@ -355,6 +355,12 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
+File and inline screenshot responses both expose capture metadata in
+`structuredContent`: the PNG path, dimensions, window, region, and optional
+settling information. With `inline: true`, the response also includes the PNG
+image and the same metadata as JSON text. If saving the file fails, an inline
+capture still returns the image, with `path: null` and `write_error` in its metadata.
+
 Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.

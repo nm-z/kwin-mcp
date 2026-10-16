@@ -10273,11 +10273,8 @@ impl KwinMcp {
             Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
         };
         if params.inline {
-            // Claude Code's MCP client hides content[] when structured_content is also
-            // set, so we can't return both the image AND a structured field at the
-            // same time. Instead, serialize the payload into a text block so the
-            // image renders AND the machine-readable data is still recoverable by
-            // parsing that block as JSON.
+            // Keep the JSON text block for clients that consume metadata from
+            // content, alongside the same structured metadata as file captures.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
@@ -10287,11 +10284,13 @@ impl KwinMcp {
                     serde_json::json!(text),
                 ))
                 .await;
-            Ok(CallToolResult::success(vec![
+            let mut result = CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
                 Content::image(b64, "image/png"),
-            ]))
+            ]);
+            result.structured_content = Some(payload);
+            Ok(result)
         } else {
             Ok(structured_result(&peer, text, payload).await)
         }
