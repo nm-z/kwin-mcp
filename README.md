@@ -26,6 +26,8 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `launch_app` | Launch an application and wait for its window. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 
+Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
+
 ## Resize a maximized session window
 
 To resize a maximized window with KWin's native controls, restore it with the session's configured restore/maximize shortcut through `keyboard_key` (the regression proof binds this to `super+Backspace`). Read its `x`, `y`, `w`, and `h` with `window_list`, then hold Super with `keyboard_press` (`key: "super"`) and call `mouse_drag` with `button: "right"` from ten pixels inside the lower-right corner to the desired lower-right point. `mouse_drag` coordinates are relative to the active window. Release Super with `keyboard_release` (`key: "super"`), then verify the geometry with `window_list` or screenshot metadata.
