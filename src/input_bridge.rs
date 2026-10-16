@@ -1059,8 +1059,9 @@ impl std::fmt::Display for FocusNotEditable {
 impl std::error::Error for FocusNotEditable {}
 
 impl TextDelivery {
-    /// Focus was on a control that is not editable text before and after the
-    /// keys were sent, so no field received the text.
+    /// No characters were submitted, and focus is on a control that is not
+    /// editable text. Non-editable focus alone cannot prove sent keys missed
+    /// the active application.
     pub fn not_in_field(focus: &FocusNotEditable) -> Self {
         Self {
             status: "not_in_field",

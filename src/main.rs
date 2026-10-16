@@ -11022,7 +11022,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. not_in_field means accessibility showed focus on a non-editable control before and after the keys, so no field got the text and retry_safe is true; the warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -11072,8 +11072,9 @@ impl KwinMcp {
         })?;
         let delivery = match receipt {
             Ok(receipt) => receipt.confirm().await,
-            // Focus read before typing can lag a click that just moved it, so the
-            // text counts as outside any field only if focus is still not editable.
+            // A terminal or other inaccessible target can receive these key
+            // events even when AT-SPI reports focus on a non-editable control.
+            // That focus report cannot prove that submitted text missed the app.
             Err(error) if error.is::<input_bridge::FocusNotEditable>() => {
                 let after = match &active {
                     Ok(geometry) => {
@@ -11089,7 +11090,13 @@ impl KwinMcp {
                 };
                 match after {
                     Err(after) => match after.downcast_ref::<input_bridge::FocusNotEditable>() {
-                        Some(focus) => input_bridge::TextDelivery::not_in_field(focus),
+                        Some(focus) if keys.is_empty() => {
+                            input_bridge::TextDelivery::not_in_field(focus)
+                        }
+                        Some(focus) => input_bridge::TextDelivery::unavailable(format!(
+                            "{focus}; {} submitted character key events may have reached the active application",
+                            keys.len()
+                        )),
                         None => input_bridge::TextDelivery::unavailable(after.to_string()),
                     },
                     Ok(_) => input_bridge::TextDelivery::unavailable(
@@ -11100,7 +11107,7 @@ impl KwinMcp {
             }
             Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
         };
-        let retry_safe = delivery.status == "not_in_field";
+        let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
         drop(guard);
         self.mark_input().await;
         let mut result = structured_result(

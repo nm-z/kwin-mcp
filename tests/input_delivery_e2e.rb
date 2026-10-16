@@ -255,6 +255,8 @@ class InputDeliveryProbe
     delivery = data.fetch('delivery')
     raise "terminal falsely reported app-text verification: #{delivery}" unless delivery['status'] == 'unverified'
     raise 'terminal compositor not acknowledged' unless delivery['compositor_acknowledged']
+    raise 'terminal suggested blind retry' unless data['retry_safe'] == false
+    raise 'terminal lost submitted character count' unless data['submitted_characters'] == command.length
     assert_success(call('keyboard_key', key: 'Return'))
     destination = File.join(@artifacts, 'terminal-proof.txt')
     assert_success(call('export_file', session_path: "#{@home}/km-input-terminal-proof", host_path: destination))
