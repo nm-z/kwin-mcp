@@ -10,7 +10,7 @@ abort 'usage: client_lifetime_e2e.rb SERVER EVIDENCE' unless binary && evidence
 binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
-bus = "unix:path=/run/user/#{Process.euid}/bus"
+bus = ENV.fetch("KWIN_MCP_E2E_SESSION_BUS", "unix:path=/run/user/#{Process.euid}/bus")
 runtime = "/run/user/#{Process.euid}"
 
 if ARGV[2]&.start_with?('controller-')
@@ -63,7 +63,9 @@ if ARGV[2]&.start_with?('controller-')
     end
     raise 'scope omitted nested KWin' unless names.any? { |_,name| name == 'kwin_wayland' }
     raise 'scope omitted D-Bus' unless names.any? { |_,name| name == 'dbus-daemon' }
-    session.merge('scope_unit'=>unit,'cgroup'=>cgroup,'members'=>names)
+    disk = File.join(home, '.cache/kwin-mcp', File.basename(session.fetch('workdir')))
+    raise 'session disk overlay missing before client exit' unless File.directory?(disk)
+    session.merge('scope_unit'=>unit,'cgroup'=>cgroup,'members'=>names,'disk'=>disk)
   end
   keeper = mode == 'eof' ? nil : Process.spawn('sleep','300',3=>input,close_others:true,out:File::NULL,err:File::NULL)
   ready = {controller:Process.pid,server:server.pid,keeper:keeper,sessions:records}
@@ -132,7 +134,7 @@ begin
       scopes_empty = record.fetch('sessions').all? do |session|
         Dir.glob(File.join(session.fetch('cgroup'),'**','cgroup.procs')).all? { |file| File.read(file).strip.empty? }
       end
-      workdirs_gone = record.fetch('sessions').all? { |session| !File.exist?(session.fetch('workdir')) }
+      workdirs_gone = record.fetch('sessions').all? { |session| !File.exist?(session.fetch('workdir')) && !File.exist?(session.fetch('disk')) }
       break if processes_gone && scopes_empty && workdirs_gone
       sleep 0.05
     end
@@ -150,7 +152,7 @@ begin
   raise 'writer was killed with session' if record['keeper'] && !File.directory?("/proc/#{record.fetch('keeper')}")
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
   File.write(File.join(evidence,'verification.json'),JSON.pretty_generate(status:'passed',mode:mode,elapsed:elapsed,writer_still_alive:!record['keeper'].nil?,record:record))
-  puts "client_#{mode}=PASS (#{elapsed.round(3)}s; two scopes, members terminated and workdirs gone)"
+  puts "client_#{mode}=PASS (#{elapsed.round(3)}s; two scopes, members terminated and tmp/disk storage gone)"
 rescue Timeout::Error
   if record
     observed = {
@@ -158,6 +160,7 @@ rescue Timeout::Error
       keeper_present: record['keeper'] && File.directory?("/proc/#{record['keeper']}"),
       sessions: record.fetch('sessions').map do |session|
         session.merge('workdir_present'=>File.exist?(session.fetch('workdir')),
+                      'disk_present'=>File.exist?(session.fetch('disk')),
                       'remaining_members'=>Dir.glob(File.join(session.fetch('cgroup'),'**','cgroup.procs')).flat_map { |file| File.readlines(file).map(&:to_i) })
       end,
     }
