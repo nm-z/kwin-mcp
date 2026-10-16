@@ -4198,6 +4198,14 @@ fn discovery_creates_no_session_processes() {
         "{unavailable}"
     );
     assert_eq!(
+        unavailable["error"]["data"]["session_status"], "owned_by_another_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_available_here"], false,
+        "{unavailable}"
+    );
+    assert_eq!(
         unavailable["error"]["data"]["previous_server_cleanup"],
         "not_confirmed_from_current_process",
         "{unavailable}"
@@ -4214,6 +4222,10 @@ fn discovery_creates_no_session_processes() {
     let no_live = call_tool(&mut client, 4, "window_list", json!({}));
     assert_eq!(
         no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    assert_eq!(
+        no_live["error"]["data"]["session_status"], "none_running",
         "{no_live}"
     );
     let sessions = call_tool(&mut client, 5, "session_list", json!({}));
@@ -4345,6 +4357,14 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
         response["error"]["data"]["reason"], "different_server_process",
         "{response}"
     );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "owned_by_another_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_available_here"], false,
+        "{response}"
+    );
     assert_eq!(response["error"]["data"]["session_id"], session_id);
     assert_eq!(response["error"]["data"]["server_pid"], server_pid);
     assert_eq!(
@@ -4359,7 +4379,124 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
         message.contains("session_start without session_id"),
         "{message}"
     );
+
+    let local_missing_id = format!("s{server_pid}-999999");
+    let local_missing = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":local_missing_id}),
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["reason"], "session_not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_status"], "not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_available_here"], false,
+        "{local_missing}"
+    );
     assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn prior_manual_stop_and_ttl_expiry_report_terminal_session_status() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-terminal-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let stopped_pid = server_pid.saturating_add(1);
+    let expired_pid = server_pid.saturating_add(2);
+    let stopped_id = format!("s{stopped_pid}-1");
+    let expired_id = format!("s{expired_pid}-1");
+    let records = [
+        json!({
+            "session_id": stopped_id,
+            "server_pid": stopped_pid,
+            "state": "session_stopped",
+            "reason": "session_stop",
+            "finished_at_unix_seconds": 100,
+            "workdir_cleanup": "removed",
+        }),
+        json!({
+            "session_id": expired_id,
+            "server_pid": expired_pid,
+            "state": "session_expired",
+            "reason": "idle_timeout",
+            "finished_at_unix_seconds": 200,
+            "workdir_cleanup": "removed",
+        }),
+    ];
+    let contents = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        log_dir.join("session-lifecycle.jsonl"),
+        format!("{contents}\n"),
+    )
+    .expect("write terminal lifecycle records");
+
+    let stopped = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":stopped_id}),
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_status"], "stopped",
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_stopped_at_unix_seconds"], 100,
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_end_reason"], "session_stop",
+        "{stopped}"
+    );
+
+    let expired = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":expired_id}),
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_status"], "expired",
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_expired_at_unix_seconds"], 200,
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_end_reason"], "idle_timeout",
+        "{expired}"
+    );
+    assert!(
+        expired["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is expired")),
+        "{expired}"
+    );
+
     client.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
@@ -4473,6 +4610,24 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     );
     assert_eq!(
         response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "stopped",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_stopped_at_unix_seconds"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_end_reason"], "server_shutdown",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is stopped")),
         "{response}"
     );
     assert_eq!(
@@ -5448,6 +5603,27 @@ fn transport_eof_cleans_every_owned_session() {
         );
         directories.push(workdir(&response));
     }
+    let manually_stopped = call_tool(
+        &mut client,
+        4,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let manually_stopped_id = session_handle(&manually_stopped);
+    let manually_stopped_workdir = workdir(&manually_stopped);
+    sessions.push(manually_stopped_id.clone());
+    directories.push(manually_stopped_workdir.clone());
+    let stopped = call_tool(
+        &mut client,
+        5,
+        "session_stop",
+        json!({"session_id":manually_stopped_id}),
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    assert!(!manually_stopped_workdir.exists());
     drop(client.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(20);
     while client.child.try_wait().expect("server status").is_none() {
@@ -5481,25 +5657,45 @@ fn transport_eof_cleans_every_owned_session() {
             "window_list",
             json!({"session_id":session_id}),
         );
-        assert_eq!(
-            unavailable["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
-            "{unavailable}"
-        );
-        let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
-        assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
-        assert_eq!(record["reason"], "server_shutdown", "{record}");
-        assert_eq!(
-            record["session_id"].as_str(),
-            Some(session_id.as_str()),
-            "{record}"
-        );
-        assert_eq!(record["workdir_cleanup"], "removed", "{record}");
-        assert!(
-            unavailable["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("shutdown cleanup finished")),
-            "{unavailable}"
-        );
+        if index < 2 {
+            assert_eq!(
+                unavailable["error"]["data"]["previous_server_cleanup"],
+                "shutdown_cleanup_finished",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
+            assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
+            assert_eq!(record["reason"], "server_shutdown", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+            assert_eq!(record["workdir_cleanup"], "removed", "{record}");
+            assert!(
+                unavailable["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("shutdown cleanup finished")),
+                "{unavailable}"
+            );
+        } else {
+            assert_eq!(
+                unavailable["error"]["data"]["session_status"], "stopped",
+                "{unavailable}"
+            );
+            assert_eq!(
+                unavailable["error"]["data"]["session_end_reason"], "session_stop",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_session_lifecycle_record"];
+            assert_eq!(record["state"], "session_stopped", "{record}");
+            assert_eq!(record["reason"], "session_stop", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+        }
     }
     replacement.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove shared lifecycle state");
