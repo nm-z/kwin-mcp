@@ -473,7 +473,7 @@ fn viewer_windows(pid: u32) -> Vec<String> {
             "--pid",
             &pid.to_string(),
             "--title",
-            "^kwin-viewer$",
+            "^kwin-viewer.*$",
         ])
         .output()
         .expect("query host KWin windows");
@@ -1616,16 +1616,57 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         !workdir(&started).join("viewer.log").exists(),
         "session_start launched a viewer"
     );
-    let opened = call_tool(&mut client, 3, "viewer_open", json!({}));
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"kdialog --title viewer-first-frame --msgbox 'First frame content'"}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "viewer frame fixture did not launch: {launched}"
+    );
+    let captured = call_tool(&mut client, 4, "screenshot", json!({}));
+    assert!(
+        !captured["result"]["isError"].as_bool().unwrap_or(false),
+        "session screenshot before viewer_open failed: {captured}"
+    );
+    let opened = call_tool(&mut client, 5, "viewer_open", json!({}));
+    let viewer = &opened["result"]["structuredContent"]["viewer"];
+    let log_path = opened["result"]["structuredContent"]["viewer"]["log"]
+        .as_str()
+        .unwrap_or("");
+    let viewer_log = std::fs::read_to_string(log_path)
+        .unwrap_or_else(|error| format!("could not read viewer log: {error}"));
     assert_eq!(
         opened["result"]["structuredContent"]["status"],
         json!("opened"),
-        "{opened}"
+        "{opened}\n{viewer_log}"
     );
-    let viewer = &opened["result"]["structuredContent"]["viewer"];
+    assert_eq!(viewer["state"], json!("ready"), "{opened}\n{viewer_log}");
     assert!(
-        viewer["state"] == "ready" || viewer["state"] == "starting",
-        "{opened}"
+        viewer_log.contains("first frame submitted for presentation"),
+        "viewer did not submit its first frame: {opened}\n{viewer_log}"
+    );
+    let configured = viewer_log.find("initial nonzero resize received");
+    let first_redraw = viewer_log.find("first host window redraw");
+    assert!(
+        configured
+            .zip(first_redraw)
+            .is_some_and(|(configured, redraw)| configured < redraw),
+        "viewer drew before initial Wayland configure: {opened}\n{viewer_log}"
+    );
+    assert!(
+        viewer_log.contains("first PipeWire frame consumed by host window"),
+        "viewer did not consume its first PipeWire frame: {opened}\n{viewer_log}"
+    );
+    let consumed = viewer_log.find("first PipeWire frame consumed by host window");
+    let submitted = viewer_log.find("first frame submitted for presentation");
+    assert!(
+        consumed
+            .zip(submitted)
+            .is_some_and(|(consumed, submitted)| consumed < submitted),
+        "viewer reported submission before consuming its first PipeWire frame: {opened}\n{viewer_log}"
     );
     let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
     assert!(
@@ -1635,15 +1676,15 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
     assert_eq!(
         wait_for_viewer_windows(pid, 1).len(),
         1,
-        "viewer_open did not create exactly one host window: pid={pid} opened={opened}"
+        "viewer_open did not create exactly one host window: pid={pid} opened={opened}\n{viewer_log}"
     );
-    let again = call_tool(&mut client, 4, "viewer_open", json!({}));
+    let again = call_tool(&mut client, 6, "viewer_open", json!({}));
     assert_eq!(
         again["result"]["structuredContent"]["status"],
         json!("already_open"),
         "{again}"
     );
-    let closed = call_tool(&mut client, 5, "viewer_close", json!({}));
+    let closed = call_tool(&mut client, 7, "viewer_close", json!({}));
     assert_eq!(
         closed["result"]["structuredContent"]["status"],
         json!("closed"),
@@ -1662,7 +1703,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         wait_for_viewer_windows(pid, 0).is_empty(),
         "viewer_close left a host window"
     );
-    let running = call_tool(&mut client, 6, "session_list", json!({}));
+    let running = call_tool(&mut client, 8, "session_list", json!({}));
     assert_eq!(
         running["result"]["structuredContent"]["sessions"]
             .as_array()
@@ -1670,7 +1711,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
             .len(),
         1
     );
-    call_tool(&mut client, 7, "session_stop", json!({}));
+    call_tool(&mut client, 9, "session_stop", json!({}));
     client.stop_process();
 
     // A missing host Wayland display affects viewer_open, not session_start.
@@ -6638,7 +6679,10 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "{ready}"
     );
     let log = std::fs::read_to_string(path.join("viewer.log")).expect("viewer log");
-    assert!(log.contains("first frame presented"), "{log}");
+    assert!(
+        log.contains("first frame submitted for presentation"),
+        "{log}"
+    );
     thread::sleep(Duration::from_millis(400));
     save_session_image(&mut desktop, 3, &host_id, "viewer-recovered.png");
     let reused = call_tool(&mut client, 7, "viewer_open", json!({"session_id":session}));
