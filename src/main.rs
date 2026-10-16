@@ -3271,75 +3271,13 @@ fn terminate_with_parent(command: &mut std::process::Command) {
     }
 }
 
-// ── uinput virtual devices ──────────────────────────────────────────────
-
-fn create_uinput_devices() -> Result<
-    (
-        evdev::uinput::VirtualDevice,
-        std::path::PathBuf,
-        evdev::uinput::VirtualDevice,
-        std::path::PathBuf,
-    ),
-    KwinError,
-> {
-    // Mouse: buttons + relative axes
-    let mut mouse_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
-    mouse_keys.insert(evdev::KeyCode::BTN_LEFT);
-    mouse_keys.insert(evdev::KeyCode::BTN_RIGHT);
-    mouse_keys.insert(evdev::KeyCode::BTN_MIDDLE);
-
-    let mut mouse_axes = evdev::AttributeSet::<evdev::RelativeAxisCode>::new();
-    mouse_axes.insert(evdev::RelativeAxisCode::REL_X);
-    mouse_axes.insert(evdev::RelativeAxisCode::REL_Y);
-    mouse_axes.insert(evdev::RelativeAxisCode::REL_WHEEL);
-    mouse_axes.insert(evdev::RelativeAxisCode::REL_HWHEEL);
-
-    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()?
-        .name("kwin-mcp-virtual-mouse")
-        .with_keys(&mouse_keys)?
-        .with_relative_axes(&mouse_axes)?
-        .build()?;
-
-    let mouse_path = mouse_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput mouse: no devnode".to_owned()))??;
-
-    // Keyboard: all standard keys (KEY_ESC=1 through KEY_MAX=0x2ff)
-    let mut kbd_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
-    let mut code: u16 = 1;
-    loop {
-        if code > 0x2ff {
-            break;
-        }
-        kbd_keys.insert(evdev::KeyCode::new(code));
-        code = match code.checked_add(1) {
-            Some(v) => v,
-            None => break,
-        };
-    }
-
-    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()?
-        .name("kwin-mcp-virtual-keyboard")
-        .with_keys(&kbd_keys)?
-        .build()?;
-
-    let kbd_path = kbd_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput keyboard: no devnode".to_owned()))??;
-
-    Ok((mouse_dev, mouse_path, kbd_dev, kbd_path))
-}
+const VIRTUAL_MOUSE_SYSNAME: &str = "kwin_mcp_pointer";
+const VIRTUAL_KEYBOARD_SYSNAME: &str = "kwin_mcp_keyboard";
 
 // ── Mount-aware overlay ──────────────────────────────────────────────────
 
 const HOST_SOCKET_ROOT: &str = "/run/kwin-mcp-host-sockets";
 const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
-
-/// Nested mounts require private copies of files in their ancestor directories.
-/// Avoid eager bulk copies unless the caller explicitly requests writability.
-const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
@@ -3383,7 +3321,7 @@ impl Drop for SocketLinks {
     }
 }
 struct OverlayPlan {
-    staging_root: Option<PathBuf>,
+    fuse_home: Option<PathBuf>,
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
@@ -3402,9 +3340,7 @@ struct OverlayPlan {
 }
 
 impl OverlayPlan {
-    /// Overlay upper-layer path that shadows `path` (under `target`), or None
-    /// when the path is not under a writable overlay (read-only bind or a
-    /// file copied into the split-overlay staging root).
+    /// Overlay upper-layer path that shadows a HOME path, or None when the path is beneath a read-only nested mount.
     fn upper_path(&self, path: &Path) -> Option<(PathBuf, &OverlayMount)> {
         if self
             .read_only_binds
@@ -3426,19 +3362,20 @@ impl OverlayPlan {
         ))
     }
 
-    fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
+    fn add_bwrap_args(&self, command: &mut std::process::Command) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
-        if let Some(staging_root) = &self.staging_root {
-            command.arg("--bind").arg(staging_root).arg(target);
-        }
         // The plan is made seconds before bwrap runs. HOME entries that vanished
         // since (lock directories such as ~/.claude.json.lock) would make bwrap
-        // fail, so skip them; their staging stub stays an empty directory.
+        // fail, so skip the overlay when its host lower path has vanished.
         for overlay in self
             .overlays
             .iter()
             .filter(|overlay| std::fs::symlink_metadata(&overlay.lower).is_ok())
         {
+            if let Some(merged) = &self.fuse_home {
+                command.arg("--bind").arg(merged).arg(&overlay.destination);
+                continue;
+            }
             command
                 .arg("--overlay-src")
                 .arg(&overlay.lower)
@@ -3478,7 +3415,9 @@ impl OverlayPlan {
             // Apply directory masks last: individual socket placeholders must
             // not recreate entries inside an intentionally empty directory.
             for hidden in &self.empty_dirs {
-                if let Ok(relative) = hidden.strip_prefix(source) {
+                if let Ok(relative) = hidden.strip_prefix(source)
+                    && std::fs::symlink_metadata(hidden).is_ok_and(|metadata| metadata.is_dir())
+                {
                     command.arg("--tmpfs").arg(destination.join(relative));
                 }
             }
@@ -3641,10 +3580,7 @@ impl OverlayPlan {
                 if let Some(overlay) = mount {
                     overlay.upper.join(path.strip_prefix(&overlay.destination)?)
                 } else {
-                    self.staging_root
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("no overlay for {}", path.display()))?
-                        .join(path.strip_prefix(target)?)
+                    anyhow::bail!("no overlay for {}", path.display())
                 }
             } else {
                 destination
@@ -3736,251 +3672,18 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
     })
 }
 
-fn create_staging_directory(
-    source: &Path,
-    destination: &Path,
-    initialize: bool,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    // A source that vanished meanwhile keeps the default mode.
-    if initialize && let Ok(meta) = std::fs::metadata(source) {
-        std::fs::set_permissions(destination, meta.permissions())?;
-    }
-    Ok(())
-}
-
-struct SplitOverlayContext<'a> {
-    target: &'a Path,
-    staging_root: &'a Path,
-    upper_root: &'a Path,
-    work_root: &'a Path,
-    mounts: &'a [procfs::process::MountInfo],
-    initialize: bool,
-    writable_paths: &'a [PathBuf],
-    live_databases: &'a [PathBuf],
-}
-
-fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let source = std::fs::File::open(source)?;
-    let destination = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    // Both descriptors stay open for this ioctl. FICLONE shares data extents;
-    // later writes to either file leave the other file's contents unchanged.
-    if unsafe {
-        nix::libc::ioctl(
-            destination.as_raw_fd(),
-            nix::libc::FICLONE,
-            source.as_raw_fd(),
-        )
-    } == -1
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    destination.set_permissions(source.metadata()?.permissions())
-}
-
-fn prepare_split_overlay_directory(
-    source_directory: &Path,
-    context: &SplitOverlayContext<'_>,
-    overlays: &mut Vec<OverlayMount>,
-    read_only_binds: &mut Vec<PathBuf>,
-    oversized_read_only_files: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    let relative_directory = source_directory.strip_prefix(context.target)?;
-    let staged_directory = context.staging_root.join(relative_directory);
-    create_staging_directory(source_directory, &staged_directory, context.initialize)?;
-
-    let mut entries: Vec<std::fs::DirEntry> =
-        std::fs::read_dir(source_directory)?.collect::<Result<_, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let source = entry.path();
-        let relative = source.strip_prefix(context.target)?;
-        let staged = context.staging_root.join(relative);
-        let file_type = entry.file_type()?;
-        let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
-
-        if context
-            .mounts
-            .iter()
-            .any(|mount| mount.mount_point == source)
-        {
-            // Only a stub for bwrap's bind: the mount shadows its mode. Never
-            // stat the mount itself; a hung FUSE or network mount would block
-            // session_start in the kernel.
-            if file_type.is_dir() {
-                std::fs::create_dir_all(&staged)?;
-            }
-            continue;
-        }
-
-        if file_type.is_dir() {
-            if context
-                .mounts
-                .iter()
-                .any(|mount| mount.mount_point != source && mount.mount_point.starts_with(&source))
-            {
-                prepare_split_overlay_directory(
-                    &source,
-                    context,
-                    overlays,
-                    read_only_binds,
-                    oversized_read_only_files,
-                )?;
-            } else {
-                create_staging_directory(&source, &staged, context.initialize)?;
-                let upper = context.upper_root.join(relative);
-                let work = context.work_root.join(relative);
-                std::fs::create_dir_all(&upper)?;
-                std::fs::create_dir_all(&work)?;
-                overlays.push(OverlayMount {
-                    lower: source.clone(),
-                    upper,
-                    work,
-                    destination: source,
-                });
-            }
-            continue;
-        }
-
-        if file_type.is_symlink() {
-            if context.initialize && !staged_exists {
-                std::os::unix::fs::symlink(std::fs::read_link(&source)?, &staged)?;
-            }
-        } else if file_type.is_file() {
-            if context.live_databases.iter().any(|database| {
-                !browser_cookie_database(context.target, database)
-                    && (source == *database
-                        || ["-wal", "-shm"].iter().any(|suffix| {
-                            database.file_name().is_some_and(|name| {
-                                source
-                                    == database.with_file_name(format!(
-                                        "{}{suffix}",
-                                        name.to_string_lossy()
-                                    ))
-                            })
-                        }))
-            }) {
-                // These files will resolve through the read-only live directory.
-                continue;
-            }
-            if context.initialize && !staged_exists {
-                let requested_writable = context
-                    .writable_paths
-                    .iter()
-                    .any(|path| source.starts_with(path));
-                let size = match entry.metadata() {
-                    Ok(metadata) => metadata.len(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if size > STAGING_COPY_MAX_BYTES {
-                    match clone_staging_file(&source, &staged) {
-                        Ok(()) => continue,
-                        Err(error) => {
-                            match std::fs::remove_file(&staged) {
-                                Ok(()) => {}
-                                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(cleanup) => return Err(cleanup.into()),
-                            }
-                            if !requested_writable {
-                                eprintln!(
-                                    "session_start: oversized ancestor file {} ({size} bytes) stays read-only; reflink unavailable: {error}",
-                                    source.display()
-                                );
-                                oversized_read_only_files.push(source.clone());
-                                read_only_binds.push(source);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                match std::fs::copy(&source, &staged) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::PermissionDenied
-                            && !requested_writable =>
-                    {
-                        let _ = std::fs::remove_file(&staged);
-                        read_only_binds.push(source);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        } else {
-            read_only_binds.push(source);
-        }
-    }
-    Ok(())
-}
-
 fn prepare_overlay_plan(
     target: &Path,
     session_tmp: &Path,
+    host_xdg_dir: &Path,
     mounts: &[procfs::process::MountInfo],
-    writable_paths: &[PathBuf],
-    live_databases: &[PathBuf],
 ) -> anyhow::Result<OverlayPlan> {
-    let excluded_mounts = mount_descendants(mounts, target);
-    if excluded_mounts.is_empty() {
-        let upper = session_tmp.join("overlay-upper");
-        let work = session_tmp.join("overlay-work");
-        std::fs::create_dir_all(&upper)?;
-        std::fs::create_dir_all(&work)?;
-        let overlay = OverlayMount {
-            lower: target.to_path_buf(),
-            upper,
-            work,
-            destination: target.to_path_buf(),
-        };
-        return Ok(OverlayPlan {
-            staging_root: None,
-            overlays: vec![overlay],
-            read_only_binds: Vec::new(),
-            socket_binds: Vec::new(),
-            graphical_socket_paths: Vec::new(),
-            sqlite_binds: Vec::new(),
-            sqlite_blocked_sockets: Vec::new(),
-            socket_links: SocketLinks::default(),
-            host_runtime: None,
-            empty_dirs: Vec::new(),
-            oversized_read_only_files: Vec::new(),
-        });
-    }
-
-    let staging_root = session_tmp.join("overlay-root");
-    let initialized_marker = session_tmp.join("overlay-root.initialized");
-    let initialize = !initialized_marker.exists();
-    let upper_root = session_tmp.join("overlay-upper");
-    let work_root = session_tmp.join("overlay-work");
-    std::fs::create_dir_all(&upper_root)?;
-    std::fs::create_dir_all(&work_root)?;
-
-    let context = SplitOverlayContext {
-        target,
-        staging_root: &staging_root,
-        upper_root: &upper_root,
-        work_root: &work_root,
-        mounts,
-        initialize,
-        writable_paths,
-        live_databases,
-    };
-    let mut overlays = Vec::new();
-    let mut read_only_binds = excluded_mounts;
-    let mut oversized_read_only_files = Vec::new();
-    prepare_split_overlay_directory(
-        target,
-        &context,
-        &mut overlays,
-        &mut read_only_binds,
-        &mut oversized_read_only_files,
-    )?;
+    let upper = session_tmp.join("overlay-upper");
+    let work = session_tmp.join("overlay-work");
+    std::fs::create_dir_all(&upper)?;
+    std::fs::create_dir_all(&work)?;
+    let mut read_only_binds = mount_descendants(mounts, target);
+    let lower = target.to_path_buf();
     read_only_binds.sort_by(|left, right| {
         left.components()
             .count()
@@ -3988,13 +3691,14 @@ fn prepare_overlay_plan(
             .then_with(|| left.cmp(right))
     });
     read_only_binds.dedup();
-    if initialize {
-        std::fs::write(&initialized_marker, b"split-overlay-v1\n")?;
-    }
-
     Ok(OverlayPlan {
-        staging_root: Some(staging_root),
-        overlays,
+        fuse_home: (!read_only_binds.is_empty()).then(|| host_xdg_dir.join("home-merged")),
+        overlays: vec![OverlayMount {
+            lower,
+            upper,
+            work,
+            destination: target.to_path_buf(),
+        }],
         read_only_binds,
         socket_binds: Vec::new(),
         graphical_socket_paths: Vec::new(),
@@ -4003,7 +3707,7 @@ fn prepare_overlay_plan(
         socket_links: SocketLinks::default(),
         host_runtime: None,
         empty_dirs: Vec::new(),
-        oversized_read_only_files,
+        oversized_read_only_files: Vec::new(),
     })
 }
 
@@ -4065,10 +3769,10 @@ fn bind_live_sqlite(
         let upper = if plan.upper_path(database).is_some() {
             upper_file(plan, database)?
         } else {
-            plan.staging_root
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no private layer for live database"))?
-                .join(database.strip_prefix(target)?)
+            anyhow::bail!(
+                "no writable overlay for live database {}",
+                database.display()
+            )
         };
         std::os::unix::fs::symlink(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
@@ -4385,7 +4089,6 @@ fn prepare_host_view(
     target: &Path,
     host_xdg_dir: &Path,
     host_runtime: &Path,
-    writable_paths: &[PathBuf],
     service: &KwinMcp,
 ) -> anyhow::Result<HostView> {
     service.set_start_stage("scanning host mounts");
@@ -4427,14 +4130,8 @@ fn prepare_host_view(
     service.set_start_stage("scanning host sockets and processes");
     let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
-    let mut overlay_plan = prepare_overlay_plan(
-        target,
-        &disk,
-        &mount_inventory,
-        writable_paths,
-        &inventory.live_databases,
-    )
-    .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
+    let mut overlay_plan = prepare_overlay_plan(target, &disk, host_xdg_dir, &mount_inventory)
+        .map_err(|e| anyhow::anyhow!("prepare overlays: {e:#}"))?;
     // Inside the overlay the layers' own path would loop (ELOOP); the session
     // sees an empty directory there instead.
     let disk_root = session_disk_root();
@@ -4449,12 +4146,7 @@ fn prepare_host_view(
     bind_live_sqlite(&mut overlay_plan, target, &inventory.live_databases)?;
 
     eprintln!(
-        "session_start: overlay plan={} overlays={} read-only-mounts={}",
-        if overlay_plan.staging_root.is_some() {
-            "split"
-        } else {
-            "whole"
-        },
+        "session_start: overlay plan=live-home overlays={} read-only-mounts={}",
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
@@ -4485,13 +4177,6 @@ fn prepare_host_view(
 // ── Session ──────────────────────────────────────────────────────────────
 
 /// A child of this same PID, including children retained across exec.
-fn input_sysname(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
 struct SessionProcess {
     pid: u32,
     status: Option<std::process::ExitStatus>,
@@ -4748,8 +4433,9 @@ struct Session {
     sandbox_child: SessionProcess,
     sandbox_stdin: std::os::fd::OwnedFd,
     host_xdg_dir: std::path::PathBuf,
-    _uinput_mouse: std::os::fd::OwnedFd,
-    _uinput_keyboard: std::os::fd::OwnedFd,
+    // Keep inherited descriptors alive for sessions started before EIS-only input.
+    legacy_uinput_mouse: Option<std::os::fd::OwnedFd>,
+    legacy_uinput_keyboard: Option<std::os::fd::OwnedFd>,
     mouse_sysname: String,
     kbd_sysname: String,
     cdp_browser: Option<Arc<chromiumoxide::Browser>>,
@@ -4850,6 +4536,7 @@ fn terminate_child(child: impl Into<SessionProcess>, process_group: bool, label:
 /// them until the Session takes them, so cancelling the startup future cannot
 /// detach a process or task that has no reachable cleanup path.
 struct StartupResources {
+    fuse_home: Option<PathBuf>,
     scope_unit: Option<String>,
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
@@ -4859,6 +4546,7 @@ struct StartupResources {
 impl StartupResources {
     fn new() -> Self {
         Self {
+            fuse_home: None,
             scope_unit: None,
             sandbox_child: None,
             sandbox_stdin: None,
@@ -4878,6 +4566,9 @@ impl StartupResources {
         if let Some(sandbox) = self.sandbox_child.take() {
             terminate_child(sandbox, true, "startup sandbox");
         }
+        if let Some(merged) = self.fuse_home.take() {
+            unmount_home_overlay(&merged);
+        }
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
         }
@@ -4891,6 +4582,7 @@ impl StartupResources {
         Vec<std::process::Child>,
     ) {
         self.scope_unit.take();
+        self.fuse_home.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -4908,6 +4600,97 @@ impl StartupResources {
 impl Drop for StartupResources {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+/// A nested mount is locked when bwrap enters its user namespace. Kernel
+/// overlayfs cannot clone that lower mount, and ignores newly bound submounts
+/// in a staged lower tree. FUSE resolves the live lower paths without copying
+/// HOME or creating an overlay for each of its entries.
+async fn start_home_overlay(
+    plan: &OverlayPlan,
+    startup: &mut StartupResources,
+) -> anyhow::Result<()> {
+    let Some(merged) = &plan.fuse_home else {
+        return Ok(());
+    };
+    let overlay = plan
+        .overlays
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing HOME overlay"))?;
+    for path in [&overlay.lower, &overlay.upper, &overlay.work] {
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| b",:\\\n".contains(byte))
+        {
+            anyhow::bail!(
+                "nested HOME overlay path contains an unsupported separator: {}",
+                path.display()
+            );
+        }
+    }
+    std::fs::create_dir(merged)?;
+    let log = std::fs::File::create(merged.with_extension("log"))?;
+    let mut command = std::process::Command::new("fuse-overlayfs");
+    command
+        .arg("-f")
+        .arg("-o")
+        .arg(format!(
+            "lowerdir={},upperdir={},workdir={}",
+            overlay.lower.display(),
+            overlay.upper.display(),
+            overlay.work.display()
+        ))
+        .arg(merged)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log);
+    terminate_with_parent(&mut command);
+    startup.fuse_home = Some(merged.clone());
+    let child = spawn_session_child(command, false).await.map_err(|error| {
+        anyhow::anyhow!("nested HOME mounts require fuse-overlayfs and /dev/fuse: {error}")
+    })?;
+    startup.add_proxy(child);
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if procfs::process::Process::myself()?
+            .mountinfo()?
+            .0
+            .iter()
+            .any(|mount| mount.mount_point == *merged)
+        {
+            return Ok(());
+        }
+        if let Some(child) = startup.service_proxy_children.last_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            anyhow::bail!(
+                "fuse-overlayfs exited with {status}; see {}",
+                merged.with_extension("log").display()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out mounting the nested HOME overlay");
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+}
+
+fn unmount_home_overlay(merged: &Path) {
+    let mounted = procfs::process::Process::myself()
+        .and_then(|process| process.mountinfo())
+        .is_ok_and(|mounts| mounts.0.iter().any(|mount| mount.mount_point == merged));
+    if mounted {
+        match std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(merged)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            status => eprintln!("HOME overlay unmount {}: {status:?}", merged.display()),
+        }
     }
 }
 
@@ -5395,8 +5178,7 @@ fn session_disk_root() -> std::path::PathBuf {
         .join("kwin-mcp")
 }
 
-/// The disk-backed twin of a session workdir: its overlay upper, work and
-/// staging layers.
+/// The disk-backed twin of a session workdir: its overlay upper and work dirs.
 fn session_disk_path(workdir: &Path) -> std::path::PathBuf {
     session_disk_root().join(workdir.file_name().unwrap_or_default())
 }
@@ -5485,6 +5267,21 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Remove a directory after the caller has proved its ownership. This helper
 /// never follows a symlink while repairing nested permissions.
 fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
+    // Never traverse a mounted HOME view if unmounting failed. Repairing or
+    // removing it would operate on session files rather than owned storage.
+    let mounts = procfs::process::Process::myself()
+        .and_then(|process| process.mountinfo())
+        .map_err(std::io::Error::other)?;
+    if mounts
+        .0
+        .iter()
+        .any(|mount| mount.mount_point.starts_with(dir))
+    {
+        return Err(std::io::Error::other(format!(
+            "mount remains inside {}",
+            dir.display()
+        )));
+    }
     let flags =
         nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC;
     if let Ok(root) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) {
@@ -6109,6 +5906,7 @@ fn teardown(mut sess: Session) -> Vec<String> {
     sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
     terminate_child(sess.sandbox_child, true, "sandbox");
+    unmount_home_overlay(&sess.host_xdg_dir.join("home-merged"));
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
@@ -7967,6 +7765,7 @@ struct FindUiElementsParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SessionStartParams {
     /// Session RAM throttle in GiB. Zero disables throttling; omit for the server default.
     memory_high: Option<u64>,
@@ -7980,10 +7779,9 @@ struct SessionStartParams {
     /// Virtual display height in pixels for this session. Omit to use the
     /// server default. Ignored when the server was launched with --no-override.
     height: Option<u32>,
-    /// Absolute paths under HOME whose oversized ancestor files need writable
-    /// private copies. Default: files over 64 MiB use reflink or a read-only
-    /// bind. Explicit copies still share the 20-second startup deadline.
-    writable_paths: Option<Vec<PathBuf>>,
+    /// Start private PipeWire and WirePlumber immediately. Otherwise they start
+    /// on demand when viewer_open needs video capture. No host sound devices are exposed.
+    audio: Option<bool>,
 }
 
 impl SessionStartParams {
@@ -8018,6 +7816,48 @@ impl SessionStartParams {
         }
         Ok(config)
     }
+}
+
+const SESSION_MEDIA_BOOTSTRAP: &str = r#"start_session_media() {
+    (
+        flock -x 9
+        if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+            pipewire 9>&- &
+            n=0
+            while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ "$n" -lt 50 ]; do
+                sleep 0.1
+                n=$((n+1))
+            done
+            if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+                wireplumber 9>&- &
+            fi
+        fi
+    ) 9>"$XDG_RUNTIME_DIR/media.lock"
+}
+"#;
+
+const SESSION_MEDIA_READY_WAIT: Duration = Duration::from_secs(5);
+
+async fn ensure_session_media(
+    descriptor: std::os::fd::OwnedFd,
+    runtime: &Path,
+) -> Result<(), String> {
+    tokio::time::timeout(SESSION_MEDIA_READY_WAIT, async {
+        use tokio::io::AsyncWriteExt;
+        let mut pipe = tokio::net::unix::pipe::Sender::from_owned_fd(descriptor)
+            .map_err(|error| format!("session media command pipe: {error}"))?;
+        pipe.write_all(b"start_session_media\n")
+            .await
+            .map_err(|error| format!("start session media: {error}"))?;
+        wait_for_socket(
+            &runtime.join("pipewire-0"),
+            "session PipeWire socket",
+            std::time::Instant::now() + SESSION_MEDIA_READY_WAIT,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| "private media startup timed out".to_owned())?
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -8636,20 +8476,6 @@ impl KwinMcp {
                 overlay_target.display()
             )));
         }
-        let writable_paths = params.writable_paths.unwrap_or_default();
-        for path in &writable_paths {
-            if !path.is_absolute()
-                || !path.starts_with(&overlay_target)
-                || path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                return Err(ver_err(format!(
-                    "writable_paths must contain absolute paths under HOME without '..': {}",
-                    path.display()
-                )));
-            }
-        }
         // Mount, socket, and /proc scans can block in the kernel on a hung
         // FUSE or network mount, or on a process stuck in D state. Run them on
         // a blocking thread so the hard limit can still answer; the handle
@@ -8666,7 +8492,6 @@ impl KwinMcp {
                 &view_target,
                 &view_xdg,
                 &view_runtime,
-                &writable_paths,
                 &view_service,
             ));
         });
@@ -8785,19 +8610,17 @@ impl KwinMcp {
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
-            pipewire &\n\
-            wireplumber &\n\
+            {SESSION_MEDIA_BOOTSTRAP}\n\
+            {media_start}\n\
             while read -r cmd; do\n\
                 eval \"$cmd\" &\n\
-            done\n"
+            done\n",
+            media_start = if params.audio.unwrap_or(false) {
+                "start_session_media"
+            } else {
+                ""
+            },
         );
-        // Create uinput virtual devices before bwrap so we can bind-mount them
-        let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) =
-            create_uinput_devices().map_err(|e| ver_err(format!("uinput: {e}")))?;
-        let mouse_evdev_str = mouse_evdev.display().to_string();
-        let kbd_evdev_str = kbd_evdev.display().to_string();
-        eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
-
         let cleanup_err = |message: String, startup: &mut StartupResources| {
             eprintln!("session_start: startup error: {message}");
             startup.cleanup();
@@ -9041,7 +8864,7 @@ impl KwinMcp {
             host_name,
             "--unshare-ipc",
         ]);
-        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
+        overlay_plan.add_bwrap_args(&mut cmd);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
@@ -9072,15 +8895,6 @@ impl KwinMcp {
             }
         }
         cmd.args([
-            "--dev-bind",
-            "/dev/uinput",
-            "/dev/uinput",
-            "--dev-bind",
-            &mouse_evdev_str,
-            &mouse_evdev_str,
-            "--dev-bind",
-            &kbd_evdev_str,
-            &kbd_evdev_str,
             "--proc",
             "/proc",
             "--tmpfs",
@@ -9122,6 +8936,11 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
+        if let Some(merged) = &overlay_plan.fuse_home {
+            // The source alias bypasses HOME's socket and nested-mount masks.
+            // Keep the mounted view reachable only through the sandbox HOME.
+            cmd.arg("--tmpfs").arg(merged);
+        }
         // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
         // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
         // them the NVIDIA render node (often the primary GBM device) loads as
@@ -9216,6 +9035,10 @@ impl KwinMcp {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         terminate_with_parent(&mut cmd);
+        self.set_start_stage("mounting the HOME overlay");
+        start_home_overlay(&overlay_plan, &mut startup)
+            .await
+            .map_err(|error| ver_err(format!("HOME overlay: {error:#}")))?;
         self.set_start_stage("spawning the pasta and bwrap sandbox");
         let sandbox_child = match spawn_session_child(cmd, true).await {
             Ok(child) => child,
@@ -9288,18 +9111,8 @@ impl KwinMcp {
         eprintln!("session_start: proxy_conn owns org.kde.KWin");
 
         // Register InputDevice objects on proxy_conn
-        let mouse_sysname = mouse_evdev
-            .file_name()
-            .ok_or_else(|| ver_err("no mouse sysname".to_owned()))?
-            .to_string_lossy()
-            .to_string();
-        let kbd_sysname = kbd_evdev
-            .file_name()
-            .ok_or_else(|| ver_err("no keyboard sysname".to_owned()))?
-            .to_string_lossy()
-            .to_string();
-        let mouse_dev = input_bridge::InputDevice::new_pointer(mouse_sysname);
-        let kbd_dev = input_bridge::InputDevice::new_keyboard(kbd_sysname);
+        let mouse_dev = input_bridge::InputDevice::new_pointer(VIRTUAL_MOUSE_SYSNAME.to_owned());
+        let kbd_dev = input_bridge::InputDevice::new_keyboard(VIRTUAL_KEYBOARD_SYSNAME.to_owned());
         if let Err(e) = input_bridge::register_devices(&proxy_conn, vec![mouse_dev, kbd_dev]).await
         {
             return cleanup_err(format!("register input devices: {e}"), &mut startup);
@@ -9465,7 +9278,7 @@ impl KwinMcp {
             msg
         } else {
             format!(
-                "{msg}; {} oversized ancestor file(s) are read-only; see oversized_read_only_files. Request writable_paths on a new session for private writable copies.",
+                "{msg}; {} oversized file(s) are read-only; see oversized_read_only_files.",
                 oversized_read_only_files.len()
             )
         };
@@ -9489,20 +9302,16 @@ impl KwinMcp {
             sandbox_child: sandbox_child.into(),
             sandbox_stdin: sandbox_stdin.into(),
             host_xdg_dir,
-            _uinput_mouse: std::os::fd::AsFd::as_fd(&uinput_mouse)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
-            _uinput_keyboard: std::os::fd::AsFd::as_fd(&uinput_keyboard)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
+            legacy_uinput_mouse: None,
+            legacy_uinput_keyboard: None,
             cdp_browser: None,
             cdp_forward_port,
             service_proxy_children: service_proxy_children
                 .into_iter()
                 .map(SessionProcess::from)
                 .collect(),
-            mouse_sysname: input_sysname(&mouse_evdev),
-            kbd_sysname: input_sysname(&kbd_evdev),
+            mouse_sysname: VIRTUAL_MOUSE_SYSNAME.to_owned(),
+            kbd_sysname: VIRTUAL_KEYBOARD_SYSNAME.to_owned(),
             viewer_child: None,
             viewer_unavailable: None,
             overlay_work_paths,
@@ -9714,10 +9523,32 @@ impl KwinMcp {
                 },
             )
         };
+        let media = if existing.is_none() {
+            let (descriptor, runtime) = {
+                let guard = self.session.read().await;
+                let sess = guard.as_ref().ok_or_else(|| {
+                    McpError::internal_error("session stopped before media startup", None)
+                })?;
+                use std::os::fd::AsFd;
+                (
+                    sess.sandbox_stdin
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .map_err(KwinError::from)?,
+                    sess.host_xdg_dir.clone(),
+                )
+            };
+            ensure_session_media(descriptor, &runtime).await
+        } else {
+            Ok(())
+        };
         let reused = existing.is_some();
-        let spawned = match existing {
-            Some(child) => Ok(child),
-            None => spawn_viewer(&host_xdg_dir, width, height).await,
+        let spawned = match media {
+            Err(error) => Err(error),
+            Ok(()) => match existing {
+                Some(child) => Ok(child),
+                None => spawn_viewer(&host_xdg_dir, width, height).await,
+            },
         };
         let mut guard = self.session.write().await;
         let Some(sess) = guard
@@ -12952,8 +12783,10 @@ struct SessionRestore {
     path: PathBuf,
     sandbox_pid: u32,
     stdin_fd: i32,
-    mouse_fd: i32,
-    keyboard_fd: i32,
+    #[serde(default)]
+    mouse_fd: Option<i32>,
+    #[serde(default)]
+    keyboard_fd: Option<i32>,
     proxy_fd: i32,
     proxy_guid: String,
     proxy_name: String,
@@ -13131,8 +12964,8 @@ impl SessionRouter {
                 },
                 sandbox_stdin: adopt_descriptor(saved.stdin_fd)?,
                 host_xdg_dir: saved.path,
-                _uinput_mouse: adopt_descriptor(saved.mouse_fd)?,
-                _uinput_keyboard: adopt_descriptor(saved.keyboard_fd)?,
+                legacy_uinput_mouse: saved.mouse_fd.map(adopt_descriptor).transpose()?,
+                legacy_uinput_keyboard: saved.keyboard_fd.map(adopt_descriptor).transpose()?,
                 mouse_sysname: saved.mouse_sysname,
                 kbd_sysname: saved.kbd_sysname,
                 cdp_browser: None,
@@ -13237,8 +13070,16 @@ impl SessionRouter {
                 path: service.path.clone(),
                 sandbox_pid: session.sandbox_child.id(),
                 stdin_fd: retain_descriptor(&session.sandbox_stdin, &mut retained)?,
-                mouse_fd: retain_descriptor(&session._uinput_mouse, &mut retained)?,
-                keyboard_fd: retain_descriptor(&session._uinput_keyboard, &mut retained)?,
+                mouse_fd: session
+                    .legacy_uinput_mouse
+                    .as_ref()
+                    .map(|descriptor| retain_descriptor(descriptor, &mut retained))
+                    .transpose()?,
+                keyboard_fd: session
+                    .legacy_uinput_keyboard
+                    .as_ref()
+                    .map(|descriptor| retain_descriptor(descriptor, &mut retained))
+                    .transpose()?,
                 proxy_fd: retain_descriptor(&session._proxy_socket, &mut retained)?,
                 proxy_guid: session._proxy_conn.server_guid().to_string(),
                 proxy_name: session
