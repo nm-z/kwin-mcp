@@ -5657,7 +5657,11 @@ impl KwinMcp {
         // Process guards have stopped startup children, but the owned disk
         // twin still exists here. Keep bounded diagnostics in the response
         // before autoclean removes the only copy of their stderr.
-        let error = preserve_startup_sandbox_diagnostics(error, &self.path);
+        let error = if self.workdir.owned().is_some() {
+            preserve_startup_sandbox_diagnostics(error, &self.path)
+        } else {
+            error
+        };
         match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => error,
             WorkdirCleanup::Removed(dir) => {
