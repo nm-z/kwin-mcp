@@ -5854,6 +5854,41 @@ fn live_session_tools_are_forwarded_to_the_owner_process() {
 #[test]
 #[ignore = "requires private KWin sessions, input devices, and a full one-minute idle TTL"]
 fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
+    check_live_idle_expiry(false);
+}
+
+#[test]
+#[ignore = "requires private KWin, input devices, one-minute idle TTL, and sudo for a synthetic cleanup blocker"]
+fn live_expiry_cleanup_retry_preserves_the_reason_and_end_time() {
+    check_live_idle_expiry(true);
+}
+
+struct CleanupBlocker(PathBuf);
+impl CleanupBlocker {
+    fn create(path: PathBuf) -> Self {
+        assert!(
+            Command::new("sudo")
+                .args([
+                    "-n", "install", "-d", "-m", "700", "-o", "root", "-g", "root"
+                ])
+                .arg(&path)
+                .status()
+                .expect("create synthetic cleanup blocker")
+                .success()
+        );
+        Self(path)
+    }
+}
+impl Drop for CleanupBlocker {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "rmdir"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+fn check_live_idle_expiry(block_cleanup: bool) {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start_with_env(&[("KWIN_MCP_E2E_TTL_MINUTES", "1")]);
     initialize(&mut client);
@@ -5872,6 +5907,7 @@ fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
     let log = client
         .home
         .join(".local/state/kwin-mcp/session-lifecycle.jsonl");
+    let blocker = block_cleanup.then(|| CleanupBlocker::create(disk.join("synthetic-root-owned")));
     let deadline = Instant::now() + Duration::from_secs(85);
     let mut request = 3;
     loop {
@@ -5883,8 +5919,7 @@ fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
         if sessions
             .iter()
             .any(|entry| entry["session_id"] == id && entry["status"] == "expired")
-            && !runtime.exists()
-            && !disk.exists()
+            && (block_cleanup || (!runtime.exists() && !disk.exists()))
             && log.exists()
         {
             break;
@@ -5901,7 +5936,10 @@ fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
     assert_eq!(record["session_id"], id);
     assert_eq!(record["state"], "session_expired");
     assert_eq!(record["reason"], "idle_timeout");
-    assert_eq!(record["workdir_cleanup"], "removed");
+    assert_eq!(
+        record["workdir_cleanup"],
+        if block_cleanup { "retained" } else { "removed" }
+    );
     let unavailable = call_tool(
         &mut client,
         request,
@@ -5912,6 +5950,8 @@ fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
         unavailable["error"]["data"]["session_status"], "expired",
         "{unavailable}"
     );
+    drop(blocker);
+    thread::sleep(Duration::from_secs(1));
     let stopped = call_tool(
         &mut client,
         request + 1,
@@ -5932,6 +5972,15 @@ fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
     assert_eq!(
         stale["error"]["data"]["session_end_reason"], "idle_timeout",
         "{stale}"
+    );
+    assert!(!runtime.exists() && !disk.exists());
+    assert_eq!(
+        stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",
+        "{stale}"
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_ended_at_unix_seconds"], record["finished_at_unix_seconds"],
+        "cleanup changed the terminal timestamp: {stale}"
     );
     eprintln!("expiry proof: {record}; unavailable={stale}");
     client.stop_process();
@@ -5956,34 +6005,29 @@ fn cleanup_retry_updates_the_record_to_removed() {
         .join(".cache/kwin-mcp")
         .join(runtime.file_name().expect("workdir name"));
     let blocked = disk.join("synthetic-root-owned");
-    assert!(
-        Command::new("sudo")
-            .args([
-                "-n", "install", "-d", "-m", "700", "-o", "root", "-g", "root"
-            ])
-            .arg(&blocked)
-            .status()
-            .expect("create owned blocker")
-            .success()
-    );
+    let blocker = CleanupBlocker::create(blocked);
     let first = call_tool(&mut client, 3, "session_stop", json!({"session_id":id}));
     let kept = runtime.exists() && disk.exists();
-    assert!(
-        Command::new("sudo")
-            .args(["-n", "rmdir"])
-            .arg(&blocked)
-            .status()
-            .expect("remove synthetic blocker")
-            .success()
-    );
+    let still_blocked = call_tool(&mut client, 4, "session_stop", json!({"session_id":id}));
+
+    drop(blocker);
     assert!(
         first["error"].is_object() && kept,
         "cleanup unexpectedly discarded ownership: {first}"
     );
-    let second = call_tool(&mut client, 4, "session_stop", json!({"session_id":id}));
+    assert_eq!(
+        still_blocked["error"]["data"]["session_status"], "stopped",
+        "{still_blocked}"
+    );
+    assert_eq!(
+        still_blocked["error"]["data"]["session_end_reason"], "session_stop",
+        "{still_blocked}"
+    );
+    let second = call_tool(&mut client, 5, "session_stop", json!({"session_id":id}));
+
     assert!(second["error"].is_null(), "{second}");
     assert!(!runtime.exists() && !disk.exists());
-    let stale = call_tool(&mut client, 5, "window_list", json!({"session_id":id}));
+    let stale = call_tool(&mut client, 6, "window_list", json!({"session_id":id}));
     eprintln!("cleanup retry proof: first={first}; second={second}; stale={stale}");
     assert_eq!(
         stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",

@@ -5293,7 +5293,16 @@ impl KwinMcp {
     }
 
     fn record_lifecycle(&self, state: &str, reason: &str, workdir_cleanup: &str) {
-        match append_session_lifecycle_event(&self.session_id, state, reason, workdir_cleanup) {
+        let ended_at = self
+            .death_record()
+            .and_then(|record| record["session_ended_at_unix_seconds"].as_u64());
+        match append_session_lifecycle_event(
+            &self.session_id,
+            state,
+            reason,
+            workdir_cleanup,
+            ended_at,
+        ) {
             Ok(()) => eprintln!(
                 "session lifecycle: session_id={} state={state} reason={reason}",
                 self.session_id
@@ -5303,6 +5312,24 @@ impl KwinMcp {
                 self.session_id
             ),
         }
+    }
+
+    fn record_terminal_cleanup(&self, cleanup: &str) {
+        let Some(terminal) = self.death_record() else {
+            return;
+        };
+        let transition = match terminal["session_status"].as_str() {
+            Some("stopped") => (
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
+                SESSION_LIFECYCLE_REASON_SESSION_STOP,
+            ),
+            Some("expired") => (
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            ),
+            _ => return,
+        };
+        self.record_lifecycle(transition.0, transition.1, cleanup);
     }
 
     async fn check_liveness(&self) -> Option<serde_json::Value> {
@@ -5596,7 +5623,9 @@ impl KwinMcp {
             }
             teardown_blocking(sess).await;
         }
-        let workdir_cleanup = match self.workdir.remove() {
+        let cleanup = self.workdir.remove();
+        let cleanup_changed = !matches!(&cleanup, WorkdirCleanup::NothingOwned);
+        let workdir_cleanup = match cleanup {
             WorkdirCleanup::NothingOwned => "not_requested",
             WorkdirCleanup::Removed(dir) => {
                 eprintln!("shutdown: autoclean removed {}", dir.display());
@@ -5616,6 +5645,8 @@ impl KwinMcp {
                 SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN,
                 workdir_cleanup,
             );
+        } else if cleanup_changed {
+            self.record_terminal_cleanup(workdir_cleanup);
         }
     }
 }
@@ -8670,6 +8701,7 @@ fn append_session_lifecycle_event(
     state: &str,
     reason: &str,
     workdir_cleanup: &str,
+    ended_at: Option<u64>,
 ) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
@@ -8688,7 +8720,7 @@ fn append_session_lifecycle_event(
         server_pid: std::process::id(),
         state: state.to_owned(),
         reason: reason.to_owned(),
-        finished_at_unix_seconds: finished_at,
+        finished_at_unix_seconds: ended_at.unwrap_or(finished_at),
         workdir_cleanup: workdir_cleanup.to_owned(),
     }
     .validate()?;
@@ -10571,6 +10603,7 @@ impl KwinMcp {
             self.set_death(serde_json::json!({
                 "status": "stopped",
                 "session_status": "stopped",
+                "session_available_here": false,
                 "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
                 "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
                 "session_ended_at_unix_seconds": ended_at,
@@ -10579,11 +10612,7 @@ impl KwinMcp {
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
                 if had_session {
-                    self.record_lifecycle(
-                        SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
-                        SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                        "not_requested",
-                    );
+                    self.record_terminal_cleanup("not_requested");
                 }
                 return Ok(if had_session {
                     structured_result(
@@ -10602,23 +10631,12 @@ impl KwinMcp {
                 });
             }
             WorkdirCleanup::Removed(dir) => {
-                if had_session {
-                    self.record_lifecycle(
-                        SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
-                        SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                        "removed",
-                    );
-                }
+                self.record_terminal_cleanup("removed");
                 dir
             }
             WorkdirCleanup::Retained { dir, error } => {
-                if had_session {
-                    self.record_lifecycle(
-                        SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
-                        SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                        "retained",
-                    );
-                }
+                self.record_terminal_cleanup("retained");
+                let terminal = self.death_record();
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
@@ -10639,12 +10657,10 @@ impl KwinMcp {
                     ),
                     Some(serde_json::json!({
                         "cookie_errors": cookie_errors,
-                        "session_status": if had_session { "stopped" } else { "none_running" },
-                        "session_end_reason": if had_session {
-                            Some(SESSION_LIFECYCLE_REASON_SESSION_STOP)
-                        } else {
-                            None
-                        },
+                        "session_status": terminal.as_ref().and_then(|record| record["session_status"].as_str()).unwrap_or("none_running"),
+                        "session_available_here": false,
+                        "session_end_reason": terminal.as_ref().and_then(|record| record["reason"].as_str()),
+                        "session_ended_at_unix_seconds": terminal.as_ref().and_then(|record| record["session_ended_at_unix_seconds"].as_u64()),
                     })),
                 ));
             }
