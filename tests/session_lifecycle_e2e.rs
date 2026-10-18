@@ -4101,9 +4101,66 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "session write leaked to the host without export"
     );
 
-    let exported = call_tool(
+    let not_ready = call_tool(
         &mut client,
         4,
+        "wait_for_file",
+        json!({
+            "session_path": home.join("Downloads/not-yet-created.txt"),
+            "timeout_seconds": 1,
+            "stable_for_ms": 100,
+        }),
+    );
+    assert_eq!(not_ready["error"]["data"]["status"], json!("not_ready"));
+    assert_eq!(not_ready["error"]["data"]["reason"], json!("missing"));
+
+    let delayed = home.join("Downloads/capture.txt");
+    let producer = format!(
+        "sleep 3; printf 'capture complete\\n' > {}; exec bash",
+        shlex::try_quote(&delayed.display().to_string()).expect("quote delayed session path")
+    );
+    let command = format!(
+        "konsole --separate -e bash -c {}",
+        shlex::try_quote(&producer).expect("quote delayed producer command")
+    );
+    let launched = call_tool(&mut client, 5, "launch_app", json!({"command": command}));
+    assert_eq!(
+        launched["result"]["structuredContent"]["window_outcome"],
+        json!("new"),
+        "{launched}"
+    );
+    let ready = call_tool(
+        &mut client,
+        6,
+        "wait_for_file",
+        json!({
+            "session_path": delayed,
+            "timeout_seconds": 10,
+            "stable_for_ms": 500,
+        }),
+    );
+    let readiness = &ready["result"]["structuredContent"];
+    assert_eq!(readiness["status"], json!("ready"), "{ready}");
+    assert_eq!(readiness["size_bytes"], json!(17), "{ready}");
+    let delayed_export = call_tool(
+        &mut client,
+        7,
+        "export_file",
+        json!({"session_path": delayed, "host_path": home.join("out")}),
+    );
+    assert_eq!(
+        delayed_export["result"]["structuredContent"]["status"],
+        json!("exported"),
+        "{delayed_export}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("out/capture.txt")).expect("exported capture"),
+        "capture complete\n"
+    );
+
+    let exported = call_tool(
+        &mut client,
+        8,
         "export_file",
         json!({"session_path": download, "host_path": home.join("out")}),
     );
@@ -4120,7 +4177,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let refused = call_tool(
         &mut client,
-        5,
+        9,
         "export_file",
         json!({"session_path": download, "host_path": home.join("out")}),
     );
@@ -4133,7 +4190,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
     );
     let replaced = call_tool(
         &mut client,
-        6,
+        10,
         "export_file",
         json!({"session_path": download, "host_path": host_copy, "overwrite": true}),
     );
@@ -4146,7 +4203,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
     // Default destination: the same path on the host (the directory the user named).
     let default = call_tool(
         &mut client,
-        7,
+        11,
         "export_file",
         json!({"session_path": download}),
     );
@@ -4159,7 +4216,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let note = call_tool(
         &mut client,
-        8,
+        12,
         "export_file",
         json!({"session_path": "/tmp/session-note.txt", "host_path": home.join("out")}),
     );
@@ -4175,7 +4232,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let partial = call_tool(
         &mut client,
-        9,
+        13,
         "export_file",
         json!({"session_path": home.join("Downloads/partial.zip"), "host_path": home.join("out")}),
     );
@@ -4187,7 +4244,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "{partial}"
     );
     assert!(!home.join("out/partial.zip").exists());
-    call_tool(&mut client, 10, "session_stop", json!({}));
+    call_tool(&mut client, 14, "session_stop", json!({}));
     client.stop_process();
 }
 
