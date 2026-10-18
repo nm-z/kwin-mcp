@@ -8112,31 +8112,43 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         connecting["state"], "starting",
         "premature streaming status: {connecting}"
     );
-    thread::sleep(Duration::from_millis(150));
-    let windows = call_tool(
-        &mut desktop,
-        3,
-        "window_list",
-        json!({"session_id":host_id}),
-    );
-    let viewer_window = windows["result"]["structuredContent"]["windows"]
-        .as_array()
-        .expect("outer desktop windows")
-        .iter()
-        .find(|window| {
-            window["title"]
-                .as_str()
-                .is_some_and(|title| title.starts_with(&format!("kwin-viewer {session}")))
-        })
-        .expect("stalled viewer window");
+    let mut outer_request = 3;
+    let window_deadline = Instant::now() + Duration::from_secs(3);
+    let viewer_window = loop {
+        let last_windows = call_tool(
+            &mut desktop,
+            outer_request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        outer_request += 1;
+        if let Some(window) = last_windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .and_then(|windows| {
+                windows.iter().find(|window| {
+                    window["title"]
+                        .as_str()
+                        .is_some_and(|title| title.starts_with(&format!("kwin-viewer {session}")))
+                })
+            })
+        {
+            break window.clone();
+        }
+        assert!(
+            Instant::now() < window_deadline,
+            "stalled viewer window did not appear: {last_windows}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
     let activated = call_tool(
         &mut desktop,
-        4,
+        outer_request,
         "window_activate",
         json!({"session_id":host_id,"window_id":viewer_window["id"]}),
     );
     assert!(activated["error"].is_null(), "{activated}");
-    save_session_image(&mut desktop, 5, &host_id, "viewer-stalled.png");
+    outer_request += 1;
+    save_session_image(&mut desktop, outer_request, &host_id, "viewer-stalled.png");
     let result = client.response(4, Duration::from_secs(10));
     println!("viewer result: {}", result["result"]["structuredContent"]);
     assert_eq!(
