@@ -183,7 +183,7 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
 
 `TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
 at most 107 bytes, excluding the terminating NUL, for the entire socket path.
@@ -194,6 +194,15 @@ processes. If a path is too long, the error names it, reports its byte length,
 and asks for a shorter `TMPDIR`; set that variable before launching the server.
 The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
 filename, and counts UTF-8 bytes rather than characters.
+
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
 
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these

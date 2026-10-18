@@ -98,7 +98,10 @@ impl RpcClient {
             .as_nanos();
         let home_root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+            // Nested fixture sockets must fit sockaddr_un even when the
+            // checkout/target path is long. /tmp is hidden inside the session,
+            // so use the short, host-visible /var/tmp root by default.
+            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
         let home = home_root.join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
         for directory in [
             home.join(".config"),
@@ -1873,6 +1876,147 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
 }
 
 #[test]
+#[ignore = "run through tests/screenshot_storage_e2e.sh with KDE, KWin, bubblewrap and kdialog"]
+fn screenshot_at_full_workdir_keeps_desktop_inspection_available() {
+    use base64::Engine;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let temporary = std::env::temp_dir();
+    assert_eq!(
+        std::env::var_os("KWIN_MCP_E2E_PRIVATE_TMPFS"),
+        Some(temporary.clone().into_os_string()),
+        "use the wrapper: never fill the host's shared /tmp"
+    );
+    let filesystem = nix::sys::statfs::statfs(&temporary).expect("private tmpfs");
+    assert_eq!(filesystem.filesystem_type(), nix::sys::statfs::TMPFS_MAGIC);
+    let stat = nix::sys::statvfs::statvfs(&temporary).expect("private tmpfs capacity");
+    assert!(stat.blocks() * stat.fragment_size() <= 1024 * 1024 * 1024);
+    let proof =
+        PathBuf::from(std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR").expect("proof directory"));
+    std::fs::create_dir_all(&proof).expect("proof directory");
+
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":1440,"height":900}),
+    );
+    let workdir = workdir(&started);
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"test ! -w \"$XDG_RUNTIME_DIR/kwin-scripts\" && kdialog --title kwin319 --msgbox 'Screenshot storage regression #319'"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    for id in 4..7 {
+        let shot = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        assert!(!inline_png(&shot).is_empty(), "{shot}");
+    }
+    let screenshot = workdir.join("screenshot.png");
+    std::fs::copy(&screenshot, proof.join("before.png")).expect("before screenshot");
+    std::fs::remove_file(&screenshot).expect("remove previous screenshot");
+
+    // Fill only the wrapper's small private mount. Unlike the user-quota case,
+    // leave no page for the active-window script that precedes PNG capture.
+    let fill = FillFile(temporary.join("fill"));
+    let file = std::fs::File::create(&fill.0).expect("private fill file");
+    let stat = nix::sys::statvfs::statvfs(&temporary).expect("private headroom");
+    let remaining = stat.blocks_available() * stat.fragment_size();
+    nix::fcntl::posix_fallocate(
+        &file,
+        0,
+        i64::try_from(remaining).expect("bounded fill size"),
+    )
+    .expect("fill private tmpfs");
+    assert_eq!(
+        nix::sys::statvfs::statvfs(&temporary)
+            .expect("full tmpfs")
+            .blocks_available(),
+        0
+    );
+
+    let failed = call_tool(&mut client, 7, "screenshot", json!({}));
+    std::fs::write(proof.join("full-workdir.json"), failed.to_string()).expect("failure evidence");
+    assert_eq!(
+        failed["error"]["data"]["reason"], "write_failed",
+        "{failed}"
+    );
+    let message = failed["error"]["message"]
+        .as_str()
+        .expect("storage diagnostic");
+    assert!(message.contains("No space left on device"), "{message}");
+    assert!(message.contains("inline=true"), "{message}");
+    assert!(!screenshot.exists());
+    assert!(!workdir.join("screenshot.partial").exists());
+
+    let windows = call_tool(&mut client, 8, "window_list", json!({}));
+    std::fs::write(proof.join("windows.json"), windows.to_string()).expect("window evidence");
+    assert!(windows["error"].is_null(), "{windows}");
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .expect("window list")
+            .iter()
+            .any(|window| window["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("kwin319"))),
+        "{windows}"
+    );
+    for id in 9..11 {
+        let inline = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        let metadata = screenshot_meta(&inline);
+        assert!(metadata["path"].is_null(), "{metadata}");
+        assert!(
+            metadata["write_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("No space left on device")),
+            "{metadata}"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(inline_png(&inline))
+            .expect("fallback PNG");
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes))
+            .read_info()
+            .expect("fallback PNG header");
+        let mut pixels = vec![0; decoder.output_buffer_size()];
+        let info = decoder
+            .next_frame(&mut pixels)
+            .expect("complete fallback PNG");
+        assert!(info.width > 0 && info.height > 0);
+        std::fs::write(proof.join("at-capacity.png"), bytes).expect("fallback screenshot");
+        std::fs::write(proof.join("inline.json"), metadata.to_string()).expect("fallback metadata");
+        assert!(!screenshot.exists());
+        assert!(!workdir.join("screenshot.partial").exists());
+    }
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(workdir.file_name().expect("workdir name"));
+    assert_eq!(
+        std::fs::read_dir(disk.join("kwin-scripts"))
+            .expect("disk-backed scripts")
+            .count(),
+        0,
+        "KWin scripts leaked after inspection"
+    );
+    drop(file);
+    drop(fill);
+    let recovered = call_tool(&mut client, 11, "screenshot", json!({}));
+    assert!(
+        recovered["error"].is_null() && screenshot.exists(),
+        "{recovered}"
+    );
+    std::fs::copy(&screenshot, proof.join("recovered.png")).expect("recovered screenshot");
+    let stopped = call_tool(&mut client, 12, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    assert!(!workdir.exists(), "workdir was not cleaned");
+    assert!(!disk.exists(), "disk twin was not cleaned");
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
 fn browser_cookies_continue_across_sessions_without_host_writes() {
     use std::os::unix::fs::PermissionsExt;
@@ -2888,6 +3032,11 @@ fn session_follows_host_sqlite_wal_rotation() {
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
     let hidden_cache = directory.join(".cache/google-chrome/nested");
+    let cookie_state = directory.join(".local/state/kwin-mcp/browser-cookies");
+    assert!(
+        !cookie_state.exists(),
+        "cookie state must be absent beneath the HOME alias fixture"
+    );
     std::fs::create_dir_all(&hidden_cache).expect("nested browser cache");
     let cache_database = rusqlite::Connection::open(hidden_cache.join("hidden-cache.sqlite"))
         .expect("hidden cache fixture database");
@@ -3352,6 +3501,20 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         json!({"width":800,"height":600}),
     );
     let workdir = workdir(&started);
+    let bridge_exe = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(workdir.file_name().expect("session workdir name"))
+        .join("kwin-mcp-exe");
+    assert!(
+        bridge_exe.is_file(),
+        "FUSE bridge image was not staged in the disk-backed session twin: {}",
+        bridge_exe.display()
+    );
+    assert!(
+        !workdir.join("kwin-mcp-exe").exists(),
+        "FUSE bridge image consumed space in the /tmp workdir"
+    );
     std::fs::create_dir_all(workdir.join("src")).expect("source dir");
     std::fs::write(workdir.join("src/hello.txt"), "over fuse\n").expect("source file");
     // sshfs over a local sftp-server: a real libfuse3 client going through
@@ -3403,6 +3566,10 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         );
     }
     call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !bridge_exe.exists(),
+        "session_stop retained its disk-backed FUSE bridge image"
+    );
     client.stop_process();
 }
 

@@ -37,6 +37,8 @@ mod fuse_bridge {
     pub const HELPER_SOCKET: &str = "/tmp/.kwin-mcp-fuse.sock";
     /// Where the sandbox sees the real fusermount binaries.
     pub const REAL_BINARY_DIR: &str = "/run/kwin-mcp-fuse";
+    /// Where the sandbox sees the copied kwin-mcp image used to run the helper.
+    pub const BRIDGE_EXECUTABLE: &str = "/run/kwin-mcp-fuse/bridge";
     /// The FUSE helper programs the bridge serves, as named on the host.
     pub const PROGRAMS: [&str; 2] = ["fusermount", "fusermount3"];
     /// Most descriptors one request may carry (stdio plus `_FUSE_*` sockets).
@@ -310,6 +312,7 @@ mod kwin_script {
     const KWIN_SCRIPT_INTERFACE: &str = "org.kde.kwin.Script";
     const KWIN_CALLBACK_INTERFACE: &str = "org.kde.KWinMCP";
     const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+    pub(crate) const SCRIPT_DIRECTORY: &str = "kwin-scripts";
 
     static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -340,7 +343,20 @@ mod kwin_script {
         callDBus({our_name_json},{callback_path_json},'{KWIN_CALLBACK_INTERFACE}','result',JSON.stringify(result));"
         );
         let object_path = zbus::zvariant::ObjectPath::try_from(callback_path.clone())?;
-        let script_file = host_xdg_dir.join(format!("{marker}.js"));
+        let disk_scripts = crate::session_disk_path(host_xdg_dir).join(SCRIPT_DIRECTORY);
+        // Sessions created before this directory was introduced can survive a
+        // source reload, but their mount namespace has no disk-backed alias.
+        let (script_directory, container_directory) = if disk_scripts.is_dir() {
+            (disk_scripts, host_xdg_dir.join(SCRIPT_DIRECTORY))
+        } else {
+            (host_xdg_dir.to_owned(), host_xdg_dir.to_owned())
+        };
+        let filename = format!("{marker}.js");
+        let script_file = script_directory.join(&filename);
+        let container_script_path = container_directory
+            .join(filename)
+            .to_string_lossy()
+            .to_string();
         let mut cleanup = ScriptCleanup {
             conn: conn.clone(),
             kwin_unique: kwin_unique.to_owned(),
@@ -355,15 +371,20 @@ mod kwin_script {
         };
 
         let result = async {
-            {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&cleanup.script_file)?;
-                cleanup.file_created = true;
-                file.write_all(script.as_bytes())?;
-            }
-            let container_script_path = cleanup.script_file.to_string_lossy().to_string();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cleanup.script_file)
+                .and_then(|mut file| {
+                    cleanup.file_created = true;
+                    file.write_all(script.as_bytes())
+                })
+                .map_err(|error| {
+                    KwinError::Msg(format!(
+                        "prepare KWin script: {}",
+                        crate::describe_write_failure(&cleanup.script_file, &error)
+                    ))
+                })?;
             let (tx, rx) = tokio::sync::oneshot::channel::<String>();
             let callback = KWinCallback {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -1765,8 +1786,9 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
 
-// Session overlay layers live on disk under ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp
-// (/tmp is RAM with a per-user quota); session_start needs this much free there.
+// Session overlay layers and the FUSE bridge image live on disk under
+// ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
+// session_start needs this much free there.
 const SESSION_DISK_MIN_FREE: u64 = 2 << 30;
 const DEFAULT_STATS_SECONDS: u64 = 3600;
 
@@ -3609,8 +3631,18 @@ impl OverlayPlan {
         ))
     }
 
-    fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
+    fn add_bwrap_args(
+        &self,
+        command: &mut std::process::Command,
+        target: &Path,
+        pre_overlay_binds: &[(PathBuf, PathBuf)],
+    ) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
+        // Some bridge sources live beneath HOME, whose overlays below hide the
+        // host cache tree. Bind them while the original host paths are visible.
+        for (source, destination) in pre_overlay_binds {
+            command.arg("--ro-bind").arg(source).arg(destination);
+        }
         if let Some(staging_root) = &self.staging_root {
             command.arg("--bind").arg(staging_root).arg(target);
         }
@@ -3661,7 +3693,11 @@ impl OverlayPlan {
             // Apply directory masks last: individual socket placeholders must
             // not recreate entries inside an intentionally empty directory.
             for hidden in &self.empty_dirs {
-                if let Ok(relative) = hidden.strip_prefix(source) {
+                // Upper-layer directories can be absent from this read-only
+                // alias; bwrap cannot mount a tmpfs at a missing destination.
+                if let Ok(relative) = hidden.strip_prefix(source)
+                    && std::fs::symlink_metadata(hidden).is_ok_and(|metadata| metadata.is_dir())
+                {
                     command.arg("--tmpfs").arg(destination.join(relative));
                 }
             }
@@ -4607,6 +4643,9 @@ fn prepare_host_view(
             gib(free)
         );
     }
+    let scripts = disk.join(kwin_script::SCRIPT_DIRECTORY);
+    std::fs::create_dir(&scripts)
+        .map_err(|e| anyhow::anyhow!("create KWin script storage {}: {e}", scripts.display()))?;
     service.set_start_stage("scanning host sockets and processes");
     let inventory = host_process_inventory(target)?;
     service.set_start_stage("preparing HOME overlays");
@@ -5037,6 +5076,9 @@ struct StartupResources {
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
     service_proxy_children: Vec<std::process::Child>,
+    /// Disk-backed image staged for the FUSE helper, until Session owns the
+    /// whole disk twin or failed startup cleanup removes the image.
+    fuse_bridge_exe: Option<PathBuf>,
 }
 
 impl StartupResources {
@@ -5046,6 +5088,7 @@ impl StartupResources {
             sandbox_child: None,
             sandbox_stdin: None,
             service_proxy_children: Vec::new(),
+            fuse_bridge_exe: None,
         }
     }
 
@@ -5064,6 +5107,14 @@ impl StartupResources {
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
         }
+        if let Some(exe) = self.fuse_bridge_exe.take()
+            && let Err(error) = std::fs::remove_file(&exe)
+        {
+            eprintln!(
+                "startup: could not remove staged FUSE bridge {}: {error}",
+                exe.display()
+            );
+        }
     }
 
     fn into_parts(
@@ -5074,6 +5125,7 @@ impl StartupResources {
         Vec<std::process::Child>,
     ) {
         self.scope_unit.take();
+        self.fuse_bridge_exe.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -5534,12 +5586,12 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
 
 // ── Session workdir autoclean ────────────────────────────────────────────
 //
-// --autoclean owns exactly one directory, the session workdir of this server
-// process, and moves through one explicit state machine:
+// --autoclean owns the session workdir and its disk-backed overlay twin, and
+// moves through one explicit state machine:
 //
 //   Idle  --claim (session_start, before the directory is created)--> Owned
-//   Owned --remove succeeded (workdir gone)--------------------------> Idle
-//   Owned --remove failed (workdir still there)---------------------> Owned
+//   Owned --remove succeeded (both directories gone)----------------> Idle
+//   Owned --remove failed (either directory remains)----------------> Owned
 //
 // `claim` and `remove` are synchronous and each runs under a single lock
 // acquisition, so no await, cancellation, or hard timeout can split a
@@ -5579,7 +5631,7 @@ fn session_disk_root() -> std::path::PathBuf {
 }
 
 /// The disk-backed twin of a session workdir: its overlay upper, work and
-/// staging layers.
+/// staging layers, and temporary KWin scripts.
 fn session_disk_path(workdir: &Path) -> std::path::PathBuf {
     session_disk_root().join(workdir.file_name().unwrap_or_default())
 }
@@ -5662,6 +5714,16 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             ),
         ));
     }
+    // Startup can fail before a Session exists, so teardown cannot be the only
+    // owner of the disk overlay's cleanup. Remove it before the temporary
+    // workdir: a failure must keep the lease and ownership reachable for retry.
+    let disk = session_disk_path(dir);
+    remove_verified_workdir(&disk).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("disk overlay {} not removed: {error}", disk.display()),
+        )
+    })?;
     remove_verified_workdir(dir)
 }
 
@@ -5962,8 +6024,8 @@ impl WorkdirOwnership {
     fn owned(&self) -> Option<std::path::PathBuf> {
         self.lock().as_ref().map(|claim| claim.dir.clone())
     }
-    /// The terminal transition: delete the owned workdir and release ownership
-    /// only once it is actually gone. Both the delete and the release happen
+    /// The terminal transition: delete the owned workdir and its disk twin,
+    /// releasing ownership only once both are gone. The deletes and release happen
     /// under one lock acquisition, so concurrent callers cannot observe or lose
     /// a half-finished transition.
     fn remove(&self) -> WorkdirCleanup {
@@ -6386,7 +6448,7 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
     if let Ok(stat) = nix::sys::statvfs::statvfs(directory) {
         let free = stat.blocks_available().saturating_mul(stat.fragment_size());
         message.push_str(&format!(
-            "; the filesystem itself has {} free. The session workdir, including its HOME overlay upper layer, counts against this limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
+            "; the filesystem itself has {} free. Files owned by this user on this filesystem count against its limit; free space owned by this user on that filesystem (or stop idle sessions) and retry",
             gib(free)
         ));
     }
@@ -9370,7 +9432,40 @@ impl KwinMcp {
             host_name,
             "--unshare-ipc",
         ]);
-        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
+        let fuse_exe = if fuse.is_some() {
+            // Keep this large copy on the disk-backed session twin. Putting it
+            // in host_xdg_dir charges it to /tmp's per-user tmpfs quota and can
+            // leave later session operations unable to write there.
+            let exe = session_disk_path(&host_xdg_dir).join("kwin-mcp-exe");
+            let temporary = exe.with_extension("partial");
+            let copied = std::fs::copy("/proc/self/exe", &temporary)
+                .and_then(|_| std::fs::rename(&temporary, &exe));
+            if let Err(error) = copied {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(ver_err(format!(
+                    "copy running binary for the FUSE bridge: {}",
+                    describe_write_failure(&temporary, &error)
+                )));
+            }
+            startup.fuse_bridge_exe = Some(exe.clone());
+            Some(exe)
+        } else {
+            None
+        };
+        let mut pre_overlay_binds = Vec::new();
+        if let (Some(binaries), Some(exe)) = (&fuse, &fuse_exe) {
+            pre_overlay_binds.push((exe.clone(), PathBuf::from(fuse_bridge::BRIDGE_EXECUTABLE)));
+            for (real, program) in binaries {
+                let hidden = PathBuf::from(format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR));
+                pre_overlay_binds.push((real.clone(), hidden));
+            }
+            // Preserve all real helpers before replacing any PATH entry with
+            // the bridge; the host may resolve multiple names to one binary.
+            for (real, _) in binaries {
+                pre_overlay_binds.push((exe.clone(), real.clone()));
+            }
+        }
+        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target, &pre_overlay_binds);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
@@ -9383,6 +9478,8 @@ impl KwinMcp {
         let home_kscreenlockerrc = format!("{home}/.config/kscreenlockerrc");
         let home_kcmfonts = format!("{home}/.config/kcmfonts");
         let home_fonts_conf = format!("{home}/.config/fontconfig/fonts.conf");
+        let script_directory = session_disk_path(&host_xdg_dir).join(kwin_script::SCRIPT_DIRECTORY);
+        let container_script_directory = host_xdg_dir.join(kwin_script::SCRIPT_DIRECTORY);
         cmd.args(["--dev", "/dev"]);
         let trimmed_dri = usable_dri_nodes(nvidia_gbm_installed());
         match &trimmed_dri {
@@ -9420,6 +9517,11 @@ impl KwinMcp {
             "--bind",
             &xdg_dir_str,
             &xdg_dir_str,
+            // Geometry/window inspection must not need a free page on /tmp
+            // before screenshot's PNG-save error or inline fallback can run.
+            "--ro-bind",
+            &script_directory.display().to_string(),
+            &container_script_directory.display().to_string(),
             // System config overrides (read-only)
             "--ro-bind",
             &atspi_conf_path.display().to_string(),
@@ -9471,12 +9573,8 @@ impl KwinMcp {
                 // different or missing file ("<path> (deleted)"), bwrap cannot
                 // bind it, and the sandbox died before D-Bus came up.
                 // /proc/self/exe stays readable after deletion; bwrap will not
-                // bind it directly, so it is copied into the session dir.
-                let exe = host_xdg_dir.join("kwin-mcp-exe");
-                std::fs::copy("/proc/self/exe", &exe).map_err(|e| {
-                    ver_err(format!("copy running binary for the FUSE bridge: {e}"))
-                })?;
-                let exe = &exe;
+                // bind it directly, so it is copied into the disk-backed twin
+                // and bound before HOME overlays hide that host path.
                 cmd.args([
                     "--dev-bind",
                     "/dev/fuse",
@@ -9484,11 +9582,6 @@ impl KwinMcp {
                     "--cap-add",
                     "CAP_SYS_ADMIN",
                 ]);
-                for (real, program) in binaries {
-                    let hidden = format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR);
-                    cmd.arg("--ro-bind").arg(real).arg(&hidden);
-                    cmd.arg("--ro-bind").arg(exe).arg(real);
-                }
                 let entrypoint_path = host_xdg_dir.join("entrypoint.sh");
                 std::fs::write(&entrypoint_path, &entrypoint)
                     .map_err(|e| ver_err(format!("write entrypoint: {e}")))?;
@@ -9515,7 +9608,7 @@ impl KwinMcp {
                     .unwrap_or_default();
                 format!(
                     "{prog}{} --fuse-helper {} </dev/null >/dev/null &\nexec unshare --user --map-user={uid} --map-group={gid} setpriv --inh-caps=-all --ambient-caps=-all bash {}",
-                    shell_quote(&exe.display().to_string()),
+                    shell_quote(fuse_bridge::BRIDGE_EXECUTABLE),
                     fuse_bridge::HELPER_SOCKET,
                     shell_quote(&entrypoint_path.display().to_string()),
                 )
@@ -9804,6 +9897,14 @@ impl KwinMcp {
             .iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
+        // Keep the startup guard responsible for the sandbox and staged FUSE
+        // image until every fallible session resource has been acquired.
+        let uinput_mouse_fd = std::os::fd::AsFd::as_fd(&uinput_mouse)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
+        let uinput_keyboard_fd = std::os::fd::AsFd::as_fd(&uinput_keyboard)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
@@ -9818,12 +9919,8 @@ impl KwinMcp {
             sandbox_child: sandbox_child.into(),
             sandbox_stdin: sandbox_stdin.into(),
             host_xdg_dir,
-            _uinput_mouse: std::os::fd::AsFd::as_fd(&uinput_mouse)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
-            _uinput_keyboard: std::os::fd::AsFd::as_fd(&uinput_keyboard)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
+            _uinput_mouse: uinput_mouse_fd,
+            _uinput_keyboard: uinput_keyboard_fd,
             cdp_browser: None,
             cdp_forward_port,
             service_proxy_children: service_proxy_children
