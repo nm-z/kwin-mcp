@@ -8763,8 +8763,11 @@ impl KwinMcp {
         let fc_hinting_dest_str = fc_hinting_dest.display().to_string();
         let fc_lcd_dest_str = fc_lcd_dest.display().to_string();
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
+        // The host TMPDIR names the workdir's parent, which is read-only inside
+        // bwrap. Keep session applications' temporary files in private /tmp.
         let entrypoint = format!(
             "set -u\n\
+            export TMPDIR=/tmp\n\
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
@@ -8783,7 +8786,7 @@ impl KwinMcp {
             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
             sleep 0.3\n\
-            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER ATSPI_DBUS_IMPLEMENTATION\n\
+            dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
             wireplumber &\n\
