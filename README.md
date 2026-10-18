@@ -195,6 +195,15 @@ and asks for a shorter `TMPDIR`; set that variable before launching the server.
 The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
 filename, and counts UTF-8 bytes rather than characters.
 
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
+
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these
 databases without copying their contents, and reads use the host inodes and
