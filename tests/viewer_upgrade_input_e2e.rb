@@ -78,6 +78,8 @@ Dir.mktmpdir('kmvup-','/var/tmp') do |root|
     else
       raise blocked.inspect unless blocked.dig('error','data','reason')=='viewer_activity_check_failed' && blocked.dig('error','data','retry_safe')==true
     end
+    capture=inner.ok(inner.call('screenshot',session_id:id))
+    FileUtils.cp(capture.fetch('path'),File.join(proof,'after-admission.png'))
     reopened=inner.ok(inner.call('viewer_open',session_id:id,reason:'Inspect refreshed viewer')).fetch('viewer')
     raise reopened.inspect unless reopened['state']=='ready' && reopened.fetch('pid')!=paused
     raise 'stale viewer not reaped' if File.exist?("/proc/#{paused}")
