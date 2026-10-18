@@ -3880,6 +3880,18 @@ fn host_graphical_socket_fixture() {
 }
 
 #[test]
+#[ignore = "helper launched by session_start_bounds_large_ancestor_copies_with_a_nested_mount"]
+fn session_graphical_home_socket_probe() {
+    let socket = std::env::var("KWIN_GRAPHICAL_HOME_SOCKET").expect("graphical socket path");
+    let report = std::env::var("KWIN_GRAPHICAL_HOME_REPORT").expect("graphical socket report");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_err(),
+        "split HOME exposed a graphical host socket through its ordinary path"
+    );
+    std::fs::write(report, "GRAPHICAL_SOCKET_BLOCKED\n").expect("graphical socket report");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
 fn session_follows_host_sqlite_wal_rotation() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
@@ -4937,6 +4949,30 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         failed["result"]["structuredContent"]["exit_status"], 3,
         "{failed}"
     );
+    // The command's stderr comes back with its exit status.
+    let noisy = call_tool(
+        &mut client,
+        7,
+        "launch_app",
+        json!({"command":"sh -c 'echo boom >&2; exit 3'"}),
+    );
+    assert_eq!(noisy["result"]["isError"], true, "{noisy}");
+    assert_eq!(
+        noisy["result"]["structuredContent"]["exit_status"], 3,
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["structuredContent"]["stderr_tail"]
+            .as_array()
+            .is_some_and(|lines| lines.contains(&json!("boom"))),
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stderr (last") && text.contains("boom")),
+        "{noisy}"
+    );
 
     let finished = call_tool(
         &mut client,
@@ -4965,6 +5001,58 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{stopped}"
     );
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_names_a_socket_path_in_a_host_directory_the_session_cannot_see() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The socket does not exist yet, so only its host parent directory is probed.
+    let directory =
+        std::env::temp_dir().join(format!("kwin-mcp-e2e-socket-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("host directory");
+    let socket = directory.join("sock");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let refused = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command": format!("true {}", socket.display())}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["reason"], "path_not_visible",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["data"]["path"],
+        json!(socket.display().to_string()),
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not visible in the session")),
+        "{refused}"
+    );
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -6442,7 +6530,7 @@ impl Drop for ResumeProcess {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
-fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
+fn launch_app_submits_despite_its_own_frozen_compositor_and_recovers() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
     initialize(&mut client);
@@ -6471,28 +6559,24 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         json!({})
     );
     let ping_ms = ping_started.elapsed().as_millis();
-    let timed_out = client.response(3, Duration::from_secs(25));
+    // The window baselines are bounded at 5 seconds each and never hold the
+    // command back, so it is submitted; the window wait then ends at its own 15.
+    let fault_response = client.response(3, Duration::from_secs(45));
     let elapsed_ms = begun.elapsed().as_millis();
+    let payload = &fault_response["result"]["structuredContent"];
+    assert!(fault_response["error"].is_null(), "{fault_response}");
+    assert_eq!(payload["command_submitted"], true, "{fault_response}");
+    assert_eq!(payload["window"], "timeout", "{fault_response}");
     assert_eq!(
-        timed_out["error"]["data"]["reason"], "launch_timeout",
-        "{timed_out}"
-    );
-    assert_eq!(
-        timed_out["error"]["data"]["command_submitted"], false,
-        "{timed_out}"
+        payload["window_baseline"], "unavailable",
+        "{fault_response}"
     );
     assert!(
-        timed_out["error"]["data"]["stage"]
-            .as_str()
-            .expect("stage")
-            .contains("windows before launch")
-    );
-    assert!(
-        (19_000..23_000).contains(&elapsed_ms),
-        "timeout duration {elapsed_ms}ms"
+        (24_000..29_000).contains(&elapsed_ms),
+        "launch duration {elapsed_ms}ms"
     );
     eprintln!(
-        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} timeout_ms={elapsed_ms} response={timed_out}",
+        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} launch_ms={elapsed_ms} response={fault_response}",
         client.child.id()
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -6583,7 +6667,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
             .as_str()
             .expect("screenshot path");
         std::fs::copy(capture, directory.join("launch-recovery.png")).expect("copy screenshot");
-        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"timeout_ms":elapsed_ms,"response":timed_out,
+        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"launch_ms":elapsed_ms,"response":fault_response,
             "commit":started["result"]["structuredContent"]["commit"],"version":started["result"]["structuredContent"]["version"]}).to_string()).expect("write fault proof");
     }
     let stopped = call_tool(&mut client, 8, "session_stop", json!({}));
@@ -6675,6 +6759,33 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    let graphical_socket = home.join("project/host-graphical.sock");
+    struct GraphicalFixture(Child);
+    impl Drop for GraphicalFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _graphical = GraphicalFixture(
+        Command::new(std::env::current_exe().expect("fixture executable"))
+            .args(["--ignored", "--exact", "host_graphical_socket_fixture"])
+            .env("KWIN_GRAPHICAL_SOCKET_FIXTURE", &graphical_socket)
+            // Only this owned helper is marked graphical; no host connection is made.
+            .env("WAYLAND_DISPLAY", "wayland-0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start graphical fixture"),
+    );
+    let socket_deadline = Instant::now() + Duration::from_secs(5);
+    while !graphical_socket.exists() {
+        assert!(
+            Instant::now() < socket_deadline,
+            "graphical fixture did not start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let ordinary = home.join("project/ordinary.bin");
     let large = home.join("project/large.bin");
     let explicit = home.join("project/explicit.bin");
@@ -6731,6 +6842,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         "startup exceeded deadline: {started}"
     );
     let dir = workdir(&started);
+    let socket_probe = dir.join("graphical-socket-probe");
+    std::fs::copy(
+        std::env::current_exe().expect("probe executable"),
+        &socket_probe,
+    )
+    .expect("copy graphical socket probe");
+    let socket_report = dir.join("graphical-socket-report.txt");
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
@@ -6800,6 +6918,15 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         ),
     )
     .expect("session check script");
+    let script_contents = std::fs::read_to_string(&script).expect("read session check script");
+    let socket_check = format!(
+        "KWIN_GRAPHICAL_HOME_SOCKET={} KWIN_GRAPHICAL_HOME_REPORT={} {} --ignored --exact session_graphical_home_socket_probe --nocapture\n",
+        quote(&graphical_socket),
+        quote(&socket_report),
+        quote(&socket_probe)
+    );
+    std::fs::write(&script, format!("{script_contents}{socket_check}"))
+        .expect("add graphical socket check");
     let launched = call_tool(
         &mut client,
         4,
@@ -6810,10 +6937,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     );
     assert!(launched["error"].is_null(), "{launched}");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n") {
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n")
+        || std::fs::read_to_string(&socket_report).ok().as_deref()
+            != Some("GRAPHICAL_SOCKET_BLOCKED\n")
+    {
         assert!(
             Instant::now() < deadline,
-            "session file checks did not pass: {launched}"
+            "session file or graphical socket checks did not pass: {launched}"
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -8789,7 +8919,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
 }
 
 #[test]
-#[ignore = "requires private KWin desktops, kdialog, and wl-paste"]
+#[ignore = "requires private KWin desktops, kdialog, wl-paste, and xterm"]
 fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut desktop = RpcClient::start();
@@ -8843,6 +8973,49 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     assert_eq!(
         run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
         agent_text
+    );
+    let long_command = format!("{}printf 'paste probe';", "echo x;".repeat(82));
+    assert_eq!(long_command.chars().count(), 595);
+    assert_eq!(
+        run(
+            &mut client,
+            "clipboard_write",
+            json!({"session_id":id,"target":"session","text":&long_command})
+        ),
+        json!({"target":"session","length":595})
+    );
+    let xterm_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_command}),
+    );
+    let paste_started = Instant::now();
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&dir.join("xterm.txt")),
+        format!("{long_command}\n")
+    );
+    assert!(
+        paste_started.elapsed() < Duration::from_secs(5),
+        "595-character XTerm paste exceeded five seconds"
+    );
+    run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"session","text":agent_text}),
     );
     run(
         &mut client,
@@ -9005,6 +9178,35 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
             json!({"target":"session","length":32,"text":null,"protected":true})
         );
     }
+    let xterm_secret_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm-secret.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_secret_command}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    let restored_secret = submitted_text(&dir.join("xterm-secret.txt"));
+    let restored_secret = restored_secret.trim_end_matches('\n');
+    assert!(
+        restored_secret.len() == 32
+            && restored_secret.bytes().any(|b| b.is_ascii_lowercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_uppercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_digit())
+            && restored_secret.bytes().any(|b| b.is_ascii_punctuation()),
+        "reloaded PRIMARY selection must retain the protected generated value"
+    );
     // Replacing a selection from an app must prevent reload from resurrecting it.
     run(
         &mut client,
@@ -9046,7 +9248,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     run(&mut desktop, "session_stop", json!({"session_id":host_id}));
     desktop.stop_process();
     println!(
-        "PASS: separate clipboards; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
+        "PASS: separate clipboards; 595-character XTerm Shift+Insert paste; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
     );
 }
 

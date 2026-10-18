@@ -97,7 +97,7 @@ The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Conf
 
 Each session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host clipboard, and Ctrl+V or Shift+Insert pastes from the host clipboard. The viewer restores the session's prior selection afterward. Put anything the user should paste through the viewer on the **host** clipboard.
 
-Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
+Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste from PRIMARY can consume it. In XTerm, the default fast paste shortcut is Shift+Insert; Ctrl+V is not bound to paste by default. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
 
 `clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
@@ -162,6 +162,13 @@ as proof of an OOM kill. After upgrading an older server, scope identity and
 limits are recovered from the sandbox PID cgroup; values that cannot be
 recovered remain unknown. Stop the dead handle, start a new desktop without
 `session_id`, and relaunch the applications to continue.
+
+Every handle `session_list` shows is accepted by `session_stop`: a running desktop
+is stopped, and a dead, expired, or blocked-start handle is cleared with its
+lifecycle record. A `session_start` whose host call stays blocked past its budget
+is listed as `start_blocked`; `session_stop` answers `cleanup_pending` until that
+call returns, then clears the handle. A stop of an ID whose record is already
+cleared is a confirmed no-op.
 
 Configure MCP clients to launch the current `kwin-mcp` executable directly.
 The historical `kwin-mcp-shim` has its own session listing and hides these
@@ -514,9 +521,19 @@ before sending or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 
+After an editable field is cleared, AT-SPI may expose one blank newline that the
+application removes when typing starts. If the entire resulting field matches
+the requested text, `atspi_transformed_blank_line` reports `unverified` with
+inspection guidance. It retains the original expected and observed counts;
+preservation of that initial newline is ambiguous. A newline retained by the
+application still follows the normal exact-text verification path.
+
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+The [input delivery regression](tests/input_delivery_e2e.md) covers clearing and
+retyping the same text followed immediately by repeated screenshots.
 
 ### Startup budgets and fresh browser profiles
 
