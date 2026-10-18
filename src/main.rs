@@ -37,6 +37,8 @@ mod fuse_bridge {
     pub const HELPER_SOCKET: &str = "/tmp/.kwin-mcp-fuse.sock";
     /// Where the sandbox sees the real fusermount binaries.
     pub const REAL_BINARY_DIR: &str = "/run/kwin-mcp-fuse";
+    /// Where the sandbox sees the copied kwin-mcp image used to run the helper.
+    pub const BRIDGE_EXECUTABLE: &str = "/run/kwin-mcp-fuse/bridge";
     /// The FUSE helper programs the bridge serves, as named on the host.
     pub const PROGRAMS: [&str; 2] = ["fusermount", "fusermount3"];
     /// Most descriptors one request may carry (stdio plus `_FUSE_*` sockets).
@@ -1765,8 +1767,9 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
 
-// Session overlay layers live on disk under ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp
-// (/tmp is RAM with a per-user quota); session_start needs this much free there.
+// Session overlay layers and the FUSE bridge image live on disk under
+// ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
+// session_start needs this much free there.
 const SESSION_DISK_MIN_FREE: u64 = 2 << 30;
 const DEFAULT_STATS_SECONDS: u64 = 3600;
 
@@ -3609,8 +3612,18 @@ impl OverlayPlan {
         ))
     }
 
-    fn add_bwrap_args(&self, command: &mut std::process::Command, target: &Path) {
+    fn add_bwrap_args(
+        &self,
+        command: &mut std::process::Command,
+        target: &Path,
+        pre_overlay_binds: &[(PathBuf, PathBuf)],
+    ) {
         command.args(["--ro-bind", "/", "/", "--tmpfs", "/run"]);
+        // Some bridge sources live beneath HOME, whose overlays below hide the
+        // host cache tree. Bind them while the original host paths are visible.
+        for (source, destination) in pre_overlay_binds {
+            command.arg("--ro-bind").arg(source).arg(destination);
+        }
         if let Some(staging_root) = &self.staging_root {
             command.arg("--bind").arg(staging_root).arg(target);
         }
@@ -5041,6 +5054,9 @@ struct StartupResources {
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
     service_proxy_children: Vec<std::process::Child>,
+    /// Disk-backed image staged for the FUSE helper, until Session owns the
+    /// whole disk twin or failed startup cleanup removes the image.
+    fuse_bridge_exe: Option<PathBuf>,
 }
 
 impl StartupResources {
@@ -5050,6 +5066,7 @@ impl StartupResources {
             sandbox_child: None,
             sandbox_stdin: None,
             service_proxy_children: Vec::new(),
+            fuse_bridge_exe: None,
         }
     }
 
@@ -5068,6 +5085,14 @@ impl StartupResources {
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
         }
+        if let Some(exe) = self.fuse_bridge_exe.take()
+            && let Err(error) = std::fs::remove_file(&exe)
+        {
+            eprintln!(
+                "startup: could not remove staged FUSE bridge {}: {error}",
+                exe.display()
+            );
+        }
     }
 
     fn into_parts(
@@ -5078,6 +5103,7 @@ impl StartupResources {
         Vec<std::process::Child>,
     ) {
         self.scope_unit.take();
+        self.fuse_bridge_exe.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -9384,7 +9410,40 @@ impl KwinMcp {
             host_name,
             "--unshare-ipc",
         ]);
-        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target);
+        let fuse_exe = if fuse.is_some() {
+            // Keep this large copy on the disk-backed session twin. Putting it
+            // in host_xdg_dir charges it to /tmp's per-user tmpfs quota and can
+            // leave later session operations unable to write there.
+            let exe = session_disk_path(&host_xdg_dir).join("kwin-mcp-exe");
+            let temporary = exe.with_extension("partial");
+            let copied = std::fs::copy("/proc/self/exe", &temporary)
+                .and_then(|_| std::fs::rename(&temporary, &exe));
+            if let Err(error) = copied {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(ver_err(format!(
+                    "copy running binary for the FUSE bridge: {}",
+                    describe_write_failure(&temporary, &error)
+                )));
+            }
+            startup.fuse_bridge_exe = Some(exe.clone());
+            Some(exe)
+        } else {
+            None
+        };
+        let mut pre_overlay_binds = Vec::new();
+        if let (Some(binaries), Some(exe)) = (&fuse, &fuse_exe) {
+            pre_overlay_binds.push((exe.clone(), PathBuf::from(fuse_bridge::BRIDGE_EXECUTABLE)));
+            for (real, program) in binaries {
+                let hidden = PathBuf::from(format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR));
+                pre_overlay_binds.push((real.clone(), hidden));
+            }
+            // Preserve all real helpers before replacing any PATH entry with
+            // the bridge; the host may resolve multiple names to one binary.
+            for (real, _) in binaries {
+                pre_overlay_binds.push((exe.clone(), real.clone()));
+            }
+        }
+        overlay_plan.add_bwrap_args(&mut cmd, &overlay_target, &pre_overlay_binds);
         let kwinrc_str = kwinrc_path.display().to_string();
         let kdeglobals_str = kdeglobals_path.display().to_string();
         let kwinrulesrc_str = kwinrulesrc_path.display().to_string();
@@ -9485,12 +9544,8 @@ impl KwinMcp {
                 // different or missing file ("<path> (deleted)"), bwrap cannot
                 // bind it, and the sandbox died before D-Bus came up.
                 // /proc/self/exe stays readable after deletion; bwrap will not
-                // bind it directly, so it is copied into the session dir.
-                let exe = host_xdg_dir.join("kwin-mcp-exe");
-                std::fs::copy("/proc/self/exe", &exe).map_err(|e| {
-                    ver_err(format!("copy running binary for the FUSE bridge: {e}"))
-                })?;
-                let exe = &exe;
+                // bind it directly, so it is copied into the disk-backed twin
+                // and bound before HOME overlays hide that host path.
                 cmd.args([
                     "--dev-bind",
                     "/dev/fuse",
@@ -9498,11 +9553,6 @@ impl KwinMcp {
                     "--cap-add",
                     "CAP_SYS_ADMIN",
                 ]);
-                for (real, program) in binaries {
-                    let hidden = format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR);
-                    cmd.arg("--ro-bind").arg(real).arg(&hidden);
-                    cmd.arg("--ro-bind").arg(exe).arg(real);
-                }
                 let entrypoint_path = host_xdg_dir.join("entrypoint.sh");
                 std::fs::write(&entrypoint_path, &entrypoint)
                     .map_err(|e| ver_err(format!("write entrypoint: {e}")))?;
@@ -9529,7 +9579,7 @@ impl KwinMcp {
                     .unwrap_or_default();
                 format!(
                     "{prog}{} --fuse-helper {} </dev/null >/dev/null &\nexec unshare --user --map-user={uid} --map-group={gid} setpriv --inh-caps=-all --ambient-caps=-all bash {}",
-                    shell_quote(&exe.display().to_string()),
+                    shell_quote(fuse_bridge::BRIDGE_EXECUTABLE),
                     fuse_bridge::HELPER_SOCKET,
                     shell_quote(&entrypoint_path.display().to_string()),
                 )
@@ -9818,6 +9868,14 @@ impl KwinMcp {
             .iter()
             .map(|overlay| overlay.work.join("work"))
             .collect();
+        // Keep the startup guard responsible for the sandbox and staged FUSE
+        // image until every fallible session resource has been acquired.
+        let uinput_mouse_fd = std::os::fd::AsFd::as_fd(&uinput_mouse)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
+        let uinput_keyboard_fd = std::os::fd::AsFd::as_fd(&uinput_keyboard)
+            .try_clone_to_owned()
+            .map_err(KwinError::from)?;
         let mut guard = self.session.write().await;
         let (sandbox_child, sandbox_stdin, service_proxy_children) = startup.into_parts();
         *guard = Some(Session {
@@ -9832,12 +9890,8 @@ impl KwinMcp {
             sandbox_child: sandbox_child.into(),
             sandbox_stdin: sandbox_stdin.into(),
             host_xdg_dir,
-            _uinput_mouse: std::os::fd::AsFd::as_fd(&uinput_mouse)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
-            _uinput_keyboard: std::os::fd::AsFd::as_fd(&uinput_keyboard)
-                .try_clone_to_owned()
-                .map_err(KwinError::from)?,
+            _uinput_mouse: uinput_mouse_fd,
+            _uinput_keyboard: uinput_keyboard_fd,
             cdp_browser: None,
             cdp_forward_port,
             service_proxy_children: service_proxy_children
