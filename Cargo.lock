@@ -2978,7 +2978,6 @@ dependencies = [
 [[package]]
 name = "screen-13-window"
 version = "0.1.0"
-source = "git+https://github.com/attackgoat/screen-13?rev=d9f961c#d9f961ce9c4f9633b4f750f42ae3582c0fd9c6cc"
 dependencies = [
  "log",
  "profiling",

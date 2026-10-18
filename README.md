@@ -32,7 +32,7 @@ To resize a maximized window with KWin's native controls, restore it with the se
 
 A successful `org.kde.kwin.Script.run` response does not verify the resulting window geometry. Check `window_list` or screenshot metadata before reporting a resize as successful.
 
-`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete; the viewer may remain open so the user can watch, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after a frame is presented, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). The old `--no-viewer` argument remains accepted for existing server commands.
+`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete. Viewer input is forwarded immediately. If it arrives during an agent mouse or keyboard operation, the remaining agent operation is cancelled and reports `retry_safe: false` because partial input may already have arrived; inspect the target before retrying. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer may remain open while agent input resumes, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after the host renderer successfully submits the first PipeWire frame for presentation, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). This reports renderer submission, not compositor acknowledgement. The old `--no-viewer` argument remains accepted for existing server commands.
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
@@ -115,7 +115,7 @@ startup. Other files and directory overlays keep their existing write behavior.
 `session_start` reports these fallback files in `oversized_read_only_files`.
 To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
-Explicit copies still share the 20-second startup deadline; this option does not
+Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
 ### Session memory limits
@@ -183,7 +183,26 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
+
+`TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
+at most 107 bytes, excluding the terminating NUL, for the entire socket path.
+The session's D-Bus sockets have a stricter 99-byte limit imposed by
+[libdbus](https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html).
+`session_start` checks both constraints before creating its workdir or starting
+processes. If a path is too long, the error names it, reports its byte length,
+and asks for a shorter `TMPDIR`; set that variable before launching the server.
+The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
+filename, and counts UTF-8 bytes rather than characters.
+
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
 
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these
@@ -202,6 +221,12 @@ overlays, host sockets and processes, or browser profiles.
 
 ### Two-phase D-Bus startup
 
+The private KWallet bus records `dbus-daemon` diagnostics in the session
+workdir's `kwallet-bus.stderr`. If the daemon exits before readiness or its
+socket does not appear within three seconds, `session_start` includes a bounded
+stderr excerpt in the error before cleanup. `--autoclean` removes the log with
+the failed session's workdir.
+
 1. bwrap starts, dbus-daemon creates session bus
 2. Host `proxy_conn` claims `org.kde.KWin`, registers InputDevice objects
 3. Container starts KWin (gets unique name `:1.N`, not the well-known name)
@@ -213,6 +238,20 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 ### HID isolation
 
 Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
+
+Startup device errors identify the mouse or keyboard, the failed operation,
+the `/dev/uinput` or sysfs path, and the original OS error. They also report
+the failing server's numeric `Uid`, `Gid`, and supplementary `Groups` from
+`/proc/self/status`, plus its user and mount namespace IDs. Compare these
+with the launching shell when investigating access from an enclosing
+namespace: a writable `/dev/uinput` check alone does not verify device
+configuration, creation, or evdev discovery.
+
+Run `ruby tests/uinput_startup_e2e.rb /path/to/kwin-mcp /path/to/evidence`
+on a KDE host with `/dev/uinput`, an existing user runtime and bus, and
+passwordless sudo to verify startup diagnostics through the stdio server.
+The regression mounts failure fixtures in private mount namespaces and
+restores the caller's credentials before launching the server.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
@@ -361,6 +400,14 @@ settling information. With `inline: true`, the response also includes the PNG
 image and the same metadata as JSON text. If saving the file fails, an inline
 capture still returns the image, with `path: null` and `write_error` in its metadata.
 
+Inline PNGs request original-detail presentation on supporting Codex clients
+through the image block's `_meta["codex/imageDetail"]`. The hint does not change
+the image bytes, capture dimensions, or click coordinates. Other clients may
+ignore it. If a preview appears blank or loses small text, inspect the saved PNG
+at original detail or request a narrow `region` crop before diagnosing a
+compositor failure. An inline image and its saved PNG can contain identical,
+correct pixels even when a client presents them differently (see #435).
+
 Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
@@ -395,3 +442,30 @@ receipt.
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+### Startup budgets and fresh browser profiles
+
+`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).
+The budget includes waiting for the lifecycle gate and preparing host profiles;
+it does not disable bounded startup or cleanup. Increase it explicitly when a
+large profile set needs more preparation time.
+
+For a terminal-only task or a browser that should start without inherited
+Chromium profiles, use `browser_profiles: "fresh"`. The recognized Chromium
+configuration directories start empty in that session, profile/cookie copying
+is skipped, and cookies from those fresh profiles are not persisted between
+sessions. Host files are unchanged. The default `"inherit"` preserves the
+existing profile and cookie-continuity behavior. The response reports both the
+profile mode and startup budget. This option does not bypass general HOME
+mount/process discovery or unblock unrelated hung filesystems.
+
+Browser preparation timeouts identify the current operation and pathname,
+without printing file contents. Preparation checks its deadline between
+operations. If an operation is blocked in the kernel, cleanup retains ownership
+until that operation returns; it then stops preparation and removes the owned
+storage. Do not remove that storage manually while the operation still uses it.
+
+Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
+regression. It uses synthetic private profiles, a controlled blocked Preferences
+read, terminal launch, and a delayed real sandbox to verify profile isolation,
+operation diagnostics, deferred cleanup, and configurable timeout bounds.
