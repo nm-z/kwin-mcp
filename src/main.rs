@@ -1785,6 +1785,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_START_MAX_SECONDS: u64 = 300;
 
 // Session overlay layers and the FUSE bridge image live on disk under
 // ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
@@ -3860,8 +3861,13 @@ fn bind_live_sqlite(
     plan: &mut OverlayPlan,
     target: &Path,
     databases: &[PathBuf],
+    service: &KwinMcp,
+    browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<()> {
-    let discarded = discarded_session_databases(target);
+    let discarded = match browser_profiles {
+        BrowserProfiles::Inherit => discarded_session_databases(target, service)?,
+        BrowserProfiles::Fresh => Vec::new(),
+    };
     for database in databases.iter().filter(|database| {
         !discarded.contains(database) && !browser_cookie_database(target, database)
     }) {
@@ -3978,6 +3984,7 @@ fn prepare_browser_cookies(
     plan: &mut OverlayPlan,
     target: &Path,
     baseline_root: &Path,
+    service: &KwinMcp,
 ) -> anyhow::Result<(Vec<kwin_mcp::browser_cookies::CookieRoot>, Vec<String>)> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(baseline_root)?;
@@ -3994,6 +4001,7 @@ fn prepare_browser_cookies(
         let baseline = baseline_root.join(config);
         let mut profiles = std::collections::BTreeSet::new();
         for directory in [&host, &saved] {
+            service.profile_operation("list cookie profiles", directory)?;
             if let Ok(entries) = std::fs::read_dir(directory) {
                 for entry in entries
                     .flatten()
@@ -4007,13 +4015,16 @@ fn prepare_browser_cookies(
             for name in ["Cookies", "Network/Cookies"] {
                 let database = host.join(&profile).join(name);
                 let previous = saved.join(&profile).join(name);
+                service.profile_operation("inspect cookie database", &database)?;
                 if !database.is_file() && !previous.is_file() {
                     continue;
                 }
                 let upper = upper_file(plan, &database)?;
                 let mut merge_failed = false;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                    service.profile_operation("snapshot host cookies", &database)?;
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
+                        service.profile_operation("merge saved cookies", &previous)?;
                         if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
                             merge_failed = true;
                             let message = format!("{}: {error:#}", database.display());
@@ -4023,8 +4034,10 @@ fn prepare_browser_cookies(
                             );
                             cookie_errors.push(message);
                         }
+                        Ok(())
                     })
                 } else {
+                    service.profile_operation("snapshot saved cookies", &previous)?;
                     kwin_mcp::browser_cookies::snapshot(&previous, &upper)
                 };
                 if let Err(error) = result {
@@ -4038,6 +4051,7 @@ fn prepare_browser_cookies(
                         );
                         eprintln!("session_start: {message}");
                         cookie_errors.push(message);
+                        service.profile_operation("snapshot saved cookies", &previous)?;
                         kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
                     } else {
                         return Err(
@@ -4045,6 +4059,7 @@ fn prepare_browser_cookies(
                         );
                     }
                 }
+                service.profile_operation("inspect private cookie schema", &upper)?;
                 if !kwin_mcp::browser_cookies::supports_cookie_jar(&upper)? {
                     eprintln!(
                         "session_start: skipping non-cookie SQLite database {}",
@@ -4053,6 +4068,7 @@ fn prepare_browser_cookies(
                     continue;
                 }
                 if !merge_failed {
+                    service.profile_operation("apply cookie deletions", &previous)?;
                     kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
                 }
                 let original = baseline.join(&profile).join(name);
@@ -4061,6 +4077,7 @@ fn prepare_browser_cookies(
                         .parent()
                         .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
                 )?;
+                service.profile_operation("snapshot cookie baseline", &original)?;
                 kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
             }
         }
@@ -4083,9 +4100,10 @@ fn prepare_browser_cookies(
     Ok((roots, cookie_errors))
 }
 
-fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
+fn discarded_session_databases(target: &Path, service: &KwinMcp) -> anyhow::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4095,17 +4113,23 @@ fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
         {
             for name in EMPTY_BROWSER_DATABASES {
                 let path = profile.path().join(name);
+                service.profile_operation("inspect disposable database", &path)?;
                 if path.is_file() {
                     paths.push(path);
                 }
             }
         }
     }
-    paths
+    Ok(paths)
 }
 
-fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow::Result<()> {
+fn empty_session_databases(
+    plan: &OverlayPlan,
+    databases: &[PathBuf],
+    service: &KwinMcp,
+) -> anyhow::Result<()> {
     for database in databases {
+        service.profile_operation("empty private database", database)?;
         if !database.parent().is_some_and(Path::is_dir) {
             continue;
         }
@@ -4132,8 +4156,13 @@ fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow:
 /// setting itself is left alone, because switching Chrome off "continue where
 /// you left off" makes it delete session-only cookies at startup and would
 /// drop logins that live in them.
-fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
+fn hide_browser_sessions(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    service: &KwinMcp,
+) -> anyhow::Result<()> {
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4142,17 +4171,24 @@ fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         {
             let sessions = profile.path().join("Sessions");
+            service.profile_operation("inspect saved tabs", &sessions)?;
             if sessions.is_dir() {
                 plan.empty_dirs.push(sessions);
             }
         }
     }
+    Ok(())
 }
 
-fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
+fn mark_browser_exits_clean(
+    plan: &OverlayPlan,
+    target: &Path,
+    service: &KwinMcp,
+) -> anyhow::Result<usize> {
     use std::os::unix::fs::PermissionsExt;
     let mut marked = 0;
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4161,6 +4197,7 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         {
             let preferences = profile.path().join("Preferences");
+            service.profile_operation("read Preferences", &preferences)?;
             let result = (|| -> anyhow::Result<bool> {
                 let text = match std::fs::read(&preferences) {
                     Ok(text) => text,
@@ -4210,7 +4247,7 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
             }
         }
     }
-    marked
+    Ok(marked)
 }
 
 /// Host state session_start reads before it spawns the sandbox.
@@ -4228,6 +4265,7 @@ fn prepare_host_view(
     host_xdg_dir: &Path,
     host_runtime: &Path,
     service: &KwinMcp,
+    browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<HostView> {
     service.set_start_stage("scanning host mounts");
     test_block_host_scan();
@@ -4284,28 +4322,47 @@ fn prepare_host_view(
         .expose_sockets(target, host_runtime, host_xdg_dir, &inventory)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
     service.set_start_stage("mounting live SQLite databases read-only");
-    bind_live_sqlite(&mut overlay_plan, target, &inventory.live_databases)?;
+    if matches!(browser_profiles, BrowserProfiles::Fresh) {
+        // Mask the profile roots before alias mounts are constructed, too.
+        overlay_plan
+            .empty_dirs
+            .extend(BROWSER_CONFIG_DIRS.iter().map(|config| target.join(config)));
+    }
+    bind_live_sqlite(
+        &mut overlay_plan,
+        target,
+        &inventory.live_databases,
+        service,
+        browser_profiles,
+    )?;
 
     eprintln!(
         "session_start: overlay plan=live-home overlays={} read-only-mounts={}",
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
-    service.set_start_stage("preparing browser profiles");
-    let discarded = discarded_session_databases(target);
-    empty_session_databases(&overlay_plan, &discarded)?;
-    let (cookie_roots, cookie_errors) =
-        prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
+    let (cookie_roots, cookie_errors) = match browser_profiles {
+        BrowserProfiles::Inherit => {
+            let discarded = discarded_session_databases(target, service)?;
+            empty_session_databases(&overlay_plan, &discarded, service)?;
+            let cookies = prepare_browser_cookies(
+                &mut overlay_plan,
+                target,
+                &disk.join("cookie-baselines"),
+                service,
+            )?;
+            let marked = mark_browser_exits_clean(&overlay_plan, target, service)?;
+            hide_browser_sessions(&mut overlay_plan, target, service)?;
+            eprintln!("session_start: marked {marked} browser profile(s) clean");
+            cookies
+        }
+        BrowserProfiles::Fresh => (Vec::new(), Vec::new()),
+    };
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
     }
-    let marked = mark_browser_exits_clean(&overlay_plan, target);
-    hide_browser_sessions(&mut overlay_plan, target);
-    eprintln!(
-        "session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty",
-        overlay_plan.empty_dirs.len()
-    );
+    service.set_start_stage("reading desktop settings");
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView {
         overlay_plan,
@@ -4906,7 +4963,6 @@ struct KwinMcp {
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
     input_order: Arc<InputOrder>,
-    tool_calls: Arc<std::sync::Mutex<usize>>,
     session: Arc<tokio::sync::RwLock<Option<Session>>>,
     /// Cleanup ownership of the session workdir under --autoclean. Claimed
     /// before session_start creates the directory and released only once the
@@ -4919,7 +4975,8 @@ struct KwinMcp {
     /// directory that nothing is left to delete.
     start_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last startup checkpoint reached, named in the hard-limit error.
-    start_stage: Arc<std::sync::Mutex<&'static str>>,
+    start_stage: Arc<std::sync::Mutex<String>>,
+    startup_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     display: DisplayConfig,
 }
 
@@ -4969,6 +5026,63 @@ impl KwinMcp {
         Some(diagnostic)
     }
 
+    async fn refresh_viewer_child(&self) -> Result<(), String> {
+        let mut guard = self.session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
+            Some(Ok(None)) | None => Ok(()),
+            Some(Ok(Some(_))) => {
+                session.viewer_child.take();
+                Ok(())
+            }
+            Some(Err(error)) => {
+                let reason = format!(
+                    "check viewer process {}: {error}",
+                    session.viewer_child.as_ref().map_or(0, SessionProcess::id)
+                );
+                eprintln!("viewer liveness: {reason}");
+                Err(reason)
+            }
+        }
+    }
+
+    async fn viewer_input_is_recent(&self) -> Result<bool, String> {
+        // Do not queue another session read lock while an input operation
+        // holds one: a waiting liveness writer would block the activity check
+        // that must cancel that operation. The owned workdir path is stable.
+        let activity_path = self.path.join(VIEWER_INPUT_ACTIVITY_FILE);
+        let modified = match std::fs::metadata(&activity_path) {
+            Ok(metadata) => metadata.modified().map_err(|error| {
+                format!(
+                    "read {} modification time: {error}",
+                    activity_path.display()
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "read {} metadata: {error}",
+                    activity_path.display()
+                ));
+            }
+        };
+        let age = match std::time::SystemTime::now().duration_since(modified) {
+            Ok(age) => age,
+            Err(error) => error.duration(),
+        };
+        Ok(age <= VIEWER_INPUT_QUIET_PERIOD)
+    }
+
+    async fn viewer_is_active_with_recent_input(&self) -> Result<bool, String> {
+        // The child exists only for a viewer on this host. A remote viewer's
+        // `--serve` relay writes the same activity file without a local child.
+        // Always reap/check a local child when present, then use the file for
+        // both local and remote input activity.
+        self.refresh_viewer_child().await?;
+        self.viewer_input_is_recent().await
+    }
     fn new(display: DisplayConfig) -> Self {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
@@ -4979,24 +5093,46 @@ impl KwinMcp {
             path: session_workdir_path(),
             input_gate: Arc::new(tokio::sync::Mutex::new(())),
             input_order: Arc::new(InputOrder::default()),
-            tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
-            start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
+            start_stage: Arc::new(std::sync::Mutex::new(
+                "waiting for the lifecycle gate".to_owned(),
+            )),
+            startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             display,
         }
     }
-    fn set_start_stage(&self, stage: &'static str) {
+    fn set_start_stage(&self, stage: impl Into<String>) {
+        let stage = stage.into();
         eprintln!("session_start: stage: {stage}");
         if let Ok(mut current) = self.start_stage.lock() {
             *current = stage;
         }
     }
-    fn start_stage(&self) -> &'static str {
+    fn start_stage(&self) -> String {
         self.start_stage
             .lock()
-            .map(|stage| *stage)
-            .unwrap_or("unknown")
+            .map(|stage| stage.clone())
+            .unwrap_or_else(|_| "unknown".to_owned())
+    }
+    fn profile_operation(&self, operation: &str, path: &Path) -> anyhow::Result<()> {
+        if self
+            .startup_deadline
+            .lock()
+            .ok()
+            .and_then(|deadline| *deadline)
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            anyhow::bail!(
+                "startup deadline elapsed before {operation} {}",
+                path.display()
+            );
+        }
+        self.set_start_stage(format!(
+            "preparing browser profiles: {operation} {}",
+            path.display()
+        ));
+        Ok(())
     }
     /// Wait for the lifecycle gate, bounded so a start, stop, or reaper stuck
     /// behind a blocked host call answers with an error instead of hanging.
@@ -6775,59 +6911,14 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
-/// FIFO in the session workdir that the viewer reads tool-call starts ("B")
-/// and ends ("E") from, so it holds the user's input while a call runs (see
-/// src/bin/kwin-viewer.rs ToolGate).
-const TOOL_CALLS_FIFO: &str = "tool-calls";
-
-/// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
-/// Non-blocking and best effort: with no viewer reading the FIFO the open
-/// fails with ENXIO and nothing is sent, so tool calls never wait on it.
-fn signal_tool_call(dir: &Path, mark: u8) {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join(TOOL_CALLS_FIFO);
-    if let Ok(mut fifo) = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-    {
-        let _ = std::io::Write::write_all(&mut fifo, &[mark]);
-    }
-}
-
-/// Marks one tool call in flight for the viewer; the end is sent on drop, so
-/// it goes out whether the call returns, errors or is cancelled.
-struct ToolCallMark(PathBuf, Arc<std::sync::Mutex<usize>>);
-
-impl ToolCallMark {
-    fn begin(dir: &Path, calls: &Arc<std::sync::Mutex<usize>>) -> Self {
-        let mut active = calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *active == 0 {
-            signal_tool_call(dir, b'B');
-        }
-        *active += 1;
-        Self(dir.to_owned(), calls.clone())
-    }
-}
-
-impl Drop for ToolCallMark {
-    fn drop(&mut self) {
-        let mut active = self
-            .1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active -= 1;
-        if *active == 0 {
-            signal_tool_call(&self.0, b'E');
-        }
-    }
-}
+const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
+const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const VIEWER_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
+const VIEWER_STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work, and the error is
@@ -6935,7 +7026,33 @@ fn viewer_report(
         };
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
-    match field("state").as_str() {
+    let phase = field("state");
+    if let Some(status_pid) = status.as_ref().and_then(|value| value["pid"].as_u64())
+        && status_pid != u64::from(child.id())
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer status belongs to another process",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    if phase == "ready"
+        && (status.as_ref().and_then(|value| value["pid"].as_u64()) != Some(u64::from(child.id()))
+            || !std::fs::metadata(host_xdg_dir.join(VIEWER_STATUS_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age <= VIEWER_STATUS_STALE_AFTER))
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer window status is stale",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    match phase.as_str() {
         "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
         "failed" | "closed" => {
             serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
@@ -8054,9 +8171,24 @@ struct FindUiElementsParams {
     query: String,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BrowserProfiles {
+    #[default]
+    Inherit,
+    Fresh,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SessionStartParams {
+    /// Startup wall-clock limit in seconds (1..300). Default 20; includes host preparation.
+    startup_timeout_seconds: Option<u64>,
+    /// inherit (default) prepares saved Chromium profiles and cookies. fresh
+    /// starts those browser config directories empty, skipping profile copying
+    /// and cookie persistence; useful for terminal-only work.
+    #[serde(default)]
+    browser_profiles: BrowserProfiles,
     /// Session RAM throttle in GiB. Zero disables throttling; omit for the server default.
     memory_high: Option<u64>,
     /// Session RAM hard limit in GiB. Must be positive; omit for the server default.
@@ -8112,21 +8244,35 @@ const SESSION_MEDIA_BOOTSTRAP: &str = r#"start_session_media() {
     (
         flock -x 9
         if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+            media_error="$XDG_RUNTIME_DIR/media-start.error"
+            : > "$media_error"
             pipewire 9>&- &
+            media_pid=$!
             n=0
             while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ "$n" -lt 50 ]; do
+                if ! kill -0 "$media_pid"; then
+                    wait "$media_pid"
+                    media_status=$?
+                    echo "pipewire exited before its socket was ready (status $media_status)" > "$media_error"
+                    return 1
+                fi
                 sleep 0.1
                 n=$((n+1))
             done
             if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
                 wireplumber 9>&- &
+            else
+                echo "pipewire socket startup timed out" > "$media_error"
+                kill "$media_pid"
+                return 1
             fi
         fi
     ) 9>"$XDG_RUNTIME_DIR/media.lock"
 }
 "#;
 
-const SESSION_MEDIA_READY_WAIT: Duration = Duration::from_secs(5);
+const SESSION_MEDIA_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_MEDIA_READY_WAIT: Duration = Duration::from_secs(6);
 
 async fn ensure_session_media(
     descriptor: std::os::fd::OwnedFd,
@@ -8139,12 +8285,21 @@ async fn ensure_session_media(
         pipe.write_all(b"start_session_media\n")
             .await
             .map_err(|error| format!("start session media: {error}"))?;
-        wait_for_socket(
+        match wait_for_socket(
             &runtime.join("pipewire-0"),
             "session PipeWire socket",
-            std::time::Instant::now() + SESSION_MEDIA_READY_WAIT,
+            std::time::Instant::now() + SESSION_MEDIA_START_TIMEOUT,
         )
         .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => match std::fs::read_to_string(runtime.join("media-start.error")) {
+                Ok(message) if !message.trim().is_empty() => {
+                    Err(format!("{error}; {}", message.trim()))
+                }
+                _ => Err(error),
+            },
+        }
     })
     .await
     .map_err(|_| "private media startup timed out".to_owned())?
@@ -8538,7 +8693,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -8549,7 +8704,17 @@ impl KwinMcp {
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
         let mut attempt = SessionStartAttempt::new();
-        let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        let startup_timeout = params
+            .startup_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(SESSION_START_HARD_TIMEOUT);
+        if !(1..=SESSION_START_MAX_SECONDS).contains(&startup_timeout.as_secs()) {
+            return Err(McpError::invalid_params(
+                "startup_timeout_seconds must be from 1 to 300",
+                None,
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + startup_timeout;
         let gate = match self.lifecycle_gate(deadline, "session_start").await {
             Ok(gate) => gate,
             Err(error) => {
@@ -8558,6 +8723,11 @@ impl KwinMcp {
             }
         };
         self.set_start_stage("preparing the session workdir");
+        *self
+            .startup_deadline
+            .lock()
+            .map_err(|_| McpError::internal_error("startup deadline lock poisoned", None))? =
+            Some(deadline.into_std());
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
         let outcome = match tokio::time::timeout_at(
             deadline,
@@ -8570,7 +8740,7 @@ impl KwinMcp {
                 let stage = self.start_stage();
                 let message = format!(
                     "session_start exceeded {}s hard limit while {stage}",
-                    SESSION_START_HARD_TIMEOUT.as_secs()
+                    startup_timeout.as_secs()
                 );
                 eprintln!("session_start: {message}");
                 let blocked = host_work
@@ -8602,7 +8772,7 @@ impl KwinMcp {
                             "{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."
                         ),
                         Some(
-                            serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true}),
+                            serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": true}),
                         ),
                     );
                     attempt.finish(Some(&error.message));
@@ -8611,7 +8781,7 @@ impl KwinMcp {
                 Err(McpError::internal_error(
                     message,
                     Some(
-                        serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": false}),
+                        serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": false}),
                     ),
                 ))
             }
@@ -8632,6 +8802,7 @@ impl KwinMcp {
         host_work: HostWork,
     ) -> Result<CallToolResult, McpError> {
         let memory = params.memory_config(self.display)?;
+        let browser_profiles = params.browser_profiles;
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
             env!("CARGO_PKG_VERSION"),
@@ -8796,6 +8967,7 @@ impl KwinMcp {
                 &view_xdg,
                 &view_runtime,
                 &view_service,
+                browser_profiles,
             ));
         });
         if let Ok(mut slot) = host_work.lock() {
@@ -8922,7 +9094,7 @@ impl KwinMcp {
                 eval \"$cmd\" &\n\
             done\n",
             media_start = if params.audio.unwrap_or(false) {
-                "start_session_media"
+                "start_session_media || exit 1"
             } else {
                 ""
             },
@@ -9676,6 +9848,8 @@ impl KwinMcp {
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
+            "browser_profiles": browser_profiles,
+            "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_HARD_TIMEOUT.as_secs()),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
@@ -9804,7 +9978,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. If it interrupts an in-flight agent operation, remaining agent events are cancelled with retry_safe=false because some input may have arrived; inspect before retrying. New agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -9818,6 +9992,7 @@ impl KwinMcp {
                 "viewer_open",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let reason = params
             .reason
             .as_deref()
@@ -9830,7 +10005,7 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
-        let (host_xdg_dir, width, height, existing) = {
+        let (host_xdg_dir, width, height, existing, stale) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -9843,30 +10018,47 @@ impl KwinMcp {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
                 None => false,
             };
-            if running {
-                let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
-                if viewer["state"] == "ready" {
-                    let message = format!("viewer already open: {}", viewer_summary(&viewer));
-                    drop(guard);
-                    return Ok(structured_result(
+            let viewer = if running {
+                sess.viewer_child
+                    .as_mut()
+                    .map(|child| viewer_report(&sess.host_xdg_dir, Some(child), None))
+            } else {
+                None
+            };
+            if let Some(viewer) = viewer.as_ref()
+                && viewer["state"] == "ready"
+            {
+                let message = format!("viewer already open: {}", viewer_summary(viewer));
+                drop(guard);
+                return Ok(structured_result(
                     &peer,
                     message,
                     serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
-                }
             }
+            let reuse = viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer["state"] == "starting");
+            let (existing, stale) = if running {
+                let child = sess.viewer_child.take();
+                if reuse { (child, None) } else { (None, child) }
+            } else {
+                (None, None)
+            };
             (
                 sess.host_xdg_dir.clone(),
                 sess.screen_width,
                 sess.screen_height,
-                if running {
-                    sess.viewer_child.take()
-                } else {
-                    None
-                },
+                existing,
+                stale,
             )
         };
+        if let Some(stale) = stale {
+            tokio::task::spawn_blocking(move || terminate_child(stale, false, "stale viewer"))
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+        }
         let media = if existing.is_none() {
             let (descriptor, runtime) = {
                 let guard = self.session.read().await;
@@ -10002,6 +10194,7 @@ impl KwinMcp {
                 "viewer_close",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let mut guard = self.session.write().await;
         let sess = guard.as_mut().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -10455,6 +10648,15 @@ impl KwinMcp {
             // parsing that block as JSON.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let mut image = Content::image(b64, "image/png");
+            if let rmcp::model::RawContent::Image(raw) = &mut image.raw {
+                let mut meta = rmcp::model::Meta::new();
+                meta.0.insert(
+                    "codex/imageDetail".to_owned(),
+                    serde_json::json!("original"),
+                );
+                raw.meta = Some(meta);
+            }
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
             let _ = peer
                 .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
@@ -10465,7 +10667,7 @@ impl KwinMcp {
             Ok(CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
-                Content::image(b64, "image/png"),
+                image,
             ]))
         } else {
             Ok(structured_result(&peer, text, payload).await)
@@ -11533,7 +11735,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -12298,17 +12500,6 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
             .unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
-    // Every tool call is bracketed for the viewer's input gate.
-    for route in tool_router.map.values_mut() {
-        let inner = std::sync::Arc::clone(&route.call);
-        route.call = std::sync::Arc::new(move |context| {
-            let inner = std::sync::Arc::clone(&inner);
-            Box::pin(async move {
-                let _mark = ToolCallMark::begin(&context.service.path, &context.service.tool_calls);
-                inner(context).await
-            })
-        });
-    }
     tool_router
 }
 
@@ -12807,28 +12998,89 @@ impl rmcp::ServerHandler for SessionRouter {
                 Some(death),
             ));
         }
-        let input = ordered_tool(&request.name);
+        let agent_input = input_tool(&request.name);
         // Queued input waits outside the global limit so it cannot starve reads.
         let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
         if let Some(turn) = &turn {
             turn.wait().await;
         }
-        let _input = if input && turn.is_none() {
+        let _input = if ordered_tool(&request.name) {
             Some(session.input_gate.clone().lock_owned().await)
         } else {
             None
         };
+        if agent_input {
+            let recent_viewer_input =
+                session
+                    .viewer_is_active_with_recent_input()
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!("Could not check live viewer input activity: {error}"),
+                            Some(serde_json::json!({
+                                "reason":"viewer_activity_check_failed",
+                                "retry_safe":true
+                            })),
+                        )
+                    })?;
+            if recent_viewer_input {
+                return Err(McpError::internal_error(
+                    "Agent input is paused for one second after viewer input to avoid interfering with the user's recent interaction. Retry when the viewer has been idle for one second; the viewer can stay open.",
+                    Some(serde_json::json!({
+                        "reason":"recent_viewer_input",
+                        "retry_safe":true,
+                        "quiet_period_ms":VIEWER_INPUT_QUIET_PERIOD.as_millis()
+                    })),
+                ));
+            }
+        }
         let execution = session.clone();
         let operation = request.name.to_string();
-        let result = self
-            .limit
-            .layer(execution)
-            .oneshot(SessionCall {
+        let result = {
+            let call = self.limit.layer(execution).oneshot(SessionCall {
                 request,
                 context,
                 routes: self.routes.clone(),
-            })
-            .await;
+            });
+            if agent_input {
+                // Human input can begin after admission, during a paced type
+                // or drag. Cancel the remaining agent events as well as
+                // rejecting new calls. Dropping the call releases its held
+                // keys/buttons through SentInput before liveness inspection.
+                let viewer_activity = async {
+                    loop {
+                        tokio::time::sleep(VIEWER_INPUT_CHECK_INTERVAL).await;
+                        match session.viewer_input_is_recent().await {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                break McpError::internal_error(
+                                    "Viewer input interrupted the agent operation. Some input may already have arrived; inspect the target before retrying.",
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                break McpError::internal_error(
+                                    format!(
+                                        "Stopped agent input because viewer activity could not be checked: {error}. Some input may already have arrived; inspect before retrying."
+                                    ),
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_activity_check_failed", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = call => result,
+                    error = viewer_activity => Err(error),
+                }
+            } else {
+                call.await
+            }
+        };
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {

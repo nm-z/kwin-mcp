@@ -32,7 +32,7 @@ To resize a maximized window with KWin's native controls, restore it with the se
 
 A successful `org.kde.kwin.Script.run` response does not verify the resulting window geometry. Check `window_list` or screenshot metadata before reporting a resize as successful.
 
-`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete; the viewer may remain open so the user can watch, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after the host renderer successfully submits the first PipeWire frame for presentation, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). This reports renderer submission, not compositor acknowledgement. The old `--no-viewer` argument remains accepted for existing server commands.
+`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete. Viewer input is forwarded immediately. If it arrives during an agent mouse or keyboard operation, the remaining agent operation is cancelled and reports `retry_safe: false` because partial input may already have arrived; inspect the target before retrying. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer may remain open while agent input resumes, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after the host renderer successfully submits the first PipeWire frame for presentation, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). This reports renderer submission, not compositor acknowledgement. The old `--no-viewer` argument remains accepted for existing server commands.
 
 Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
@@ -383,6 +383,15 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
+Inline PNGs request original-detail presentation on supporting Codex clients
+through the image block's `_meta["codex/imageDetail"]`. The hint does not change
+the image bytes, capture dimensions, or click coordinates. Other clients may
+ignore it. If a preview appears blank or loses small text, inspect the saved PNG
+at original detail or request a narrow `region` crop before diagnosing a
+compositor failure. An inline image and its saved PNG can contain identical,
+correct pixels even when a client presents them differently (see #435).
+
+
 Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
@@ -417,3 +426,30 @@ receipt.
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+### Startup budgets and fresh browser profiles
+
+`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).
+The budget includes waiting for the lifecycle gate and preparing host profiles;
+it does not disable bounded startup or cleanup. Increase it explicitly when a
+large profile set needs more preparation time.
+
+For a terminal-only task or a browser that should start without inherited
+Chromium profiles, use `browser_profiles: "fresh"`. The recognized Chromium
+configuration directories start empty in that session, profile/cookie copying
+is skipped, and cookies from those fresh profiles are not persisted between
+sessions. Host files are unchanged. The default `"inherit"` preserves the
+existing profile and cookie-continuity behavior. The response reports both the
+profile mode and startup budget. This option does not bypass general HOME
+mount/process discovery or unblock unrelated hung filesystems.
+
+Browser preparation timeouts identify the current operation and pathname,
+without printing file contents. Preparation checks its deadline between
+operations. If an operation is blocked in the kernel, cleanup retains ownership
+until that operation returns; it then stops preparation and removes the owned
+storage. Do not remove that storage manually while the operation still uses it.
+
+Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
+regression. It uses synthetic private profiles, a controlled blocked Preferences
+read, terminal launch, and a delayed real sandbox to verify profile isolation,
+operation diagnostics, deferred cleanup, and configurable timeout bounds.
