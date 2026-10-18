@@ -9624,8 +9624,8 @@ impl KwinMcp {
         // pasta gives the session its own loopback. Into the host it forwards
         // only the session's CDP port. Host listeners are reachable from the
         // session via --tcp-ns, but pasta's default `auto` ranges omit the host's
-        // ephemeral port range. Include that range with auto-scan enabled so
-        // active listeners there are forwarded while unbound ports remain
+        // ephemeral port range. Scan every usable port with auto enabled so
+        // active listeners are forwarded while unbound ports remain
         // private. The CDP port is excluded so the session's browser can bind it.
         let scope_unit = format!(
             "{}.scope",
@@ -9639,10 +9639,10 @@ impl KwinMcp {
                 Err(error) => return cleanup_err(error, &mut startup),
             };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
-        let (ephemeral_port_start, ephemeral_port_end) = host_ephemeral_port_range()
-            .map_err(|error| ver_err(format!("read host ephemeral port range: {error:#}")))?;
-        let host_ports_spec =
-            format!("auto,{ephemeral_port_start}-{ephemeral_port_end},~{cdp_forward_port}");
+        // With auto, an explicit range defines the complete scan set, not
+        // an addition to the default non-ephemeral range. Include all usable
+        // ports while still forwarding only bound host listeners.
+        let host_ports_spec = format!("auto,1-{},~{cdp_forward_port}", u16::MAX);
         let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
             eprintln!(
                 "session_start: host IPv4 lookup failed ({error:#}); pasta picks the address itself"
@@ -12645,26 +12645,6 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
         "non-contiguous IPv4 netmask {mask} on {interface}"
     );
     Ok(Some((address, prefix)))
-}
-
-/// Linux's automatic local port range, used to include active ephemeral
-/// listeners in pasta's otherwise non-ephemeral `auto` forwarding rules.
-fn host_ephemeral_port_range() -> anyhow::Result<(u16, u16)> {
-    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")?;
-    let mut ports = range.split_whitespace();
-    let start = ports
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("ephemeral port range is empty"))?
-        .parse::<u16>()?;
-    let end = ports
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("ephemeral port range has no end"))?
-        .parse::<u16>()?;
-    anyhow::ensure!(
-        ports.next().is_none() && start != 0 && start <= end,
-        "invalid ephemeral port range {range:?}"
-    );
-    Ok((start, end))
 }
 
 /// Descriptor limit (soft:hard) for every process in a session. A scope cannot

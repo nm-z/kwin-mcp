@@ -675,14 +675,38 @@ fn autoclean_sweeps_only_a_crashed_owned_session() {
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, input devices, and a live GPU session"]
 fn session_reaches_host_loopback_listener_on_ephemeral_port() {
+    check_host_loopback_listener(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("host ephemeral listener"),
+    );
+}
+
+#[test]
+#[ignore = "requires private KWin, pasta, Konsole, and input devices"]
+fn session_still_reaches_host_listener_below_the_ephemeral_range() {
+    let range =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").expect("host port range");
+    let start: u16 = range
+        .split_whitespace()
+        .next()
+        .expect("range start")
+        .parse()
+        .expect("port");
+    let listener = (1024..start)
+        .rev()
+        .find_map(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok())
+        .expect("available non-ephemeral host listener");
+    check_host_loopback_listener(listener);
+}
+
+fn check_host_loopback_listener(listener: std::net::TcpListener) {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
         Ok("1"),
         "set KWIN_MCP_E2E=1 to run"
     );
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind host listener");
     let port = listener.local_addr().expect("host listener address").port();
+    eprintln!("host loopback proof port={port}");
     let mut client = RpcClient::start();
     initialize(&mut client);
     let started = call_tool(
