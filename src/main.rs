@@ -312,6 +312,7 @@ mod kwin_script {
     const KWIN_SCRIPT_INTERFACE: &str = "org.kde.kwin.Script";
     const KWIN_CALLBACK_INTERFACE: &str = "org.kde.KWinMCP";
     const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+    const SCRIPT_FINISH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
     pub(crate) const SCRIPT_DIRECTORY: &str = "kwin-scripts";
 
     static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -433,6 +434,7 @@ mod kwin_script {
         }
         .await;
 
+        test_script_cleanup_gate(&cleanup).await;
         let cleanup_result = cleanup.finish().await;
         match result {
             Ok(payload) => {
@@ -440,6 +442,48 @@ mod kwin_script {
                 Ok(payload)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    // Gate one actual cleanup in a debug E2E test so its owned compositor can
+    // be paused after the script result, without mocking a D-Bus reply.
+    async fn test_script_cleanup_gate(cleanup: &ScriptCleanup) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Some(root) = std::env::var_os("KWIN_MCP_TEST_SCRIPT_CLEANUP_GATE").map(PathBuf::from)
+        else {
+            return;
+        };
+        let ready = root.join("ready.json");
+        let release = root.join("release");
+        if ready.exists() || release.exists() {
+            return;
+        }
+        let temporary = root.join("ready.pending");
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "marker": cleanup.marker,
+            "callback_name": cleanup.conn.unique_name().map(ToString::to_string),
+            "callback_path": cleanup.object_path.as_str(),
+            "kwin_name": cleanup.kwin_unique,
+        });
+        if file.write_all(payload.to_string().as_bytes()).is_err() {
+            return;
+        }
+        drop(file);
+        if std::fs::rename(&temporary, &ready).is_err() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !release.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -457,7 +501,10 @@ mod kwin_script {
     }
 
     impl ScriptCleanup {
-        fn start(&mut self) -> Option<tokio::task::JoinHandle<Result<(), KwinError>>> {
+        fn start(
+            &mut self,
+            cleanup_timeout: Duration,
+        ) -> Option<tokio::task::JoinHandle<Result<(), KwinError>>> {
             if self.cleanup_started {
                 return None;
             }
@@ -491,7 +538,7 @@ mod kwin_script {
                     return Ok(());
                 }
                 match tokio::time::timeout(
-                    SCRIPT_CLEANUP_TIMEOUT,
+                    cleanup_timeout,
                     conn.object_server().remove::<KWinCallback, _>(&object_path),
                 )
                 .await
@@ -499,7 +546,7 @@ mod kwin_script {
                     Ok(Ok(_)) | Ok(Err(zbus::Error::InterfaceNotFound)) => Ok(()),
                     Ok(Err(error)) => Err(KwinError::from(error)),
                     Err(_) => Err(KwinError::Msg(format!(
-                        "KWin callback cleanup timed out at {object_path} after {SCRIPT_CLEANUP_TIMEOUT:?}"
+                        "KWin callback cleanup timed out at {object_path} after {cleanup_timeout:?}"
                     ))),
                 }
             };
@@ -508,7 +555,7 @@ mod kwin_script {
                     return Ok(());
                 }
                 let reply = tokio::time::timeout(
-                    SCRIPT_CLEANUP_TIMEOUT,
+                    cleanup_timeout,
                     conn.call_method(
                         Some(kwin_unique.as_str()),
                         KWIN_SCRIPTING_PATH,
@@ -520,7 +567,7 @@ mod kwin_script {
                 .await
                 .map_err(|_| {
                     KwinError::Msg(format!(
-                        "KWin unloadScript cleanup timed out for {marker} after {SCRIPT_CLEANUP_TIMEOUT:?}"
+                        "KWin unloadScript cleanup timed out for {marker} after {cleanup_timeout:?}"
                     ))
                 })??;
                 let (_,): (bool,) = reply.body().deserialize()?;
@@ -539,7 +586,7 @@ mod kwin_script {
         }
 
         async fn finish(&mut self) -> Result<(), KwinError> {
-            match self.start() {
+            match self.start(SCRIPT_FINISH_CLEANUP_TIMEOUT) {
                 Some(task) => task.await.map_err(|error| {
                     KwinError::Msg(format!("KWin script cleanup task failed: {error}"))
                 })?,
@@ -550,7 +597,7 @@ mod kwin_script {
 
     impl Drop for ScriptCleanup {
         fn drop(&mut self) {
-            if let Some(task) = self.start() {
+            if let Some(task) = self.start(SCRIPT_CLEANUP_TIMEOUT) {
                 drop(task);
             }
         }
