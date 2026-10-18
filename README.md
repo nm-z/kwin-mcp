@@ -15,7 +15,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
-| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
+| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). |
 | `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
@@ -24,7 +24,20 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_type` | Type a string of text. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
+| `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+
+When a producer writes an artifact asynchronously, call `wait_for_file` with
+its absolute session path before `export_file`. The file is ready when it is a
+regular file whose inode, size, and modification time remain unchanged for
+`stable_for_ms` (default 500 ms, range 100–5000), within `timeout_seconds`
+(default 30, range 1–300). A timeout distinguishes a missing file from one
+that is still changing. This bounded observation does not prove that the
+producer has exited.
+
+## Large accessibility trees
+
+`accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
 
 ## Resize a maximized session window
 
@@ -32,9 +45,9 @@ To resize a maximized window with KWin's native controls, restore it with the se
 
 A successful `org.kde.kwin.Script.run` response does not verify the resulting window geometry. Check `window_list` or screenshot metadata before reporting a resize as successful.
 
-`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete; the viewer may remain open so the user can watch, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after a frame is presented, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). The old `--no-viewer` argument remains accepted for existing server commands.
+`session_start` leaves the host viewer closed. Work without a viewer unless the user must act on the session (for example, Duo, OTP, CAPTCHA, or approval) or asks to watch. Before asking for information, put the relevant form or empty entry on screen, then call `viewer_open` with a short `reason` explaining what the user should do. Never assume the viewer is already open. You can keep your turn open and poll screenshots for completion instead of requiring a chat confirmation. Continue when the screen shows that the step is complete. Viewer input is forwarded immediately. If it arrives during an agent mouse or keyboard operation, the remaining agent operation is cancelled and reports `retry_safe: false` because partial input may already have arrived; inspect the target before retrying. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer may remain open while agent input resumes, and the user can close it directly. Use `viewer_close` when the user asks. If a Duo push expires, tell the user in one line and leave the page on the resend option so they can retry; continue when the page advances. `session_start` reports the viewer as `closed`; `viewer_open` reports `ready` after the host renderer successfully submits the first PipeWire frame for presentation, or `unavailable` with a reason (for example, no active host Wayland session when serving over SSH). This reports renderer submission, not compositor acknowledgement. The old `--no-viewer` argument remains accepted for existing server commands.
 
-Pass `--autoclean` to remove the server-owned workdir after stop, failed start, timeout, transport close, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside that directory and does not follow symlinks. If removal fails, `session_stop` reports the error and keeps ownership for a retry. Without the flag, the workdir remains after stop.
+Pass `--autoclean` to remove the server-owned workdir and its disk-backed overlay cache after stop, failed start, timeout, transport close, launching-client death, or SIGTERM/SIGINT/SIGHUP. Cleanup repairs permissions only inside those directories and does not follow symlinks. If either removal fails, `session_stop` reports the failing path and keeps ownership for a retry. Without the flag, the workdir remains after stop.
 
 On startup, `--autoclean` also removes a workdir left by a crashed server when this version's lease marker proves it opted into cleanup, its lock is free, its sandbox process group has exited, and no mount remains inside it. Older workdirs without a lease marker remain for individual review.
 
@@ -97,7 +110,7 @@ The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Conf
 
 Each session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host clipboard, and Ctrl+V or Shift+Insert pastes from the host clipboard. The viewer restores the session's prior selection afterward. Put anything the user should paste through the viewer on the **host** clipboard.
 
-Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
+Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste from PRIMARY can consume it. In XTerm, the default fast paste shortcut is Shift+Insert; Ctrl+V is not bound to paste by default. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
 
 `clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
@@ -115,7 +128,7 @@ startup. Other files and directory overlays keep their existing write behavior.
 `session_start` reports these fallback files in `oversized_read_only_files`.
 To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
-Explicit copies still share the 20-second startup deadline; this option does not
+Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
 ### Session memory limits
@@ -169,6 +182,13 @@ limits are recovered from the sandbox PID cgroup; values that cannot be
 recovered remain unknown. Stop the dead handle, start a new desktop without
 `session_id`, and relaunch the applications to continue.
 
+Every handle `session_list` shows is accepted by `session_stop`: a running desktop
+is stopped, and a dead, expired, or blocked-start handle is cleared with its
+lifecycle record. A `session_start` whose host call stays blocked past its budget
+is listed as `start_blocked`; `session_stop` answers `cleanup_pending` until that
+call returns, then clears the handle. A stop of an ID whose record is already
+cleared is a confirmed no-op.
+
 Configure MCP clients to launch the current `kwin-mcp` executable directly.
 The historical `kwin-mcp-shim` has its own session listing and hides these
 structured lifecycle diagnostics; it is no longer built by this repository.
@@ -189,7 +209,26 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
+
+`TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
+at most 107 bytes, excluding the terminating NUL, for the entire socket path.
+The session's D-Bus sockets have a stricter 99-byte limit imposed by
+[libdbus](https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html).
+`session_start` checks both constraints before creating its workdir or starting
+processes. If a path is too long, the error names it, reports its byte length,
+and asks for a shorter `TMPDIR`; set that variable before launching the server.
+The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
+filename, and counts UTF-8 bytes rather than characters.
+
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
 
 Live host SQLite databases with open WAL files are mounted read-only with their
 WAL and shared-memory files, except browser cookie jars. Startup mounts these
@@ -208,6 +247,12 @@ overlays, host sockets and processes, or browser profiles.
 
 ### Two-phase D-Bus startup
 
+The private KWallet bus records `dbus-daemon` diagnostics in the session
+workdir's `kwallet-bus.stderr`. If the daemon exits before readiness or its
+socket does not appear within three seconds, `session_start` includes a bounded
+stderr excerpt in the error before cleanup. `--autoclean` removes the log with
+the failed session's workdir.
+
 1. bwrap starts, dbus-daemon creates session bus
 2. Host `proxy_conn` claims `org.kde.KWin`, registers InputDevice objects
 3. Container starts KWin (gets unique name `:1.N`, not the well-known name)
@@ -219,6 +264,20 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 ### HID isolation
 
 Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
+
+Startup device errors identify the mouse or keyboard, the failed operation,
+the `/dev/uinput` or sysfs path, and the original OS error. They also report
+the failing server's numeric `Uid`, `Gid`, and supplementary `Groups` from
+`/proc/self/status`, plus its user and mount namespace IDs. Compare these
+with the launching shell when investigating access from an enclosing
+namespace: a writable `/dev/uinput` check alone does not verify device
+configuration, creation, or evdev discovery.
+
+Run `ruby tests/uinput_startup_e2e.rb /path/to/kwin-mcp /path/to/evidence`
+on a KDE host with `/dev/uinput`, an existing user runtime and bus, and
+passwordless sudo to verify startup diagnostics through the stdio server.
+The regression mounts failure fixtures in private mount namespaces and
+restores the caller's credentials before launching the server.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
@@ -238,7 +297,16 @@ cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 
 Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
 (default `1.0`). `keyboard_type` defaults to approximately 100 WPM; `speed: 2`
-requests approximately twice that rate. Mouse tools also accept `target_width`,
+requests approximately twice that rate. A 900-character comment can therefore
+need roughly two minutes at the default rate. For a longer comment, pass a
+larger multiplier such as `keyboard_type({"text":"...","speed":4})`. On engi, a real
+900-character Chrome textarea probe completed in 28.63 seconds at that rate
+and independently copied back the exact text. Inspect the delivery result and
+the field before submitting. Run the synthetic probe with
+`ruby tests/input_delivery_e2e.rb long_comment` using the server/artifact
+variables documented in [the input-delivery tests](tests/input_delivery_e2e.md).
+Mouse tools also accept `target_width`,
+
 the smaller target dimension in pixels (default `20`), for movement timing.
 
 Pointer movement uses sampled Fitts-law durations, minimum-jerk progress,
@@ -291,15 +359,86 @@ reported there as well. Remove the profile's saved database from this directory
 to discard its session cookie history. This does not sign out the host browser.
 
 
-Point your MCP client at `target/release/kwin-mcp`. One server process owns all isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops that may belong to other agents sharing the server. Use only IDs returned by your own `session_start` calls.
+Point your MCP client at `target/release/kwin-mcp`. One server process owns its isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Use only IDs returned by your own `session_start` calls. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops owned by that server. Requests carrying a live session ID owned by another kwin-mcp process running as the same user on the same host are forwarded to that process through a private Unix socket.
 
-Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops. An in-place source reload preserves its PID, pipes, and live sessions. The replacement server's `session_list` covers only its own process. The previous server records completed shutdown cleanup in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle.jsonl`; the log is capped at 1 MiB and retains recent records, so older cleanup details may be absent. An unavailable-ID error reports the previous process and cleanup record when available, and reports malformed records as errors. If an ID belongs to another process, retry the request there while it is running; otherwise call `session_start` without `session_id`, relaunch the applications, and restore the task.
+Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops. An in-place source reload preserves its PID, pipes, and live sessions. Calls with a session ID from another live same-user server on this host are automatically forwarded after checking the target PID and effective UID. The replacement server's `session_list` covers only its own process. Session stops, idle TTL expirations, and completed server-shutdown cleanup are recorded in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle-v2.jsonl`; the log is capped at 1 MiB and retains recent records, so older details may be absent. An unavailable-ID error includes `session_status`: `stopped` or `expired` with the recorded end time and reason when known, `owned_by_another_process` when the ID belongs elsewhere but its final state is unknown, or `not_found`. A request without an ID when no session is active reports `none_running`. These responses also report whether the ID is available in the current process and provide recovery guidance. TTL-expired handles appear as `expired` in the current process's `session_list` and can be cleared with `session_stop`. If the owning process is unavailable, call `session_start` without `session_id`, relaunch the applications, and restore the task.
+
+Completed server-shutdown records are also mirrored to the legacy
+`session-lifecycle.jsonl` format for older servers. Explicit stops and expiry
+records stay in the versioned file. When a mixed legacy log is found, the server
+moves its newer event kinds under a file lock and keeps a bounded recovery copy
+as `session-lifecycle-v1-migration.jsonl`. Each history file remains capped at
+1 MiB. Unknown future terminal kinds in the versioned file report an unknown
+status without falsely claiming a stop or invalidating unrelated history.
 
 Sessions run concurrently. Input requests retain arrival order within a desktop, reads run concurrently, and a shared Tower concurrency limit matches the machine thread count. App launches use a Tower timeout.
 
 The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its executable. A source change triggers a rebuild. A rebuilt executable replaces the server in place while preserving its PID, client pipes, and live desktops. The client receives `notifications/tools/list_changed`. Build diagnostics are in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/build.log`. Set `KWIN_MCP_REPO` when the source is elsewhere.
 
 ## Setup
+
+### Install the Rust executables
+
+Build this checkout, then install its server and viewer together:
+
+```bash
+cargo build --release --bins
+bash scripts/install.sh
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+The installer requires Bash, GNU coreutils, and `jq`. It defaults to `~/.local/bin`
+and checks that the source server prints help, valid MCP schemas, and identical
+`--version` / `-V` identities before installing either executable. Both version
+flags must print one line with the Rust package version, build number, and Git
+commit, such as `kwin-mcp v0.1.2.651 (a34524a)`. Installation reports this identity
+along with the selected PATH executable. Use `--bin-dir DIR` for a different
+destination, or `--source-dir DIR` for a different build output directory.
+Put the destination first in `PATH`. If another directory still supplies the
+`kwin-mcp` command, installation reports an actionable error after copying the
+executables; use their absolute paths or fix `PATH` and clear the shell command cache.
+
+An existing destination requires explicit replacement:
+
+```bash
+type -a kwin-mcp
+bash scripts/install.sh --replace
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+`--replace` replaces the destination file or symlink itself. It preserves the
+target of an old symlink, including a uv-managed console script. The separately
+published Python/PyPI package also named `kwin-mcp` belongs to
+[isac322/kwin-mcp](https://github.com/isac322/kwin-mcp); `uv tool install kwin-mcp`
+does not install this Rust server. If `--version`, `--help`, or `--describe`
+succeeds with empty output, inspect `type -a kwin-mcp` for that conflicting
+command and install the Rust executables with the steps above. If you no longer need the Python
+tool, run `uv tool uninstall kwin-mcp` before installing the Rust executables.
+To keep both projects, use separate installation directories and absolute
+commands: uv can recreate or remove its console entry point during later package
+operations. Configure MCP clients with the absolute installed Rust path, such
+as `~/.local/bin/kwin-mcp` expanded to your home directory.
+
+MCP clients may still name an older absolute build-artifact path even after PATH
+is corrected. Check the configured command as well as `kwin-mcp --version`.
+For an existing provider, verify an old-to-new in-place reload before replacing
+its executable; the production regression accepts
+`KWIN_MCP_E2E_REEXEC_REPLACEMENT=/path/to/new/kwin-mcp` to check two live desktops,
+PID, pipes, input, and partially buffered requests. Keep the server and viewer
+from the same installation. Agent input is refused while an open viewer's status
+is stale; finish any current user interaction, then use `viewer_open` to refresh
+it. Read-only inspection remains available during that refresh step.
+
+To check installation behavior against built artifacts without changing your
+real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
+It installs into temporary directories and exercises help, schemas, and both
+version flags through `PATH`, including rejection of silent version entrypoints.
 
 ### Host runtime environment
 
@@ -361,7 +500,16 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
-Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
+Inline PNGs request original-detail presentation on supporting Codex clients
+through the image block's `_meta["codex/imageDetail"]`. The hint does not change
+the image bytes, capture dimensions, or click coordinates. Other clients may
+ignore it. If a preview appears blank or loses small text, inspect the saved PNG
+at original detail or request a narrow `region` crop before diagnosing a
+compositor failure. An inline image and its saved PNG can contain identical,
+correct pixels even when a client presents them differently (see #435).
+
+
+Virtual display is 2000×1875 (3.75MP). By default all windows open maximized. `session_start` with `window_mode: "native"` maps each window at the size its app requests instead, so a relaunched app reopens at its own size. Windows have no decorations or shadows in either mode. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
 
@@ -392,6 +540,64 @@ before sending or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 
+After an editable field is cleared, AT-SPI may expose one blank newline that the
+application removes when typing starts. If the entire resulting field matches
+the requested text, `atspi_transformed_blank_line` reports `unverified` with
+inspection guidance. It retains the original expected and observed counts;
+preservation of that initial newline is ambiguous. A newline retained by the
+application still follows the normal exact-text verification path.
+
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+The [input delivery regression](tests/input_delivery_e2e.md) covers clearing and
+retyping the same text followed immediately by repeated screenshots.
+
+### Startup budgets and fresh browser profiles
+
+`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).
+The budget includes waiting for the lifecycle gate and preparing host profiles;
+it does not disable bounded startup or cleanup. Increase it explicitly when a
+large profile set needs more preparation time.
+
+For a terminal-only task or a browser that should start without inherited
+Chromium profiles, use `browser_profiles: "fresh"`. The recognized Chromium
+configuration directories start empty in that session, profile/cookie copying
+is skipped, and cookies from those fresh profiles are not persisted between
+sessions. Host files are unchanged. The default `"inherit"` preserves the
+existing profile and cookie-continuity behavior. The response reports both the
+profile mode and startup budget. This option does not bypass general HOME
+mount/process discovery or unblock unrelated hung filesystems.
+
+Browser preparation timeouts identify the current operation and pathname,
+without printing file contents. Preparation checks its deadline between
+operations. If an operation is blocked in the kernel, cleanup retains ownership
+until that operation returns; it then stops preparation and removes the owned
+storage. Do not remove that storage manually while the operation still uses it.
+
+When sandbox startup fails, the response preserves available sandbox stderr
+before autoclean removes its log. Long logs include only a bounded tail and a
+truncation flag. The D-Bus readiness marker is published only after its socket
+exists; a sandbox that exits before a startup signal reports its exit status.
+Run `ruby tests/startup_diagnostics_e2e.rb SERVER EVIDENCE` to exercise real
+D-Bus failures, noisy diagnostics, normal KWin startup, and cleanup.
+
+Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
+regression. It uses synthetic private profiles, a controlled blocked Preferences
+read, terminal launch, and a delayed real sandbox to verify profile isolation,
+operation diagnostics, deferred cleanup, and configurable timeout bounds.
+
+## Release packaging and deployment
+
+The shipped `kwin-mcp-deploy` CLI builds committed source on the least busy eligible
+sentry/archy host, stages checksummed release packages, and explicitly installs
+new release directories on engi, archy or benji. Engi builds require an explicit
+host override and always use nice 19; selected engi builds and installs run
+locally when invoked on engi, without an SSH listener. Unreachable benji is skipped. No command
+activates a release or restarts services. Packages include optional OAuth gateway
+and Cloudflare tunnel user unit templates; the gateway executable and credentials
+are external prerequisites.
+
+See [deployment instructions](docs/deployment.md) for commands, private build and
+install paths, runtime compatibility requirements and unit configuration.

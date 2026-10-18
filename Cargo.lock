@@ -2821,6 +2821,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
@@ -2978,7 +2979,6 @@ dependencies = [
 [[package]]
 name = "screen-13-window"
 version = "0.1.0"
-source = "git+https://github.com/attackgoat/screen-13?rev=d9f961c#d9f961ce9c4f9633b4f750f42ae3582c0fd9c6cc"
 dependencies = [
  "log",
  "profiling",
@@ -3450,6 +3450,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

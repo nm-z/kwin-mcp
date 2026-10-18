@@ -6,6 +6,7 @@ require 'rbconfig'
 require 'shellwords'
 require 'socket'
 require 'timeout'
+require 'tmpdir'
 
 desktop_variables = %w[DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET]
 if desktop_variables.any? { |name| ENV[name] && !ENV[name].empty? }
@@ -24,7 +25,9 @@ FileUtils.mkdir_p(evidence)
 class RuntimeProof
   def initialize(binary, directory, overrides)
     @binary, @directory = binary, directory
-    private_home = File.join(directory, 'home')
+    # Socket addresses must fit sockaddr_un independently of artifact paths.
+    @fixture_root = Dir.mktmpdir('kmr-', '/var/tmp')
+    private_home = File.join(@fixture_root, 'home')
     @private_home = private_home
     %w[.config .local/share .cache .local/state .kde].each do |name|
       FileUtils.mkdir_p(File.join(private_home, name))
@@ -152,12 +155,16 @@ class RuntimeProof
       end
     end
   ensure
-    @nongraphical_socket&.close
-    @nongraphical_thread&.join(2)
-    @hidden_socket&.close
-    if @graphical_pid
-      Process.kill('TERM', @graphical_pid)
-      Timeout.timeout(5) { Process.wait(@graphical_pid) }
+    begin
+      @nongraphical_socket&.close
+      @nongraphical_thread&.join(2)
+      @hidden_socket&.close
+      if @graphical_pid
+        Process.kill('TERM', @graphical_pid)
+        Timeout.timeout(5) { Process.wait(@graphical_pid) }
+      end
+    ensure
+      FileUtils.remove_entry(@fixture_root) if @fixture_root && File.directory?(@fixture_root)
     end
   end
 
