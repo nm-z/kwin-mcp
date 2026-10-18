@@ -71,7 +71,15 @@ Dir.mktmpdir('kmvup-','/var/tmp') do |root|
     raise viewer.inspect unless viewer['state']=='ready'
     paused=Integer(viewer.fetch('pid'));Process.kill('STOP',paused)
     activity=File.join(workdir,'viewer-input-activity');File.delete(activity) if File.exist?(activity)
-    status_path=File.join(workdir,'viewer-status.json');sleep 3.2
+    status_path=File.join(workdir,'viewer-status.json')
+    if ENV['KWIN_MCP_VIEWER_LEGACY_CASE']=='1'
+      legacy_status=JSON.parse(File.read(status_path))
+      legacy_status.delete('input_activity_reporting')
+      File.write(status_path,JSON.generate(legacy_status))
+    else
+      sleep 3.2
+    end
+
     blocked=inner.call('keyboard_type',session_id:id,text:'not-sent')
     if baseline
       raise 'baseline did not expose unsafe admission' unless blocked.dig('result','structuredContent','submitted_characters')==8
