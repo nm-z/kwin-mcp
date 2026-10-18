@@ -8113,7 +8113,30 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "premature streaming status: {connecting}"
     );
     thread::sleep(Duration::from_millis(150));
-    save_session_image(&mut desktop, 9, &host_id, "viewer-stalled.png");
+    let windows = call_tool(
+        &mut desktop,
+        3,
+        "window_list",
+        json!({"session_id":host_id}),
+    );
+    let viewer_window = windows["result"]["structuredContent"]["windows"]
+        .as_array()
+        .expect("outer desktop windows")
+        .iter()
+        .find(|window| {
+            window["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with(&format!("kwin-viewer {session}")))
+        })
+        .expect("stalled viewer window");
+    let activated = call_tool(
+        &mut desktop,
+        4,
+        "window_activate",
+        json!({"session_id":host_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(activated["error"].is_null(), "{activated}");
+    save_session_image(&mut desktop, 5, &host_id, "viewer-stalled.png");
     let result = client.response(4, Duration::from_secs(10));
     println!("viewer result: {}", result["result"]["structuredContent"]);
     assert_eq!(
@@ -8150,7 +8173,30 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "{log}"
     );
     thread::sleep(Duration::from_millis(400));
-    save_session_image(&mut desktop, 3, &host_id, "viewer-recovered.png");
+    let windows = call_tool(
+        &mut desktop,
+        6,
+        "window_list",
+        json!({"session_id":host_id}),
+    );
+    let viewer_window = windows["result"]["structuredContent"]["windows"]
+        .as_array()
+        .expect("outer desktop windows")
+        .iter()
+        .find(|window| {
+            window["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with(&format!("kwin-viewer {session}")))
+        })
+        .expect("recovered viewer window");
+    let activated = call_tool(
+        &mut desktop,
+        7,
+        "window_activate",
+        json!({"session_id":host_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(activated["error"].is_null(), "{activated}");
+    save_session_image(&mut desktop, 8, &host_id, "viewer-recovered.png");
     let reused = call_tool(&mut client, 7, "viewer_open", json!({"session_id":session}));
     assert_eq!(
         reused["result"]["structuredContent"]["status"],
@@ -8169,7 +8215,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     client.stop_process();
     call_tool(
         &mut desktop,
-        4,
+        9,
         "session_stop",
         json!({"session_id":host_id}),
     );
