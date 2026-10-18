@@ -190,31 +190,39 @@ fn read_deletions(saved: &Path, keys: Vec<String>) -> Result<DeletedCookies> {
     }
 }
 
-fn apply_deleted(connection: &Connection, deleted: &DeletedCookies) -> Result<()> {
+fn apply_deleted(connection: &mut Connection, deleted: &DeletedCookies) -> Result<()> {
     let predicate = deleted
         .columns
         .iter()
         .map(|key| format!("{} IS ?", quote(key)))
         .collect::<Vec<_>>()
         .join(" AND ");
-    for row in &deleted.rows {
-        let mut identity = row.key.iter().map(Value::from).collect::<Vec<_>>();
-        identity.push(Value::Integer(row.through));
-        connection.execute(
-            &format!("DELETE FROM cookies WHERE {predicate} AND last_update_utc <= ?"),
-            params_from_iter(identity),
-        )?;
+    // Applying a continuity snapshot is one operation. Autocommit here makes
+    // every tombstone wait for a separate durable journal commit, which can
+    // outlive the entire startup budget for an ordinary saved deletion list.
+    let transaction = connection.transaction()?;
+    {
+        let mut remove = transaction.prepare(&format!(
+            "DELETE FROM cookies WHERE {predicate} AND last_update_utc <= ?"
+        ))?;
+        for row in &deleted.rows {
+            let mut identity = row.key.iter().map(Value::from).collect::<Vec<_>>();
+            identity.push(Value::Integer(row.through));
+            remove.execute(params_from_iter(identity))?;
+        }
     }
-    prune_expired(connection)
+    prune_expired(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Tombstones remove the baseline version that a session deleted, including
 /// old host rows and stale concurrent sessions. A newer last_update_utc wins
 /// independently of session stop order; absence cannot date an unseen update.
 pub fn apply_deletions(database: &Path, saved: &Path) -> Result<()> {
-    let database = Connection::open(database)?;
+    let mut database = Connection::open(database)?;
     let deleted = read_deletions(saved, identity_columns(&database)?)?;
-    apply_deleted(&database, &deleted)
+    apply_deleted(&mut database, &deleted)
 }
 
 fn record_deletions(
@@ -744,8 +752,11 @@ pub fn persist(roots: &[CookieRoot]) -> Result<()> {
                 let deleted = record_deletions(&temporary, jar.baseline.as_deref(), &jar.saved)
                     .context("record cookie deletions")?;
                 merge(&temporary, &jar.saved).context("merge persisted cookie jar")?;
-                apply_deleted(&Connection::open(&temporary)?, &deleted)
-                    .context("apply cookie deletion tombstones")?;
+                {
+                    let mut temporary_database = Connection::open(&temporary)?;
+                    apply_deleted(&mut temporary_database, &deleted)
+                        .context("apply cookie deletion tombstones")?;
+                }
                 // Publish deletions before the jar: even a crash between renames
                 // must not restore a removed cookie from the old saved jar.
                 write_deletions(&jar.saved, &deleted)
