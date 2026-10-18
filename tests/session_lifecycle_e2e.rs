@@ -206,6 +206,12 @@ impl RpcClient {
                 std::env::var_os("WAYLAND_DISPLAY")
                     .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
             );
+        if let Some((_, minutes)) = extra_env
+            .iter()
+            .find(|(name, _)| *name == "KWIN_MCP_E2E_TTL_MINUTES")
+        {
+            command.args(["--ttl", minutes]);
+        }
         if let Some(stage) = delay_stage {
             command
                 .env("KWIN_MCP_TEST_STARTUP_DELAY_STAGE", stage)
@@ -346,8 +352,7 @@ impl RpcClient {
 
     fn stop_process(mut self) {
         self.cleanup_sessions();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.stdin.take());
     }
 
     fn cleanup_sessions(&mut self) {
@@ -514,6 +519,38 @@ fn wait_for_viewer_windows(pid: u32, expected: usize) -> Vec<String> {
             return windows;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_recent_viewer_input(path: &std::path::Path) -> SystemTime {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("viewer input activity timestamp");
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if modified > UNIX_EPOCH && age <= Duration::from_secs(1) {
+            return modified;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "viewer input did not update {} recently",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct OwnedChild(Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
     }
 }
 
@@ -1604,6 +1641,660 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
     client.stop_process();
 }
 
+fn save_inline_screenshot(result: &Value, label: &str) -> PathBuf {
+    use base64::Engine;
+
+    assert!(result["error"].is_null(), "{result}");
+    let image = result["result"]["content"]
+        .as_array()
+        .expect("screenshot content")
+        .iter()
+        .find(|item| item["type"] == "image")
+        .expect("inline screenshot image");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image["data"].as_str().expect("screenshot data"))
+        .expect("decode screenshot");
+    let path =
+        std::env::temp_dir().join(format!("kwin-mcp-300-{label}-{}.png", std::process::id()));
+    std::fs::write(&path, bytes).expect("write live screenshot");
+    eprintln!("live screenshot: {}", path.display());
+    path
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, viewer GPU, and a host Wayland session"]
+fn viewer_input_only_pauses_agent_input_for_the_recent_quiet_period() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let desktop_started = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert!(desktop_started["error"].is_null(), "{desktop_started}");
+    let desktop_id = desktop_started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("desktop session id");
+    let display = workdir(&desktop_started).join("wayland-0");
+    let display = display.to_str().expect("desktop Wayland socket").to_owned();
+
+    // Run the viewer as a real window on the outer KWin desktop. Input sent
+    // through the outer MCP session reaches that window as viewer input.
+    let mut client = RpcClient::start_with_env(&[("WAYLAND_DISPLAY", &display)]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert!(started["error"].is_null(), "{started}");
+    let session_id = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session id");
+    let session_dir = workdir(&started);
+    let opened = call_tool(
+        &mut client,
+        3,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["status"],
+        json!("opened"),
+        "{opened}"
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"],
+        json!("ready"),
+        "{opened}"
+    );
+
+    let viewer_window = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let listed = call_tool(
+                &mut desktop,
+                3,
+                "window_list",
+                json!({"session_id":desktop_id}),
+            );
+            assert!(listed["error"].is_null(), "{listed}");
+            let rows = listed["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("desktop windows");
+            if let Some(viewer) = rows.iter().find(|row| {
+                row["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with("kwin-viewer"))
+                    || row["resourceClass"]
+                        .as_str()
+                        .is_some_and(|class| class.contains("kwin-viewer"))
+            }) {
+                break viewer.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "viewer window did not appear: {rows:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let activated = call_tool(
+        &mut desktop,
+        4,
+        "window_activate",
+        json!({"session_id":desktop_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(activated["error"].is_null(), "{activated}");
+
+    let page = "data:text/html,%3C!doctype%20html%3E%3Chtml%3E%3Cbody%3E%3Ch1%3EViewer%20input%20probe%3C/h1%3E%3Clabel%3EBirth%20date:%20%3Cinput%20type%3Ddate%20aria-label%3D%22Birth%20date%22%20autofocus%3E%3C/label%3E%3Cbr%3E%3Clabel%3ERepeat%20probe:%20%3Cinput%20type%3Dtext%20aria-label%3D%22Repeat%20probe%22%3E%3C/label%3E%3C/body%3E%3C/html%3E";
+    let launched = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --no-first-run --app='{page}'")}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let mut next_client_id = 5;
+    let tree_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let tree = call_tool(
+            &mut client,
+            next_client_id,
+            "accessibility_tree",
+            json!({"session_id":session_id,"max_depth":16}),
+        );
+        next_client_id += 1;
+        let tree_text = serde_json::to_string(&tree)
+            .expect("serialize date field accessibility tree")
+            .to_lowercase();
+        if tree_text.contains("birth date") && tree_text.contains("repeat probe") {
+            break;
+        }
+        assert!(
+            Instant::now() < tree_deadline,
+            "date page did not load: {tree}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    let date_before = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    let _date_before_image = save_inline_screenshot(&date_before, "date-field-before");
+
+    thread::sleep(Duration::from_millis(1100));
+    let idle_input = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(idle_input["error"].is_null(), "{idle_input}");
+
+    let (typed, during_typing) = thread::scope(|scope| {
+        let (started_tx, started_rx) = mpsc::channel();
+        let screenshot_id = next_client_id;
+        next_client_id += 1;
+        let client = &mut client;
+        let screenshot = scope.spawn(move || {
+            started_rx.recv().expect("typing started");
+            thread::sleep(Duration::from_millis(150));
+            call_tool(
+                client,
+                screenshot_id,
+                "screenshot",
+                json!({"session_id":session_id,"inline":true}),
+            )
+        });
+        started_tx.send(()).expect("start concurrent screenshot");
+        let typed = call_tool(
+            &mut desktop,
+            5,
+            "keyboard_type",
+            json!({"session_id":desktop_id,"text":"10122026"}),
+        );
+        let screenshot = screenshot.join().expect("agent screenshot while typing");
+        (typed, screenshot)
+    });
+    assert!(typed["error"].is_null(), "{typed}");
+    let _during_typing_image = save_inline_screenshot(&during_typing, "date-during-typing");
+    let activity_path = session_dir.join("viewer-input-activity");
+    wait_for_recent_viewer_input(&activity_path);
+    let paused = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert_eq!(
+        paused["error"]["data"]["reason"],
+        json!("recent_viewer_input"),
+        "{paused}"
+    );
+    assert_eq!(
+        paused["error"]["data"]["retry_safe"],
+        json!(true),
+        "{paused}"
+    );
+
+    thread::sleep(Duration::from_millis(1100));
+    let resumed_input = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(resumed_input["error"].is_null(), "{resumed_input}");
+    let date_screenshot = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    let _date_image = save_inline_screenshot(&date_screenshot, "date-field");
+
+    let clicked = call_tool(
+        &mut desktop,
+        6,
+        "mouse_click",
+        json!({"session_id":desktop_id,"x":150,"y":114}),
+    );
+    assert!(clicked["error"].is_null(), "{clicked}");
+    wait_for_recent_viewer_input(&activity_path);
+    let repeat_field = call_tool(
+        &mut client,
+        next_client_id,
+        "find_ui_elements",
+        json!({"session_id":session_id,"query":"Repeat probe"}),
+    );
+    next_client_id += 1;
+    let repeat_field_text = serde_json::to_string(&repeat_field)
+        .expect("serialize repeat field")
+        .to_lowercase();
+    assert!(
+        repeat_field_text.contains("repeat probe") && repeat_field_text.contains("focused"),
+        "repeat field is missing or not focused: {repeat_field}"
+    );
+
+    thread::sleep(Duration::from_millis(1100));
+    // Viewer input must interrupt an already admitted paced operation, too.
+    let input_log = started["result"]["structuredContent"]["input_log"]
+        .as_str()
+        .expect("input log path");
+    let interrupted_id = next_client_id;
+    next_client_id += 1;
+    let interrupted = thread::scope(|scope| {
+        let (begin_tx, begin_rx) = mpsc::channel();
+        let client = &mut client;
+        let typing = scope.spawn(move || {
+            begin_tx.send(()).expect("start agent typing");
+            call_tool(
+                client,
+                interrupted_id,
+                "keyboard_type",
+                json!({"session_id":session_id,"text":"x".repeat(300)}),
+            )
+        });
+        begin_rx.recv().expect("agent typing submitted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sent = std::fs::read_to_string(input_log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|record| {
+                    record["tool"]["request_id"] == interrupted_id
+                        && record["character"] == "x"
+                        && record["pressed"] == true
+                });
+            if sent {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent did not begin key submission"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let human = call_tool(
+            &mut desktop,
+            60,
+            "keyboard_key",
+            json!({"session_id":desktop_id,"key":"b"}),
+        );
+        assert!(human["error"].is_null(), "{human}");
+        let began = Instant::now();
+        let interrupted = typing.join().expect("agent typing completion");
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "agent typing did not yield promptly"
+        );
+        interrupted
+    });
+    assert_eq!(
+        interrupted["error"]["data"]["reason"], "viewer_input_interrupted",
+        "{interrupted}"
+    );
+    assert_eq!(
+        interrupted["error"]["data"]["retry_safe"], false,
+        "{interrupted}"
+    );
+    thread::sleep(Duration::from_millis(1100));
+    for key in ["ctrl+a", "ctrl+c"] {
+        let response = call_tool(
+            &mut client,
+            next_client_id,
+            "keyboard_key",
+            json!({"session_id":session_id,"key":key}),
+        );
+        next_client_id += 1;
+        assert!(response["error"].is_null(), "{response}");
+    }
+    let receipt = call_tool(
+        &mut client,
+        next_client_id,
+        "clipboard_read",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    let text = receipt["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("interrupted field text");
+    assert!(
+        text.contains('b') && text.contains('x') && text.matches('x').count() < 300,
+        "human input lost or agent typing continued: {text}"
+    );
+    let interrupted_screen = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    save_inline_screenshot(&interrupted_screen, "viewer-interrupted-agent");
+    let cleared = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Backspace"}),
+    );
+    next_client_id += 1;
+    assert!(cleared["error"].is_null(), "{cleared}");
+    let baseline_press = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_press",
+        json!({"session_id":session_id,"key":"a"}),
+    );
+    next_client_id += 1;
+    assert!(baseline_press["error"].is_null(), "{baseline_press}");
+    thread::sleep(Duration::from_millis(1100));
+    let baseline_held = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    let _baseline_held_image = save_inline_screenshot(&baseline_held, "direct-key-held");
+    let baseline_release = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_release",
+        json!({"session_id":session_id,"key":"a"}),
+    );
+    next_client_id += 1;
+    assert!(baseline_release["error"].is_null(), "{baseline_release}");
+    let baseline_select = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"ctrl+a"}),
+    );
+    next_client_id += 1;
+    assert!(baseline_select["error"].is_null(), "{baseline_select}");
+    let baseline_copy = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"ctrl+c"}),
+    );
+    next_client_id += 1;
+    assert!(baseline_copy["error"].is_null(), "{baseline_copy}");
+    let baseline_clipboard = call_tool(
+        &mut client,
+        next_client_id,
+        "clipboard_read",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    let baseline_text = baseline_clipboard["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("baseline repeat text");
+    let baseline_repeats = baseline_text
+        .chars()
+        .filter(|character| *character == 'a')
+        .count();
+    assert!(
+        baseline_repeats > 1,
+        "held key did not repeat: {baseline_text}"
+    );
+    let clear = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Backspace"}),
+    );
+    next_client_id += 1;
+    assert!(clear["error"].is_null(), "{clear}");
+    let clear_clipboard = call_tool(
+        &mut client,
+        next_client_id,
+        "clipboard_write",
+        json!({"session_id":session_id,"target":"session","text":""}),
+    );
+    next_client_id += 1;
+    assert!(clear_clipboard["error"].is_null(), "{clear_clipboard}");
+
+    let pressed = call_tool(
+        &mut desktop,
+        7,
+        "keyboard_press",
+        json!({"session_id":desktop_id,"key":"a"}),
+    );
+    assert!(pressed["error"].is_null(), "{pressed}");
+    thread::sleep(Duration::from_millis(1100));
+    let repeat_held = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    let _repeat_held_image = save_inline_screenshot(&repeat_held, "held-key-repeat");
+    let released = call_tool(
+        &mut desktop,
+        8,
+        "keyboard_release",
+        json!({"session_id":desktop_id,"key":"a"}),
+    );
+    assert!(released["error"].is_null(), "{released}");
+    let repeat_result = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    let _repeat_result_image = save_inline_screenshot(&repeat_result, "held-key-result");
+    thread::sleep(Duration::from_millis(1100));
+    let viewer_select = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"ctrl+a"}),
+    );
+    next_client_id += 1;
+    assert!(viewer_select["error"].is_null(), "{viewer_select}");
+    let viewer_copy = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"ctrl+c"}),
+    );
+    next_client_id += 1;
+    assert!(viewer_copy["error"].is_null(), "{viewer_copy}");
+    let viewer_clipboard = call_tool(
+        &mut client,
+        next_client_id,
+        "clipboard_read",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    let viewer_text = viewer_clipboard["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("viewer repeat text");
+    let viewer_repeats = viewer_text
+        .chars()
+        .filter(|character| *character == 'a')
+        .count();
+    let repeat_margin = baseline_repeats / 4 + 2;
+    eprintln!("held-key repeat count: session={baseline_repeats}, viewer={viewer_repeats}");
+    assert!(
+        viewer_repeats > 1 && viewer_repeats <= baseline_repeats + repeat_margin,
+        "viewer hold repeated at a different rate: session={baseline_repeats}, viewer={viewer_repeats}"
+    );
+
+    let still_open = call_tool(
+        &mut client,
+        next_client_id,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    assert_eq!(
+        still_open["result"]["structuredContent"]["status"],
+        json!("already_open"),
+        "{still_open}"
+    );
+
+    let closed = call_tool(
+        &mut client,
+        next_client_id,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    assert!(closed["error"].is_null(), "{closed}");
+
+    // A remote --serve relay has no local viewer_child. Send the same key
+    // records --remote writes so the server sees activity through its actual
+    // relay input path rather than a test-written marker timestamp.
+    thread::sleep(Duration::from_millis(1100));
+    let quiet_input = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(quiet_input["error"].is_null(), "{quiet_input}");
+
+    let mut relay = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_kwin-viewer"))
+            .args(["--serve"])
+            .arg(&session_dir)
+            .args(["800", "600"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start remote viewer relay"),
+    );
+    let relay_pid = u64::from(relay.0.id());
+    let relay_status = session_dir.join("viewer-status.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&relay_status)
+            && let Ok(status) = serde_json::from_str::<Value>(&contents)
+            && status["pid"].as_u64() == Some(relay_pid)
+            && (status["state"] == "starting" || status["state"] == "ready")
+        {
+            break;
+        }
+        if let Some(status) = relay.0.try_wait().expect("check remote relay") {
+            panic!("remote relay exited before input: {status}");
+        }
+        assert!(Instant::now() < deadline, "remote relay did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let quiet_remote_input = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(
+        quiet_remote_input["error"].is_null(),
+        "{quiet_remote_input}"
+    );
+    let activity_before_remote_input = std::fs::metadata(&activity_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("activity timestamp before remote input");
+    let relay_stdin = relay.0.stdin.as_mut().expect("remote relay input");
+    for pressed in [1_u64, 0] {
+        let mut record = [0_u8; 17];
+        record[0] = 4; // Op::Key
+        record[1..9].copy_from_slice(&1_u64.to_le_bytes()); // Escape
+        record[9..17].copy_from_slice(&pressed.to_le_bytes());
+        relay_stdin
+            .write_all(&record)
+            .expect("send key through remote relay");
+    }
+    relay_stdin.flush().expect("flush remote relay input");
+    let remote_deadline = Instant::now() + Duration::from_secs(3);
+    let remote_activity = loop {
+        let modified = std::fs::metadata(&activity_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("remote viewer activity timestamp");
+        if modified > activity_before_remote_input {
+            break modified;
+        }
+        assert!(
+            Instant::now() < remote_deadline,
+            "remote relay did not update input activity"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        SystemTime::now()
+            .duration_since(remote_activity)
+            .unwrap_or_default()
+            <= Duration::from_secs(1),
+        "remote viewer activity was not recent"
+    );
+    let remote_paused = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert_eq!(
+        remote_paused["error"]["data"]["reason"],
+        json!("recent_viewer_input"),
+        "{remote_paused}"
+    );
+    assert_eq!(
+        remote_paused["error"]["data"]["retry_safe"],
+        json!(true),
+        "{remote_paused}"
+    );
+    thread::sleep(Duration::from_millis(1100));
+    let remote_resumed = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(remote_resumed["error"].is_null(), "{remote_resumed}");
+
+    drop(relay);
+    call_tool(
+        &mut client,
+        next_client_id,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    client.stop_process();
+    call_tool(
+        &mut desktop,
+        9,
+        "session_stop",
+        json!({"session_id":desktop_id}),
+    );
+    desktop.stop_process();
+}
+
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, kdotool, a live GPU session, and a host Wayland session"]
 fn viewer_opens_on_demand_and_closes_without_stopping_session() {
@@ -1696,13 +2387,58 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         1,
         "viewer_open did not create exactly one host window: pid={pid} opened={opened}\n{viewer_log}"
     );
+    thread::sleep(Duration::from_secs(4));
     let again = call_tool(&mut client, 6, "viewer_open", json!({}));
     assert_eq!(
         again["result"]["structuredContent"]["status"],
         json!("already_open"),
         "{again}"
     );
-    let closed = call_tool(&mut client, 7, "viewer_close", json!({}));
+    let windows = viewer_windows(pid);
+    assert_eq!(windows.len(), 1, "viewer window disappeared before close");
+    let close_window = Command::new("kdotool")
+        .env("KDE_SESSION_VERSION", "6")
+        .args(["windowclose", windows[0].as_str()])
+        .output()
+        .expect("close host viewer window");
+    assert!(
+        close_window.status.success(),
+        "kdotool windowclose failed: {}",
+        String::from_utf8_lossy(&close_window.stderr)
+    );
+    assert!(
+        wait_for_viewer_windows(pid, 0).is_empty(),
+        "host window close left the viewer window visible"
+    );
+
+    let reopened = call_tool(&mut client, 7, "viewer_open", json!({}));
+    assert_eq!(
+        reopened["result"]["structuredContent"]["status"],
+        json!("opened"),
+        "{reopened}"
+    );
+    let reopened_viewer = &reopened["result"]["structuredContent"]["viewer"];
+    let reopened_pid = u32::try_from(
+        reopened_viewer["pid"]
+            .as_u64()
+            .expect("reopened viewer pid"),
+    )
+    .expect("reopened pid fits");
+    assert_ne!(
+        reopened_pid, pid,
+        "viewer_open reused a closed viewer process"
+    );
+    assert!(
+        process_alive(reopened_pid).unwrap_or(false),
+        "reopened viewer is not running"
+    );
+    assert_eq!(
+        wait_for_viewer_windows(reopened_pid, 1).len(),
+        1,
+        "viewer_open did not recreate the host window: pid={reopened_pid} opened={reopened}"
+    );
+
+    let closed = call_tool(&mut client, 8, "viewer_close", json!({}));
     assert_eq!(
         closed["result"]["structuredContent"]["status"],
         json!("closed"),
@@ -1714,14 +2450,14 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         "{closed}"
     );
     assert!(
-        !process_alive(pid).unwrap_or(true),
+        !process_alive(reopened_pid).unwrap_or(true),
         "viewer remained alive after viewer_close"
     );
     assert!(
-        wait_for_viewer_windows(pid, 0).is_empty(),
+        wait_for_viewer_windows(reopened_pid, 0).is_empty(),
         "viewer_close left a host window"
     );
-    let running = call_tool(&mut client, 8, "session_list", json!({}));
+    let running = call_tool(&mut client, 9, "session_list", json!({}));
     assert_eq!(
         running["result"]["structuredContent"]["sessions"]
             .as_array()
@@ -1729,7 +2465,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
             .len(),
         1
     );
-    call_tool(&mut client, 9, "session_stop", json!({}));
+    call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
 
     // A missing host Wayland display affects viewer_open, not session_start.
@@ -4616,11 +5352,7 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    let session_server_pid = if client.child.id() == u32::MAX {
-        client.child.id() - 1
-    } else {
-        client.child.id() + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let unavailable = call_tool(
         &mut client,
@@ -4630,6 +5362,14 @@ fn discovery_creates_no_session_processes() {
     );
     assert_eq!(
         unavailable["error"]["data"]["reason"], "different_server_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_status"], "owned_by_another_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_available_here"], false,
         "{unavailable}"
     );
     assert_eq!(
@@ -4649,6 +5389,10 @@ fn discovery_creates_no_session_processes() {
     let no_live = call_tool(&mut client, 4, "window_list", json!({}));
     assert_eq!(
         no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    assert_eq!(
+        no_live["error"]["data"]["session_status"], "none_running",
         "{no_live}"
     );
     let sessions = call_tool(&mut client, 5, "session_list", json!({}));
@@ -4781,12 +5525,7 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let server_pid = client.child.id();
-    let next_pid = server_pid.saturating_add(1);
-    let session_server_pid = if next_pid == server_pid {
-        server_pid - 1
-    } else {
-        next_pid
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
 
     let response = call_tool(
@@ -4798,6 +5537,14 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     assert_eq!(response["error"]["code"], -32602, "{response}");
     assert_eq!(
         response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "owned_by_another_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_available_here"], false,
         "{response}"
     );
     assert_eq!(response["error"]["data"]["session_id"], session_id);
@@ -4814,7 +5561,574 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
         message.contains("session_start without session_id"),
         "{message}"
     );
+
+    let local_missing_id = format!("s{server_pid}-999999");
+    let local_missing = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":local_missing_id}),
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["reason"], "session_not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_status"], "not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_available_here"], false,
+        "{local_missing}"
+    );
     assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn silent_session_owner_handshake_has_a_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = PathBuf::from(host_runtime_dir())
+        .join(format!("kwin-mcp-control-{}.sock", std::process::id()));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("private silent owner socket");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("socket permissions");
+    struct RemoveSocket(PathBuf);
+    impl Drop for RemoveSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _socket = RemoveSocket(path);
+    let (done_tx, done_rx) = mpsc::channel();
+    let fixture = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("owner connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("read deadline");
+        let mut reader = BufReader::new(stream);
+        let mut initialize = String::new();
+        reader
+            .read_line(&mut initialize)
+            .expect("initialization request");
+        assert!(initialize.contains("initialize"), "{initialize}");
+        let _ = done_rx.recv_timeout(Duration::from_secs(8));
+    });
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let began = Instant::now();
+    let response = call_tool(
+        &mut caller,
+        2,
+        "window_list",
+        json!({"session_id":format!("s{}-1", std::process::id())}),
+    );
+    let elapsed = began.elapsed();
+    let _ = done_tx.send(());
+    fixture.join().expect("silent owner fixture");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "owner handshake did not time out: {elapsed:?}"
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    caller.stop_process();
+}
+
+#[test]
+fn unknown_session_from_a_live_server_is_checked_by_its_owner() {
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let owner_pid = owner.child.id();
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let session_id = format!("s{owner_pid}-999999");
+
+    let response = call_tool(
+        &mut caller,
+        2,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "session_not_found",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["server_pid"], owner_pid,
+        "{response}"
+    );
+    assert_ne!(response["error"]["data"]["server_pid"], caller.child.id());
+
+    drop(caller);
+    drop(owner);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, input devices, and a live GPU session"]
+fn live_session_tools_are_forwarded_to_the_owner_process() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // Both desktops belong to this test; the caller's desktop hosts the viewer.
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let outer = call_tool(
+        &mut caller,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let caller_id = session_handle(&outer);
+    let display = workdir(&outer).join("wayland-0");
+    let mut owner =
+        RpcClient::start_with_env(&[("WAYLAND_DISPLAY", display.to_str().expect("display"))]);
+    initialize(&mut owner);
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_id = session_handle(&started);
+    let launched = call_tool(
+        &mut owner,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":"konsole --separate --nofork -e bash --noprofile --norc"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let window_id = launched["result"]["structuredContent"]["window"].clone();
+    let windows = call_tool(
+        &mut caller,
+        3,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|windows| windows.iter().any(|window| window["id"] == window_id)),
+        "{windows}"
+    );
+    let opened = call_tool(
+        &mut caller,
+        4,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{opened}"
+    );
+    let viewer_pid = u32::try_from(
+        opened["result"]["structuredContent"]["viewer"]["pid"]
+            .as_u64()
+            .expect("viewer PID"),
+    )
+    .expect("PID fits");
+    let command = "printf routed-owner-proof > \"$HOME/routed-proof\"";
+    let typed = call_tool(
+        &mut caller,
+        5,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":command}),
+    );
+    assert!(typed["error"].is_null(), "{typed}");
+    assert_eq!(
+        typed["result"]["structuredContent"]["retry_safe"], false,
+        "{typed}"
+    );
+    let returned = call_tool(
+        &mut caller,
+        6,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(returned["error"].is_null(), "{returned}");
+    let proof = caller.home.join("routed-proof.txt");
+    let exported = call_tool(
+        &mut caller,
+        7,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-proof"),"host_path":proof}),
+    );
+    assert!(exported["error"].is_null(), "{exported}");
+    assert_eq!(
+        std::fs::read_to_string(&proof).expect("exported proof"),
+        "routed-owner-proof"
+    );
+    let prefix = call_tool(
+        &mut caller,
+        20,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"printf %s '"}),
+    );
+    assert!(prefix["error"].is_null(), "{prefix}");
+    for index in 0..12 {
+        caller.send(100 + index, "tools/call", json!({"name":"keyboard_type","arguments":{"session_id":session_id,"text":format!("{index},")}}));
+    }
+    for index in 0..12 {
+        let response = caller.response(100 + index, Duration::from_secs(30));
+        assert!(response["error"].is_null(), "{response}");
+    }
+    let suffix = call_tool(
+        &mut caller,
+        21,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"' > \"$HOME/routed-order\""}),
+    );
+    assert!(suffix["error"].is_null(), "{suffix}");
+    let submitted = call_tool(
+        &mut caller,
+        22,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(submitted["error"].is_null(), "{submitted}");
+    let ordered_proof = caller.home.join("routed-order.txt");
+    let exported_order = call_tool(
+        &mut caller,
+        23,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-order"),"host_path":ordered_proof}),
+    );
+    assert!(exported_order["error"].is_null(), "{exported_order}");
+    assert_eq!(
+        std::fs::read_to_string(ordered_proof).expect("ordered output"),
+        (0..12).map(|index| format!("{index},")).collect::<String>(),
+        "forwarded input lost wire order"
+    );
+    let log = std::fs::read_to_string(
+        started["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("input log"),
+    )
+    .expect("owner audit");
+    assert!(
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|record| record["typing"]["characters"] == command),
+        "owner did not audit routed text"
+    );
+    let closed = call_tool(
+        &mut caller,
+        8,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert!(closed["error"].is_null(), "{closed}");
+    assert!(
+        !process_alive(viewer_pid).unwrap_or(true),
+        "forwarded close did not reap viewer"
+    );
+    let stopped = call_tool(
+        &mut caller,
+        9,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    owner.sessions.retain(|owned| owned != &session_id);
+    assert!(!workdir(&started).exists(), "owner workdir remains");
+    let listed = call_tool(&mut owner, 4, "session_list", json!({}));
+    assert!(
+        listed["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{listed}"
+    );
+    let caller_sessions = call_tool(&mut caller, 10, "session_list", json!({}));
+    assert!(
+        caller_sessions["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1 && sessions[0]["session_id"] == caller_id),
+        "forwarding affected caller's desktop: {caller_sessions}"
+    );
+    caller.stop_process();
+    owner.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, input devices, and a full one-minute idle TTL"]
+fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
+    check_live_idle_expiry(false);
+}
+
+#[test]
+#[ignore = "requires private KWin, input devices, one-minute idle TTL, and sudo for a synthetic cleanup blocker"]
+fn live_expiry_cleanup_retry_preserves_the_reason_and_end_time() {
+    check_live_idle_expiry(true);
+}
+
+struct CleanupBlocker(PathBuf);
+impl CleanupBlocker {
+    fn create(path: PathBuf) -> Self {
+        assert!(
+            Command::new("sudo")
+                .args([
+                    "-n", "install", "-d", "-m", "700", "-o", "root", "-g", "root"
+                ])
+                .arg(&path)
+                .status()
+                .expect("create synthetic cleanup blocker")
+                .success()
+        );
+        Self(path)
+    }
+}
+impl Drop for CleanupBlocker {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "rmdir"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+fn check_live_idle_expiry(block_cleanup: bool) {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_with_env(&[("KWIN_MCP_E2E_TTL_MINUTES", "1")]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+    );
+    let id = session_handle(&started);
+    let runtime = workdir(&started);
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(runtime.file_name().expect("workdir name"));
+    let log = client
+        .home
+        .join(".local/state/kwin-mcp/session-lifecycle.jsonl");
+    let blocker = block_cleanup.then(|| CleanupBlocker::create(disk.join("synthetic-root-owned")));
+    let deadline = Instant::now() + Duration::from_secs(85);
+    let mut request = 3;
+    loop {
+        let list = call_tool(&mut client, request, "session_list", json!({}));
+        request += 1;
+        let sessions = list["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .expect("sessions");
+        if sessions
+            .iter()
+            .any(|entry| entry["session_id"] == id && entry["status"] == "expired")
+            && (block_cleanup || (!runtime.exists() && !disk.exists()))
+            && log.exists()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle session did not expire and clean up: {list}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    let records = std::fs::read_to_string(&log).expect("real lifecycle log");
+    let record: Value =
+        serde_json::from_str(records.lines().last().expect("expiry record")).expect("expiry JSON");
+    assert_eq!(record["session_id"], id);
+    assert_eq!(record["state"], "session_expired");
+    assert_eq!(record["reason"], "idle_timeout");
+    assert_eq!(
+        record["workdir_cleanup"],
+        if block_cleanup { "retained" } else { "removed" }
+    );
+    let unavailable = call_tool(
+        &mut client,
+        request,
+        "window_list",
+        json!({"session_id":id}),
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_status"], "expired",
+        "{unavailable}"
+    );
+    drop(blocker);
+    thread::sleep(Duration::from_secs(1));
+    let stopped = call_tool(
+        &mut client,
+        request + 1,
+        "session_stop",
+        json!({"session_id":id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    let stale = call_tool(
+        &mut client,
+        request + 2,
+        "window_list",
+        json!({"session_id":id}),
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_status"], "expired",
+        "{stale}"
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_end_reason"], "idle_timeout",
+        "{stale}"
+    );
+    assert!(!runtime.exists() && !disk.exists());
+    assert_eq!(
+        stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",
+        "{stale}"
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_ended_at_unix_seconds"], record["finished_at_unix_seconds"],
+        "cleanup changed the terminal timestamp: {stale}"
+    );
+    eprintln!("expiry proof: {record}; unavailable={stale}");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, input devices, and sudo for one synthetic root-owned directory"]
+fn cleanup_retry_updates_the_record_to_removed() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+    );
+    let id = session_handle(&started);
+    let runtime = workdir(&started);
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(runtime.file_name().expect("workdir name"));
+    let blocked = disk.join("synthetic-root-owned");
+    let blocker = CleanupBlocker::create(blocked);
+    let first = call_tool(&mut client, 3, "session_stop", json!({"session_id":id}));
+    let kept = runtime.exists() && disk.exists();
+    let still_blocked = call_tool(&mut client, 4, "session_stop", json!({"session_id":id}));
+
+    drop(blocker);
+    assert!(
+        first["error"].is_object() && kept,
+        "cleanup unexpectedly discarded ownership: {first}"
+    );
+    assert_eq!(
+        still_blocked["error"]["data"]["session_status"], "stopped",
+        "{still_blocked}"
+    );
+    assert_eq!(
+        still_blocked["error"]["data"]["session_end_reason"], "session_stop",
+        "{still_blocked}"
+    );
+    let second = call_tool(&mut client, 5, "session_stop", json!({"session_id":id}));
+
+    assert!(second["error"].is_null(), "{second}");
+    assert!(!runtime.exists() && !disk.exists());
+    let stale = call_tool(&mut client, 6, "window_list", json!({"session_id":id}));
+    eprintln!("cleanup retry proof: first={first}; second={second}; stale={stale}");
+    assert_eq!(
+        stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",
+        "successful cleanup left a stale retained record: {stale}"
+    );
+    client.stop_process();
+}
+
+#[test]
+fn prior_manual_stop_and_ttl_expiry_report_terminal_session_status() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-terminal-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let stopped_pid = server_pid.saturating_add(1);
+    let expired_pid = server_pid.saturating_add(2);
+    let stopped_id = format!("s{stopped_pid}-1");
+    let expired_id = format!("s{expired_pid}-1");
+    let records = [
+        json!({
+            "session_id": stopped_id,
+            "server_pid": stopped_pid,
+            "state": "session_stopped",
+            "reason": "session_stop",
+            "finished_at_unix_seconds": 100,
+            "workdir_cleanup": "removed",
+        }),
+        json!({
+            "session_id": expired_id,
+            "server_pid": expired_pid,
+            "state": "session_expired",
+            "reason": "idle_timeout",
+            "finished_at_unix_seconds": 200,
+            "workdir_cleanup": "removed",
+        }),
+    ];
+    let contents = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        log_dir.join("session-lifecycle.jsonl"),
+        format!("{contents}\n"),
+    )
+    .expect("write terminal lifecycle records");
+
+    let stopped = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":stopped_id}),
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_status"], "stopped",
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_stopped_at_unix_seconds"], 100,
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_end_reason"], "session_stop",
+        "{stopped}"
+    );
+
+    let expired = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":expired_id}),
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_status"], "expired",
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_expired_at_unix_seconds"], 200,
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_end_reason"], "idle_timeout",
+        "{expired}"
+    );
+    assert!(
+        expired["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is expired")),
+        "{expired}"
+    );
+
     client.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
@@ -4835,11 +6149,7 @@ fn malformed_session_lifecycle_record_is_an_error() {
     initialize(&mut client);
 
     let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let malformed = format!(
         "{}\n",
@@ -4896,12 +6206,7 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let seed_record = format!(
         "{}\n",
@@ -4928,6 +6233,24 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     );
     assert_eq!(
         response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "stopped",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_stopped_at_unix_seconds"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_end_reason"], "server_shutdown",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is stopped")),
         "{response}"
     );
     assert_eq!(
@@ -5037,7 +6360,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         timed_out["error"]["data"]["stage"]
             .as_str()
             .expect("stage")
-            .contains("active window")
+            .contains("windows before launch")
     );
     assert!(
         (19_000..23_000).contains(&elapsed_ms),
@@ -5049,14 +6372,20 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let scripts = std::fs::read_dir(&workdir)
-            .expect("workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let scripts = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir.file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if scripts == 0 {
             break;
         }
@@ -5571,14 +6900,20 @@ fn one_process_routes_parallel_sessions_and_orders_input_on_stdio() {
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let concurrent = std::fs::read_dir(workdir(&a))
-            .expect("A workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let concurrent = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir(&a).file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("A workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if concurrent >= 2 {
             break;
         }
@@ -5903,6 +7238,27 @@ fn transport_eof_cleans_every_owned_session() {
         );
         directories.push(workdir(&response));
     }
+    let manually_stopped = call_tool(
+        &mut client,
+        4,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let manually_stopped_id = session_handle(&manually_stopped);
+    let manually_stopped_workdir = workdir(&manually_stopped);
+    sessions.push(manually_stopped_id.clone());
+    directories.push(manually_stopped_workdir.clone());
+    let stopped = call_tool(
+        &mut client,
+        5,
+        "session_stop",
+        json!({"session_id":manually_stopped_id}),
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    assert!(!manually_stopped_workdir.exists());
     drop(client.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(20);
     while client.child.try_wait().expect("server status").is_none() {
@@ -5936,25 +7292,45 @@ fn transport_eof_cleans_every_owned_session() {
             "window_list",
             json!({"session_id":session_id}),
         );
-        assert_eq!(
-            unavailable["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
-            "{unavailable}"
-        );
-        let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
-        assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
-        assert_eq!(record["reason"], "server_shutdown", "{record}");
-        assert_eq!(
-            record["session_id"].as_str(),
-            Some(session_id.as_str()),
-            "{record}"
-        );
-        assert_eq!(record["workdir_cleanup"], "removed", "{record}");
-        assert!(
-            unavailable["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("shutdown cleanup finished")),
-            "{unavailable}"
-        );
+        if index < 2 {
+            assert_eq!(
+                unavailable["error"]["data"]["previous_server_cleanup"],
+                "shutdown_cleanup_finished",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
+            assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
+            assert_eq!(record["reason"], "server_shutdown", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+            assert_eq!(record["workdir_cleanup"], "removed", "{record}");
+            assert!(
+                unavailable["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("shutdown cleanup finished")),
+                "{unavailable}"
+            );
+        } else {
+            assert_eq!(
+                unavailable["error"]["data"]["session_status"], "stopped",
+                "{unavailable}"
+            );
+            assert_eq!(
+                unavailable["error"]["data"]["session_end_reason"], "session_stop",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_session_lifecycle_record"];
+            assert_eq!(record["state"], "session_stopped", "{record}");
+            assert_eq!(record["reason"], "session_stop", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+        }
     }
     replacement.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove shared lifecycle state");
@@ -6613,6 +7989,315 @@ fn human_input_matches_published_timing_profile_on_stdio() {
         json!({"session_id":session}),
     );
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin desktops, Chrome, PipeWire, and Vulkan viewer rendering"]
+fn viewer_displays_current_pixels_after_a_second_fresh_session() {
+    use base64::Engine;
+
+    const WIDTH: u32 = 1440;
+    const HEIGHT: u32 = 900;
+    const SOURCE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+    const VIEWER_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+    const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const COLOR_TOLERANCE: u8 = 16;
+
+    fn tool(client: &mut RpcClient, request: &mut u64, name: &str, args: Value) -> Value {
+        let response = call_tool(client, *request, name, args);
+        *request += 1;
+        response
+    }
+
+    fn matches_palette(response: &Value, colors: &[[u8; 3]; 4]) -> bool {
+        if inline_png(response).is_empty() {
+            return false;
+        }
+        let image = decode_rgba(response);
+        let height = u32::try_from(image.1.len() / 4 / usize::try_from(image.0).expect("width"))
+            .expect("height");
+        [(1, 1), (3, 1), (1, 3), (3, 3)]
+            .into_iter()
+            .zip(colors)
+            .all(|((x, y), expected)| {
+                let actual = pixel(&image, image.0 * x / 4, height * y / 4);
+                actual[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(*expected) <= COLOR_TOLERANCE)
+            })
+    }
+
+    let save = |response: &Value, name: &str| {
+        if let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).expect("screenshot artifact directory");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(response))
+                .expect("screenshot artifact base64");
+            std::fs::write(root.join(name), bytes).expect("save screenshot artifact");
+        }
+    };
+
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // The viewer's host is another isolated desktop, so its actual composited
+    // pixels can be checked through MCP without capturing the user's desktop.
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    assert!(display.exists(), "private viewer display missing");
+    // Force PipeWire to become ready after WirePlumber would otherwise start.
+    // Both are still real daemons; only their startup ordering is controlled.
+    let wrappers =
+        PathBuf::from("/var/tmp").join(format!("km-viewer-media-{}", std::process::id()));
+    std::fs::create_dir(&wrappers).expect("media wrapper directory");
+    let _wrappers = RemoveDirOnDrop(wrappers.clone());
+    use std::os::unix::fs::PermissionsExt;
+    for (name, script) in [
+        (
+            "pipewire",
+            "#!/bin/bash\nsleep 1\nexec /usr/bin/pipewire \"$@\"\n",
+        ),
+        (
+            "wireplumber",
+            "#!/bin/bash\ntest -S \"$XDG_RUNTIME_DIR/pipewire-0\" || { echo 'policy started before PipeWire socket' >&2; exit 98; }\nexec /usr/bin/wireplumber \"$@\"\n",
+        ),
+    ] {
+        let path = wrappers.join(name);
+        std::fs::write(&path, script).expect("media startup wrapper");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("executable wrapper");
+    }
+    let path = format!(
+        "{}:{}",
+        wrappers.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let mut client = RpcClient::start_with_env(&[
+        (
+            "WAYLAND_DISPLAY",
+            display.to_str().expect("private display"),
+        ),
+        ("PATH", &path),
+    ]);
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let mut request = 2;
+    let mut host_request = 3;
+    let mut previous_session = None;
+    let palettes = [
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]],
+        [[0, 255, 255], [255, 0, 255], [255, 255, 0], [0, 0, 255]],
+    ];
+    for (round, colors) in palettes.iter().enumerate() {
+        let fixture = client.home.join("viewer-frame.html");
+        let swatches =
+            colors.map(|[r, g, b]| format!("<div style='background:rgb({r},{g},{b})'></div>"));
+        std::fs::write(
+            &fixture,
+            format!(
+                "<!doctype html><style>html,body{{margin:0;width:100%;height:100%;overflow:hidden}}\
+                 body{{display:grid;grid-template:1fr 1fr/1fr 1fr}}\
+                 p{{position:absolute;top:45%;left:30%;background:white;padding:12px;font:28px sans-serif}}</style>\
+                 {}<p>Fresh session {}</p>",
+                swatches.join(""),
+                round + 1
+            ),
+        )
+        .expect("write private browser fixture");
+        let started = tool(
+            &mut client,
+            &mut request,
+            "session_start",
+            json!({"width":WIDTH,"height":HEIGHT}),
+        );
+        let session = session_handle(&started);
+        assert_ne!(previous_session.as_ref(), Some(&session));
+        assert_eq!(client.child.id(), server_pid, "MCP server was restarted");
+        assert_eq!(
+            started["result"]["structuredContent"]["viewer"]["state"], "closed",
+            "{started}"
+        );
+        let launched = tool(
+            &mut client,
+            &mut request,
+            "launch_app",
+            json!({"session_id":session,"command":format!(
+                "google-chrome-stable --user-data-dir=/tmp/viewer-fresh-{round} --no-first-run --no-default-browser-check --app='file://{}'",
+                fixture.display()
+            )}),
+        );
+        assert!(
+            !launched["result"]["isError"].as_bool().unwrap_or(false),
+            "{launched}"
+        );
+        let deadline = Instant::now() + SOURCE_FRAME_TIMEOUT;
+        loop {
+            let source = tool(
+                &mut client,
+                &mut request,
+                "screenshot",
+                json!({"session_id":session,"inline":true}),
+            );
+            if matches_palette(&source, colors) {
+                let meta = screenshot_meta(&source);
+                assert_eq!(meta["width"], WIDTH, "{meta}");
+                assert_eq!(meta["height"], HEIGHT, "{meta}");
+                save(&source, &format!("viewer-fresh-{}-source.png", round + 1));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "browser fixture pixels did not appear"
+            );
+            thread::sleep(FRAME_POLL_INTERVAL);
+        }
+
+        let open_request = request;
+        request += 1;
+        client.send(
+            open_request,
+            "tools/call",
+            json!({"name":"viewer_open","arguments":{"session_id":session}}),
+        );
+        let expected_title = format!("kwin-viewer {session}");
+        let deadline = Instant::now() + VIEWER_FRAME_TIMEOUT;
+        let mut displayed = false;
+        let mut saved_first = false;
+        while Instant::now() < deadline {
+            let windows = tool(
+                &mut desktop,
+                &mut host_request,
+                "window_list",
+                json!({"session_id":host_id}),
+            );
+            let viewers: Vec<_> = windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("private desktop windows")
+                .iter()
+                .filter(|window| window["title"] == expected_title)
+                .collect();
+            assert!(viewers.len() <= 1, "duplicate viewer windows: {viewers:?}");
+            if let Some(viewer) = viewers.first() {
+                tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "window_activate",
+                    json!({"session_id":host_id,"window_id":viewer["id"]}),
+                );
+                let captured = tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "screenshot",
+                    json!({"session_id":host_id,"inline":true}),
+                );
+                if !inline_png(&captured).is_empty() && !saved_first {
+                    save(
+                        &captured,
+                        &format!("viewer-fresh-{}-initial.png", round + 1),
+                    );
+                    saved_first = true;
+                }
+                if matches_palette(&captured, colors) {
+                    save(
+                        &captured,
+                        &format!("viewer-fresh-{}-displayed.png", round + 1),
+                    );
+                    displayed = true;
+                    break;
+                }
+            }
+            thread::sleep(FRAME_POLL_INTERVAL);
+        }
+        let opened = client.response(open_request, Duration::from_secs(10));
+        let log = std::fs::read_to_string(workdir(&started).join("viewer.log")).unwrap_or_default();
+        if opened["result"]["structuredContent"]["viewer"]["state"] != "ready"
+            && let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR")
+        {
+            let root = PathBuf::from(root);
+            let runtime = workdir(&started);
+            let sandbox = client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(runtime.file_name().expect("workdir name"))
+                .join("sandbox.log");
+            let _ = std::fs::copy(sandbox, root.join("failed-sandbox.log"));
+            let _ = std::fs::write(root.join("failed-viewer.log"), &log);
+            if let Ok(graph) = Command::new("timeout")
+                .args(["3", "pw-dump", "--remote"])
+                .arg(runtime.join("pipewire-0"))
+                .output()
+            {
+                let _ = std::fs::write(root.join("failed-pipewire.json"), graph.stdout);
+                let _ = std::fs::write(root.join("failed-pipewire.stderr"), graph.stderr);
+            }
+        }
+        assert_eq!(
+            opened["result"]["structuredContent"]["viewer"]["state"],
+            "ready",
+            "fresh session {}: {opened}\n{log}",
+            round + 1
+        );
+        assert!(
+            displayed,
+            "fresh session {}: viewer did not display current session pixels\n{log}",
+            round + 1
+        );
+        let pid = u32::try_from(
+            opened["result"]["structuredContent"]["viewer"]["pid"]
+                .as_u64()
+                .expect("viewer PID"),
+        )
+        .expect("PID fits");
+        let stopped = tool(
+            &mut client,
+            &mut request,
+            "session_stop",
+            json!({"session_id":session}),
+        );
+        assert_eq!(
+            stopped["result"]["structuredContent"]["status"], "stopped",
+            "{stopped}"
+        );
+        assert!(
+            !process_alive(pid).unwrap_or(true),
+            "stopped session left a viewer process"
+        );
+        let windows = tool(
+            &mut desktop,
+            &mut host_request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        assert!(
+            !windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("private desktop windows")
+                .iter()
+                .any(|window| window["title"] == expected_title),
+            "stopped session left its viewer window: {windows}"
+        );
+        previous_session = Some(session);
+        println!(
+            "PASS: fresh session {} displayed its current palette and cleaned up",
+            round + 1
+        );
+    }
+    client.stop_process();
+    tool(
+        &mut desktop,
+        &mut host_request,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
 }
 
 #[test]
@@ -7373,4 +9058,379 @@ fn launch_rejects_host_tmp_file_before_opening_app() {
     println!(
         "PASS: host /tmp path and --file path rejected before app launch; ordinary launch still opens a private window"
     );
+}
+
+#[test]
+#[ignore = "requires private KWin desktops, Chrome, PipeWire, and Vulkan viewer rendering"]
+fn viewer_reuses_and_reopens_after_presenting_a_frame() {
+    use base64::Engine;
+
+    const WIDTH: u32 = 1400;
+    const HEIGHT: u32 = 1000;
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const COLOR_TOLERANCE: u8 = 16;
+
+    fn tool(client: &mut RpcClient, request: &mut u64, name: &str, args: Value) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let response = loop {
+            let response = call_tool(client, *request, name, args.clone());
+            *request += 1;
+            if response["error"]["data"]["reason"] == "recent_viewer_input"
+                && response["error"]["data"]["retry_safe"] == true
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            break response;
+        };
+
+        assert!(response["error"].is_null(), "{response}");
+        assert!(
+            !response["result"]["isError"].as_bool().unwrap_or(false),
+            "{response}"
+        );
+        response
+    }
+
+    fn matches_palette(response: &Value, colors: &[[u8; 3]; 4]) -> bool {
+        if inline_png(response).is_empty() {
+            return false;
+        }
+        let image = decode_rgba(response);
+        let height = u32::try_from(image.1.len() / 4 / usize::try_from(image.0).expect("width"))
+            .expect("height");
+        [(1, 1), (3, 1), (1, 3), (3, 3)]
+            .into_iter()
+            .zip(colors)
+            .all(|((x, y), expected)| {
+                let actual = pixel(&image, image.0 * x / 4, height * y / 4);
+                actual[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(*expected) <= COLOR_TOLERANCE)
+            })
+    }
+
+    fn save(response: &Value, name: &str) {
+        if let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).expect("artifact directory");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(response))
+                .expect("screenshot base64");
+            std::fs::write(root.join(name), bytes).expect("save screenshot");
+        }
+    }
+
+    fn write_fixture(path: &std::path::Path, colors: &[[u8; 3]; 4], label: &str) {
+        let swatches =
+            colors.map(|[r, g, b]| format!("<div style='background:rgb({r},{g},{b})'></div>"));
+        std::fs::write(path, format!(
+            "<!doctype html><style>html,body{{margin:0;width:100%;height:100%;overflow:hidden}}\
+             body{{display:grid;grid-template:1fr 1fr/1fr 1fr}}\
+             p{{position:absolute;top:45%;left:30%;background:white;padding:12px;font:28px sans-serif}}</style>\
+             {}<p>Same session, frame {}</p>", swatches.join(""), label
+        )).expect("write private HTML fixture");
+    }
+
+    fn navigate(
+        client: &mut RpcClient,
+        request: &mut u64,
+        session: &str,
+        fixture: &std::path::Path,
+    ) {
+        tool(
+            client,
+            request,
+            "keyboard_key",
+            json!({"session_id":session,"key":"ctrl+l"}),
+        );
+        tool(
+            client,
+            request,
+            "keyboard_type",
+            json!({"session_id":session,"text":format!("file://{}",fixture.display())}),
+        );
+        tool(
+            client,
+            request,
+            "keyboard_key",
+            json!({"session_id":session,"key":"Return"}),
+        );
+    }
+
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // The viewer renders into an owned outer desktop, so the proof captures
+    // compositor pixels without reading or operating the user's desktop.
+    let bus = require_filtered_cookie_test_bus();
+    let mut desktop = RpcClient::start_with_env(&[("DBUS_SESSION_BUS_ADDRESS", &bus)]);
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    let mut client = RpcClient::start_with_env(&[
+        ("WAYLAND_DISPLAY", display.to_str().expect("display")),
+        ("DBUS_SESSION_BUS_ADDRESS", &bus),
+    ]);
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let mut request = 2;
+    let mut host_request = 3;
+    let started = tool(
+        &mut client,
+        &mut request,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let session = session_handle(&started);
+    let palettes = [
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]],
+        [[0, 255, 255], [255, 0, 255], [255, 255, 0], [0, 0, 255]],
+    ];
+    let mut previous_pid = None;
+    let mut browser_id = None;
+    for (round, colors) in palettes.iter().enumerate() {
+        let fixture = client.home.join(format!("viewer-reuse-{round}.html"));
+        write_fixture(&fixture, colors, &format!("{} opened", round + 1));
+        if round == 0 {
+            tool(
+                &mut client,
+                &mut request,
+                "launch_app",
+                json!({"session_id":session,"command":format!(
+                    "google-chrome-stable --user-data-dir=/tmp/viewer-reuse --no-first-run --no-default-browser-check 'file://{}'", fixture.display()
+                )}),
+            );
+            let windows = tool(
+                &mut client,
+                &mut request,
+                "window_list",
+                json!({"session_id":session}),
+            );
+            browser_id = Some(
+                windows["result"]["structuredContent"]["windows"]
+                    .as_array()
+                    .expect("browser windows")
+                    .iter()
+                    .find(|window| {
+                        window["resourceClass"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("chrome")
+                    })
+                    .expect("Chrome window")["id"]
+                    .clone(),
+            );
+        } else {
+            navigate(&mut client, &mut request, &session, &fixture);
+        }
+        let deadline = Instant::now() + FRAME_TIMEOUT;
+        loop {
+            let source = tool(
+                &mut client,
+                &mut request,
+                "screenshot",
+                json!({"session_id":session,"inline":true}),
+            );
+            if matches_palette(&source, colors) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source palette did not appear");
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let opened = tool(
+            &mut client,
+            &mut request,
+            "viewer_open",
+            json!({"session_id":session,"reason":"Inspect the current frame"}),
+        );
+        let viewer = &opened["result"]["structuredContent"]["viewer"];
+        let log = std::fs::read_to_string(workdir(&started).join("viewer.log")).unwrap_or_default();
+        assert_eq!(viewer["state"], "ready", "{opened}\n{log}");
+        let pid = viewer["pid"].as_u64().expect("viewer PID");
+        assert_ne!(
+            previous_pid,
+            Some(pid),
+            "reopen did not create a new viewer"
+        );
+        if let Some(previous) = previous_pid {
+            assert!(
+                !process_alive(u32::try_from(previous).expect("old PID fits")).unwrap_or(true),
+                "reopen did not reap the old viewer"
+            );
+        }
+        let mut window_id = None;
+
+        for (phase, reason) in [
+            ("opened", "Inspect the current frame"),
+            ("reused", "Enter the verification code"),
+        ] {
+            let current_colors = if phase == "reused" {
+                colors.map(|[r, g, b]| [b, r, g])
+            } else {
+                *colors
+            };
+            if phase == "reused" {
+                // Change the live browser before updating the viewer's reason:
+                // stale pixels and a stale ready file must not satisfy reuse.
+                let live = client.home.join(format!("viewer-reuse-{round}-live.html"));
+                write_fixture(&live, &current_colors, &format!("{} reused", round + 1));
+                navigate(&mut client, &mut request, &session, &live);
+                let reused = tool(
+                    &mut client,
+                    &mut request,
+                    "viewer_open",
+                    json!({"session_id":session,"reason":reason}),
+                );
+                let data = &reused["result"]["structuredContent"];
+                assert_eq!(data["status"], "already_open", "{reused}");
+                assert_eq!(data["viewer"]["state"], "ready", "{reused}");
+                assert_eq!(
+                    data["viewer"]["pid"], pid,
+                    "reuse replaced a working viewer"
+                );
+            }
+            let title = format!("kwin-viewer {session}: {reason}");
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            loop {
+                let windows = tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "window_list",
+                    json!({"session_id":host_id}),
+                );
+                let viewers: Vec<_> = windows["result"]["structuredContent"]["windows"]
+                    .as_array()
+                    .expect("outer windows")
+                    .iter()
+                    .filter(|window| {
+                        window["title"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .starts_with(&format!("kwin-viewer {session}:"))
+                    })
+                    .collect();
+                assert!(viewers.len() <= 1, "duplicate viewers: {viewers:?}");
+                if let Some(window) = viewers.first().filter(|window| window["title"] == title) {
+                    if let Some(id) = &window_id {
+                        assert_eq!(&window["id"], id, "reuse replaced the window");
+                    }
+                    window_id = Some(window["id"].clone());
+                    tool(
+                        &mut desktop,
+                        &mut host_request,
+                        "window_activate",
+                        json!({"session_id":host_id,"window_id":window["id"]}),
+                    );
+                    let displayed = tool(
+                        &mut desktop,
+                        &mut host_request,
+                        "screenshot",
+                        json!({"session_id":host_id,"inline":true}),
+                    );
+                    if matches_palette(&displayed, &current_colors) {
+                        save(&displayed, &format!("viewer-reuse-{round}-{phase}.png"));
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "viewer did not show current pixels/title: {windows}"
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+        assert_eq!(client.child.id(), server_pid, "server restarted");
+        let windows = tool(
+            &mut client,
+            &mut request,
+            "window_list",
+            json!({"session_id":session}),
+        );
+        assert!(
+            windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("source windows")
+                .iter()
+                .any(|window| Some(&window["id"]) == browser_id.as_ref()),
+            "browser was replaced: {windows}"
+        );
+        if round == 0 {
+            // Exercise an actual window-manager close through the outer MCP
+            // desktop, rather than relying only on viewer_close.
+            tool(
+                &mut desktop,
+                &mut host_request,
+                "window_activate",
+                json!({"session_id":host_id,"window_id":window_id}),
+            );
+            tool(
+                &mut desktop,
+                &mut host_request,
+                "keyboard_key",
+                json!({"session_id":host_id,"key":"alt+F4"}),
+            );
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            while process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(false) {
+                assert!(
+                    Instant::now() < deadline,
+                    "viewer process survived window close"
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+        } else {
+            let closed = tool(
+                &mut client,
+                &mut request,
+                "viewer_close",
+                json!({"session_id":session}),
+            );
+            assert_eq!(closed["result"]["structuredContent"]["status"], "closed");
+        }
+        assert!(
+            round == 0 || !process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(true),
+            "viewer process survived close"
+        );
+        let windows = tool(
+            &mut desktop,
+            &mut host_request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        assert!(
+            !windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("outer windows")
+                .iter()
+                .any(|window| Some(&window["id"]) == window_id.as_ref()),
+            "viewer window survived close"
+        );
+        previous_pid = Some(pid);
+        println!(
+            "PASS: round {} opened, reused with updated title/current pixels, and closed; browser/session unchanged",
+            round + 1
+        );
+    }
+    tool(
+        &mut client,
+        &mut request,
+        "session_stop",
+        json!({"session_id":session}),
+    );
+    client.stop_process();
+    tool(
+        &mut desktop,
+        &mut host_request,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
 }

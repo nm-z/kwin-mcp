@@ -5261,7 +5261,6 @@ struct KwinMcp {
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
     input_order: Arc<InputOrder>,
-    tool_calls: Arc<std::sync::Mutex<usize>>,
     session: Arc<tokio::sync::RwLock<Option<Session>>>,
     /// Cleanup ownership of the session workdir under --autoclean. Claimed
     /// before session_start creates the directory and released only once the
@@ -5291,6 +5290,46 @@ impl KwinMcp {
             .death
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(diagnostic);
+    }
+
+    fn record_lifecycle(&self, state: &str, reason: &str, workdir_cleanup: &str) {
+        let ended_at = self
+            .death_record()
+            .and_then(|record| record["session_ended_at_unix_seconds"].as_u64());
+        match append_session_lifecycle_event(
+            &self.session_id,
+            state,
+            reason,
+            workdir_cleanup,
+            ended_at,
+        ) {
+            Ok(()) => eprintln!(
+                "session lifecycle: session_id={} state={state} reason={reason}",
+                self.session_id
+            ),
+            Err(error) => eprintln!(
+                "session lifecycle: could not record {state} for {}: {error}",
+                self.session_id
+            ),
+        }
+    }
+
+    fn record_terminal_cleanup(&self, cleanup: &str) {
+        let Some(terminal) = self.death_record() else {
+            return;
+        };
+        let transition = match terminal["session_status"].as_str() {
+            Some("stopped") => (
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
+                SESSION_LIFECYCLE_REASON_SESSION_STOP,
+            ),
+            Some("expired") => (
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            ),
+            _ => return,
+        };
+        self.record_lifecycle(transition.0, transition.1, cleanup);
     }
 
     async fn check_liveness(&self) -> Option<serde_json::Value> {
@@ -5325,6 +5364,63 @@ impl KwinMcp {
         Some(diagnostic)
     }
 
+    async fn refresh_viewer_child(&self) -> Result<(), String> {
+        let mut guard = self.session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
+            Some(Ok(None)) | None => Ok(()),
+            Some(Ok(Some(_))) => {
+                session.viewer_child.take();
+                Ok(())
+            }
+            Some(Err(error)) => {
+                let reason = format!(
+                    "check viewer process {}: {error}",
+                    session.viewer_child.as_ref().map_or(0, SessionProcess::id)
+                );
+                eprintln!("viewer liveness: {reason}");
+                Err(reason)
+            }
+        }
+    }
+
+    async fn viewer_input_is_recent(&self) -> Result<bool, String> {
+        // Do not queue another session read lock while an input operation
+        // holds one: a waiting liveness writer would block the activity check
+        // that must cancel that operation. The owned workdir path is stable.
+        let activity_path = self.path.join(VIEWER_INPUT_ACTIVITY_FILE);
+        let modified = match std::fs::metadata(&activity_path) {
+            Ok(metadata) => metadata.modified().map_err(|error| {
+                format!(
+                    "read {} modification time: {error}",
+                    activity_path.display()
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "read {} metadata: {error}",
+                    activity_path.display()
+                ));
+            }
+        };
+        let age = match std::time::SystemTime::now().duration_since(modified) {
+            Ok(age) => age,
+            Err(error) => error.duration(),
+        };
+        Ok(age <= VIEWER_INPUT_QUIET_PERIOD)
+    }
+
+    async fn viewer_is_active_with_recent_input(&self) -> Result<bool, String> {
+        // The child exists only for a viewer on this host. A remote viewer's
+        // `--serve` relay writes the same activity file without a local child.
+        // Always reap/check a local child when present, then use the file for
+        // both local and remote input activity.
+        self.refresh_viewer_child().await?;
+        self.viewer_input_is_recent().await
+    }
     fn new(display: DisplayConfig) -> Self {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
@@ -5335,7 +5431,6 @@ impl KwinMcp {
             path: session_workdir_path(),
             input_gate: Arc::new(tokio::sync::Mutex::new(())),
             input_order: Arc::new(InputOrder::default()),
-            tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             start_stage: Arc::new(std::sync::Mutex::new(
@@ -5528,7 +5623,9 @@ impl KwinMcp {
             }
             teardown_blocking(sess).await;
         }
-        let workdir_cleanup = match self.workdir.remove() {
+        let cleanup = self.workdir.remove();
+        let cleanup_changed = !matches!(&cleanup, WorkdirCleanup::NothingOwned);
+        let workdir_cleanup = match cleanup {
             WorkdirCleanup::NothingOwned => "not_requested",
             WorkdirCleanup::Removed(dir) => {
                 eprintln!("shutdown: autoclean removed {}", dir.display());
@@ -5543,16 +5640,13 @@ impl KwinMcp {
             }
         };
         if session_was_live {
-            match append_session_lifecycle_event(&self.session_id, workdir_cleanup) {
-                Ok(()) => eprintln!(
-                    "session lifecycle: session_id={} state=shutdown_cleanup_finished",
-                    self.session_id
-                ),
-                Err(error) => eprintln!(
-                    "session lifecycle: could not record shutdown for {}: {error}",
-                    self.session_id
-                ),
-            }
+            self.record_lifecycle(
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED,
+                SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN,
+                workdir_cleanup,
+            );
+        } else if cleanup_changed {
+            self.record_terminal_cleanup(workdir_cleanup);
         }
     }
 }
@@ -5795,9 +5889,7 @@ fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
             ),
         ));
     }
-    // Startup can fail before a Session exists, so teardown cannot be the only
-    // owner of the disk overlay's cleanup. Remove it before the temporary
-    // workdir: a failure must keep the lease and ownership reachable for retry.
+    // Failed startup may not publish a Session to clean its disk overlay.
     let disk = session_disk_path(dir);
     remove_verified_workdir(&disk).map_err(|error| {
         std::io::Error::new(
@@ -5824,6 +5916,39 @@ fn remove_verified_workdir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Mountinfo escapes whitespace and backslashes with octal bytes. Compare
+/// decoded paths, not its printed field, before traversing owned storage.
+fn mounted_paths() -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    std::fs::read("/proc/self/mountinfo")?
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut field = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .nth(4)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "mountinfo lacks a mountpoint",
+                    )
+                })?;
+            let mut path = Vec::with_capacity(field.len());
+            while !field.is_empty() {
+                if let [b'\\', a @ b'0'..=b'3', b @ b'0'..=b'7', c @ b'0'..=b'7', ..] = field {
+                    path.push((*a - b'0') * 64 + (*b - b'0') * 8 + (*c - b'0'));
+                    field = &field[4..];
+                } else {
+                    path.push(field[0]);
+                    field = &field[1..];
+                }
+            }
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(path)))
+        })
+        .collect()
+}
+
 /// A previous --autoclean server explicitly marked this workdir and held its
 /// lease until exit. The marker records the sandbox process group so a crash
 /// cannot cause a later server to delete a still-running container.
@@ -5832,7 +5957,7 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let temp = std::env::temp_dir();
     let uid = std::fs::metadata("/proc/self")?.uid();
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mounts = mounted_paths()?;
     for entry in std::fs::read_dir(&temp)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -5903,16 +6028,20 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
         {
             continue;
         }
-        let dir_text = dir.to_string_lossy();
-        let mount_prefix = format!("{dir_text}/");
-        if mounts
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(4))
-            .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
-        {
+        let disk = session_disk_path(&dir);
+        let storage_mounted = [&dir, &disk]
+            .iter()
+            .any(|path| mounts.iter().any(|mount| mount.starts_with(*path)));
+        if storage_mounted {
             continue;
         }
-        match remove_verified_workdir(&dir) {
+        let remove_disk = remove_verified_workdir(&disk).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("disk overlay {} not removed: {error}", disk.display()),
+            )
+        });
+        match remove_disk.and_then(|()| remove_verified_workdir(&dir)) {
             Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
             Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
         }
@@ -5930,11 +6059,11 @@ fn sweep_dead_owner_workdirs(
     use std::os::unix::fs::MetadataExt;
     let temp = std::env::temp_dir();
     let uid = std::fs::metadata("/proc/self")?.uid();
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let cmdlines: Vec<String> = procfs::process::all_processes()
+    let mounts = mounted_paths()?;
+    let cmdlines: Vec<Vec<String>> = procfs::process::all_processes()
         .map_err(std::io::Error::other)?
         .flatten()
-        .filter_map(|process| process.cmdline().ok().map(|args| args.join(" ")))
+        .filter_map(|process| process.cmdline().ok())
         .collect();
     // Disk twins (session_disk_root) count too: a twin whose workdir is gone,
     // removed above or cleared from /tmp by a reboot, is leaked the same way.
@@ -5986,19 +6115,22 @@ fn sweep_dead_owner_workdirs(
             if owner_alive {
                 continue;
             }
-            let dir_text = dir.to_string_lossy();
-            let mount_prefix = format!("{dir_text}/");
+            let disk = session_disk_path(&dir);
             if mounts
-                .lines()
-                .filter_map(|line| line.split_whitespace().nth(4))
-                .any(|mount| mount == dir_text || mount.starts_with(&mount_prefix))
+                .iter()
+                .any(|mount| mount.starts_with(&dir) || (root == temp && mount.starts_with(&disk)))
             {
                 continue;
             }
-            if cmdlines.iter().any(|args| {
-                args.split(' ')
-                    .any(|arg| arg == dir_text || arg.starts_with(&mount_prefix))
-            }) {
+            // Keep argv boundaries: splitting a joined command line loses
+            // paths containing whitespace. Conservatively retain references
+            // embedded in shell command arguments as well.
+            let dir_text = dir.to_string_lossy();
+            if cmdlines
+                .iter()
+                .flatten()
+                .any(|arg| arg.contains(dir_text.as_ref()))
+            {
                 continue;
             }
             match remove_verified_workdir(&dir) {
@@ -7138,59 +7270,14 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
-/// FIFO in the session workdir that the viewer reads tool-call starts ("B")
-/// and ends ("E") from, so it holds the user's input while a call runs (see
-/// src/bin/kwin-viewer.rs ToolGate).
-const TOOL_CALLS_FIFO: &str = "tool-calls";
-
-/// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
-/// Non-blocking and best effort: with no viewer reading the FIFO the open
-/// fails with ENXIO and nothing is sent, so tool calls never wait on it.
-fn signal_tool_call(dir: &Path, mark: u8) {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join(TOOL_CALLS_FIFO);
-    if let Ok(mut fifo) = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-    {
-        let _ = std::io::Write::write_all(&mut fifo, &[mark]);
-    }
-}
-
-/// Marks one tool call in flight for the viewer; the end is sent on drop, so
-/// it goes out whether the call returns, errors or is cancelled.
-struct ToolCallMark(PathBuf, Arc<std::sync::Mutex<usize>>);
-
-impl ToolCallMark {
-    fn begin(dir: &Path, calls: &Arc<std::sync::Mutex<usize>>) -> Self {
-        let mut active = calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *active == 0 {
-            signal_tool_call(dir, b'B');
-        }
-        *active += 1;
-        Self(dir.to_owned(), calls.clone())
-    }
-}
-
-impl Drop for ToolCallMark {
-    fn drop(&mut self) {
-        let mut active = self
-            .1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active -= 1;
-        if *active == 0 {
-            signal_tool_call(&self.0, b'E');
-        }
-    }
-}
+const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
+const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const VIEWER_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
+const VIEWER_STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work, and the error is
@@ -7298,7 +7385,33 @@ fn viewer_report(
         };
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
-    match field("state").as_str() {
+    let phase = field("state");
+    if let Some(status_pid) = status.as_ref().and_then(|value| value["pid"].as_u64())
+        && status_pid != u64::from(child.id())
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer status belongs to another process",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    if phase == "ready"
+        && (status.as_ref().and_then(|value| value["pid"].as_u64()) != Some(u64::from(child.id()))
+            || !std::fs::metadata(host_xdg_dir.join(VIEWER_STATUS_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age <= VIEWER_STATUS_STALE_AFTER))
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer window status is stale",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    match phase.as_str() {
         "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
         "failed" | "closed" => {
             serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
@@ -8516,6 +8629,10 @@ fn session_lifecycle_log_path() -> PathBuf {
 
 const SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED: &str = "shutdown_cleanup_finished";
 const SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN: &str = "server_shutdown";
+const SESSION_LIFECYCLE_STATE_SESSION_STOPPED: &str = "session_stopped";
+const SESSION_LIFECYCLE_REASON_SESSION_STOP: &str = "session_stop";
+const SESSION_LIFECYCLE_STATE_SESSION_EXPIRED: &str = "session_expired";
+const SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT: &str = "idle_timeout";
 const SESSION_LIFECYCLE_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -8538,14 +8655,26 @@ impl SessionLifecycleRecord {
                 pid.parse::<u32>().ok() == Some(self.server_pid)
                     && number.parse::<u64>().is_ok_and(|number| number > 0)
             });
+        let valid_transition = matches!(
+            (self.state.as_str(), self.reason.as_str()),
+            (
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED,
+                SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN
+            ) | (
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
+                SESSION_LIFECYCLE_REASON_SESSION_STOP
+            ) | (
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT
+            )
+        );
         if self.server_pid == 0
             || self.finished_at_unix_seconds == 0
             || !valid_session_id
-            || self.state != SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED
-            || self.reason != SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN
+            || !valid_transition
             || !matches!(
                 self.workdir_cleanup.as_str(),
-                "not_requested" | "removed" | "retained"
+                "not_requested" | "not_owned" | "removed" | "retained"
             )
         {
             return Err(std::io::Error::new(
@@ -8555,9 +8684,25 @@ impl SessionLifecycleRecord {
         }
         Ok(self)
     }
+
+    fn status(&self) -> &'static str {
+        match self.state.as_str() {
+            SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "expired",
+            SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED | SESSION_LIFECYCLE_STATE_SESSION_STOPPED => {
+                "stopped"
+            }
+            _ => "unknown",
+        }
+    }
 }
 
-fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> std::io::Result<()> {
+fn append_session_lifecycle_event(
+    session_id: &str,
+    state: &str,
+    reason: &str,
+    workdir_cleanup: &str,
+    ended_at: Option<u64>,
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -8573,9 +8718,9 @@ fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> st
     let record = SessionLifecycleRecord {
         session_id: session_id.to_owned(),
         server_pid: std::process::id(),
-        state: SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED.to_owned(),
-        reason: SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN.to_owned(),
-        finished_at_unix_seconds: finished_at,
+        state: state.to_owned(),
+        reason: reason.to_owned(),
+        finished_at_unix_seconds: ended_at.unwrap_or(finished_at),
         workdir_cleanup: workdir_cleanup.to_owned(),
     }
     .validate()?;
@@ -8626,7 +8771,7 @@ fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> st
     Ok(())
 }
 
-fn previous_session_cleanup(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
+fn previous_session_lifecycle(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let path = session_lifecycle_log_path();
@@ -8874,7 +9019,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -9261,6 +9406,8 @@ impl KwinMcp {
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
         // The host TMPDIR names the workdir's parent, which is read-only inside
         // bwrap. Keep session applications' temporary files in private /tmp.
+        let media_wait_attempts = STARTUP_TIMEOUT.as_millis() / STARTUP_POLL.as_millis();
+        let media_poll_seconds = STARTUP_POLL.as_secs_f64();
         let entrypoint = format!(
             "set -u\n\
             export TMPDIR=/tmp\n\
@@ -9285,6 +9432,13 @@ impl KwinMcp {
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
+            media_pid=$!\n\
+            for ((attempt=0; attempt<{media_wait_attempts}; attempt++)); do\n\
+                test -S \"$XDG_RUNTIME_DIR/pipewire-0\" && break\n\
+                kill -0 \"$media_pid\" 2>/dev/null || {{ echo 'private PipeWire exited before its socket was ready' >&2; exit 1; }}\n\
+                sleep {media_poll_seconds}\n\
+            done\n\
+            test -S \"$XDG_RUNTIME_DIR/pipewire-0\" || {{ echo 'private PipeWire socket startup timed out' >&2; exit 1; }}\n\
             wireplumber &\n\
             while read -r cmd; do\n\
                 eval \"$cmd\" &\n\
@@ -10192,7 +10346,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. If it interrupts an in-flight agent operation, remaining agent events are cancelled with retry_safe=false because some input may have arrived; inspect before retrying. New agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -10206,6 +10360,7 @@ impl KwinMcp {
                 "viewer_open",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let reason = params
             .reason
             .as_deref()
@@ -10218,7 +10373,7 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
-        let (host_xdg_dir, width, height, existing) = {
+        let (host_xdg_dir, width, height, existing, stale) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -10231,30 +10386,47 @@ impl KwinMcp {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
                 None => false,
             };
-            if running {
-                let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
-                if viewer["state"] == "ready" {
-                    let message = format!("viewer already open: {}", viewer_summary(&viewer));
-                    drop(guard);
-                    return Ok(structured_result(
+            let viewer = if running {
+                sess.viewer_child
+                    .as_mut()
+                    .map(|child| viewer_report(&sess.host_xdg_dir, Some(child), None))
+            } else {
+                None
+            };
+            if let Some(viewer) = viewer.as_ref()
+                && viewer["state"] == "ready"
+            {
+                let message = format!("viewer already open: {}", viewer_summary(viewer));
+                drop(guard);
+                return Ok(structured_result(
                     &peer,
                     message,
                     serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
-                }
             }
+            let reuse = viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer["state"] == "starting");
+            let (existing, stale) = if running {
+                let child = sess.viewer_child.take();
+                if reuse { (child, None) } else { (None, child) }
+            } else {
+                (None, None)
+            };
             (
                 sess.host_xdg_dir.clone(),
                 sess.screen_width,
                 sess.screen_height,
-                if running {
-                    sess.viewer_child.take()
-                } else {
-                    None
-                },
+                existing,
+                stale,
             )
         };
+        if let Some(stale) = stale {
+            tokio::task::spawn_blocking(move || terminate_child(stale, false, "stale viewer"))
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+        }
         let reused = existing.is_some();
         let spawned = match existing {
             Some(child) => Ok(child),
@@ -10368,6 +10540,7 @@ impl KwinMcp {
                 "viewer_close",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let mut guard = self.session.write().await;
         let sess = guard.as_mut().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -10422,8 +10595,25 @@ impl KwinMcp {
             }
             cookie_errors = teardown_blocking(sess).await;
         }
+        if had_session {
+            let ended_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.set_death(serde_json::json!({
+                "status": "stopped",
+                "session_status": "stopped",
+                "session_available_here": false,
+                "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                "session_ended_at_unix_seconds": ended_at,
+            }));
+        }
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
+                if had_session {
+                    self.record_terminal_cleanup("not_requested");
+                }
                 return Ok(if had_session {
                     structured_result(
                         &peer,
@@ -10440,8 +10630,13 @@ impl KwinMcp {
                     .await
                 });
             }
-            WorkdirCleanup::Removed(dir) => dir,
+            WorkdirCleanup::Removed(dir) => {
+                self.record_terminal_cleanup("removed");
+                dir
+            }
             WorkdirCleanup::Retained { dir, error } => {
+                self.record_terminal_cleanup("retained");
+                let terminal = self.death_record();
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
@@ -10460,7 +10655,13 @@ impl KwinMcp {
                         "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.{cookie_note}",
                         dir.display()
                     ),
-                    Some(serde_json::json!({"cookie_errors": cookie_errors})),
+                    Some(serde_json::json!({
+                        "cookie_errors": cookie_errors,
+                        "session_status": terminal.as_ref().and_then(|record| record["session_status"].as_str()).unwrap_or("none_running"),
+                        "session_available_here": false,
+                        "session_end_reason": terminal.as_ref().and_then(|record| record["reason"].as_str()),
+                        "session_ended_at_unix_seconds": terminal.as_ref().and_then(|record| record["session_ended_at_unix_seconds"].as_u64()),
+                    })),
                 ));
             }
         };
@@ -10821,6 +11022,15 @@ impl KwinMcp {
             // parsing that block as JSON.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let mut image = Content::image(b64, "image/png");
+            if let rmcp::model::RawContent::Image(raw) = &mut image.raw {
+                let mut meta = rmcp::model::Meta::new();
+                meta.0.insert(
+                    "codex/imageDetail".to_owned(),
+                    serde_json::json!("original"),
+                );
+                raw.meta = Some(meta);
+            }
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
             let _ = peer
                 .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
@@ -10831,7 +11041,7 @@ impl KwinMcp {
             Ok(CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
-                Content::image(b64, "image/png"),
+                image,
             ]))
         } else {
             Ok(structured_result(&peer, text, payload).await)
@@ -11940,7 +12150,10 @@ impl KwinMcp {
                     })?;
                     Err(launch_timeout(&progress, call_timeout))
                 } else {
-                    Err(McpError::internal_error(error.to_string(), None))
+                    Err(match error.downcast::<McpError>() {
+                        Ok(error) => *error,
+                        Err(error) => McpError::internal_error(error.to_string(), None),
+                    })
                 }
             }
         }
@@ -12115,7 +12328,12 @@ impl KwinMcp {
                 Ok(Some(window)) => (Some(window.geometry), window.reused),
                 Ok(None) => (None, false),
                 Err(error) if error.is::<tower::timeout::error::Elapsed>() => (None, false),
-                Err(error) => return Err(McpError::internal_error(error.to_string(), None)),
+                Err(error) => {
+                    return Err(match error.downcast::<McpError>() {
+                        Ok(error) => *error,
+                        Err(error) => McpError::internal_error(error.to_string(), None),
+                    });
+                }
             };
         let exit_status = std::fs::read_to_string(&exit_file)
             .ok()
@@ -12664,17 +12882,6 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
             .unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
-    // Every tool call is bracketed for the viewer's input gate.
-    for route in tool_router.map.values_mut() {
-        let inner = std::sync::Arc::clone(&route.call);
-        route.call = std::sync::Arc::new(move |context| {
-            let inner = std::sync::Arc::clone(&inner);
-            Box::pin(async move {
-                let _mark = ToolCallMark::begin(&context.service.path, &context.service.tool_calls);
-                inner(context).await
-            })
-        });
-    }
     tool_router
 }
 
@@ -12754,8 +12961,197 @@ fn ordered_tool(name: &str) -> bool {
     input_tool(name) || matches!(name, "clipboard_write" | "clipboard_read")
 }
 
-const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls.";
-const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
+const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls; a session you created through another live same-user kwin-mcp process on this host can also be reached.";
+const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, or expired to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
+const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
+const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn session_owner_pid(id: &str) -> Option<u32> {
+    id.strip_prefix('s')
+        .and_then(|id| id.split_once('-'))
+        .and_then(|(pid, _)| pid.parse::<u32>().ok())
+}
+
+fn session_control_socket_path(server_pid: u32) -> anyhow::Result<PathBuf> {
+    Ok(host_environment::runtime_dir()?
+        .join(format!("{SESSION_CONTROL_SOCKET_PREFIX}{server_pid}.sock")))
+}
+
+struct SessionControlSocket {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl SessionControlSocket {
+    fn bind(server_pid: u32) -> std::io::Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        let path = session_control_socket_path(server_pid).map_err(std::io::Error::other)?;
+        let uid = unsafe { nix::libc::geteuid() };
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket() || metadata.uid() != uid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "session control path is not an owned socket",
+                    ));
+                }
+                match std::os::unix::net::UnixStream::connect(&path) {
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "session control socket is already active",
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        std::fs::remove_file(&path)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_socket() || metadata.uid() != uid {
+            let _ = std::fs::remove_file(&path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session control socket ownership validation failed",
+            ));
+        }
+        Ok(Self {
+            listener,
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    async fn serve(self, router: SessionRouter) {
+        let uid = unsafe { nix::libc::geteuid() };
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        let authorized = stream
+                            .peer_cred()
+                            .is_ok_and(|credentials| credentials.uid() == uid);
+                        if !authorized {
+                            eprintln!(
+                                "session control: rejected peer with a different effective UID"
+                            );
+                            continue;
+                        }
+                        let router = router.clone();
+                        connections.spawn(async move {
+                            match router.serve(stream).await {
+                                Ok(service) => {
+                                    if let Err(error) = service.waiting().await {
+                                        eprintln!("session control: MCP connection failed: {error}");
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!("session control: MCP handshake failed: {error}")
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("session control: accept failed: {error}");
+                        break;
+                    }
+                },
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result {
+                        eprintln!("session control: connection task failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SessionControlSocket {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let should_remove = std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.file_type().is_socket()
+                && metadata.uid() == unsafe { nix::libc::geteuid() }
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+        });
+        if should_remove {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn forward_session_call(
+    server_pid: u32,
+    request: rmcp::model::CallToolRequestParams,
+) -> Result<Option<CallToolResult>, McpError> {
+    let connected = tokio::time::timeout(SESSION_CONTROL_CONNECT_TIMEOUT, async {
+        let path = match session_control_socket_path(server_pid) {
+            Ok(path) => path,
+            Err(_) => return None,
+        };
+        let stream = match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => stream,
+            Err(_) => return None,
+        };
+        let credentials = match stream.peer_cred() {
+            Ok(credentials) => credentials,
+            Err(_) => return None,
+        };
+        let effective_uid = unsafe { nix::libc::geteuid() };
+        if credentials.uid() != effective_uid
+            || credentials.pid().and_then(|pid| u32::try_from(pid).ok()) != Some(server_pid)
+        {
+            return None;
+        }
+
+        rmcp::service::serve_client((), stream).await.ok()
+    })
+    .await;
+    let Ok(Some(mut service)) = connected else {
+        return Ok(None);
+    };
+    let result = match service.peer().call_tool(request).await {
+        Ok(result) => Ok(Some(result)),
+        Err(rmcp::service::ServiceError::McpError(error)) => Err(error),
+        Err(error) => Err(McpError::internal_error(
+            format!(
+                "session owner process {server_pid} lost the control connection while handling the request; inspect the session before retrying"
+            ),
+            Some(serde_json::json!({
+                "reason": "session_owner_connection_failed",
+                "retry_safe": false,
+                "session_server_pid": server_pid,
+                "transport_error": error.to_string(),
+            })),
+        )),
+    };
+    let _ = tokio::time::timeout(SESSION_CONTROL_CLOSE_TIMEOUT, service.close()).await;
+    result
+}
 
 fn unavailable_session_error() -> McpError {
     let server_pid = std::process::id();
@@ -12766,6 +13162,8 @@ fn unavailable_session_error() -> McpError {
         message,
         Some(serde_json::json!({
             "reason": "session_handle_unavailable",
+            "session_status": "none_running",
+            "session_available_here": false,
             "session_id": null,
             "server_pid": server_pid,
             "session_list_scope": "current_process",
@@ -12776,9 +13174,9 @@ fn unavailable_session_error() -> McpError {
     )
 }
 
-fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
+fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> {
     let mut error = unknown_session_error(id);
-    let record = match previous_session_cleanup(id) {
+    let record = match previous_session_lifecycle(id) {
         Ok(record) => record,
         Err(source) => {
             let reason = if source.kind() == std::io::ErrorKind::InvalidData {
@@ -12788,7 +13186,7 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
             };
             return Err(McpError::internal_error(
                 format!(
-                    "{} Previous server cleanup record could not be validated: {source}",
+                    "{} Previous session lifecycle record could not be validated: {source}",
                     error.message
                 ),
                 Some(serde_json::json!({
@@ -12801,11 +13199,19 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
     };
     match record {
         Some(record) => {
+            let status = record.status();
+            let event_description = match record.state.as_str() {
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED => "shutdown cleanup finished",
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED => "session stop",
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "idle TTL expiration",
+                _ => "session lifecycle transition",
+            };
             error.message = format!(
-                "{} The previous server (PID {}) recorded shutdown cleanup finished at Unix time {} (workdir cleanup: {}).",
+                "{} Session status is {status}. The previous server (PID {}) recorded {event_description} at Unix time {} (reason: {}, workdir cleanup: {}).",
                 error.message,
                 record.server_pid,
                 record.finished_at_unix_seconds,
+                record.reason,
                 record.workdir_cleanup,
             )
             .into();
@@ -12813,14 +13219,49 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
                 Some(serde_json::Value::Object(data)) => data,
                 _ => serde_json::Map::new(),
             };
+            data.insert("session_status".to_owned(), serde_json::json!(status));
             data.insert(
-                "previous_server_cleanup".to_owned(),
-                serde_json::json!(SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED),
+                "session_ended_at_unix_seconds".to_owned(),
+                serde_json::json!(record.finished_at_unix_seconds),
             );
             data.insert(
-                "previous_server_cleanup_record".to_owned(),
-                serde_json::json!(record),
+                "session_end_reason".to_owned(),
+                serde_json::json!(record.reason.as_str()),
             );
+            if status == "expired" {
+                data.insert(
+                    "session_expired_at_unix_seconds".to_owned(),
+                    serde_json::json!(record.finished_at_unix_seconds),
+                );
+            } else {
+                data.insert(
+                    "session_stopped_at_unix_seconds".to_owned(),
+                    serde_json::json!(record.finished_at_unix_seconds),
+                );
+            }
+            data.insert(
+                "previous_session_lifecycle_record".to_owned(),
+                serde_json::json!(&record),
+            );
+            if record.state == SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED {
+                data.insert(
+                    "previous_server_cleanup".to_owned(),
+                    serde_json::json!(SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED),
+                );
+                data.insert(
+                    "previous_server_cleanup_record".to_owned(),
+                    serde_json::json!(record),
+                );
+            } else {
+                data.insert(
+                    "previous_server_cleanup".to_owned(),
+                    serde_json::json!("not_applicable"),
+                );
+                data.insert(
+                    "previous_server_cleanup_record".to_owned(),
+                    serde_json::Value::Null,
+                );
+            }
             error.data = Some(serde_json::Value::Object(data));
         }
         None => {
@@ -12856,19 +13297,19 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
 
 fn unknown_session_error(id: &str) -> McpError {
     let server_pid = std::process::id();
-    let session_server_pid = id
-        .strip_prefix('s')
-        .and_then(|id| id.split_once('-'))
-        .and_then(|(pid, _)| pid.parse::<u32>().ok());
+    let session_server_pid = session_owner_pid(id);
     let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
-    let (reason, message, recovery) = if let Some(other_server_pid) = other_server_pid {
+    let (reason, session_status, message, recovery) = if let Some(other_server_pid) =
+        other_server_pid
+    {
         let recovery = format!(
-            "If process {other_server_pid} is still running, retry this request with that server. Otherwise call session_start without session_id and relaunch your applications."
+            "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
         );
         (
             "different_server_process",
+            "owned_by_another_process",
             format!(
-                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them and cannot be reattached by a fresh server. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
             ),
             recovery,
         )
@@ -12876,6 +13317,7 @@ fn unknown_session_error(id: &str) -> McpError {
         let recovery = "Call session_list to check this server. If the desktop is absent, call session_start without session_id and relaunch your applications.".to_owned();
         (
             "session_not_found",
+            "not_found",
             format!(
                 "session_id '{id}' is not known to kwin-mcp process {server_pid}; it may have been stopped, expired, or created by another server. {recovery}"
             ),
@@ -12886,6 +13328,8 @@ fn unknown_session_error(id: &str) -> McpError {
         message,
         Some(serde_json::json!({
             "reason": reason,
+            "session_status": session_status,
+            "session_available_here": false,
             "session_id": id,
             "server_pid": server_pid,
             "session_server_pid": session_server_pid,
@@ -12896,6 +13340,8 @@ fn unknown_session_error(id: &str) -> McpError {
 
 #[derive(Clone)]
 struct SessionRouter {
+    remote_input_orders:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Weak<InputOrder>>>>,
     clipboards: Arc<std::sync::Mutex<ClipboardStore>>,
     sessions: Arc<std::sync::Mutex<std::collections::BTreeMap<String, KwinMcp>>>,
     next: Arc<std::sync::atomic::AtomicU64>,
@@ -12907,6 +13353,7 @@ struct SessionRouter {
 impl SessionRouter {
     fn new(display: DisplayConfig) -> Self {
         Self {
+            remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
             sessions: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             next: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -12992,7 +13439,7 @@ impl SessionRouter {
         };
         let session = sessions.get(&id).cloned();
         let Some(session) = session else {
-            return Err(unknown_session_error_with_cleanup(&id)?);
+            return Err(unknown_session_error_with_lifecycle(&id)?);
         };
         Ok((id, session))
     }
@@ -13000,7 +13447,11 @@ impl SessionRouter {
         let mut records = Vec::new();
         for (id, service) in self.entries()? {
             if let Some(death) = service.check_liveness().await {
-                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":"dead", "diagnostic":death}));
+                let status = death
+                    .get("session_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("dead");
+                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":status, "diagnostic":death}));
                 continue;
             }
             let guard = service.session.read().await;
@@ -13015,7 +13466,7 @@ impl SessionRouter {
         Ok(structured_result(
             peer,
             format!(
-                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. Session IDs are process-local; earlier-process sessions are not listed here. A call with a saved ID reports its shutdown record when available.\n{}",
+                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, or expired; a call with a saved ID reports its lifecycle record when available.\n{}",
                 std::process::id(),
                 serde_json::to_string(&records).map_err(KwinError::from)?
             ),
@@ -13064,17 +13515,36 @@ impl SessionRouter {
                         .is_some_and(|session| session.last_activity.elapsed() >= ttl)
                 });
                 if expired {
+                    let expired_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                     let stopped = guard.take();
                     drop(guard);
+                    service.set_death(serde_json::json!({
+                        "status": "expired",
+                        "session_status": "expired",
+                        "reason": SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+                        "session_expired_at_unix_seconds": expired_at,
+                        "session_ended_at_unix_seconds": expired_at,
+                        "session_available_here": false,
+                    }));
                     if let Some(session) = stopped {
                         teardown_blocking(session).await;
                     }
-                    match service.workdir.remove() {
+                    let workdir_cleanup = match service.workdir.remove() {
                         WorkdirCleanup::Retained { dir, error } => {
-                            eprintln!("ttl: retained {}: {error}", dir.display())
+                            eprintln!("ttl: retained {}: {error}", dir.display());
+                            "retained"
                         }
-                        WorkdirCleanup::NothingOwned | WorkdirCleanup::Removed(_) => {}
-                    }
+                        WorkdirCleanup::NothingOwned => "not_owned",
+                        WorkdirCleanup::Removed(_) => "removed",
+                    };
+                    service.record_lifecycle(
+                        SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                        SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+                        workdir_cleanup,
+                    );
                 }
             }
         }
@@ -13092,17 +13562,17 @@ impl SessionRouter {
                 .entry("properties")
                 .or_insert_with(|| serde_json::json!({}));
             if let Some(properties) = properties.as_object_mut() {
-                properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist."}));
+                properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist. Requests for a live session owned by another same-user kwin-mcp process are forwarded to its owner."}));
             }
             let description = tool.description.take().unwrap_or_default();
             tool.description = Some(
-                format!("{description} Pass a session_id returned by your own session_start call.")
+                format!("{description} Pass a session_id returned by your own session_start call; a live session you created through another local same-user process is forwarded to its owner.")
                     .into(),
             );
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            format!("List live isolated sessions owned by this kwin-mcp process. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports its previous server's shutdown record when available. {SESSION_OWNERSHIP_NOTICE}"),
+            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. {SESSION_OWNERSHIP_NOTICE}"),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -13121,7 +13591,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. session_list covers only this kwin-mcp process and may include other agents' sessions. After DSH/client migration or a server restart, an old handle cannot be resumed in the replacement process; its unavailable-handle error reports previous shutdown cleanup when recorded, otherwise says cleanup is unconfirmed. Start a new session and relaunch the applications.",
+            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error includes session_status and the recorded end time and reason when available, otherwise says cleanup is unconfirmed. session_stop clears dead, stopped, and expired handles. Start a new session and relaunch the applications.",
             info.instructions.unwrap_or_default()
         ));
         info
@@ -13155,6 +13625,26 @@ impl rmcp::ServerHandler for SessionRouter {
                 .oneshot(context.peer)
                 .await;
         }
+        let requested_id = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("session_id"))
+            .and_then(serde_json::Value::as_str);
+        if request.name != "session_start"
+            && let Some(id) = requested_id
+            && let Some(owner_pid) = session_owner_pid(id)
+            && owner_pid != std::process::id()
+        {
+            // Reserve at stdio receipt, then retain the turn through the reply:
+            // independent owner handshakes must not reorder queued input.
+            let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
+            if let Some(turn) = &turn {
+                turn.wait().await;
+            }
+            if let Some(result) = forward_session_call(owner_pid, request.clone()).await? {
+                return Ok(result);
+            }
+        }
         let (id, session) = self.resolve(&mut request)?;
         let start = request.name == "session_start";
         let stop = request.name == "session_stop";
@@ -13162,9 +13652,13 @@ impl rmcp::ServerHandler for SessionRouter {
             && !stop
             && let Some(death) = session.check_liveness().await
         {
+            let status = death
+                .get("session_status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("dead");
             return Err(McpError::internal_error(
                 format!(
-                    "Session {id} is dead: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
+                    "Session {id} is {status}: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
                     death["reason"],
                     death["memory_max_bytes"]
                         .as_u64()
@@ -13173,28 +13667,89 @@ impl rmcp::ServerHandler for SessionRouter {
                 Some(death),
             ));
         }
-        let input = ordered_tool(&request.name);
+        let agent_input = input_tool(&request.name);
         // Queued input waits outside the global limit so it cannot starve reads.
         let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
         if let Some(turn) = &turn {
             turn.wait().await;
         }
-        let _input = if input && turn.is_none() {
+        let _input = if ordered_tool(&request.name) {
             Some(session.input_gate.clone().lock_owned().await)
         } else {
             None
         };
+        if agent_input {
+            let recent_viewer_input =
+                session
+                    .viewer_is_active_with_recent_input()
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!("Could not check live viewer input activity: {error}"),
+                            Some(serde_json::json!({
+                                "reason":"viewer_activity_check_failed",
+                                "retry_safe":true
+                            })),
+                        )
+                    })?;
+            if recent_viewer_input {
+                return Err(McpError::internal_error(
+                    "Agent input is paused for one second after viewer input to avoid interfering with the user's recent interaction. Retry when the viewer has been idle for one second; the viewer can stay open.",
+                    Some(serde_json::json!({
+                        "reason":"recent_viewer_input",
+                        "retry_safe":true,
+                        "quiet_period_ms":VIEWER_INPUT_QUIET_PERIOD.as_millis()
+                    })),
+                ));
+            }
+        }
         let execution = session.clone();
         let operation = request.name.to_string();
-        let result = self
-            .limit
-            .layer(execution)
-            .oneshot(SessionCall {
+        let result = {
+            let call = self.limit.layer(execution).oneshot(SessionCall {
                 request,
                 context,
                 routes: self.routes.clone(),
-            })
-            .await;
+            });
+            if agent_input {
+                // Human input can begin after admission, during a paced type
+                // or drag. Cancel the remaining agent events as well as
+                // rejecting new calls. Dropping the call releases its held
+                // keys/buttons through SentInput before liveness inspection.
+                let viewer_activity = async {
+                    loop {
+                        tokio::time::sleep(VIEWER_INPUT_CHECK_INTERVAL).await;
+                        match session.viewer_input_is_recent().await {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                break McpError::internal_error(
+                                    "Viewer input interrupted the agent operation. Some input may already have arrived; inspect the target before retrying.",
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                break McpError::internal_error(
+                                    format!(
+                                        "Stopped agent input because viewer activity could not be checked: {error}. Some input may already have arrived; inspect before retrying."
+                                    ),
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_activity_check_failed", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = call => result,
+                    error = viewer_activity => Err(error),
+                }
+            } else {
+                call.await
+            }
+        };
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {
@@ -13546,6 +14101,27 @@ impl rmcp::transport::Transport<rmcp::RoleServer> for SessionStdio {
                                 let mut params = call.params.clone();
                                 if let Ok((_, session)) = self.router.resolve(&mut params) {
                                     call.extensions_mut().insert(session.input_order.enqueue());
+                                } else if let Some(id) = call
+                                    .params
+                                    .arguments
+                                    .as_ref()
+                                    .and_then(|args| args.get("session_id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    && session_owner_pid(id)
+                                        .is_some_and(|pid| pid != std::process::id())
+                                {
+                                    let mut orders = self
+                                        .router
+                                        .remote_input_orders
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    orders.retain(|_, order| order.strong_count() > 0);
+                                    let order = orders
+                                        .get(id)
+                                        .and_then(std::sync::Weak::upgrade)
+                                        .unwrap_or_else(|| Arc::new(InputOrder::default()));
+                                    orders.insert(id.to_owned(), Arc::downgrade(&order));
+                                    call.extensions_mut().insert(order.enqueue());
                                 }
                             }
                         }
@@ -14158,6 +14734,13 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         Some(state) => router.reattach(state).await?,
         None => Vec::new(),
     };
+    let session_control = match SessionControlSocket::bind(std::process::id()) {
+        Ok(socket) => Some(tokio::spawn(socket.serve(router.clone()))),
+        Err(error) => {
+            eprintln!("session control: cross-process routing unavailable: {error}");
+            None
+        }
+    };
     let transport = SessionStdio::new(router.clone(), input, client)?;
     let wire = transport.clone();
     let service = match resumed_client {
@@ -14204,6 +14787,10 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
             }
         }
     };
+    if let Some(session_control) = session_control {
+        session_control.abort();
+        let _ = session_control.await;
+    }
     drop(process_commands);
     if waited.is_none() {
         cancellation.cancel();
