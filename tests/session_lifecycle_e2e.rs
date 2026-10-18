@@ -6616,6 +6616,264 @@ fn human_input_matches_published_timing_profile_on_stdio() {
 }
 
 #[test]
+#[ignore = "requires private KWin desktops, Chrome, PipeWire, and Vulkan viewer rendering"]
+fn viewer_displays_current_pixels_after_a_second_fresh_session() {
+    use base64::Engine;
+
+    const WIDTH: u32 = 1440;
+    const HEIGHT: u32 = 900;
+    const SOURCE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+    const VIEWER_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+    const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const COLOR_TOLERANCE: u8 = 16;
+
+    fn tool(client: &mut RpcClient, request: &mut u64, name: &str, args: Value) -> Value {
+        let response = call_tool(client, *request, name, args);
+        *request += 1;
+        response
+    }
+
+    fn matches_palette(response: &Value, colors: &[[u8; 3]; 4]) -> bool {
+        if inline_png(response).is_empty() {
+            return false;
+        }
+        let image = decode_rgba(response);
+        let height = u32::try_from(image.1.len() / 4 / usize::try_from(image.0).expect("width"))
+            .expect("height");
+        [(1, 1), (3, 1), (1, 3), (3, 3)]
+            .into_iter()
+            .zip(colors)
+            .all(|((x, y), expected)| {
+                let actual = pixel(&image, image.0 * x / 4, height * y / 4);
+                actual[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(*expected) <= COLOR_TOLERANCE)
+            })
+    }
+
+    let save = |response: &Value, name: &str| {
+        if let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).expect("screenshot artifact directory");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(response))
+                .expect("screenshot artifact base64");
+            std::fs::write(root.join(name), bytes).expect("save screenshot artifact");
+        }
+    };
+
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // The viewer's host is another isolated desktop, so its actual composited
+    // pixels can be checked through MCP without capturing the user's desktop.
+    let mut desktop = RpcClient::start();
+    initialize(&mut desktop);
+    let host = call_tool(
+        &mut desktop,
+        2,
+        "session_start",
+        json!({"width":WIDTH,"height":HEIGHT}),
+    );
+    let host_id = session_handle(&host);
+    let display = workdir(&host).join("wayland-0");
+    assert!(display.exists(), "private viewer display missing");
+    let mut client = RpcClient::start_with_env(&[(
+        "WAYLAND_DISPLAY",
+        display.to_str().expect("private display"),
+    )]);
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let mut request = 2;
+    let mut host_request = 3;
+    let mut previous_session = None;
+    let palettes = [
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]],
+        [[0, 255, 255], [255, 0, 255], [255, 255, 0], [0, 0, 255]],
+    ];
+    for (round, colors) in palettes.iter().enumerate() {
+        let fixture = client.home.join("viewer-frame.html");
+        let swatches =
+            colors.map(|[r, g, b]| format!("<div style='background:rgb({r},{g},{b})'></div>"));
+        std::fs::write(
+            &fixture,
+            format!(
+                "<!doctype html><style>html,body{{margin:0;width:100%;height:100%;overflow:hidden}}\
+                 body{{display:grid;grid-template:1fr 1fr/1fr 1fr}}\
+                 p{{position:absolute;top:45%;left:30%;background:white;padding:12px;font:28px sans-serif}}</style>\
+                 {}<p>Fresh session {}</p>",
+                swatches.join(""),
+                round + 1
+            ),
+        )
+        .expect("write private browser fixture");
+        let started = tool(
+            &mut client,
+            &mut request,
+            "session_start",
+            json!({"width":WIDTH,"height":HEIGHT}),
+        );
+        let session = session_handle(&started);
+        assert_ne!(previous_session.as_ref(), Some(&session));
+        assert_eq!(client.child.id(), server_pid, "MCP server was restarted");
+        assert_eq!(
+            started["result"]["structuredContent"]["viewer"]["state"], "closed",
+            "{started}"
+        );
+        let launched = tool(
+            &mut client,
+            &mut request,
+            "launch_app",
+            json!({"session_id":session,"command":format!(
+                "google-chrome-stable --user-data-dir=/tmp/viewer-fresh-{round} --no-first-run --no-default-browser-check --app='file://{}'",
+                fixture.display()
+            )}),
+        );
+        assert!(
+            !launched["result"]["isError"].as_bool().unwrap_or(false),
+            "{launched}"
+        );
+        let deadline = Instant::now() + SOURCE_FRAME_TIMEOUT;
+        loop {
+            let source = tool(
+                &mut client,
+                &mut request,
+                "screenshot",
+                json!({"session_id":session,"inline":true}),
+            );
+            if matches_palette(&source, colors) {
+                let meta = screenshot_meta(&source);
+                assert_eq!(meta["width"], WIDTH, "{meta}");
+                assert_eq!(meta["height"], HEIGHT, "{meta}");
+                save(&source, &format!("viewer-fresh-{}-source.png", round + 1));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "browser fixture pixels did not appear"
+            );
+            thread::sleep(FRAME_POLL_INTERVAL);
+        }
+
+        let open_request = request;
+        request += 1;
+        client.send(
+            open_request,
+            "tools/call",
+            json!({"name":"viewer_open","arguments":{"session_id":session}}),
+        );
+        let expected_title = format!("kwin-viewer {session}");
+        let deadline = Instant::now() + VIEWER_FRAME_TIMEOUT;
+        let mut displayed = false;
+        let mut saved_first = false;
+        while Instant::now() < deadline {
+            let windows = tool(
+                &mut desktop,
+                &mut host_request,
+                "window_list",
+                json!({"session_id":host_id}),
+            );
+            let viewers: Vec<_> = windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("private desktop windows")
+                .iter()
+                .filter(|window| window["title"] == expected_title)
+                .collect();
+            assert!(viewers.len() <= 1, "duplicate viewer windows: {viewers:?}");
+            if let Some(viewer) = viewers.first() {
+                tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "window_activate",
+                    json!({"session_id":host_id,"window_id":viewer["id"]}),
+                );
+                let captured = tool(
+                    &mut desktop,
+                    &mut host_request,
+                    "screenshot",
+                    json!({"session_id":host_id,"inline":true}),
+                );
+                if !inline_png(&captured).is_empty() && !saved_first {
+                    save(
+                        &captured,
+                        &format!("viewer-fresh-{}-initial.png", round + 1),
+                    );
+                    saved_first = true;
+                }
+                if matches_palette(&captured, colors) {
+                    save(
+                        &captured,
+                        &format!("viewer-fresh-{}-displayed.png", round + 1),
+                    );
+                    displayed = true;
+                    break;
+                }
+            }
+            thread::sleep(FRAME_POLL_INTERVAL);
+        }
+        let opened = client.response(open_request, Duration::from_secs(10));
+        let log = std::fs::read_to_string(workdir(&started).join("viewer.log")).unwrap_or_default();
+        assert_eq!(
+            opened["result"]["structuredContent"]["viewer"]["state"],
+            "ready",
+            "fresh session {}: {opened}\n{log}",
+            round + 1
+        );
+        assert!(
+            displayed,
+            "fresh session {}: viewer did not display current session pixels\n{log}",
+            round + 1
+        );
+        let pid = u32::try_from(
+            opened["result"]["structuredContent"]["viewer"]["pid"]
+                .as_u64()
+                .expect("viewer PID"),
+        )
+        .expect("PID fits");
+        let stopped = tool(
+            &mut client,
+            &mut request,
+            "session_stop",
+            json!({"session_id":session}),
+        );
+        assert_eq!(
+            stopped["result"]["structuredContent"]["status"], "stopped",
+            "{stopped}"
+        );
+        assert!(
+            !process_alive(pid).unwrap_or(true),
+            "stopped session left a viewer process"
+        );
+        let windows = tool(
+            &mut desktop,
+            &mut host_request,
+            "window_list",
+            json!({"session_id":host_id}),
+        );
+        assert!(
+            !windows["result"]["structuredContent"]["windows"]
+                .as_array()
+                .expect("private desktop windows")
+                .iter()
+                .any(|window| window["title"] == expected_title),
+            "stopped session left its viewer window: {windows}"
+        );
+        previous_session = Some(session);
+        println!(
+            "PASS: fresh session {} displayed its current palette and cleaned up",
+            round + 1
+        );
+    }
+    client.stop_process();
+    tool(
+        &mut desktop,
+        &mut host_request,
+        "session_stop",
+        json!({"session_id":host_id}),
+    );
+    desktop.stop_process();
+}
+
+#[test]
 #[ignore = "requires three private KWin sessions and Vulkan viewer rendering"]
 fn viewer_titles_identify_sessions_and_update_reasons_in_private_desktop() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
