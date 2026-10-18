@@ -5292,6 +5292,46 @@ impl KwinMcp {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(diagnostic);
     }
 
+    fn record_lifecycle(&self, state: &str, reason: &str, workdir_cleanup: &str) {
+        let ended_at = self
+            .death_record()
+            .and_then(|record| record["session_ended_at_unix_seconds"].as_u64());
+        match append_session_lifecycle_event(
+            &self.session_id,
+            state,
+            reason,
+            workdir_cleanup,
+            ended_at,
+        ) {
+            Ok(()) => eprintln!(
+                "session lifecycle: session_id={} state={state} reason={reason}",
+                self.session_id
+            ),
+            Err(error) => eprintln!(
+                "session lifecycle: could not record {state} for {}: {error}",
+                self.session_id
+            ),
+        }
+    }
+
+    fn record_terminal_cleanup(&self, cleanup: &str) {
+        let Some(terminal) = self.death_record() else {
+            return;
+        };
+        let transition = match terminal["session_status"].as_str() {
+            Some("stopped") => (
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
+                SESSION_LIFECYCLE_REASON_SESSION_STOP,
+            ),
+            Some("expired") => (
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            ),
+            _ => return,
+        };
+        self.record_lifecycle(transition.0, transition.1, cleanup);
+    }
+
     async fn check_liveness(&self) -> Option<serde_json::Value> {
         if let Some(death) = self.death_record() {
             return Some(death);
@@ -5583,7 +5623,9 @@ impl KwinMcp {
             }
             teardown_blocking(sess).await;
         }
-        let workdir_cleanup = match self.workdir.remove() {
+        let cleanup = self.workdir.remove();
+        let cleanup_changed = !matches!(&cleanup, WorkdirCleanup::NothingOwned);
+        let workdir_cleanup = match cleanup {
             WorkdirCleanup::NothingOwned => "not_requested",
             WorkdirCleanup::Removed(dir) => {
                 eprintln!("shutdown: autoclean removed {}", dir.display());
@@ -5598,16 +5640,13 @@ impl KwinMcp {
             }
         };
         if session_was_live {
-            match append_session_lifecycle_event(&self.session_id, workdir_cleanup) {
-                Ok(()) => eprintln!(
-                    "session lifecycle: session_id={} state=shutdown_cleanup_finished",
-                    self.session_id
-                ),
-                Err(error) => eprintln!(
-                    "session lifecycle: could not record shutdown for {}: {error}",
-                    self.session_id
-                ),
-            }
+            self.record_lifecycle(
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED,
+                SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN,
+                workdir_cleanup,
+            );
+        } else if cleanup_changed {
+            self.record_terminal_cleanup(workdir_cleanup);
         }
     }
 }
@@ -8590,6 +8629,10 @@ fn session_lifecycle_log_path() -> PathBuf {
 
 const SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED: &str = "shutdown_cleanup_finished";
 const SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN: &str = "server_shutdown";
+const SESSION_LIFECYCLE_STATE_SESSION_STOPPED: &str = "session_stopped";
+const SESSION_LIFECYCLE_REASON_SESSION_STOP: &str = "session_stop";
+const SESSION_LIFECYCLE_STATE_SESSION_EXPIRED: &str = "session_expired";
+const SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT: &str = "idle_timeout";
 const SESSION_LIFECYCLE_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -8612,14 +8655,26 @@ impl SessionLifecycleRecord {
                 pid.parse::<u32>().ok() == Some(self.server_pid)
                     && number.parse::<u64>().is_ok_and(|number| number > 0)
             });
+        let valid_transition = matches!(
+            (self.state.as_str(), self.reason.as_str()),
+            (
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED,
+                SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN
+            ) | (
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
+                SESSION_LIFECYCLE_REASON_SESSION_STOP
+            ) | (
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT
+            )
+        );
         if self.server_pid == 0
             || self.finished_at_unix_seconds == 0
             || !valid_session_id
-            || self.state != SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED
-            || self.reason != SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN
+            || !valid_transition
             || !matches!(
                 self.workdir_cleanup.as_str(),
-                "not_requested" | "removed" | "retained"
+                "not_requested" | "not_owned" | "removed" | "retained"
             )
         {
             return Err(std::io::Error::new(
@@ -8629,9 +8684,25 @@ impl SessionLifecycleRecord {
         }
         Ok(self)
     }
+
+    fn status(&self) -> &'static str {
+        match self.state.as_str() {
+            SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "expired",
+            SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED | SESSION_LIFECYCLE_STATE_SESSION_STOPPED => {
+                "stopped"
+            }
+            _ => "unknown",
+        }
+    }
 }
 
-fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> std::io::Result<()> {
+fn append_session_lifecycle_event(
+    session_id: &str,
+    state: &str,
+    reason: &str,
+    workdir_cleanup: &str,
+    ended_at: Option<u64>,
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -8647,9 +8718,9 @@ fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> st
     let record = SessionLifecycleRecord {
         session_id: session_id.to_owned(),
         server_pid: std::process::id(),
-        state: SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED.to_owned(),
-        reason: SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN.to_owned(),
-        finished_at_unix_seconds: finished_at,
+        state: state.to_owned(),
+        reason: reason.to_owned(),
+        finished_at_unix_seconds: ended_at.unwrap_or(finished_at),
         workdir_cleanup: workdir_cleanup.to_owned(),
     }
     .validate()?;
@@ -8700,7 +8771,7 @@ fn append_session_lifecycle_event(session_id: &str, workdir_cleanup: &str) -> st
     Ok(())
 }
 
-fn previous_session_cleanup(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
+fn previous_session_lifecycle(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let path = session_lifecycle_log_path();
@@ -10524,8 +10595,25 @@ impl KwinMcp {
             }
             cookie_errors = teardown_blocking(sess).await;
         }
+        if had_session {
+            let ended_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.set_death(serde_json::json!({
+                "status": "stopped",
+                "session_status": "stopped",
+                "session_available_here": false,
+                "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                "session_ended_at_unix_seconds": ended_at,
+            }));
+        }
         let dir = match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => {
+                if had_session {
+                    self.record_terminal_cleanup("not_requested");
+                }
                 return Ok(if had_session {
                     structured_result(
                         &peer,
@@ -10542,8 +10630,13 @@ impl KwinMcp {
                     .await
                 });
             }
-            WorkdirCleanup::Removed(dir) => dir,
+            WorkdirCleanup::Removed(dir) => {
+                self.record_terminal_cleanup("removed");
+                dir
+            }
             WorkdirCleanup::Retained { dir, error } => {
+                self.record_terminal_cleanup("retained");
+                let terminal = self.death_record();
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
@@ -10562,7 +10655,13 @@ impl KwinMcp {
                         "{stopped_note}session workdir {} not removed: {error}. Cleanup is still owned, call session_stop again to retry.{cookie_note}",
                         dir.display()
                     ),
-                    Some(serde_json::json!({"cookie_errors": cookie_errors})),
+                    Some(serde_json::json!({
+                        "cookie_errors": cookie_errors,
+                        "session_status": terminal.as_ref().and_then(|record| record["session_status"].as_str()).unwrap_or("none_running"),
+                        "session_available_here": false,
+                        "session_end_reason": terminal.as_ref().and_then(|record| record["reason"].as_str()),
+                        "session_ended_at_unix_seconds": terminal.as_ref().and_then(|record| record["session_ended_at_unix_seconds"].as_u64()),
+                    })),
                 ));
             }
         };
@@ -12863,7 +12962,7 @@ fn ordered_tool(name: &str) -> bool {
 }
 
 const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls; a session you created through another live same-user kwin-mcp process on this host can also be reached.";
-const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
+const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, or expired to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
 const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -13063,6 +13162,8 @@ fn unavailable_session_error() -> McpError {
         message,
         Some(serde_json::json!({
             "reason": "session_handle_unavailable",
+            "session_status": "none_running",
+            "session_available_here": false,
             "session_id": null,
             "server_pid": server_pid,
             "session_list_scope": "current_process",
@@ -13073,9 +13174,9 @@ fn unavailable_session_error() -> McpError {
     )
 }
 
-fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
+fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> {
     let mut error = unknown_session_error(id);
-    let record = match previous_session_cleanup(id) {
+    let record = match previous_session_lifecycle(id) {
         Ok(record) => record,
         Err(source) => {
             let reason = if source.kind() == std::io::ErrorKind::InvalidData {
@@ -13085,7 +13186,7 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
             };
             return Err(McpError::internal_error(
                 format!(
-                    "{} Previous server cleanup record could not be validated: {source}",
+                    "{} Previous session lifecycle record could not be validated: {source}",
                     error.message
                 ),
                 Some(serde_json::json!({
@@ -13098,11 +13199,19 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
     };
     match record {
         Some(record) => {
+            let status = record.status();
+            let event_description = match record.state.as_str() {
+                SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED => "shutdown cleanup finished",
+                SESSION_LIFECYCLE_STATE_SESSION_STOPPED => "session stop",
+                SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "idle TTL expiration",
+                _ => "session lifecycle transition",
+            };
             error.message = format!(
-                "{} The previous server (PID {}) recorded shutdown cleanup finished at Unix time {} (workdir cleanup: {}).",
+                "{} Session status is {status}. The previous server (PID {}) recorded {event_description} at Unix time {} (reason: {}, workdir cleanup: {}).",
                 error.message,
                 record.server_pid,
                 record.finished_at_unix_seconds,
+                record.reason,
                 record.workdir_cleanup,
             )
             .into();
@@ -13110,14 +13219,49 @@ fn unknown_session_error_with_cleanup(id: &str) -> Result<McpError, McpError> {
                 Some(serde_json::Value::Object(data)) => data,
                 _ => serde_json::Map::new(),
             };
+            data.insert("session_status".to_owned(), serde_json::json!(status));
             data.insert(
-                "previous_server_cleanup".to_owned(),
-                serde_json::json!(SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED),
+                "session_ended_at_unix_seconds".to_owned(),
+                serde_json::json!(record.finished_at_unix_seconds),
             );
             data.insert(
-                "previous_server_cleanup_record".to_owned(),
-                serde_json::json!(record),
+                "session_end_reason".to_owned(),
+                serde_json::json!(record.reason.as_str()),
             );
+            if status == "expired" {
+                data.insert(
+                    "session_expired_at_unix_seconds".to_owned(),
+                    serde_json::json!(record.finished_at_unix_seconds),
+                );
+            } else {
+                data.insert(
+                    "session_stopped_at_unix_seconds".to_owned(),
+                    serde_json::json!(record.finished_at_unix_seconds),
+                );
+            }
+            data.insert(
+                "previous_session_lifecycle_record".to_owned(),
+                serde_json::json!(&record),
+            );
+            if record.state == SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED {
+                data.insert(
+                    "previous_server_cleanup".to_owned(),
+                    serde_json::json!(SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED),
+                );
+                data.insert(
+                    "previous_server_cleanup_record".to_owned(),
+                    serde_json::json!(record),
+                );
+            } else {
+                data.insert(
+                    "previous_server_cleanup".to_owned(),
+                    serde_json::json!("not_applicable"),
+                );
+                data.insert(
+                    "previous_server_cleanup_record".to_owned(),
+                    serde_json::Value::Null,
+                );
+            }
             error.data = Some(serde_json::Value::Object(data));
         }
         None => {
@@ -13155,12 +13299,15 @@ fn unknown_session_error(id: &str) -> McpError {
     let server_pid = std::process::id();
     let session_server_pid = session_owner_pid(id);
     let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
-    let (reason, message, recovery) = if let Some(other_server_pid) = other_server_pid {
+    let (reason, session_status, message, recovery) = if let Some(other_server_pid) =
+        other_server_pid
+    {
         let recovery = format!(
             "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
         );
         (
             "different_server_process",
+            "owned_by_another_process",
             format!(
                 "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
             ),
@@ -13170,6 +13317,7 @@ fn unknown_session_error(id: &str) -> McpError {
         let recovery = "Call session_list to check this server. If the desktop is absent, call session_start without session_id and relaunch your applications.".to_owned();
         (
             "session_not_found",
+            "not_found",
             format!(
                 "session_id '{id}' is not known to kwin-mcp process {server_pid}; it may have been stopped, expired, or created by another server. {recovery}"
             ),
@@ -13180,6 +13328,8 @@ fn unknown_session_error(id: &str) -> McpError {
         message,
         Some(serde_json::json!({
             "reason": reason,
+            "session_status": session_status,
+            "session_available_here": false,
             "session_id": id,
             "server_pid": server_pid,
             "session_server_pid": session_server_pid,
@@ -13289,7 +13439,7 @@ impl SessionRouter {
         };
         let session = sessions.get(&id).cloned();
         let Some(session) = session else {
-            return Err(unknown_session_error_with_cleanup(&id)?);
+            return Err(unknown_session_error_with_lifecycle(&id)?);
         };
         Ok((id, session))
     }
@@ -13297,7 +13447,11 @@ impl SessionRouter {
         let mut records = Vec::new();
         for (id, service) in self.entries()? {
             if let Some(death) = service.check_liveness().await {
-                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":"dead", "diagnostic":death}));
+                let status = death
+                    .get("session_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("dead");
+                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":status, "diagnostic":death}));
                 continue;
             }
             let guard = service.session.read().await;
@@ -13312,7 +13466,7 @@ impl SessionRouter {
         Ok(structured_result(
             peer,
             format!(
-                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. A call with a saved ID reports its shutdown record when available.\n{}",
+                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, or expired; a call with a saved ID reports its lifecycle record when available.\n{}",
                 std::process::id(),
                 serde_json::to_string(&records).map_err(KwinError::from)?
             ),
@@ -13361,17 +13515,36 @@ impl SessionRouter {
                         .is_some_and(|session| session.last_activity.elapsed() >= ttl)
                 });
                 if expired {
+                    let expired_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                     let stopped = guard.take();
                     drop(guard);
+                    service.set_death(serde_json::json!({
+                        "status": "expired",
+                        "session_status": "expired",
+                        "reason": SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+                        "session_expired_at_unix_seconds": expired_at,
+                        "session_ended_at_unix_seconds": expired_at,
+                        "session_available_here": false,
+                    }));
                     if let Some(session) = stopped {
                         teardown_blocking(session).await;
                     }
-                    match service.workdir.remove() {
+                    let workdir_cleanup = match service.workdir.remove() {
                         WorkdirCleanup::Retained { dir, error } => {
-                            eprintln!("ttl: retained {}: {error}", dir.display())
+                            eprintln!("ttl: retained {}: {error}", dir.display());
+                            "retained"
                         }
-                        WorkdirCleanup::NothingOwned | WorkdirCleanup::Removed(_) => {}
-                    }
+                        WorkdirCleanup::NothingOwned => "not_owned",
+                        WorkdirCleanup::Removed(_) => "removed",
+                    };
+                    service.record_lifecycle(
+                        SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+                        SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+                        workdir_cleanup,
+                    );
                 }
             }
         }
@@ -13399,7 +13572,7 @@ impl SessionRouter {
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            format!("List live isolated sessions owned by this kwin-mcp process. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports its previous server's shutdown record when available. {SESSION_OWNERSHIP_NOTICE}"),
+            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. {SESSION_OWNERSHIP_NOTICE}"),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -13418,7 +13591,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error reports previous shutdown cleanup when recorded, otherwise says cleanup is unconfirmed. Start a new session and relaunch the applications.",
+            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error includes session_status and the recorded end time and reason when available, otherwise says cleanup is unconfirmed. session_stop clears dead, stopped, and expired handles. Start a new session and relaunch the applications.",
             info.instructions.unwrap_or_default()
         ));
         info
@@ -13479,9 +13652,13 @@ impl rmcp::ServerHandler for SessionRouter {
             && !stop
             && let Some(death) = session.check_liveness().await
         {
+            let status = death
+                .get("session_status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("dead");
             return Err(McpError::internal_error(
                 format!(
-                    "Session {id} is dead: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
+                    "Session {id} is {status}: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
                     death["reason"],
                     death["memory_max_bytes"]
                         .as_u64()
