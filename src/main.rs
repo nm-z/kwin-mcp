@@ -5832,7 +5832,13 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
         if storage_mounted {
             continue;
         }
-        match remove_verified_session_storage(&dir) {
+        let remove_disk = remove_verified_workdir(&disk).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("disk overlay {} not removed: {error}", disk.display()),
+            )
+        });
+        match remove_disk.and_then(|()| remove_verified_workdir(&dir)) {
             Ok(()) => eprintln!("autoclean: removed orphaned {}", dir.display()),
             Err(error) => eprintln!("autoclean: retained orphaned {}: {error}", dir.display()),
         }
