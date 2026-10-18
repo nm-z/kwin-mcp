@@ -2888,6 +2888,11 @@ fn session_follows_host_sqlite_wal_rotation() {
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
     let hidden_cache = directory.join(".cache/google-chrome/nested");
+    let cookie_state = directory.join(".local/state/kwin-mcp/browser-cookies");
+    assert!(
+        !cookie_state.exists(),
+        "cookie state must be absent beneath the HOME alias fixture"
+    );
     std::fs::create_dir_all(&hidden_cache).expect("nested browser cache");
     let cache_database = rusqlite::Connection::open(hidden_cache.join("hidden-cache.sqlite"))
         .expect("hidden cache fixture database");
