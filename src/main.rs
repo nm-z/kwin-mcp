@@ -1923,8 +1923,10 @@ const DBUS_SOCKET_PATH_MAX: usize = 99;
 // KWin unique-name discovery: per-candidate introspect probe timeout.
 const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-// AT-SPI tree traversal hard timeout (find_ui_elements).
+// Default AT-SPI tree deadline and find_ui_elements hard timeout.
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS: u32 = 1;
+const ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS: u32 = 30;
 // keyboard_key checks a browser page's focus over AT-SPI (#180) within this
 // time and node count; past either it makes no claim.
 const KEY_FOCUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -9367,6 +9369,9 @@ struct AccessibilityTreeParams {
     max_depth: Option<u32>,
     role: Option<String>,
     show_elements: Option<bool>,
+    /// Traversal time budget in seconds, from 1 to 30. Defaults to 5.
+    #[schemars(range(min = 1, max = 30))]
+    timeout_seconds: Option<u32>,
     /// Node id from a previous reply's "+N children root=ID" note; the tree
     /// starts at that node.
     root: Option<String>,
@@ -12167,7 +12172,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The tree has a 5 second budget and returns gathered nodes with incomplete=true and root=ID continuations if time runs out; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -12175,6 +12180,24 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<AccessibilityTreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        let timeout = match params.timeout_seconds {
+            Some(seconds)
+                if (ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS
+                    ..=ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS)
+                    .contains(&seconds) =>
+            {
+                Duration::from_secs(u64::from(seconds))
+            }
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "timeout_seconds must be between {ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS} and {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}"
+                    ),
+                    None,
+                ));
+            }
+            None => ATSPI_TRAVERSAL_TIMEOUT,
+        };
         self.touch_activity().await;
         self.settle_input().await?;
         let mut tree = LevelTree::default();
@@ -12184,7 +12207,7 @@ impl KwinMcp {
                 .saturating_add(1)
         });
         match tokio::time::timeout(
-            ATSPI_TRAVERSAL_TIMEOUT,
+            timeout,
             self.accessibility_tree_result(peer.clone(), params, &mut tree),
         )
         .await
@@ -12193,10 +12216,14 @@ impl KwinMcp {
             Err(_) => {
                 let (text, mut info) = tree.render_partial(max_levels, true);
                 info["incomplete"] = serde_json::json!(true);
-                info["reason"] = serde_json::json!("traversal reached the 5 second limit");
-                info["continuation"] = serde_json::json!(
-                    "Call accessibility_tree with a root=ID shown in this reply and a smaller max_depth. If no nodes were read, use find_ui_elements for a named control or screenshot."
-                );
+                info["timeout_seconds"] = serde_json::json!(timeout.as_secs());
+                info["reason"] = serde_json::json!(format!(
+                    "traversal reached the {} second limit",
+                    timeout.as_secs()
+                ));
+                info["continuation"] = serde_json::json!(format!(
+                    "Call accessibility_tree with a root=ID shown in this reply and a smaller max_depth to continue that subtree. Set timeout_seconds from {ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS} to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS} to adjust the time budget. If no nodes were read, use find_ui_elements for a named control or screenshot."
+                ));
                 Ok(structured_result(&peer, text, info).await)
             }
         }
