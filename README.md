@@ -308,7 +308,16 @@ cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 
 Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
 (default `1.0`). `keyboard_type` defaults to approximately 100 WPM; `speed: 2`
-requests approximately twice that rate. Mouse tools also accept `target_width`,
+requests approximately twice that rate. A 900-character comment can therefore
+need roughly two minutes at the default rate. For a longer comment, pass a
+larger multiplier such as `keyboard_type({"text":"...","speed":4})`. On engi, a real
+900-character Chrome textarea probe completed in 28.63 seconds at that rate
+and independently copied back the exact text. Inspect the delivery result and
+the field before submitting. Run the synthetic probe with
+`ruby tests/input_delivery_e2e.rb long_comment` using the server/artifact
+variables documented in [the input-delivery tests](tests/input_delivery_e2e.md).
+Mouse tools also accept `target_width`,
+
 the smaller target dimension in pixels (default `20`), for movement timing.
 
 Pointer movement uses sampled Fitts-law durations, minimum-jerk progress,
