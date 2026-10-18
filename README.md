@@ -514,9 +514,19 @@ before sending or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 
+After an editable field is cleared, AT-SPI may expose one blank newline that the
+application removes when typing starts. If the entire resulting field matches
+the requested text, `atspi_transformed_blank_line` reports `unverified` with
+inspection guidance. It retains the original expected and observed counts;
+preservation of that initial newline is ambiguous. A newline retained by the
+application still follows the normal exact-text verification path.
+
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+The [input delivery regression](tests/input_delivery_e2e.md) covers clearing and
+retyping the same text followed immediately by repeated screenshots.
 
 ### Startup budgets and fresh browser profiles
 
