@@ -363,13 +363,66 @@ to discard its session cookie history. This does not sign out the host browser.
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns its isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Use only IDs returned by your own `session_start` calls. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops owned by that server. Requests carrying a live session ID owned by another kwin-mcp process running as the same user on the same host are forwarded to that process through a private Unix socket.
 
-Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops. An in-place source reload preserves its PID, pipes, and live sessions. Calls with a session ID from another live same-user server on this host are automatically forwarded after checking the target PID and effective UID. The replacement server's `session_list` covers only its own process. The previous server records completed shutdown cleanup in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle.jsonl`; the log is capped at 1 MiB and retains recent records, so older cleanup details may be absent. An unavailable-ID error reports the previous process and cleanup record when available, and reports malformed records as errors. If an ID's owner is unavailable, call `session_start` without `session_id`, relaunch the applications, and restore the task.
+Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops. An in-place source reload preserves its PID, pipes, and live sessions. Calls with a session ID from another live same-user server on this host are automatically forwarded after checking the target PID and effective UID. The replacement server's `session_list` covers only its own process. Session stops, idle TTL expirations, and completed server-shutdown cleanup are recorded in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle.jsonl`; the log is capped at 1 MiB and retains recent records, so older details may be absent. An unavailable-ID error includes `session_status`: `stopped` or `expired` with the recorded end time and reason when known, `owned_by_another_process` when the ID belongs elsewhere but its final state is unknown, or `not_found`. A request without an ID when no session is active reports `none_running`. These responses also report whether the ID is available in the current process and provide recovery guidance. TTL-expired handles appear as `expired` in the current process's `session_list` and can be cleared with `session_stop`. If the owning process is unavailable, call `session_start` without `session_id`, relaunch the applications, and restore the task.
 
 Sessions run concurrently. Input requests retain arrival order within a desktop, reads run concurrently, and a shared Tower concurrency limit matches the machine thread count. App launches use a Tower timeout.
 
 The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its executable. A source change triggers a rebuild. A rebuilt executable replaces the server in place while preserving its PID, client pipes, and live desktops. The client receives `notifications/tools/list_changed`. Build diagnostics are in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/build.log`. Set `KWIN_MCP_REPO` when the source is elsewhere.
 
 ## Setup
+
+### Install the Rust executables
+
+Build this checkout, then install its server and viewer together:
+
+```bash
+cargo build --release --bins
+bash scripts/install.sh
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+The installer requires Bash, GNU coreutils, and `jq`. It defaults to `~/.local/bin`
+and checks that the source server prints help, valid MCP schemas, and identical
+`--version` / `-V` identities before installing either executable. Both version
+flags must print one line with the Rust package version, build number, and Git
+commit, such as `kwin-mcp v0.1.2.651 (a34524a)`. Installation reports this identity
+along with the selected PATH executable. Use `--bin-dir DIR` for a different
+destination, or `--source-dir DIR` for a different build output directory.
+Put the destination first in `PATH`. If another directory still supplies the
+`kwin-mcp` command, installation reports an actionable error after copying the
+executables; use their absolute paths or fix `PATH` and clear the shell command cache.
+
+An existing destination requires explicit replacement:
+
+```bash
+type -a kwin-mcp
+bash scripts/install.sh --replace
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+`--replace` replaces the destination file or symlink itself. It preserves the
+target of an old symlink, including a uv-managed console script. The separately
+published Python/PyPI package also named `kwin-mcp` belongs to
+[isac322/kwin-mcp](https://github.com/isac322/kwin-mcp); `uv tool install kwin-mcp`
+does not install this Rust server. If `--version`, `--help`, or `--describe`
+succeeds with empty output, inspect `type -a kwin-mcp` for that conflicting
+command and install the Rust executables with the steps above. If you no longer need the Python
+tool, run `uv tool uninstall kwin-mcp` before installing the Rust executables.
+To keep both projects, use separate installation directories and absolute
+commands: uv can recreate or remove its console entry point during later package
+operations. Configure MCP clients with the absolute installed Rust path, such
+as `~/.local/bin/kwin-mcp` expanded to your home directory.
+
+To check installation behavior against built artifacts without changing your
+real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
+It installs into temporary directories and exercises help, schemas, and both
+version flags through `PATH`, including rejection of silent version entrypoints.
 
 ### Host runtime environment
 
