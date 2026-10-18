@@ -202,6 +202,12 @@ overlays, host sockets and processes, or browser profiles.
 
 ### Two-phase D-Bus startup
 
+The private KWallet bus records `dbus-daemon` diagnostics in the session
+workdir's `kwallet-bus.stderr`. If the daemon exits before readiness or its
+socket does not appear within three seconds, `session_start` includes a bounded
+stderr excerpt in the error before cleanup. `--autoclean` removes the log with
+the failed session's workdir.
+
 1. bwrap starts, dbus-daemon creates session bus
 2. Host `proxy_conn` claims `org.kde.KWin`, registers InputDevice objects
 3. Container starts KWin (gets unique name `:1.N`, not the well-known name)
@@ -213,6 +219,20 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 ### HID isolation
 
 Virtual input devices are created via `/dev/uinput` (requires `input` group). They are kernel-global but the host's KWin does not claim them (no seat tag assigned by udev). The devices are bind-mounted into the container and destroyed on session_stop.
+
+Startup device errors identify the mouse or keyboard, the failed operation,
+the `/dev/uinput` or sysfs path, and the original OS error. They also report
+the failing server's numeric `Uid`, `Gid`, and supplementary `Groups` from
+`/proc/self/status`, plus its user and mount namespace IDs. Compare these
+with the launching shell when investigating access from an enclosing
+namespace: a writable `/dev/uinput` check alone does not verify device
+configuration, creation, or evdev discovery.
+
+Run `ruby tests/uinput_startup_e2e.rb /path/to/kwin-mcp /path/to/evidence`
+on a KDE host with `/dev/uinput`, an existing user runtime and bus, and
+passwordless sudo to verify startup diagnostics through the stdio server.
+The regression mounts failure fixtures in private mount namespaces and
+restores the caller's credentials before launching the server.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 

@@ -3135,6 +3135,80 @@ async fn wait_for_socket(
     }
 }
 
+fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
+    use std::io::Read;
+    const DIAGNOSTIC_LIMIT: u64 = 16 * 1024;
+
+    // Read a regular file instead of a pipe: a noisy daemon must not block on
+    // stderr while we wait for its socket, and a live child must not hold up EOF.
+    let diagnostics = (|| -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(stderr_path)?
+            .take(DIAGNOSTIC_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > DIAGNOSTIC_LIMIT;
+        if truncated {
+            bytes.pop();
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(format!(
+            "{}{}",
+            text.trim(),
+            if truncated { " [truncated]" } else { "" }
+        ))
+    })();
+    match diagnostics {
+        Ok(text) if text.is_empty() => format!(
+            "{message}; dbus-daemon stderr at {} is empty",
+            stderr_path.display()
+        ),
+        Ok(text) => format!(
+            "{message}; dbus-daemon stderr at {}: {text}",
+            stderr_path.display()
+        ),
+        Err(error) => format!(
+            "{message}; read dbus-daemon stderr at {}: {error}",
+            stderr_path.display()
+        ),
+    }
+}
+
+async fn wait_for_wallet_bus(
+    child: &mut std::process::Child,
+    socket: &Path,
+    stderr_path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
+    loop {
+        let error = match child.try_wait() {
+            Ok(Some(status)) => Some(format!(
+                "KWallet bus dbus-daemon exited with {status} before startup completed at {}",
+                socket.display()
+            )),
+            Err(error) => Some(format!("check KWallet bus dbus-daemon: {error}")),
+            Ok(None) => None,
+        };
+        if let Some(error) = error {
+            return Err(wallet_bus_startup_error(error, stderr_path));
+        }
+        if std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(wallet_bus_startup_error(
+                format!(
+                    "KWallet bus socket did not appear at {} within {}s",
+                    socket.display(),
+                    DBUS_PROXY_TIMEOUT.as_secs()
+                ),
+                stderr_path,
+            ));
+        }
+        tokio::time::sleep(DBUS_PROXY_POLL).await;
+    }
+}
+
 async fn connect_session_bus(
     address: &str,
     deadline: std::time::Instant,
@@ -3273,6 +3347,75 @@ fn terminate_with_parent(command: &mut std::process::Command) {
 
 // ── uinput virtual devices ──────────────────────────────────────────────
 
+const UINPUT_PATH: &str = "/dev/uinput";
+
+fn uinput_error(
+    device: &str,
+    operation: &str,
+    path: &Path,
+    error: impl std::fmt::Display,
+) -> KwinError {
+    // Capture the failing process's credentials and namespaces, not those of
+    // the login shell: an enclosing user namespace can change device access.
+    let credentials = std::fs::read_to_string("/proc/self/status")
+        .map(|status| {
+            status
+                .lines()
+                .filter(|line| {
+                    line.starts_with("Uid:")
+                        || line.starts_with("Gid:")
+                        || line.starts_with("Groups:")
+                })
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|error| format!("credentials unavailable: {error}"));
+    let namespace = |name| {
+        std::fs::read_link(format!("/proc/self/ns/{name}"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("unavailable ({error})"))
+    };
+    KwinError::Msg(format!(
+        "{device}: {operation} {}: {error}; {credentials}; user_namespace={}; mount_namespace={}",
+        path.display(),
+        namespace("user"),
+        namespace("mnt"),
+    ))
+}
+
+fn uinput_devnode(
+    device: &mut evdev::uinput::VirtualDevice,
+    name: &str,
+) -> Result<PathBuf, KwinError> {
+    let syspath = device.get_syspath().map_err(|error| {
+        uinput_error(
+            name,
+            "query sysfs path (UI_GET_SYSNAME) via",
+            Path::new(UINPUT_PATH),
+            error,
+        )
+    })?;
+    // Match evdev's enumeration, keeping the sysfs path at each fallible step.
+    let entries = std::fs::read_dir(&syspath)
+        .map_err(|error| uinput_error(name, "read evdev directory", &syspath, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            uinput_error(name, "read evdev directory entry in", &syspath, error)
+        })?;
+        let filename = entry.file_name();
+        if filename.as_encoded_bytes().starts_with(b"event") {
+            return Ok(Path::new("/dev/input").join(filename));
+        }
+    }
+    Err(uinput_error(
+        name,
+        "locate evdev node in",
+        &syspath,
+        "no event* entry for /dev/input",
+    ))
+}
+
 fn create_uinput_devices() -> Result<
     (
         evdev::uinput::VirtualDevice,
@@ -3294,16 +3437,24 @@ fn create_uinput_devices() -> Result<
     mouse_axes.insert(evdev::RelativeAxisCode::REL_WHEEL);
     mouse_axes.insert(evdev::RelativeAxisCode::REL_HWHEEL);
 
-    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()?
+    let mouse_error =
+        |operation, error| uinput_error("mouse", operation, Path::new(UINPUT_PATH), error);
+    let mut mouse_dev = evdev::uinput::VirtualDevice::builder()
+        .map_err(|error| mouse_error("open read/write", error))?
         .name("kwin-mcp-virtual-mouse")
-        .with_keys(&mouse_keys)?
-        .with_relative_axes(&mouse_axes)?
-        .build()?;
+        .with_keys(&mouse_keys)
+        .map_err(|error| mouse_error("configure key capabilities on", error))?
+        .with_relative_axes(&mouse_axes)
+        .map_err(|error| mouse_error("configure relative axes on", error))?
+        .build()
+        .map_err(|error| {
+            mouse_error(
+                "create virtual device (UI_DEV_SETUP/UI_DEV_CREATE) via",
+                error,
+            )
+        })?;
 
-    let mouse_path = mouse_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput mouse: no devnode".to_owned()))??;
+    let mouse_path = uinput_devnode(&mut mouse_dev, "mouse")?;
 
     // Keyboard: all standard keys (KEY_ESC=1 through KEY_MAX=0x2ff)
     let mut kbd_keys = evdev::AttributeSet::<evdev::KeyCode>::new();
@@ -3319,15 +3470,22 @@ fn create_uinput_devices() -> Result<
         };
     }
 
-    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()?
+    let keyboard_error =
+        |operation, error| uinput_error("keyboard", operation, Path::new(UINPUT_PATH), error);
+    let mut kbd_dev = evdev::uinput::VirtualDevice::builder()
+        .map_err(|error| keyboard_error("open read/write", error))?
         .name("kwin-mcp-virtual-keyboard")
-        .with_keys(&kbd_keys)?
-        .build()?;
+        .with_keys(&kbd_keys)
+        .map_err(|error| keyboard_error("configure key capabilities on", error))?
+        .build()
+        .map_err(|error| {
+            keyboard_error(
+                "create virtual device (UI_DEV_SETUP/UI_DEV_CREATE) via",
+                error,
+            )
+        })?;
 
-    let kbd_path = kbd_dev
-        .enumerate_dev_nodes_blocking()?
-        .next()
-        .ok_or_else(|| KwinError::Msg("uinput keyboard: no devnode".to_owned()))??;
+    let kbd_path = uinput_devnode(&mut kbd_dev, "keyboard")?;
 
     Ok((mouse_dev, mouse_path, kbd_dev, kbd_path))
 }
@@ -8856,21 +9014,29 @@ impl KwinMcp {
         ) {
             return cleanup_err(format!("write KWallet bus config: {error}"), &mut startup);
         }
+        let wallet_bus_stderr_path = host_xdg_dir.join("kwallet-bus.stderr");
+        let wallet_bus_stderr = match std::fs::File::create(&wallet_bus_stderr_path) {
+            Ok(file) => file,
+            Err(error) => {
+                return cleanup_err(format!("create KWallet bus stderr: {error}"), &mut startup);
+            }
+        };
         let mut wallet_bus = std::process::Command::new("dbus-daemon");
         wallet_bus
             .arg(format!("--config-file={}", wallet_bus_config.display()))
             .args(["--nofork", "--nopidfile"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::from(wallet_bus_stderr));
         terminate_with_parent(&mut wallet_bus);
+        let wallet_bus_index = startup.service_proxy_children.len();
         match spawn_session_child(wallet_bus, false).await {
             Ok(child) => startup.add_proxy(child),
             Err(error) => return cleanup_err(format!("start KWallet bus: {error}"), &mut startup),
         }
-        if let Err(error) = wait_for_socket(
+        if let Err(error) = wait_for_wallet_bus(
+            &mut startup.service_proxy_children[wallet_bus_index],
             &wallet_bus_socket,
-            "KWallet bus socket",
-            std::time::Instant::now() + DBUS_PROXY_TIMEOUT,
+            &wallet_bus_stderr_path,
         )
         .await
         {
