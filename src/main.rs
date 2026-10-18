@@ -1785,6 +1785,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(50);
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_START_MAX_SECONDS: u64 = 300;
 
 // Session overlay layers and the FUSE bridge image live on disk under
 // ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
@@ -4237,8 +4238,13 @@ fn bind_live_sqlite(
     plan: &mut OverlayPlan,
     target: &Path,
     databases: &[PathBuf],
+    service: &KwinMcp,
+    browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<()> {
-    let discarded = discarded_session_databases(target);
+    let discarded = match browser_profiles {
+        BrowserProfiles::Inherit => discarded_session_databases(target, service)?,
+        BrowserProfiles::Fresh => Vec::new(),
+    };
     for database in databases.iter().filter(|database| {
         !discarded.contains(database) && !browser_cookie_database(target, database)
     }) {
@@ -4355,6 +4361,7 @@ fn prepare_browser_cookies(
     plan: &mut OverlayPlan,
     target: &Path,
     baseline_root: &Path,
+    service: &KwinMcp,
 ) -> anyhow::Result<(Vec<kwin_mcp::browser_cookies::CookieRoot>, Vec<String>)> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(baseline_root)?;
@@ -4371,6 +4378,7 @@ fn prepare_browser_cookies(
         let baseline = baseline_root.join(config);
         let mut profiles = std::collections::BTreeSet::new();
         for directory in [&host, &saved] {
+            service.profile_operation("list cookie profiles", directory)?;
             if let Ok(entries) = std::fs::read_dir(directory) {
                 for entry in entries
                     .flatten()
@@ -4384,13 +4392,16 @@ fn prepare_browser_cookies(
             for name in ["Cookies", "Network/Cookies"] {
                 let database = host.join(&profile).join(name);
                 let previous = saved.join(&profile).join(name);
+                service.profile_operation("inspect cookie database", &database)?;
                 if !database.is_file() && !previous.is_file() {
                     continue;
                 }
                 let upper = upper_file(plan, &database)?;
                 let mut merge_failed = false;
                 let result = if database.is_file() {
-                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).map(|()| {
+                    service.profile_operation("snapshot host cookies", &database)?;
+                    kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
+                        service.profile_operation("merge saved cookies", &previous)?;
                         if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
                             merge_failed = true;
                             let message = format!("{}: {error:#}", database.display());
@@ -4400,8 +4411,10 @@ fn prepare_browser_cookies(
                             );
                             cookie_errors.push(message);
                         }
+                        Ok(())
                     })
                 } else {
+                    service.profile_operation("snapshot saved cookies", &previous)?;
                     kwin_mcp::browser_cookies::snapshot(&previous, &upper)
                 };
                 if let Err(error) = result {
@@ -4415,6 +4428,7 @@ fn prepare_browser_cookies(
                         );
                         eprintln!("session_start: {message}");
                         cookie_errors.push(message);
+                        service.profile_operation("snapshot saved cookies", &previous)?;
                         kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
                     } else {
                         return Err(
@@ -4422,6 +4436,7 @@ fn prepare_browser_cookies(
                         );
                     }
                 }
+                service.profile_operation("inspect private cookie schema", &upper)?;
                 if !kwin_mcp::browser_cookies::supports_cookie_jar(&upper)? {
                     eprintln!(
                         "session_start: skipping non-cookie SQLite database {}",
@@ -4430,6 +4445,7 @@ fn prepare_browser_cookies(
                     continue;
                 }
                 if !merge_failed {
+                    service.profile_operation("apply cookie deletions", &previous)?;
                     kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
                 }
                 let original = baseline.join(&profile).join(name);
@@ -4438,6 +4454,7 @@ fn prepare_browser_cookies(
                         .parent()
                         .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
                 )?;
+                service.profile_operation("snapshot cookie baseline", &original)?;
                 kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
             }
         }
@@ -4460,9 +4477,10 @@ fn prepare_browser_cookies(
     Ok((roots, cookie_errors))
 }
 
-fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
+fn discarded_session_databases(target: &Path, service: &KwinMcp) -> anyhow::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4472,17 +4490,23 @@ fn discarded_session_databases(target: &Path) -> Vec<PathBuf> {
         {
             for name in EMPTY_BROWSER_DATABASES {
                 let path = profile.path().join(name);
+                service.profile_operation("inspect disposable database", &path)?;
                 if path.is_file() {
                     paths.push(path);
                 }
             }
         }
     }
-    paths
+    Ok(paths)
 }
 
-fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow::Result<()> {
+fn empty_session_databases(
+    plan: &OverlayPlan,
+    databases: &[PathBuf],
+    service: &KwinMcp,
+) -> anyhow::Result<()> {
     for database in databases {
+        service.profile_operation("empty private database", database)?;
         if !database.parent().is_some_and(Path::is_dir) {
             continue;
         }
@@ -4509,8 +4533,13 @@ fn empty_session_databases(plan: &OverlayPlan, databases: &[PathBuf]) -> anyhow:
 /// setting itself is left alone, because switching Chrome off "continue where
 /// you left off" makes it delete session-only cookies at startup and would
 /// drop logins that live in them.
-fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
+fn hide_browser_sessions(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    service: &KwinMcp,
+) -> anyhow::Result<()> {
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4519,17 +4548,24 @@ fn hide_browser_sessions(plan: &mut OverlayPlan, target: &Path) {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         {
             let sessions = profile.path().join("Sessions");
+            service.profile_operation("inspect saved tabs", &sessions)?;
             if sessions.is_dir() {
                 plan.empty_dirs.push(sessions);
             }
         }
     }
+    Ok(())
 }
 
-fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
+fn mark_browser_exits_clean(
+    plan: &OverlayPlan,
+    target: &Path,
+    service: &KwinMcp,
+) -> anyhow::Result<usize> {
     use std::os::unix::fs::PermissionsExt;
     let mut marked = 0;
     for config in BROWSER_CONFIG_DIRS {
+        service.profile_operation("list profiles", &target.join(config))?;
         let Ok(profiles) = std::fs::read_dir(target.join(config)) else {
             continue;
         };
@@ -4538,6 +4574,7 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         {
             let preferences = profile.path().join("Preferences");
+            service.profile_operation("read Preferences", &preferences)?;
             let result = (|| -> anyhow::Result<bool> {
                 let text = match std::fs::read(&preferences) {
                     Ok(text) => text,
@@ -4587,7 +4624,7 @@ fn mark_browser_exits_clean(plan: &OverlayPlan, target: &Path) -> usize {
             }
         }
     }
-    marked
+    Ok(marked)
 }
 
 /// Host state session_start reads before it spawns the sandbox.
@@ -4606,6 +4643,7 @@ fn prepare_host_view(
     host_runtime: &Path,
     writable_paths: &[PathBuf],
     service: &KwinMcp,
+    browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<HostView> {
     service.set_start_stage("scanning host mounts");
     test_block_host_scan();
@@ -4668,7 +4706,19 @@ fn prepare_host_view(
         .expose_sockets(target, host_runtime, host_xdg_dir, &inventory)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
     service.set_start_stage("mounting live SQLite databases read-only");
-    bind_live_sqlite(&mut overlay_plan, target, &inventory.live_databases)?;
+    if matches!(browser_profiles, BrowserProfiles::Fresh) {
+        // Mask the profile roots before alias mounts are constructed, too.
+        overlay_plan
+            .empty_dirs
+            .extend(BROWSER_CONFIG_DIRS.iter().map(|config| target.join(config)));
+    }
+    bind_live_sqlite(
+        &mut overlay_plan,
+        target,
+        &inventory.live_databases,
+        service,
+        browser_profiles,
+    )?;
 
     eprintln!(
         "session_start: overlay plan={} overlays={} read-only-mounts={}",
@@ -4680,21 +4730,28 @@ fn prepare_host_view(
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
-    service.set_start_stage("preparing browser profiles");
-    let discarded = discarded_session_databases(target);
-    empty_session_databases(&overlay_plan, &discarded)?;
-    let (cookie_roots, cookie_errors) =
-        prepare_browser_cookies(&mut overlay_plan, target, &disk.join("cookie-baselines"))?;
+    let (cookie_roots, cookie_errors) = match browser_profiles {
+        BrowserProfiles::Inherit => {
+            let discarded = discarded_session_databases(target, service)?;
+            empty_session_databases(&overlay_plan, &discarded, service)?;
+            let cookies = prepare_browser_cookies(
+                &mut overlay_plan,
+                target,
+                &disk.join("cookie-baselines"),
+                service,
+            )?;
+            let marked = mark_browser_exits_clean(&overlay_plan, target, service)?;
+            hide_browser_sessions(&mut overlay_plan, target, service)?;
+            eprintln!("session_start: marked {marked} browser profile(s) clean");
+            cookies
+        }
+        BrowserProfiles::Fresh => (Vec::new(), Vec::new()),
+    };
     let browser_cache = target.join(".cache/google-chrome");
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
     }
-    let marked = mark_browser_exits_clean(&overlay_plan, target);
-    hide_browser_sessions(&mut overlay_plan, target);
-    eprintln!(
-        "session_start: marked {marked} browser profile(s) as cleanly exited in the session copy; {} saved browser session dir(s) start empty",
-        overlay_plan.empty_dirs.len()
-    );
+    service.set_start_stage("reading desktop settings");
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView {
         overlay_plan,
@@ -5217,7 +5274,8 @@ struct KwinMcp {
     /// directory that nothing is left to delete.
     start_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last startup checkpoint reached, named in the hard-limit error.
-    start_stage: Arc<std::sync::Mutex<&'static str>>,
+    start_stage: Arc<std::sync::Mutex<String>>,
+    startup_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     display: DisplayConfig,
 }
 
@@ -5280,21 +5338,44 @@ impl KwinMcp {
             tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
-            start_stage: Arc::new(std::sync::Mutex::new("waiting for the lifecycle gate")),
+            start_stage: Arc::new(std::sync::Mutex::new(
+                "waiting for the lifecycle gate".to_owned(),
+            )),
+            startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             display,
         }
     }
-    fn set_start_stage(&self, stage: &'static str) {
+    fn set_start_stage(&self, stage: impl Into<String>) {
+        let stage = stage.into();
         eprintln!("session_start: stage: {stage}");
         if let Ok(mut current) = self.start_stage.lock() {
             *current = stage;
         }
     }
-    fn start_stage(&self) -> &'static str {
+    fn start_stage(&self) -> String {
         self.start_stage
             .lock()
-            .map(|stage| *stage)
-            .unwrap_or("unknown")
+            .map(|stage| stage.clone())
+            .unwrap_or_else(|_| "unknown".to_owned())
+    }
+    fn profile_operation(&self, operation: &str, path: &Path) -> anyhow::Result<()> {
+        if self
+            .startup_deadline
+            .lock()
+            .ok()
+            .and_then(|deadline| *deadline)
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            anyhow::bail!(
+                "startup deadline elapsed before {operation} {}",
+                path.display()
+            );
+        }
+        self.set_start_stage(format!(
+            "preparing browser profiles: {operation} {}",
+            path.display()
+        ));
+        Ok(())
     }
     /// Wait for the lifecycle gate, bounded so a start, stop, or reaper stuck
     /// behind a blocked host call answers with an error instead of hanging.
@@ -8336,8 +8417,23 @@ struct FindUiElementsParams {
     query: String,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BrowserProfiles {
+    #[default]
+    Inherit,
+    Fresh,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SessionStartParams {
+    /// Startup wall-clock limit in seconds (1..300). Default 20; includes host preparation.
+    startup_timeout_seconds: Option<u64>,
+    /// inherit (default) prepares saved Chromium profiles and cookies. fresh
+    /// starts those browser config directories empty, skipping profile copying
+    /// and cookie persistence; useful for terminal-only work.
+    #[serde(default)]
+    browser_profiles: BrowserProfiles,
     /// Session RAM throttle in GiB. Zero disables throttling; omit for the server default.
     memory_high: Option<u64>,
     /// Session RAM hard limit in GiB. Must be positive; omit for the server default.
@@ -8352,7 +8448,7 @@ struct SessionStartParams {
     height: Option<u32>,
     /// Absolute paths under HOME whose oversized ancestor files need writable
     /// private copies. Default: files over 64 MiB use reflink or a read-only
-    /// bind. Explicit copies still share the 20-second startup deadline.
+    /// bind. Explicit copies share startup_timeout_seconds (default 20).
     writable_paths: Option<Vec<PathBuf>>,
 }
 
@@ -8778,7 +8874,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -8789,7 +8885,17 @@ impl KwinMcp {
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
         let mut attempt = SessionStartAttempt::new();
-        let deadline = tokio::time::Instant::now() + SESSION_START_HARD_TIMEOUT;
+        let startup_timeout = params
+            .startup_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(SESSION_START_HARD_TIMEOUT);
+        if !(1..=SESSION_START_MAX_SECONDS).contains(&startup_timeout.as_secs()) {
+            return Err(McpError::invalid_params(
+                "startup_timeout_seconds must be from 1 to 300",
+                None,
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + startup_timeout;
         let gate = match self.lifecycle_gate(deadline, "session_start").await {
             Ok(gate) => gate,
             Err(error) => {
@@ -8798,6 +8904,11 @@ impl KwinMcp {
             }
         };
         self.set_start_stage("preparing the session workdir");
+        *self
+            .startup_deadline
+            .lock()
+            .map_err(|_| McpError::internal_error("startup deadline lock poisoned", None))? =
+            Some(deadline.into_std());
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
         let outcome = match tokio::time::timeout_at(
             deadline,
@@ -8810,7 +8921,7 @@ impl KwinMcp {
                 let stage = self.start_stage();
                 let message = format!(
                     "session_start exceeded {}s hard limit while {stage}",
-                    SESSION_START_HARD_TIMEOUT.as_secs()
+                    startup_timeout.as_secs()
                 );
                 eprintln!("session_start: {message}");
                 let blocked = host_work
@@ -8842,7 +8953,7 @@ impl KwinMcp {
                             "{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."
                         ),
                         Some(
-                            serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": true}),
+                            serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": true}),
                         ),
                     );
                     attempt.finish(Some(&error.message));
@@ -8851,7 +8962,7 @@ impl KwinMcp {
                 Err(McpError::internal_error(
                     message,
                     Some(
-                        serde_json::json!({"reason": "hard_timeout", "stage": stage, "host_call_blocked": false}),
+                        serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": false}),
                     ),
                 ))
             }
@@ -8872,6 +8983,7 @@ impl KwinMcp {
         host_work: HostWork,
     ) -> Result<CallToolResult, McpError> {
         let memory = params.memory_config(self.display)?;
+        let browser_profiles = params.browser_profiles;
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
             env!("CARGO_PKG_VERSION"),
@@ -9051,6 +9163,7 @@ impl KwinMcp {
                 &view_runtime,
                 &writable_paths,
                 &view_service,
+                browser_profiles,
             ));
         });
         if let Ok(mut slot) = host_work.lock() {
@@ -9949,6 +10062,8 @@ impl KwinMcp {
         });
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
+            "browser_profiles": browser_profiles,
+            "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_HARD_TIMEOUT.as_secs()),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
@@ -11784,7 +11899,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
