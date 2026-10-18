@@ -2419,6 +2419,14 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         wait_for_viewer_windows(pid, 0).is_empty(),
         "host window close left the viewer window visible"
     );
+    let viewer_exit_deadline = Instant::now() + Duration::from_secs(15);
+    while process_alive(pid).unwrap_or(false) {
+        assert!(
+            Instant::now() < viewer_exit_deadline,
+            "viewer process survived its host window close"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 
     let reopened = call_tool(&mut client, 7, "viewer_open", json!({}));
     assert_eq!(
