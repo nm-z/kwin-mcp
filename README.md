@@ -536,3 +536,17 @@ Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
 regression. It uses synthetic private profiles, a controlled blocked Preferences
 read, terminal launch, and a delayed real sandbox to verify profile isolation,
 operation diagnostics, deferred cleanup, and configurable timeout bounds.
+
+## Release packaging and deployment
+
+The shipped `kwin-mcp-deploy` CLI builds committed source on the least busy eligible
+sentry/archy host, stages checksummed release packages, and explicitly installs
+new release directories on engi, archy or benji. Engi builds require an explicit
+host override and always use nice 19; selected engi builds and installs run
+locally when invoked on engi, without an SSH listener. Unreachable benji is skipped. No command
+activates a release or restarts services. Packages include optional OAuth gateway
+and Cloudflare tunnel user unit templates; the gateway executable and credentials
+are external prerequisites.
+
+See [deployment instructions](docs/deployment.md) for commands, private build and
+install paths, runtime compatibility requirements and unit configuration.
