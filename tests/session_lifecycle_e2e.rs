@@ -4078,6 +4078,38 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         .to_owned();
     assert_ne!(school_window, first_window, "{school}");
 
+    // A window can appear before Chrome loads its initial document. Establish
+    // both titles so School's initial load cannot masquerade as a second handoff.
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = call_tool(&mut client, 40, "window_list", json!({}));
+        let ready = windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| {
+                [
+                    (&first_window, "kwin-mcp-handoff-before"),
+                    (&school_window, "kwin-mcp-school-window"),
+                ]
+                .iter()
+                .all(|(id, title)| {
+                    entries.iter().any(|window| {
+                        window["id"] == id.as_str()
+                            && window["title"]
+                                .as_str()
+                                .is_some_and(|value| value.contains(title))
+                    })
+                })
+            });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "initial pages not ready: {windows}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let handoff_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>After handoff'";
     let handed_off = call_tool(
         &mut client,
