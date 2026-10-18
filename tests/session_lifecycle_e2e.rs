@@ -4949,6 +4949,30 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         failed["result"]["structuredContent"]["exit_status"], 3,
         "{failed}"
     );
+    // The command's stderr comes back with its exit status.
+    let noisy = call_tool(
+        &mut client,
+        7,
+        "launch_app",
+        json!({"command":"sh -c 'echo boom >&2; exit 3'"}),
+    );
+    assert_eq!(noisy["result"]["isError"], true, "{noisy}");
+    assert_eq!(
+        noisy["result"]["structuredContent"]["exit_status"], 3,
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["structuredContent"]["stderr_tail"]
+            .as_array()
+            .is_some_and(|lines| lines.contains(&json!("boom"))),
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stderr (last") && text.contains("boom")),
+        "{noisy}"
+    );
 
     let finished = call_tool(
         &mut client,
@@ -4977,6 +5001,58 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{stopped}"
     );
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_names_a_socket_path_in_a_host_directory_the_session_cannot_see() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The socket does not exist yet, so only its host parent directory is probed.
+    let directory =
+        std::env::temp_dir().join(format!("kwin-mcp-e2e-socket-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("host directory");
+    let socket = directory.join("sock");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let refused = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command": format!("true {}", socket.display())}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["reason"], "path_not_visible",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["data"]["path"],
+        json!(socket.display().to_string()),
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not visible in the session")),
+        "{refused}"
+    );
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -6454,7 +6530,7 @@ impl Drop for ResumeProcess {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
-fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
+fn launch_app_submits_despite_its_own_frozen_compositor_and_recovers() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
     initialize(&mut client);
@@ -6483,28 +6559,24 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         json!({})
     );
     let ping_ms = ping_started.elapsed().as_millis();
-    let timed_out = client.response(3, Duration::from_secs(25));
+    // The window baselines are bounded at 5 seconds each and never hold the
+    // command back, so it is submitted; the window wait then ends at its own 15.
+    let fault_response = client.response(3, Duration::from_secs(45));
     let elapsed_ms = begun.elapsed().as_millis();
+    let payload = &fault_response["result"]["structuredContent"];
+    assert!(fault_response["error"].is_null(), "{fault_response}");
+    assert_eq!(payload["command_submitted"], true, "{fault_response}");
+    assert_eq!(payload["window"], "timeout", "{fault_response}");
     assert_eq!(
-        timed_out["error"]["data"]["reason"], "launch_timeout",
-        "{timed_out}"
-    );
-    assert_eq!(
-        timed_out["error"]["data"]["command_submitted"], false,
-        "{timed_out}"
+        payload["window_baseline"], "unavailable",
+        "{fault_response}"
     );
     assert!(
-        timed_out["error"]["data"]["stage"]
-            .as_str()
-            .expect("stage")
-            .contains("windows before launch")
-    );
-    assert!(
-        (19_000..23_000).contains(&elapsed_ms),
-        "timeout duration {elapsed_ms}ms"
+        (24_000..29_000).contains(&elapsed_ms),
+        "launch duration {elapsed_ms}ms"
     );
     eprintln!(
-        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} timeout_ms={elapsed_ms} response={timed_out}",
+        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} launch_ms={elapsed_ms} response={fault_response}",
         client.child.id()
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -6595,7 +6667,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
             .as_str()
             .expect("screenshot path");
         std::fs::copy(capture, directory.join("launch-recovery.png")).expect("copy screenshot");
-        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"timeout_ms":elapsed_ms,"response":timed_out,
+        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"launch_ms":elapsed_ms,"response":fault_response,
             "commit":started["result"]["structuredContent"]["commit"],"version":started["result"]["structuredContent"]["version"]}).to_string()).expect("write fault proof");
     }
     let stopped = call_tool(&mut client, 8, "session_stop", json!({}));

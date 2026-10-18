@@ -1962,9 +1962,15 @@ const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
-const LAUNCH_PRECHECK_TIMEOUT: Duration = Duration::from_secs(20);
-// The call deadline leaves room for the prelaunch KWin check and CDP retries.
+// The window baseline is read before submission, but a KWin that does not answer
+// within this bound must not hold the command back: it is read after submission.
+const LAUNCH_BASELINE_TIMEOUT: Duration = Duration::from_secs(5);
+// The call deadline leaves room for the baseline reads and CDP retries.
 const LAUNCH_CALL_OVERHEAD_TIMEOUT: Duration = Duration::from_secs(30);
+// A launch that exits without a window reports this many stderr lines, read
+// from the bytes sandbox.log gained since the command was submitted.
+const LAUNCH_STDERR_TAIL_LINES: usize = 20;
+const LAUNCH_STDERR_READ_BYTES: u64 = 64 * 1024;
 
 // KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
 // it when a non-blocking pipe is full at close. Frames are captured into a
@@ -7145,7 +7151,8 @@ fn gib(bytes: u64) -> String {
 
 /// Explain a failed write: for EDQUOT/ENOSPC, name the per-user quota (systemd
 /// mounts /tmp as tmpfs with usrquota, so a user can hit its limit while df
-/// still shows free space) and the filesystem's own free space.
+/// still shows free space), the filesystem it applies to, and the filesystem's
+/// own free space.
 fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
     let mut message = format!("writing {} failed: {error}", path.display());
     let Some(code) = error.raw_os_error() else {
@@ -7155,6 +7162,9 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
         return message;
     }
     let directory = path.parent().unwrap_or(path);
+    let filesystem = nix::sys::statfs::statfs(directory)
+        .map(|stat| filesystem_name(stat.filesystem_type()))
+        .unwrap_or_else(|_| "unidentified".to_owned());
     if let Ok(dir) = std::fs::File::open(directory) {
         use std::os::fd::AsRawFd;
         let mut quota = IfDqblk::default();
@@ -7173,12 +7183,11 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
                 std::ptr::from_mut(&mut quota),
             )
         };
-        if result == 0 && quota.dqb_bhardlimit > 0 {
-            let limit = quota.dqb_bhardlimit.saturating_mul(QUOTA_BLOCK_BYTES);
+        if result == 0
+            && let Some(summary) = quota_summary(&quota)
+        {
             message.push_str(&format!(
-                ". Per-user disk quota for uid {uid} on this filesystem: {} used of a {} limit",
-                gib(quota.dqb_curspace),
-                gib(limit)
+                ". Per-user disk quota for uid {uid} on the {filesystem} filesystem: {summary}"
             ));
         }
     }
@@ -7190,6 +7199,66 @@ fn describe_write_failure(path: &Path, error: &std::io::Error) -> String {
         ));
     }
     message
+}
+
+/// The name of the filesystem a write failed on: /tmp is tmpfs, and the HOME
+/// overlay's upper layer is overlayfs.
+fn filesystem_name(kind: nix::sys::statfs::FsType) -> String {
+    if kind == nix::sys::statfs::TMPFS_MAGIC {
+        "tmpfs".to_owned()
+    } else if kind == nix::sys::statfs::OVERLAYFS_SUPER_MAGIC {
+        "overlayfs".to_owned()
+    } else {
+        format!("type {:#x}", kind.0)
+    }
+}
+
+/// The block and inode usage of a per-user quota, marking each limit that is
+/// reached, or `None` when the quota sets neither limit.
+fn quota_summary(quota: &IfDqblk) -> Option<String> {
+    let mut parts = Vec::new();
+    if quota.dqb_bhardlimit > 0 {
+        let limit = quota.dqb_bhardlimit.saturating_mul(QUOTA_BLOCK_BYTES);
+        let at_limit = if quota.dqb_curspace >= limit {
+            " (at its limit)"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{} used of a {} block limit{at_limit}",
+            gib(quota.dqb_curspace),
+            gib(limit)
+        ));
+    }
+    if quota.dqb_ihardlimit > 0 {
+        let at_limit = if quota.dqb_curinodes >= quota.dqb_ihardlimit {
+            " (at its limit)"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{} of {} inodes used{at_limit}",
+            quota.dqb_curinodes, quota.dqb_ihardlimit
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// A launch whose command script cannot be written fails before anything is
+/// submitted, and names what ran out.
+fn launch_script_write_error(path: &Path, error: &std::io::Error) -> McpError {
+    McpError::internal_error(
+        format!(
+            "launch_app could not write its command script: {}. Nothing was submitted.",
+            describe_write_failure(path, error)
+        ),
+        Some(serde_json::json!({
+            "reason": "write_failed",
+            "stage": "writing the launch script",
+            "command_submitted": false,
+            "path": path.display().to_string(),
+        })),
+    )
 }
 
 /// Write `bytes` to `path` via a sibling temporary file and rename, so a
@@ -7453,11 +7522,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// Literal absolute arguments that name something on the host. The session
-/// shell checks these paths before it starts the requested program, because
-/// mounts such as /tmp can hide host files even when the spelling is unchanged.
-fn launch_host_paths(command: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Absolute path arguments of a launch command, each once. A `NAME=/path` or
+/// `--option=/path` word contributes its value.
+fn launch_path_words(command: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
     for word in shlex::split(command).unwrap_or_default() {
         let value = if word.starts_with('/') {
             word.as_str()
@@ -7466,14 +7534,133 @@ fn launch_host_paths(command: &str) -> Vec<PathBuf> {
                 .map_or(word.as_str(), |(_, value)| value)
         };
         let path = Path::new(value);
-        if path.is_absolute()
-            && std::fs::symlink_metadata(path).is_ok()
-            && !paths.iter().any(|saved| saved == path)
-        {
+        if path.is_absolute() && !paths.iter().any(|saved| saved == path) {
             paths.push(path.to_owned());
         }
     }
     paths
+}
+
+/// The session path each absolute launch argument must reach before the program
+/// starts, paired with the argument it reports. The session shell checks these
+/// because mounts such as /tmp can hide host files even when the spelling is
+/// unchanged. An argument that exists on the host is probed as itself; one the
+/// command may create is probed through its parent directory. An argument whose
+/// host parent is also missing is not probed, since the command may create that.
+fn launch_path_probes(command: &str, host_has: impl Fn(&Path) -> bool) -> Vec<(PathBuf, PathBuf)> {
+    let mut probes = Vec::new();
+    for path in launch_path_words(command) {
+        let probe = if host_has(&path) {
+            path.clone()
+        } else {
+            match path.parent() {
+                Some(parent) if host_has(parent) => parent.to_owned(),
+                _ => continue,
+            }
+        };
+        probes.push((path, probe));
+    }
+    probes
+}
+
+/// What a launch that exits without a window left in the session's stderr: the
+/// last lines it wrote and the sandbox.log line that names one of its paths.
+#[derive(Debug, PartialEq, Eq)]
+struct ExitDiagnostics {
+    stderr: Vec<String>,
+    sandbox_line: Option<String>,
+    unavailable: Option<String>,
+}
+
+/// The session's stderr from `offset` on: the bytes sandbox.log gained since the
+/// command was submitted, at most the last LAUNCH_STDERR_READ_BYTES of them.
+fn sandbox_log_since(path: &Path, offset: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = offset.max(length.saturating_sub(LAUNCH_STDERR_READ_BYTES));
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > offset {
+        // Reading from inside the output starts mid-line, so drop that partial line.
+        text = match text.find('\n') {
+            Some(newline) => text.split_off(newline + 1),
+            None => String::new(),
+        };
+    }
+    Ok(text)
+}
+
+/// The newest line that names one of the command's paths or reports a missing or
+/// denied file, so a path the session cannot see is named in the result.
+fn relevant_sandbox_line(output: &str, command_paths: &[PathBuf]) -> Option<String> {
+    let names: Vec<String> = command_paths
+        .iter()
+        .filter(|path| path.as_path() != Path::new("/"))
+        .map(|path| path.display().to_string())
+        .collect();
+    output
+        .lines()
+        .rev()
+        .find(|line| {
+            line.contains("No such file or directory")
+                || line.contains("Permission denied")
+                || names.iter().any(|name| line.contains(name.as_str()))
+        })
+        .map(str::to_owned)
+}
+
+fn exit_diagnostics(output: std::io::Result<String>, command_paths: &[PathBuf]) -> ExitDiagnostics {
+    match output {
+        Ok(text) => {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let shown = lines.len().saturating_sub(LAUNCH_STDERR_TAIL_LINES);
+            ExitDiagnostics {
+                stderr: lines[shown..]
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .collect(),
+                sandbox_line: relevant_sandbox_line(&text, command_paths),
+                unavailable: None,
+            }
+        }
+        Err(error) => ExitDiagnostics {
+            stderr: Vec::new(),
+            sandbox_line: None,
+            unavailable: Some(error.to_string()),
+        },
+    }
+}
+
+/// The lines a launch that exited without a window adds to its result.
+fn exit_diagnostics_text(diagnostics: &ExitDiagnostics) -> String {
+    let mut text = String::new();
+    if let Some(error) = &diagnostics.unavailable {
+        text.push_str(&format!("\nstderr unavailable: {error}"));
+    } else if diagnostics.stderr.is_empty() {
+        text.push_str("\nno stderr was written");
+    } else {
+        let count = diagnostics.stderr.len();
+        let noun = if count == 1 { "line" } else { "lines" };
+        text.push_str(&format!(
+            "\nstderr (last {count} {noun}):\n{}",
+            diagnostics.stderr.join("\n")
+        ));
+    }
+    // A relevant line already in the tail needs no second copy.
+    if let Some(line) = diagnostics
+        .sandbox_line
+        .as_ref()
+        .filter(|line| !diagnostics.stderr.contains(*line))
+    {
+        text.push_str(&format!("\nsandbox.log: {line}"));
+    }
+    text
 }
 
 /// The DRM device nodes to show the session when the host's NVIDIA nodes are
@@ -9082,6 +9269,49 @@ fn changed_existing_browser_window_titles<'a>(
                     .is_some_and(|before| before.title != window.title)
         })
         .collect()
+}
+
+/// The active window's id and the full window list, read before a launch so a
+/// window that appears afterwards can be told apart from the ones already open.
+async fn window_baseline(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    xdg: &Path,
+) -> (Option<String>, Option<Vec<WindowSnapshot>>) {
+    let windows = window_snapshots(conn, kwin_unique, xdg).await.ok();
+    let active = windows
+        .as_ref()
+        .and_then(|windows| windows.iter().find(|window| window.active))
+        .map(|window| window.id.clone());
+    let active = match active {
+        Some(id) => Some(id),
+        None => active_window_info(conn, kwin_unique, xdg)
+            .await
+            .ok()
+            .map(|(_, _, geometry)| geometry.id),
+    };
+    (active, windows)
+}
+
+/// When the window list a launch compares against was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowBaseline {
+    /// Read before the command was submitted.
+    PreLaunch,
+    /// KWin did not answer before submission, so it was read right after.
+    AfterSubmit,
+    /// KWin did not answer either time, so a window found may predate the command.
+    Unavailable,
+}
+
+impl WindowBaseline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PreLaunch => "pre_launch",
+            Self::AfterSubmit => "after_submit",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 fn launch_window_geometry(window: &WindowSnapshot) -> WindowGeometry {
@@ -12969,7 +13199,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -13060,41 +13290,32 @@ impl KwinMcp {
         if let Ok(mut progress) = progress.lock() {
             progress.stage = "reading windows before launch";
         }
-        let (prev_window_id, previous_windows) =
-            match tokio::time::timeout(LAUNCH_PRECHECK_TIMEOUT, async {
-                let windows = window_snapshots(&conn, &kwin_unique, &xdg).await.ok();
-                let active = windows
-                    .as_ref()
-                    .and_then(|windows| windows.iter().find(|window| window.active))
-                    .map(|window| window.id.clone());
-                let active = match active {
-                    Some(id) => Some(id),
-                    None => active_window_info(&conn, &kwin_unique, &xdg)
-                        .await
-                        .ok()
-                        .map(|(_, _, geometry)| geometry.id),
-                };
-                (active, windows)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    let progress = progress.lock().map_err(|_| {
-                        McpError::internal_error("launch progress lock poisoned", None)
-                    })?;
-                    return Err(launch_timeout(&progress, LAUNCH_PRECHECK_TIMEOUT));
-                }
-            };
+        let mut baseline = WindowBaseline::PreLaunch;
+        let (mut prev_window_id, mut previous_windows) = match tokio::time::timeout(
+            LAUNCH_BASELINE_TIMEOUT,
+            window_baseline(&conn, &kwin_unique, &xdg),
+        )
+        .await
+        {
+            Ok(read) => read,
+            Err(_) => {
+                baseline = WindowBaseline::AfterSubmit;
+                (None, None)
+            }
+        };
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
+        let command_paths = launch_path_words(&params.command);
         let mut checked_command = String::new();
-        for path in launch_host_paths(&params.command) {
-            let quoted = shell_quote(&path.display().to_string());
+        for (path, probe) in launch_path_probes(&params.command, |path| {
+            std::fs::symlink_metadata(path).is_ok()
+        }) {
             checked_command.push_str(&format!(
-                "if [ ! -e {quoted} ]; then printf '%s' {quoted} > {}; exit 125; fi\n",
+                "if [ ! -e {} ]; then printf '%s' {} > {}; exit 125; fi\n",
+                shell_quote(&probe.display().to_string()),
+                shell_quote(&path.display().to_string()),
                 shell_quote(&path_error_file.display().to_string()),
             ));
         }
@@ -13116,6 +13337,10 @@ impl KwinMcp {
             shell_quote(&checked_command),
             shell_quote(&exit_file.display().to_string()),
         );
+        // sandbox.log holds the session's stderr. This launch's output starts at
+        // the log's current end, so an exit can report what the command wrote.
+        let sandbox_log = session_disk_path(&xdg).join("sandbox.log");
+        let sandbox_log_offset = std::fs::metadata(&sandbox_log).map(|meta| meta.len());
         if let Ok(mut progress) = progress.lock() {
             progress.stage = "submitting the command to the session shell";
         }
@@ -13124,7 +13349,7 @@ impl KwinMcp {
             .write(true)
             .create_new(true)
             .open(&command_path)
-            .map_err(KwinError::from)?;
+            .map_err(|error| launch_script_write_error(&command_path, &error))?;
         let mut command_file = PendingLaunchFile {
             path: command_path,
             submitted: false,
@@ -13133,7 +13358,7 @@ impl KwinMcp {
         let script_body = format!("unlink -- {quoted_path}\n{launch_cmd}");
         script
             .write_all(script_body.as_bytes())
-            .map_err(KwinError::from)?;
+            .map_err(|error| launch_script_write_error(&command_file.path, &error))?;
         drop(script);
         let dispatch = format!("bash {quoted_path}\n");
         // A short pipe write is atomic, so cancellation cannot leave half a
@@ -13163,6 +13388,21 @@ impl KwinMcp {
                 progress.command_submitted = true;
             }
             command_file.submitted = true;
+        }
+
+        if baseline == WindowBaseline::AfterSubmit {
+            match tokio::time::timeout(
+                LAUNCH_BASELINE_TIMEOUT,
+                window_baseline(&conn, &kwin_unique, &xdg),
+            )
+            .await
+            {
+                Ok((active, windows)) => {
+                    prev_window_id = active;
+                    previous_windows = windows;
+                }
+                Err(_) => baseline = WindowBaseline::Unavailable,
+            }
         }
 
         if let Ok(mut progress) = progress.lock() {
@@ -13262,7 +13502,11 @@ impl KwinMcp {
             };
             return Err(McpError::invalid_params(
                 format!("{path} is not visible in the session; {detail}"),
-                None,
+                Some(serde_json::json!({
+                    "reason": "path_not_visible",
+                    "path": path,
+                    "command_submitted": true,
+                })),
             ));
         }
 
@@ -13302,6 +13546,16 @@ impl KwinMcp {
             .as_deref()
             .map(|text| format!(". {text}"))
             .unwrap_or_default();
+        let baseline_note = match baseline {
+            WindowBaseline::PreLaunch => "",
+            WindowBaseline::AfterSubmit => {
+                ". warning: KWin did not answer before the command was submitted, so the window list was read right after submission"
+            }
+            WindowBaseline::Unavailable => {
+                ". warning: KWin did not answer before or after submission, so a window reported here may predate the command"
+            }
+        };
+        let suffix = format!("{suffix}{baseline_note}");
         match (win_geo, exit_status) {
             (Some(geo), _) => {
                 let (outcome, description) = if window_reused {
@@ -13318,10 +13572,16 @@ impl KwinMcp {
                     "window_title": geo.title,
                     "cdp": cdp_connected, "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
+                    "window_baseline": baseline.as_str(),
                 })).await)
             }
             (None, Some(status)) => {
                 let browser_unattributed = status == 0 && chromium_launch;
+                let sandbox_output = match &sandbox_log_offset {
+                    Ok(offset) => sandbox_log_since(&sandbox_log, *offset),
+                    Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                };
+                let diagnostics = exit_diagnostics(sandbox_output, &command_paths);
                 let text = match status {
                     0 if browser_unattributed => format!(
                         "launched: {} (browser launch returned status 0, but no matching existing window could be attributed: {} after {}s){suffix}",
@@ -13333,6 +13593,7 @@ impl KwinMcp {
                     127 => format!("{} failed: command not found (exit status 127)", params.command),
                     _ => format!("{} exited with status {status} without opening a window", params.command),
                 };
+                let text = format!("{text}{}", exit_diagnostics_text(&diagnostics));
                 let window_outcome = if browser_unattributed {
                     "unattributed"
                 } else {
@@ -13344,6 +13605,10 @@ impl KwinMcp {
                     "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
+                    "window_baseline": baseline.as_str(),
+                    "stderr_tail": diagnostics.stderr,
+                    "sandbox_log_line": diagnostics.sandbox_line,
+                    "stderr_error": diagnostics.unavailable,
                 });
                 if browser_unattributed {
                     payload["handoff"] = serde_json::json!({
@@ -13361,6 +13626,7 @@ impl KwinMcp {
                 "window_outcome": "timeout",
                 "cdp": false, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
                 "window_timeout_seconds": window_timeout.as_secs(),
+                "window_baseline": baseline.as_str(),
             })).await),
         }
     }
@@ -16321,5 +16587,229 @@ mod typing_pace_tests {
             elapsed + Duration::from_millis(1) >= TYPING_BUDGET,
             "{elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_diagnostics_tests {
+    use super::{
+        ExitDiagnostics, IfDqblk, LAUNCH_STDERR_READ_BYTES, exit_diagnostics,
+        exit_diagnostics_text, filesystem_name, launch_path_probes, launch_path_words,
+        launch_script_write_error, quota_summary, relevant_sandbox_line, sandbox_log_since,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn exit_text(output: &str, command_paths: &[&str]) -> String {
+        let paths: Vec<PathBuf> = command_paths.iter().map(PathBuf::from).collect();
+        exit_diagnostics_text(&exit_diagnostics(Ok(output.to_owned()), &paths))
+    }
+
+    #[test]
+    fn exit_text_carries_the_last_twenty_stderr_lines() {
+        let output: String = (1..=25).map(|n| format!("line {n}\n")).collect();
+        let text = exit_text(&output, &[]);
+        assert!(
+            text.starts_with("\nstderr (last 20 lines):\nline 6\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("\nline 25"), "{text}");
+        assert!(!text.contains("line 5\n"), "{text}");
+    }
+
+    #[test]
+    fn blank_stderr_lines_do_not_count_toward_the_tail() {
+        assert_eq!(
+            exit_text("boom\n\n\nbang\n\n", &[]),
+            "\nstderr (last 2 lines):\nboom\nbang"
+        );
+        assert_eq!(exit_text("boom\n", &[]), "\nstderr (last 1 line):\nboom");
+    }
+
+    #[test]
+    fn exit_without_stderr_says_so() {
+        assert_eq!(exit_text("", &[]), "\nno stderr was written");
+    }
+
+    #[test]
+    fn sandbox_log_line_names_the_path_the_session_cannot_see() {
+        let output = "sh: line 1: /tmp/claude-1000/obs57/probe.txt: No such file or directory\n";
+        let diagnostics = exit_diagnostics(Ok(output.to_owned()), &[]);
+        assert_eq!(
+            diagnostics,
+            ExitDiagnostics {
+                stderr: vec![
+                    "sh: line 1: /tmp/claude-1000/obs57/probe.txt: No such file or directory"
+                        .to_owned()
+                ],
+                sandbox_line: Some(
+                    "sh: line 1: /tmp/claude-1000/obs57/probe.txt: No such file or directory"
+                        .to_owned()
+                ),
+                unavailable: None,
+            }
+        );
+        // Already in the tail, so it is not repeated as a separate sandbox.log line.
+        assert_eq!(
+            exit_text(output, &[]),
+            format!("\nstderr (last 1 line):\n{}", output.trim_end())
+        );
+    }
+
+    #[test]
+    fn a_relevant_line_outside_the_tail_is_named_separately() {
+        let mut output = String::from(
+            "sh: line 1: /tmp/claude-1000/obs57/probe.txt: No such file or directory\n",
+        );
+        for n in 1..=20 {
+            output.push_str(&format!("later {n}\n"));
+        }
+        let text = exit_text(&output, &[]);
+        assert!(
+            text.starts_with("\nstderr (last 20 lines):\nlater 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "\nsandbox.log: sh: line 1: /tmp/claude-1000/obs57/probe.txt: No such file or directory"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn relevant_line_is_the_newest_one_naming_a_command_path() {
+        let output = "kwin: warning about a window\nold: /usr/bin/drawd failed\nnew: /usr/bin/drawd exited\nunrelated line\n";
+        assert_eq!(
+            relevant_sandbox_line(output, &[PathBuf::from("/usr/bin/drawd")]).as_deref(),
+            Some("new: /usr/bin/drawd exited")
+        );
+        // The root directory names every absolute path, so it cannot pick a line.
+        assert_eq!(
+            relevant_sandbox_line("plasma: /usr/share/x\n", &[PathBuf::from("/")]),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_sandbox_log_is_reported_not_hidden() {
+        let diagnostics =
+            exit_diagnostics(Err(std::io::Error::from(std::io::ErrorKind::NotFound)), &[]);
+        assert!(diagnostics.stderr.is_empty());
+        assert!(
+            exit_diagnostics_text(&diagnostics).starts_with("\nstderr unavailable: "),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn launch_paths_include_option_values_once_and_skip_relative_words() {
+        let words = launch_path_words(
+            "drawd --sock=/tmp/a/sock SOCKET=/run/x 1280 relative/path /tmp/a/sock",
+        );
+        assert_eq!(
+            words,
+            vec![PathBuf::from("/tmp/a/sock"), PathBuf::from("/run/x")]
+        );
+    }
+
+    #[test]
+    fn a_path_to_create_is_probed_through_its_host_parent() {
+        let host =
+            |path: &Path| matches!(path.to_str(), Some("/tmp/claude/old" | "/usr/bin/drawd"));
+        let probes = launch_path_probes(
+            "/usr/bin/drawd /tmp/claude/old/sock /tmp/missing/dir/sock",
+            host,
+        );
+        assert_eq!(
+            probes,
+            vec![
+                (
+                    PathBuf::from("/usr/bin/drawd"),
+                    PathBuf::from("/usr/bin/drawd")
+                ),
+                (
+                    PathBuf::from("/tmp/claude/old/sock"),
+                    PathBuf::from("/tmp/claude/old")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn quota_summary_names_the_limit_that_is_reached() {
+        const GIB_KIB: u64 = 1024 * 1024;
+        const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+        let blocks = IfDqblk {
+            dqb_bhardlimit: 2 * GIB_KIB,
+            dqb_curspace: GIB_BYTES,
+            ..IfDqblk::default()
+        };
+        assert_eq!(
+            quota_summary(&blocks).as_deref(),
+            Some("1.00 GiB used of a 2.00 GiB block limit")
+        );
+        let full_blocks = IfDqblk {
+            dqb_bhardlimit: GIB_KIB,
+            dqb_curspace: GIB_BYTES,
+            ..IfDqblk::default()
+        };
+        assert_eq!(
+            quota_summary(&full_blocks).as_deref(),
+            Some("1.00 GiB used of a 1.00 GiB block limit (at its limit)")
+        );
+        let inodes = IfDqblk {
+            dqb_ihardlimit: 100,
+            dqb_curinodes: 100,
+            ..IfDqblk::default()
+        };
+        assert_eq!(
+            quota_summary(&inodes).as_deref(),
+            Some("100 of 100 inodes used (at its limit)")
+        );
+        assert_eq!(quota_summary(&IfDqblk::default()), None);
+    }
+
+    #[test]
+    fn write_failures_name_tmpfs_and_overlay_filesystems() {
+        assert_eq!(filesystem_name(nix::sys::statfs::TMPFS_MAGIC), "tmpfs");
+        assert_eq!(
+            filesystem_name(nix::sys::statfs::OVERLAYFS_SUPER_MAGIC),
+            "overlayfs"
+        );
+    }
+
+    #[test]
+    fn script_write_failure_says_nothing_was_submitted() {
+        let error = std::io::Error::from_raw_os_error(nix::libc::EDQUOT);
+        let failure =
+            launch_script_write_error(Path::new("/nonexistent-kwin-mcp/launch-1.sh"), &error);
+        assert!(
+            failure.message.contains("Disk quota exceeded")
+                && failure.message.contains("Nothing was submitted"),
+            "{failure:?}"
+        );
+        let data = failure.data.unwrap_or_default();
+        assert_eq!(data["reason"], "write_failed");
+        assert_eq!(data["command_submitted"], false);
+    }
+
+    #[test]
+    fn sandbox_log_read_starts_at_the_offset_and_drops_a_partial_line() -> std::io::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "kwin-mcp-launch-diagnostics-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let log = dir.join("sandbox.log");
+        std::fs::write(&log, "earlier output\nboom\n")?;
+        assert_eq!(sandbox_log_since(&log, 15)?, "boom\n");
+
+        // A read that starts inside a long output begins at the next whole line.
+        let mut long = String::from("old\n");
+        long.push_str(&"x".repeat(usize::try_from(LAUNCH_STDERR_READ_BYTES).unwrap_or(0) + 10));
+        long.push_str("\nlast\n");
+        std::fs::write(&log, &long)?;
+        assert_eq!(sandbox_log_since(&log, 4)?, "last\n");
+        std::fs::remove_dir_all(&dir)
     }
 }
