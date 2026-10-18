@@ -1148,10 +1148,13 @@ impl TextReceipt {
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
+        // Chrome can retain Focused on page editors after Ctrl+L; visit its
+        // toolbar before web content so the address bar wins that stale state.
+        let prefer_chrome_toolbar_focus = title.to_ascii_lowercase().contains("google chrome");
         let mut visited = 0;
         let mut focus = None;
-        for app in root.get_children().await? {
-            let app = app.as_accessible_proxy(&bus).await?;
+        for app_object in root.get_children().await? {
+            let app = app_object.as_accessible_proxy(&bus).await?;
             for frame in app.get_children().await? {
                 let frame = frame.as_accessible_proxy(&bus).await?;
                 let name = frame.name().await.unwrap_or_default();
@@ -1177,6 +1180,9 @@ impl TextReceipt {
                     continue;
                 }
                 let mut stack = frame.get_children().await?;
+                if prefer_chrome_toolbar_focus {
+                    stack.reverse();
+                }
                 while let Some(object) = stack.pop() {
                     visited += 1;
                     if visited > TEXT_DISCOVERY_MAX_NODES {
@@ -1272,7 +1278,11 @@ impl TextReceipt {
                             initial_descendant_snapshot_error,
                         });
                     }
-                    stack.extend(node.get_children().await?);
+                    let mut children = node.get_children().await?;
+                    if prefer_chrome_toolbar_focus {
+                        children.reverse();
+                    }
+                    stack.extend(children);
                 }
             }
         }

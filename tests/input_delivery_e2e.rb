@@ -212,6 +212,53 @@ class InputDeliveryProbe
     screen('electron-rich-after-return')
   end
 
+  def chrome_omnibox
+    command = 'google-chrome-stable --no-first-run --no-default-browser-check --new-window'
+    assert_success(call('launch_app', command: command))
+    assert_success(call('keyboard_key', key: 'ctrl+l'))
+    initial = assert_success(call('keyboard_type', text: 'https://www.perplexity.ai/'))
+    raise "initial Chrome navigation was not verified: #{initial}" unless initial.dig('delivery', 'status') == 'verified'
+    assert_success(call('keyboard_key', key: 'Return'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    loop do
+      windows = assert_success(call('window_list')).fetch('windows')
+      break if windows.any? { |window| window.fetch('title').downcase.include?('perplexity') }
+      raise 'Chrome did not navigate to Perplexity' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.25
+    end
+    screen('chrome-omnibox-populated-page')
+    assert_success(call('keyboard_key', key: 'ctrl+l'))
+    screen('chrome-omnibox-before-type')
+    visible = tree
+    File.write(File.join(@artifacts, 'chrome-omnibox-before-type.tree.txt'), visible)
+    focused_omnibox = visible.lines.any? do |line|
+      line.include?("entry\tAddress and search bar\t") && line.include?('|focused|')
+    end
+    raise 'Ctrl+L did not focus Chrome address bar' unless focused_omnibox
+    text = 'chrome://extensions/'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    screen('chrome-omnibox-after-type')
+    File.write(File.join(@artifacts, 'chrome-omnibox-after-type.tree.txt'), tree)
+    raise 'omnibox omitted completed submission' unless result['submission_complete']
+    raise 'omnibox lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise "omnibox suggested retry: #{delivery}" unless result['retry_safe'] == false
+    raise "omnibox URL was not verified: #{delivery}" unless delivery['status'] == 'verified'
+    raise "omnibox used the wrong verification path: #{delivery}" unless delivery['method'] == 'atspi_focused_text'
+    raise "wrong omnibox expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
+    raise "wrong omnibox observed length: #{delivery}" unless delivery['observed_field_characters'] == text.length
+    screen('chrome-omnibox-before-return')
+    assert_success(call('keyboard_key', key: 'Return'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    visible = nil
+    loop do
+      visible = screen('chrome-omnibox-after-return')
+      break if visible.dig('window', 'title').downcase.include?('extensions')
+      raise 'omnibox URL did not navigate to Extensions' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.25
+    end
+  end
+
   def nested_rich_contenteditable
     visible = tree
     match = visible.match(/entry\tNested rich contenteditable\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
