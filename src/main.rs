@@ -2290,6 +2290,15 @@ const DEFAULT_TARGET_WIDTH: f64 = 20.0;
 const FITTS_INTERCEPT_MS: f64 = 230.0;
 const FITTS_SLOPE_MS: f64 = 166.0;
 const FITTS_RESIDUAL_MS: f64 = 64.0;
+// A key still down after the compositor's repeat delay auto-repeats. KDE defaults
+// to 600 ms, and this host is configured for 300 ms. The keyboard fit's lognormal
+// tail is unbounded, so typed and tapped keys clip holds to 250 ms.
+const TYPED_KEY_HOLD_MAX: Duration = Duration::from_millis(250);
+// Typing paces every key from the profile, which takes about 110 ms per character.
+// Longer inputs compress their intervals to fit this budget instead of outlasting
+// the caller, and never go below the profile's 10 ms interval floor.
+const TYPING_BUDGET: Duration = Duration::from_secs(45);
+const TYPED_KEY_INTERVAL_FLOOR: Duration = Duration::from_millis(10);
 
 #[derive(Deserialize)]
 struct HumanInputProfile {
@@ -2357,6 +2366,9 @@ impl InputPace {
     fn hold(self) -> anyhow::Result<Duration> {
         Ok(self.key_timing('\0', None)?.0)
     }
+    fn key_hold(self) -> anyhow::Result<Duration> {
+        Ok(capped_key_hold(self.hold()?))
+    }
     async fn move_pointer(self, eis: &Eis, start: [f64; 2], end: [f64; 2]) -> anyhow::Result<()> {
         let distance = (end[0] - start[0]).hypot(end[1] - start[1]);
         if distance < f64::EPSILON {
@@ -2418,6 +2430,19 @@ impl InputPace {
         }
         eis.move_abs(input_coordinate(end[0]), input_coordinate(end[1]))
     }
+}
+fn capped_key_hold(hold: Duration) -> Duration {
+    hold.min(TYPED_KEY_HOLD_MAX)
+}
+// Shrinks a sampled press-to-press interval so the remaining characters fit the
+// remaining budget. Short inputs keep their sampled timing.
+fn budgeted_interval(
+    sampled: Duration,
+    remaining_budget: Duration,
+    remaining_characters: usize,
+) -> Duration {
+    let count = u32::try_from(remaining_characters.max(1)).unwrap_or(u32::MAX);
+    sampled.min((remaining_budget / count).max(TYPED_KEY_INTERVAL_FLOOR))
 }
 #[expect(clippy::as_conversions, reason = "EIS accepts f32 screen coordinates")]
 fn input_coordinate(value: f64) -> f32 {
@@ -2530,6 +2555,12 @@ async fn type_with_profile(
     let result: anyhow::Result<()> = async {
         for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
             let (hold, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
+            let hold = capped_key_hold(hold);
+            let interval = budgeted_interval(
+                interval,
+                TYPING_BUDGET.saturating_sub(began.elapsed()),
+                characters.len() - i,
+            );
             // Repeated keys must release before their next press. Shift transitions
             // also wait for held characters so their requested case stays intact.
             for (up, key, _) in &pending {
@@ -12657,7 +12688,10 @@ impl KwinMcp {
             // A terminal or other inaccessible target can receive these key
             // events even when AT-SPI reports focus on a non-editable control.
             // That focus report cannot prove that submitted text missed the app.
-            Err(error) if error.is::<input_bridge::FocusNotEditable>() => {
+            Err(error)
+                if error.is::<input_bridge::FocusNotEditable>()
+                    || error.is::<input_bridge::TerminalFocus>() =>
+            {
                 let after = match &active {
                     Ok(geometry) => {
                         input_bridge::TextReceipt::capture(
@@ -12671,16 +12705,11 @@ impl KwinMcp {
                     Err(error) => Err(anyhow::anyhow!(error.to_string())),
                 };
                 match after {
-                    Err(after) => match after.downcast_ref::<input_bridge::FocusNotEditable>() {
-                        Some(focus) if keys.is_empty() => {
-                            input_bridge::TextDelivery::not_in_field(focus)
-                        }
-                        Some(focus) => input_bridge::TextDelivery::unavailable(format!(
-                            "{focus}; {} submitted character key events may have reached the active application",
-                            keys.len()
-                        )),
-                        None => input_bridge::TextDelivery::unavailable(after.to_string()),
-                    },
+                    Err(after) => input_bridge::TextDelivery::unreadable_field_delivery(
+                        keys.len(),
+                        &error,
+                        &after,
+                    ),
                     Ok(_) => input_bridge::TextDelivery::unavailable(
                         "keyboard focus moved into an editable field while the keys were sent"
                             .to_owned(),
@@ -12762,7 +12791,7 @@ impl KwinMcp {
         }
         let k = main;
         sent.key(k, true, None).map_err(KwinError::from)?;
-        tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+        tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
         sent.key(k, false, None).map_err(KwinError::from)?;
         if !mods.is_empty() {
             tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
@@ -16208,5 +16237,89 @@ mod startup_report_tests {
             |target| matches!(target, procfs::process::FDTarget::Path(open) if *open == path)
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typing_pace_tests {
+    use super::{
+        InputPace, TYPED_KEY_HOLD_MAX, TYPED_KEY_INTERVAL_FLOOR, TYPING_BUDGET, budgeted_interval,
+        capped_key_hold,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn sampled_holds_stay_below_the_key_repeat_delay() -> Result<(), String> {
+        let pace = InputPace::new(None, None).map_err(|error| format!("{error:?}"))?;
+        let mut longest_sample = Duration::ZERO;
+        for _ in 0..20_000 {
+            let (hold, _) = pace
+                .key_timing('-', Some('o'))
+                .map_err(|error| format!("{error:?}"))?;
+            longest_sample = longest_sample.max(hold);
+            assert!(capped_key_hold(hold) <= TYPED_KEY_HOLD_MAX);
+        }
+        // The unclipped tail exceeds the cap, so the clip is exercised.
+        assert!(longest_sample > TYPED_KEY_HOLD_MAX, "{longest_sample:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn typical_holds_pass_through_the_cap_unchanged() {
+        let typical = Duration::from_millis(93);
+        assert_eq!(capped_key_hold(typical), typical);
+        assert_eq!(
+            capped_key_hold(Duration::from_millis(700)),
+            TYPED_KEY_HOLD_MAX
+        );
+    }
+
+    #[test]
+    fn short_inputs_keep_their_sampled_interval() {
+        let sampled = Duration::from_millis(111);
+        assert_eq!(budgeted_interval(sampled, TYPING_BUDGET, 120), sampled);
+    }
+
+    #[test]
+    fn long_inputs_shrink_to_their_share_of_the_remaining_budget() {
+        assert_eq!(
+            budgeted_interval(Duration::from_millis(100), Duration::from_millis(500), 10),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_falls_to_the_interval_floor_without_lengthening() {
+        assert_eq!(
+            budgeted_interval(Duration::from_millis(100), Duration::ZERO, 10),
+            TYPED_KEY_INTERVAL_FLOOR
+        );
+        let short = Duration::from_millis(3);
+        assert_eq!(budgeted_interval(short, Duration::ZERO, 10), short);
+    }
+
+    #[test]
+    fn final_character_uses_the_remaining_budget_without_dividing_by_zero() {
+        assert_eq!(
+            budgeted_interval(Duration::from_millis(100), Duration::from_millis(40), 0),
+            Duration::from_millis(40)
+        );
+    }
+
+    #[test]
+    fn long_compressed_schedule_fits_the_budget() {
+        // 1,300 characters at the profile's 111 ms mean would take about 144 s.
+        let sampled = Duration::from_millis(111);
+        let characters = 1_300;
+        let mut elapsed = Duration::ZERO;
+        for index in 0..characters {
+            let remaining = TYPING_BUDGET.saturating_sub(elapsed);
+            elapsed += budgeted_interval(sampled, remaining, characters - index);
+        }
+        assert!(elapsed <= TYPING_BUDGET, "{elapsed:?}");
+        assert!(
+            elapsed + Duration::from_millis(1) >= TYPING_BUDGET,
+            "{elapsed:?}"
+        );
     }
 }
