@@ -7994,7 +7994,9 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         &mut client,
         2,
         "session_start",
-        json!({"width":640,"height":480}),
+        // This recovery case observes PipeWire before opening the viewer, so
+        // opt into the private graph explicitly under deferred media startup.
+        json!({"width":640,"height":480,"audio":true}),
     );
     let session = session_handle(&started);
     let path = workdir(&started);
