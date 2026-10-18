@@ -8694,6 +8694,16 @@ enum BrowserProfiles {
     Fresh,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WindowMode {
+    /// Every new window maximizes when it maps (default).
+    #[default]
+    Maximized,
+    /// New windows map at the size their app requests, including on relaunch.
+    Native,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SessionStartParams {
     /// Startup wall-clock limit in seconds (1..300). Default 20; includes host preparation.
@@ -8703,6 +8713,11 @@ struct SessionStartParams {
     /// and cookie persistence; useful for terminal-only work.
     #[serde(default)]
     browser_profiles: BrowserProfiles,
+    /// maximized (default) maximizes every new window when it maps. native
+    /// leaves windows at the size their app requests, so a relaunched app
+    /// reopens at its own size. Both modes disable window decorations.
+    #[serde(default)]
+    window_mode: WindowMode,
     /// Session RAM throttle in GiB. Zero disables throttling; omit for the server default.
     memory_high: Option<u64>,
     /// Session RAM hard limit in GiB. Must be positive; omit for the server default.
@@ -8753,6 +8768,23 @@ impl SessionStartParams {
         }
         Ok(config)
     }
+}
+
+/// The session's KWin window rule. Maximize is applied only at window
+/// creation (rule type 3), so KWin doesn't force the window to stay maximized
+/// after later resize requests. Both modes disable window decorations.
+fn kwinrulesrc_contents(window_mode: WindowMode) -> String {
+    let (description, maximize) = match window_mode {
+        WindowMode::Maximized => (
+            "No decorations, initially maximized",
+            "maximizehoriz=true\nmaximizehorizrule=3\nmaximizevert=true\nmaximizevertrule=3\n",
+        ),
+        WindowMode::Native => ("No decorations", ""),
+    };
+    format!(
+        "[1]\nDescription={description}\nnoborder=true\nnoborderrule=2\n{maximize}\
+         wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+    )
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -9291,7 +9323,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
                 Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
-                {size_line} Windows are auto-maximized.",
+                {size_line} Windows are auto-maximized unless session_start sets window_mode=native.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -9305,7 +9337,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. window_mode=maximized (default) maximizes every new window when it maps; window_mode=native maps each window at the size its app requests, so an app relaunched after a stop reopens at its own size (use it for window-geometry repros). Both modes remove window decorations. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
     )]
     async fn session_start(
         &self,
@@ -9415,6 +9447,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         let memory = params.memory_config(self.display)?;
         let browser_profiles = params.browser_profiles;
+        let window_mode = params.window_mode;
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
             env!("CARGO_PKG_VERSION"),
@@ -9515,15 +9548,8 @@ impl KwinMcp {
         )
         .map_err(|e| ver_err(format!("write kwinrc: {e}")))?;
         let kwinrulesrc_path = host_xdg_dir.join("kwinrulesrc");
-        // Apply maximize only at window creation, so KWin doesn't force the
-        // window to stay maximized after later resize requests.
-        std::fs::write(
-            &kwinrulesrc_path,
-            "[1]\nDescription=No decorations, initially maximized\nnoborder=true\nnoborderrule=2\n\
-             maximizehoriz=true\nmaximizehorizrule=3\nmaximizevert=true\nmaximizevertrule=3\n\
-             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n",
-        )
-        .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
+        std::fs::write(&kwinrulesrc_path, kwinrulesrc_contents(window_mode))
+            .map_err(|e| ver_err(format!("write kwinrulesrc: {e}")))?;
         let kscreenlockerrc_path = host_xdg_dir.join("kscreenlockerrc");
         std::fs::write(
             &kscreenlockerrc_path,
@@ -15340,5 +15366,46 @@ mod launch_warning_tests {
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
+    }
+}
+
+#[cfg(test)]
+mod window_mode_tests {
+    use super::{WindowMode, kwinrulesrc_contents};
+
+    #[test]
+    fn maximized_mode_writes_the_initial_maximize_rule() {
+        assert_eq!(
+            kwinrulesrc_contents(WindowMode::Maximized),
+            "[1]\nDescription=No decorations, initially maximized\nnoborder=true\nnoborderrule=2\n\
+             maximizehoriz=true\nmaximizehorizrule=3\nmaximizevert=true\nmaximizevertrule=3\n\
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+        );
+    }
+
+    #[test]
+    fn native_mode_keeps_decorations_off_and_drops_maximize() {
+        let rules = kwinrulesrc_contents(WindowMode::Native);
+        assert_eq!(
+            rules,
+            "[1]\nDescription=No decorations\nnoborder=true\nnoborderrule=2\n\
+             wmclassmatch=0\n\n[General]\ncount=1\nrules=1\n"
+        );
+        assert!(!rules.contains("maximize"));
+    }
+
+    #[test]
+    fn wire_names_select_the_mode_and_default_is_maximized() -> Result<(), serde_json::Error> {
+        assert!(matches!(WindowMode::default(), WindowMode::Maximized));
+        assert!(matches!(
+            serde_json::from_str::<WindowMode>("\"native\"")?,
+            WindowMode::Native
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WindowMode>("\"maximized\"")?,
+            WindowMode::Maximized
+        ));
+        assert!(serde_json::from_str::<WindowMode>("\"Native\"").is_err());
+        Ok(())
     }
 }
