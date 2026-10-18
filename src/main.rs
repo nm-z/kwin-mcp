@@ -9131,6 +9131,114 @@ struct ExportFileParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct WaitForFileParams {
+    /// Absolute path of the file as the session sees it.
+    session_path: String,
+    /// Maximum wait in seconds. Defaults to 30; accepted range is 1–300.
+    timeout_seconds: Option<u64>,
+    /// Require the file's inode, size, and modification time to remain unchanged
+    /// for this many milliseconds. Defaults to 500; accepted range is 100–5000.
+    stable_for_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct FileReadinessObservation {
+    ready: bool,
+    exists: bool,
+    size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileRevision {
+    inode: u64,
+    size_bytes: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+enum FileReadinessError {
+    NotRegularFile,
+    Inspect(String),
+}
+
+async fn wait_for_file_stability(
+    path: &Path,
+    timeout: Duration,
+    stable_for: Duration,
+) -> Result<FileReadinessObservation, FileReadinessError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let poll_interval = Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut previous_revision = None;
+    let mut stable_since = None;
+    let mut exists;
+    let mut size_bytes;
+
+    loop {
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(FileReadinessError::NotRegularFile);
+            }
+            Ok(metadata) => {
+                let now = tokio::time::Instant::now();
+                exists = true;
+                size_bytes = Some(metadata.len());
+                let revision = FileRevision {
+                    inode: metadata.ino(),
+                    size_bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
+                };
+                if previous_revision == Some(revision) {
+                    if now < deadline
+                        && stable_since.is_some_and(|started| {
+                            now.saturating_duration_since(started) >= stable_for
+                        })
+                    {
+                        return Ok(FileReadinessObservation {
+                            ready: true,
+                            exists,
+                            size_bytes,
+                        });
+                    }
+                } else {
+                    previous_revision = Some(revision);
+                    stable_since = Some(now);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let now = tokio::time::Instant::now();
+                exists = false;
+                size_bytes = None;
+                previous_revision = None;
+                stable_since = None;
+                if now >= deadline {
+                    return Ok(FileReadinessObservation {
+                        ready: false,
+                        exists,
+                        size_bytes,
+                    });
+                }
+            }
+            Err(error) => {
+                return Err(FileReadinessError::Inspect(format!(
+                    "cannot inspect the session file: {error}"
+                )));
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(FileReadinessObservation {
+                ready: false,
+                exists,
+                size_bytes,
+            });
+        }
+        tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
     /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
@@ -13172,8 +13280,130 @@ impl KwinMcp {
     }
 
     #[rmcp::tool(
+        name = "wait_for_file",
+        description = "Wait for an absolute session file path to exist as a regular file and remain unchanged for a bounded interval. Readiness compares its inode, byte size, and modification time; this does not prove the producer has exited. A timeout reports whether the file is still missing or changing. Call export_file after the file is ready."
+    )]
+    async fn wait_for_file(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<WaitForFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let timeout_seconds = params.timeout_seconds.unwrap_or(30);
+        if !(1..=300).contains(&timeout_seconds) {
+            return Err(McpError::invalid_params(
+                "timeout_seconds must be between 1 and 300",
+                None,
+            ));
+        }
+        let stable_for_ms = params.stable_for_ms.unwrap_or(500);
+        if !(100..=5000).contains(&stable_for_ms) {
+            return Err(McpError::invalid_params(
+                "stable_for_ms must be between 100 and 5000",
+                None,
+            ));
+        }
+        let session_path = PathBuf::from(&params.session_path);
+        if !session_path.is_absolute() {
+            return Err(McpError::invalid_params(
+                format!("session_path must be absolute: {}", params.session_path),
+                None,
+            ));
+        }
+        if session_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(McpError::invalid_params(
+                "session_path must not contain a parent-directory component",
+                None,
+            ));
+        }
+
+        self.touch_activity().await;
+        let sandbox_pid = self
+            .with_session(|sess| Ok(sess.sandbox_child.id()))
+            .await?;
+        let timeout = Duration::from_secs(timeout_seconds);
+        let stable_for = Duration::from_millis(stable_for_ms);
+        let root = tokio::task::spawn_blocking(move || sandbox_root(sandbox_pid))
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("wait_for_file session lookup: {error}"), None)
+            })?
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "cannot reach the session filesystem (sandbox not running)",
+                    None,
+                )
+            })?;
+        let relative = session_path.strip_prefix("/").map_err(|error| {
+            McpError::invalid_params(format!("invalid session path: {error}"), None)
+        })?;
+        let source = root.join(relative);
+        let observation = wait_for_file_stability(&source, timeout, stable_for).await;
+
+        let observation = match observation {
+            Ok(observation) => observation,
+            Err(FileReadinessError::NotRegularFile) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{} is not a regular file in the session",
+                        params.session_path
+                    ),
+                    None,
+                ));
+            }
+            Err(FileReadinessError::Inspect(reason)) => {
+                return Err(McpError::internal_error(reason, None));
+            }
+        };
+
+        if observation.ready {
+            let size_bytes = observation.size_bytes.ok_or_else(|| {
+                McpError::internal_error("ready session file has no observed size", None)
+            })?;
+            Ok(structured_result(
+                &peer,
+                format!(
+                    "ready: {} ({size_bytes} bytes stable for {stable_for_ms} ms)",
+                    params.session_path
+                ),
+                serde_json::json!({
+                    "status": "ready",
+                    "session_path": params.session_path,
+                    "size_bytes": size_bytes,
+                    "stable_for_ms": stable_for_ms,
+                    "timeout_seconds": timeout_seconds,
+                }),
+            )
+            .await)
+        } else {
+            let reason = if observation.exists {
+                "changing"
+            } else {
+                "missing"
+            };
+            Err(McpError::internal_error(
+                format!(
+                    "wait_for_file timed out after {timeout_seconds}s: {} is {reason} in the session",
+                    params.session_path
+                ),
+                Some(serde_json::json!({
+                    "status": "not_ready",
+                    "reason": reason,
+                    "session_path": params.session_path,
+                    "exists": observation.exists,
+                    "size_bytes": observation.size_bytes,
+                    "stable_for_ms": stable_for_ms,
+                    "timeout_seconds": timeout_seconds,
+                })),
+            ))
+        }
+    }
+
+    #[rmcp::tool(
         name = "export_file",
-        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
+        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). For an asynchronously produced file, call wait_for_file first to observe it becoming stable. host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
     )]
     async fn export_file(
         &self,

@@ -24,7 +24,16 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_type` | Type a string of text. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
+| `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+
+When a producer writes an artifact asynchronously, call `wait_for_file` with
+its absolute session path before `export_file`. The file is ready when it is a
+regular file whose inode, size, and modification time remain unchanged for
+`stable_for_ms` (default 500 ms, range 100–5000), within `timeout_seconds`
+(default 30, range 1–300). A timeout distinguishes a missing file from one
+that is still changing. This bounded observation does not prove that the
+producer has exited.
 
 ## Large accessibility trees
 
