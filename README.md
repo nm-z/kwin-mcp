@@ -180,7 +180,28 @@ kwin-mcp (host process)
               └── EIS input          (virtual mouse + keyboard, no host devices)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper and work directories are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper and work directories and the FUSE bridge executable are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
+
+When HOME contains nested mounts, `session_start` keeps the live HOME as the lower layer and uses one `fuse-overlayfs` mount, rebinding nested mounts read-only. This requires `fuse-overlayfs`, `fusermount3`, and `/dev/fuse` on hosts with nested HOME mounts.
+
+`TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
+at most 107 bytes, excluding the terminating NUL, for the entire socket path.
+The session's D-Bus sockets have a stricter 99-byte limit imposed by
+[libdbus](https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html).
+`session_start` checks both constraints before creating its workdir or starting
+processes. If a path is too long, the error names it, reports its byte length,
+and asks for a shorter `TMPDIR`; set that variable before launching the server.
+The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
+filename, and counts UTF-8 bytes rather than characters.
+
+Temporary KWin scripts also live in that disk directory, exposed to the sandbox
+through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`
+therefore does not prevent `window_list` or screenshot geometry queries in new
+sessions. If saving `screenshot.png` fails, the default call reports a
+`write_failed` storage error; retry with `inline=true` to receive the pixels
+with `path: null` and `write_error`. Freeing storage allows later screenshots
+to save normally. A session restored from an older server keeps its original
+script storage until it is recreated.
 
 Live host SQLite databases with open WAL files resolve through read-only
 directory binds, except browser cookie jars. Their private main-file symlinks
@@ -200,6 +221,12 @@ overlays, host sockets and processes, or browser profiles.
 
 ### Two-phase D-Bus startup
 
+The private KWallet bus records `dbus-daemon` diagnostics in the session
+workdir's `kwallet-bus.stderr`. If the daemon exits before readiness or its
+socket does not appear within three seconds, `session_start` includes a bounded
+stderr excerpt in the error before cleanup. `--autoclean` removes the log with
+the failed session's workdir.
+
 1. bwrap starts, dbus-daemon creates session bus
 2. Host `proxy_conn` claims `org.kde.KWin`, registers InputDevice objects
 3. Container starts KWin (gets unique name `:1.N`, not the well-known name)
@@ -211,6 +238,9 @@ This lets KCMs (like Mouse settings) see our virtual devices under `org.kde.KWin
 ### HID isolation
 
 MCP mouse and keyboard events use the isolated KWin's EIS connection. New sessions create no kernel uinput devices and expose no host input devices. D-Bus input settings devices store their properties in memory. Sessions inherited from an older binary retain their existing uinput descriptors until they stop.
+
+
+The historical `tests/uinput_startup_e2e.rb` probe applies to binaries that create uinput devices. This EIS server does not use that startup path.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
