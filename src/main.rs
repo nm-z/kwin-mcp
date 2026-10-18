@@ -11906,7 +11906,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Before sending, accessibility must identify a focused editable field; if it cannot, no keys are sent and the result is not_in_field. Recognized terminal and password fields can receive text but cannot provide an application-text receipt, so their result is unverified. For accessible fields, waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -11926,6 +11926,7 @@ impl KwinMcp {
             .chars()
             .map(char_key)
             .collect::<Result<Vec<_>, _>>()?;
+        let started = std::time::Instant::now();
         let active =
             active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
                 .await
@@ -11942,7 +11943,42 @@ impl KwinMcp {
             }
             Err(error) => Err(anyhow::anyhow!(error.to_string())),
         };
-        let started = std::time::Instant::now();
+        enum TextTarget {
+            Verifiable(input_bridge::TextReceipt),
+            Unverified(String),
+        }
+        let target = match receipt {
+            Ok(receipt) => TextTarget::Verifiable(receipt),
+            Err(error) if error.is::<input_bridge::UnverifiedTypingTarget>() => {
+                TextTarget::Unverified(error.to_string())
+            }
+            Err(error) => {
+                let delivery = input_bridge::TextDelivery::not_in_field(&error.to_string());
+                let mut result = structured_result(
+                    &peer,
+                    format!(
+                        "typing {}: {}{}",
+                        delivery.status,
+                        params.text,
+                        delivery
+                            .warning
+                            .as_ref()
+                            .map(|warning| format!(". {warning}"))
+                            .unwrap_or_default()
+                    ),
+                    serde_json::json!({
+                        "action": "type", "text": params.text,
+                        "attempted_characters": 0, "submitted_characters": 0,
+                        "submission_complete": false,
+                        "retry_safe": true, "delivery": delivery,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    }),
+                )
+                .await;
+                result.is_error = Some(true);
+                return Ok(result);
+            }
+        };
         type_with_profile(&sess.eis, &params.text, &keys, pace).await?;
         sess.eis.roundtrip().await.map_err(|error| {
             McpError::internal_error(
@@ -11954,42 +11990,9 @@ impl KwinMcp {
                 })),
             )
         })?;
-        let delivery = match receipt {
-            Ok(receipt) => receipt.confirm().await,
-            // A terminal or other inaccessible target can receive these key
-            // events even when AT-SPI reports focus on a non-editable control.
-            // That focus report cannot prove that submitted text missed the app.
-            Err(error) if error.is::<input_bridge::FocusNotEditable>() => {
-                let after = match &active {
-                    Ok(geometry) => {
-                        input_bridge::TextReceipt::capture(
-                            &sess.atspi_bus_address,
-                            &geometry.title,
-                            [geometry.x, geometry.y, geometry.w, geometry.h],
-                            "",
-                        )
-                        .await
-                    }
-                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
-                };
-                match after {
-                    Err(after) => match after.downcast_ref::<input_bridge::FocusNotEditable>() {
-                        Some(focus) if keys.is_empty() => {
-                            input_bridge::TextDelivery::not_in_field(focus)
-                        }
-                        Some(focus) => input_bridge::TextDelivery::unavailable(format!(
-                            "{focus}; {} submitted character key events may have reached the active application",
-                            keys.len()
-                        )),
-                        None => input_bridge::TextDelivery::unavailable(after.to_string()),
-                    },
-                    Ok(_) => input_bridge::TextDelivery::unavailable(
-                        "keyboard focus moved into an editable field while the keys were sent"
-                            .to_owned(),
-                    ),
-                }
-            }
-            Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
+        let delivery = match target {
+            TextTarget::Verifiable(receipt) => receipt.confirm().await,
+            TextTarget::Unverified(reason) => input_bridge::TextDelivery::unavailable(reason),
         };
         let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
         drop(guard);

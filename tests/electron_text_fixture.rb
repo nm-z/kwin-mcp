@@ -22,6 +22,7 @@ module ElectronTextFixture
     <label>Unverified password field</label><input class="protected-entry" type="password" aria-label="Unverified password field" autocomplete="off" tabindex="0">
     <!-- The embedded editor accepts input but is hidden from AT-SPI; the graphic keeps the parent at U+FFFC. -->
     <label>Unverified embedded rich text</label><div class="entry rich" role="textbox" aria-label="Unverified embedded rich text" contenteditable="true" tabindex="0" spellcheck="false"><div class="embedded-editor" contenteditable="true" tabindex="0" aria-hidden="true"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div><span class="opaque-object" role="img" aria-label="Opaque embedded object" contenteditable="false"></span></div>
+    <button type="button" aria-label="Noneditable focus target">Noneditable focus target</button>
     </body></html>
   HTML
 

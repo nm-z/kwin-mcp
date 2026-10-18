@@ -479,15 +479,20 @@ applications. Check the previous application state before repeating input.
 
 ### Typing delivery receipts
 
-`keyboard_type` submits paced press/release events and waits for a compositor
-acknowledgement. Its `delivery` separates that acknowledgement from application
-text verification. When the focused editable field exposes accessible text,
+`keyboard_type` first requires AT-SPI to identify a focused editable field, then
+submits paced press/release events and waits for a compositor acknowledgement.
+When it cannot identify a field, it sends no keys and returns `not_in_field`
+with `retry_safe: true`. Its `delivery` separates compositor acknowledgement
+from application text verification. When the focused editable field exposes
+accessible text,
 `verified` confirms the complete expected insertion; expected/observed character
 counts accompany the receipt. For `atspi_rich_text`, the expected value is
 verified in accessible descendants while `observed_field_characters` continues
 to report the focused node's text length; an embedded-object placeholder can
 therefore report one observed character alongside a verified full value.
 Otherwise `unverified` warns that the application text has not been confirmed.
+Recognized terminal and password fields can receive text but cannot provide an
+application-text receipt, so their delivery is `unverified`.
 When a timed-out check has seen U+FFFC in the focused text or a descendant, it
 reports `unverified` because embedded rich-text content may not be fully
 exposed through AT-SPI. Otherwise, a field that still differs after the

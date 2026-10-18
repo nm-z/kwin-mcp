@@ -1058,19 +1058,31 @@ impl std::fmt::Display for FocusNotEditable {
 
 impl std::error::Error for FocusNotEditable {}
 
+/// The focused target can accept keyboard text, but AT-SPI does not expose its
+/// contents for an application-text receipt.
+#[derive(Debug)]
+pub struct UnverifiedTypingTarget(pub String);
+
+impl std::fmt::Display for UnverifiedTypingTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnverifiedTypingTarget {}
+
 impl TextDelivery {
-    /// No characters were submitted, and focus is on a control that is not
-    /// editable text. Non-editable focus alone cannot prove sent keys missed
-    /// the active application.
-    pub fn not_in_field(focus: &FocusNotEditable) -> Self {
+    /// No characters were submitted because accessibility could not identify
+    /// a focused editable field.
+    pub fn not_in_field(reason: &str) -> Self {
         Self {
             status: "not_in_field",
             method: "atspi_focus",
-            compositor_acknowledged: true,
+            compositor_acknowledged: false,
             expected_field_characters: None,
             observed_field_characters: None,
             warning: Some(format!(
-                "{focus}, so the text did not go into a field. Click the field first (a disabled field cannot take focus), then type again."
+                "No key events were sent because {reason}. Click or focus an editable field first, then type again."
             )),
         }
     }
@@ -1184,40 +1196,37 @@ impl TextReceipt {
                     }
                     let node = object.as_accessible_proxy(&bus).await?;
                     let states = node.get_state().await?;
-                    // Konsole's focused terminal does not report Editable. Its
-                    // hidden plugin widgets can also report Focused/Showing,
-                    // so recognizing the terminal must precede the noneditable
-                    // fallback: those widgets do not prove shell input missed.
-                    if states.contains(atspi::State::Focused)
-                        && states.contains(atspi::State::Showing)
-                        && node.get_role().await? == atspi::Role::Terminal
-                    {
-                        anyhow::bail!(
-                            "the focused control is a terminal, not an inspectable editable field"
-                        );
-                    }
-                    if focus.is_none()
-                        && states.contains(atspi::State::Focused)
-                        && states.contains(atspi::State::Showing)
-                        && !states.contains(atspi::State::Editable)
-                        && node.get_role().await? != atspi::Role::Terminal
-                    {
-                        focus = Some(format!(
-                            "{} \"{}\"",
-                            node.get_role_name().await.unwrap_or_default(),
-                            node.name().await.unwrap_or_default()
-                        ));
-                    }
-                    if states.contains(atspi::State::Focused)
-                        && states.contains(atspi::State::Editable)
-                        && states.contains(atspi::State::Showing)
-                    {
+                    let focused = states.contains(atspi::State::Focused)
+                        && states.contains(atspi::State::Showing);
+                    if focused {
                         let role = node.get_role().await?;
-                        if role == atspi::Role::PasswordText || role == atspi::Role::Terminal {
-                            anyhow::bail!(
-                                "the focused control is a password field or terminal, not an inspectable editable field"
-                            );
+                        // Terminals and password entries accept intentional text
+                        // input even though AT-SPI cannot provide a text receipt.
+                        // Other inaccessible focus targets are rejected before
+                        // keyboard events are sent.
+                        if role == atspi::Role::Terminal {
+                            return Err(UnverifiedTypingTarget(
+                                "the focused control is a terminal, not an inspectable editable field"
+                                    .to_owned(),
+                            )
+                            .into());
                         }
+                        if role == atspi::Role::PasswordText {
+                            return Err(UnverifiedTypingTarget(
+                                "the focused control is a password field, not an inspectable editable field"
+                                    .to_owned(),
+                            )
+                            .into());
+                        }
+                        if focus.is_none() && !states.contains(atspi::State::Editable) {
+                            focus = Some(format!(
+                                "{} \"{}\"",
+                                node.get_role_name().await.unwrap_or_default(),
+                                node.name().await.unwrap_or_default()
+                            ));
+                        }
+                    }
+                    if focused && states.contains(atspi::State::Editable) {
                         let text = node.proxies().await?.text().await?;
                         let count = text.character_count().await?;
                         if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {

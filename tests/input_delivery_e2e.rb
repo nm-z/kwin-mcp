@@ -185,6 +185,7 @@ class InputDeliveryProbe
     nested_rich_contenteditable
     unverified_password_field
     unverified_embedded_rich_text
+    noneditable_focus_guard
   end
 
   def rich_contenteditable
@@ -362,6 +363,40 @@ class InputDeliveryProbe
     raise "password field used an unexpected fallback method: #{delivery}" unless delivery['method'] == 'eis_roundtrip'
     raise "password field exposed text character counts: #{delivery}" unless delivery['expected_field_characters'].nil? && delivery['observed_field_characters'].nil?
     screen('electron-password-after-return')
+  end
+
+  def noneditable_focus_guard
+    visible = tree
+    line = visible.lines.find do |candidate|
+      candidate.include?("push button\tNoneditable focus target\t")
+    end
+    raise 'noneditable focus target is missing from the accessibility tree' unless line
+    match = line.match(/\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'noneditable focus target bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('electron-noneditable-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    visible = tree
+    line = visible.lines.find do |candidate|
+      candidate.include?("push button\tNoneditable focus target\t")
+    end
+    raise 'noneditable focus target did not receive focus' unless line && line.include?('focused')
+
+    text = 'This text must remain unsent'
+    response = call('keyboard_type', text: text)
+    result = response.fetch('result')
+    raise "unidentified focus did not reject typing: #{response}" unless result['isError']
+    data = result.fetch('structuredContent')
+    delivery = data.fetch('delivery')
+    raise "wrong inaccessible-focus status: #{delivery}" unless delivery['status'] == 'not_in_field'
+    raise "unidentified focus attempted character keys: #{data}" unless data['attempted_characters'] == 0
+    raise "unidentified focus submitted characters: #{data}" unless data['submitted_characters'] == 0
+    raise 'unidentified focus claimed complete submission' if data['submission_complete']
+    raise 'unidentified focus did not report safe retry' unless data['retry_safe']
+    raise 'unidentified focus claimed compositor acknowledgement' if delivery['compositor_acknowledged']
+    raise 'unidentified focus leaked text into the document' if tree.include?(text)
+    screen('electron-noneditable-after')
   end
 
   def partial_failure
