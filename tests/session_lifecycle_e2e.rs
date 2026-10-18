@@ -1696,13 +1696,58 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         1,
         "viewer_open did not create exactly one host window: pid={pid} opened={opened}\n{viewer_log}"
     );
+    thread::sleep(Duration::from_secs(4));
     let again = call_tool(&mut client, 6, "viewer_open", json!({}));
     assert_eq!(
         again["result"]["structuredContent"]["status"],
         json!("already_open"),
         "{again}"
     );
-    let closed = call_tool(&mut client, 7, "viewer_close", json!({}));
+    let windows = viewer_windows(pid);
+    assert_eq!(windows.len(), 1, "viewer window disappeared before close");
+    let close_window = Command::new("kdotool")
+        .env("KDE_SESSION_VERSION", "6")
+        .args(["windowclose", windows[0].as_str()])
+        .output()
+        .expect("close host viewer window");
+    assert!(
+        close_window.status.success(),
+        "kdotool windowclose failed: {}",
+        String::from_utf8_lossy(&close_window.stderr)
+    );
+    assert!(
+        wait_for_viewer_windows(pid, 0).is_empty(),
+        "host window close left the viewer window visible"
+    );
+
+    let reopened = call_tool(&mut client, 7, "viewer_open", json!({}));
+    assert_eq!(
+        reopened["result"]["structuredContent"]["status"],
+        json!("opened"),
+        "{reopened}"
+    );
+    let reopened_viewer = &reopened["result"]["structuredContent"]["viewer"];
+    let reopened_pid = u32::try_from(
+        reopened_viewer["pid"]
+            .as_u64()
+            .expect("reopened viewer pid"),
+    )
+    .expect("reopened pid fits");
+    assert_ne!(
+        reopened_pid, pid,
+        "viewer_open reused a closed viewer process"
+    );
+    assert!(
+        process_alive(reopened_pid).unwrap_or(false),
+        "reopened viewer is not running"
+    );
+    assert_eq!(
+        wait_for_viewer_windows(reopened_pid, 1).len(),
+        1,
+        "viewer_open did not recreate the host window: pid={reopened_pid} opened={reopened}"
+    );
+
+    let closed = call_tool(&mut client, 8, "viewer_close", json!({}));
     assert_eq!(
         closed["result"]["structuredContent"]["status"],
         json!("closed"),
@@ -1714,14 +1759,14 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         "{closed}"
     );
     assert!(
-        !process_alive(pid).unwrap_or(true),
+        !process_alive(reopened_pid).unwrap_or(true),
         "viewer remained alive after viewer_close"
     );
     assert!(
-        wait_for_viewer_windows(pid, 0).is_empty(),
+        wait_for_viewer_windows(reopened_pid, 0).is_empty(),
         "viewer_close left a host window"
     );
-    let running = call_tool(&mut client, 8, "session_list", json!({}));
+    let running = call_tool(&mut client, 9, "session_list", json!({}));
     assert_eq!(
         running["result"]["structuredContent"]["sessions"]
             .as_array()
@@ -1729,7 +1774,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
             .len(),
         1
     );
-    call_tool(&mut client, 9, "session_stop", json!({}));
+    call_tool(&mut client, 10, "session_stop", json!({}));
     client.stop_process();
 
     // A missing host Wayland display affects viewer_open, not session_start.

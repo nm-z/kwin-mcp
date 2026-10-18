@@ -7191,6 +7191,7 @@ impl Drop for ToolCallMark {
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
+const VIEWER_STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work, and the error is
@@ -7298,7 +7299,33 @@ fn viewer_report(
         };
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
-    match field("state").as_str() {
+    let phase = field("state");
+    if let Some(status_pid) = status.as_ref().and_then(|value| value["pid"].as_u64())
+        && status_pid != u64::from(child.id())
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer status belongs to another process",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    if phase == "ready"
+        && (status.as_ref().and_then(|value| value["pid"].as_u64()) != Some(u64::from(child.id()))
+            || !std::fs::metadata(host_xdg_dir.join(VIEWER_STATUS_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age <= VIEWER_STATUS_STALE_AFTER))
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer window status is stale",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    match phase.as_str() {
         "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
         "failed" | "closed" => {
             serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
@@ -10218,7 +10245,7 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
-        let (host_xdg_dir, width, height, existing) = {
+        let (host_xdg_dir, width, height, existing, stale) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -10231,30 +10258,47 @@ impl KwinMcp {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
                 None => false,
             };
-            if running {
-                let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
-                if viewer["state"] == "ready" {
-                    let message = format!("viewer already open: {}", viewer_summary(&viewer));
-                    drop(guard);
-                    return Ok(structured_result(
+            let viewer = if running {
+                sess.viewer_child
+                    .as_mut()
+                    .map(|child| viewer_report(&sess.host_xdg_dir, Some(child), None))
+            } else {
+                None
+            };
+            if let Some(viewer) = viewer.as_ref()
+                && viewer["state"] == "ready"
+            {
+                let message = format!("viewer already open: {}", viewer_summary(viewer));
+                drop(guard);
+                return Ok(structured_result(
                     &peer,
                     message,
                     serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
-                }
             }
+            let reuse = viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer["state"] == "starting");
+            let (existing, stale) = if running {
+                let child = sess.viewer_child.take();
+                if reuse { (child, None) } else { (None, child) }
+            } else {
+                (None, None)
+            };
             (
                 sess.host_xdg_dir.clone(),
                 sess.screen_width,
                 sess.screen_height,
-                if running {
-                    sess.viewer_child.take()
-                } else {
-                    None
-                },
+                existing,
+                stale,
             )
         };
+        if let Some(stale) = stale {
+            tokio::task::spawn_blocking(move || terminate_child(stale, false, "stale viewer"))
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+        }
         let reused = existing.is_some();
         let spawned = match existing {
             Some(child) => Ok(child),
