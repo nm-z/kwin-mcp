@@ -10885,6 +10885,15 @@ impl KwinMcp {
             // parsing that block as JSON.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let mut image = Content::image(b64, "image/png");
+            if let rmcp::model::RawContent::Image(raw) = &mut image.raw {
+                let mut meta = rmcp::model::Meta::new();
+                meta.0.insert(
+                    "codex/imageDetail".to_owned(),
+                    serde_json::json!("original"),
+                );
+                raw.meta = Some(meta);
+            }
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
             let _ = peer
                 .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
@@ -10895,7 +10904,7 @@ impl KwinMcp {
             Ok(CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
-                Content::image(b64, "image/png"),
+                image,
             ]))
         } else {
             Ok(structured_result(&peer, text, payload).await)
