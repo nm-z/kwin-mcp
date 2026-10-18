@@ -370,10 +370,19 @@ class InputDeliveryProbe
                         y: (y + height / 2 - window.fetch('y')).round))
     assert_success(call('keyboard_key', key: 'ctrl+l'))
     typing = call('keyboard_type', text: 'chrome://extensions')
-    delivery = typing.dig('result', 'structuredContent', 'delivery')
-    raise "Chrome address-bar typing omitted its delivery receipt: #{typing}" unless delivery
+    receipt = typing.dig('result', 'structuredContent')
+    delivery = receipt&.fetch('delivery', nil)
+    raise "Chrome address-bar typing omitted its delivery receipt: #{typing}" unless receipt && delivery
     raise "Chrome address-bar typing lacks compositor acknowledgement: #{delivery}" unless delivery['compositor_acknowledged']
+    unless delivery['status'] == 'unverified' && delivery['method'] == 'chromium_browser_ui'
+      raise "Chrome browser UI text was not classified as unverified: #{delivery}"
+    end
+    raise "Chrome browser UI text suggested a retry: #{receipt}" unless receipt['retry_safe'] == false
+    raise "Chrome address-bar typing was reported as an error: #{typing}" if typing['error'] || typing.dig('result', 'isError')
     return_key = assert_success(call('keyboard_key', key: 'Return'))
+    unless return_key.fetch('warning', '').include?("the key went to the browser's own UI")
+      raise "Return did not report browser UI focus: #{return_key}"
+    end
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
     after = nil
     loop do
@@ -381,13 +390,6 @@ class InputDeliveryProbe
       break if after.fetch('window').fetch('title').include?('Extensions')
       raise "Chrome did not navigate to Extensions: #{after.fetch('window')}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
       sleep 0.5
-    end
-    if return_key['warning']
-      unsafe_status = %w[pending_or_mismatched not_in_field]
-      retry_safe = typing.dig('result', 'structuredContent', 'retry_safe')
-      if unsafe_status.include?(delivery['status']) || typing.dig('result', 'isError') || retry_safe == true
-        raise "Chrome browser UI focus was misreported as failed or safely retryable text: #{typing}"
-      end
     end
   end
 
