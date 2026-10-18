@@ -1,0 +1,163 @@
+{
+  "baseline": {
+    "commit": "3dffc29",
+    "sha256": "a8f656ef4e863bb21a01a153ebe5bf6cb8e18aac6d1561039fe3945f3dbbf303",
+    "errors": [
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {
+          "code": -32603,
+          "message": "kwin-mcp v0.1.2.1 (3dffc29) — system D-Bus proxy: D-Bus proxy socket did not appear at /tmp/k353-20261015-1892313-yvwhxb/long-ascii/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1892404-1/system_bus_socket"
+        }
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "e3b46ba",
+    "sha256": "d54df0d4b53bd63eb34701ea81caa4e9600724060f3fc1e75e283dcda7a4c1a3",
+    "cases": {
+      "long-ascii": {
+        "status": "passed",
+        "socket_bytes": 180,
+        "socket_characters": 180,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/long-ascii/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980091-1/service_bus_socket",
+        "elapsed": 0.0009340710239484906,
+        "errors": [
+          {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — Unix socket path /tmp/k353-20261015-1980036-hokvfm/long-ascii/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980091-1/system_bus_socket (179 bytes) cannot fit sockaddr_un.sun_path with a terminating NUL: ENAMETOOLONG: File name too long; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — Unix socket path /tmp/k353-20261015-1980036-hokvfm/long-ascii/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980091-2/system_bus_socket (179 bytes) cannot fit sockaddr_un.sun_path with a terminating NUL: ENAMETOOLONG: File name too long; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          }
+        ]
+      },
+      "linux-one-over": {
+        "status": "passed",
+        "socket_bytes": 108,
+        "socket_characters": 108,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/linux-one-over/xxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980125-1/service_bus_socket",
+        "elapsed": 0.0013696399983018637,
+        "errors": [
+          {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/linux-one-over/xxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980125-1/system_bus_socket (107 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/linux-one-over/xxxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980125-2/system_bus_socket (107 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          }
+        ]
+      },
+      "linux-boundary": {
+        "status": "passed",
+        "socket_bytes": 107,
+        "socket_characters": 107,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/linux-boundary/xxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980163-1/service_bus_socket",
+        "elapsed": 0.001003701938316226,
+        "errors": [
+          {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/linux-boundary/xxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980163-1/system_bus_socket (106 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/linux-boundary/xxxxxxxxxxxxxxxxxxxx/kwin-mcp-1980163-2/system_bus_socket (106 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          }
+        ]
+      },
+      "dbus-one-over": {
+        "status": "passed",
+        "socket_bytes": 100,
+        "socket_characters": 100,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/dbus-one-over/xxxxxxxxxxxxxx/kwin-mcp-1980193-1/service_bus_socket",
+        "elapsed": 0.001154035096988082,
+        "errors": [
+          {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/dbus-one-over/xxxxxxxxxxxxxx/kwin-mcp-1980193-1/service_bus_socket (100 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/dbus-one-over/xxxxxxxxxxxxxx/kwin-mcp-1980193-2/service_bus_socket (100 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          }
+        ]
+      },
+      "long-utf8": {
+        "status": "passed",
+        "socket_bytes": 100,
+        "socket_characters": 91,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/long-utf8/ééééééééé/kwin-mcp-1980228-1/service_bus_socket",
+        "elapsed": 0.0010413629934191704,
+        "errors": [
+          {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/long-utf8/ééééééééé/kwin-mcp-1980228-1/service_bus_socket (100 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+              "code": -32603,
+              "message": "kwin-mcp v0.1.2.2 (e3b46ba) — D-Bus Unix socket path /tmp/k353-20261015-1980036-hokvfm/long-utf8/ééééééééé/kwin-mcp-1980228-2/service_bus_socket (100 bytes) exceeds the libdbus pathname limit of 99 bytes; choose a shorter TMPDIR before starting kwin-mcp"
+            }
+          }
+        ]
+      },
+      "dbus-boundary": {
+        "status": "passed",
+        "socket_bytes": 99,
+        "socket_characters": 99,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/dbus-boundary/xxxxxxxxxxxxx/kwin-mcp-1980263-1/service_bus_socket",
+        "elapsed": 1.5496960069285706,
+        "errors": []
+      },
+      "short": {
+        "status": "passed",
+        "socket_bytes": 80,
+        "socket_characters": 80,
+        "socket": "/tmp/k353-20261015-1980036-hokvfm/short/xx/kwin-mcp-1980845-1/service_bus_socket",
+        "elapsed": 1.6465604430995882,
+        "errors": []
+      }
+    }
+  }
+}
