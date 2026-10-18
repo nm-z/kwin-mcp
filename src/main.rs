@@ -1894,6 +1894,8 @@ const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
 const LAUNCH_PRECHECK_TIMEOUT: Duration = Duration::from_secs(20);
 // The call deadline leaves room for the prelaunch KWin check and CDP retries.
 const LAUNCH_CALL_OVERHEAD_TIMEOUT: Duration = Duration::from_secs(30);
+// expect_window: false reports the command's PID once its shell has recorded it.
+const LAUNCH_PID_TIMEOUT: Duration = Duration::from_secs(5);
 
 // KWin 6.7.4 and older buffer a frame's last partial page in a QFile and drop
 // it when a non-blocking pipe is full at close. Frames are captured into a
@@ -7064,6 +7066,59 @@ fn resolve_viewer_binary() -> Option<std::path::PathBuf> {
     }
 }
 
+/// OpenSSH rejects an included config file unless root or the running user
+/// owns it and no group or other write bit is set. The sandbox maps only the
+/// session user, so a host root-owned drop-in reaches it with an unmapped owner.
+fn ssh_config_needs_copy(owner: u32, mode: u32, session_uid: u32) -> bool {
+    owner != session_uid || mode & 0o022 != 0
+}
+
+/// Session copies of the host's OpenSSH drop-ins that ssh would refuse, each
+/// owned by the session user with mode 600, paired with the host path they
+/// replace. The copies live in the workdir and are bound over those paths.
+fn prepare_ssh_config_overrides(workdir: &Path, session_uid: u32) -> Vec<(PathBuf, PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(entries) = std::fs::read_dir("/etc/ssh/ssh_config.d") else {
+        return Vec::new();
+    };
+    let mut overrides = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "conf") {
+            continue;
+        }
+        // Follow symlinks: ssh checks the file it reads, not the link.
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || !ssh_config_needs_copy(metadata.uid(), metadata.mode(), session_uid)
+        {
+            continue;
+        }
+        let copy = workdir.join(format!("ssh-{}", entry.file_name().to_string_lossy()));
+        let written = std::fs::canonicalize(&path).and_then(|target| {
+            let contents = std::fs::read(&target)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&copy)?
+                .write_all(&contents)?;
+            Ok(target)
+        });
+        match written {
+            Ok(target) => overrides.push((copy, target)),
+            Err(error) => eprintln!(
+                "session_start: cannot copy {} for the sandbox: {error}",
+                path.display()
+            ),
+        }
+    }
+    overrides
+}
+
 /// Quote one complete shell expression as a single argument to `bash -c`.
 /// This keeps control operators inside the child shell so the required
 /// environment reaches every simple command in the expression.
@@ -8485,6 +8540,60 @@ struct LaunchAppParams {
     command: String,
     /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
     window_timeout_seconds: Option<u64>,
+    /// Set false for a command that backgrounds itself or never maps a window:
+    /// the call returns once the command is submitted, with its PID, instead of
+    /// waiting for a window. Defaults to true.
+    expect_window: Option<bool>,
+}
+
+/// The PID the command's shell wrote to its launch file. Zero and text that is
+/// not a number, such as a partially written file, are not PIDs.
+fn parse_launch_pid(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|pid| *pid != 0)
+}
+
+/// Waits up to LAUNCH_PID_TIMEOUT for the command shell to record its PID. The
+/// shell writes it before running the command, so this normally returns within
+/// one poll interval.
+async fn poll_launch_pid(path: &Path) -> Option<u32> {
+    let deadline = tokio::time::Instant::now() + LAUNCH_PID_TIMEOUT;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| parse_launch_pid(&text))
+        {
+            return Some(pid);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
+    }
+}
+
+/// Warning for a Chromium-family launch without the session wallet, which
+/// cannot decrypt the copied profile's cookies and saved logins.
+fn launch_wallet_warning(wallet_note: Option<String>, command: &str) -> Option<String> {
+    wallet_note.filter(|_| launches_chromium(command)).map(|reason| {
+        format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
+    })
+}
+
+/// The error for a command whose host-side path the session cannot see. The
+/// session's shell records such a path before it runs the command.
+fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
+    let path = std::fs::read_to_string(path_error_file).ok();
+    let _ = std::fs::remove_file(path_error_file);
+    let path = path?;
+    let detail = if Path::new(&path).starts_with("/tmp") {
+        "/tmp is private to the session"
+    } else {
+        "use a path available inside the session"
+    };
+    Some(McpError::invalid_params(
+        format!("{path} is not visible in the session; {detail}"),
+        None,
+    ))
 }
 
 async fn poll_launch_window(
@@ -9305,7 +9414,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. Container writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory. Host visibility: the result's host_shared_dir is the only /tmp directory shared with the host. It has the same absolute path on both sides and is the session's XDG_RUNTIME_DIR, so sockets, FIFOs, logs and output that host processes must read or connect to belong there. The rest of the session's /tmp is a private tmpfs that the host cannot see, and host /tmp contents outside host_shared_dir are hidden from the session. A socket created under $HOME stays in the overlay and cannot be connected from the host, so put host-facing sockets under host_shared_dir. /sys/fs/cgroup is read-only in the session; a program that needs a writable delegated cgroup runs on the host, for example under systemd-run --user --scope -p Delegate=yes. Application stdout is discarded, and stderr goes to sandbox.log in the disk-backed directory under ~/.cache/kwin-mcp with the same name as host_shared_dir."
     )]
     async fn session_start(
         &self,
@@ -9908,6 +10017,7 @@ impl KwinMcp {
             .map_err(|error| ver_err(format!("read current UID and GID: {error}")))?;
         let uid = identity.uid().to_string();
         let gid = identity.gid().to_string();
+        let ssh_config_overrides = prepare_ssh_config_overrides(&host_xdg_dir, identity.uid());
         // pasta gives the session its own loopback. Into the host it forwards
         // only the session's CDP port. Host listeners are reachable from the
         // session via --tcp-ns, but pasta's default `auto` ranges omit the host's
@@ -10108,6 +10218,9 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
+        for (copy, destination) in &ssh_config_overrides {
+            cmd.arg("--ro-bind").arg(copy).arg(destination);
+        }
         // NVIDIA GPUs expose their GBM/EGL driver through char nodes that live OUTSIDE
         // /dev/dri (/dev/nvidia0, nvidiactl, nvidia-modeset, nvidia-uvm, …). Without
         // them the NVIDIA render node (often the primary GBM device) loads as
@@ -10514,6 +10627,7 @@ impl KwinMcp {
             "bus": bus_name,
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
+            "host_shared_dir": workdir,
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
@@ -12399,7 +12513,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Pass expect_window: false for a command that backgrounds itself (cmd &) or never maps a window: the call returns as soon as the command is submitted, with its PID (the command shell's process ID inside the session, not a host PID) and exit_status if it has already exited, instead of waiting out window_timeout_seconds. Command stdout is discarded and not returned; write output under host_shared_dir from session_start and read it from the host. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -12520,7 +12634,12 @@ impl KwinMcp {
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
-        let mut checked_command = String::new();
+        // The command shell records its own PID before anything else runs.
+        let pid_file = xdg.join(format!("launch-{launch_id}.pid"));
+        let mut checked_command = format!(
+            "echo $$ > {}\n",
+            shell_quote(&pid_file.display().to_string())
+        );
         for path in launch_host_paths(&params.command) {
             let quoted = shell_quote(&path.display().to_string());
             checked_command.push_str(&format!(
@@ -12595,6 +12714,49 @@ impl KwinMcp {
             command_file.submitted = true;
         }
 
+        if params.expect_window == Some(false) {
+            if let Ok(mut progress) = progress.lock() {
+                progress.stage = "reading the command's PID";
+            }
+            let pid = poll_launch_pid(&pid_file).await;
+            let _ = std::fs::remove_file(&pid_file);
+            if let Some(error) = invisible_launch_path(&path_error_file) {
+                return Err(error);
+            }
+            let exit_status = std::fs::read_to_string(&exit_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            let warning = launch_wallet_warning(wallet_note, &params.command);
+            let suffix = warning
+                .as_deref()
+                .map(|text| format!(". {text}"))
+                .unwrap_or_default();
+            let pid_text = pid.map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"));
+            let text = match exit_status {
+                Some(status) => format!(
+                    "launched: {} (no window expected; {pid_text}; exited with status {status}){suffix}",
+                    params.command
+                ),
+                None => format!(
+                    "launched: {} (no window expected; {pid_text}){suffix}",
+                    params.command
+                ),
+            };
+            let mut result = structured_result(
+                &peer,
+                text,
+                serde_json::json!({
+                    "action": "launch", "command": params.command,
+                    "window": "not_expected", "window_outcome": "not_expected",
+                    "pid": pid, "exit_status": exit_status,
+                    "cdp": false, "warning": warning,
+                }),
+            )
+            .await;
+            result.is_error = Some(exit_status.is_some_and(|status| status != 0));
+            return Ok(result);
+        }
+
         if let Ok(mut progress) = progress.lock() {
             progress.stage = "waiting for a window";
         }
@@ -12629,6 +12791,7 @@ impl KwinMcp {
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
         let _ = std::fs::remove_file(&exit_file);
+        let _ = std::fs::remove_file(&pid_file);
         let mut handoff_reason = None;
         let mut handoff_candidates = Vec::new();
         if win_geo.is_none() && exit_status == Some(0) && chromium_launch {
@@ -12682,18 +12845,8 @@ impl KwinMcp {
                 }
             }
         }
-        let invisible_path = std::fs::read_to_string(&path_error_file).ok();
-        let _ = std::fs::remove_file(&path_error_file);
-        if let Some(path) = invisible_path {
-            let detail = if Path::new(&path).starts_with("/tmp") {
-                "/tmp is private to the session"
-            } else {
-                "use a path available inside the session"
-            };
-            return Err(McpError::invalid_params(
-                format!("{path} is not visible in the session; {detail}"),
-                None,
-            ));
+        if let Some(error) = invisible_launch_path(&path_error_file) {
+            return Err(error);
         }
 
         // The browser wrapper records CDP intent only when it actually ran.
@@ -12725,9 +12878,7 @@ impl KwinMcp {
 
         // A Chromium-family browser without the wallet cannot decrypt the copied
         // profile's cookies and saved logins, so its sites show signed out.
-        let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
-            format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
-        });
+        let warning = launch_wallet_warning(wallet_note, &params.command);
         let suffix = warning
             .as_deref()
             .map(|text| format!(". {text}"))
@@ -15340,5 +15491,35 @@ mod launch_warning_tests {
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
+    }
+}
+
+#[cfg(test)]
+mod launch_pid_tests {
+    use super::parse_launch_pid;
+
+    #[test]
+    fn only_a_complete_nonzero_number_is_a_pid() {
+        assert_eq!(parse_launch_pid("4242\n"), Some(4242));
+        assert_eq!(parse_launch_pid(""), None);
+        assert_eq!(parse_launch_pid("0\n"), None);
+        assert_eq!(parse_launch_pid("42x"), None);
+        assert_eq!(parse_launch_pid("-7"), None);
+    }
+}
+
+#[cfg(test)]
+mod ssh_config_tests {
+    use super::ssh_config_needs_copy;
+
+    #[test]
+    fn host_root_owned_or_group_writable_drop_ins_need_a_session_copy() {
+        // A root-owned drop-in is unmapped inside the sandbox.
+        assert!(ssh_config_needs_copy(0, 0o100644, 1000));
+        assert!(ssh_config_needs_copy(1000, 0o100664, 1000));
+        assert!(ssh_config_needs_copy(1000, 0o100646, 1000));
+        // A file the session user owns, without group or other write, is used as-is.
+        assert!(!ssh_config_needs_copy(1000, 0o100600, 1000));
+        assert!(!ssh_config_needs_copy(1000, 0o100644, 1000));
     }
 }
