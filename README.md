@@ -163,6 +163,13 @@ limits are recovered from the sandbox PID cgroup; values that cannot be
 recovered remain unknown. Stop the dead handle, start a new desktop without
 `session_id`, and relaunch the applications to continue.
 
+Every handle `session_list` shows is accepted by `session_stop`: a running desktop
+is stopped, and a dead, expired, or blocked-start handle is cleared with its
+lifecycle record. A `session_start` whose host call stays blocked past its budget
+is listed as `start_blocked`; `session_stop` answers `cleanup_pending` until that
+call returns, then clears the handle. A stop of an ID whose record is already
+cleared is a confirmed no-op.
+
 Configure MCP clients to launch the current `kwin-mcp` executable directly.
 The historical `kwin-mcp-shim` has its own session listing and hides these
 structured lifecycle diagnostics; it is no longer built by this repository.
