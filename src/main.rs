@@ -5374,7 +5374,6 @@ struct KwinMcp {
     path: PathBuf,
     input_gate: Arc<tokio::sync::Mutex<()>>,
     input_order: Arc<InputOrder>,
-    tool_calls: Arc<std::sync::Mutex<usize>>,
     session: Arc<tokio::sync::RwLock<Option<Session>>>,
     /// Cleanup ownership of the session workdir under --autoclean. Claimed
     /// before session_start creates the directory and released only once the
@@ -5438,6 +5437,63 @@ impl KwinMcp {
         Some(diagnostic)
     }
 
+    async fn refresh_viewer_child(&self) -> Result<(), String> {
+        let mut guard = self.session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
+            Some(Ok(None)) | None => Ok(()),
+            Some(Ok(Some(_))) => {
+                session.viewer_child.take();
+                Ok(())
+            }
+            Some(Err(error)) => {
+                let reason = format!(
+                    "check viewer process {}: {error}",
+                    session.viewer_child.as_ref().map_or(0, SessionProcess::id)
+                );
+                eprintln!("viewer liveness: {reason}");
+                Err(reason)
+            }
+        }
+    }
+
+    async fn viewer_input_is_recent(&self) -> Result<bool, String> {
+        // Do not queue another session read lock while an input operation
+        // holds one: a waiting liveness writer would block the activity check
+        // that must cancel that operation. The owned workdir path is stable.
+        let activity_path = self.path.join(VIEWER_INPUT_ACTIVITY_FILE);
+        let modified = match std::fs::metadata(&activity_path) {
+            Ok(metadata) => metadata.modified().map_err(|error| {
+                format!(
+                    "read {} modification time: {error}",
+                    activity_path.display()
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "read {} metadata: {error}",
+                    activity_path.display()
+                ));
+            }
+        };
+        let age = match std::time::SystemTime::now().duration_since(modified) {
+            Ok(age) => age,
+            Err(error) => error.duration(),
+        };
+        Ok(age <= VIEWER_INPUT_QUIET_PERIOD)
+    }
+
+    async fn viewer_is_active_with_recent_input(&self) -> Result<bool, String> {
+        // The child exists only for a viewer on this host. A remote viewer's
+        // `--serve` relay writes the same activity file without a local child.
+        // Always reap/check a local child when present, then use the file for
+        // both local and remote input activity.
+        self.refresh_viewer_child().await?;
+        self.viewer_input_is_recent().await
+    }
     fn new(display: DisplayConfig) -> Self {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
@@ -5448,7 +5504,6 @@ impl KwinMcp {
             path: session_workdir_path(),
             input_gate: Arc::new(tokio::sync::Mutex::new(())),
             input_order: Arc::new(InputOrder::default()),
-            tool_calls: Arc::new(std::sync::Mutex::new(0)),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             start_stage: Arc::new(std::sync::Mutex::new(
@@ -7251,59 +7306,14 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 
 /// Status file the viewer writes (see src/bin/kwin-viewer.rs).
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
-/// FIFO in the session workdir that the viewer reads tool-call starts ("B")
-/// and ends ("E") from, so it holds the user's input while a call runs (see
-/// src/bin/kwin-viewer.rs ToolGate).
-const TOOL_CALLS_FIFO: &str = "tool-calls";
-
-/// Tell an open viewer that a tool call started (`b'B'`) or ended (`b'E'`).
-/// Non-blocking and best effort: with no viewer reading the FIFO the open
-/// fails with ENXIO and nothing is sent, so tool calls never wait on it.
-fn signal_tool_call(dir: &Path, mark: u8) {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join(TOOL_CALLS_FIFO);
-    if let Ok(mut fifo) = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-    {
-        let _ = std::io::Write::write_all(&mut fifo, &[mark]);
-    }
-}
-
-/// Marks one tool call in flight for the viewer; the end is sent on drop, so
-/// it goes out whether the call returns, errors or is cancelled.
-struct ToolCallMark(PathBuf, Arc<std::sync::Mutex<usize>>);
-
-impl ToolCallMark {
-    fn begin(dir: &Path, calls: &Arc<std::sync::Mutex<usize>>) -> Self {
-        let mut active = calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *active == 0 {
-            signal_tool_call(dir, b'B');
-        }
-        *active += 1;
-        Self(dir.to_owned(), calls.clone())
-    }
-}
-
-impl Drop for ToolCallMark {
-    fn drop(&mut self) {
-        let mut active = self
-            .1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active -= 1;
-        if *active == 0 {
-            signal_tool_call(&self.0, b'E');
-        }
-    }
-}
+const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
+const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const VIEWER_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
 const VIEWER_READY_POLL: Duration = Duration::from_millis(50);
+const VIEWER_STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Spawn the viewer as a sibling host-side process. Intentionally non-fatal:
 /// if anything goes wrong the agent's MCP tools still work, and the error is
@@ -7411,7 +7421,33 @@ fn viewer_report(
         };
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
-    match field("state").as_str() {
+    let phase = field("state");
+    if let Some(status_pid) = status.as_ref().and_then(|value| value["pid"].as_u64())
+        && status_pid != u64::from(child.id())
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer status belongs to another process",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    if phase == "ready"
+        && (status.as_ref().and_then(|value| value["pid"].as_u64()) != Some(u64::from(child.id()))
+            || !std::fs::metadata(host_xdg_dir.join(VIEWER_STATUS_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age <= VIEWER_STATUS_STALE_AFTER))
+    {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer window status is stale",
+            "pid": child.id(),
+            "log": log,
+        });
+    }
+    match phase.as_str() {
         "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
         "failed" | "closed" => {
             serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
@@ -9383,6 +9419,8 @@ impl KwinMcp {
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
         // The host TMPDIR names the workdir's parent, which is read-only inside
         // bwrap. Keep session applications' temporary files in private /tmp.
+        let media_wait_attempts = STARTUP_TIMEOUT.as_millis() / STARTUP_POLL.as_millis();
+        let media_poll_seconds = STARTUP_POLL.as_secs_f64();
         let entrypoint = format!(
             "set -u\n\
             export TMPDIR=/tmp\n\
@@ -9407,6 +9445,13 @@ impl KwinMcp {
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
+            media_pid=$!\n\
+            for ((attempt=0; attempt<{media_wait_attempts}; attempt++)); do\n\
+                test -S \"$XDG_RUNTIME_DIR/pipewire-0\" && break\n\
+                kill -0 \"$media_pid\" 2>/dev/null || {{ echo 'private PipeWire exited before its socket was ready' >&2; exit 1; }}\n\
+                sleep {media_poll_seconds}\n\
+            done\n\
+            test -S \"$XDG_RUNTIME_DIR/pipewire-0\" || {{ echo 'private PipeWire socket startup timed out' >&2; exit 1; }}\n\
             wireplumber &\n\
             while read -r cmd; do\n\
                 eval \"$cmd\" &\n\
@@ -10329,7 +10374,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. If it interrupts an in-flight agent operation, remaining agent events are cancelled with retry_safe=false because some input may have arrived; inspect before retrying. New agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -10343,6 +10388,7 @@ impl KwinMcp {
                 "viewer_open",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let reason = params
             .reason
             .as_deref()
@@ -10355,7 +10401,7 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
-        let (host_xdg_dir, width, height, existing) = {
+        let (host_xdg_dir, width, height, existing, stale) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -10368,30 +10414,47 @@ impl KwinMcp {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
                 None => false,
             };
-            if running {
-                let viewer = viewer_report(&sess.host_xdg_dir, sess.viewer_child.as_mut(), None);
-                if viewer["state"] == "ready" {
-                    let message = format!("viewer already open: {}", viewer_summary(&viewer));
-                    drop(guard);
-                    return Ok(structured_result(
+            let viewer = if running {
+                sess.viewer_child
+                    .as_mut()
+                    .map(|child| viewer_report(&sess.host_xdg_dir, Some(child), None))
+            } else {
+                None
+            };
+            if let Some(viewer) = viewer.as_ref()
+                && viewer["state"] == "ready"
+            {
+                let message = format!("viewer already open: {}", viewer_summary(viewer));
+                drop(guard);
+                return Ok(structured_result(
                     &peer,
                     message,
                     serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
                 )
                 .await);
-                }
             }
+            let reuse = viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer["state"] == "starting");
+            let (existing, stale) = if running {
+                let child = sess.viewer_child.take();
+                if reuse { (child, None) } else { (None, child) }
+            } else {
+                (None, None)
+            };
             (
                 sess.host_xdg_dir.clone(),
                 sess.screen_width,
                 sess.screen_height,
-                if running {
-                    sess.viewer_child.take()
-                } else {
-                    None
-                },
+                existing,
+                stale,
             )
         };
+        if let Some(stale) = stale {
+            tokio::task::spawn_blocking(move || terminate_child(stale, false, "stale viewer"))
+                .await
+                .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
+        }
         let reused = existing.is_some();
         let spawned = match existing {
             Some(child) => Ok(child),
@@ -10505,6 +10568,7 @@ impl KwinMcp {
                 "viewer_close",
             )
             .await?;
+        let _input = self.input_gate.clone().lock_owned().await;
         let mut guard = self.session.write().await;
         let sess = guard.as_mut().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -10958,6 +11022,15 @@ impl KwinMcp {
             // parsing that block as JSON.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let mut image = Content::image(b64, "image/png");
+            if let rmcp::model::RawContent::Image(raw) = &mut image.raw {
+                let mut meta = rmcp::model::Meta::new();
+                meta.0.insert(
+                    "codex/imageDetail".to_owned(),
+                    serde_json::json!("original"),
+                );
+                raw.meta = Some(meta);
+            }
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
             let _ = peer
                 .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
@@ -10968,7 +11041,7 @@ impl KwinMcp {
             Ok(CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
-                Content::image(b64, "image/png"),
+                image,
             ]))
         } else {
             Ok(structured_result(&peer, text, payload).await)
@@ -12801,17 +12874,6 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
             .unwrap_or_default();
         route.attr.description = Some(std::borrow::Cow::Owned(base + &hint));
     }
-    // Every tool call is bracketed for the viewer's input gate.
-    for route in tool_router.map.values_mut() {
-        let inner = std::sync::Arc::clone(&route.call);
-        route.call = std::sync::Arc::new(move |context| {
-            let inner = std::sync::Arc::clone(&inner);
-            Box::pin(async move {
-                let _mark = ToolCallMark::begin(&context.service.path, &context.service.tool_calls);
-                inner(context).await
-            })
-        });
-    }
     tool_router
 }
 
@@ -13311,28 +13373,89 @@ impl rmcp::ServerHandler for SessionRouter {
                 Some(death),
             ));
         }
-        let input = ordered_tool(&request.name);
+        let agent_input = input_tool(&request.name);
         // Queued input waits outside the global limit so it cannot starve reads.
         let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
         if let Some(turn) = &turn {
             turn.wait().await;
         }
-        let _input = if input && turn.is_none() {
+        let _input = if ordered_tool(&request.name) {
             Some(session.input_gate.clone().lock_owned().await)
         } else {
             None
         };
+        if agent_input {
+            let recent_viewer_input =
+                session
+                    .viewer_is_active_with_recent_input()
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!("Could not check live viewer input activity: {error}"),
+                            Some(serde_json::json!({
+                                "reason":"viewer_activity_check_failed",
+                                "retry_safe":true
+                            })),
+                        )
+                    })?;
+            if recent_viewer_input {
+                return Err(McpError::internal_error(
+                    "Agent input is paused for one second after viewer input to avoid interfering with the user's recent interaction. Retry when the viewer has been idle for one second; the viewer can stay open.",
+                    Some(serde_json::json!({
+                        "reason":"recent_viewer_input",
+                        "retry_safe":true,
+                        "quiet_period_ms":VIEWER_INPUT_QUIET_PERIOD.as_millis()
+                    })),
+                ));
+            }
+        }
         let execution = session.clone();
         let operation = request.name.to_string();
-        let result = self
-            .limit
-            .layer(execution)
-            .oneshot(SessionCall {
+        let result = {
+            let call = self.limit.layer(execution).oneshot(SessionCall {
                 request,
                 context,
                 routes: self.routes.clone(),
-            })
-            .await;
+            });
+            if agent_input {
+                // Human input can begin after admission, during a paced type
+                // or drag. Cancel the remaining agent events as well as
+                // rejecting new calls. Dropping the call releases its held
+                // keys/buttons through SentInput before liveness inspection.
+                let viewer_activity = async {
+                    loop {
+                        tokio::time::sleep(VIEWER_INPUT_CHECK_INTERVAL).await;
+                        match session.viewer_input_is_recent().await {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                break McpError::internal_error(
+                                    "Viewer input interrupted the agent operation. Some input may already have arrived; inspect the target before retrying.",
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                break McpError::internal_error(
+                                    format!(
+                                        "Stopped agent input because viewer activity could not be checked: {error}. Some input may already have arrived; inspect before retrying."
+                                    ),
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_activity_check_failed", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = call => result,
+                    error = viewer_activity => Err(error),
+                }
+            } else {
+                call.await
+            }
+        };
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {
