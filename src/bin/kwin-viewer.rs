@@ -15,12 +15,13 @@
 //! window. Mouse/keyboard events on the window are forwarded back into the
 //! container via org_kde_kwin_fake_input.
 
+use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
-use screen_13_window::WindowBuilder;
-use kwin_mcp::clipboard::{Clipboard, DispatchThread, Shutdown, DISPATCH_POLL_INTERVAL};
+use screen_13_window::{FrameContext, WindowBuilder};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
 use std::os::fd::AsFd;
@@ -42,7 +43,8 @@ use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_uns
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1::{
     Pointer as ScPointer, ZkdeScreencastUnstableV1,
 };
-use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::keyboard::PhysicalKey;
 
 // Bindings ceilings — the wayland-protocols-plasma 0.3.12 XMLs cap here even
@@ -75,13 +77,15 @@ const PASTE_SETTLE: Duration = Duration::from_millis(200);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+const INITIAL_VIEWER_WIDTH: f64 = 1920.0;
+const INITIAL_VIEWER_HEIGHT: f64 = 1080.0;
 
 fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
     let state = session
         .and_then(|path| std::fs::read_to_string(path.join("viewer-pipewire.json")).ok())
         .unwrap_or_else(|| "not connected".to_owned());
     format!(
-        "viewer did not present a frame within {} seconds; last PipeWire state: {}",
+        "viewer did not submit a frame within {} seconds; last PipeWire state: {}",
         FIRST_FRAME_TIMEOUT.as_secs(),
         state.trim()
     )
@@ -92,7 +96,7 @@ fn frame_timeout_reason(session: Option<&std::path::Path>) -> String {
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 
 /// Atomically publish the viewer's lifecycle state: starting,
-/// ready (a frame is on the host window), closed, or failed.
+/// ready (the first session frame's render graph was submitted successfully), closed, or failed.
 fn write_status(session: &std::path::Path, state: &str, detail: &str) {
     let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
     let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id()});
@@ -113,7 +117,46 @@ struct Frame {
 // draw_fn reads. No queue, no backpressure: at <60fps the window simply
 // redraws the last frame. Wrapped in Mutex instead of a channel of 1 so the
 // producer never blocks if the consumer is slow.
-type FrameMailbox = Arc<Mutex<Option<Frame>>>;
+type FrameMailbox = Arc<(Mutex<Option<Frame>>, Condvar)>;
+
+fn store_frame(mailbox: &FrameMailbox, frame: Frame) {
+    let (latest, ready) = &**mailbox;
+    if let Ok(mut latest) = latest.lock() {
+        *latest = Some(frame);
+        ready.notify_one();
+    }
+}
+
+fn take_frame(mailbox: &FrameMailbox) -> Option<Frame> {
+    let (latest, _) = &**mailbox;
+    latest.lock().ok().and_then(|mut latest| latest.take())
+}
+
+fn wait_for_first_frame(
+    mailbox: &FrameMailbox,
+    shutdown: &Shutdown,
+    deadline: Instant,
+) -> Option<Frame> {
+    let (latest, ready) = &**mailbox;
+    let mut latest = latest.lock().ok()?;
+    loop {
+        if let Some(frame) = latest.take() {
+            return Some(frame);
+        }
+        if shutdown.requested() {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        // Shutdown is an atomic flag rather than a condition-variable event;
+        // bounded waits make teardown responsive without spinning the UI thread.
+        let wait = remaining.min(DISPATCH_POLL_INTERVAL);
+        let (next, _) = ready.wait_timeout(latest, wait).ok()?;
+        latest = next;
+    }
+}
 
 // Cooperative stop signal shared by every thread the viewer owns. Whatever
 // ends first sets it: the user closing the window, a compositor dropping a
@@ -549,7 +592,9 @@ fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u
             None => Ok(default),
         }
     };
-    Ok((next(3840, "width")?, next(2160, "height")?))
+    let size = (next(3840, "width")?, next(2160, "height")?);
+    anyhow::ensure!(size.0 > 0 && size.1 > 0, "viewer dimensions must be positive");
+    Ok(size)
 }
 
 // The link to a session's compositor: its fake_input, the PipeWire loop that
@@ -726,7 +771,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         restore: None,
     };
 
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
     numlock.apply(&link.fake_input, &link.conn)?;
 
@@ -736,6 +781,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         out: InputOut::Local(gate),
         last_pos: None,
         held_buttons: 0,
+        active_touch: None,
         held_keys: HashSet::new(),
         clipboard: Some(clipboard),
     };
@@ -792,8 +838,15 @@ fn window_loop(
 ) -> anyhow::Result<()> {
     let status_dir = match &title {ViewerTitle::Local(path) => Some(*path), ViewerTitle::Remote(_,_) => None};
     let initial_title = title.text();
+    let initial_scale = (INITIAL_VIEWER_WIDTH / f64::from(virt.0))
+        .min(INITIAL_VIEWER_HEIGHT / f64::from(virt.1))
+        .min(1.0);
+    let initial_size = LogicalSize::new(
+        f64::from(virt.0) * initial_scale,
+        f64::from(virt.1) * initial_scale,
+    );
     let window = WindowBuilder::default()
-        .window(|wa| wa.with_title(&initial_title).with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)))
+        .window(|wa| wa.with_title(&initial_title).with_inner_size(initial_size))
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -801,14 +854,21 @@ fn window_loop(
     // Starting as None so the first frame triggers allocation.
     let mut src_image: Option<Arc<Image>> = None;
     let mut src_dims: (u32, u32) = (0, 0);
-    let mut ready_reported = false;
-    let mut first_frame_submitted = false;
+    let ready_reported = Cell::new(false);
+    let first_frame_queued = Cell::new(false);
+    let mut first_host_redraw = false;
+    let mut first_frame_consumed = false;
     let mut startup_error = None;
     let started = Instant::now();
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
+    let mut aspect = ViewerAspect::new(virt);
 
-    window.run(|mut frame| {
+    let remote_output = match &input_state.out {
+        InputOut::Local(_) => None,
+        InputOut::Remote(pipe) => Some(Arc::clone(pipe)),
+    };
+    let mut draw_frame = |mut frame: FrameContext<'_>| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
         if shutdown.requested() {
@@ -816,13 +876,12 @@ fn window_loop(
             return;
         }
 
-        if first_frame_submitted && !ready_reported {
-            ready_reported = true;
-            eprintln!("kwin-viewer: first frame presented");
-            if let Some(dir) = status_dir {write_status(dir,"ready","host window is showing the session");}
-            if matches!(input_state.out,InputOut::Remote(_)) { input_state.out.send(Op::Presented); }
+        if !first_host_redraw {
+            first_host_redraw = true;
+            eprintln!("kwin-viewer: first host window redraw");
         }
-        if !ready_reported && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+
+        if !ready_reported.get() && started.elapsed() >= FIRST_FRAME_TIMEOUT {
             let reason=frame_timeout_reason(status_dir);
             if let Some(dir)=status_dir {write_status(dir,"failed",&reason);}
             startup_error=Some(reason);
@@ -838,16 +897,58 @@ fn window_loop(
             }
             next_title_check = Instant::now() + Duration::from_millis(250);
         }
-        for event in frame.events {
-            forward_input(event, (frame.width, frame.height), virt, input_state, numlock);
+        for event in frame.events.iter() {
+            if let Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } = event
+            {
+                aspect.resize(frame.window, *size);
+            }
+            forward_input(
+                event,
+                (frame.width, frame.height),
+                virt,
+                input_state,
+                numlock,
+            );
         }
 
         // Consume the latest frame if one arrived; upload into src_image.
         // Retain src_image across frames so when the mailbox is momentarily
         // empty we still re-blit the last known picture instead of flashing
         // black.
-        let latest = mailbox.lock().ok().and_then(|mut g| g.take());
+        let latest = if first_frame_queued.get() {
+            take_frame(mailbox)
+        } else {
+            match wait_for_first_frame(
+                mailbox,
+                shutdown,
+                started + FIRST_FRAME_TIMEOUT,
+            ) {
+                Some(frame) => Some(frame),
+                None if shutdown.requested() => {
+                    frame.exit();
+                    return;
+                }
+                None => {
+                    let reason = frame_timeout_reason(status_dir);
+                    if let Some(dir) = status_dir {
+                        write_status(dir, "failed", &reason);
+                    }
+                    startup_error = Some(reason);
+                    shutdown.request();
+                    frame.exit();
+                    return;
+                }
+            }
+        };
+        let mut session_frame_queued = false;
         if let Some(f) = latest {
+            if !first_frame_consumed {
+                first_frame_consumed = true;
+                eprintln!("kwin-viewer: first PipeWire frame consumed by host window");
+            }
             if src_dims != (f.width, f.height) {
                 let info = ImageInfo::image_2d(
                     f.width,
@@ -873,6 +974,7 @@ fn window_loop(
                         let staging_node = frame.render_graph.bind_node(staging);
                         let image_node = frame.render_graph.bind_node(image);
                         frame.render_graph.copy_buffer_to_image(staging_node, image_node);
+                        session_frame_queued = true;
                     }
                     Err(e) => eprintln!("kwin-viewer: staging buffer failed: {e:?}"),
                 }
@@ -884,7 +986,9 @@ fn window_loop(
             frame
                 .render_graph
                 .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
-            first_frame_submitted = true;
+            if session_frame_queued {
+                first_frame_queued.set(true);
+            }
         } else {
             frame.render_graph.clear_color_image(frame.swapchain_image);
         }
@@ -895,9 +999,83 @@ fn window_loop(
         // are arriving. Explicitly requesting a redraw each frame guarantees
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
+    };
+    window.run_with_submission_callback(&mut draw_frame, || {
+        if !ready_reported.get() && first_frame_queued.get() {
+            ready_reported.set(true);
+            eprintln!("kwin-viewer: first frame submitted for presentation");
+            if let Some(dir) = status_dir {
+                write_status(
+                    dir,
+                    "ready",
+                    "first session frame render submitted to the host window",
+                );
+            }
+            if let Some(pipe) = remote_output.as_ref() {
+                send_remote_op(pipe, Op::Presented);
+            }
+        }
     })?;
     if let Some(error)=startup_error {anyhow::bail!(error);}
     Ok(())
+}
+
+// Follow the changed edge instead of undoing a vertical drag with a width-only
+// correction. Window and input dimensions remain physical pixels.
+struct ViewerAspect {
+    source: (u32, u32),
+    previous: Option<PhysicalSize<u32>>,
+    requested: Option<(PhysicalSize<u32>, PhysicalSize<u32>)>,
+}
+
+impl ViewerAspect {
+    fn new(source: (u32, u32)) -> Self {
+        Self {
+            source,
+            previous: None,
+            requested: None,
+        }
+    }
+
+    fn resize(&mut self, window: &winit::window::Window, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let previous = self.previous.replace(size);
+        let height = (u64::from(size.width) * u64::from(self.source.1)
+            + u64::from(self.source.0) / 2)
+            / u64::from(self.source.0);
+        let width = (u64::from(size.height) * u64::from(self.source.0)
+            + u64::from(self.source.1) / 2)
+            / u64::from(self.source.1);
+        let height = u32::try_from(height.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        let width = u32::try_from(width.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        if height == size.height || width == size.width {
+            self.requested = None;
+            return;
+        }
+        let follow_width = match previous {
+            Some(old) => {
+                u64::from(size.width.abs_diff(old.width)) * u64::from(old.height)
+                    >= u64::from(size.height.abs_diff(old.height)) * u64::from(old.width)
+            }
+            None => height <= size.height,
+        };
+        let target = if follow_width {
+            PhysicalSize::new(size.width, height)
+        } else {
+            PhysicalSize::new(width, size.height)
+        };
+        if self.requested == Some((size, target)) {
+            return;
+        }
+        self.requested = Some((size, target));
+        let applied = window.request_inner_size(target);
+        eprintln!(
+            "kwin-viewer: aspect resize configured={}x{} requested={}x{} applied={applied:?}",
+            size.width, size.height, target.width, target.height
+        );
+    }
 }
 
 // Wire format between `--serve` (on the host that runs the session) and
@@ -990,38 +1168,44 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     write_status(&session_path, "starting", "remote viewer");
     pipewire::init();
     let shutdown = Shutdown::default();
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
     let gate = ToolGate::new(link.fake_input.clone(), link.conn.clone());
     let gate_thread = gate.spawn(&session_path, shutdown.clone())?;
 
-    let presented=Arc::new(AtomicBool::new(false));
+    let submitted = Arc::new(AtomicBool::new(false));
     // Input records come in until the client's ssh pipe closes. The thread
     // blocks in read, so it is left to end with the process.
     {
         let (gate, shutdown) = (gate.clone(), shutdown.clone());
-        let presented=presented.clone();
-        let session_path=session_path.clone();
+        let submitted = submitted.clone();
+        let session_path = session_path.clone();
         std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
             let mut stdin = std::io::stdin().lock();
             while let Ok(Some(op)) = Op::decode(&mut stdin) {
-                if matches!(op,Op::Presented) {
-                    presented.store(true,Ordering::Release);
-                    write_status(&session_path,"ready","remote viewer presented its first frame");
-                } else { gate.send(op); }
+                if matches!(op, Op::Presented) {
+                    submitted.store(true, Ordering::Release);
+                    write_status(
+                        &session_path,
+                        "ready",
+                        "remote viewer submitted its first frame for presentation",
+                    );
+                } else {
+                    gate.send(op);
+                }
             }
             shutdown.request();
         })?;
     }
 
-    write_status(&session_path, "starting", "waiting for remote first-frame presentation");
+    write_status(&session_path, "starting", "waiting for remote first-frame submission");
     let started=Instant::now();
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     let mut result = Ok(());
     let mut sent_title = String::new();
     while !shutdown.requested() {
-        if !presented.load(Ordering::Acquire) && started.elapsed()>=FIRST_FRAME_TIMEOUT {
-            result=Err(anyhow::anyhow!(frame_timeout_reason(Some(&session_path))));
+        if !submitted.load(Ordering::Acquire) && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+            result = Err(anyhow::anyhow!(frame_timeout_reason(Some(&session_path))));
             shutdown.request();
             break;
         }
@@ -1030,7 +1214,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
             if let Err(error) = write_title(&mut stdout,&title) { result=Err(error); break; }
             sent_title=title;
         }
-        let latest = mailbox.lock().ok().and_then(|mut g| g.take());
+        let latest = take_frame(&mailbox);
         match latest {
             Some(frame) => {
                 if let Err(error) = write_frame(&mut stdout, &frame) {
@@ -1067,6 +1251,9 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         .or_else(|| std::env::current_exe().ok().map(|path| path.display().to_string()))
         .ok_or_else(|| anyhow::anyhow!("cannot locate the remote kwin-viewer; set KWIN_VIEWER_REMOTE_BIN"))?;
     anyhow::ensure!(plain(&remote_bin), "remote kwin-viewer path must be a plain name");
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
     let mut child = std::process::Command::new("ssh")
         .args(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
         .arg(&host)
@@ -1079,9 +1266,6 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("ssh stdin missing"))?;
     let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("ssh stdout missing"))?;
 
-    let shutdown = Shutdown::default();
-    let mailbox: FrameMailbox = Arc::new(Mutex::new(None));
-    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
     let reader = {
         let title = Arc::clone(&title);
         let (mailbox, shutdown) = (Arc::clone(&mailbox), shutdown.clone());
@@ -1089,9 +1273,7 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
             loop {
                 match read_frame(&mut stdout,Some(&title)) {
                     Ok(Some(frame)) => {
-                        if let Ok(mut slot) = mailbox.lock() {
-                            *slot = Some(frame);
-                        }
+                        store_frame(&mailbox, frame);
                     }
                     Ok(None) => break,
                     Err(error) => {
@@ -1108,10 +1290,18 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         out: InputOut::Remote(Arc::new(Mutex::new(stdin))),
         last_pos: None,
         held_buttons: 0,
+        active_touch: None,
         held_keys: HashSet::new(),
         clipboard: None,
     };
-    let result = window_loop(ViewerTitle::Remote(&title,&host), &mailbox, &shutdown, virt, &mut input_state, None);
+    let result = window_loop(
+        ViewerTitle::Remote(&title, &host),
+        &mailbox,
+        &shutdown,
+        virt,
+        &mut input_state,
+        None,
+    );
     shutdown.request();
     // Closing the pipe ends `--serve` on the far side; ssh then exits.
     drop(input_state);
@@ -1140,6 +1330,7 @@ enum Op {
     Button(u32, u32),
     Axis(u32, f64),
     Key(u32, u32),
+    // The remote viewer has queued its first rendered frame for presentation.
     Presented,
 }
 
@@ -1370,13 +1561,19 @@ impl InputOut {
     fn send(&self, op: Op) {
         match self {
             InputOut::Local(gate) => gate.send(op),
-            InputOut::Remote(pipe) => {
-                let Ok(mut pipe) = pipe.lock() else { return };
-                if pipe.write_all(&op.encode()).and_then(|()| pipe.flush()).is_err() {
-                    eprintln!("kwin-viewer: remote input pipe closed");
-                }
-            }
+            InputOut::Remote(pipe) => send_remote_op(pipe, op),
         }
+    }
+}
+
+fn send_remote_op(pipe: &Arc<Mutex<std::process::ChildStdin>>, op: Op) {
+    let Ok(mut pipe) = pipe.lock() else { return };
+    if pipe
+        .write_all(&op.encode())
+        .and_then(|()| pipe.flush())
+        .is_err()
+    {
+        eprintln!("kwin-viewer: remote input pipe closed");
     }
 }
 
@@ -1390,6 +1587,8 @@ struct InputState {
     // Currently-held mouse buttons. Non-empty means we're in a drag and
     // pointer motions should be forwarded so the drag actually drags.
     held_buttons: u32,
+    // One touch controls the same pointer used by local and remote mouse input.
+    active_touch: Option<u64>,
     // Evdev keycodes currently held inside the container. We forcibly
     // release them on focus loss; otherwise a missed Released event (e.g.
     // user releases Shift outside the viewer window) leaves a modifier
@@ -1424,6 +1623,9 @@ fn forward_input(
         eprintln!("kwin-viewer: Num Lock synchronization failed: {error}");
     }
     if let WindowEvent::Focused(false) = event {
+        if state.active_touch.take().is_some() {
+            state.out.send(Op::Button(BTN_LEFT, 0));
+        }
         // Drain any keys that were forwarded as pressed but whose Released
         // event we may not see — release them all so no modifier stays
         // stuck inside the container while the user is elsewhere on host.
@@ -1439,6 +1641,38 @@ fn forward_input(
         }
     }
     match event {
+        WindowEvent::Touch(touch) => {
+            let begin = touch.phase == TouchPhase::Started
+                && state.active_touch.is_none()
+                && state.held_buttons == 0;
+            let mapped = map_window_to_virtual(
+                (touch.location.x, touch.location.y),
+                window_size.0,
+                window_size.1,
+                virt,
+            );
+            if begin {
+                if mapped.is_none() {
+                    return;
+                }
+                state.active_touch = Some(touch.id);
+            }
+            if state.active_touch != Some(touch.id) {
+                return;
+            }
+            if touch.phase != TouchPhase::Cancelled
+                && let Some((x, y)) = mapped
+            {
+                state.last_pos = Some((touch.location.x, touch.location.y));
+                state.out.send(Op::Motion(x, y));
+            }
+            if begin {
+                state.out.send(Op::Button(BTN_LEFT, 1));
+            } else if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                state.out.send(Op::Button(BTN_LEFT, 0));
+                state.active_touch = None;
+            }
+        }
         WindowEvent::CursorMoved { position, .. } => {
             // Always record the latest cursor position locally so a subsequent
             // click can snap the container's cursor to it. Only forward the
@@ -1452,7 +1686,14 @@ fn forward_input(
                 state.out.send(Op::Motion(x, y));
             }
         }
-        WindowEvent::MouseInput { state: btn_state, button, .. } => {
+        WindowEvent::MouseInput {
+            state: btn_state,
+            button,
+            ..
+        } => {
+            if state.active_touch.is_some() {
+                return;
+            }
             let code = match button {
                 MouseButton::Left => BTN_LEFT,
                 MouseButton::Right => BTN_RIGHT,
@@ -1594,10 +1835,12 @@ fn run_pipewire(
     struct UserData {
         format: spa::param::video::VideoInfoRaw,
         mailbox: FrameMailbox,
+        first_frame_received: bool,
     }
     let data = UserData {
         format: spa::param::video::VideoInfoRaw::default(),
         mailbox,
+        first_frame_received: false,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -1657,9 +1900,18 @@ fn run_pipewire(
             let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
             convert_to_rgba(raw, &mut rgba, w as usize, h as usize, stride, src_fmt);
 
-            if let Ok(mut g) = ud.mailbox.lock() {
-                *g = Some(Frame { width: w, height: h, rgba });
+            if !ud.first_frame_received {
+                eprintln!(
+                    "kwin-viewer: first PipeWire frame received: {}x{}, chunk={}, stride={}, mapped={}",
+                    w,
+                    h,
+                    size,
+                    stride,
+                    raw.len()
+                );
+                ud.first_frame_received = true;
             }
+            store_frame(&ud.mailbox, Frame { width: w, height: h, rgba });
         })
         .register()?;
 

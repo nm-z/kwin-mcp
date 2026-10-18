@@ -27,15 +27,19 @@ Use the user's active desktop only when the requested result inherently belongs 
 - The user asks about or asks the agent to manipulate a window, tab, focus state, or application already open on their active desktop.
 - The result must remain visible or usable on the user's active desktop after the agent finishes.
 
+For a user-requested host window inventory or exact activation, the isolated-session `window_list` and `window_activate` tools do not apply. On KDE Plasma 6, follow the host-side `kdotool` fallback documented in the repository README. It queries or activates the host window directly, so use it only for an explicitly requested host-desktop task.
+
 "My session" means the user's active desktop. "KWin MCP," "your session," and "your KWin MCP session" mean the carbon-copy live desktop.
 
 ## Operate and prove the path
 
-1. Call `session_start` before every other KWin MCP operation. It is idempotent.
+1. Call `session_start` before every other KWin MCP operation when starting a desktop. Every call creates a new isolated session; `session_start` cannot attach an existing `session_id`.
 2. Launch the production application and traverse the same visible workflow the user would use.
 3. Start with a screenshot and visual input. Use `find_ui_elements` for a specific named control, and a filtered accessibility tree only when structure helps. If the tree is empty or larger than the visual task warrants, continue with screenshots, keyboard, and mouse input.
 4. Interact inside the carbon-copy desktop and verify the resulting visible state there.
 5. Call `session_stop` when finished unless continued state is required.
+
+Session IDs belong to the `kwin-mcp` process that created them. An in-place source reload preserves sessions, but a DSH migration or client/server restart does not transfer them to a new process. `session_list` shows only sessions owned by the current process. If an ID belongs to another process, retry the request there while it is running; otherwise create a new session with `session_start`, relaunch the applications, and restore the task. The previous server's `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle.jsonl` log is capped at 1 MiB and retains recent cleanup records. An unavailable-ID error reports a retained cleanup record, says when cleanup is unconfirmed, and treats malformed records as errors.
 
 Do not replace a requested GUI path with HTTP calls, internal calls, mocks, or shell-only checks. A process, launch result, `session_start`, or viewer window does not prove the requested GUI outcome.
 

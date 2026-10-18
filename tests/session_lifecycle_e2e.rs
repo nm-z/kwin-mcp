@@ -9,12 +9,30 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const SESSION_LIFECYCLE_LOG_MAX_BYTES: usize = 1024 * 1024;
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to clean test directory {}: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
 struct RpcClient {
     child: Child,
     stdin: Option<ChildStdin>,
     responses: Receiver<Value>,
     stderr: Receiver<String>,
     pending: HashMap<u64, Value>,
+    sessions: Vec<String>,
     /// Private HOME for this run, removed on drop.
     home: PathBuf,
     notifications: Vec<Value>,
@@ -62,6 +80,11 @@ impl RpcClient {
         )
     }
 
+    fn start_with_cookie_test_bus() -> Self {
+        let address = require_filtered_cookie_test_bus();
+        Self::start_with_env(&[("DBUS_SESSION_BUS_ADDRESS", address.as_str())])
+    }
+
     fn start_program(
         program: &str,
         delay_stage: Option<&str>,
@@ -75,7 +98,10 @@ impl RpcClient {
             .as_nanos();
         let home_root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+            // Nested fixture sockets must fit sockaddr_un even when the
+            // checkout/target path is long. /tmp is hidden inside the session,
+            // so use the short, host-visible /var/tmp root by default.
+            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
         let home = home_root.join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
         for directory in [
             home.join(".config"),
@@ -163,6 +189,8 @@ impl RpcClient {
         if let Some(path) = &binary_copy {
             command.env("KWIN_MCP_BINARY", path);
         }
+        let runtime_dir = host_runtime_dir();
+        let session_bus = host_session_bus_address(&runtime_dir);
         command
             .args(["--autoclean"])
             .env("HOME", &home)
@@ -171,16 +199,8 @@ impl RpcClient {
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("KDEHOME", home.join(".kde"))
-            .env(
-                "XDG_RUNTIME_DIR",
-                std::env::var_os("XDG_RUNTIME_DIR")
-                    .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
-            )
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
-                    .unwrap_or_else(|| std::ffi::OsString::from("unix:path=/run/user/1000/bus")),
-            )
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env("DBUS_SESSION_BUS_ADDRESS", session_bus)
             .env(
                 "WAYLAND_DISPLAY",
                 std::env::var_os("WAYLAND_DISPLAY")
@@ -237,6 +257,7 @@ impl RpcClient {
             responses,
             stderr: stderr_rx,
             pending: HashMap::new(),
+            sessions: Vec::new(),
             home,
             notifications: Vec::new(),
             binary_copy,
@@ -324,8 +345,41 @@ impl RpcClient {
     }
 
     fn stop_process(mut self) {
+        self.cleanup_sessions();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    fn cleanup_sessions(&mut self) {
+        let sessions = std::mem::take(&mut self.sessions);
+        let arguments = if sessions.is_empty() {
+            vec![json!({})]
+        } else {
+            sessions
+                .into_iter()
+                .map(|session| json!({"session_id":session}))
+                .collect()
+        };
+        for (index, arguments) in arguments.into_iter().enumerate() {
+            let Some(stdin) = &mut self.stdin else { break };
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            let id = 9999 + index;
+            let request = json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"session_stop","arguments":arguments}});
+            let _ = writeln!(stdin, "{request}");
+            let _ = stdin.flush();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while let Ok(message) = self
+                .responses
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                if message["id"] == id {
+                    break;
+                }
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -336,18 +390,7 @@ impl RpcClient {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
-        if let Some(stdin) = &mut self.stdin
-            && self.child.try_wait().ok().flatten().is_none()
-        {
-            let request = json!({
-                "jsonrpc":"2.0",
-                "id":9999,
-                "method":"tools/call",
-                "params":{"name":"session_stop","arguments":{}}
-            });
-            let _ = writeln!(stdin, "{request}");
-            let _ = stdin.flush();
-        }
+        self.cleanup_sessions();
         // Closing the transport lets the production server stop its scopes.
         // Killing it immediately after writing session_stop races that cleanup.
         drop(self.stdin.take());
@@ -396,12 +439,27 @@ fn initialize(client: &mut RpcClient) {
 }
 
 fn call_tool(client: &mut RpcClient, id: u64, name: &str, arguments: Value) -> Value {
+    let selected = arguments["session_id"].as_str().map(str::to_owned);
     client.send(
         id,
         "tools/call",
         json!({"name":name, "arguments":arguments}),
     );
-    client.response(id, Duration::from_secs(45))
+    let response = client.response(id, Duration::from_secs(45));
+    if response["error"].is_null() && !response["result"]["isError"].as_bool().unwrap_or(false) {
+        if name == "session_start" {
+            if let Some(session) = response["result"]["structuredContent"]["session_id"].as_str() {
+                client.sessions.push(session.to_owned());
+            }
+        } else if name == "session_stop" {
+            if let Some(selected) = selected {
+                client.sessions.retain(|session| session != &selected);
+            } else if client.sessions.len() == 1 {
+                client.sessions.clear();
+            }
+        }
+    }
+    response
 }
 
 #[cfg(debug_assertions)]
@@ -433,7 +491,7 @@ fn viewer_windows(pid: u32) -> Vec<String> {
             "--pid",
             &pid.to_string(),
             "--title",
-            "^kwin-viewer$",
+            "^kwin-viewer.*$",
         ])
         .output()
         .expect("query host KWin windows");
@@ -464,6 +522,36 @@ fn workdir(response: &Value) -> PathBuf {
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("session_start did not return a workdir: {response}"))
+}
+
+fn host_runtime_dir() -> std::ffi::OsString {
+    use std::os::unix::fs::MetadataExt;
+    std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| {
+        let uid = std::fs::metadata("/proc/self")
+            .expect("inspect current process owner")
+            .uid();
+        std::ffi::OsString::from(format!("/run/user/{uid}"))
+    })
+}
+
+fn host_session_bus_address(runtime_dir: &std::ffi::OsStr) -> std::ffi::OsString {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|| {
+        let mut address = std::ffi::OsString::from("unix:path=");
+        address.push(runtime_dir);
+        address.push("/bus");
+        address
+    })
+}
+
+fn require_filtered_cookie_test_bus() -> String {
+    let address = std::env::var("KWIN_MCP_TEST_DBUS_SESSION_BUS_ADDRESS")
+        .expect("cookie session checks require a filtered test D-Bus proxy");
+    let host_bus = host_session_bus_address(&host_runtime_dir());
+    assert!(
+        std::ffi::OsStr::new(&address) != host_bus.as_os_str(),
+        "cookie session checks must not connect directly to the host user bus"
+    );
+    address
 }
 
 #[test]
@@ -1546,16 +1634,57 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         !workdir(&started).join("viewer.log").exists(),
         "session_start launched a viewer"
     );
-    let opened = call_tool(&mut client, 3, "viewer_open", json!({}));
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"kdialog --title viewer-first-frame --msgbox 'First frame content'"}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "viewer frame fixture did not launch: {launched}"
+    );
+    let captured = call_tool(&mut client, 4, "screenshot", json!({}));
+    assert!(
+        !captured["result"]["isError"].as_bool().unwrap_or(false),
+        "session screenshot before viewer_open failed: {captured}"
+    );
+    let opened = call_tool(&mut client, 5, "viewer_open", json!({}));
+    let viewer = &opened["result"]["structuredContent"]["viewer"];
+    let log_path = opened["result"]["structuredContent"]["viewer"]["log"]
+        .as_str()
+        .unwrap_or("");
+    let viewer_log = std::fs::read_to_string(log_path)
+        .unwrap_or_else(|error| format!("could not read viewer log: {error}"));
     assert_eq!(
         opened["result"]["structuredContent"]["status"],
         json!("opened"),
-        "{opened}"
+        "{opened}\n{viewer_log}"
     );
-    let viewer = &opened["result"]["structuredContent"]["viewer"];
+    assert_eq!(viewer["state"], json!("ready"), "{opened}\n{viewer_log}");
     assert!(
-        viewer["state"] == "ready" || viewer["state"] == "starting",
-        "{opened}"
+        viewer_log.contains("first frame submitted for presentation"),
+        "viewer did not submit its first frame: {opened}\n{viewer_log}"
+    );
+    let configured = viewer_log.find("initial nonzero resize received");
+    let first_redraw = viewer_log.find("first host window redraw");
+    assert!(
+        configured
+            .zip(first_redraw)
+            .is_some_and(|(configured, redraw)| configured < redraw),
+        "viewer drew before initial Wayland configure: {opened}\n{viewer_log}"
+    );
+    assert!(
+        viewer_log.contains("first PipeWire frame consumed by host window"),
+        "viewer did not consume its first PipeWire frame: {opened}\n{viewer_log}"
+    );
+    let consumed = viewer_log.find("first PipeWire frame consumed by host window");
+    let submitted = viewer_log.find("first frame submitted for presentation");
+    assert!(
+        consumed
+            .zip(submitted)
+            .is_some_and(|(consumed, submitted)| consumed < submitted),
+        "viewer reported submission before consuming its first PipeWire frame: {opened}\n{viewer_log}"
     );
     let pid = u32::try_from(viewer["pid"].as_u64().expect("viewer pid")).expect("pid fits");
     assert!(
@@ -1565,15 +1694,15 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
     assert_eq!(
         wait_for_viewer_windows(pid, 1).len(),
         1,
-        "viewer_open did not create exactly one host window: pid={pid} opened={opened}"
+        "viewer_open did not create exactly one host window: pid={pid} opened={opened}\n{viewer_log}"
     );
-    let again = call_tool(&mut client, 4, "viewer_open", json!({}));
+    let again = call_tool(&mut client, 6, "viewer_open", json!({}));
     assert_eq!(
         again["result"]["structuredContent"]["status"],
         json!("already_open"),
         "{again}"
     );
-    let closed = call_tool(&mut client, 5, "viewer_close", json!({}));
+    let closed = call_tool(&mut client, 7, "viewer_close", json!({}));
     assert_eq!(
         closed["result"]["structuredContent"]["status"],
         json!("closed"),
@@ -1592,7 +1721,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
         wait_for_viewer_windows(pid, 0).is_empty(),
         "viewer_close left a host window"
     );
-    let running = call_tool(&mut client, 6, "session_list", json!({}));
+    let running = call_tool(&mut client, 8, "session_list", json!({}));
     assert_eq!(
         running["result"]["structuredContent"]["sessions"]
             .as_array()
@@ -1600,7 +1729,7 @@ fn viewer_opens_on_demand_and_closes_without_stopping_session() {
             .len(),
         1
     );
-    call_tool(&mut client, 7, "session_stop", json!({}));
+    call_tool(&mut client, 9, "session_stop", json!({}));
     client.stop_process();
 
     // A missing host Wayland display affects viewer_open, not session_start.
@@ -1743,6 +1872,833 @@ fn screenshot_at_user_quota_reports_the_limit_and_leaves_no_partial_file() {
         "{recovered}"
     );
     call_tool(&mut client, 8, "session_stop", json!({}));
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "run through tests/screenshot_storage_e2e.sh with KDE, KWin, bubblewrap and kdialog"]
+fn screenshot_at_full_workdir_keeps_desktop_inspection_available() {
+    use base64::Engine;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let temporary = std::env::temp_dir();
+    assert_eq!(
+        std::env::var_os("KWIN_MCP_E2E_PRIVATE_TMPFS"),
+        Some(temporary.clone().into_os_string()),
+        "use the wrapper: never fill the host's shared /tmp"
+    );
+    let filesystem = nix::sys::statfs::statfs(&temporary).expect("private tmpfs");
+    assert_eq!(filesystem.filesystem_type(), nix::sys::statfs::TMPFS_MAGIC);
+    let stat = nix::sys::statvfs::statvfs(&temporary).expect("private tmpfs capacity");
+    assert!(stat.blocks() * stat.fragment_size() <= 1024 * 1024 * 1024);
+    let proof =
+        PathBuf::from(std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR").expect("proof directory"));
+    std::fs::create_dir_all(&proof).expect("proof directory");
+
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":1440,"height":900}),
+    );
+    let workdir = workdir(&started);
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"test ! -w \"$XDG_RUNTIME_DIR/kwin-scripts\" && kdialog --title kwin319 --msgbox 'Screenshot storage regression #319'"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    for id in 4..7 {
+        let shot = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        assert!(!inline_png(&shot).is_empty(), "{shot}");
+    }
+    let screenshot = workdir.join("screenshot.png");
+    std::fs::copy(&screenshot, proof.join("before.png")).expect("before screenshot");
+    std::fs::remove_file(&screenshot).expect("remove previous screenshot");
+
+    // Fill only the wrapper's small private mount. Unlike the user-quota case,
+    // leave no page for the active-window script that precedes PNG capture.
+    let fill = FillFile(temporary.join("fill"));
+    let file = std::fs::File::create(&fill.0).expect("private fill file");
+    let stat = nix::sys::statvfs::statvfs(&temporary).expect("private headroom");
+    let remaining = stat.blocks_available() * stat.fragment_size();
+    nix::fcntl::posix_fallocate(
+        &file,
+        0,
+        i64::try_from(remaining).expect("bounded fill size"),
+    )
+    .expect("fill private tmpfs");
+    assert_eq!(
+        nix::sys::statvfs::statvfs(&temporary)
+            .expect("full tmpfs")
+            .blocks_available(),
+        0
+    );
+
+    let failed = call_tool(&mut client, 7, "screenshot", json!({}));
+    std::fs::write(proof.join("full-workdir.json"), failed.to_string()).expect("failure evidence");
+    assert_eq!(
+        failed["error"]["data"]["reason"], "write_failed",
+        "{failed}"
+    );
+    let message = failed["error"]["message"]
+        .as_str()
+        .expect("storage diagnostic");
+    assert!(message.contains("No space left on device"), "{message}");
+    assert!(message.contains("inline=true"), "{message}");
+    assert!(!screenshot.exists());
+    assert!(!workdir.join("screenshot.partial").exists());
+
+    let windows = call_tool(&mut client, 8, "window_list", json!({}));
+    std::fs::write(proof.join("windows.json"), windows.to_string()).expect("window evidence");
+    assert!(windows["error"].is_null(), "{windows}");
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .expect("window list")
+            .iter()
+            .any(|window| window["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("kwin319"))),
+        "{windows}"
+    );
+    for id in 9..11 {
+        let inline = call_tool(&mut client, id, "screenshot", json!({"inline":true}));
+        let metadata = screenshot_meta(&inline);
+        assert!(metadata["path"].is_null(), "{metadata}");
+        assert!(
+            metadata["write_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("No space left on device")),
+            "{metadata}"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(inline_png(&inline))
+            .expect("fallback PNG");
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes))
+            .read_info()
+            .expect("fallback PNG header");
+        let mut pixels = vec![0; decoder.output_buffer_size()];
+        let info = decoder
+            .next_frame(&mut pixels)
+            .expect("complete fallback PNG");
+        assert!(info.width > 0 && info.height > 0);
+        std::fs::write(proof.join("at-capacity.png"), bytes).expect("fallback screenshot");
+        std::fs::write(proof.join("inline.json"), metadata.to_string()).expect("fallback metadata");
+        assert!(!screenshot.exists());
+        assert!(!workdir.join("screenshot.partial").exists());
+    }
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(workdir.file_name().expect("workdir name"));
+    assert_eq!(
+        std::fs::read_dir(disk.join("kwin-scripts"))
+            .expect("disk-backed scripts")
+            .count(),
+        0,
+        "KWin scripts leaked after inspection"
+    );
+    drop(file);
+    drop(fill);
+    let recovered = call_tool(&mut client, 11, "screenshot", json!({}));
+    assert!(
+        recovered["error"].is_null() && screenshot.exists(),
+        "{recovered}"
+    );
+    std::fs::copy(&screenshot, proof.join("recovered.png")).expect("recovered screenshot");
+    let stopped = call_tool(&mut client, 12, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    assert!(!workdir.exists(), "workdir was not cleaned");
+    assert!(!disk.exists(), "disk twin was not cleaned");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
+fn browser_cookies_continue_across_sessions_without_host_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_with_cookie_test_bus();
+    let profile = client.home.join(".config/google-chrome/Profile 2");
+    std::fs::create_dir_all(&profile).expect("profile directory");
+    let database = profile.join("Cookies");
+    let host = rusqlite::Connection::open(&database).expect("host cookies");
+    host.execute_batch(
+        "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER,
+         encrypted_value BLOB, UNIQUE(host_key,name,path));
+         INSERT INTO cookies VALUES('.example.test','session','/',10,x'0010');
+         INSERT INTO cookies VALUES('.example.test','host','/',10,x'0010');",
+    )
+    .expect("seed cookies");
+    let wal = profile.join("Cookies-wal");
+    let source_database = std::fs::read(&database).expect("host database bytes");
+    let source_wal = std::fs::read(&wal).expect("host WAL bytes");
+    assert!(
+        !profile.join("Cookies-shm").exists(),
+        "EXCLUSIVE fixture unexpectedly uses shared memory"
+    );
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let first_workdir = workdir(&started);
+    let created = client.home.join(".config/google-chrome/Default/Cookies");
+    let sql = "PRAGMA journal_mode=WAL; UPDATE cookies SET last_update_utc=20, encrypted_value=x'0020'; INSERT INTO cookies VALUES('.example.test','new','/',40,x'0040');";
+    let new_sql = "CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER, encrypted_value BLOB, UNIQUE(host_key,name,path)); INSERT INTO cookies VALUES('.example.test','session','/',99,x'0099');";
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "sqlite3 {} {} && mkdir -p {} && sqlite3 {} {}; konsole",
+            shlex::try_quote(&database.display().to_string()).expect("database quote"),
+            shlex::try_quote(sql).expect("SQL quote"),
+            shlex::try_quote(&created.parent().expect("profile parent").display().to_string()).expect("profile quote"),
+            shlex::try_quote(&created.display().to_string()).expect("new database quote"),
+            shlex::try_quote(new_sql).expect("new SQL quote")
+        )}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "{launched}"
+    );
+    save_session_image(
+        &mut client,
+        100,
+        started["result"]["structuredContent"]["session_id"]
+            .as_str()
+            .expect("session ID"),
+        "cookies-first-session.png",
+    );
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(!first_workdir.exists(), "first session was not cleaned");
+    let saved = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies");
+    assert_eq!(
+        std::fs::metadata(&saved)
+            .expect("saved jar")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let persisted = rusqlite::Connection::open(&saved).expect("saved cookies");
+    let count: i64 = persisted
+        .query_row("SELECT count(*) FROM cookies", [], |row| row.get(0))
+        .expect("persisted cookie count");
+    assert_eq!(count, 3);
+    drop(persisted);
+    let original: i64 = host
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("host timestamp");
+    assert_eq!(original, 10, "session changed the host profile");
+    assert_eq!(
+        std::fs::read(&database).expect("host database after session"),
+        source_database
+    );
+    assert_eq!(
+        std::fs::read(&wal).expect("host WAL after session"),
+        source_wal
+    );
+    assert!(
+        !profile.join("Cookies-shm").exists(),
+        "session opened host shared memory"
+    );
+    assert!(!created.exists(), "session created a host profile");
+    host.execute(
+        "UPDATE cookies SET last_update_utc=30,encrypted_value=x'0030' WHERE name='host'",
+        [],
+    )
+    .expect("real browser refresh");
+    let started = call_tool(
+        &mut client,
+        5,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let second_workdir = workdir(&started);
+    let exported = client.home.join("merged-cookies.sqlite");
+    let result = call_tool(
+        &mut client,
+        6,
+        "export_file",
+        json!({
+            "session_path":database,"host_path":exported
+        }),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let merged = rusqlite::Connection::open(exported).expect("merged jar");
+    let rows = merged
+        .prepare("SELECT name,last_update_utc,hex(encrypted_value) FROM cookies ORDER BY name")
+        .expect("merged query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("merged rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("merged values");
+    assert_eq!(
+        rows,
+        vec![
+            ("host".to_owned(), 30, "0030".to_owned()),
+            ("new".to_owned(), 40, "0040".to_owned()),
+            ("session".to_owned(), 20, "0020".to_owned())
+        ]
+    );
+    let new_export = client.home.join("new-profile-cookies.sqlite");
+    let result = call_tool(
+        &mut client,
+        101,
+        "export_file",
+        json!({
+            "session_path":created,"host_path":new_export
+        }),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let restored = rusqlite::Connection::open(new_export).expect("new profile jar");
+    let updated: i64 = restored
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("new profile cookie");
+    assert_eq!(updated, 99, "profiles shared a cookie jar");
+    let stopped = call_tool(&mut client, 7, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(!second_workdir.exists(), "second session was not cleaned");
+
+    let started = call_tool(
+        &mut client,
+        8,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let third_workdir = workdir(&started);
+    let migrate_schema = "ALTER TABLE cookies ADD COLUMN source_scheme INTEGER NOT NULL DEFAULT 0; UPDATE cookies SET source_scheme=1;";
+    let migrated = call_tool(
+        &mut client,
+        9,
+        "launch_app",
+        json!({"command":format!(
+            "sqlite3 {} {}; konsole",
+            shlex::try_quote(&database.display().to_string()).expect("database quote"),
+            shlex::try_quote(migrate_schema).expect("migration SQL quote")
+        )}),
+    );
+    assert!(
+        !migrated["result"]["isError"].as_bool().unwrap_or(false),
+        "{migrated}"
+    );
+    let stopped = call_tool(&mut client, 10, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        !third_workdir.exists(),
+        "schema migration session was not cleaned"
+    );
+    let persisted = rusqlite::Connection::open(&saved).expect("schema-updated saved jar");
+    let columns = persisted
+        .prepare("PRAGMA table_info(cookies)")
+        .expect("schema query")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("schema columns")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("schema names");
+    assert!(columns.iter().any(|column| column == "source_scheme"));
+    let migrated_value: i64 = persisted
+        .query_row(
+            "SELECT source_scheme FROM cookies WHERE name='session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migrated session cookie");
+    assert_eq!(migrated_value, 1);
+    drop(persisted);
+
+    let started = call_tool(
+        &mut client,
+        11,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let startup_cookie_errors = started["result"]["structuredContent"]["cookie_errors"]
+        .as_array()
+        .expect("session_start cookie errors");
+    assert!(
+        startup_cookie_errors.iter().any(|error| error
+            .as_str()
+            .is_some_and(|message| message.contains("cookie schemas differ"))),
+        "schema mismatch was not returned from session_start: {started}"
+    );
+    let fourth_workdir = workdir(&started);
+    let stopped = call_tool(&mut client, 12, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        !fourth_workdir.exists(),
+        "schema fallback session was not cleaned"
+    );
+
+    host.execute(
+        "UPDATE cookies SET last_update_utc=50,encrypted_value=x'0050' WHERE name='host'",
+        [],
+    )
+    .expect("host cookie update after schema fallback");
+    let started = call_tool(
+        &mut client,
+        13,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let fifth_workdir = workdir(&started);
+    let refreshed = client.home.join("refreshed-host-cookie.sqlite");
+    let result = call_tool(
+        &mut client,
+        14,
+        "export_file",
+        json!({"session_path":database,"host_path":refreshed}),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let refreshed_jar = rusqlite::Connection::open(refreshed).expect("refreshed session jar");
+    let host_timestamp: i64 = refreshed_jar
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='host'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("refreshed host cookie");
+    assert_eq!(
+        host_timestamp, 50,
+        "schema mismatch froze the old host cookie"
+    );
+    drop(refreshed_jar);
+    let stopped = call_tool(&mut client, 15, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(!fifth_workdir.exists(), "refreshed session was not cleaned");
+
+    let started = call_tool(
+        &mut client,
+        16,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let sixth_workdir = workdir(&started);
+    let cookie_state = client.home.join(".local/state/kwin-mcp/browser-cookies");
+    let displaced_state = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies.saved");
+    std::fs::rename(&cookie_state, &displaced_state).expect("displace private cookie state");
+    std::fs::write(&cookie_state, b"occupied").expect("block cookie state directory");
+    let stopped = call_tool(&mut client, 17, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    assert!(
+        stopped["result"]["structuredContent"]["cookie_errors"]
+            .as_array()
+            .is_some_and(|errors| !errors.is_empty()),
+        "cookie save failure was not returned from session_stop: {stopped}"
+    );
+    assert!(
+        !sixth_workdir.exists(),
+        "save-failure session was not cleaned"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, input devices, and a live GPU session"]
+fn browser_cookies_snapshot_concurrent_wal_commits_and_checkpoints() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    struct Writer {
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("WAL writer finished");
+            }
+        }
+    }
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_with_cookie_test_bus();
+    let relative = ".config/google-chrome/Profile 2/Cookies";
+    let database = client.home.join(relative);
+    let saved = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies")
+        .join(relative);
+    let schema = "CREATE TABLE cookies(host_key TEXT, name TEXT, path TEXT, last_update_utc INTEGER,
+        encrypted_value BLOB, UNIQUE(host_key,name,path));
+        WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2048)
+        INSERT INTO cookies SELECT '.example.test',printf('cookie%d',x),'/',0,zeroblob(1024) FROM n;";
+    for path in [&database, &saved] {
+        std::fs::create_dir_all(path.parent().expect("jar parent")).expect("jar directory");
+        rusqlite::Connection::open(path)
+            .expect("jar")
+            .execute_batch(schema)
+            .expect("jar schema");
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let generation = Arc::new(AtomicI64::new(0));
+    let writer_stop = stop.clone();
+    let writer_generation = generation.clone();
+    let writer_database = database.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let writer = Writer {
+        stop,
+        thread: Some(thread::spawn(move || {
+            let host = rusqlite::Connection::open(writer_database).expect("writer connection");
+            host.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").expect("exclusive WAL");
+            ready_tx.send(()).expect("writer ready");
+            let mut generation = 0i64;
+            while !writer_stop.load(Ordering::SeqCst) {
+                generation += 1;
+                host.execute(
+                    "UPDATE cookies SET last_update_utc=?1,encrypted_value=CAST(?1 AS BLOB)",
+                    [generation],
+                )
+                .expect("atomic cookie generation");
+                writer_generation.store(generation, Ordering::SeqCst);
+                host.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .expect("concurrent checkpoint");
+                thread::sleep(Duration::from_millis(5));
+            }
+        })),
+    };
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("WAL fixture started");
+    initialize(&mut client);
+    let mut observed_live_generation = false;
+    for cycle in 0..4u64 {
+        let started = call_tool(
+            &mut client,
+            10 + cycle * 10,
+            "session_start",
+            json!({"width":800,"height":600}),
+        );
+        let session_workdir = workdir(&started);
+        let exported = client.home.join(format!("wal-snapshot-{cycle}.sqlite"));
+        let result = call_tool(
+            &mut client,
+            11 + cycle * 10,
+            "export_file",
+            json!({"session_path":database,"host_path":exported}),
+        );
+        assert!(
+            !result["result"]["isError"].as_bool().unwrap_or(false),
+            "{result}"
+        );
+        let snapshot = rusqlite::Connection::open(&exported).expect("snapshot");
+        let check: String = snapshot
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity check");
+        assert_eq!(check, "ok");
+        let (rows, versions, minimum, maximum): (i64, i64, i64, i64) = snapshot.query_row(
+            "SELECT count(*),count(DISTINCT last_update_utc),min(last_update_utc),max(last_update_utc) FROM cookies",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).expect("snapshot generation");
+        assert_eq!(rows, 2048);
+        assert_eq!(versions, 1, "snapshot mixed concurrent transactions");
+        assert_eq!(minimum, maximum);
+        assert!(maximum <= generation.load(Ordering::SeqCst));
+        observed_live_generation |= maximum > 0;
+        if cycle == 0 {
+            let launched = call_tool(&mut client, 12, "launch_app", json!({"command":"konsole"}));
+            assert!(
+                !launched["result"]["isError"].as_bool().unwrap_or(false),
+                "{launched}"
+            );
+            save_session_image(
+                &mut client,
+                13,
+                &session_handle(&started),
+                "cookies-concurrent-wal.png",
+            );
+        }
+        let stopped = call_tool(&mut client, 14 + cycle * 10, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+        assert!(!session_workdir.exists());
+    }
+    drop(writer);
+    assert!(
+        observed_live_generation,
+        "all snapshots fell back to saved state"
+    );
+    assert!(
+        !database.with_file_name("Cookies-shm").exists(),
+        "opened host shared memory"
+    );
+    let host_bytes = std::fs::read(&database).expect("host snapshot after writer stopped");
+    let started = call_tool(
+        &mut client,
+        60,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_workdir = workdir(&started);
+    call_tool(&mut client, 61, "session_stop", json!({}));
+    assert!(!session_workdir.exists());
+    assert_eq!(
+        std::fs::read(&database).expect("unchanged host jar"),
+        host_bytes
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, konsole, sqlite3, input devices, and a live GPU session"]
+fn browser_cookie_deletion_survives_stale_sessions_and_expiry_is_pruned() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_with_cookie_test_bus();
+    let database = client.home.join(".config/google-chrome/Profile 2/Cookies");
+    std::fs::create_dir_all(database.parent().expect("profile parent")).expect("profile");
+    let host = rusqlite::Connection::open(&database).expect("host jar");
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_micros(),
+    )
+    .expect("cookie time")
+        + 11_644_473_600_000_000;
+    host.execute_batch(&format!("CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,
+        top_frame_site_key TEXT,source_scheme INTEGER,source_port INTEGER,last_update_utc INTEGER,
+        expires_utc INTEGER,has_expires INTEGER,encrypted_value BLOB,
+        UNIQUE(host_key,name,path,top_frame_site_key,source_scheme,source_port));
+        INSERT INTO cookies VALUES('.example.test','removed','/','',2,443,10,0,0,x'0010');
+        INSERT INTO cookies VALUES('.example.test','kept','/','',2,443,10,0,0,x'0010');
+        INSERT INTO cookies VALUES('.example.test','kept','/','https://partition.test',2,443,10,0,0,x'0010');
+        INSERT INTO cookies VALUES('.example.test','expired','/','',2,443,10,1,1,x'0010');
+        INSERT INTO cookies VALUES('.example.test','zero-expired','/','',2,443,10,0,1,x'0010');
+        INSERT INTO cookies VALUES('.example.test','future','/','',2,443,10,{},1,x'0010');
+        INSERT INTO cookies VALUES('.example.test','session','/','',2,443,10,0,0,x'0010');", now + 3_600_000_000)).expect("seed jar");
+    let unsupported = client.home.join(".config/google-chrome/Other/Cookies");
+    std::fs::create_dir_all(unsupported.parent().expect("other parent")).expect("other directory");
+    rusqlite::Connection::open(&unsupported)
+        .expect("other SQLite")
+        .execute_batch(
+            "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('preserve');",
+        )
+        .expect("other schema");
+    let original = std::fs::read(&database).expect("host bytes");
+    let unsupported_original = std::fs::read(&unsupported).expect("other bytes");
+    initialize(&mut client);
+    let a = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let a_id = session_handle(&a);
+    let b = call_tool(
+        &mut client,
+        3,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let b_id = session_handle(&b);
+    let quoted_database = shlex::try_quote(&database.display().to_string())
+        .expect("jar quote")
+        .into_owned();
+    let deleted = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"session_id":a_id,"command":format!("sqlite3 {quoted_database} \"DELETE FROM cookies WHERE name='removed';\" && konsole")}),
+    );
+    assert!(
+        !deleted["result"]["isError"].as_bool().unwrap_or(false),
+        "{deleted}"
+    );
+    let updated = call_tool(
+        &mut client,
+        5,
+        "launch_app",
+        json!({"session_id":b_id,"command":format!("sqlite3 {quoted_database} \"UPDATE cookies SET last_update_utc={now} WHERE name='kept' AND top_frame_site_key=''; INSERT INTO cookies VALUES('.example.test','new','/','',2,443,{now},0,0,x'0020');\" && konsole")}),
+    );
+    assert!(
+        !updated["result"]["isError"].as_bool().unwrap_or(false),
+        "{updated}"
+    );
+    save_session_image(&mut client, 6, &a_id, "cookies-deletion-session-a.png");
+    // Both stops run at once: either lock acquisition order must preserve the
+    // deletion and the other session's newer row/profile partition identities.
+    for (id, session) in [(7, &a_id), (8, &b_id)] {
+        client.send(
+            id,
+            "tools/call",
+            json!({"name":"session_stop","arguments":{"session_id":session}}),
+        );
+    }
+    for id in [7, 8] {
+        let stopped = client.response(id, Duration::from_secs(45));
+        assert!(
+            stopped["error"].is_null() && !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+    }
+    client
+        .sessions
+        .retain(|session| session != &a_id && session != &b_id);
+    assert!(!workdir(&a).exists() && !workdir(&b).exists());
+    assert_eq!(std::fs::read(&database).expect("unchanged host"), original);
+    assert_eq!(
+        std::fs::read(&unsupported).expect("unchanged other"),
+        unsupported_original
+    );
+    let saved = client
+        .home
+        .join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies");
+    let private = rusqlite::Connection::open(&saved).expect("saved jar");
+    let counts: (i64,i64,i64,i64,i64,i64) = private.query_row("SELECT count(*),sum(name='removed'),sum(name='expired'),sum(name='session'),sum(name='future'),sum(name='kept') FROM cookies", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).expect("persisted identities");
+    assert_eq!(counts, (5, 0, 0, 1, 1, 2));
+    let kept: i64 = private
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='kept' AND top_frame_site_key=''",
+            [],
+            |row| row.get(0),
+        )
+        .expect("newer concurrent row");
+    assert_eq!(kept, now);
+    assert!(
+        !client
+            .home
+            .join(".local/state/kwin-mcp/browser-cookies/.config/google-chrome/Other/Cookies")
+            .exists()
+    );
+    drop(private);
+    let c = call_tool(
+        &mut client,
+        9,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let c_id = session_handle(&c);
+    let exported = client.home.join("after-deletion.sqlite");
+    let result = call_tool(
+        &mut client,
+        10,
+        "export_file",
+        json!({"session_id":c_id,"session_path":database,"host_path":exported}),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let restored = rusqlite::Connection::open(exported).expect("restored jar");
+    let removed: i64 = restored
+        .query_row(
+            "SELECT count(*) FROM cookies WHERE name IN ('removed','expired')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("deleted count");
+    assert_eq!(
+        removed, 0,
+        "old host jar resurrected removed or expired cookie"
+    );
+    let hidden = call_tool(
+        &mut client,
+        11,
+        "launch_app",
+        json!({"session_id":c_id,"command":"test ! -e \"$HOME/.local/state/kwin-mcp/browser-cookies/.config/google-chrome/Profile 2/Cookies\" && konsole"}),
+    );
+    assert!(
+        !hidden["result"]["isError"].as_bool().unwrap_or(false),
+        "private store visible: {hidden}"
+    );
+    call_tool(&mut client, 12, "session_stop", json!({"session_id":c_id}));
+    assert!(!workdir(&c).exists());
+    let recreated = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_micros(),
+    )
+    .expect("cookie time")
+        + 11_644_473_601_000_000;
+    host.execute(
+        "UPDATE cookies SET last_update_utc=? WHERE name='removed'",
+        [recreated],
+    )
+    .expect("genuine newer host cookie");
+    let d = call_tool(
+        &mut client,
+        13,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let d_id = session_handle(&d);
+    let recreated_copy = client.home.join("recreated-cookie.sqlite");
+    let result = call_tool(
+        &mut client,
+        14,
+        "export_file",
+        json!({"session_id":d_id,"session_path":database,"host_path":recreated_copy}),
+    );
+    assert!(
+        !result["result"]["isError"].as_bool().unwrap_or(false),
+        "{result}"
+    );
+    let recreated_jar = rusqlite::Connection::open(recreated_copy).expect("recreated jar");
+    let version: i64 = recreated_jar
+        .query_row(
+            "SELECT last_update_utc FROM cookies WHERE name='removed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("new cookie survived tombstone");
+    assert_eq!(version, recreated);
+    call_tool(&mut client, 15, "session_stop", json!({"session_id":d_id}));
+    assert!(!workdir(&d).exists());
     client.stop_process();
 }
 
@@ -2076,6 +3032,11 @@ fn session_follows_host_sqlite_wal_rotation() {
     let directory = client.home.clone();
     let database = directory.join("rotation.sqlite");
     let hidden_cache = directory.join(".cache/google-chrome/nested");
+    let cookie_state = directory.join(".local/state/kwin-mcp/browser-cookies");
+    assert!(
+        !cookie_state.exists(),
+        "cookie state must be absent beneath the HOME alias fixture"
+    );
     std::fs::create_dir_all(&hidden_cache).expect("nested browser cache");
     let cache_database = rusqlite::Connection::open(hidden_cache.join("hidden-cache.sqlite"))
         .expect("hidden cache fixture database");
@@ -2110,12 +3071,8 @@ fn session_follows_host_sqlite_wal_rotation() {
         assert!(Instant::now() < deadline, "graphical fixture did not start");
         thread::sleep(Duration::from_millis(20));
     }
-    std::os::unix::fs::symlink(
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|| std::ffi::OsString::from("/run/user/1000")),
-        directory.join("host-runtime-link"),
-    )
-    .expect("runtime symlink fixture");
+    std::os::unix::fs::symlink(host_runtime_dir(), directory.join("host-runtime-link"))
+        .expect("runtime symlink fixture");
     let mut host = rusqlite::Connection::open(&database).expect("host database");
     host.execute_batch("pragma journal_mode=wal; create table generation(marker integer); insert into generation values(0); create table churn(body blob);")
         .expect("seed generation");
@@ -2544,6 +3501,20 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         json!({"width":800,"height":600}),
     );
     let workdir = workdir(&started);
+    let bridge_exe = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(workdir.file_name().expect("session workdir name"))
+        .join("kwin-mcp-exe");
+    assert!(
+        bridge_exe.is_file(),
+        "FUSE bridge image was not staged in the disk-backed session twin: {}",
+        bridge_exe.display()
+    );
+    assert!(
+        !workdir.join("kwin-mcp-exe").exists(),
+        "FUSE bridge image consumed space in the /tmp workdir"
+    );
     std::fs::create_dir_all(workdir.join("src")).expect("source dir");
     std::fs::write(workdir.join("src/hello.txt"), "over fuse\n").expect("source file");
     // sshfs over a local sftp-server: a real libfuse3 client going through
@@ -2595,6 +3566,10 @@ fn fuse_mounts_work_in_the_session_without_giving_apps_capabilities() {
         );
     }
     call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !bridge_exe.exists(),
+        "session_stop retained its disk-backed FUSE bridge image"
+    );
     client.stop_process();
 }
 
@@ -3091,6 +4066,10 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         missing["result"]["structuredContent"]["exit_status"], 127,
         "{missing}"
     );
+    assert_eq!(
+        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
+        "{missing}"
+    );
     assert!(
         begun.elapsed() < Duration::from_secs(5),
         "missing command took {:?}",
@@ -3104,7 +4083,12 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{failed}"
     );
 
-    let finished = call_tool(&mut client, 5, "launch_app", json!({"command":"true"}));
+    let finished = call_tool(
+        &mut client,
+        5,
+        "launch_app",
+        json!({"command":"true","window_timeout_seconds":1}),
+    );
     assert_ne!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(
         finished["result"]["structuredContent"]["exit_status"], 0,
@@ -3121,6 +4105,317 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     assert_eq!(retained, 0, "launch command files were retained");
 
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, ChatGPT, input devices, and a live GPU session"]
+fn launch_chatgpt_with_disk_backed_host_tmpdir() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let temp_root = PathBuf::from("/var/tmp").join(format!(
+        "kwin-mcp-e2e-tmpdir-{}-{nonce}",
+        std::process::id()
+    ));
+    use std::os::unix::fs::DirBuilderExt;
+    let mut temp_dir = std::fs::DirBuilder::new();
+    temp_dir
+        .mode(0o700)
+        .create(&temp_root)
+        .expect("create disk-backed host TMPDIR");
+    let _temp_root_cleanup = RemoveDirOnDrop(temp_root.clone());
+    let host_tmpdir = temp_root.display().to_string();
+    let mut client = RpcClient::start_with_env(&[("TMPDIR", &host_tmpdir)]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let directory = workdir(&started);
+    assert!(
+        directory.starts_with(&temp_root),
+        "session workdir {} did not use host TMPDIR {}",
+        directory.display(),
+        temp_root.display()
+    );
+
+    let debug_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve a free ChatGPT debug port")
+        .local_addr()
+        .expect("read reserved ChatGPT debug port")
+        .port();
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":format!(
+            "printf '%s\\n' \"$TMPDIR\" > \"$XDG_RUNTIME_DIR/tmpdir-proof\" && touch \"$TMPDIR/kwin-mcp-tmpdir-probe\" && /usr/lib/chatgpt/ChatGPT --user-data-dir=\"$HOME/.km-input-e2e-private\" --force-renderer-accessibility --remote-debugging-port={debug_port}"
+        )}),
+    );
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("tmpdir-proof"))
+            .expect("read TMPDIR proof")
+            .trim(),
+        "/tmp",
+        "launched processes should use the sandbox's writable private /tmp"
+    );
+    let window_id = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("ChatGPT window ID");
+    let windows = call_tool(&mut client, 4, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|window| window["id"] == window_id)),
+        "ChatGPT window missing from window_list: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
+    assert_ne!(stopped["result"]["isError"], true, "{stopped}");
+    assert!(!directory.exists(), "session workdir remains");
+    client.stop_process();
+    std::fs::remove_dir_all(&temp_root).expect("remove disk-backed host TMPDIR");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Google Chrome, input devices, and a live GPU session"]
+fn launch_app_reports_existing_chrome_window_after_url_handoff() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+
+    let first = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "command":"google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-handoff-before</title>Before handoff'"
+        }),
+    );
+    assert_ne!(first["result"]["isError"], true, "{first}");
+    let first_window = first["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("initial Chrome window ID")
+        .to_owned();
+
+    let school = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({
+            "command":"google-chrome-stable --profile-directory=School --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run --new-window 'data:text/html,<title>kwin-mcp-school-window</title>School profile'"
+        }),
+    );
+    assert_ne!(school["result"]["isError"], true, "{school}");
+    let school_window = school["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("School Chrome window ID")
+        .to_owned();
+    assert_ne!(school_window, first_window, "{school}");
+
+    // A window can appear before Chrome loads its initial document. Establish
+    // both titles so School's initial load cannot masquerade as a second handoff.
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = call_tool(&mut client, 40, "window_list", json!({}));
+        let ready = windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| {
+                [
+                    (&first_window, "kwin-mcp-handoff-before"),
+                    (&school_window, "kwin-mcp-school-window"),
+                ]
+                .iter()
+                .all(|(id, title)| {
+                    entries.iter().any(|window| {
+                        window["id"] == id.as_str()
+                            && window["title"]
+                                .as_str()
+                                .is_some_and(|value| value.contains(title))
+                    })
+                })
+            });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "initial pages not ready: {windows}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let handoff_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>After handoff'";
+    let handed_off = call_tool(
+        &mut client,
+        5,
+        "launch_app",
+        json!({
+            "command":handoff_command
+        }),
+    );
+    assert_ne!(handed_off["result"]["isError"], true, "{handed_off}");
+    let result = &handed_off["result"]["structuredContent"];
+    assert_eq!(result["window"], first_window, "{handed_off}");
+    assert_eq!(result["window_outcome"], "reused_existing", "{handed_off}");
+    assert_eq!(result["window_reused"], true, "{handed_off}");
+    assert!(
+        result["window_title"]
+            .as_str()
+            .is_some_and(|title| title.contains("kwin-mcp-handoff-after")),
+        "handoff title was not reported: {handed_off}"
+    );
+
+    let focused_school = call_tool(
+        &mut client,
+        6,
+        "window_activate",
+        json!({"window_id":school_window}),
+    );
+    assert_ne!(
+        focused_school["result"]["isError"], true,
+        "{focused_school}"
+    );
+
+    // Multiple URLs can be forwarded without a new window or a changed title.
+    let same_title_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, another tab' 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, second tab'";
+    let ambiguous = call_tool(
+        &mut client,
+        7,
+        "launch_app",
+        json!({"command":same_title_command,"window_timeout_seconds":1}),
+    );
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["window_outcome"], "unattributed",
+        "{ambiguous}"
+    );
+    assert_eq!(
+        ambiguous["result"]["structuredContent"]["exit_status"], 0,
+        "{ambiguous}"
+    );
+    assert!(
+        ambiguous["result"]["structuredContent"]["handoff"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("activation or minimized state")),
+        "missing attribution reason: {ambiguous}"
+    );
+    assert!(
+        ambiguous["result"]["structuredContent"]["handoff"]["candidate_windows"]
+            .as_array()
+            .is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["window"] == first_window)
+            }),
+        "the focused existing window was not reported as a candidate: {ambiguous}"
+    );
+
+    let windows = call_tool(&mut client, 8, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|window| {
+                    window["id"] == first_window
+                        && window["title"]
+                            .as_str()
+                            .is_some_and(|title| title.contains("kwin-mcp-handoff-after"))
+                })
+            }),
+        "the reused Chrome window did not show the handed-off tab: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 9, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn launch_app_waits_for_a_delayed_window() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+
+    let begun = Instant::now();
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command":"sleep 18; konsole --separate --hold -e bash -c 'printf delayed-window-proof'","window_timeout_seconds":30}),
+    );
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    let elapsed = begun.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(17),
+        "launch_app returned before the delayed window appeared: {elapsed:?}"
+    );
+    let window_id = launched["result"]["structuredContent"]["window"]
+        .as_str()
+        .expect("window ID");
+    assert!(window_id.starts_with('{'), "{launched}");
+    assert_eq!(
+        launched["result"]["structuredContent"]["window_timeout_seconds"], 30,
+        "{launched}"
+    );
+    let windows = call_tool(&mut client, 4, "window_list", json!({}));
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|window| window["id"] == window_id)),
+        "delayed window missing from window_list: {windows}"
+    );
+
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
     assert!(
         !stopped["result"]["isError"].as_bool().unwrap_or(false),
         "{stopped}"
@@ -3294,7 +4589,16 @@ fn direct_children(pid: u32) -> Vec<i32> {
 
 #[test]
 fn discovery_creates_no_session_processes() {
-    let mut client = RpcClient::start();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-discovery-state-{nonce}"));
+    std::fs::create_dir_all(&state_home).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
     thread::sleep(Duration::from_secs(2));
     assert!(direct_children(client.child.id()).is_empty());
     initialize(&mut client);
@@ -3312,10 +4616,49 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    call_tool(&mut client, 3, "session_list", json!({}));
-    client.send(4, "ping", json!({}));
+    let session_server_pid = if client.child.id() == u32::MAX {
+        client.child.id() - 1
+    } else {
+        client.child.id() + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let unavailable = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
     assert_eq!(
-        client.response(4, Duration::from_secs(2))["result"],
+        unavailable["error"]["data"]["reason"], "different_server_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["previous_server_cleanup"],
+        "not_confirmed_from_current_process",
+        "{unavailable}"
+    );
+    assert!(
+        unavailable["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("session_start without session_id")
+                    && message.contains("relaunch")
+            ),
+        "{unavailable}"
+    );
+    let no_live = call_tool(&mut client, 4, "window_list", json!({}));
+    assert_eq!(
+        no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    let sessions = call_tool(&mut client, 5, "session_list", json!({}));
+    assert_eq!(
+        sessions["result"]["structuredContent"]["scope"], "current_process",
+        "{sessions}"
+    );
+    client.send(6, "ping", json!({}));
+    assert_eq!(
+        client.response(6, Duration::from_secs(2))["result"],
         json!({})
     );
     for (index, method) in [
@@ -3327,7 +4670,7 @@ fn discovery_creates_no_session_processes() {
     .iter()
     .enumerate()
     {
-        let id = 5 + u64::try_from(index).expect("index");
+        let id = 7 + u64::try_from(index).expect("index");
         client.send(id, method, json!({"ref":{"type":"ref/prompt","name":"unused"},"argument":{"name":"unused","value":""}}));
         assert!(
             client.response(id, Duration::from_secs(2))["result"].is_object(),
@@ -3346,6 +4689,7 @@ fn discovery_creates_no_session_processes() {
             .any(|line| line.contains("started child"))
     );
     client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
 
 #[test]
@@ -3383,11 +4727,31 @@ fn describe_matches_the_stdio_server() {
 }
 
 #[test]
+fn non_pollable_stdio_error_identifies_the_descriptor() {
+    let output = Command::new(
+        std::env::var("KWIN_MCP_E2E_SERVER")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned()),
+    )
+    .args(["--width", "1232", "--height", "924", "--autoclean"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("start server with null stdin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("MCP stdin (fd 0) is not pollable by epoll"),
+        "startup error did not identify the unpollable input descriptor: {stderr}"
+    );
+}
+
+#[test]
 fn call_without_session_creates_no_processes() {
     let mut client = RpcClient::start();
     initialize(&mut client);
     let result = call_tool(&mut client, 2, "window_list", json!({}));
-    assert!(result.to_string().contains("no session"), "{result}");
+    assert!(result.to_string().contains("no live session"), "{result}");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !direct_children(client.child.id()).is_empty() {
         assert!(Instant::now() < deadline, "unbound server did not exit");
@@ -3401,6 +4765,184 @@ fn call_without_session_creates_no_processes() {
         json!({})
     );
     client.stop_process();
+}
+
+#[test]
+fn unknown_session_from_another_server_reports_recovery_guidance() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-other-server-state-{nonce}"));
+    std::fs::create_dir_all(&state_home).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+    let server_pid = client.child.id();
+    let next_pid = server_pid.saturating_add(1);
+    let session_server_pid = if next_pid == server_pid {
+        server_pid - 1
+    } else {
+        next_pid
+    };
+    let session_id = format!("s{session_server_pid}-1");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert_eq!(
+        response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert_eq!(response["error"]["data"]["session_id"], session_id);
+    assert_eq!(response["error"]["data"]["server_pid"], server_pid);
+    assert_eq!(
+        response["error"]["data"]["session_server_pid"],
+        session_server_pid
+    );
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("server restart"), "{message}");
+    assert!(
+        message.contains("session_start without session_id"),
+        "{message}"
+    );
+    assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn malformed_session_lifecycle_record_is_an_error() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-malformed-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let session_server_pid = if server_pid == u32::MAX {
+        server_pid - 1
+    } else {
+        server_pid + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let malformed = format!(
+        "{}\n",
+        json!({
+            "session_id": session_id,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    std::fs::write(log_dir.join("session-lifecycle.jsonl"), malformed)
+        .expect("write malformed lifecycle record");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(response["error"]["code"], -32603, "{response}");
+    assert_eq!(
+        response["error"]["data"]["reason"], "malformed_session_lifecycle_record",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["unknown_session_error"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("malformed session-lifecycle record")),
+        "{response}"
+    );
+    assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kwin-mcp-oversized-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let lifecycle_log = log_dir.join("session-lifecycle.jsonl");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    let server_pid = client.child.id();
+    let session_server_pid = if server_pid == u32::MAX {
+        server_pid - 1
+    } else {
+        server_pid + 1
+    };
+    let session_id = format!("s{session_server_pid}-1");
+    let seed_record = format!(
+        "{}\n",
+        json!({
+            "session_id": session_id,
+            "server_pid": session_server_pid,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    let mut seed_log = Vec::new();
+    while seed_log.len() <= SESSION_LIFECYCLE_LOG_MAX_BYTES {
+        seed_log.extend_from_slice(seed_record.as_bytes());
+    }
+    std::fs::write(&lifecycle_log, seed_log).expect("seed oversized lifecycle log");
+
+    let response = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["previous_server_cleanup_record"]["session_id"], session_id,
+        "{response}"
+    );
+    assert!(
+        std::fs::metadata(&lifecycle_log)
+            .expect("read capped lifecycle log metadata")
+            .len()
+            <= u64::try_from(SESSION_LIFECYCLE_LOG_MAX_BYTES).expect("lifecycle cap fits u64"),
+        "session-lifecycle.jsonl exceeded its cap"
+    );
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
 
 fn child_compositor(server: u32) -> i32 {
@@ -3879,10 +5421,10 @@ fn copy_source(source: &std::path::Path, target: &std::path::Path) {
 }
 
 fn session_handle(response: &Value) -> String {
-    response["result"]["structuredContent"]["session_id"]
-        .as_str()
-        .expect("session id")
-        .to_owned()
+    let Some(session_id) = response["result"]["structuredContent"]["session_id"].as_str() else {
+        panic!("session_start did not return a session ID: {response}");
+    };
+    session_id.to_owned()
 }
 fn save_session_image(client: &mut RpcClient, request: u64, session: &str, name: &str) {
     use base64::Engine;
@@ -4311,9 +5853,37 @@ fn check_reexecution(source_reload: bool) {
 #[ignore = "requires private KWin sessions, bubblewrap, and input devices"]
 fn transport_eof_cleans_every_owned_session() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
-    let mut client = RpcClient::start();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-eof-state-{nonce}"));
+    let lifecycle_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&lifecycle_dir).expect("create shared lifecycle state");
+    let lifecycle_log = lifecycle_dir.join("session-lifecycle.jsonl");
+    let seed_record = format!(
+        "{}\n",
+        json!({
+            "session_id": "s1-1",
+            "server_pid": 1,
+            "state": "shutdown_cleanup_finished",
+            "reason": "server_shutdown",
+            "finished_at_unix_seconds": 1,
+            "workdir_cleanup": "removed",
+        })
+    );
+    let mut seed_log = Vec::new();
+    while seed_log.len() <= SESSION_LIFECYCLE_LOG_MAX_BYTES {
+        seed_log.extend_from_slice(seed_record.as_bytes());
+    }
+    std::fs::write(&lifecycle_log, seed_log).expect("seed bounded lifecycle log");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let mut directories = Vec::new();
+    let mut sessions = Vec::new();
     for request in [2, 3] {
         let response = call_tool(
             &mut client,
@@ -4324,6 +5894,12 @@ fn transport_eof_cleans_every_owned_session() {
         assert_eq!(
             response["result"]["structuredContent"]["status"], "started",
             "{response}"
+        );
+        sessions.push(
+            response["result"]["structuredContent"]["session_id"]
+                .as_str()
+                .expect("session ID")
+                .to_owned(),
         );
         directories.push(workdir(&response));
     }
@@ -4343,6 +5919,45 @@ fn transport_eof_cleans_every_owned_session() {
             directory.display()
         );
     }
+    assert!(
+        std::fs::metadata(&lifecycle_log)
+            .expect("read bounded lifecycle log metadata")
+            .len()
+            <= u64::try_from(SESSION_LIFECYCLE_LOG_MAX_BYTES).expect("lifecycle cap fits u64"),
+        "session-lifecycle.jsonl exceeded its cap"
+    );
+    let mut replacement = RpcClient::start_with_env(&extra_env);
+    initialize(&mut replacement);
+    for (index, session_id) in sessions.iter().enumerate() {
+        let request = 2 + u64::try_from(index).expect("index");
+        let unavailable = call_tool(
+            &mut replacement,
+            request,
+            "window_list",
+            json!({"session_id":session_id}),
+        );
+        assert_eq!(
+            unavailable["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+            "{unavailable}"
+        );
+        let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
+        assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
+        assert_eq!(record["reason"], "server_shutdown", "{record}");
+        assert_eq!(
+            record["session_id"].as_str(),
+            Some(session_id.as_str()),
+            "{record}"
+        );
+        assert_eq!(record["workdir_cleanup"], "removed", "{record}");
+        assert!(
+            unavailable["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("shutdown cleanup finished")),
+            "{unavailable}"
+        );
+    }
+    replacement.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove shared lifecycle state");
 }
 
 #[test]
@@ -5325,7 +6940,10 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "{ready}"
     );
     let log = std::fs::read_to_string(path.join("viewer.log")).expect("viewer log");
-    assert!(log.contains("first frame presented"), "{log}");
+    assert!(
+        log.contains("first frame submitted for presentation"),
+        "{log}"
+    );
     thread::sleep(Duration::from_millis(400));
     save_session_image(&mut desktop, 3, &host_id, "viewer-recovered.png");
     let reused = call_tool(&mut client, 7, "viewer_open", json!({"session_id":session}));

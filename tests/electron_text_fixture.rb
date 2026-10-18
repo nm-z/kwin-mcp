@@ -11,9 +11,17 @@ require 'timeout'
 module ElectronTextFixture
   HTML = <<~HTML.freeze
     <!doctype html><html><head><title>Input delivery fixture</title>
-    <style>body{font:20px sans-serif;padding:28px}.entry{display:block;width:90%;height:440px;font:18px monospace;white-space:pre-wrap;border:2px solid;padding:12px}</style>
+    <style>body{font:20px sans-serif;padding:16px}h1{margin:0 0 8px}.entry{display:block;width:90%;height:180px;font:18px monospace;white-space:pre-wrap;border:2px solid;padding:12px}.entry.rich{height:60px}.entry.nested{height:50px}.embedded-editor{display:block;width:100%;height:40px;padding:8px;border:1px solid #888}.opaque-object{display:block;width:100%;height:16px;background:#ddd}.protected-entry{display:block;width:90%;height:44px;font:18px monospace;border:2px solid;padding:8px}</style>
     </head><body><h1>Private Electron input delivery</h1>
     <label>Do anything</label><div class="entry" role="textbox" aria-label="Do anything" contenteditable="true" tabindex="0" autofocus spellcheck="false"></div>
+    <!-- The matching note is stale; keyboard input goes into the hidden embedded editor. -->
+    <label>Stale descendant rich text</label><div class="entry rich" role="textbox" aria-label="Stale descendant rich text" contenteditable="true" tabindex="0" spellcheck="false"><div class="embedded-editor" contenteditable="true" tabindex="0" aria-hidden="true"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div><span class="opaque-object" role="img" aria-label="Opaque embedded object" contenteditable="false"></span><span role="note" contenteditable="false">Stale descendant delivery probe</span></div>
+    <label>Rich contenteditable</label><div class="entry rich" role="textbox" aria-label="Rich contenteditable" contenteditable="true" tabindex="0" spellcheck="false"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div>
+    <!-- The focused parent exposes an embedded-object character; child text exposes the value. -->
+    <label>Nested rich contenteditable</label><div class="entry rich nested" role="textbox" aria-label="Nested rich contenteditable" contenteditable="true" tabindex="0" spellcheck="false"><div class="embedded-editor" role="textbox" aria-label="Embedded rich text" contenteditable="true" tabindex="0"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div></div>
+    <label>Unverified password field</label><input class="protected-entry" type="password" aria-label="Unverified password field" autocomplete="off" tabindex="0">
+    <!-- The embedded editor accepts input but is hidden from AT-SPI; the graphic keeps the parent at U+FFFC. -->
+    <label>Unverified embedded rich text</label><div class="entry rich" role="textbox" aria-label="Unverified embedded rich text" contenteditable="true" tabindex="0" spellcheck="false"><div class="embedded-editor" contenteditable="true" tabindex="0" aria-hidden="true"><span style="font-weight:700">seed </span><span style="font-style:italic">text</span></div><span class="opaque-object" role="img" aria-label="Opaque embedded object" contenteditable="false"></span></div>
     </body></html>
   HTML
 

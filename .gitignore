@@ -1,4 +1,5 @@
 target/
+tests/evidence/
 .build_number
 backup-initial-commit.zip
 .worktrees
