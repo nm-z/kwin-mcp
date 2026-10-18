@@ -4110,7 +4110,8 @@ fn launch_app_reports_existing_chrome_window_after_url_handoff() {
         "{focused_school}"
     );
 
-    let same_title_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, another tab'";
+    // Multiple URLs can be forwarded without a new window or a changed title.
+    let same_title_command = "google-chrome-stable --profile-directory=Default --user-data-dir=\"$HOME/.local/share/kwin-mcp-e2e-profile-handoff\" --no-first-run 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, another tab' 'data:text/html,<title>kwin-mcp-handoff-after</title>Same title, second tab'";
     let ambiguous = call_tool(
         &mut client,
         7,

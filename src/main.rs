@@ -8092,9 +8092,9 @@ async fn poll_launch_window(
             if let Some(active) = windows.iter().find(|window| window.active)
                 && previous.as_deref() != Some(&active.id)
             {
-                let reused = previous_windows.as_ref().is_some_and(|before| {
-                    before.iter().any(|window| window.id == active.id)
-                });
+                let reused = previous_windows
+                    .as_ref()
+                    .is_some_and(|before| before.iter().any(|window| window.id == active.id));
                 let current = (active.id.clone(), active.title.clone());
                 if !reused {
                     return Ok(Some(LaunchWindow {
@@ -8115,9 +8115,9 @@ async fn poll_launch_window(
         } else if let Ok((_, _, geometry)) = active_window_info(&conn, &kwin_unique, &xdg).await
             && previous.as_deref() != Some(&geometry.id)
         {
-            let reused = previous_windows.as_ref().is_some_and(|before| {
-                before.iter().any(|window| window.id == geometry.id)
-            });
+            let reused = previous_windows
+                .as_ref()
+                .is_some_and(|before| before.iter().any(|window| window.id == geometry.id));
             let current = (geometry.id.clone(), geometry.title.clone());
             if !reused {
                 return Ok(Some(LaunchWindow {
@@ -11793,14 +11793,14 @@ impl KwinMcp {
             })
             .await
             {
-            Ok(result) => result,
-            Err(_) => {
-                let progress = progress
-                    .lock()
-                    .map_err(|_| McpError::internal_error("launch progress lock poisoned", None))?;
-                return Err(launch_timeout(&progress, LAUNCH_PRECHECK_TIMEOUT));
-            }
-        };
+                Ok(result) => result,
+                Err(_) => {
+                    let progress = progress.lock().map_err(|_| {
+                        McpError::internal_error("launch progress lock poisoned", None)
+                    })?;
+                    return Err(launch_timeout(&progress, LAUNCH_PRECHECK_TIMEOUT));
+                }
+            };
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
