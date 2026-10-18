@@ -1032,6 +1032,7 @@ pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    blank_line_replacement: Option<String>,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
 }
@@ -1201,10 +1202,13 @@ impl TextReceipt {
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
+        // Chrome can retain Focused on page editors after Ctrl+L; visit its
+        // toolbar before web content so the address bar wins that stale state.
+        let prefer_chrome_toolbar_focus = title.to_ascii_lowercase().contains("google chrome");
         let mut visited = 0;
         let mut focus = None;
-        for app in root.get_children().await? {
-            let app = app.as_accessible_proxy(&bus).await?;
+        for app_object in root.get_children().await? {
+            let app = app_object.as_accessible_proxy(&bus).await?;
             for frame in app.get_children().await? {
                 let frame = frame.as_accessible_proxy(&bus).await?;
                 let name = frame.name().await.unwrap_or_default();
@@ -1230,6 +1234,9 @@ impl TextReceipt {
                     continue;
                 }
                 let mut stack = frame.get_children().await?;
+                if prefer_chrome_toolbar_focus {
+                    stack.reverse();
+                }
                 while let Some(object) = stack.pop() {
                     visited += 1;
                     if visited > TEXT_DISCOVERY_MAX_NODES {
@@ -1275,6 +1282,7 @@ impl TextReceipt {
                             anyhow::bail!("focused field exceeds the text snapshot limit");
                         }
                         let before = text.get_text(0, -1).await?;
+                        let initial_blank_line = before == "\n";
                         if before.chars().count() != usize::try_from(count)? {
                             anyhow::bail!(
                                 "focused field character offsets do not match its text snapshot"
@@ -1308,6 +1316,13 @@ impl TextReceipt {
                             .chain(input.chars())
                             .chain(before.chars().skip(end))
                             .collect();
+                        // An emptied contenteditable can expose a synthetic newline
+                        // which the application removes when typing starts. Keep
+                        // the exact expectation, but distinguish this observable
+                        // transformation from missing or delayed input.
+                        let blank_line_replacement =
+                            (initial_blank_line && start == end && !input.is_empty())
+                                .then(|| input.to_owned());
                         let (initial_descendant_snapshot, initial_descendant_snapshot_error) =
                             match descendant_text_snapshot(&object, &bus).await {
                                 Ok(snapshot) => (Some(snapshot), None),
@@ -1319,11 +1334,16 @@ impl TextReceipt {
                             bus: bus.clone(),
                             object,
                             expected,
+                            blank_line_replacement,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
                         });
                     }
-                    stack.extend(node.get_children().await?);
+                    let mut children = node.get_children().await?;
+                    if prefer_chrome_toolbar_focus {
+                        children.reverse();
+                    }
+                    stack.extend(children);
                 }
             }
         }
@@ -1357,6 +1377,13 @@ impl TextReceipt {
                 observed_count = Some(observed.chars().count());
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
+                }
+                if self
+                    .blank_line_replacement
+                    .as_ref()
+                    .is_some_and(|replacement| replacement == &normalized_observed)
+                {
+                    return Ok("atspi_transformed_blank_line");
                 }
                 has_embedded_object |= observed.contains(EMBEDDED_OBJECT_CHARACTER);
                 if poll_count == 0 || poll_count % 5 == 4 {
@@ -1397,6 +1424,16 @@ impl TextReceipt {
             }
         };
         match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
+            Ok(Ok(method @ "atspi_transformed_blank_line")) => TextDelivery {
+                status: "unverified",
+                method,
+                compositor_acknowledged: true,
+                expected_field_characters: Some(expected_count),
+                observed_field_characters: observed_count,
+                warning: Some(
+                    "KWin acknowledged all keys and the complete field matches the requested text, but the application replaced its initial blank line. The blank line may have been an empty-editor placeholder; its preservation could not be verified. Inspect the field before sending or retrying; do not retype blindly.".to_owned(),
+                ),
+            },
             Ok(Ok(method)) => TextDelivery {
                 status: "verified",
                 method,
