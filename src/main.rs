@@ -3175,6 +3175,26 @@ async fn wait_for_sandbox_path(
     }
 }
 
+async fn wait_for_socket(
+    path: &std::path::Path,
+    description: &str,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{description} did not appear at {} within {}s",
+                path.display(),
+                STARTUP_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+}
+
 fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
     use std::io::Read;
     const DIAGNOSTIC_LIMIT: u64 = 16 * 1024;
