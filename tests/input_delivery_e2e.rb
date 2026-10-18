@@ -8,6 +8,8 @@ require 'fileutils'
 require_relative 'electron_text_fixture'
 
 class InputDeliveryProbe
+  class TerminalFocusTimeout < StandardError; end
+
   def initialize(server, artifacts)
     @artifacts = artifacts
     @baseline = ENV['KWIN_MCP_E2E_BASELINE'] == '1'
@@ -81,8 +83,8 @@ class InputDeliveryProbe
     data
   end
 
-  def tree
-    response = call('accessibility_tree')
+  def tree(arguments = {})
+    response = call('accessibility_tree', arguments)
     assert_success(response)
     response.fetch('result').fetch('content').filter_map { |block| block['text'] }.join("\n")
   end
@@ -249,19 +251,58 @@ class InputDeliveryProbe
   end
 
   def terminal
-    assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
+    launched = assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
+    wait_for_terminal(launched.fetch('window'))
     command = 'printf %s terminal-paced-proof > "$HOME/km-input-terminal-proof"'
     data = assert_success(call('keyboard_type', text: command))
     delivery = data.fetch('delivery')
     raise "terminal falsely reported app-text verification: #{delivery}" unless delivery['status'] == 'unverified'
     raise 'terminal compositor not acknowledged' unless delivery['compositor_acknowledged']
-    raise 'terminal suggested blind retry' unless data['retry_safe'] == false
-    raise 'terminal lost submitted character count' unless data['submitted_characters'] == command.length
+    raise "terminal omitted completed submission" unless data["submission_complete"]
+    raise "terminal suggested blind retry" unless data["retry_safe"] == false
+    raise "terminal lost submitted character count" unless data["submitted_characters"] == command.length
+    raise "terminal exposed text character counts" unless delivery["expected_field_characters"].nil? && delivery["observed_field_characters"].nil?
     assert_success(call('keyboard_key', key: 'Return'))
     destination = File.join(@artifacts, 'terminal-proof.txt')
     assert_success(call('export_file', session_path: "#{@home}/km-input-terminal-proof", host_path: destination))
     raise 'terminal command was truncated or changed' unless File.read(destination) == 'terminal-paced-proof'
     screen('terminal-after-return')
+  end
+
+  def terminal_blocked
+    launched = assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
+    assert_success(call('launch_app', command: 'kdialog --title "Terminal focus blocker" --msgbox "Leave the terminal probe blocked"'))
+    begin
+      wait_for_terminal(launched.fetch('window'), wait_seconds: 1)
+    rescue TerminalFocusTimeout
+      return
+    end
+    raise 'terminal preflight accepted a covering dialog'
+  end
+
+  def wait_for_terminal(window_id, wait_seconds: 15)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait_seconds
+    loop do
+      windows = assert_success(call('window_list')).fetch('windows')
+      # Konsole's terminal is unnamed and is omitted by the default tree filter.
+      visible = tree(app_name: 'konsole', role: 'terminal', show_elements: true)
+      File.write(File.join(@artifacts, 'terminal-focus.tree.txt'), visible)
+      File.write(File.join(@artifacts, 'terminal-focus.windows.json'), JSON.pretty_generate(windows))
+      focused = visible.lines.any? do |line|
+        role, _name, states = line.strip.split("\t", -1)
+        role == 'terminal' && %w[focused visible].all? { |state| states.to_s.split('|').include?(state) }
+      end
+      active = windows.any? { |window| window['id'] == window_id && window['active'] && !window['dialog'] }
+      if active && focused
+        screen('terminal-before-typing')
+        return
+      end
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        screen('terminal-focus-timeout')
+        raise TerminalFocusTimeout, 'Konsole did not expose a focused terminal in its active window; no shell input sent (see terminal-focus artifacts)'
+      end
+      sleep 0.2
+    end
   end
 
   def unverified_password_field
