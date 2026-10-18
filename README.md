@@ -522,6 +522,13 @@ operations. If an operation is blocked in the kernel, cleanup retains ownership
 until that operation returns; it then stops preparation and removes the owned
 storage. Do not remove that storage manually while the operation still uses it.
 
+When sandbox startup fails, the response preserves available sandbox stderr
+before autoclean removes its log. Long logs include only a bounded tail and a
+truncation flag. The D-Bus readiness marker is published only after its socket
+exists; a sandbox that exits before a startup signal reports its exit status.
+Run `ruby tests/startup_diagnostics_e2e.rb SERVER EVIDENCE` to exercise real
+D-Bus failures, noisy diagnostics, normal KWin startup, and cleanup.
+
 Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
 regression. It uses synthetic private profiles, a controlled blocked Preferences
 read, terminal launch, and a delayed real sandbox to verify profile isolation,

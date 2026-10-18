@@ -3143,12 +3143,24 @@ impl Eis {
     }
 }
 
-async fn wait_for_socket(
+async fn wait_for_sandbox_path(
     path: &std::path::Path,
     description: &str,
     deadline: std::time::Instant,
+    sandbox: &mut Option<std::process::Child>,
 ) -> Result<(), String> {
+    let child = sandbox
+        .as_mut()
+        .ok_or_else(|| format!("startup sandbox process is unavailable before {description}"))?;
     loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("check startup sandbox before {description}: {error}"))?
+        {
+            return Err(format!(
+                "startup sandbox exited with {status} before {description}"
+            ));
+        }
         if path.exists() {
             return Ok(());
         }
@@ -3199,6 +3211,68 @@ fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
             stderr_path.display()
         ),
     }
+}
+
+fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> McpError {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    const DIAGNOSTIC_LIMIT: u64 = 16 * 1024;
+
+    let path = session_disk_path(workdir).join("sandbox.log");
+    let diagnostic = (|| -> std::io::Result<(String, bool)> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sandbox stderr is not a regular file",
+            ));
+        }
+        let length = metadata.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(DIAGNOSTIC_LIMIT)))?;
+        let mut bytes = Vec::new();
+        file.take(DIAGNOSTIC_LIMIT).read_to_end(&mut bytes)?;
+        Ok((
+            String::from_utf8_lossy(&bytes).into_owned(),
+            length > DIAGNOSTIC_LIMIT,
+        ))
+    })();
+    let (tail, truncated) = match diagnostic {
+        Ok(diagnostic) => diagnostic,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return error,
+        Err(source) => {
+            error.message = format!(
+                "{}; could not read sandbox stderr before cleanup: {source}",
+                error.message
+            )
+            .into();
+            return error;
+        }
+    };
+    error.message = if tail.trim().is_empty() {
+        format!("{}; sandbox stderr was empty before cleanup", error.message)
+    } else {
+        format!(
+            "{}; sandbox stderr{}: {}",
+            error.message,
+            if truncated { " (truncated tail)" } else { "" },
+            tail.trim()
+        )
+    }
+    .into();
+    let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(data) = data.as_object_mut() {
+        data.insert("sandbox_stderr_tail".to_owned(), serde_json::json!(tail));
+        data.insert(
+            "sandbox_stderr_truncated".to_owned(),
+            serde_json::json!(truncated),
+        );
+        data.insert("sandbox_stderr_path".to_owned(), serde_json::json!(path));
+    }
+    error
 }
 
 async fn wait_for_wallet_bus(
@@ -5580,6 +5654,14 @@ impl KwinMcp {
         if self.session.read().await.is_some() {
             return error;
         }
+        // Process guards have stopped startup children, but the owned disk
+        // twin still exists here. Keep bounded diagnostics in the response
+        // before autoclean removes the only copy of their stderr.
+        let error = if self.workdir.owned().is_some() {
+            preserve_startup_sandbox_diagnostics(error, &self.path)
+        } else {
+            error
+        };
         match self.workdir.remove() {
             WorkdirCleanup::NothingOwned => error,
             WorkdirCleanup::Removed(dir) => {
@@ -9423,6 +9505,7 @@ impl KwinMcp {
             dbus-daemon --config-file=/tmp/mcp-dbus.conf --address='unix:path={xdg_dir_str}/bus' --nofork &\n\
             dbus_pid=$!\n\
             n=0; while [ ! -S '{xdg_dir_str}/bus' ] && kill -0 \"$dbus_pid\" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            test -S '{xdg_dir_str}/bus' || {{ echo 'container D-Bus daemon did not create its socket' >&2; exit 1; }}\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
@@ -9943,10 +10026,11 @@ impl KwinMcp {
         // Wait for dbus-ready marker (entrypoint touches it after dbus-daemon starts)
         let dbus_ready_path = host_xdg_dir.join("dbus-ready");
         self.set_start_stage("waiting for the container D-Bus daemon");
-        if let Err(e) = wait_for_socket(
+        if let Err(e) = wait_for_sandbox_path(
             &dbus_ready_path,
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
+            &mut startup.sandbox_child,
         )
         .await
         {
@@ -10013,10 +10097,11 @@ impl KwinMcp {
         // Wait for KWin's wayland-0 socket to appear (proves KWin is running)
         let wayland_socket = host_xdg_dir.join("wayland-0");
         self.set_start_stage("waiting for KWin's Wayland socket");
-        if let Err(e) = wait_for_socket(
+        if let Err(e) = wait_for_sandbox_path(
             &wayland_socket,
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
+            &mut startup.sandbox_child,
         )
         .await
         {
