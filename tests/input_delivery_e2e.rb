@@ -9,6 +9,13 @@ require_relative 'electron_text_fixture'
 
 class InputDeliveryProbe
   class TerminalFocusTimeout < StandardError; end
+  LONG_COMMENT_HTML = <<~HTML.freeze
+      <!doctype html><title>Long comment timing</title>
+      <style>body{font:20px sans-serif;margin:20px}textarea{width:95%;height:500px;font:18px monospace}</style>
+      <h1>Long comment timing</h1><label for="comment">Comment</label>
+      <textarea id="comment" aria-label="Comment" autofocus spellcheck="false"></textarea>
+  HTML
+
 
   def initialize(server, artifacts)
     @artifacts = artifacts
@@ -87,6 +94,34 @@ class InputDeliveryProbe
     response = call('accessibility_tree', arguments)
     assert_success(response)
     response.fetch('result').fetch('content').filter_map { |block| block['text'] }.join("\n")
+  end
+
+  def long_comment
+    fixture = File.join(@home, 'long-comment.html')
+    assert_success(call('launch_app', command: "google-chrome-stable --no-first-run --no-default-browser-check --new-window --force-renderer-accessibility 'file://#{fixture}'"))
+    visible = tree
+    File.write(File.join(@artifacts, 'comment-before.tree.txt'), visible)
+    match = visible.match(/entry\tComment\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'comment field bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('comment-before').fetch('window')
+    assert_success(call('mouse_click', x: x + width/2 - window.fetch('x'), y: y + height/2 - window.fetch('y')))
+    text = ("Routine comment typing probe: letters AaZz digits 0123456789. " * 20)[0,900]
+    began = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    result = assert_success(call('keyboard_type', text: text, speed: 4))
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - began
+    raise "900-character accelerated typing exceeded 60 seconds: #{elapsed}" unless elapsed < 60
+    raise "typing did not complete safely: #{result}" unless result['submission_complete'] && result['retry_safe'] == false
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    assert_success(call('keyboard_key', key: 'ctrl+c'))
+    observed = assert_success(call('clipboard_read')).fetch('text')
+    File.write(File.join(@artifacts, 'comment-expected.txt'), text)
+    File.write(File.join(@artifacts, 'comment-observed.txt'), observed)
+    raise 'independently copied comment differs' unless observed == text
+    screen('comment-after')
+    proof = {characters:text.length,speed:4,elapsed_seconds:elapsed,delivery:result['delivery'],independent_clipboard_match:true}
+    File.write(File.join(@artifacts, 'comment-timing.json'), JSON.pretty_generate(proof))
+    puts JSON.generate(proof)
   end
 
   def electron
@@ -363,8 +398,12 @@ server = ENV.fetch('KWIN_MCP_E2E_SERVER')
 artifacts = File.expand_path(ENV.fetch('KWIN_MCP_TEST_ARTIFACT_DIR'))
 probe = nil
 begin
-  probe = InputDeliveryProbe.new(server, artifacts)
   modes = ARGV.empty? ? %w[electron terminal] : ARGV
+  if modes.include?('long_comment')
+    FileUtils.mkdir_p(File.join(artifacts, 'home'))
+    File.write(File.join(artifacts, 'home', 'long-comment.html'), InputDeliveryProbe::LONG_COMMENT_HTML)
+  end
+  probe = InputDeliveryProbe.new(server, artifacts)
   modes.each { |mode| probe.public_send(mode) }
   puts "PASS: #{modes.join(', ')}; evidence #{artifacts}"
 ensure

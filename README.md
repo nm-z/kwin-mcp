@@ -271,7 +271,16 @@ cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 
 Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
 (default `1.0`). `keyboard_type` defaults to approximately 100 WPM; `speed: 2`
-requests approximately twice that rate. Mouse tools also accept `target_width`,
+requests approximately twice that rate. A 900-character comment can therefore
+need roughly two minutes at the default rate. For a longer comment, pass a
+larger multiplier such as `keyboard_type({"text":"...","speed":4})`. On engi, a real
+900-character Chrome textarea probe completed in 28.63 seconds at that rate
+and independently copied back the exact text. Inspect the delivery result and
+the field before submitting. Run the synthetic probe with
+`ruby tests/input_delivery_e2e.rb long_comment` using the server/artifact
+variables documented in [the input-delivery tests](tests/input_delivery_e2e.md).
+Mouse tools also accept `target_width`,
+
 the smaller target dimension in pixels (default `20`), for movement timing.
 
 Pointer movement uses sampled Fitts-law durations, minimum-jerk progress,
@@ -333,6 +342,59 @@ Sessions run concurrently. Input requests retain arrival order within a desktop,
 The server watches `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and its executable. A source change triggers a rebuild. A rebuilt executable replaces the server in place while preserving its PID, client pipes, and live desktops. The client receives `notifications/tools/list_changed`. Build diagnostics are in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/build.log`. Set `KWIN_MCP_REPO` when the source is elsewhere.
 
 ## Setup
+
+### Install the Rust executables
+
+Build this checkout, then install its server and viewer together:
+
+```bash
+cargo build --release --bins
+bash scripts/install.sh
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+The installer requires Bash, GNU coreutils, and `jq`. It defaults to `~/.local/bin`
+and checks that the source server prints help, valid MCP schemas, and identical
+`--version` / `-V` identities before installing either executable. Both version
+flags must print one line with the Rust package version, build number, and Git
+commit, such as `kwin-mcp v0.1.2.651 (a34524a)`. Installation reports this identity
+along with the selected PATH executable. Use `--bin-dir DIR` for a different
+destination, or `--source-dir DIR` for a different build output directory.
+Put the destination first in `PATH`. If another directory still supplies the
+`kwin-mcp` command, installation reports an actionable error after copying the
+executables; use their absolute paths or fix `PATH` and clear the shell command cache.
+
+An existing destination requires explicit replacement:
+
+```bash
+type -a kwin-mcp
+bash scripts/install.sh --replace
+hash -r
+kwin-mcp --version
+kwin-mcp --help
+kwin-mcp --describe
+```
+
+`--replace` replaces the destination file or symlink itself. It preserves the
+target of an old symlink, including a uv-managed console script. The separately
+published Python/PyPI package also named `kwin-mcp` belongs to
+[isac322/kwin-mcp](https://github.com/isac322/kwin-mcp); `uv tool install kwin-mcp`
+does not install this Rust server. If `--version`, `--help`, or `--describe`
+succeeds with empty output, inspect `type -a kwin-mcp` for that conflicting
+command and install the Rust executables with the steps above. If you no longer need the Python
+tool, run `uv tool uninstall kwin-mcp` before installing the Rust executables.
+To keep both projects, use separate installation directories and absolute
+commands: uv can recreate or remove its console entry point during later package
+operations. Configure MCP clients with the absolute installed Rust path, such
+as `~/.local/bin/kwin-mcp` expanded to your home directory.
+
+To check installation behavior against built artifacts without changing your
+real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
+It installs into temporary directories and exercises help, schemas, and both
+version flags through `PATH`, including rejection of silent version entrypoints.
 
 ### Host runtime environment
 
