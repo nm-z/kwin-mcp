@@ -673,7 +673,124 @@ fn autoclean_sweeps_only_a_crashed_owned_session() {
 }
 
 #[test]
-#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Python, input devices, and a live GPU session"]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, input devices, and a live GPU session"]
+fn session_reaches_host_loopback_listener_on_ephemeral_port() {
+    check_host_loopback_listener(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("host ephemeral listener"),
+    );
+}
+
+#[test]
+#[ignore = "requires private KWin, pasta, Konsole, and input devices"]
+fn session_still_reaches_host_listener_below_the_ephemeral_range() {
+    let range =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").expect("host port range");
+    let start: u16 = range
+        .split_whitespace()
+        .next()
+        .expect("range start")
+        .parse()
+        .expect("port");
+    let listener = (1024..start)
+        .rev()
+        .find_map(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok())
+        .expect("available non-ephemeral host listener");
+    check_host_loopback_listener(listener);
+}
+
+fn check_host_loopback_listener(listener: std::net::TcpListener) {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let port = listener.local_addr().expect("host listener address").port();
+    eprintln!("host loopback proof port={port}");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "session_start failed: {started}"
+    );
+    let session_id = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session_start returned a session ID")
+        .to_owned();
+
+    listener
+        .set_nonblocking(true)
+        .expect("make listener nonblocking");
+    let host_request = thread::spawn(move || -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| error.to_string())?;
+                    let mut request = String::new();
+                    BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
+                        .read_line(&mut request)
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    return Ok(request);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("host loopback listener received no request".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    });
+
+    let command = format!(
+        "konsole -e bash -lc 'curl --noproxy \"*\" --fail --silent --show-error --connect-timeout 2 --max-time 4 http://127.0.0.1:{port}/probe; sleep 3'"
+    );
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":command}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "launch_app failed: {launched}"
+    );
+    let request = host_request
+        .join()
+        .expect("host listener thread")
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(request, "GET /probe HTTP/1.1\r\n");
+
+    let stopped = call_tool(
+        &mut client,
+        4,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "session_stop failed: {stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Ruby, input devices, and a live GPU session"]
 fn concurrent_sessions_bind_same_private_loopback_port() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
@@ -686,6 +803,9 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
         .local_addr()
         .expect("host listener address")
         .port();
+    // Keep this as a free port so pasta does not forward a host listener that
+    // would occupy the same loopback port inside each session.
+    drop(host_listener);
     let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("read host name");
     let mut sessions = Vec::new();
     for _ in 0..2 {
@@ -717,7 +837,7 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
         );
         let dir = workdir(&started);
         let command = format!(
-            "konsole -e bash -lc 'python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & listener=$!; sleep 1; if kill -0 \"$listener\" 2>/dev/null; then hostname > \"$XDG_RUNTIME_DIR/loopback-ready\"; fi; wait \"$listener\"'"
+            "konsole -e ruby -rsocket -e 'server = TCPServer.new(\"127.0.0.1\", {port}); File.write(File.join(ENV.fetch(\"XDG_RUNTIME_DIR\"), \"loopback-ready\"), Socket.gethostname); loop {{ server.accept.close }}'"
         );
         let launched = call_tool(&mut client, 3, "launch_app", json!({"command":command}));
         assert!(
@@ -746,7 +866,6 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
             "sandbox hostname changed"
         );
     }
-    drop(host_listener);
     for (mut client, dir) in sessions {
         let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
         assert!(
@@ -6051,9 +6170,15 @@ fn prior_manual_stop_and_ttl_expiry_report_terminal_session_status() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let stopped_pid = server_pid.saturating_add(1);
-    let expired_pid = server_pid.saturating_add(2);
+    // Adjacent OS PIDs can belong to concurrent real test servers. Their
+    // control sockets would forward these synthetic IDs outside this fixture.
+    let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .expect("kernel PID limit")
+        .trim()
+        .parse()
+        .expect("PID limit");
+    let stopped_pid = pid_max.checked_add(1).expect("synthetic stopped PID");
+    let expired_pid = pid_max.checked_add(2).expect("synthetic expired PID");
     let stopped_id = format!("s{stopped_pid}-1");
     let expired_id = format!("s{expired_pid}-1");
     let records = [
