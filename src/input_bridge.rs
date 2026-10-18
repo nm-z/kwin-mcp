@@ -1060,8 +1060,9 @@ impl std::fmt::Display for FocusNotEditable {
 impl std::error::Error for FocusNotEditable {}
 
 impl TextDelivery {
-    /// Focus was on a control that is not editable text before and after the
-    /// keys were sent, so no field received the text.
+    /// No characters were submitted, and focus is on a control that is not
+    /// editable text. Non-editable focus alone cannot prove sent keys missed
+    /// the active application.
     pub fn not_in_field(focus: &FocusNotEditable) -> Self {
         Self {
             status: "not_in_field",
@@ -1184,6 +1185,18 @@ impl TextReceipt {
                     }
                     let node = object.as_accessible_proxy(&bus).await?;
                     let states = node.get_state().await?;
+                    // Konsole's focused terminal does not report Editable. Its
+                    // hidden plugin widgets can also report Focused/Showing,
+                    // so recognizing the terminal must precede the noneditable
+                    // fallback: those widgets do not prove shell input missed.
+                    if states.contains(atspi::State::Focused)
+                        && states.contains(atspi::State::Showing)
+                        && node.get_role().await? == atspi::Role::Terminal
+                    {
+                        anyhow::bail!(
+                            "the focused control is a terminal, not an inspectable editable field"
+                        );
+                    }
                     if focus.is_none()
                         && states.contains(atspi::State::Focused)
                         && states.contains(atspi::State::Showing)

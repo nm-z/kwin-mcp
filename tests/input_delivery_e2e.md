@@ -1,48 +1,71 @@
-# Input delivery regressions
+# Input delivery receipt probe
 
-Build the production server, then run the Ruby probe against that private binary:
+Run on a KDE desktop host with KWin, bubblewrap, pasta, input devices and Konsole.
+Build the production server separately, then give each run a fresh artifact
+directory. The probe creates an empty private HOME and stops its owned session
+in `ensure`; no host browser profile is used.
+
+```bash
+KWIN_MCP_E2E_SERVER="$PWD/target/debug/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/terminal" \
+ruby tests/input_delivery_e2e.rb terminal
+```
+
+The terminal mode waits up to 15 seconds for the launched Konsole window to be
+active and for a terminal to report focus and visibility through AT-SPI. It
+requests unnamed elements explicitly: Konsole's terminal has no accessible
+name. An unexpected dialog or missing focus ends the probe before shell input,
+with the last window inventory, terminal tree and screenshot in the artifact
+directory.
+
+After typing the synthetic command, the probe requires an `unverified` receipt,
+compositor acknowledgement, complete submission, no application text counts and
+`retry_safe: false`. It then sends Return and independently exports the command's
+output file, checking its exact contents.
+
+Konsole can expose focused list items under its hidden SSH Manager panel,
+including “Don't Change”, while its actual terminal also reports focus. This
+does not establish a first-run dialog. The terminal does not report `Editable`,
+so receipt discovery must recognize its role independently of that state.
+
+To verify that a real covering dialog prevents the preflight from proceeding,
+run this separate mode (also requires `kdialog`):
+
+```bash
+KWIN_MCP_E2E_SERVER="$PWD/target/debug/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/terminal-blocked" \
+ruby tests/input_delivery_e2e.rb terminal_blocked
+```
+
+This mode opens a synthetic message dialog and expects the focus wait to time
+out without any `keyboard_type` or `keyboard_key` call. Both modes log their
+production stdio requests and responses in `rpc.jsonl`.
+
+## Cleared composer after Delete (#288)
+
+Build the production server, then run this mode in a new artifact directory:
 
 ```bash
 cargo build --release --bin kwin-mcp
 KWIN_MCP_E2E_SERVER="$PWD/target/release/kwin-mcp" \
-  KWIN_MCP_TEST_ARTIFACT_DIR=/tmp/input-delivery-evidence \
-  ruby tests/input_delivery_e2e.rb clear_retype
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/clear-retype" \
+ruby tests/input_delivery_e2e.rb clear_retype
 ```
 
-This mode covers [issue #288](https://github.com/nm-z/kwin-mcp/issues/288) through
-production MCP stdio in a fresh 1920×1080 isolated desktop. It starts the actual
-ChatGPT Electron executable with a private profile and installs a static,
-synthetic document with CDP. It does not sign in or use a host browser session.
-KDE, KWin, bubblewrap, input devices, and `/usr/lib/chatgpt/ChatGPT` are required.
+The mode starts an isolated 1920×1080 desktop, launches the ChatGPT Electron
+executable with a private profile, and installs a static synthetic document with
+CDP. It clicks the composer, types 250 ASCII characters, captures immediately,
+then copies and checks the exact field text through the session clipboard. It
+clears with Ctrl+A/Delete, captures the empty composer, retypes the same text,
+and repeats the checks. The clipboard sentinel prevents an old selection from
+passing a new copy check. A separate textarea case types after a real Return and
+verifies that its leading newline is retained.
 
-The probe clicks the composer, types 250 ASCII characters, and immediately calls
-`screenshot` before any accessibility read or sleep. It repeats capture in a
-cropped region, copies the field through Ctrl+A/Ctrl+C, and requires
-byte-identical text from the session clipboard. A sentinel replaces
-the clipboard before each copy, so a stale value from the previous round cannot
-pass. The typing receipt must also report complete submission, compositor
-acknowledgement, and `retry_safe=false`.
-
-It then clears with Ctrl+A/Delete, captures the cleared field, types the same
-250 characters again, and repeats all checks. The initial receipt must verify
-the exact field counts. After Delete, the receipt may instead report the narrow
-`atspi_transformed_blank_line` ambiguity: one initial newline was removed by the
-application, so the original expected count is 251 and the observed count is 250.
-This must be `unverified` with inspection guidance, never a mismatch error or a
-claim that the original newline was preserved. The independent copied value
-must still equal all 250 requested bytes.
-
-A final screenshot checks that capture continues working. A separate textarea
-case enters a real newline with Return, types after it, and requires normal
-verified delivery plus an exact copied value retaining that newline. This guards
-against silently discarding meaningful newlines. PNGs, copied values,
-accessibility trees, and RPC responses are saved in the artifact directory.
-The desktop is stopped in an
-`ensure` block. All text and clipboard operations belong to the private session;
-no viewer is opened.
-
-This supplements the `electron` mode's selected-field replacement coverage.
-The production pacing and delivery acknowledgements landed in
-[PR #274](https://github.com/nm-z/kwin-mcp/pull/274), after #288 was reported.
-The regression does not deliberately stall the compositor or simulate host
-resource exhaustion.
+After Delete, Electron may remove the accessible blank-line placeholder when
+typing. In that case the receipt reports `unverified` with
+`atspi_transformed_blank_line`, preserving the original 251 expected / 250
+observed counts and the inspection/no-blind-retry warning. The probe still
+requires the independent copy to match all 250 requested bytes. A real newline
+retained by the field must remain normally verified. The mode saves PNGs,
+copied values, accessibility snapshots and MCP responses, and its `ensure`
+block stops the owned session.
