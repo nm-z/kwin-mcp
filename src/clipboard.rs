@@ -158,6 +158,8 @@ struct ClipWatch {
     selection: Option<(ExtDataControlOfferV1, Vec<String>)>,
     // Counts selection changes, including the ones this viewer makes.
     generation: u64,
+    // X11 terminal emulators commonly use PRIMARY for Shift+Insert.
+    primary_generation: u64,
     // When a compositor last asked a source this viewer set for its data.
     served: Option<Instant>,
     synced: u64,
@@ -244,12 +246,15 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for ClipState {
                     watch.generation += 1;
                 });
             }
-            data_device::Event::PrimarySelection { id: Some(offer) } => {
-                state.offered.remove(&offer.id());
-                offer.destroy();
+            data_device::Event::PrimarySelection { id } => {
+                if let Some(offer) = id {
+                    state.offered.remove(&offer.id());
+                    offer.destroy();
+                }
+                state.shared.update(|watch| watch.primary_generation += 1);
             }
             data_device::Event::Finished => state.shared.update(|watch| watch.ended = true),
-            data_device::Event::PrimarySelection { id: None } | _ => {}
+            _ => {}
         }
     }
 
@@ -450,6 +455,16 @@ impl Clipboard {
         Ok(watch.generation)
     }
 
+    pub fn primary_generation(&self) -> anyhow::Result<u64> {
+        self.sync()?;
+        let watch = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?;
+        Ok(watch.primary_generation)
+    }
+
     pub fn wait_for_change(&self, generation: u64, timeout: Duration) -> anyhow::Result<bool> {
         self.wait_until(timeout, |watch| watch.generation > generation)
     }
@@ -567,6 +582,24 @@ impl Clipboard {
                 source.offer(mime.clone());
             }
             self.device.set_selection(Some(&source));
+        }
+        self.sync()
+    }
+
+    // Keep the X11 primary selection aligned with agent input so applications
+    // whose paste shortcut reads PRIMARY (such as XTerm's default Shift+Insert)
+    // can consume the same text without paced key events.
+    pub fn write_primary(&self, contents: ClipContents) -> anyhow::Result<()> {
+        if contents.is_empty() {
+            self.device.set_primary_selection(None);
+        } else {
+            let source = self
+                .manager
+                .create_data_source(&self.qh, Arc::clone(&contents));
+            for (mime, _) in contents.iter() {
+                source.offer(mime.clone());
+            }
+            self.device.set_primary_selection(Some(&source));
         }
         self.sync()
     }
