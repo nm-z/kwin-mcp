@@ -8819,13 +8819,13 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let node = loop {
         let log = std::fs::read_to_string(path.join("viewer.log")).unwrap_or_default();
-        if log.contains("pw stream Unconnected -> Connecting") {
-            if let Some(id) = log.lines().find_map(|line| {
+        if log.contains("pw stream Unconnected -> Connecting")
+            && let Some(id) = log.lines().find_map(|line| {
                 line.strip_prefix("kwin-viewer: connected to pipewire node ")
                     .and_then(|id| id.parse::<u64>().ok())
-            }) {
-                break id;
-            }
+            })
+        {
+            break id;
         }
         assert!(
             Instant::now() < deadline,
