@@ -1778,6 +1778,11 @@ const EIS_NEGOTIATION_POLL: Duration = Duration::from_millis(50);
 const DBUS_PROXY_TIMEOUT: Duration = Duration::from_secs(3);
 const DBUS_PROXY_POLL: Duration = Duration::from_millis(20);
 
+// libdbus uses this portable limit even on Linux, whose sun_path is larger.
+// https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html
+// (_DBUS_MAX_SUN_PATH_LENGTH). Session apps also connect through libdbus.
+const DBUS_SOCKET_PATH_MAX: usize = 99;
+
 // KWin unique-name discovery: per-candidate introspect probe timeout.
 const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -3233,6 +3238,26 @@ async fn connect_session_bus(
         }
         tokio::time::sleep(STARTUP_POLL).await;
     }
+}
+
+fn validate_session_socket_path(socket: &Path) -> anyhow::Result<()> {
+    // UnixAddr uses the platform's sockaddr_un.sun_path capacity and reserves
+    // its terminating NUL. Count filesystem bytes, not Unicode characters.
+    nix::sys::socket::UnixAddr::new(socket).map_err(|error| {
+        anyhow::anyhow!(
+            "Unix socket path {} ({} bytes) cannot fit sockaddr_un.sun_path with a terminating NUL: {error}; choose a shorter TMPDIR before starting kwin-mcp",
+            socket.display(),
+            socket.as_os_str().len(),
+        )
+    })?;
+    if socket.as_os_str().len() > DBUS_SOCKET_PATH_MAX {
+        anyhow::bail!(
+            "D-Bus Unix socket path {} ({} bytes) exceeds the libdbus pathname limit of {DBUS_SOCKET_PATH_MAX} bytes; choose a shorter TMPDIR before starting kwin-mcp",
+            socket.display(),
+            socket.as_os_str().len(),
+        );
+    }
+    Ok(())
 }
 
 async fn spawn_dbus_proxy(
@@ -8704,6 +8729,19 @@ impl KwinMcp {
         };
         eprintln!("session_start: virtual display {screen_w}x{screen_h}");
         let host_xdg_dir = self.path.clone();
+        let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
+        let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
+        let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
+        // Validate before creating the workdir or acquiring devices/processes.
+        // The service proxy basename also bounds the shorter session bus,
+        // Wayland, PipeWire and generated dbus-* socket names in this directory.
+        for socket in [
+            &system_proxy_socket,
+            &wallet_bus_socket,
+            &service_proxy_socket,
+        ] {
+            validate_session_socket_path(socket).map_err(|error| ver_err(error.to_string()))?;
+        }
         // Creation and the ownership claim are synchronous with no cancellation
         // point between them. Never claim an existing path from another run.
         std::fs::create_dir(&host_xdg_dir).map_err(|e| ver_err(e.to_string()))?;
@@ -8968,7 +9006,6 @@ impl KwinMcp {
         // cancellation between proxy acquisitions is therefore still covered.
         let mut startup = StartupResources::new();
         self.set_start_stage("starting host D-Bus proxies");
-        let system_proxy_socket = host_xdg_dir.join("system_bus_socket");
         match spawn_dbus_proxy(
             "unix:path=/run/dbus/system_bus_socket",
             &system_proxy_socket,
@@ -8999,7 +9036,6 @@ impl KwinMcp {
         // bus (see wallet_mediator): a one-time guarded snapshot of the host
         // wallet, then answers from memory; the host is never contacted again.
         self.set_start_stage("starting the KWallet mediator");
-        let wallet_bus_socket = host_xdg_dir.join("kwallet_bus");
         let wallet_bus_config = host_xdg_dir.join("kwallet-bus.conf");
         if let Err(error) = std::fs::write(
             &wallet_bus_config,
@@ -9066,7 +9102,6 @@ impl KwinMcp {
             Ok(mediator) => mediator,
             Err(error) => return cleanup_err(format!("KWallet service: {error}"), &mut startup),
         };
-        let service_proxy_socket = host_xdg_dir.join("service_bus_socket");
         match spawn_dbus_proxy(
             &wallet_bus_address,
             &service_proxy_socket,
