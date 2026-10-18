@@ -8776,6 +8776,10 @@ struct SessionLifecycleRecord {
 
 impl SessionLifecycleRecord {
     fn validate(self) -> std::io::Result<Self> {
+        self.validate_with_future_states(false)
+    }
+
+    fn validate_with_future_states(self, future: bool) -> std::io::Result<Self> {
         let valid_session_id = self
             .session_id
             .strip_prefix('s')
@@ -8797,14 +8801,17 @@ impl SessionLifecycleRecord {
                 SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT
             )
         );
+        let valid_transition =
+            valid_transition || (future && !self.state.is_empty() && !self.reason.is_empty());
+        let valid_cleanup = matches!(
+            self.workdir_cleanup.as_str(),
+            "not_requested" | "not_owned" | "removed" | "retained"
+        ) || (future && !self.workdir_cleanup.is_empty());
         if self.server_pid == 0
             || self.finished_at_unix_seconds == 0
             || !valid_session_id
             || !valid_transition
-            || !matches!(
-                self.workdir_cleanup.as_str(),
-                "not_requested" | "not_owned" | "removed" | "retained"
-            )
+            || !valid_cleanup
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -8812,6 +8819,24 @@ impl SessionLifecycleRecord {
             ));
         }
         Ok(self)
+    }
+
+    fn legacy_compatible(&self) -> bool {
+        self.state == SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED
+            && self.reason == SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN
+            && matches!(
+                self.workdir_cleanup.as_str(),
+                "not_requested" | "removed" | "retained"
+            )
+    }
+
+    fn supersedes(&self, previous: &Self) -> bool {
+        if self.finished_at_unix_seconds != previous.finished_at_unix_seconds {
+            return self.finished_at_unix_seconds > previous.finished_at_unix_seconds;
+        }
+        // A retry preserves its original end time. Migrating an older retained
+        // row must never undo the later confirmation that storage was removed.
+        !(self.workdir_cleanup == "retained" && previous.workdir_cleanup == "removed")
     }
 
     fn status(&self) -> &'static str {
@@ -8825,6 +8850,10 @@ impl SessionLifecycleRecord {
     }
 }
 
+fn current_session_lifecycle_log_path() -> PathBuf {
+    session_lifecycle_log_path().with_file_name("session-lifecycle-v2.jsonl")
+}
+
 fn append_session_lifecycle_event(
     session_id: &str,
     state: &str,
@@ -8832,14 +8861,6 @@ fn append_session_lifecycle_event(
     workdir_cleanup: &str,
     ended_at: Option<u64>,
 ) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let path = session_lifecycle_log_path();
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(parent)?;
     let finished_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?
@@ -8853,7 +8874,21 @@ fn append_session_lifecycle_event(
         workdir_cleanup: workdir_cleanup.to_owned(),
     }
     .validate()?;
-    let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+    migrate_legacy_lifecycle_records()?;
+    append_lifecycle_record(&current_session_lifecycle_log_path(), &record)?;
+    if record.legacy_compatible() {
+        append_lifecycle_record(&session_lifecycle_log_path(), &record)?;
+    }
+    Ok(())
+}
+
+fn append_lifecycle_record(path: &Path, record: &SessionLifecycleRecord) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     line.push(b'\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -8900,26 +8935,14 @@ fn append_session_lifecycle_event(
     Ok(())
 }
 
-fn previous_session_lifecycle(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
+fn read_lifecycle_tail(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom, Write};
-
-    let path = session_lifecycle_log_path();
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    file.lock()?;
     let file_len = file.metadata()?.len();
     let log_was_over_limit = file_len > SESSION_LIFECYCLE_LOG_MAX_BYTES;
     let start = file_len.saturating_sub(SESSION_LIFECYCLE_LOG_MAX_BYTES);
     file.seek(SeekFrom::Start(start))?;
     let mut contents = Vec::new();
-    (&mut file)
+    (&mut *file)
         .take(SESSION_LIFECYCLE_LOG_MAX_BYTES)
         .read_to_end(&mut contents)?;
     if start > 0 {
@@ -8955,35 +8978,142 @@ fn previous_session_lifecycle(session_id: &str) -> std::io::Result<Option<Sessio
         file.write_all(&contents)?;
     }
 
+    Ok(contents)
+}
+
+fn lifecycle_record_from_path(
+    path: &Path,
+    session_id: &str,
+    future: bool,
+) -> std::io::Result<Option<SessionLifecycleRecord>> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    file.lock()?;
+    let contents = read_lifecycle_tail(&mut file)?;
     let mut latest = None;
     if contents.is_empty() {
         return Ok(None);
     }
     let complete_records = &contents[..contents.len() - 1];
     for (line_number, line) in complete_records.split(|byte| *byte == b'\n').enumerate() {
-        let record = serde_json::from_slice::<SessionLifecycleRecord>(line)
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "malformed session-lifecycle record at retained line {line_number}: {error}"
-                    ),
-                )
-            })?
-            .validate()
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "malformed session-lifecycle record at retained line {line_number}: {error}"
-                    ),
-                )
-            })?;
-        if record.session_id == session_id {
+        let record = parse_lifecycle_record(line, line_number, future)?;
+        if record.session_id == session_id
+            && latest
+                .as_ref()
+                .is_none_or(|previous| record.supersedes(previous))
+        {
             latest = Some(record);
         }
     }
     Ok(latest)
+}
+
+fn parse_lifecycle_record(
+    line: &[u8],
+    number: usize,
+    future: bool,
+) -> std::io::Result<SessionLifecycleRecord> {
+    let parsed = serde_json::from_slice::<SessionLifecycleRecord>(line).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed session-lifecycle record at retained line {number}: {error}"),
+        )
+    })?;
+    parsed.validate_with_future_states(future).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed session-lifecycle record at retained line {number}: {error}"),
+        )
+    })
+}
+
+fn migrate_legacy_lifecycle_records() -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let legacy_path = session_lifecycle_log_path();
+    let mut legacy = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&legacy_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    legacy.lock()?;
+    let contents = read_lifecycle_tail(&mut legacy)?;
+    if contents.is_empty() {
+        return Ok(());
+    }
+    let mut retained = Vec::new();
+    let mut migrated = Vec::new();
+    for (number, line) in contents[..contents.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let record = parse_lifecycle_record(line, number, false)?;
+        if record.legacy_compatible() {
+            retained.extend_from_slice(line);
+            retained.push(b'\n');
+        } else {
+            migrated.push(record);
+        }
+    }
+    if migrated.is_empty() {
+        return Ok(());
+    }
+    // Keep a bounded recovery copy before changing the stable legacy inode.
+    // Old writers may already have that inode open and be waiting on its lock.
+    let backup_path = legacy_path.with_file_name("session-lifecycle-v1-migration.jsonl");
+    let mut backup = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&backup_path)?;
+    backup.write_all(&contents)?;
+    backup.sync_all()?;
+    let current_path = current_session_lifecycle_log_path();
+    for record in migrated {
+        append_lifecycle_record(&current_path, &record)?;
+    }
+    let current = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&current_path)?;
+    current.lock()?;
+    current.sync_all()?;
+    if let Some(parent) = legacy_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    legacy.set_len(0)?;
+    legacy.seek(SeekFrom::Start(0))?;
+    legacy.write_all(&retained)?;
+    legacy.sync_all()?;
+    Ok(())
+}
+
+fn previous_session_lifecycle(session_id: &str) -> std::io::Result<Option<SessionLifecycleRecord>> {
+    migrate_legacy_lifecycle_records()?;
+    let legacy = lifecycle_record_from_path(&session_lifecycle_log_path(), session_id, false)?;
+    let current =
+        lifecycle_record_from_path(&current_session_lifecycle_log_path(), session_id, true)?;
+    Ok(match (legacy, current) {
+        (Some(legacy), Some(current)) => Some(if current.supersedes(&legacy) {
+            current
+        } else {
+            legacy
+        }),
+        (Some(record), None) | (None, Some(record)) => Some(record),
+        (None, None) => None,
+    })
 }
 
 fn append_session_start_outcome(
@@ -13366,7 +13496,7 @@ fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> 
                     "session_expired_at_unix_seconds".to_owned(),
                     serde_json::json!(record.finished_at_unix_seconds),
                 );
-            } else {
+            } else if status == "stopped" {
                 data.insert(
                     "session_stopped_at_unix_seconds".to_owned(),
                     serde_json::json!(record.finished_at_unix_seconds),
