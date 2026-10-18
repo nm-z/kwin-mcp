@@ -3883,6 +3883,7 @@ impl OverlayPlan {
         host_runtime: &Path,
         isolated_runtime: &Path,
         inventory: &HostProcessInventory,
+        service: &KwinMcp,
     ) -> anyhow::Result<()> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let canonical_target = std::fs::canonicalize(target)?;
@@ -3922,6 +3923,9 @@ impl OverlayPlan {
                     return None;
                 }
                 let path = entry.path?;
+                // The stat below is the call that stalls on a hung mount, so
+                // a blocked start names the socket it was checking.
+                service.record_start_stage(format!("checking host socket {}", path.display()));
                 let parent = std::fs::canonicalize(path.parent()?).ok()?;
                 let metadata = std::fs::metadata(&path).ok()?;
                 if metadata.uid() != current_uid
@@ -4015,15 +4019,44 @@ struct HostProcessInventory {
     live_databases: Vec<PathBuf>,
 }
 
+/// Link targets of one process's descriptors. procfs' `fd()` also opens and
+/// stats every descriptor, which classification never reads; reading only the
+/// links cut the scan of a desktop with 21k descriptors by about 40%.
+fn descriptor_targets(pid: i32) -> Vec<procfs::process::FDTarget> {
+    use std::str::FromStr;
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let link = std::fs::read_link(entry.path()).ok()?;
+            procfs::process::FDTarget::from_str(link.to_str()?).ok()
+        })
+        .collect()
+}
+
 /// Read descriptors once for both graphical socket isolation and live WAL files.
-fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory> {
+fn host_process_inventory(
+    target: &Path,
+    service: &KwinMcp,
+) -> anyhow::Result<HostProcessInventory> {
+    use procfs::process::FDTarget;
     let mut graphical = std::collections::HashSet::new();
     let mut databases = Vec::new();
     let uid = procfs::process::Process::myself()?.uid()?;
     let canonical_target = std::fs::canonicalize(target)?;
     for process in procfs::process::all_processes()?.flatten() {
+        service.record_start_stage(format!("reading /proc/{}", process.pid));
         let owned = process.uid().ok() == Some(uid);
-        let environment = process.environ().unwrap_or_default();
+        // A server that is not root cannot read another user's environment,
+        // so that read is skipped for those processes. The read is denied to
+        // them anyway, so skipping it changes nothing.
+        let environment = if owned || uid == 0 {
+            process.environ().unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let cgroup =
             std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).unwrap_or_default();
         // The MCP launcher may have no desktop variables. Classify sockets
@@ -4038,11 +4071,16 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
                 });
         let desktop_scope = cgroup.contains("/session.slice/")
             || (cgroup.contains("/app.slice/") && cgroup.contains(".scope"));
-        let descriptors: Vec<procfs::process::FDInfo> =
-            process.fd().into_iter().flatten().flatten().collect();
+        // Descriptors of another user's process are unreadable to a server
+        // that is not root, so those reads are skipped as well.
+        let descriptors = if owned || uid == 0 {
+            descriptor_targets(process.pid)
+        } else {
+            Vec::new()
+        };
         for descriptor in &descriptors {
             if owned
-                && let procfs::process::FDTarget::Path(path) = &descriptor.target
+                && let FDTarget::Path(path) = descriptor
                 && let Some(name) = path.file_name().and_then(|name| name.to_str())
                 && let Some(database) = name.strip_suffix("-wal")
                 && let Ok(relative) = path
@@ -4053,7 +4091,7 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
             }
         }
         let input_attached = descriptors.iter().any(|descriptor| {
-            if let procfs::process::FDTarget::Path(path) = &descriptor.target {
+            if let FDTarget::Path(path) = descriptor {
                 path == Path::new("/dev/uinput") || path.starts_with("/dev/input")
             } else {
                 false
@@ -4061,7 +4099,7 @@ fn host_process_inventory(target: &Path) -> anyhow::Result<HostProcessInventory>
         });
         if display_attached || desktop_scope || input_attached {
             graphical.extend(descriptors.into_iter().filter_map(|descriptor| {
-                if let procfs::process::FDTarget::Socket(inode) = descriptor.target {
+                if let FDTarget::Socket(inode) = descriptor {
                     Some(inode)
                 } else {
                     None
@@ -4766,7 +4804,7 @@ fn prepare_host_view(
     service: &KwinMcp,
     browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<HostView> {
-    service.set_start_stage("scanning host mounts");
+    service.host_step("reading the host mount table (/proc/self/mountinfo)")?;
     test_block_host_scan();
     let mount_inventory = procfs::process::Process::myself()
         .and_then(|process| process.mountinfo())
@@ -4787,6 +4825,10 @@ fn prepare_host_view(
     // A leftover twin (a crash, or this pid's run before a reboot) never leaks
     // into the new session.
     let disk = session_disk_path(host_xdg_dir);
+    service.host_step(format!(
+        "clearing the previous disk overlay {}",
+        disk.display()
+    ))?;
     remove_verified_workdir(&disk).map_err(|e| anyhow::anyhow!("clear {}: {e}", disk.display()))?;
     std::fs::create_dir_all(&disk)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", disk.display()))?;
@@ -4805,9 +4847,12 @@ fn prepare_host_view(
     let scripts = disk.join(kwin_script::SCRIPT_DIRECTORY);
     std::fs::create_dir(&scripts)
         .map_err(|e| anyhow::anyhow!("create KWin script storage {}: {e}", scripts.display()))?;
-    service.set_start_stage("scanning host sockets and processes");
-    let inventory = host_process_inventory(target)?;
-    service.set_start_stage("preparing HOME overlays");
+    service.host_step("reading host processes (/proc/<pid>)")?;
+    let inventory = host_process_inventory(target, service)?;
+    service.host_step(format!(
+        "preparing HOME overlays under {}",
+        target.display()
+    ))?;
     let mut overlay_plan = prepare_overlay_plan(
         target,
         &disk,
@@ -4822,11 +4867,11 @@ fn prepare_host_view(
     if disk_root.starts_with(target) {
         overlay_plan.empty_dirs.push(disk_root);
     }
-    service.set_start_stage("scanning host sockets and processes");
+    service.host_step("reading host unix sockets (/proc/net/unix)")?;
     overlay_plan
-        .expose_sockets(target, host_runtime, host_xdg_dir, &inventory)
+        .expose_sockets(target, host_runtime, host_xdg_dir, &inventory, service)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
-    service.set_start_stage("mounting live SQLite databases read-only");
+    service.host_step("mounting live SQLite databases read-only")?;
     if matches!(browser_profiles, BrowserProfiles::Fresh) {
         // Mask the profile roots before alias mounts are constructed, too.
         overlay_plan
@@ -4872,7 +4917,7 @@ fn prepare_host_view(
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
     }
-    service.set_start_stage("reading desktop settings");
+    service.host_step("reading desktop settings")?;
     let kdeglobals = std::fs::read_to_string(target.join(".config/kdeglobals")).unwrap_or_default();
     Ok(HostView {
         overlay_plan,
@@ -5393,10 +5438,22 @@ struct KwinMcp {
     /// a start still running when the transport closes cannot repopulate a
     /// directory that nothing is left to delete.
     start_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Last startup checkpoint reached, named in the hard-limit error.
-    start_stage: Arc<std::sync::Mutex<String>>,
+    /// Last startup checkpoint reached, named in the hard-limit error, with
+    /// the moment it was reached so a blocked call's age can be reported.
+    start_stage: Arc<std::sync::Mutex<StartStage>>,
     startup_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Workdir of a timed-out start whose blocked host call still owns the
+    /// lifecycle gate. Set when that cleanup is deferred and cleared just
+    /// before the gate is released.
+    pending_cleanup: Arc<std::sync::Mutex<Option<PathBuf>>>,
     display: DisplayConfig,
+}
+
+/// The most recent startup checkpoint and when it began.
+#[derive(Clone)]
+struct StartStage {
+    label: String,
+    since: std::time::Instant,
 }
 
 impl KwinMcp {
@@ -5567,47 +5624,76 @@ impl KwinMcp {
             input_order: Arc::new(InputOrder::default()),
             workdir: Arc::new(WorkdirOwnership::default()),
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
-            start_stage: Arc::new(std::sync::Mutex::new(
-                "waiting for the lifecycle gate".to_owned(),
-            )),
+            start_stage: Arc::new(std::sync::Mutex::new(StartStage {
+                label: "waiting for the lifecycle gate".to_owned(),
+                since: std::time::Instant::now(),
+            })),
             startup_deadline: Arc::new(std::sync::Mutex::new(None)),
+            pending_cleanup: Arc::new(std::sync::Mutex::new(None)),
             display,
         }
     }
+    /// Logs a startup checkpoint that runs once per start.
     fn set_start_stage(&self, stage: impl Into<String>) {
         let stage = stage.into();
         eprintln!("session_start: stage: {stage}");
+        self.record_start_stage(stage);
+    }
+    /// Records a checkpoint without logging it, for per-process and per-socket
+    /// steps that would otherwise flood the log.
+    fn record_start_stage(&self, stage: impl Into<String>) {
         if let Ok(mut current) = self.start_stage.lock() {
-            *current = stage;
+            *current = StartStage {
+                label: stage.into(),
+                since: std::time::Instant::now(),
+            };
         }
     }
-    fn start_stage(&self) -> String {
+    /// host call blocks, nothing moves the checkpoint, so this names the call.
+    fn start_stage_report(&self) -> (String, std::time::Duration) {
         self.start_stage
             .lock()
-            .map(|stage| stage.clone())
-            .unwrap_or_else(|_| "unknown".to_owned())
+            .map(|stage| (stage.label.clone(), stage.since.elapsed()))
+            .unwrap_or_else(|_| ("unknown".to_owned(), std::time::Duration::ZERO))
     }
-    fn profile_operation(&self, operation: &str, path: &Path) -> anyhow::Result<()> {
-        if self
+    /// Checkpoints a host step and refuses to run it once the startup budget is
+    /// spent. A scan that is slow but not blocked then stops at the next step
+    /// rather than finishing after its caller has already been answered.
+    fn host_step(&self, stage: impl Into<String>) -> anyhow::Result<()> {
+        let stage = stage.into();
+        let elapsed = self
             .startup_deadline
             .lock()
             .ok()
             .and_then(|deadline| *deadline)
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            anyhow::bail!(
-                "startup deadline elapsed before {operation} {}",
-                path.display()
-            );
-        }
-        self.set_start_stage(format!(
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        anyhow::ensure!(!elapsed, "startup deadline elapsed before {stage}");
+        self.set_start_stage(stage);
+        Ok(())
+    }
+    fn profile_operation(&self, operation: &str, path: &Path) -> anyhow::Result<()> {
+        self.host_step(format!(
             "preparing browser profiles: {operation} {}",
             path.display()
-        ));
-        Ok(())
+        ))
+    }
+    /// The workdir whose timed-out start still holds the lifecycle gate.
+    fn pending_cleanup(&self) -> Option<PathBuf> {
+        self.pending_cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn set_pending_cleanup(&self, workdir: Option<PathBuf>) {
+        *self
+            .pending_cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = workdir;
     }
     /// Wait for the lifecycle gate, bounded so a start, stop, or reaper stuck
     /// behind a blocked host call answers with an error instead of hanging.
+    /// The refusal names the blocked call and the pending cleanup when a
+    /// timed-out start is what holds the gate.
     async fn lifecycle_gate(
         &self,
         deadline: tokio::time::Instant,
@@ -5616,13 +5702,18 @@ impl KwinMcp {
         tokio::time::timeout_at(deadline, self.start_gate.clone().lock_owned())
             .await
             .map_err(|_| {
-                McpError::internal_error(
-                    format!(
-                        "{operation} could not start: another session lifecycle operation is still running (last startup stage: {}). Retry shortly.",
-                        self.start_stage()
+                let (stage, blocked_for) = self.start_stage_report();
+                let detail = match self.pending_cleanup() {
+                    Some(workdir) => format!(
+                        "a previous start is still blocked: {}",
+                        blocked_call_report(&stage, blocked_for, &workdir)
                     ),
-                    Some(serde_json::json!({"reason": "lifecycle_busy", "stage": self.start_stage()})),
-                )
+                    None => format!(
+                        "another session lifecycle operation is still running; its last startup stage is {stage}, current for {}s",
+                        blocked_for.as_secs()
+                    ),
+                };
+                lifecycle_busy_error(operation, &stage, &detail)
             })
     }
     async fn mark_input(&self) {
@@ -9180,6 +9271,66 @@ fn append_session_start_outcome(
     Ok(())
 }
 
+/// Names the host call a start is blocked in, how long it has been blocked,
+/// and the cleanup that waits for it to return.
+fn blocked_call_report(stage: &str, blocked_for: std::time::Duration, workdir: &Path) -> String {
+    format!(
+        "{stage} has not returned after {}s; cleanup of {} and its disk overlay runs when it does",
+        blocked_for.as_secs(),
+        workdir.display()
+    )
+}
+
+/// The refusal for a lifecycle call that could not take the start gate within
+/// its budget. The detail names a timed-out start's blocked call when that is
+/// what holds the gate.
+fn lifecycle_busy_error(operation: &str, stage: &str, detail: &str) -> McpError {
+    McpError::internal_error(
+        format!("{operation} could not start: {detail}. Retry shortly."),
+        Some(serde_json::json!({"reason": "lifecycle_busy", "stage": stage, "detail": detail})),
+    )
+}
+
+/// The hard-limit error for a start that ran out of budget. A blocked call is
+/// reported with its operation, its age, and the cleanup it holds.
+fn hard_timeout_error(
+    budget: std::time::Duration,
+    stage: &str,
+    blocked_for: std::time::Duration,
+    blocked: bool,
+    workdir: &Path,
+) -> McpError {
+    let message = format!(
+        "session_start exceeded {}s hard limit while {stage}",
+        budget.as_secs()
+    );
+    if !blocked {
+        return McpError::internal_error(
+            message,
+            Some(
+                serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": budget.as_secs(), "stage": stage, "host_call_blocked": false}),
+            ),
+        );
+    }
+    let pending = blocked_call_report(stage, blocked_for, workdir);
+    McpError::internal_error(
+        format!(
+            "session_start exceeded {}s hard limit: {stage} has not returned after {}s. A host filesystem or /proc call is blocked (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup of {} and its disk overlay runs when it does, and lifecycle calls wait for it and then report this status.",
+            budget.as_secs(),
+            blocked_for.as_secs(),
+            workdir.display()
+        ),
+        Some(serde_json::json!({
+            "reason": "hard_timeout",
+            "startup_timeout_seconds": budget.as_secs(),
+            "stage": stage,
+            "host_call_blocked": true,
+            "blocked_seconds": blocked_for.as_secs(),
+            "pending_cleanup": pending,
+        })),
+    )
+}
+
 struct SessionStartAttempt {
     started: std::time::Instant,
     recorded: bool,
@@ -9349,12 +9500,11 @@ impl KwinMcp {
         {
             Ok(res) => res,
             Err(_) => {
-                let stage = self.start_stage();
-                let message = format!(
-                    "session_start exceeded {}s hard limit while {stage}",
+                let (stage, blocked_for) = self.start_stage_report();
+                eprintln!(
+                    "session_start: exceeded {}s hard limit while {stage}",
                     startup_timeout.as_secs()
                 );
-                eprintln!("session_start: {message}");
                 let blocked = host_work
                     .lock()
                     .ok()
@@ -9364,6 +9514,7 @@ impl KwinMcp {
                     // A host call is still blocked in the kernel and may yet
                     // write into the workdir. Keep the gate and the workdir
                     // until it returns, then run the usual failed-start cleanup.
+                    self.set_pending_cleanup(Some(self.path.clone()));
                     let this = self.clone();
                     tokio::spawn(async move {
                         let _ = handle.await;
@@ -9374,27 +9525,25 @@ impl KwinMcp {
                             ))
                             .await;
                         eprintln!(
-                            "session_start: blocked host scan returned; {}",
+                            "session_start: blocked host call returned; {}",
                             error.message
                         );
+                        // Clear the record before the gate opens, so a lifecycle
+                        // call never sees neither the record nor the gate.
+                        this.set_pending_cleanup(None);
                         drop(gate);
                     });
-                    let error = McpError::internal_error(
-                        format!(
-                            "{message}. A host filesystem or /proc call has not returned (check for hung FUSE or network mounts under $HOME and processes stuck in D state); cleanup runs when it does, and lifecycle calls report busy until then."
-                        ),
-                        Some(
-                            serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": true}),
-                        ),
-                    );
+                    let error =
+                        hard_timeout_error(startup_timeout, &stage, blocked_for, true, &self.path);
                     attempt.finish(Some(&error.message));
                     return Err(error);
                 }
-                Err(McpError::internal_error(
-                    message,
-                    Some(
-                        serde_json::json!({"reason": "hard_timeout", "startup_timeout_seconds": startup_timeout.as_secs(), "stage": stage, "host_call_blocked": false}),
-                    ),
+                Err(hard_timeout_error(
+                    startup_timeout,
+                    &stage,
+                    blocked_for,
+                    false,
+                    &self.path,
                 ))
             }
         };
@@ -15340,5 +15489,172 @@ mod launch_warning_tests {
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
+    }
+}
+
+#[cfg(test)]
+mod startup_report_tests {
+    use super::{
+        DisplayConfig, KwinMcp, descriptor_targets, hard_timeout_error, lifecycle_busy_error,
+    };
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    fn server() -> KwinMcp {
+        KwinMcp::new(DisplayConfig {
+            width: 1920,
+            height: 1080,
+            locked: false,
+            autoclean: false,
+            ttl: None,
+            memory_high: None,
+            memory_max: 0,
+            memory_swap_max: 0,
+        })
+    }
+
+    fn set_deadline(service: &KwinMcp, deadline: Option<Instant>) {
+        *service
+            .startup_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+    }
+
+    #[test]
+    fn blocked_timeout_names_the_call_its_age_and_the_cleanup_it_holds() {
+        let stage = "preparing browser profiles: snapshot host cookies /home/a/.config/google-chrome/Default/Cookies";
+        let error = hard_timeout_error(
+            Duration::from_secs(20),
+            stage,
+            Duration::from_secs(23),
+            true,
+            Path::new("/run/user/1000/kwin-mcp-42"),
+        );
+        assert!(error.message.contains(&format!(
+            "exceeded 20s hard limit: {stage} has not returned after 23s"
+        )));
+        assert!(
+            error
+                .message
+                .contains(&format!("{stage} has not returned after 23s"))
+        );
+        assert!(error.message.contains(
+            "cleanup of /run/user/1000/kwin-mcp-42 and its disk overlay runs when it does"
+        ));
+        let data = error.data.unwrap_or_default();
+        assert_eq!(data["reason"], "hard_timeout");
+        assert_eq!(data["host_call_blocked"], true);
+        assert_eq!(data["blocked_seconds"], 23);
+        assert_eq!(data["stage"], stage);
+        assert!(
+            data["pending_cleanup"]
+                .as_str()
+                .is_some_and(|text| text.contains("has not returned after 23s"))
+        );
+    }
+
+    #[test]
+    fn unblocked_timeout_reports_no_blocked_call() {
+        let error = hard_timeout_error(
+            Duration::from_secs(20),
+            "reading the host mount table (/proc/self/mountinfo)",
+            Duration::from_secs(1),
+            false,
+            Path::new("/run/user/1000/kwin-mcp-42"),
+        );
+        assert_eq!(
+            error.message,
+            "session_start exceeded 20s hard limit while reading the host mount table (/proc/self/mountinfo)"
+        );
+        let data = error.data.unwrap_or_default();
+        assert_eq!(data["host_call_blocked"], false);
+        assert!(data.get("pending_cleanup").is_none());
+    }
+
+    #[test]
+    fn lifecycle_refusal_carries_the_detail_it_was_given() {
+        let error = lifecycle_busy_error(
+            "session_stop",
+            "reading /proc/42",
+            "a previous start is still blocked: reading /proc/42 has not returned after 30s",
+        );
+        assert_eq!(
+            error.message,
+            "session_stop could not start: a previous start is still blocked: reading /proc/42 has not returned after 30s. Retry shortly."
+        );
+        let data = error.data.unwrap_or_default();
+        assert_eq!(data["reason"], "lifecycle_busy");
+        assert_eq!(data["stage"], "reading /proc/42");
+    }
+
+    #[test]
+    fn host_step_refuses_to_run_once_the_budget_is_spent() -> Result<(), String> {
+        let service = server();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        set_deadline(&service, Some(deadline));
+        service
+            .host_step("reading desktop settings")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(service.start_stage_report().0, "reading desktop settings");
+        set_deadline(&service, Some(Instant::now()));
+        let refused = service.host_step("mounting live SQLite databases read-only");
+        let message = refused
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            message,
+            "startup deadline elapsed before mounting live SQLite databases read-only"
+        );
+        assert_eq!(service.start_stage_report().0, "reading desktop settings");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lifecycle_call_reports_the_pending_cleanup_when_its_budget_runs_out()
+    -> Result<(), String> {
+        let service = server();
+        // A timed-out start's deferred cleanup holds the gate while its host
+        // call is blocked, and the record names the workdir it will remove.
+        let blocked = service.start_gate.clone().lock_owned().await;
+        service.set_pending_cleanup(Some(PathBuf::from("/run/user/1000/kwin-mcp-7")));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let refused = service.lifecycle_gate(deadline, "session_start").await;
+        let error = refused
+            .err()
+            .ok_or("the gate was granted while cleanup was pending")?;
+        assert!(
+            error
+                .message
+                .starts_with("session_start could not start: a previous start is still blocked")
+        );
+        assert!(error.message.contains(
+            "cleanup of /run/user/1000/kwin-mcp-7 and its disk overlay runs when it does"
+        ));
+        drop(blocked);
+        service.set_pending_cleanup(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            service
+                .lifecycle_gate(deadline, "session_start")
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_targets_lists_an_open_file_by_its_path() -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!("kwin-mcp-fd-test-{}", std::process::id()));
+        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+        let targets = descriptor_targets(
+            i32::try_from(std::process::id()).map_err(|error| error.to_string())?,
+        );
+        drop(file);
+        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+        assert!(targets.iter().any(
+            |target| matches!(target, procfs::process::FDTarget::Path(open) if *open == path)
+        ));
+        Ok(())
     }
 }
