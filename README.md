@@ -399,6 +399,16 @@ commands: uv can recreate or remove its console entry point during later package
 operations. Configure MCP clients with the absolute installed Rust path, such
 as `~/.local/bin/kwin-mcp` expanded to your home directory.
 
+MCP clients may still name an older absolute build-artifact path even after PATH
+is corrected. Check the configured command as well as `kwin-mcp --version`.
+For an existing provider, verify an old-to-new in-place reload before replacing
+its executable; the production regression accepts
+`KWIN_MCP_E2E_REEXEC_REPLACEMENT=/path/to/new/kwin-mcp` to check two live desktops,
+PID, pipes, input, and partially buffered requests. Keep the server and viewer
+from the same installation. Agent input is refused while an open viewer's status
+is stale; finish any current user interaction, then use `viewer_open` to refresh
+it. Read-only inspection remains available during that refresh step.
+
 To check installation behavior against built artifacts without changing your
 real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
 It installs into temporary directories and exercises help, schemas, and both

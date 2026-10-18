@@ -5491,7 +5491,20 @@ impl KwinMcp {
             return Ok(());
         };
         match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
-            Some(Ok(None)) | None => Ok(()),
+            None => Ok(()),
+            Some(Ok(None)) => {
+                let report =
+                    viewer_report(&session.host_xdg_dir, session.viewer_child.as_mut(), None);
+                if report["state"] == "unavailable" || report["input_activity_reporting"] != true {
+                    return Err(format!(
+                        "The open viewer cannot report current input activity: {}. Let the user's current interaction finish, then call viewer_open to refresh it before sending agent input.",
+                        report["reason"]
+                            .as_str()
+                            .unwrap_or("viewer status is unavailable")
+                    ));
+                }
+                Ok(())
+            }
             Some(Ok(Some(_))) => {
                 session.viewer_child.take();
                 Ok(())
@@ -7515,6 +7528,10 @@ fn viewer_report(
         return serde_json::json!({"state": "unavailable", "reason": reason, "log": log});
     }
     let phase = field("state");
+    let input_activity_reporting = status
+        .as_ref()
+        .and_then(|value| value["input_activity_reporting"].as_bool())
+        .unwrap_or(false);
     if let Some(status_pid) = status.as_ref().and_then(|value| value["pid"].as_u64())
         && status_pid != u64::from(child.id())
     {
@@ -7523,6 +7540,13 @@ fn viewer_report(
             "reason": "viewer status belongs to another process",
             "pid": child.id(),
             "log": log,
+        });
+    }
+    if phase == "ready" && !input_activity_reporting {
+        return serde_json::json!({
+            "state": "unavailable",
+            "reason": "viewer uses an older input-reporting protocol; refresh it with viewer_open after the user's current interaction finishes",
+            "pid": child.id(), "log": log,
         });
     }
     if phase == "ready"
@@ -7541,7 +7565,9 @@ fn viewer_report(
         });
     }
     match phase.as_str() {
-        "ready" => serde_json::json!({"state": "ready", "pid": child.id(), "log": log}),
+        "ready" => {
+            serde_json::json!({"state": "ready", "pid": child.id(), "log": log, "input_activity_reporting": true})
+        }
         "failed" | "closed" => {
             serde_json::json!({"state": "unavailable", "reason": field("detail"), "pid": child.id(), "log": log})
         }
@@ -7550,6 +7576,7 @@ fn viewer_report(
             "phase": if phase.is_empty() { "launching" } else { phase },
             "pid": child.id(),
             "log": log,
+            "input_activity_reporting": input_activity_reporting,
         }),
     }
 }
