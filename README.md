@@ -394,6 +394,15 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
+Inline PNGs request original-detail presentation on supporting Codex clients
+through the image block's `_meta["codex/imageDetail"]`. The hint does not change
+the image bytes, capture dimensions, or click coordinates. Other clients may
+ignore it. If a preview appears blank or loses small text, inspect the saved PNG
+at original detail or request a narrow `region` crop before diagnosing a
+compositor failure. An inline image and its saved PNG can contain identical,
+correct pixels even when a client presents them differently (see #435).
+
+
 Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
