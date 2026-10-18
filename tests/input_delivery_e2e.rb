@@ -401,7 +401,8 @@ class InputDeliveryProbe
 
   def partial_failure
     # pgrep runs inside the isolated PID namespace and kills only this test's compositor.
-    assert_success(call('launch_app', command: "konsole --separate --nofork -e bash -c 'sleep 8; kill -KILL $(pgrep -x kwin_wayland)'"))
+    launched = assert_success(call('launch_app', command: "konsole --separate --nofork -e bash -c 'sleep 20; kill -KILL $(pgrep -x kwin_wayland)'"))
+    wait_for_terminal(launched.fetch('window'))
     response = call('keyboard_type', text: 'x' * 550)
     raise "typing survived a dead compositor: #{response}" unless response.dig('error', 'code') == -32603
     progress = response.dig('error', 'data')
