@@ -300,9 +300,11 @@ mod fuse_bridge {
 mod host_environment;
 mod input_bridge;
 mod kwin_script {
+    use std::collections::HashMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
 
     use crate::KwinError;
@@ -313,9 +315,31 @@ mod kwin_script {
     const KWIN_CALLBACK_INTERFACE: &str = "org.kde.KWinMCP";
     const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
     const SCRIPT_FINISH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Bound on the wait for a script's callback. Scripts answer in milliseconds;
+    /// one that never answers must not hold its KWin's script lock indefinitely.
+    const SCRIPT_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
     pub(crate) const SCRIPT_DIRECTORY: &str = "kwin-scripts";
 
     static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// KWin numbers a loaded script by how many scripts are loaded when it loads,
+    /// and exports it at `/Scripting/Script<number>`. Overlapping lifecycles can
+    /// therefore claim the same path, and unloading one removes the path the other
+    /// still uses. Each KWin admits one lifecycle (load, run, callback, unload)
+    /// at a time.
+    static SCRIPT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn script_lock(kwin_unique: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = SCRIPT_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(kwin_unique.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
 
     pub(crate) async fn run_kwin_script(
         conn: &zbus::Connection,
@@ -358,6 +382,9 @@ mod kwin_script {
             .join(filename)
             .to_string_lossy()
             .to_string();
+        // Held until this script is unloaded, including when a dropped caller
+        // leaves the unload to the cleanup task.
+        let lock = script_lock(kwin_unique).lock_owned().await;
         let mut cleanup = ScriptCleanup {
             conn: conn.clone(),
             kwin_unique: kwin_unique.to_owned(),
@@ -369,6 +396,7 @@ mod kwin_script {
             callback_attempted: false,
             load_attempted: false,
             cleanup_started: false,
+            lock: Some(lock),
         };
 
         let result = async {
@@ -429,8 +457,15 @@ mod kwin_script {
                 .build()
                 .await?;
             script_proxy.call::<_, (), ()>("run", &()).await?;
-            rx.await
-                .map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()))
+            match tokio::time::timeout(SCRIPT_RESULT_TIMEOUT, rx).await {
+                Ok(payload) => {
+                    payload.map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()))
+                }
+                Err(_) => Err(KwinError::Msg(format!(
+                    "KWin script {} gave no result within {SCRIPT_RESULT_TIMEOUT:?}",
+                    cleanup.marker
+                ))),
+            }
         }
         .await;
 
@@ -498,6 +533,7 @@ mod kwin_script {
         callback_attempted: bool,
         load_attempted: bool,
         cleanup_started: bool,
+        lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     }
 
     impl ScriptCleanup {
@@ -531,8 +567,11 @@ mod kwin_script {
             let marker = self.marker.clone();
             let callback_attempted = self.callback_attempted;
             let load_attempted = self.load_attempted;
+            let lock = self.lock.take();
 
             Some(self.runtime.spawn(async move {
+            // Released only once the unload below has finished.
+            let _lock = lock;
             let callback_cleanup = async {
                 if !callback_attempted {
                     return Ok(());
@@ -621,6 +660,33 @@ mod kwin_script {
                 }
                 Err(error) => eprintln!("KWin callback lock poisoned: {error}"),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Arc, Duration, script_lock};
+
+        #[tokio::test]
+        async fn one_kwin_admits_one_script_lifecycle_at_a_time() {
+            let first = script_lock(":1.lock-test").lock_owned().await;
+            let waiting = tokio::time::timeout(
+                Duration::from_millis(50),
+                script_lock(":1.lock-test").lock_owned(),
+            )
+            .await;
+            assert!(
+                waiting.is_err(),
+                "second lifecycle ran while the first held the lock"
+            );
+            drop(first);
+            let _second = script_lock(":1.lock-test").lock_owned().await;
+        }
+
+        #[test]
+        fn each_kwin_has_its_own_script_lock() {
+            assert!(Arc::ptr_eq(&script_lock(":1.a"), &script_lock(":1.a")));
+            assert!(!Arc::ptr_eq(&script_lock(":1.a"), &script_lock(":1.b")));
         }
     }
 }
@@ -1872,6 +1938,10 @@ const A11Y_TREE_MAX_CHARS: usize = 30_000;
 
 // Let KWin publish an activated window before reading its geometry.
 const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
+/// Listings tried before a window that activation cannot find is reported closed,
+/// and the pause between them.
+const WINDOW_LOOKUP_ATTEMPTS: u32 = 10;
+const WINDOW_LOOKUP_RETRY: Duration = Duration::from_millis(100);
 /// How long an input send may wait for KWin to drain a full EIS socket.
 const EIS_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -7744,13 +7814,15 @@ async fn request_window_activation(
     kwin_unique: &str,
     host_xdg_dir: &Path,
     window_id: &str,
-) -> Result<(), KwinError> {
+) -> Result<bool, KwinError> {
     let window_id_json = serde_json::to_string(window_id)?;
 
+    // Search the managed-window set, not the stacking order that window_list reads,
+    // so the two lookups cannot disagree about whether a window is present.
     let script = format!(
         "var targetId = {window_id_json};\
          var result = false;\
-         var windows = workspace.stackingOrder;\
+         var windows = workspace.windowList();\
          for (var i = 0; i < windows.length; ++i) {{\
            var w = windows[i];\
            if (w.internalId.toString() !== targetId) continue;\
@@ -7761,31 +7833,42 @@ async fn request_window_activation(
            break;\
          }}"
     );
-    let activated: bool =
-        serde_json::from_str(&run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?)?;
-    if !activated {
-        return Err(KwinError::Msg(format!("no window with id {window_id}")));
-    }
-    Ok(())
+    Ok(serde_json::from_str(
+        &run_kwin_script(conn, kwin_unique, host_xdg_dir, &script).await?,
+    )?)
 }
 
-async fn activate_window(
-    conn: &zbus::Connection,
-    kwin_unique: &str,
-    host_xdg_dir: &Path,
-    window_id: &str,
-) -> Result<WindowSnapshot, KwinError> {
-    // Restore the parent first: KWin can also minimize its transient dialogs.
-    request_window_activation(conn, kwin_unique, host_xdg_dir, window_id).await?;
-    tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
-    // KWin can raise a chooser along with its parent while leaving keyboard
-    // focus on the parent. Resolve the topmost visible dialog descendant before
-    // activation so the returned target agrees with what the user will see.
-    let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
-    if !windows.iter().any(|window| window.id == window_id) {
-        return Err(KwinError::Msg(format!("no window with id {window_id}")));
-    }
-    let target_id = windows
+/// The UUID form KWin reports for a window: lowercase, without braces. A caller
+/// may name a window with or without braces, or in another letter case.
+fn canonical_window_id(window_id: &str) -> String {
+    window_id
+        .trim()
+        .trim_matches(['{', '}'])
+        .to_ascii_lowercase()
+}
+
+/// The listed window that `window_id` names.
+fn find_window<'a>(windows: &'a [WindowSnapshot], window_id: &str) -> Option<&'a WindowSnapshot> {
+    let wanted = canonical_window_id(window_id);
+    windows
+        .iter()
+        .find(|window| canonical_window_id(&window.id) == wanted)
+}
+
+fn window_closed(window_id: &str) -> KwinError {
+    KwinError::Msg(format!(
+        "window {window_id} closed: window_list no longer lists it in this session"
+    ))
+}
+
+/// The window to focus for a request that names `window`: its topmost visible,
+/// non-popup transient descendant, or `window` itself when there is none.
+fn activation_target<'a>(
+    windows: &'a [WindowSnapshot],
+    window: &'a WindowSnapshot,
+) -> &'a WindowSnapshot {
+    let wanted = canonical_window_id(&window.id);
+    windows
         .iter()
         .find(|candidate| {
             if candidate.minimized || candidate.popup {
@@ -7794,29 +7877,77 @@ async fn activate_window(
             let mut ancestor = candidate.transient_for.as_deref();
             let mut visited = std::collections::HashSet::new();
             while let Some(id) = ancestor {
-                if id == window_id {
+                if canonical_window_id(id) == wanted {
                     return true;
                 }
-                if !visited.insert(id) {
+                if !visited.insert(canonical_window_id(id)) {
                     break;
                 }
-                ancestor = windows
-                    .iter()
-                    .find(|window| window.id == id)
-                    .and_then(|window| window.transient_for.as_deref());
+                ancestor =
+                    find_window(windows, id).and_then(|parent| parent.transient_for.as_deref());
             }
             false
         })
-        .map_or(window_id, |window| window.id.as_str());
+        .unwrap_or(window)
+}
+
+/// A fresh listing that includes `window_id`. KWin can omit a window it just
+/// listed while it restacks, so a missing window is looked for again before it
+/// is reported closed.
+async fn listing_with_window(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    window_id: &str,
+) -> Result<Vec<WindowSnapshot>, KwinError> {
+    let mut lookups = 1;
+    loop {
+        let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
+        if find_window(&windows, window_id).is_some() {
+            return Ok(windows);
+        }
+        if lookups >= WINDOW_LOOKUP_ATTEMPTS {
+            return Err(window_closed(window_id));
+        }
+        lookups += 1;
+        tokio::time::sleep(WINDOW_LOOKUP_RETRY).await;
+    }
+}
+
+async fn activate_window(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &Path,
+    requested_id: &str,
+) -> Result<WindowSnapshot, KwinError> {
+    // Resolve the requested ID against a listing, then activate the ID that the
+    // listing reports, so one string names the window on both sides.
+    let windows = listing_with_window(conn, kwin_unique, host_xdg_dir, requested_id).await?;
+    let window_id = find_window(&windows, requested_id)
+        .map(|window| window.id.clone())
+        .ok_or_else(|| window_closed(requested_id))?;
+    // Restore the parent first: KWin can also minimize its transient dialogs.
+    if !request_window_activation(conn, kwin_unique, host_xdg_dir, &window_id).await? {
+        return Err(window_closed(requested_id));
+    }
+    tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
+    // KWin can raise a chooser along with its parent while leaving keyboard
+    // focus on the parent. Resolve the topmost visible dialog descendant before
+    // activation so the returned target agrees with what the user will see.
+    let windows = listing_with_window(conn, kwin_unique, host_xdg_dir, &window_id).await?;
+    let listed = find_window(&windows, &window_id).ok_or_else(|| window_closed(&window_id))?;
+    let target_id = activation_target(&windows, listed).id.clone();
     if target_id != window_id {
-        request_window_activation(conn, kwin_unique, host_xdg_dir, target_id).await?;
+        if !request_window_activation(conn, kwin_unique, host_xdg_dir, &target_id).await? {
+            return Err(window_closed(&target_id));
+        }
         tokio::time::sleep(WINDOW_ACTIVATION_SETTLE).await;
     }
-    let windows = window_snapshots(conn, kwin_unique, host_xdg_dir).await?;
+    let windows = listing_with_window(conn, kwin_unique, host_xdg_dir, &target_id).await?;
     let window = windows
         .into_iter()
         .find(|window| window.id == target_id)
-        .ok_or_else(|| KwinError::Msg(format!("window {target_id} disappeared")))?;
+        .ok_or_else(|| window_closed(&target_id))?;
     if !window.active {
         return Err(KwinError::Msg(format!(
             "KWin did not activate window {target_id}"
@@ -15324,6 +15455,117 @@ mod capture_file_tests {
         assert!(read.await.is_err());
         assert_eq!(other_task.await?, "responsive");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod window_resolution_tests {
+    use super::{WindowSnapshot, activation_target, find_window, window_closed};
+
+    const PARENT: &str = "{3f1c2a6e-8d4b-4c7e-9a1f-0b2c3d4e5f60}";
+    const CHILD: &str = "{7a9e0c1d-2b3c-4d5e-8f60-1a2b3c4d5e6f}";
+    const GRANDCHILD: &str = "{c0ffee00-1234-4abc-8def-000000000001}";
+    const OTHER: &str = "{00000000-0000-4000-8000-000000000002}";
+
+    fn window(id: &str) -> WindowSnapshot {
+        WindowSnapshot {
+            id: id.to_owned(),
+            title: String::new(),
+            resource_class: String::new(),
+            resource_name: String::new(),
+            pid: 1,
+            active: false,
+            minimized: false,
+            modal: false,
+            transient: false,
+            dialog: false,
+            popup: false,
+            transient_for: None,
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+            stacking_order: 0,
+        }
+    }
+
+    fn child_of(id: &str, parent: &str) -> WindowSnapshot {
+        WindowSnapshot {
+            transient: true,
+            transient_for: Some(parent.to_owned()),
+            ..window(id)
+        }
+    }
+
+    #[test]
+    fn listed_id_resolves_in_any_spelling() {
+        let windows = [window(PARENT), window(OTHER)];
+        for spelling in [
+            PARENT,
+            "3f1c2a6e-8d4b-4c7e-9a1f-0b2c3d4e5f60",
+            "{3F1C2A6E-8D4B-4C7E-9A1F-0B2C3D4E5F60}",
+            " {3f1c2a6e-8d4b-4c7e-9a1f-0b2c3d4e5f60} ",
+        ] {
+            assert_eq!(
+                find_window(&windows, spelling).map(|window| window.id.as_str()),
+                Some(PARENT),
+                "{spelling:?} should name the listed window"
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_or_partial_ids_do_not_resolve() {
+        let windows = [window(PARENT)];
+        for spelling in [OTHER, "3f1c2a6e", "", "{}"] {
+            assert!(
+                find_window(&windows, spelling).is_none(),
+                "{spelling:?} should not name the listed window"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_focuses_the_visible_transient_child() {
+        let windows = [child_of(CHILD, PARENT), window(PARENT)];
+        assert_eq!(activation_target(&windows, &windows[1]).id, CHILD);
+    }
+
+    #[test]
+    fn activation_ignores_minimized_and_popup_children() {
+        let mut minimized = child_of(CHILD, PARENT);
+        minimized.minimized = true;
+        let mut popup = child_of(GRANDCHILD, PARENT);
+        popup.popup = true;
+        let windows = [minimized, popup, window(PARENT)];
+        assert_eq!(activation_target(&windows, &windows[2]).id, PARENT);
+    }
+
+    #[test]
+    fn activation_takes_the_topmost_descendant_of_a_chain() {
+        let windows = [
+            child_of(GRANDCHILD, CHILD),
+            child_of(CHILD, PARENT),
+            window(PARENT),
+        ];
+        assert_eq!(activation_target(&windows, &windows[2]).id, GRANDCHILD);
+    }
+
+    #[test]
+    fn activation_terminates_on_a_transient_cycle() {
+        let windows = [
+            child_of(CHILD, PARENT),
+            child_of(PARENT, CHILD),
+            window(OTHER),
+        ];
+        assert_eq!(activation_target(&windows, &windows[2]).id, OTHER);
+    }
+
+    #[test]
+    fn closed_window_error_names_the_window() {
+        let message = window_closed(PARENT).to_string();
+        assert!(message.contains(PARENT), "{message}");
+        assert!(message.contains("closed"), "{message}");
     }
 }
 
