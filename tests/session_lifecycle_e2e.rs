@@ -206,6 +206,12 @@ impl RpcClient {
                 std::env::var_os("WAYLAND_DISPLAY")
                     .unwrap_or_else(|| std::ffi::OsString::from("wayland-0")),
             );
+        if let Some((_, minutes)) = extra_env
+            .iter()
+            .find(|(name, _)| *name == "KWIN_MCP_E2E_TTL_MINUTES")
+        {
+            command.args(["--ttl", minutes]);
+        }
         if let Some(stage) = delay_stage {
             command
                 .env("KWIN_MCP_TEST_STARTUP_DELAY_STAGE", stage)
@@ -346,8 +352,7 @@ impl RpcClient {
 
     fn stop_process(mut self) {
         self.cleanup_sessions();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.stdin.take());
     }
 
     fn cleanup_sessions(&mut self) {
@@ -668,7 +673,124 @@ fn autoclean_sweeps_only_a_crashed_owned_session() {
 }
 
 #[test]
-#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Python, input devices, and a live GPU session"]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, input devices, and a live GPU session"]
+fn session_reaches_host_loopback_listener_on_ephemeral_port() {
+    check_host_loopback_listener(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("host ephemeral listener"),
+    );
+}
+
+#[test]
+#[ignore = "requires private KWin, pasta, Konsole, and input devices"]
+fn session_still_reaches_host_listener_below_the_ephemeral_range() {
+    let range =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").expect("host port range");
+    let start: u16 = range
+        .split_whitespace()
+        .next()
+        .expect("range start")
+        .parse()
+        .expect("port");
+    let listener = (1024..start)
+        .rev()
+        .find_map(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok())
+        .expect("available non-ephemeral host listener");
+    check_host_loopback_listener(listener);
+}
+
+fn check_host_loopback_listener(listener: std::net::TcpListener) {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+
+    let port = listener.local_addr().expect("host listener address").port();
+    eprintln!("host loopback proof port={port}");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "session_start failed: {started}"
+    );
+    let session_id = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session_start returned a session ID")
+        .to_owned();
+
+    listener
+        .set_nonblocking(true)
+        .expect("make listener nonblocking");
+    let host_request = thread::spawn(move || -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| error.to_string())?;
+                    let mut request = String::new();
+                    BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
+                        .read_line(&mut request)
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    return Ok(request);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("host loopback listener received no request".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    });
+
+    let command = format!(
+        "konsole -e bash -lc 'curl --noproxy \"*\" --fail --silent --show-error --connect-timeout 2 --max-time 4 http://127.0.0.1:{port}/probe; sleep 3'"
+    );
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":command}),
+    );
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "launch_app failed: {launched}"
+    );
+    let request = host_request
+        .join()
+        .expect("host listener thread")
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(request, "GET /probe HTTP/1.1\r\n");
+
+    let stopped = call_tool(
+        &mut client,
+        4,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "session_stop failed: {stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Ruby, input devices, and a live GPU session"]
 fn concurrent_sessions_bind_same_private_loopback_port() {
     assert_eq!(
         std::env::var("KWIN_MCP_E2E").as_deref(),
@@ -681,6 +803,9 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
         .local_addr()
         .expect("host listener address")
         .port();
+    // Keep this as a free port so pasta does not forward a host listener that
+    // would occupy the same loopback port inside each session.
+    drop(host_listener);
     let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("read host name");
     let mut sessions = Vec::new();
     for _ in 0..2 {
@@ -712,7 +837,7 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
         );
         let dir = workdir(&started);
         let command = format!(
-            "konsole -e bash -lc 'python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & listener=$!; sleep 1; if kill -0 \"$listener\" 2>/dev/null; then hostname > \"$XDG_RUNTIME_DIR/loopback-ready\"; fi; wait \"$listener\"'"
+            "konsole -e ruby -rsocket -e 'server = TCPServer.new(\"127.0.0.1\", {port}); File.write(File.join(ENV.fetch(\"XDG_RUNTIME_DIR\"), \"loopback-ready\"), Socket.gethostname); loop {{ server.accept.close }}'"
         );
         let launched = call_tool(&mut client, 3, "launch_app", json!({"command":command}));
         assert!(
@@ -741,7 +866,6 @@ fn concurrent_sessions_bind_same_private_loopback_port() {
             "sandbox hostname changed"
         );
     }
-    drop(host_listener);
     for (mut client, dir) in sessions {
         let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
         assert!(
@@ -5458,11 +5582,7 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    let session_server_pid = if client.child.id() == u32::MAX {
-        client.child.id() - 1
-    } else {
-        client.child.id() + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let unavailable = call_tool(
         &mut client,
@@ -5472,6 +5592,14 @@ fn discovery_creates_no_session_processes() {
     );
     assert_eq!(
         unavailable["error"]["data"]["reason"], "different_server_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_status"], "owned_by_another_process",
+        "{unavailable}"
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_available_here"], false,
         "{unavailable}"
     );
     assert_eq!(
@@ -5491,6 +5619,10 @@ fn discovery_creates_no_session_processes() {
     let no_live = call_tool(&mut client, 4, "window_list", json!({}));
     assert_eq!(
         no_live["error"]["data"]["reason"], "session_handle_unavailable",
+        "{no_live}"
+    );
+    assert_eq!(
+        no_live["error"]["data"]["session_status"], "none_running",
         "{no_live}"
     );
     let sessions = call_tool(&mut client, 5, "session_list", json!({}));
@@ -5637,12 +5769,7 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let server_pid = client.child.id();
-    let next_pid = server_pid.saturating_add(1);
-    let session_server_pid = if next_pid == server_pid {
-        server_pid - 1
-    } else {
-        next_pid
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
 
     let response = call_tool(
@@ -5654,6 +5781,14 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     assert_eq!(response["error"]["code"], -32602, "{response}");
     assert_eq!(
         response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "owned_by_another_process",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_available_here"], false,
         "{response}"
     );
     assert_eq!(response["error"]["data"]["session_id"], session_id);
@@ -5670,7 +5805,580 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
         message.contains("session_start without session_id"),
         "{message}"
     );
+
+    let local_missing_id = format!("s{server_pid}-999999");
+    let local_missing = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":local_missing_id}),
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["reason"], "session_not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_status"], "not_found",
+        "{local_missing}"
+    );
+    assert_eq!(
+        local_missing["error"]["data"]["session_available_here"], false,
+        "{local_missing}"
+    );
     assert!(direct_children(server_pid).is_empty());
+    client.stop_process();
+    std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
+}
+
+#[test]
+fn silent_session_owner_handshake_has_a_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = PathBuf::from(host_runtime_dir())
+        .join(format!("kwin-mcp-control-{}.sock", std::process::id()));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("private silent owner socket");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("socket permissions");
+    struct RemoveSocket(PathBuf);
+    impl Drop for RemoveSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _socket = RemoveSocket(path);
+    let (done_tx, done_rx) = mpsc::channel();
+    let fixture = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("owner connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("read deadline");
+        let mut reader = BufReader::new(stream);
+        let mut initialize = String::new();
+        reader
+            .read_line(&mut initialize)
+            .expect("initialization request");
+        assert!(initialize.contains("initialize"), "{initialize}");
+        let _ = done_rx.recv_timeout(Duration::from_secs(8));
+    });
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let began = Instant::now();
+    let response = call_tool(
+        &mut caller,
+        2,
+        "window_list",
+        json!({"session_id":format!("s{}-1", std::process::id())}),
+    );
+    let elapsed = began.elapsed();
+    let _ = done_tx.send(());
+    fixture.join().expect("silent owner fixture");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "owner handshake did not time out: {elapsed:?}"
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    caller.stop_process();
+}
+
+#[test]
+fn unknown_session_from_a_live_server_is_checked_by_its_owner() {
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let owner_pid = owner.child.id();
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let session_id = format!("s{owner_pid}-999999");
+
+    let response = call_tool(
+        &mut caller,
+        2,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "session_not_found",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["server_pid"], owner_pid,
+        "{response}"
+    );
+    assert_ne!(response["error"]["data"]["server_pid"], caller.child.id());
+
+    drop(caller);
+    drop(owner);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, input devices, and a live GPU session"]
+fn live_session_tools_are_forwarded_to_the_owner_process() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // Both desktops belong to this test; the caller's desktop hosts the viewer.
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let outer = call_tool(
+        &mut caller,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let caller_id = session_handle(&outer);
+    let display = workdir(&outer).join("wayland-0");
+    let mut owner =
+        RpcClient::start_with_env(&[("WAYLAND_DISPLAY", display.to_str().expect("display"))]);
+    initialize(&mut owner);
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_id = session_handle(&started);
+    let launched = call_tool(
+        &mut owner,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":"konsole --separate --nofork -e bash --noprofile --norc"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let window_id = launched["result"]["structuredContent"]["window"].clone();
+    let windows = call_tool(
+        &mut caller,
+        3,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|windows| windows.iter().any(|window| window["id"] == window_id)),
+        "{windows}"
+    );
+    let opened = call_tool(
+        &mut caller,
+        4,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{opened}"
+    );
+    let viewer_pid = u32::try_from(
+        opened["result"]["structuredContent"]["viewer"]["pid"]
+            .as_u64()
+            .expect("viewer PID"),
+    )
+    .expect("PID fits");
+    let command = "printf routed-owner-proof > \"$HOME/routed-proof\"";
+    let typed = call_tool(
+        &mut caller,
+        5,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":command}),
+    );
+    assert!(typed["error"].is_null(), "{typed}");
+    assert_eq!(
+        typed["result"]["structuredContent"]["retry_safe"], false,
+        "{typed}"
+    );
+    let returned = call_tool(
+        &mut caller,
+        6,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(returned["error"].is_null(), "{returned}");
+    let proof = caller.home.join("routed-proof.txt");
+    let exported = call_tool(
+        &mut caller,
+        7,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-proof"),"host_path":proof}),
+    );
+    assert!(exported["error"].is_null(), "{exported}");
+    assert_eq!(
+        std::fs::read_to_string(&proof).expect("exported proof"),
+        "routed-owner-proof"
+    );
+    let prefix = call_tool(
+        &mut caller,
+        20,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"printf %s '"}),
+    );
+    assert!(prefix["error"].is_null(), "{prefix}");
+    for index in 0..12 {
+        caller.send(100 + index, "tools/call", json!({"name":"keyboard_type","arguments":{"session_id":session_id,"text":format!("{index},")}}));
+    }
+    for index in 0..12 {
+        let response = caller.response(100 + index, Duration::from_secs(30));
+        assert!(response["error"].is_null(), "{response}");
+    }
+    let suffix = call_tool(
+        &mut caller,
+        21,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"' > \"$HOME/routed-order\""}),
+    );
+    assert!(suffix["error"].is_null(), "{suffix}");
+    let submitted = call_tool(
+        &mut caller,
+        22,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(submitted["error"].is_null(), "{submitted}");
+    let ordered_proof = caller.home.join("routed-order.txt");
+    let exported_order = call_tool(
+        &mut caller,
+        23,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-order"),"host_path":ordered_proof}),
+    );
+    assert!(exported_order["error"].is_null(), "{exported_order}");
+    assert_eq!(
+        std::fs::read_to_string(ordered_proof).expect("ordered output"),
+        (0..12).map(|index| format!("{index},")).collect::<String>(),
+        "forwarded input lost wire order"
+    );
+    let log = std::fs::read_to_string(
+        started["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("input log"),
+    )
+    .expect("owner audit");
+    assert!(
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|record| record["typing"]["characters"] == command),
+        "owner did not audit routed text"
+    );
+    let closed = call_tool(
+        &mut caller,
+        8,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert!(closed["error"].is_null(), "{closed}");
+    assert!(
+        !process_alive(viewer_pid).unwrap_or(true),
+        "forwarded close did not reap viewer"
+    );
+    let stopped = call_tool(
+        &mut caller,
+        9,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    owner.sessions.retain(|owned| owned != &session_id);
+    assert!(!workdir(&started).exists(), "owner workdir remains");
+    let listed = call_tool(&mut owner, 4, "session_list", json!({}));
+    assert!(
+        listed["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{listed}"
+    );
+    let caller_sessions = call_tool(&mut caller, 10, "session_list", json!({}));
+    assert!(
+        caller_sessions["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1 && sessions[0]["session_id"] == caller_id),
+        "forwarding affected caller's desktop: {caller_sessions}"
+    );
+    caller.stop_process();
+    owner.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, input devices, and a full one-minute idle TTL"]
+fn live_idle_expiry_records_the_terminal_state_and_cleanup() {
+    check_live_idle_expiry(false);
+}
+
+#[test]
+#[ignore = "requires private KWin, input devices, one-minute idle TTL, and sudo for a synthetic cleanup blocker"]
+fn live_expiry_cleanup_retry_preserves_the_reason_and_end_time() {
+    check_live_idle_expiry(true);
+}
+
+struct CleanupBlocker(PathBuf);
+impl CleanupBlocker {
+    fn create(path: PathBuf) -> Self {
+        assert!(
+            Command::new("sudo")
+                .args([
+                    "-n", "install", "-d", "-m", "700", "-o", "root", "-g", "root"
+                ])
+                .arg(&path)
+                .status()
+                .expect("create synthetic cleanup blocker")
+                .success()
+        );
+        Self(path)
+    }
+}
+impl Drop for CleanupBlocker {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "rmdir"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+fn check_live_idle_expiry(block_cleanup: bool) {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start_with_env(&[("KWIN_MCP_E2E_TTL_MINUTES", "1")]);
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+    );
+    let id = session_handle(&started);
+    let runtime = workdir(&started);
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(runtime.file_name().expect("workdir name"));
+    let log = client
+        .home
+        .join(".local/state/kwin-mcp/session-lifecycle.jsonl");
+    let blocker = block_cleanup.then(|| CleanupBlocker::create(disk.join("synthetic-root-owned")));
+    let deadline = Instant::now() + Duration::from_secs(85);
+    let mut request = 3;
+    loop {
+        let list = call_tool(&mut client, request, "session_list", json!({}));
+        request += 1;
+        let sessions = list["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .expect("sessions");
+        if sessions
+            .iter()
+            .any(|entry| entry["session_id"] == id && entry["status"] == "expired")
+            && (block_cleanup || (!runtime.exists() && !disk.exists()))
+            && log.exists()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle session did not expire and clean up: {list}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    let records = std::fs::read_to_string(&log).expect("real lifecycle log");
+    let record: Value =
+        serde_json::from_str(records.lines().last().expect("expiry record")).expect("expiry JSON");
+    assert_eq!(record["session_id"], id);
+    assert_eq!(record["state"], "session_expired");
+    assert_eq!(record["reason"], "idle_timeout");
+    assert_eq!(
+        record["workdir_cleanup"],
+        if block_cleanup { "retained" } else { "removed" }
+    );
+    let unavailable = call_tool(
+        &mut client,
+        request,
+        "window_list",
+        json!({"session_id":id}),
+    );
+    assert_eq!(
+        unavailable["error"]["data"]["session_status"], "expired",
+        "{unavailable}"
+    );
+    drop(blocker);
+    thread::sleep(Duration::from_secs(1));
+    let stopped = call_tool(
+        &mut client,
+        request + 1,
+        "session_stop",
+        json!({"session_id":id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    let stale = call_tool(
+        &mut client,
+        request + 2,
+        "window_list",
+        json!({"session_id":id}),
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_status"], "expired",
+        "{stale}"
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_end_reason"], "idle_timeout",
+        "{stale}"
+    );
+    assert!(!runtime.exists() && !disk.exists());
+    assert_eq!(
+        stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",
+        "{stale}"
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_ended_at_unix_seconds"], record["finished_at_unix_seconds"],
+        "cleanup changed the terminal timestamp: {stale}"
+    );
+    eprintln!("expiry proof: {record}; unavailable={stale}");
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires private KWin sessions, input devices, and sudo for one synthetic root-owned directory"]
+fn cleanup_retry_updates_the_record_to_removed() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+    );
+    let id = session_handle(&started);
+    let runtime = workdir(&started);
+    let disk = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(runtime.file_name().expect("workdir name"));
+    let blocked = disk.join("synthetic-root-owned");
+    let blocker = CleanupBlocker::create(blocked);
+    let first = call_tool(&mut client, 3, "session_stop", json!({"session_id":id}));
+    let kept = runtime.exists() && disk.exists();
+    let still_blocked = call_tool(&mut client, 4, "session_stop", json!({"session_id":id}));
+
+    drop(blocker);
+    assert!(
+        first["error"].is_object() && kept,
+        "cleanup unexpectedly discarded ownership: {first}"
+    );
+    assert_eq!(
+        still_blocked["error"]["data"]["session_status"], "stopped",
+        "{still_blocked}"
+    );
+    assert_eq!(
+        still_blocked["error"]["data"]["session_end_reason"], "session_stop",
+        "{still_blocked}"
+    );
+    let second = call_tool(&mut client, 5, "session_stop", json!({"session_id":id}));
+
+    assert!(second["error"].is_null(), "{second}");
+    assert!(!runtime.exists() && !disk.exists());
+    let stale = call_tool(&mut client, 6, "window_list", json!({"session_id":id}));
+    eprintln!("cleanup retry proof: first={first}; second={second}; stale={stale}");
+    assert_eq!(
+        stale["error"]["data"]["previous_session_lifecycle_record"]["workdir_cleanup"], "removed",
+        "successful cleanup left a stale retained record: {stale}"
+    );
+    client.stop_process();
+}
+
+#[test]
+fn prior_manual_stop_and_ttl_expiry_report_terminal_session_status() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let state_home =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kwin-mcp-terminal-state-{nonce}"));
+    let log_dir = state_home.join("kwin-mcp");
+    std::fs::create_dir_all(&log_dir).expect("create private lifecycle state");
+    let state_home = state_home.to_string_lossy().into_owned();
+    let extra_env = [("XDG_STATE_HOME", state_home.as_str())];
+    let mut client = RpcClient::start_with_env(&extra_env);
+    initialize(&mut client);
+
+    // Adjacent OS PIDs can belong to concurrent real test servers. Their
+    // control sockets would forward these synthetic IDs outside this fixture.
+    let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .expect("kernel PID limit")
+        .trim()
+        .parse()
+        .expect("PID limit");
+    let stopped_pid = pid_max.checked_add(1).expect("synthetic stopped PID");
+    let expired_pid = pid_max.checked_add(2).expect("synthetic expired PID");
+    let stopped_id = format!("s{stopped_pid}-1");
+    let expired_id = format!("s{expired_pid}-1");
+    let records = [
+        json!({
+            "session_id": stopped_id,
+            "server_pid": stopped_pid,
+            "state": "session_stopped",
+            "reason": "session_stop",
+            "finished_at_unix_seconds": 100,
+            "workdir_cleanup": "removed",
+        }),
+        json!({
+            "session_id": expired_id,
+            "server_pid": expired_pid,
+            "state": "session_expired",
+            "reason": "idle_timeout",
+            "finished_at_unix_seconds": 200,
+            "workdir_cleanup": "removed",
+        }),
+    ];
+    let contents = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        log_dir.join("session-lifecycle.jsonl"),
+        format!("{contents}\n"),
+    )
+    .expect("write terminal lifecycle records");
+
+    let stopped = call_tool(
+        &mut client,
+        2,
+        "window_list",
+        json!({"session_id":stopped_id}),
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_status"], "stopped",
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_stopped_at_unix_seconds"], 100,
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["error"]["data"]["session_end_reason"], "session_stop",
+        "{stopped}"
+    );
+
+    let expired = call_tool(
+        &mut client,
+        3,
+        "window_list",
+        json!({"session_id":expired_id}),
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_status"], "expired",
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_expired_at_unix_seconds"], 200,
+        "{expired}"
+    );
+    assert_eq!(
+        expired["error"]["data"]["session_end_reason"], "idle_timeout",
+        "{expired}"
+    );
+    assert!(
+        expired["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is expired")),
+        "{expired}"
+    );
+
     client.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove private lifecycle state");
 }
@@ -5691,11 +6399,7 @@ fn malformed_session_lifecycle_record_is_an_error() {
     initialize(&mut client);
 
     let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let malformed = format!(
         "{}\n",
@@ -5752,12 +6456,7 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let seed_record = format!(
         "{}\n",
@@ -5784,6 +6483,24 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     );
     assert_eq!(
         response["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_status"], "stopped",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_stopped_at_unix_seconds"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["session_end_reason"], "server_shutdown",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Session status is stopped")),
         "{response}"
     );
     assert_eq!(
@@ -5898,7 +6615,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         timed_out["error"]["data"]["stage"]
             .as_str()
             .expect("stage")
-            .contains("active window")
+            .contains("windows before launch")
     );
     assert!(
         (19_000..23_000).contains(&elapsed_ms),
@@ -5910,14 +6627,20 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let scripts = std::fs::read_dir(&workdir)
-            .expect("workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let scripts = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir.file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if scripts == 0 {
             break;
         }
@@ -6465,14 +7188,20 @@ fn one_process_routes_parallel_sessions_and_orders_input_on_stdio() {
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let concurrent = std::fs::read_dir(workdir(&a))
-            .expect("A workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let concurrent = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir(&a).file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("A workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if concurrent >= 2 {
             break;
         }
@@ -6797,6 +7526,27 @@ fn transport_eof_cleans_every_owned_session() {
         );
         directories.push(workdir(&response));
     }
+    let manually_stopped = call_tool(
+        &mut client,
+        4,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let manually_stopped_id = session_handle(&manually_stopped);
+    let manually_stopped_workdir = workdir(&manually_stopped);
+    sessions.push(manually_stopped_id.clone());
+    directories.push(manually_stopped_workdir.clone());
+    let stopped = call_tool(
+        &mut client,
+        5,
+        "session_stop",
+        json!({"session_id":manually_stopped_id}),
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
+    assert!(!manually_stopped_workdir.exists());
     drop(client.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(20);
     while client.child.try_wait().expect("server status").is_none() {
@@ -6830,25 +7580,45 @@ fn transport_eof_cleans_every_owned_session() {
             "window_list",
             json!({"session_id":session_id}),
         );
-        assert_eq!(
-            unavailable["error"]["data"]["previous_server_cleanup"], "shutdown_cleanup_finished",
-            "{unavailable}"
-        );
-        let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
-        assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
-        assert_eq!(record["reason"], "server_shutdown", "{record}");
-        assert_eq!(
-            record["session_id"].as_str(),
-            Some(session_id.as_str()),
-            "{record}"
-        );
-        assert_eq!(record["workdir_cleanup"], "removed", "{record}");
-        assert!(
-            unavailable["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("shutdown cleanup finished")),
-            "{unavailable}"
-        );
+        if index < 2 {
+            assert_eq!(
+                unavailable["error"]["data"]["previous_server_cleanup"],
+                "shutdown_cleanup_finished",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_server_cleanup_record"];
+            assert_eq!(record["state"], "shutdown_cleanup_finished", "{record}");
+            assert_eq!(record["reason"], "server_shutdown", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+            assert_eq!(record["workdir_cleanup"], "removed", "{record}");
+            assert!(
+                unavailable["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("shutdown cleanup finished")),
+                "{unavailable}"
+            );
+        } else {
+            assert_eq!(
+                unavailable["error"]["data"]["session_status"], "stopped",
+                "{unavailable}"
+            );
+            assert_eq!(
+                unavailable["error"]["data"]["session_end_reason"], "session_stop",
+                "{unavailable}"
+            );
+            let record = &unavailable["error"]["data"]["previous_session_lifecycle_record"];
+            assert_eq!(record["state"], "session_stopped", "{record}");
+            assert_eq!(record["reason"], "session_stop", "{record}");
+            assert_eq!(
+                record["session_id"].as_str(),
+                Some(session_id.as_str()),
+                "{record}"
+            );
+        }
     }
     replacement.stop_process();
     std::fs::remove_dir_all(state_home).expect("remove shared lifecycle state");
