@@ -115,7 +115,7 @@ startup. Other files and directory overlays keep their existing write behavior.
 `session_start` reports these fallback files in `oversized_read_only_files`.
 To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
-Explicit copies still share the 20-second startup deadline; this option does not
+Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
 ### Session memory limits
@@ -428,3 +428,30 @@ receipt.
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+### Startup budgets and fresh browser profiles
+
+`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).
+The budget includes waiting for the lifecycle gate and preparing host profiles;
+it does not disable bounded startup or cleanup. Increase it explicitly when a
+large profile set needs more preparation time.
+
+For a terminal-only task or a browser that should start without inherited
+Chromium profiles, use `browser_profiles: "fresh"`. The recognized Chromium
+configuration directories start empty in that session, profile/cookie copying
+is skipped, and cookies from those fresh profiles are not persisted between
+sessions. Host files are unchanged. The default `"inherit"` preserves the
+existing profile and cookie-continuity behavior. The response reports both the
+profile mode and startup budget. This option does not bypass general HOME
+mount/process discovery or unblock unrelated hung filesystems.
+
+Browser preparation timeouts identify the current operation and pathname,
+without printing file contents. Preparation checks its deadline between
+operations. If an operation is blocked in the kernel, cleanup retains ownership
+until that operation returns; it then stops preparation and removes the owned
+storage. Do not remove that storage manually while the operation still uses it.
+
+Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
+regression. It uses synthetic private profiles, a controlled blocked Preferences
+read, terminal launch, and a delayed real sandbox to verify profile isolation,
+operation diagnostics, deferred cleanup, and configurable timeout bounds.
