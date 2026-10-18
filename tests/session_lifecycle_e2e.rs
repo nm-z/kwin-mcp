@@ -4292,6 +4292,26 @@ fn describe_matches_the_stdio_server() {
 }
 
 #[test]
+fn non_pollable_stdio_error_identifies_the_descriptor() {
+    let output = Command::new(
+        std::env::var("KWIN_MCP_E2E_SERVER")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned()),
+    )
+    .args(["--width", "1232", "--height", "924", "--autoclean"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("start server with null stdin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("MCP stdin (fd 0) is not pollable by epoll"),
+        "startup error did not identify the unpollable input descriptor: {stderr}"
+    );
+}
+
+#[test]
 fn call_without_session_creates_no_processes() {
     let mut client = RpcClient::start();
     initialize(&mut client);
