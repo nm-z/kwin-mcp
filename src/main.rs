@@ -299,6 +299,7 @@ mod fuse_bridge {
 }
 mod host_environment;
 mod input_bridge;
+mod session_registry;
 mod kwin_script {
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -5399,6 +5400,35 @@ struct KwinMcp {
     display: DisplayConfig,
 }
 
+/// Bound on each session lock the reaper waits for, so one stuck handle cannot
+/// stall expiry for the others.
+const REAPER_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// The terminal status a death record carries. A desktop diagnosis has only `status`.
+fn terminal_status(record: &serde_json::Value) -> Option<&str> {
+    record["session_status"]
+        .as_str()
+        .or_else(|| record["status"].as_str())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The death record of a handle that ended without a running desktop.
+fn terminal_record(status: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "session_status": status,
+        "reason": reason,
+        "session_available_here": false,
+        "session_ended_at_unix_seconds": unix_now(),
+    })
+}
+
 impl KwinMcp {
     fn death_record(&self) -> Option<serde_json::Value> {
         self.death
@@ -5411,6 +5441,123 @@ impl KwinMcp {
             .death
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(diagnostic);
+    }
+
+    /// The handle's registry phase. The desktop is read before the terminal
+    /// status: a stop, expiry, or death records its status before it releases the
+    /// desktop, so a missing desktop always comes with its status.
+    async fn registry_phase(&self) -> session_registry::Phase {
+        let has_desktop = self.session.read().await.is_some();
+        session_registry::phase(
+            has_desktop,
+            self.death_record().as_ref().and_then(terminal_status),
+        )
+    }
+
+    /// Records how a failed session_start left its handle, after the start's own
+    /// cleanup has run, and returns what the registry keeps.
+    fn register_failed_start(&self, error: &McpError) -> session_registry::FailedStart {
+        let host_call_blocked = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("host_call_blocked"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let outcome = session_registry::failed_start(
+            error.code == rmcp::model::ErrorCode::INVALID_PARAMS,
+            host_call_blocked,
+        );
+        // A stop that arrived first already recorded the handle's end.
+        if outcome == session_registry::FailedStart::Forget || self.death_record().is_some() {
+            return outcome;
+        }
+        match outcome {
+            session_registry::FailedStart::Blocked => self.set_death(terminal_record(
+                session_registry::STATUS_START_BLOCKED,
+                SESSION_LIFECYCLE_REASON_HOST_CALL_BLOCKED,
+            )),
+            session_registry::FailedStart::Failed => {
+                self.set_death(terminal_record(
+                    session_registry::STATUS_START_FAILED,
+                    SESSION_LIFECYCLE_REASON_START_FAILED,
+                ));
+                self.record_terminal_cleanup(self.startup_cleanup_label());
+            }
+            session_registry::FailedStart::Forget => {}
+        }
+        outcome
+    }
+
+    /// The workdir cleanup a start's record names: retained while this server
+    /// still owns the workdir, removed when autoclean removed it, otherwise not owned.
+    fn startup_cleanup_label(&self) -> &'static str {
+        if self.workdir.owned().is_some() {
+            "retained"
+        } else if self.display.autoclean && !self.path.exists() {
+            "removed"
+        } else if self.path.exists() {
+            "not_owned"
+        } else {
+            "not_requested"
+        }
+    }
+
+    /// Expires this handle once its desktop has been idle for the whole TTL, and
+    /// records the expiry.
+    async fn expire_if_idle(&self) {
+        let _ = tokio::time::timeout(REAPER_LOCK_WAIT, self.check_liveness()).await;
+        let Ok(_gate) = self.start_gate.try_lock() else {
+            return;
+        };
+        let Ok(mut guard) = tokio::time::timeout(REAPER_LOCK_WAIT, self.session.write()).await
+        else {
+            eprintln!("ttl: {} is busy; expiry is retried", self.session_id);
+            return;
+        };
+        if let Some(child) = guard
+            .as_mut()
+            .and_then(|session| session.viewer_child.as_mut())
+        {
+            let _ = child.try_wait();
+        }
+        let idle = guard
+            .as_ref()
+            .map_or(Duration::ZERO, |session| session.last_activity.elapsed());
+        let phase = session_registry::phase(
+            guard.is_some(),
+            self.death_record().as_ref().and_then(terminal_status),
+        );
+        if !session_registry::idle_expired(&phase, idle, self.display.ttl) {
+            return;
+        }
+        let expired_at = unix_now();
+        // The expired status is recorded before the desktop is released.
+        self.set_death(serde_json::json!({
+            "status": "expired",
+            "session_status": "expired",
+            "reason": SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            "session_expired_at_unix_seconds": expired_at,
+            "session_ended_at_unix_seconds": expired_at,
+            "session_available_here": false,
+        }));
+        let stopped = guard.take();
+        drop(guard);
+        if let Some(session) = stopped {
+            teardown_blocking(session).await;
+        }
+        let workdir_cleanup = match self.workdir.remove() {
+            WorkdirCleanup::Retained { dir, error } => {
+                eprintln!("ttl: retained {}: {error}", dir.display());
+                "retained"
+            }
+            WorkdirCleanup::NothingOwned => "not_owned",
+            WorkdirCleanup::Removed(_) => "removed",
+        };
+        self.record_lifecycle(
+            SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
+            SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            workdir_cleanup,
+        );
     }
 
     fn record_lifecycle(&self, state: &str, reason: &str, workdir_cleanup: &str) {
@@ -5439,14 +5586,26 @@ impl KwinMcp {
         let Some(terminal) = self.death_record() else {
             return;
         };
-        let transition = match terminal["session_status"].as_str() {
-            Some("stopped") => (
+        let transition = match terminal_status(&terminal) {
+            Some(session_registry::STATUS_STOPPED) => (
                 SESSION_LIFECYCLE_STATE_SESSION_STOPPED,
                 SESSION_LIFECYCLE_REASON_SESSION_STOP,
             ),
-            Some("expired") => (
+            Some(session_registry::STATUS_EXPIRED) => (
                 SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
                 SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
+            ),
+            Some(session_registry::STATUS_DEAD) => (
+                SESSION_LIFECYCLE_STATE_SESSION_DIED,
+                SESSION_LIFECYCLE_REASON_SANDBOX_EXITED,
+            ),
+            Some(session_registry::STATUS_START_FAILED) => (
+                SESSION_LIFECYCLE_STATE_START_FAILED,
+                SESSION_LIFECYCLE_REASON_START_FAILED,
+            ),
+            Some(session_registry::STATUS_START_BLOCKED) => (
+                SESSION_LIFECYCLE_STATE_START_ABANDONED,
+                SESSION_LIFECYCLE_REASON_HOST_CALL_BLOCKED,
             ),
             _ => return,
         };
@@ -5722,7 +5881,15 @@ impl KwinMcp {
         } else {
             error
         };
-        match self.workdir.remove() {
+        let removal = self.workdir.remove();
+        // The deferred cleanup of a blocked start ends that handle, and its
+        // record names what this removal left.
+        if self.death_record().as_ref().and_then(terminal_status)
+            == Some(session_registry::STATUS_START_BLOCKED)
+        {
+            self.record_terminal_cleanup(self.startup_cleanup_label());
+        }
+        match removal {
             WorkdirCleanup::NothingOwned => error,
             WorkdirCleanup::Removed(dir) => {
                 eprintln!("session_start: autoclean removed {}", dir.display());
@@ -5781,13 +5948,18 @@ impl KwinMcp {
                 "retained"
             }
         };
+        let terminal = self.death_record();
         if session_was_live {
             self.record_lifecycle(
                 SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED,
                 SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN,
                 workdir_cleanup,
             );
-        } else if cleanup_changed {
+        } else if terminal
+            .as_ref()
+            .and_then(terminal_status)
+            .is_some_and(|status| session_registry::clear_writes_record(status, cleanup_changed))
+        {
             self.record_terminal_cleanup(workdir_cleanup);
         }
     }
@@ -8789,6 +8961,12 @@ const SESSION_LIFECYCLE_STATE_SESSION_STOPPED: &str = "session_stopped";
 const SESSION_LIFECYCLE_REASON_SESSION_STOP: &str = "session_stop";
 const SESSION_LIFECYCLE_STATE_SESSION_EXPIRED: &str = "session_expired";
 const SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT: &str = "idle_timeout";
+const SESSION_LIFECYCLE_STATE_SESSION_DIED: &str = "session_dead";
+const SESSION_LIFECYCLE_REASON_SANDBOX_EXITED: &str = "sandbox_exited";
+const SESSION_LIFECYCLE_STATE_START_FAILED: &str = "session_start_failed";
+const SESSION_LIFECYCLE_REASON_START_FAILED: &str = "start_failed";
+const SESSION_LIFECYCLE_STATE_START_ABANDONED: &str = "session_start_abandoned";
+const SESSION_LIFECYCLE_REASON_HOST_CALL_BLOCKED: &str = "host_call_blocked";
 const SESSION_LIFECYCLE_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -8826,6 +9004,15 @@ impl SessionLifecycleRecord {
             ) | (
                 SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
                 SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT
+            ) | (
+                SESSION_LIFECYCLE_STATE_SESSION_DIED,
+                SESSION_LIFECYCLE_REASON_SANDBOX_EXITED
+            ) | (
+                SESSION_LIFECYCLE_STATE_START_FAILED,
+                SESSION_LIFECYCLE_REASON_START_FAILED
+            ) | (
+                SESSION_LIFECYCLE_STATE_START_ABANDONED,
+                SESSION_LIFECYCLE_REASON_HOST_CALL_BLOCKED
             )
         );
         let valid_transition =
@@ -8868,7 +9055,10 @@ impl SessionLifecycleRecord {
 
     fn status(&self) -> &'static str {
         match self.state.as_str() {
-            SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "expired",
+            SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => session_registry::STATUS_EXPIRED,
+            SESSION_LIFECYCLE_STATE_SESSION_DIED => session_registry::STATUS_DEAD,
+            SESSION_LIFECYCLE_STATE_START_FAILED => session_registry::STATUS_START_FAILED,
+            SESSION_LIFECYCLE_STATE_START_ABANDONED => session_registry::STATUS_START_BLOCKED,
             SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED | SESSION_LIFECYCLE_STATE_SESSION_STOPPED => {
                 "stopped"
             }
@@ -9334,6 +9524,16 @@ impl KwinMcp {
                 return Err(error);
             }
         };
+        if self.death_record().is_some() {
+            // session_stop abandoned this handle while this start waited for the gate.
+            drop(gate);
+            let error = McpError::invalid_params(
+                "session_start: this session was stopped before its startup began",
+                None,
+            );
+            attempt.finish(Some(&error.message));
+            return Err(error);
+        }
         self.set_start_stage("preparing the session workdir");
         *self
             .startup_deadline
@@ -10864,6 +11064,22 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        // A start whose host call is still blocked holds the lifecycle gate until
+        // that call returns. Its stop is recorded now: the handle stays until the
+        // cleanup it owns runs, and a later session_stop clears it.
+        let gate_busy = self.start_gate.try_lock().is_err();
+        if session_registry::stop_is_pending(&self.registry_phase().await, gate_busy) {
+            return Ok(structured_result(
+                &peer,
+                "session stop recorded; this session's startup is blocked in a host call, and its cleanup runs when that call returns. Call session_stop again then to clear it.",
+                serde_json::json!({
+                    "status": "cleanup_pending",
+                    "session_status": session_registry::STATUS_START_BLOCKED,
+                    "cookie_errors": [],
+                }),
+            )
+            .await);
+        }
         // Serialize stop with the entire start attempt, including workdir
         // creation and failed-start cleanup. Without this gate, stop can see no
         // published Session, delete a workdir that startup is still using, and
@@ -10874,63 +11090,51 @@ impl KwinMcp {
                 "session_stop",
             )
             .await?;
-        let stopped = self.session.write().await.take();
-        let had_session = stopped.is_some();
+        let plan = session_registry::stop_plan(&self.registry_phase().await);
         let mut cookie_errors = Vec::new();
-        if let Some(sess) = stopped {
-            if let Ok(mut clipboards) = self.clipboards.lock() {
-                clipboards
-                    .entries
-                    .remove(&sess.host_xdg_dir.join("wayland-0"));
-            }
-            cookie_errors = teardown_blocking(sess).await;
-        }
-        if had_session {
-            let ended_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.set_death(serde_json::json!({
-                "status": "stopped",
-                "session_status": "stopped",
-                "session_available_here": false,
-                "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                "session_ended_at_unix_seconds": ended_at,
-            }));
-        }
-        let dir = match self.workdir.remove() {
-            WorkdirCleanup::NothingOwned => {
-                if had_session {
-                    self.record_terminal_cleanup("not_requested");
+        match plan {
+            session_registry::StopPlan::Teardown => {
+                // The stopped status is recorded before the desktop is released,
+                // so a reader sees the desktop or its status, never neither.
+                let mut guard = self.session.write().await;
+                if guard.is_some() {
+                    self.set_death(serde_json::json!({
+                        "status": "stopped",
+                        "session_status": "stopped",
+                        "session_available_here": false,
+                        "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                        "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                        "session_ended_at_unix_seconds": unix_now(),
+                    }));
                 }
-                return Ok(if had_session {
-                    structured_result(
-                        &peer,
-                        "session stopped",
-                        serde_json::json!({"status": "stopped", "cookie_errors": cookie_errors}),
-                    )
-                    .await
-                } else {
-                    structured_result(
-                        &peer,
-                        "no session running",
-                        serde_json::json!({"status": "none", "cookie_errors": cookie_errors}),
-                    )
-                    .await
-                });
+                let stopped = guard.take();
+                drop(guard);
+                if let Some(sess) = stopped {
+                    if let Ok(mut clipboards) = self.clipboards.lock() {
+                        clipboards
+                            .entries
+                            .remove(&sess.host_xdg_dir.join("wayland-0"));
+                    }
+                    cookie_errors = teardown_blocking(sess).await;
+                }
             }
-            WorkdirCleanup::Removed(dir) => {
-                self.record_terminal_cleanup("removed");
-                dir
-            }
+            session_registry::StopPlan::Clear => {}
+            session_registry::StopPlan::Abandon => self.set_death(terminal_record(
+                session_registry::STATUS_START_FAILED,
+                SESSION_LIFECYCLE_REASON_START_FAILED,
+            )),
+        }
+        let teardown = matches!(plan, session_registry::StopPlan::Teardown);
+        let removed = match self.workdir.remove() {
+            WorkdirCleanup::NothingOwned => None,
+            WorkdirCleanup::Removed(dir) => Some(dir),
             WorkdirCleanup::Retained { dir, error } => {
                 self.record_terminal_cleanup("retained");
                 let terminal = self.death_record();
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
-                let stopped_note = if had_session {
+                let stopped_note = if teardown {
                     "session stopped, but "
                 } else {
                     ""
@@ -10955,25 +11159,44 @@ impl KwinMcp {
                 ));
             }
         };
-        let workdir = dir.display().to_string();
-        let (status, message) = if had_session {
-            (
-                "stopped",
-                format!("session stopped, workdir {workdir} removed"),
-            )
+        // The cleanup record is written unless a clear removed nothing and the
+        // handle's end is already recorded. Teardown always records its stop.
+        let recorded = self
+            .death_record()
+            .as_ref()
+            .and_then(terminal_status)
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let cleanup = if removed.is_some() {
+            "removed"
         } else {
-            (
-                "cleaned",
-                format!("no session running, leftover workdir {workdir} removed"),
-            )
+            "not_requested"
         };
+        if teardown
+            || matches!(plan, session_registry::StopPlan::Abandon)
+            || session_registry::clear_writes_record(&recorded, removed.is_some())
+        {
+            self.record_terminal_cleanup(cleanup);
+        }
+        let workdir_removed = removed.map(|dir| dir.display().to_string());
+        let (status, subject) = if teardown {
+            ("stopped", "session stopped".to_owned())
+        } else {
+            ("cleaned", format!("cleared {recorded} session"))
+        };
+        let message = match &workdir_removed {
+            Some(workdir) => format!("{subject}, workdir {workdir} removed"),
+            None => subject,
+        };
+        let lifecycle_record = previous_session_lifecycle(&self.session_id).ok().flatten();
         Ok(structured_result(
             &peer,
             message,
             serde_json::json!({
                 "status": status,
-                "workdir_removed": workdir,
+                "workdir_removed": workdir_removed,
                 "cookie_errors": cookie_errors,
+                "session_lifecycle_record": lifecycle_record,
             }),
         )
         .await)
@@ -13252,7 +13475,7 @@ fn ordered_tool(name: &str) -> bool {
 }
 
 const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls; a session you created through another live same-user kwin-mcp process on this host can also be reached.";
-const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, or expired to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
+const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, expired, or start_blocked to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
 const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -13494,6 +13717,9 @@ fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> 
                 SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED => "shutdown cleanup finished",
                 SESSION_LIFECYCLE_STATE_SESSION_STOPPED => "session stop",
                 SESSION_LIFECYCLE_STATE_SESSION_EXPIRED => "idle TTL expiration",
+                SESSION_LIFECYCLE_STATE_SESSION_DIED => "sandbox exit",
+                SESSION_LIFECYCLE_STATE_START_FAILED => "failed session_start",
+                SESSION_LIFECYCLE_STATE_START_ABANDONED => "blocked session_start cleanup",
                 _ => "session lifecycle transition",
             };
             error.message = format!(
@@ -13733,30 +13959,77 @@ impl SessionRouter {
         };
         Ok((id, session))
     }
+    /// session_stop for a handle this process does not hold. A saved ID answers
+    /// from its lifecycle record, which is a confirmed no-op. With no ID and no
+    /// handles, nothing is running. Anything else is left to resolve.
+    async fn stop_unregistered(
+        &self,
+        requested: Option<&str>,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        let entries = self.entries()?;
+        match requested {
+            Some(id) if !entries.contains_key(id) => {
+                let Ok(Some(record)) = previous_session_lifecycle(id) else {
+                    return Ok(None);
+                };
+                let status = record.status();
+                Ok(Some(
+                    structured_result(
+                        peer,
+                        format!("session {id} is already {status}; nothing to stop"),
+                        serde_json::json!({
+                            "status": "already_cleared",
+                            "session_status": status,
+                            "session_lifecycle_record": record,
+                            "cookie_errors": [],
+                        }),
+                    )
+                    .await,
+                ))
+            }
+            None if entries.is_empty() => Ok(Some(
+                structured_result(
+                    peer,
+                    "no session running",
+                    serde_json::json!({"status": "none", "cookie_errors": []}),
+                )
+                .await,
+            )),
+            Some(_) | None => Ok(None),
+        }
+    }
     async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut records = Vec::new();
         for (id, service) in self.entries()? {
-            if let Some(death) = service.check_liveness().await {
-                let status = death
-                    .get("session_status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("dead");
-                records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":status, "diagnostic":death}));
-                continue;
-            }
-            let guard = service.session.read().await;
-            if let Some(session) = guard.as_ref() {
-                records.push(serde_json::json!({
-                    "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":session.scope.report(), "input_log":service.input_log.as_ref().map(|log| &log.path),
-                    "workdir": session.host_xdg_dir, "width": session.screen_width,
-                    "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
-                }));
+            // A desktop that exited since its last call is recorded as dead first,
+            // so the phase below reports it.
+            let _ = service.check_liveness().await;
+            match service.registry_phase().await {
+                // A start still running is not handed out yet. A failed start is
+                // reached by the ID its error gave, and session_stop clears it.
+                session_registry::Phase::Starting => {}
+                session_registry::Phase::Terminal(status)
+                    if status == session_registry::STATUS_START_FAILED => {}
+                session_registry::Phase::Terminal(status) => {
+                    records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":status, "diagnostic":service.death_record().unwrap_or_default()}));
+                }
+                session_registry::Phase::Running => {
+                    let guard = service.session.read().await;
+                    if let Some(session) = guard.as_ref() {
+                        records.push(serde_json::json!({
+                            "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":session.scope.report(), "input_log":service.input_log.as_ref().map(|log| &log.path),
+                            "workdir": session.host_xdg_dir, "width": session.screen_width,
+                            "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
+                        }));
+                    }
+                }
             }
         }
         Ok(structured_result(
             peer,
             format!(
-                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, or expired; a call with a saved ID reports its lifecycle record when available.\n{}",
+                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, expired, or start_blocked; a call with a saved ID reports its lifecycle record when available.\n{}",
                 std::process::id(),
                 serde_json::to_string(&records).map_err(KwinError::from)?
             ),
@@ -13786,56 +14059,7 @@ impl SessionRouter {
                 continue;
             };
             for (_, service) in entries {
-                let _ = service.check_liveness().await;
-                let Ok(_gate) = service.start_gate.try_lock() else {
-                    continue;
-                };
-                let Ok(mut guard) = service.session.try_write() else {
-                    continue;
-                };
-                if let Some(child) = guard
-                    .as_mut()
-                    .and_then(|session| session.viewer_child.as_mut())
-                {
-                    let _ = child.try_wait();
-                }
-                let expired = service.display.ttl.is_some_and(|ttl| {
-                    guard
-                        .as_ref()
-                        .is_some_and(|session| session.last_activity.elapsed() >= ttl)
-                });
-                if expired {
-                    let expired_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let stopped = guard.take();
-                    drop(guard);
-                    service.set_death(serde_json::json!({
-                        "status": "expired",
-                        "session_status": "expired",
-                        "reason": SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
-                        "session_expired_at_unix_seconds": expired_at,
-                        "session_ended_at_unix_seconds": expired_at,
-                        "session_available_here": false,
-                    }));
-                    if let Some(session) = stopped {
-                        teardown_blocking(session).await;
-                    }
-                    let workdir_cleanup = match service.workdir.remove() {
-                        WorkdirCleanup::Retained { dir, error } => {
-                            eprintln!("ttl: retained {}: {error}", dir.display());
-                            "retained"
-                        }
-                        WorkdirCleanup::NothingOwned => "not_owned",
-                        WorkdirCleanup::Removed(_) => "removed",
-                    };
-                    service.record_lifecycle(
-                        SESSION_LIFECYCLE_STATE_SESSION_EXPIRED,
-                        SESSION_LIFECYCLE_REASON_IDLE_TIMEOUT,
-                        workdir_cleanup,
-                    );
-                }
+                service.expire_if_idle().await;
             }
         }
     }
@@ -13881,7 +14105,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error includes session_status and the recorded end time and reason when available, otherwise says cleanup is unconfirmed. session_stop clears dead, stopped, and expired handles. Start a new session and relaunch the applications.",
+            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error includes session_status and the recorded end time and reason when available, otherwise says cleanup is unconfirmed. session_stop clears dead, stopped, expired, and start_blocked handles. Start a new session and relaunch the applications.",
             info.instructions.unwrap_or_default()
         ));
         info
@@ -13935,6 +14159,11 @@ impl rmcp::ServerHandler for SessionRouter {
                 return Ok(result);
             }
         }
+        if request.name == "session_stop"
+            && let Some(result) = self.stop_unregistered(requested_id, &context.peer).await?
+        {
+            return Ok(result);
+        }
         let (id, session) = self.resolve(&mut request)?;
         let start = request.name == "session_start";
         let stop = request.name == "session_stop";
@@ -13955,6 +14184,16 @@ impl rmcp::ServerHandler for SessionRouter {
                         .map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
                 ),
                 Some(death),
+            ));
+        }
+        if !start && !stop && session.registry_phase().await == session_registry::Phase::Starting {
+            return Err(McpError::internal_error(
+                format!(
+                    "Session {id} is still starting; call the tool again after its session_start returns."
+                ),
+                Some(
+                    serde_json::json!({"reason": "session_starting", "session_id": id, "retry_safe": true}),
+                ),
             ));
         }
         let agent_input = input_tool(&request.name);
@@ -14068,15 +14307,36 @@ impl rmcp::ServerHandler for SessionRouter {
         } else {
             result
         };
-        if (stop && result.is_ok() || start && result.is_err() && session.workdir.owned().is_none())
+        // A failed start registers its handle, which stays until session_stop
+        // clears it, or is forgotten when nothing was created. A stop removes its
+        // handle once the stop finished, unless a blocked startup still owns cleanup.
+        let failed_start = if start {
+            result
+                .as_ref()
+                .err()
+                .map(|error| session.register_failed_start(error))
+        } else {
+            None
+        };
+        let stop_finished = stop
+            && result.as_ref().is_ok_and(|done| {
+                done.structured_content
+                    .as_ref()
+                    .and_then(|data| data["status"].as_str())
+                    != Some("cleanup_pending")
+            });
+        if (stop_finished || failed_start == Some(session_registry::FailedStart::Forget))
             && let Ok(mut sessions) = self.sessions.lock()
         {
             sessions.remove(&id);
         }
+        let kept_failed_start = failed_start
+            .as_ref()
+            .is_some_and(|outcome| *outcome != session_registry::FailedStart::Forget);
         let mut result = match result {
             Ok(result) => result,
             Err(mut error) => {
-                if start && session.workdir.owned().is_some() {
+                if kept_failed_start {
                     error.message =
                         format!("{}; retry session_stop with session_id={id}", error.message)
                             .into();
@@ -14751,6 +15011,17 @@ impl SessionRouter {
             }
             let guard = service.session.read().await;
             let Some(session) = guard.as_ref() else {
+                // Holding the start gate means no start is in flight, so a handle
+                // with neither a desktop nor a status failed without recording it.
+                if service.death_record().is_none() {
+                    deaths.push((
+                        id.clone(),
+                        terminal_record(
+                            session_registry::STATUS_START_FAILED,
+                            SESSION_LIFECYCLE_REASON_START_FAILED,
+                        ),
+                    ));
+                }
                 if let Some(path) = service.workdir.owned() {
                     cleanup.push((id, path, service.workdir.saved_lease(&mut retained)?));
                 }
