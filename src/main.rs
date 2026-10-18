@@ -7225,7 +7225,7 @@ async fn active_window_info(
     Ok((x, y, info))
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WindowSnapshot {
     id: String,
     title: String,
@@ -8080,22 +8080,147 @@ async fn poll_launch_window(
     kwin_unique: String,
     xdg: PathBuf,
     previous: Option<String>,
+    previous_windows: Option<Vec<WindowSnapshot>>,
+    chromium_launch: bool,
     exit_file: PathBuf,
-) -> Result<Option<WindowGeometry>, McpError> {
+) -> Result<Option<LaunchWindow>, McpError> {
+    let mut pending_reused: Option<(String, String)> = None;
     loop {
         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
-        if let Ok((_, _, geometry)) = active_window_info(&conn, &kwin_unique, &xdg).await
+        let current_windows = window_snapshots(&conn, &kwin_unique, &xdg).await;
+        if let Ok(windows) = &current_windows {
+            if let Some(active) = windows.iter().find(|window| window.active)
+                && previous.as_deref() != Some(&active.id)
+            {
+                let reused = previous_windows.as_ref().is_some_and(|before| {
+                    before.iter().any(|window| window.id == active.id)
+                });
+                let current = (active.id.clone(), active.title.clone());
+                if !reused {
+                    return Ok(Some(LaunchWindow {
+                        geometry: launch_window_geometry(active),
+                        reused: false,
+                    }));
+                }
+                if !chromium_launch {
+                    if pending_reused.as_ref() == Some(&current) {
+                        return Ok(Some(LaunchWindow {
+                            geometry: launch_window_geometry(active),
+                            reused: true,
+                        }));
+                    }
+                    pending_reused = Some(current);
+                }
+            }
+        } else if let Ok((_, _, geometry)) = active_window_info(&conn, &kwin_unique, &xdg).await
             && previous.as_deref() != Some(&geometry.id)
         {
-            return Ok(Some(geometry));
+            let reused = previous_windows.as_ref().is_some_and(|before| {
+                before.iter().any(|window| window.id == geometry.id)
+            });
+            let current = (geometry.id.clone(), geometry.title.clone());
+            if !reused {
+                return Ok(Some(LaunchWindow {
+                    geometry,
+                    reused: false,
+                }));
+            }
+            if !chromium_launch {
+                if pending_reused.as_ref() == Some(&current) {
+                    return Ok(Some(LaunchWindow {
+                        geometry,
+                        reused: true,
+                    }));
+                }
+                pending_reused = Some(current);
+            }
         }
-        if std::fs::read_to_string(&exit_file)
+        let exit_status = std::fs::read_to_string(&exit_file)
             .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok())
-            .is_some_and(|status| status != 0)
-        {
+            .and_then(|text| text.trim().parse::<i32>().ok());
+        if exit_status.is_some_and(|status| status != 0) {
             return Ok(None);
         }
+        if chromium_launch
+            && exit_status == Some(0)
+            && let Some(previous_windows) = previous_windows.as_deref()
+            && let Ok(current_windows) = current_windows
+        {
+            let titled = changed_existing_browser_window_titles(previous_windows, &current_windows);
+            if let [window] = titled.as_slice() {
+                let current = (window.id.clone(), window.title.clone());
+                if pending_reused.as_ref() == Some(&current) {
+                    return Ok(Some(LaunchWindow {
+                        geometry: launch_window_geometry(window),
+                        reused: true,
+                    }));
+                }
+                pending_reused = Some(current);
+            } else {
+                pending_reused = None;
+            }
+        }
+    }
+}
+
+struct LaunchWindow {
+    geometry: WindowGeometry,
+    reused: bool,
+}
+
+fn is_chromium_window(window: &WindowSnapshot) -> bool {
+    let app = format!("{} {}", window.resource_class, window.resource_name).to_lowercase();
+    ["chrome", "chromium", "brave", "vivaldi", "edge", "msedge"]
+        .iter()
+        .any(|name| app.contains(name))
+}
+
+fn changed_existing_browser_windows<'a>(
+    previous: &[WindowSnapshot],
+    current: &'a [WindowSnapshot],
+) -> Vec<&'a WindowSnapshot> {
+    current
+        .iter()
+        .filter(|window| {
+            is_chromium_window(window)
+                && previous
+                    .iter()
+                    .find(|before| before.id == window.id)
+                    .is_some_and(|before| {
+                        before.title != window.title
+                            || (!before.active && window.active)
+                            || (before.minimized && !window.minimized)
+                    })
+        })
+        .collect()
+}
+
+fn changed_existing_browser_window_titles<'a>(
+    previous: &[WindowSnapshot],
+    current: &'a [WindowSnapshot],
+) -> Vec<&'a WindowSnapshot> {
+    current
+        .iter()
+        .filter(|window| {
+            is_chromium_window(window)
+                && previous
+                    .iter()
+                    .find(|before| before.id == window.id)
+                    .is_some_and(|before| before.title != window.title)
+        })
+        .collect()
+}
+
+fn launch_window_geometry(window: &WindowSnapshot) -> WindowGeometry {
+    WindowGeometry {
+        x: window.x,
+        y: window.y,
+        w: window.w,
+        h: window.h,
+        title: window.title.clone(),
+        id: window.id.clone(),
+        cx: 0.0,
+        cy: 0.0,
     }
 }
 
@@ -11555,7 +11680,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments that exist on the host are checked inside the session before the app starts; an invisible path is reported, including when host /tmp is hidden by the session's private /tmp. The call deadline adds 30 seconds for the bounded prelaunch KWin check and browser accessibility connection; a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge block CDP on their default profile. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Session browsers carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -11615,7 +11740,6 @@ impl KwinMcp {
         use tokio::io::AsyncWriteExt;
         use tower::ServiceExt;
 
-        // Record current active window ID before launching
         let (
             conn,
             kwin_unique,
@@ -11642,15 +11766,27 @@ impl KwinMcp {
             )
         };
         if let Ok(mut progress) = progress.lock() {
-            progress.stage = "reading the active window before launch";
+            progress.stage = "reading windows before launch";
         }
-        let prev_window_id = match tokio::time::timeout(
-            LAUNCH_PRECHECK_TIMEOUT,
-            active_window_info(&conn, &kwin_unique, &xdg),
-        )
-        .await
-        {
-            Ok(result) => result.map(|(_, _, geo)| geo.id).ok(),
+        let (prev_window_id, previous_windows) =
+            match tokio::time::timeout(LAUNCH_PRECHECK_TIMEOUT, async {
+                let windows = window_snapshots(&conn, &kwin_unique, &xdg).await.ok();
+                let active = windows
+                    .as_ref()
+                    .and_then(|windows| windows.iter().find(|window| window.active))
+                    .map(|window| window.id.clone());
+                let active = match active {
+                    Some(id) => Some(id),
+                    None => active_window_info(&conn, &kwin_unique, &xdg)
+                        .await
+                        .ok()
+                        .map(|(_, _, geometry)| geometry.id),
+                };
+                (active, windows)
+            })
+            .await
+            {
+            Ok(result) => result,
             Err(_) => {
                 let progress = progress
                     .lock()
@@ -11738,29 +11874,87 @@ impl KwinMcp {
         }
 
         if let Ok(mut progress) = progress.lock() {
-            progress.stage = "waiting for a new window";
+            progress.stage = "waiting for a window";
         }
+        let chromium_launch = launches_chromium(&params.command);
         let waiting = tower::service_fn(|()| {
             poll_launch_window(
                 conn.clone(),
                 kwin_unique.clone(),
                 xdg.clone(),
                 prev_window_id.clone(),
+                previous_windows.clone(),
+                chromium_launch,
                 exit_file.clone(),
             )
         });
-        let win_geo = match tower::timeout::Timeout::new(waiting, window_timeout)
-            .oneshot(())
-            .await
-        {
-            Ok(geometry) => geometry,
-            Err(error) if error.is::<tower::timeout::error::Elapsed>() => None,
-            Err(error) => return Err(McpError::internal_error(error.to_string(), None)),
-        };
+        let (mut win_geo, mut window_reused) =
+            match tower::timeout::Timeout::new(waiting, window_timeout)
+                .oneshot(())
+                .await
+            {
+                Ok(Some(window)) => (Some(window.geometry), window.reused),
+                Ok(None) => (None, false),
+                Err(error) if error.is::<tower::timeout::error::Elapsed>() => (None, false),
+                Err(error) => return Err(McpError::internal_error(error.to_string(), None)),
+            };
         let exit_status = std::fs::read_to_string(&exit_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
         let _ = std::fs::remove_file(&exit_file);
+        let mut handoff_reason = None;
+        let mut handoff_candidates = Vec::new();
+        if win_geo.is_none() && exit_status == Some(0) && chromium_launch {
+            match previous_windows.as_deref() {
+                Some(previous) => match window_snapshots(&conn, &kwin_unique, &xdg).await {
+                    Ok(current) => {
+                        let changed = changed_existing_browser_windows(previous, &current);
+                        let titled = changed_existing_browser_window_titles(previous, &current);
+                        handoff_candidates = changed
+                            .iter()
+                            .map(|window| {
+                                serde_json::json!({
+                                    "window": window.id,
+                                    "title": window.title,
+                                })
+                            })
+                            .collect();
+                        match titled.as_slice() {
+                            [window] => {
+                                win_geo = Some(launch_window_geometry(window));
+                                window_reused = true;
+                            }
+                            _ if changed.is_empty() => {
+                                handoff_reason = Some(
+                                    "no existing Chromium window changed its title, activation, or minimized state"
+                                        .to_owned(),
+                                );
+                            }
+                            [] if changed.len() == 1 => {
+                                handoff_reason = Some(
+                                    "one existing Chromium window changed activation or minimized state, but its title did not change, so KWin cannot confirm which tab received the URL"
+                                        .to_owned(),
+                                );
+                            }
+                            _ => {
+                                handoff_reason = Some(format!(
+                                    "{} existing Chromium windows changed; the target cannot be distinguished",
+                                    changed.len()
+                                ));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        handoff_reason =
+                            Some("the post-launch KWin window list could not be read".to_owned());
+                    }
+                },
+                None => {
+                    handoff_reason =
+                        Some("the pre-launch KWin window list could not be read".to_owned());
+                }
+            }
+        }
         let invisible_path = std::fs::read_to_string(&path_error_file).ok();
         let _ = std::fs::remove_file(&path_error_file);
         if let Some(path) = invisible_path {
@@ -11812,28 +12006,63 @@ impl KwinMcp {
             .map(|text| format!(". {text}"))
             .unwrap_or_default();
         match (win_geo, exit_status) {
-            (Some(geo), _) => Ok(structured_result(&peer, format!("launched: {} window: {}{suffix}", params.command, geo.id), serde_json::json!({
-                "action": "launch", "command": params.command, "window": geo.id,
-                "cdp": cdp_connected, "warning": warning,
-                "window_timeout_seconds": window_timeout.as_secs(),
-            })).await),
+            (Some(geo), _) => {
+                let (outcome, description) = if window_reused {
+                    (
+                        "reused_existing",
+                        format!("reused window: {} title: {:?}", geo.id, geo.title),
+                    )
+                } else {
+                    ("new", format!("window: {}", geo.id))
+                };
+                Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), serde_json::json!({
+                    "action": "launch", "command": params.command, "window": geo.id,
+                    "window_outcome": outcome, "window_reused": window_reused,
+                    "window_title": geo.title,
+                    "cdp": cdp_connected, "warning": warning,
+                    "window_timeout_seconds": window_timeout.as_secs(),
+                })).await)
+            }
             (None, Some(status)) => {
+                let browser_unattributed = status == 0 && chromium_launch;
                 let text = match status {
+                    0 if browser_unattributed => format!(
+                        "launched: {} (browser launch returned status 0, but no matching existing window could be attributed: {} after {}s){suffix}",
+                        params.command,
+                        handoff_reason.as_deref().unwrap_or("KWin reported no attributable window change"),
+                        window_timeout.as_secs(),
+                    ),
                     0 => format!("launched: {} (exited with status 0; no window after {}s){suffix}", params.command, window_timeout.as_secs()),
                     127 => format!("{} failed: command not found (exit status 127)", params.command),
                     _ => format!("{} exited with status {status} without opening a window", params.command),
                 };
-                let mut result = structured_result(&peer, text, serde_json::json!({
-                    "action": "launch", "command": params.command, "window": "exited",
+                let window_outcome = if browser_unattributed {
+                    "unattributed"
+                } else {
+                    "exited"
+                };
+                let mut payload = serde_json::json!({
+                    "action": "launch", "command": params.command,
+                    "window": if browser_unattributed { "unattributed" } else { "exited" },
+                    "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "warning": warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
-                })).await;
+                });
+                if browser_unattributed {
+                    payload["handoff"] = serde_json::json!({
+                        "state": "unattributed",
+                        "reason": handoff_reason,
+                        "candidate_windows": handoff_candidates,
+                    });
+                }
+                let mut result = structured_result(&peer, text, payload).await;
                 result.is_error = Some(status != 0);
                 Ok(result)
             }
             (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
-                "cdp": false, "warning": warning, "stage": "waiting for a new window", "command_submitted": true,
+                "window_outcome": "timeout",
+                "cdp": false, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
                 "window_timeout_seconds": window_timeout.as_secs(),
             })).await),
         }
