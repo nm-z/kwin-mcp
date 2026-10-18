@@ -3784,7 +3784,7 @@ struct OverlayPlan {
     overlays: Vec<OverlayMount>,
     read_only_binds: Vec<PathBuf>,
     socket_binds: Vec<PathBuf>,
-    /// Known graphical socket names must stay hidden through parent aliases.
+    /// Known graphical socket names must stay hidden through aliases and HOME paths.
     graphical_socket_paths: Vec<PathBuf>,
     /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
     sqlite_binds: Vec<PathBuf>,
@@ -3945,6 +3945,16 @@ impl OverlayPlan {
                 }
             }
         }
+        // A read-only bind still permits Unix socket IPC. Hide graphical
+        // sockets at their ordinary HOME paths as well as in the aliases
+        // above; in split overlays those paths may come from the lower layer.
+        for path in self
+            .graphical_socket_paths
+            .iter()
+            .filter(|path| path.starts_with(target))
+        {
+            command.arg("--ro-bind-try").arg("/dev/null").arg(path);
+        }
     }
 
     fn expose_sockets(
@@ -3964,10 +3974,18 @@ impl OverlayPlan {
             .iter()
             .filter(|entry| inventory.graphical_sockets.contains(&entry.inode))
             .filter_map(|entry| entry.path.as_ref())
-            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .flat_map(|path| {
+                let mut names = vec![path.clone()];
+                if let Ok(canonical) = std::fs::canonicalize(path) {
+                    names.push(canonical);
+                }
+                names
+            })
             .collect();
         self.graphical_socket_paths.sort();
         self.graphical_socket_paths.dedup();
+        self.read_only_binds
+            .retain(|mount| !self.graphical_socket_paths.contains(mount));
         // Read-only data mounts still permit socket IPC; hide these names
         // through SQLite aliases and retain the separate helper socket policy.
         self.sqlite_blocked_sockets = socket_inventory
