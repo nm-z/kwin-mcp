@@ -5491,7 +5491,20 @@ impl KwinMcp {
             return Ok(());
         };
         match session.viewer_child.as_mut().map(SessionProcess::try_wait) {
-            Some(Ok(None)) | None => Ok(()),
+            None => Ok(()),
+            Some(Ok(None)) => {
+                let report =
+                    viewer_report(&session.host_xdg_dir, session.viewer_child.as_mut(), None);
+                if report["state"] == "unavailable" {
+                    return Err(format!(
+                        "The open viewer cannot report current input activity: {}. Let the user's current interaction finish, then call viewer_open to refresh it before sending agent input.",
+                        report["reason"]
+                            .as_str()
+                            .unwrap_or("viewer status is unavailable")
+                    ));
+                }
+                Ok(())
+            }
             Some(Ok(Some(_))) => {
                 session.viewer_child.take();
                 Ok(())

@@ -7218,7 +7218,11 @@ fn check_reexecution(source_reload: bool) {
         .expect("edit private tool description");
     } else {
         let replacement = binary.with_extension("next");
-        std::fs::copy(&binary, &replacement).expect("stage rebuilt executable");
+        let replacement_source = std::env::var_os("KWIN_MCP_E2E_REEXEC_REPLACEMENT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| binary.clone());
+        std::fs::copy(&replacement_source, &replacement).expect("stage rebuilt executable");
+
         std::fs::rename(&replacement, &binary).expect("publish rebuilt executable");
     }
     client.wait_for_stderr(
