@@ -98,7 +98,10 @@ impl RpcClient {
             .as_nanos();
         let home_root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+            // Nested fixture sockets must fit sockaddr_un even when the
+            // checkout/target path is long. /tmp is hidden inside the session,
+            // so use the short, host-visible /var/tmp root by default.
+            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
         let home = home_root.join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
         for directory in [
             home.join(".config"),
