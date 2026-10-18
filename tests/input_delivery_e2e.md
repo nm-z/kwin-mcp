@@ -41,6 +41,36 @@ This mode opens a synthetic message dialog and expects the focus wait to time
 out without any `keyboard_type` or `keyboard_key` call. Both modes log their
 production stdio requests and responses in `rpc.jsonl`.
 
+## Cleared composer after Delete (#288)
+
+Build the production server, then run this mode in a new artifact directory:
+
+```bash
+cargo build --release --bin kwin-mcp
+KWIN_MCP_E2E_SERVER="$PWD/target/release/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/clear-retype" \
+ruby tests/input_delivery_e2e.rb clear_retype
+```
+
+The mode starts an isolated 1920×1080 desktop, launches the ChatGPT Electron
+executable with a private profile, and installs a static synthetic document with
+CDP. It clicks the composer, types 250 ASCII characters, captures immediately,
+then copies and checks the exact field text through the session clipboard. It
+clears with Ctrl+A/Delete, captures the empty composer, retypes the same text,
+and repeats the checks. The clipboard sentinel prevents an old selection from
+passing a new copy check. A separate textarea case types after a real Return and
+verifies that its leading newline is retained.
+
+After Delete, Electron may remove the accessible blank-line placeholder when
+typing. In that case the receipt reports `unverified` with
+`atspi_transformed_blank_line`, preserving the original 251 expected / 250
+observed counts and the inspection/no-blind-retry warning. The probe still
+requires the independent copy to match all 250 requested bytes. A real newline
+retained by the field must remain normally verified. The mode saves PNGs,
+copied values, accessibility snapshots and MCP responses, and its `ensure`
+block stops the owned session.
+## Viewer input priority
+
 The Rust lifecycle case
 `viewer_input_only_pauses_agent_input_for_the_recent_quiet_period` also verifies
 viewer priority using an isolated outer desktop. It types into the viewer while
