@@ -5347,11 +5347,10 @@ impl KwinMcp {
     }
 
     async fn viewer_input_is_recent(&self) -> Result<bool, String> {
-        let guard = self.session.read().await;
-        let Some(session) = guard.as_ref() else {
-            return Ok(false);
-        };
-        let activity_path = session.host_xdg_dir.join(VIEWER_INPUT_ACTIVITY_FILE);
+        // Do not queue another session read lock while an input operation
+        // holds one: a waiting liveness writer would block the activity check
+        // that must cancel that operation. The owned workdir path is stable.
+        let activity_path = self.path.join(VIEWER_INPUT_ACTIVITY_FILE);
         let modified = match std::fs::metadata(&activity_path) {
             Ok(metadata) => metadata.modified().map_err(|error| {
                 format!(
@@ -7196,6 +7195,7 @@ async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
 const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const VIEWER_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
 const VIEWER_READY_WAIT: Duration = Duration::from_secs(6);
@@ -9297,6 +9297,8 @@ impl KwinMcp {
         // Inline entrypoint: starts dbus/kwin/services, reads stdin for launch_app
         // The host TMPDIR names the workdir's parent, which is read-only inside
         // bwrap. Keep session applications' temporary files in private /tmp.
+        let media_wait_attempts = STARTUP_TIMEOUT.as_millis() / STARTUP_POLL.as_millis();
+        let media_poll_seconds = STARTUP_POLL.as_secs_f64();
         let entrypoint = format!(
             "set -u\n\
             export TMPDIR=/tmp\n\
@@ -9321,6 +9323,13 @@ impl KwinMcp {
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
             pipewire &\n\
+            media_pid=$!\n\
+            for ((attempt=0; attempt<{media_wait_attempts}; attempt++)); do\n\
+                test -S \"$XDG_RUNTIME_DIR/pipewire-0\" && break\n\
+                kill -0 \"$media_pid\" 2>/dev/null || {{ echo 'private PipeWire exited before its socket was ready' >&2; exit 1; }}\n\
+                sleep {media_poll_seconds}\n\
+            done\n\
+            test -S \"$XDG_RUNTIME_DIR/pipewire-0\" || {{ echo 'private PipeWire socket startup timed out' >&2; exit 1; }}\n\
             wireplumber &\n\
             while read -r cmd; do\n\
                 eval \"$cmd\" &\n\
@@ -10228,7 +10237,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. Agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. If it interrupts an in-flight agent operation, remaining agent events are cancelled with retry_safe=false because some input may have arrived; inspect before retrying. New agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
     )]
     async fn viewer_open(
         &self,
@@ -13255,15 +13264,51 @@ impl rmcp::ServerHandler for SessionRouter {
         }
         let execution = session.clone();
         let operation = request.name.to_string();
-        let result = self
-            .limit
-            .layer(execution)
-            .oneshot(SessionCall {
+        let result = {
+            let call = self.limit.layer(execution).oneshot(SessionCall {
                 request,
                 context,
                 routes: self.routes.clone(),
-            })
-            .await;
+            });
+            if agent_input {
+                // Human input can begin after admission, during a paced type
+                // or drag. Cancel the remaining agent events as well as
+                // rejecting new calls. Dropping the call releases its held
+                // keys/buttons through SentInput before liveness inspection.
+                let viewer_activity = async {
+                    loop {
+                        tokio::time::sleep(VIEWER_INPUT_CHECK_INTERVAL).await;
+                        match session.viewer_input_is_recent().await {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                break McpError::internal_error(
+                                    "Viewer input interrupted the agent operation. Some input may already have arrived; inspect the target before retrying.",
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                break McpError::internal_error(
+                                    format!(
+                                        "Stopped agent input because viewer activity could not be checked: {error}. Some input may already have arrived; inspect before retrying."
+                                    ),
+                                    Some(
+                                        serde_json::json!({"reason":"viewer_activity_check_failed", "retry_safe":false, "submission_complete":false}),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = call => result,
+                    error = viewer_activity => Err(error),
+                }
+            } else {
+                call.await
+            }
+        };
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {

@@ -5,7 +5,7 @@ stdio server. It starts an outer isolated KWin desktop as the viewer's display
 and one 1400×1000 source desktop with a fresh Chrome profile and local HTML.
 It verifies the actual outer compositor pixels, viewer PID/window identity,
 title changes, and browser window continuity through two open/reuse/close
-rounds. Each reuse navigates the live browser to a different palette; the
+rounds. The first round closes the actual viewer window through the outer desktop using Alt+F4; the second uses viewer_close. Each reuse navigates the live browser to a different palette; the
 second open must create a new viewer in the same source session.
 
 Requires KDE Plasma 6, bubblewrap, PipeWire, Google Chrome, input-device access,
@@ -38,7 +38,7 @@ env KWIN_MCP_E2E=1 \
 Artifacts include the opened and reused viewer screenshots from each round.
 These capture transitions on the fixed build, not a comparison with the old
 renderer. The check does not exercise an existing browser profile, remote SSH
-viewing, authentication, or a user closing the window directly.
+viewing, authentication. Window-manager closure is exercised inside the isolated outer desktop.
 
 ## Captured transitions
 

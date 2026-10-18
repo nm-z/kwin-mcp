@@ -1887,6 +1887,110 @@ fn viewer_input_only_pauses_agent_input_for_the_recent_quiet_period() {
     );
 
     thread::sleep(Duration::from_millis(1100));
+    // Viewer input must interrupt an already admitted paced operation, too.
+    let input_log = started["result"]["structuredContent"]["input_log"]
+        .as_str()
+        .expect("input log path");
+    let interrupted_id = next_client_id;
+    next_client_id += 1;
+    let interrupted = thread::scope(|scope| {
+        let (begin_tx, begin_rx) = mpsc::channel();
+        let client = &mut client;
+        let typing = scope.spawn(move || {
+            begin_tx.send(()).expect("start agent typing");
+            call_tool(
+                client,
+                interrupted_id,
+                "keyboard_type",
+                json!({"session_id":session_id,"text":"x".repeat(300)}),
+            )
+        });
+        begin_rx.recv().expect("agent typing submitted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sent = std::fs::read_to_string(input_log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|record| {
+                    record["tool"]["request_id"] == interrupted_id
+                        && record["character"] == "x"
+                        && record["pressed"] == true
+                });
+            if sent {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent did not begin key submission"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let human = call_tool(
+            &mut desktop,
+            60,
+            "keyboard_key",
+            json!({"session_id":desktop_id,"key":"b"}),
+        );
+        assert!(human["error"].is_null(), "{human}");
+        let began = Instant::now();
+        let interrupted = typing.join().expect("agent typing completion");
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "agent typing did not yield promptly"
+        );
+        interrupted
+    });
+    assert_eq!(
+        interrupted["error"]["data"]["reason"], "viewer_input_interrupted",
+        "{interrupted}"
+    );
+    assert_eq!(
+        interrupted["error"]["data"]["retry_safe"], false,
+        "{interrupted}"
+    );
+    thread::sleep(Duration::from_millis(1100));
+    for key in ["ctrl+a", "ctrl+c"] {
+        let response = call_tool(
+            &mut client,
+            next_client_id,
+            "keyboard_key",
+            json!({"session_id":session_id,"key":key}),
+        );
+        next_client_id += 1;
+        assert!(response["error"].is_null(), "{response}");
+    }
+    let receipt = call_tool(
+        &mut client,
+        next_client_id,
+        "clipboard_read",
+        json!({"session_id":session_id}),
+    );
+    next_client_id += 1;
+    let text = receipt["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("interrupted field text");
+    assert!(
+        text.contains('b') && text.contains('x') && text.matches('x').count() < 300,
+        "human input lost or agent typing continued: {text}"
+    );
+    let interrupted_screen = call_tool(
+        &mut client,
+        next_client_id,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    next_client_id += 1;
+    save_inline_screenshot(&interrupted_screen, "viewer-interrupted-agent");
+    let cleared = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Backspace"}),
+    );
+    next_client_id += 1;
+    assert!(cleared["error"].is_null(), "{cleared}");
     let baseline_press = call_tool(
         &mut client,
         next_client_id,
@@ -7304,10 +7408,40 @@ fn viewer_displays_current_pixels_after_a_second_fresh_session() {
     let host_id = session_handle(&host);
     let display = workdir(&host).join("wayland-0");
     assert!(display.exists(), "private viewer display missing");
-    let mut client = RpcClient::start_with_env(&[(
-        "WAYLAND_DISPLAY",
-        display.to_str().expect("private display"),
-    )]);
+    // Force PipeWire to become ready after WirePlumber would otherwise start.
+    // Both are still real daemons; only their startup ordering is controlled.
+    let wrappers =
+        PathBuf::from("/var/tmp").join(format!("km-viewer-media-{}", std::process::id()));
+    std::fs::create_dir(&wrappers).expect("media wrapper directory");
+    let _wrappers = RemoveDirOnDrop(wrappers.clone());
+    use std::os::unix::fs::PermissionsExt;
+    for (name, script) in [
+        (
+            "pipewire",
+            "#!/bin/bash\nsleep 1\nexec /usr/bin/pipewire \"$@\"\n",
+        ),
+        (
+            "wireplumber",
+            "#!/bin/bash\ntest -S \"$XDG_RUNTIME_DIR/pipewire-0\" || { echo 'policy started before PipeWire socket' >&2; exit 98; }\nexec /usr/bin/wireplumber \"$@\"\n",
+        ),
+    ] {
+        let path = wrappers.join(name);
+        std::fs::write(&path, script).expect("media startup wrapper");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("executable wrapper");
+    }
+    let path = format!(
+        "{}:{}",
+        wrappers.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let mut client = RpcClient::start_with_env(&[
+        (
+            "WAYLAND_DISPLAY",
+            display.to_str().expect("private display"),
+        ),
+        ("PATH", &path),
+    ]);
     initialize(&mut client);
     let server_pid = client.child.id();
     let mut request = 2;
@@ -7439,6 +7573,27 @@ fn viewer_displays_current_pixels_after_a_second_fresh_session() {
         }
         let opened = client.response(open_request, Duration::from_secs(10));
         let log = std::fs::read_to_string(workdir(&started).join("viewer.log")).unwrap_or_default();
+        if opened["result"]["structuredContent"]["viewer"]["state"] != "ready"
+            && let Some(root) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR")
+        {
+            let root = PathBuf::from(root);
+            let runtime = workdir(&started);
+            let sandbox = client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(runtime.file_name().expect("workdir name"))
+                .join("sandbox.log");
+            let _ = std::fs::copy(sandbox, root.join("failed-sandbox.log"));
+            let _ = std::fs::write(root.join("failed-viewer.log"), &log);
+            if let Ok(graph) = Command::new("timeout")
+                .args(["3", "pw-dump", "--remote"])
+                .arg(runtime.join("pipewire-0"))
+                .output()
+            {
+                let _ = std::fs::write(root.join("failed-pipewire.json"), graph.stdout);
+                let _ = std::fs::write(root.join("failed-pipewire.stderr"), graph.stderr);
+            }
+        }
         assert_eq!(
             opened["result"]["structuredContent"]["viewer"]["state"],
             "ready",
@@ -8272,8 +8427,20 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
     const COLOR_TOLERANCE: u8 = 16;
 
     fn tool(client: &mut RpcClient, request: &mut u64, name: &str, args: Value) -> Value {
-        let response = call_tool(client, *request, name, args);
-        *request += 1;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let response = loop {
+            let response = call_tool(client, *request, name, args.clone());
+            *request += 1;
+            if response["error"]["data"]["reason"] == "recent_viewer_input"
+                && response["error"]["data"]["retry_safe"] == true
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            break response;
+        };
+
         assert!(response["error"].is_null(), "{response}");
         assert!(
             !response["result"]["isError"].as_bool().unwrap_or(false),
@@ -8449,7 +8616,14 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
             Some(pid),
             "reopen did not create a new viewer"
         );
+        if let Some(previous) = previous_pid {
+            assert!(
+                !process_alive(u32::try_from(previous).expect("old PID fits")).unwrap_or(true),
+                "reopen did not reap the old viewer"
+            );
+        }
         let mut window_id = None;
+
         for (phase, reason) in [
             ("opened", "Inspect the current frame"),
             ("reused", "Enter the verification code"),
@@ -8544,15 +8718,40 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
                 .any(|window| Some(&window["id"]) == browser_id.as_ref()),
             "browser was replaced: {windows}"
         );
-        let closed = tool(
-            &mut client,
-            &mut request,
-            "viewer_close",
-            json!({"session_id":session}),
-        );
-        assert_eq!(closed["result"]["structuredContent"]["status"], "closed");
+        if round == 0 {
+            // Exercise an actual window-manager close through the outer MCP
+            // desktop, rather than relying only on viewer_close.
+            tool(
+                &mut desktop,
+                &mut host_request,
+                "window_activate",
+                json!({"session_id":host_id,"window_id":window_id}),
+            );
+            tool(
+                &mut desktop,
+                &mut host_request,
+                "keyboard_key",
+                json!({"session_id":host_id,"key":"alt+F4"}),
+            );
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            while process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(false) {
+                assert!(
+                    Instant::now() < deadline,
+                    "viewer process survived window close"
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+        } else {
+            let closed = tool(
+                &mut client,
+                &mut request,
+                "viewer_close",
+                json!({"session_id":session}),
+            );
+            assert_eq!(closed["result"]["structuredContent"]["status"], "closed");
+        }
         assert!(
-            !process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(true),
+            round == 0 || !process_alive(u32::try_from(pid).expect("PID fits")).unwrap_or(true),
             "viewer process survived close"
         );
         let windows = tool(
