@@ -8139,6 +8139,24 @@ fn launches_chromium(command: &str) -> bool {
         })
 }
 
+/// Whether the command asks branded Google Chrome to load an unpacked
+/// extension. Current Google Chrome builds ignore this switch even when the
+/// DisableLoadExtensionCommandLineSwitch feature is disabled.
+fn requests_blocked_google_chrome_extension_load(command: &str) -> bool {
+    let is_google_chrome = command
+        .split_whitespace()
+        .find(|word| !word.contains('='))
+        .map(|program| program.trim_matches(|character| character == '\'' || character == '"'))
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| matches!(name, "google-chrome" | "google-chrome-stable"));
+    let requests_extension_load = command.split_whitespace().any(|argument| {
+        let argument = argument.trim_matches(|character| character == '\'' || character == '"');
+        argument == "--load-extension" || argument.starts_with("--load-extension=")
+    });
+    is_google_chrome && requests_extension_load
+}
+
 const BROWSER_COMMANDS: &[&str] = &[
     "google-chrome-stable",
     "google-chrome",
@@ -13924,7 +13942,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. The server assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. The server assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Branded Google Chrome ignores --load-extension; when requested, the result reports this and points to chrome://extensions > Load unpacked. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -14267,10 +14285,18 @@ impl KwinMcp {
         let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
             format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
         });
-        let suffix = warning
-            .as_deref()
-            .map(|text| format!(". {text}"))
-            .unwrap_or_default();
+        let extension_warning = requests_blocked_google_chrome_extension_load(&params.command)
+            .then(|| {
+                "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
+            });
+        let mut suffix = String::new();
+        for text in [warning.as_deref(), extension_warning.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            suffix.push_str(". ");
+            suffix.push_str(text);
+        }
         let baseline_note = match baseline {
             WindowBaseline::PreLaunch => "",
             WindowBaseline::AfterSubmit => {
@@ -14296,6 +14322,7 @@ impl KwinMcp {
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_title": geo.title,
                     "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
+                    "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(),
                 })).await)
@@ -14311,12 +14338,24 @@ impl KwinMcp {
                     0 if browser_unattributed => format!(
                         "launched: {} (browser launch returned status 0, but no matching existing window could be attributed: {} after {}s){suffix}",
                         params.command,
-                        handoff_reason.as_deref().unwrap_or("KWin reported no attributable window change"),
+                        handoff_reason
+                            .as_deref()
+                            .unwrap_or("KWin reported no attributable window change"),
                         window_timeout.as_secs(),
                     ),
-                    0 => format!("launched: {} (exited with status 0; no window after {}s){suffix}", params.command, window_timeout.as_secs()),
-                    127 => format!("{} failed: command not found (exit status 127)", params.command),
-                    _ => format!("{} exited with status {status} without opening a window", params.command),
+                    0 => format!(
+                        "launched: {} (exited with status 0; no window after {}s){suffix}",
+                        params.command,
+                        window_timeout.as_secs()
+                    ),
+                    127 => format!(
+                        "{} failed: command not found (exit status 127)",
+                        params.command
+                    ),
+                    _ => format!(
+                        "{} exited with status {status} without opening a window",
+                        params.command
+                    ),
                 };
                 let text = format!("{text}{}", exit_diagnostics_text(&diagnostics));
                 let window_outcome = if browser_unattributed {
@@ -14329,6 +14368,7 @@ impl KwinMcp {
                     "window": if browser_unattributed { "unattributed" } else { "exited" },
                     "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "cdp_port": null, "warning": warning,
+                    "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(),
                     "stderr_tail": diagnostics.stderr,
@@ -14349,7 +14389,8 @@ impl KwinMcp {
             (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
                 "action": "launch", "command": params.command, "window": "timeout",
                 "window_outcome": "timeout",
-                "cdp": false, "cdp_port": null, "warning": warning, "stage": "waiting for a window", "command_submitted": true,
+                "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
+                "stage": "waiting for a window", "command_submitted": true,
                 "window_timeout_seconds": window_timeout.as_secs(),
                 "window_baseline": baseline.as_str(),
             })).await),
@@ -17066,7 +17107,7 @@ mod window_resolution_tests {
 
 #[cfg(test)]
 mod launch_warning_tests {
-    use super::launches_chromium;
+    use super::{launches_chromium, requests_blocked_google_chrome_extension_load};
 
     #[test]
     fn chromium_family_commands_are_recognized() {
@@ -17077,6 +17118,25 @@ mod launch_warning_tests {
         assert!(!launches_chromium("code ."));
         assert!(!launches_chromium("kate notes.txt"));
         assert!(!launches_chromium(""));
+    }
+
+    #[test]
+    fn branded_chrome_extension_switch_is_reported_but_chromium_is_not() {
+        assert!(requests_blocked_google_chrome_extension_load(
+            "google-chrome-stable --disable-features=DisableLoadExtensionCommandLineSwitch --load-extension=/tmp/extension"
+        ));
+        assert!(requests_blocked_google_chrome_extension_load(
+            "/usr/bin/google-chrome --load-extension /tmp/extension"
+        ));
+        assert!(!requests_blocked_google_chrome_extension_load(
+            "chromium --load-extension=/tmp/extension"
+        ));
+        assert!(!requests_blocked_google_chrome_extension_load(
+            "google-chrome-stable --new-window chrome://extensions"
+        ));
+        assert!(!requests_blocked_google_chrome_extension_load(
+            "code --load-extension=/tmp/extension"
+        ));
     }
 }
 
