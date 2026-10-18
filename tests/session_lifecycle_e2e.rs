@@ -346,8 +346,7 @@ impl RpcClient {
 
     fn stop_process(mut self) {
         self.cleanup_sessions();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.stdin.take());
     }
 
     fn cleanup_sessions(&mut self) {
@@ -5541,11 +5540,7 @@ fn discovery_creates_no_session_processes() {
             "string"
         );
     }
-    let session_server_pid = if client.child.id() == u32::MAX {
-        client.child.id() - 1
-    } else {
-        client.child.id() + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let unavailable = call_tool(
         &mut client,
@@ -5706,12 +5701,7 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
     let server_pid = client.child.id();
-    let next_pid = server_pid.saturating_add(1);
-    let session_server_pid = if next_pid == server_pid {
-        server_pid - 1
-    } else {
-        next_pid
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
 
     let response = call_tool(
@@ -5745,6 +5735,271 @@ fn unknown_session_from_another_server_reports_recovery_guidance() {
 }
 
 #[test]
+fn silent_session_owner_handshake_has_a_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = PathBuf::from(host_runtime_dir())
+        .join(format!("kwin-mcp-control-{}.sock", std::process::id()));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("private silent owner socket");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("socket permissions");
+    struct RemoveSocket(PathBuf);
+    impl Drop for RemoveSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _socket = RemoveSocket(path);
+    let (done_tx, done_rx) = mpsc::channel();
+    let fixture = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("owner connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("read deadline");
+        let mut reader = BufReader::new(stream);
+        let mut initialize = String::new();
+        reader
+            .read_line(&mut initialize)
+            .expect("initialization request");
+        assert!(initialize.contains("initialize"), "{initialize}");
+        let _ = done_rx.recv_timeout(Duration::from_secs(8));
+    });
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let began = Instant::now();
+    let response = call_tool(
+        &mut caller,
+        2,
+        "window_list",
+        json!({"session_id":format!("s{}-1", std::process::id())}),
+    );
+    let elapsed = began.elapsed();
+    let _ = done_tx.send(());
+    fixture.join().expect("silent owner fixture");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "owner handshake did not time out: {elapsed:?}"
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "different_server_process",
+        "{response}"
+    );
+    caller.stop_process();
+}
+
+#[test]
+fn unknown_session_from_a_live_server_is_checked_by_its_owner() {
+    let mut owner = RpcClient::start();
+    initialize(&mut owner);
+    let owner_pid = owner.child.id();
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let session_id = format!("s{owner_pid}-999999");
+
+    let response = call_tool(
+        &mut caller,
+        2,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "session_not_found",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["server_pid"], owner_pid,
+        "{response}"
+    );
+    assert_ne!(response["error"]["data"]["server_pid"], caller.child.id());
+
+    drop(caller);
+    drop(owner);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, input devices, and a live GPU session"]
+fn live_session_tools_are_forwarded_to_the_owner_process() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    // Both desktops belong to this test; the caller's desktop hosts the viewer.
+    let mut caller = RpcClient::start();
+    initialize(&mut caller);
+    let outer = call_tool(
+        &mut caller,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let caller_id = session_handle(&outer);
+    let display = workdir(&outer).join("wayland-0");
+    let mut owner =
+        RpcClient::start_with_env(&[("WAYLAND_DISPLAY", display.to_str().expect("display"))]);
+    initialize(&mut owner);
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_id = session_handle(&started);
+    let launched = call_tool(
+        &mut owner,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":"konsole --separate --nofork -e bash --noprofile --norc"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let window_id = launched["result"]["structuredContent"]["window"].clone();
+    let windows = call_tool(
+        &mut caller,
+        3,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|windows| windows.iter().any(|window| window["id"] == window_id)),
+        "{windows}"
+    );
+    let opened = call_tool(
+        &mut caller,
+        4,
+        "viewer_open",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{opened}"
+    );
+    let viewer_pid = u32::try_from(
+        opened["result"]["structuredContent"]["viewer"]["pid"]
+            .as_u64()
+            .expect("viewer PID"),
+    )
+    .expect("PID fits");
+    let command = "printf routed-owner-proof > \"$HOME/routed-proof\"";
+    let typed = call_tool(
+        &mut caller,
+        5,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":command}),
+    );
+    assert!(typed["error"].is_null(), "{typed}");
+    assert_eq!(
+        typed["result"]["structuredContent"]["retry_safe"], false,
+        "{typed}"
+    );
+    let returned = call_tool(
+        &mut caller,
+        6,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(returned["error"].is_null(), "{returned}");
+    let proof = caller.home.join("routed-proof.txt");
+    let exported = call_tool(
+        &mut caller,
+        7,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-proof"),"host_path":proof}),
+    );
+    assert!(exported["error"].is_null(), "{exported}");
+    assert_eq!(
+        std::fs::read_to_string(&proof).expect("exported proof"),
+        "routed-owner-proof"
+    );
+    let prefix = call_tool(
+        &mut caller,
+        20,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"printf %s '"}),
+    );
+    assert!(prefix["error"].is_null(), "{prefix}");
+    for index in 0..12 {
+        caller.send(100 + index, "tools/call", json!({"name":"keyboard_type","arguments":{"session_id":session_id,"text":format!("{index},")}}));
+    }
+    for index in 0..12 {
+        let response = caller.response(100 + index, Duration::from_secs(30));
+        assert!(response["error"].is_null(), "{response}");
+    }
+    let suffix = call_tool(
+        &mut caller,
+        21,
+        "keyboard_type",
+        json!({"session_id":session_id,"text":"' > \"$HOME/routed-order\""}),
+    );
+    assert!(suffix["error"].is_null(), "{suffix}");
+    let submitted = call_tool(
+        &mut caller,
+        22,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Return"}),
+    );
+    assert!(submitted["error"].is_null(), "{submitted}");
+    let ordered_proof = caller.home.join("routed-order.txt");
+    let exported_order = call_tool(
+        &mut caller,
+        23,
+        "export_file",
+        json!({"session_id":session_id,"session_path":owner.home.join("routed-order"),"host_path":ordered_proof}),
+    );
+    assert!(exported_order["error"].is_null(), "{exported_order}");
+    assert_eq!(
+        std::fs::read_to_string(ordered_proof).expect("ordered output"),
+        (0..12).map(|index| format!("{index},")).collect::<String>(),
+        "forwarded input lost wire order"
+    );
+    let log = std::fs::read_to_string(
+        started["result"]["structuredContent"]["input_log"]
+            .as_str()
+            .expect("input log"),
+    )
+    .expect("owner audit");
+    assert!(
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|record| record["typing"]["characters"] == command),
+        "owner did not audit routed text"
+    );
+    let closed = call_tool(
+        &mut caller,
+        8,
+        "viewer_close",
+        json!({"session_id":session_id}),
+    );
+    assert!(closed["error"].is_null(), "{closed}");
+    assert!(
+        !process_alive(viewer_pid).unwrap_or(true),
+        "forwarded close did not reap viewer"
+    );
+    let stopped = call_tool(
+        &mut caller,
+        9,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    owner.sessions.retain(|owned| owned != &session_id);
+    assert!(!workdir(&started).exists(), "owner workdir remains");
+    let listed = call_tool(&mut owner, 4, "session_list", json!({}));
+    assert!(
+        listed["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{listed}"
+    );
+    let caller_sessions = call_tool(&mut caller, 10, "session_list", json!({}));
+    assert!(
+        caller_sessions["result"]["structuredContent"]["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1 && sessions[0]["session_id"] == caller_id),
+        "forwarding affected caller's desktop: {caller_sessions}"
+    );
+    caller.stop_process();
+    owner.stop_process();
+}
+
+#[test]
 fn malformed_session_lifecycle_record_is_an_error() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5760,11 +6015,7 @@ fn malformed_session_lifecycle_record_is_an_error() {
     initialize(&mut client);
 
     let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let malformed = format!(
         "{}\n",
@@ -5821,12 +6072,7 @@ fn oversized_session_lifecycle_log_is_trimmed_during_lookup() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let session_server_pid = if server_pid == u32::MAX {
-        server_pid - 1
-    } else {
-        server_pid + 1
-    };
+    let session_server_pid = u32::MAX;
     let session_id = format!("s{session_server_pid}-1");
     let seed_record = format!(
         "{}\n",
@@ -5962,7 +6208,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         timed_out["error"]["data"]["stage"]
             .as_str()
             .expect("stage")
-            .contains("active window")
+            .contains("windows before launch")
     );
     assert!(
         (19_000..23_000).contains(&elapsed_ms),
@@ -5974,14 +6220,20 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let scripts = std::fs::read_dir(&workdir)
-            .expect("workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let scripts = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir.file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if scripts == 0 {
             break;
         }
@@ -6496,14 +6748,20 @@ fn one_process_routes_parallel_sessions_and_orders_input_on_stdio() {
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let concurrent = std::fs::read_dir(workdir(&a))
-            .expect("A workdir")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
-                    && entry.path().extension().is_some_and(|ext| ext == "js")
-            })
-            .count();
+        let concurrent = std::fs::read_dir(
+            client
+                .home
+                .join(".cache/kwin-mcp")
+                .join(workdir(&a).file_name().expect("workdir name"))
+                .join("kwin-scripts"),
+        )
+        .expect("A workdir")
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with("kwin-mcp-")
+                && entry.path().extension().is_some_and(|ext| ext == "js")
+        })
+        .count();
         if concurrent >= 2 {
             break;
         }
