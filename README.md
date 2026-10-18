@@ -131,6 +131,37 @@ absolute paths under HOME in `writable_paths` when starting a new session.
 Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
+### Live application state (Codex / ChatGPT desktop)
+
+Codex needs to write its SQLite state, logs and thread history. These can exceed
+the 64 MiB copy limit, and databases open in WAL mode on the host are normally
+read-only in a session regardless of size. A private `writable_paths` copy also
+cannot deliver a message to the real host thread.
+
+To run against live host state, explicitly share the application state directory
+when starting a **new** session. For example, with HOME `/home/nate`:
+
+```json
+{"host_write_paths":["/home/nate/.codex"]}
+```
+
+Then use `launch_app` with `chatgpt`. Use the actual state directory if Codex has
+a custom `CODEX_HOME`. Each selected directory is bound directly into the session;
+its databases, WAL, shared memory and newly created sidecars use the host inodes
+and SQLite locks. Startup does not copy this subtree or impose the staging size
+limit. Writes, messages and deletions in these directories persist on the host,
+including after `session_stop`. Do not use this option for disposable work.
+
+`host_write_paths` accepts existing directories strictly beneath HOME. It rejects
+symlinked paths, parent traversal and HOME itself. Selections cannot overlap
+browser profile directories, Chrome's cache, saved browser-cookie state, session
+storage or the host runtime directory, including their ancestors and descendants.
+They also cannot overlap private `writable_paths`. Existing host Unix sockets
+within shared directories remain blocked. Other HOME paths retain their private
+overlays. `session_start` and `session_list` report the selected directories; the
+setting survives server reload.
+Omitting the option retains the default isolation.
+
 ### Session memory limits
 
 Each stdio server watches its launching client with a Linux pidfd. When that

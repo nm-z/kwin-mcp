@@ -4909,6 +4909,311 @@ fn session_start_binds_large_live_codex_state_without_copying_it() {
 }
 
 #[test]
+#[ignore = "requires KDE, bubblewrap, Konsole, squashfuse, mksquashfs, input devices and a filtered test D-Bus proxy; set KWIN_MCP_TEST_TMPDIR under /var/tmp"]
+fn session_can_explicitly_share_live_codex_state() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let address = require_filtered_cookie_test_bus();
+    let mut client = RpcClient::start_with_env(&[
+        ("DBUS_SESSION_BUS_ADDRESS", address.as_str()),
+        ("KWIN_MCP_E2E_COPY_BINARY", "1"),
+    ]);
+    assert!(
+        client.home.starts_with("/var/tmp"),
+        "mount fixture must stay outside the real HOME"
+    );
+    let codex = client.home.join(".codex");
+    std::fs::create_dir(&codex).expect("create Codex state directory");
+    // Force the split overlay path responsible for oversized ancestor files.
+    let portal = codex.join("portal");
+    let source = client.home.join("mount-source");
+    std::fs::create_dir(&portal).expect("mountpoint");
+    std::fs::create_dir(&source).expect("mount source");
+    std::fs::write(source.join("fixture"), "mounted").expect("mount fixture");
+    let image = client.home.join("mount.squashfs");
+    assert!(
+        Command::new("mksquashfs")
+            .arg(&source)
+            .arg(&image)
+            .args(["-noappend", "-processors", "1", "-quiet"])
+            .stdout(Stdio::null())
+            .status()
+            .expect("create fixture image")
+            .success()
+    );
+    struct FixtureMount(Child, PathBuf);
+    impl Drop for FixtureMount {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3").arg("-u").arg(&self.1).status();
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mount = FixtureMount(
+        Command::new("squashfuse")
+            .arg("-f")
+            .arg(&image)
+            .arg(&portal)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("mount owned fixture"),
+        portal.clone(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !procfs::process::Process::myself()
+        .expect("self")
+        .mountinfo()
+        .expect("mount inventory")
+        .0
+        .iter()
+        .any(|mount| mount.mount_point == portal)
+    {
+        assert!(Instant::now() < deadline, "fixture mount did not appear");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let socket_path = codex.join("host-app.sock");
+    let _socket =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("host socket fixture");
+    let oversized = codex.join("large-state.bin");
+    std::fs::File::create(&oversized)
+        .expect("inactive state fixture")
+        .set_len(128 * 1024 * 1024)
+        .expect("oversized sparse state");
+    let database = codex.join("state_5.sqlite");
+    let host = rusqlite::Connection::open(&database).expect("open host fixture");
+    host.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE state (value TEXT);
+         INSERT INTO state VALUES ('host');
+         CREATE TABLE large (body BLOB);
+         INSERT INTO large VALUES (zeroblob(67108865));",
+    )
+    .expect("seed oversized live state");
+    std::fs::write(client.home.join("private.txt"), "host").expect("private fixture");
+    initialize(&mut client);
+
+    let alias = client.home.join("state-alias");
+    std::os::unix::fs::symlink(&codex, &alias).expect("fixture symlink");
+    for private in [
+        ".cache/google-chrome",
+        ".local/state/kwin-mcp/browser-cookies",
+    ] {
+        std::fs::create_dir_all(client.home.join(private)).expect("private state fixture");
+    }
+    for (index, paths) in [
+        json!([client.home]),
+        json!([client.home.join("missing")]),
+        json!([database]),
+        json!([alias]),
+        json!([codex.join("..")]),
+        json!([client.home.join(".config")]),
+        json!([client.home.join(".cache")]),
+        json!([client.home.join(".cache/google-chrome")]),
+        json!([client.home.join(".local")]),
+        json!([client.home.join(".local/state")]),
+        json!([client.home.join(".local/state/kwin-mcp/browser-cookies")]),
+        json!(["/var/tmp"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rejected = call_tool(
+            &mut client,
+            100 + u64::try_from(index).expect("request ID"),
+            "session_start",
+            json!({"host_write_paths":paths}),
+        );
+        assert!(
+            rejected["result"]["isError"] == true || !rejected["error"].is_null(),
+            "{rejected}"
+        );
+        assert!(
+            rejected.to_string().contains("host_write_paths"),
+            "{rejected}"
+        );
+    }
+    let conflicting = call_tool(
+        &mut client,
+        20,
+        "session_start",
+        json!({"host_write_paths":[codex], "writable_paths":[database]}),
+    );
+    assert!(
+        conflicting.to_string().contains("conflicts"),
+        "{conflicting}"
+    );
+
+    for (index, shared) in [false, true].into_iter().enumerate() {
+        let request = 30 + 10 * u64::try_from(index).expect("request ID");
+        let mut params = json!({"width":640,"height":480});
+        if shared {
+            params["host_write_paths"] = json!([codex]);
+        }
+        let started = call_tool(&mut client, request, "session_start", params);
+        let directory = workdir(&started);
+        if shared {
+            let binary = client.binary_copy.as_ref().expect("private executable");
+            let replacement = binary.with_extension("next");
+            std::fs::copy(binary, &replacement).expect("stage replacement executable");
+            std::fs::rename(&replacement, binary).expect("publish replacement executable");
+            client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+            client
+                .wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+        }
+        let layers = client
+            .home
+            .join(".cache/kwin-mcp")
+            .join(directory.file_name().expect("workdir name"));
+        if shared {
+            for name in ["state_5.sqlite", "state_5.sqlite-wal", "large-state.bin"] {
+                assert!(
+                    !layers.join("overlay-root/.codex").join(name).exists(),
+                    "copied shared state: {name}"
+                );
+            }
+        }
+        let expected_paths = if shared { json!([codex]) } else { json!([]) };
+        assert_eq!(
+            started["result"]["structuredContent"]["host_write_paths"], expected_paths,
+            "{started}"
+        );
+        let listed = call_tool(&mut client, request + 1, "session_list", json!({}));
+        assert_eq!(
+            listed["result"]["structuredContent"]["sessions"][0]["host_write_paths"],
+            expected_paths,
+            "{listed}"
+        );
+        if shared {
+            assert!(
+                !started["result"]["structuredContent"]["oversized_read_only_files"]
+                    .as_array()
+                    .expect("oversized report")
+                    .contains(&json!(oversized)),
+                "shared state reported read-only: {started}"
+            );
+        }
+        let report = directory.join("live-state-report");
+        let probe = directory.join("live-state-probe");
+        std::fs::copy(std::env::current_exe().expect("test executable"), &probe)
+            .expect("copy Rust probe");
+        let quote = |path: &std::path::Path| {
+            shlex::try_quote(path.to_str().expect("UTF-8 path"))
+                .expect("quote path")
+                .into_owned()
+        };
+        let private_file = client.home.join("private.txt");
+        let launched = call_tool(
+            &mut client,
+            request + 2,
+            "launch_app",
+            json!({"command":format!(
+            "KWIN_LIVE_STATE_DB={} KWIN_LIVE_STATE_PRIVATE={} KWIN_LIVE_STATE_REPORT={} KWIN_LIVE_STATE_SOCKET={} KWIN_LIVE_STATE_SHARED={} {} --ignored --exact session_live_state_probe --nocapture; konsole",
+            quote(&database), quote(&private_file), quote(&report), quote(&socket_path), shared, quote(&probe),
+            )}),
+        );
+        assert!(launched["error"].is_null(), "{launched}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while std::fs::read_to_string(&report).ok().as_deref() != Some("PASS\n") {
+            assert!(
+                Instant::now() < deadline,
+                "live state probe failed: {launched}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        let count: i64 = host
+            .query_row(
+                "SELECT count(*) FROM state WHERE value='session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("host observes session writes");
+        assert_eq!(count, i64::from(shared));
+        if shared {
+            use std::io::Read;
+            let mut header = [0; 13];
+            std::fs::File::open(&oversized)
+                .expect("oversized host state")
+                .read_exact(&mut header)
+                .expect("host write evidence");
+            assert_eq!(&header, b"session-state");
+        }
+        assert_eq!(
+            std::fs::read_to_string(client.home.join("private.txt")).expect("host private file"),
+            "host"
+        );
+        let stopped = call_tool(&mut client, request + 3, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+        assert!(!directory.exists(), "session cleanup");
+    }
+    drop(host);
+    let reopened = rusqlite::Connection::open(&database).expect("persistent state");
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT count(*) FROM state WHERE value='session'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("persistent row"),
+        1
+    );
+    assert_eq!(
+        reopened
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .expect("integrity"),
+        "ok"
+    );
+    drop(reopened);
+    drop(mount);
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "helper launched by session_can_explicitly_share_live_codex_state"]
+fn session_live_state_probe() {
+    let database = std::env::var("KWIN_LIVE_STATE_DB").expect("database path");
+    let shared = std::env::var("KWIN_LIVE_STATE_SHARED").expect("sharing mode") == "true";
+    if shared {
+        assert!(
+            std::os::unix::net::UnixStream::connect(
+                std::env::var("KWIN_LIVE_STATE_SOCKET").expect("socket path")
+            )
+            .is_err(),
+            "shared state exposed a host app socket"
+        );
+    }
+    let connection = rusqlite::Connection::open(&database).expect("open session state");
+    let inserted = connection.execute("INSERT INTO state VALUES ('session')", []);
+    assert_eq!(inserted.is_ok(), shared, "{inserted:?}");
+    if shared {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(PathBuf::from(&database).with_file_name("large-state.bin"))
+            .expect("open oversized live state writable")
+            .write_all(b"session-state")
+            .expect("write oversized live state");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint live WAL");
+        drop(connection);
+        let connection = rusqlite::Connection::open(&database).expect("reopen live database");
+        connection.execute_batch("CREATE TABLE recreated_sidecar (value TEXT); INSERT INTO recreated_sidecar VALUES ('live');").expect("write after checkpoint");
+    }
+    std::fs::write(
+        std::env::var("KWIN_LIVE_STATE_PRIVATE").expect("private file"),
+        "session",
+    )
+    .expect("private overlay write");
+    std::fs::write(
+        std::env::var("KWIN_LIVE_STATE_REPORT").expect("report"),
+        "PASS\n",
+    )
+    .expect("probe report");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn application_binary_stderr_keeps_screenshots_and_shutdown_working() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
