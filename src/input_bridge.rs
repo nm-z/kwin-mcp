@@ -1129,9 +1129,6 @@ impl TextReceipt {
         bounds: [f64; 4],
         input: &str,
     ) -> anyhow::Result<Self> {
-        if input.contains(['\t', '\n']) {
-            anyhow::bail!("Tab or Return may change focus or submit the field");
-        }
         if title.is_empty() {
             anyhow::bail!("there is no active window");
         }
@@ -1227,6 +1224,12 @@ impl TextReceipt {
                         }
                     }
                     if focused && states.contains(atspi::State::Editable) {
+                        if input.contains(['\t', '\n']) {
+                            return Err(UnverifiedTypingTarget(
+                                "Tab or Return may change focus or submit the field".to_owned(),
+                            )
+                            .into());
+                        }
                         let text = node.proxies().await?.text().await?;
                         let count = text.character_count().await?;
                         if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {
