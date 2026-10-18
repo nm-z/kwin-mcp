@@ -3135,6 +3135,80 @@ async fn wait_for_socket(
     }
 }
 
+fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
+    use std::io::Read;
+    const DIAGNOSTIC_LIMIT: u64 = 16 * 1024;
+
+    // Read a regular file instead of a pipe: a noisy daemon must not block on
+    // stderr while we wait for its socket, and a live child must not hold up EOF.
+    let diagnostics = (|| -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(stderr_path)?
+            .take(DIAGNOSTIC_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > DIAGNOSTIC_LIMIT;
+        if truncated {
+            bytes.pop();
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(format!(
+            "{}{}",
+            text.trim(),
+            if truncated { " [truncated]" } else { "" }
+        ))
+    })();
+    match diagnostics {
+        Ok(text) if text.is_empty() => format!(
+            "{message}; dbus-daemon stderr at {} is empty",
+            stderr_path.display()
+        ),
+        Ok(text) => format!(
+            "{message}; dbus-daemon stderr at {}: {text}",
+            stderr_path.display()
+        ),
+        Err(error) => format!(
+            "{message}; read dbus-daemon stderr at {}: {error}",
+            stderr_path.display()
+        ),
+    }
+}
+
+async fn wait_for_wallet_bus(
+    child: &mut std::process::Child,
+    socket: &Path,
+    stderr_path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let deadline = std::time::Instant::now() + DBUS_PROXY_TIMEOUT;
+    loop {
+        let error = match child.try_wait() {
+            Ok(Some(status)) => Some(format!(
+                "KWallet bus dbus-daemon exited with {status} before startup completed at {}",
+                socket.display()
+            )),
+            Err(error) => Some(format!("check KWallet bus dbus-daemon: {error}")),
+            Ok(None) => None,
+        };
+        if let Some(error) = error {
+            return Err(wallet_bus_startup_error(error, stderr_path));
+        }
+        if std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(wallet_bus_startup_error(
+                format!(
+                    "KWallet bus socket did not appear at {} within {}s",
+                    socket.display(),
+                    DBUS_PROXY_TIMEOUT.as_secs()
+                ),
+                stderr_path,
+            ));
+        }
+        tokio::time::sleep(DBUS_PROXY_POLL).await;
+    }
+}
+
 async fn connect_session_bus(
     address: &str,
     deadline: std::time::Instant,
@@ -8940,21 +9014,29 @@ impl KwinMcp {
         ) {
             return cleanup_err(format!("write KWallet bus config: {error}"), &mut startup);
         }
+        let wallet_bus_stderr_path = host_xdg_dir.join("kwallet-bus.stderr");
+        let wallet_bus_stderr = match std::fs::File::create(&wallet_bus_stderr_path) {
+            Ok(file) => file,
+            Err(error) => {
+                return cleanup_err(format!("create KWallet bus stderr: {error}"), &mut startup);
+            }
+        };
         let mut wallet_bus = std::process::Command::new("dbus-daemon");
         wallet_bus
             .arg(format!("--config-file={}", wallet_bus_config.display()))
             .args(["--nofork", "--nopidfile"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::from(wallet_bus_stderr));
         terminate_with_parent(&mut wallet_bus);
+        let wallet_bus_index = startup.service_proxy_children.len();
         match spawn_session_child(wallet_bus, false).await {
             Ok(child) => startup.add_proxy(child),
             Err(error) => return cleanup_err(format!("start KWallet bus: {error}"), &mut startup),
         }
-        if let Err(error) = wait_for_socket(
+        if let Err(error) = wait_for_wallet_bus(
+            &mut startup.service_proxy_children[wallet_bus_index],
             &wallet_bus_socket,
-            "KWallet bus socket",
-            std::time::Instant::now() + DBUS_PROXY_TIMEOUT,
+            &wallet_bus_stderr_path,
         )
         .await
         {
