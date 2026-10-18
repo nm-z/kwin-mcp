@@ -6170,9 +6170,15 @@ fn prior_manual_stop_and_ttl_expiry_report_terminal_session_status() {
     let mut client = RpcClient::start_with_env(&extra_env);
     initialize(&mut client);
 
-    let server_pid = client.child.id();
-    let stopped_pid = server_pid.saturating_add(1);
-    let expired_pid = server_pid.saturating_add(2);
+    // Adjacent OS PIDs can belong to concurrent real test servers. Their
+    // control sockets would forward these synthetic IDs outside this fixture.
+    let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .expect("kernel PID limit")
+        .trim()
+        .parse()
+        .expect("PID limit");
+    let stopped_pid = pid_max.checked_add(1).expect("synthetic stopped PID");
+    let expired_pid = pid_max.checked_add(2).expect("synthetic expired PID");
     let stopped_id = format!("s{stopped_pid}-1");
     let expired_id = format!("s{expired_pid}-1");
     let records = [
