@@ -1058,6 +1058,21 @@ impl std::fmt::Display for FocusNotEditable {
 
 impl std::error::Error for FocusNotEditable {}
 
+/// Keyboard focus is on a terminal. AT-SPI exposes no readable text for it.
+#[derive(Debug)]
+pub struct TerminalFocus;
+
+impl std::fmt::Display for TerminalFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the focused control is a terminal, which AT-SPI cannot read back"
+        )
+    }
+}
+
+impl std::error::Error for TerminalFocus {}
+
 impl TextDelivery {
     /// No characters were submitted, and focus is on a control that is not
     /// editable text. Non-editable focus alone cannot prove sent keys missed
@@ -1072,6 +1087,44 @@ impl TextDelivery {
             warning: Some(format!(
                 "{focus}, so the text did not go into a field. Click the field first (a disabled field cannot take focus), then type again."
             )),
+        }
+    }
+
+    /// Keys were acknowledged while focus was on a terminal. The terminal's
+    /// output is the only evidence of delivery, so this is never a rejection.
+    pub fn terminal_unverified() -> Self {
+        Self {
+            status: "unverified",
+            method: "terminal",
+            compositor_acknowledged: true,
+            expected_field_characters: None,
+            observed_field_characters: None,
+            warning: Some(
+                "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output before sending or retrying; retyping can run the command again.".to_owned(),
+            ),
+        }
+    }
+
+    /// Classifies a field that could not be read before typing. `before` is the
+    /// pre-typing error and `after` is the read taken with no new input.
+    /// `not_in_field` is only reported when no characters were submitted.
+    pub fn unreadable_field_delivery(
+        submitted: usize,
+        before: &anyhow::Error,
+        after: &anyhow::Error,
+    ) -> Self {
+        if before.is::<TerminalFocus>() || after.is::<TerminalFocus>() {
+            return Self::terminal_unverified();
+        }
+        let focus = after
+            .downcast_ref::<FocusNotEditable>()
+            .or_else(|| before.downcast_ref::<FocusNotEditable>());
+        match focus {
+            Some(focus) if submitted == 0 => Self::not_in_field(focus),
+            Some(focus) => Self::unavailable(format!(
+                "{focus}; {submitted} submitted character key events may have reached the active application"
+            )),
+            None => Self::unavailable(after.to_string()),
         }
     }
 
@@ -1192,9 +1245,7 @@ impl TextReceipt {
                         && states.contains(atspi::State::Showing)
                         && node.get_role().await? == atspi::Role::Terminal
                     {
-                        anyhow::bail!(
-                            "the focused control is a terminal, not an inspectable editable field"
-                        );
+                        return Err(TerminalFocus.into());
                     }
                     if focus.is_none()
                         && states.contains(atspi::State::Focused)
@@ -1383,5 +1434,90 @@ impl TextReceipt {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod text_receipt_tests {
+    use super::{FocusNotEditable, TerminalFocus, TextDelivery};
+
+    fn non_editable_focus() -> anyhow::Error {
+        FocusNotEditable("panel \"Tools\"".to_owned()).into()
+    }
+
+    #[test]
+    fn terminal_focus_is_unverified_for_every_submission_size() {
+        for submitted in [0, 1, 120] {
+            let delivery = TextDelivery::unreadable_field_delivery(
+                submitted,
+                &anyhow::Error::from(TerminalFocus),
+                &anyhow::Error::from(TerminalFocus),
+            );
+            assert_eq!(delivery.status, "unverified");
+            assert_eq!(delivery.method, "terminal");
+            assert!(delivery.compositor_acknowledged);
+            assert!(delivery.expected_field_characters.is_none());
+            assert!(delivery.warning.as_deref().is_some_and(|warning| {
+                warning.contains("Inspect the terminal output") && !warning.contains("rejected")
+            }));
+        }
+    }
+
+    #[test]
+    fn terminal_seen_only_after_typing_is_still_a_terminal_outcome() {
+        let delivery = TextDelivery::unreadable_field_delivery(
+            120,
+            &non_editable_focus(),
+            &anyhow::Error::from(TerminalFocus),
+        );
+        assert_eq!(delivery.method, "terminal");
+        assert_eq!(delivery.status, "unverified");
+    }
+
+    #[test]
+    fn non_editable_focus_is_not_in_field_only_when_nothing_was_submitted() {
+        let idle = TextDelivery::unreadable_field_delivery(
+            0,
+            &non_editable_focus(),
+            &non_editable_focus(),
+        );
+        assert_eq!(idle.status, "not_in_field");
+        assert_eq!(idle.method, "atspi_focus");
+        for submitted in [1, 120] {
+            let delivery = TextDelivery::unreadable_field_delivery(
+                submitted,
+                &non_editable_focus(),
+                &non_editable_focus(),
+            );
+            assert_eq!(delivery.status, "unverified");
+            assert_eq!(delivery.method, "eis_roundtrip");
+            assert!(delivery.warning.as_deref().is_some_and(|warning| {
+                warning.contains("may have reached the active application")
+            }));
+        }
+    }
+
+    #[test]
+    fn focus_seen_only_before_typing_classifies_an_empty_submission() {
+        let delivery = TextDelivery::unreadable_field_delivery(
+            0,
+            &non_editable_focus(),
+            &anyhow::anyhow!("the active window exposes no focused editable text"),
+        );
+        assert_eq!(delivery.status, "not_in_field");
+    }
+
+    #[test]
+    fn unexposed_text_stays_unverified_with_the_roundtrip_method() {
+        let reason = anyhow::anyhow!(
+            "the active window exposes no focused editable text through accessibility"
+        );
+        let delivery = TextDelivery::unreadable_field_delivery(
+            5,
+            &anyhow::anyhow!("another read failed"),
+            &reason,
+        );
+        assert_eq!(delivery.status, "unverified");
+        assert_eq!(delivery.method, "eis_roundtrip");
     }
 }
