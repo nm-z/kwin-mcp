@@ -9622,13 +9622,11 @@ impl KwinMcp {
         let uid = identity.uid().to_string();
         let gid = identity.gid().to_string();
         // pasta gives the session its own loopback. Into the host it forwards
-        // only the session's CDP port. Out of the session, every port the host
-        // listens on is forwarded to the host ("auto", rescanned as host
-        // services come and go), so session apps reach the user's real local
-        // services (ollama, dev servers, provider relays) at 127.0.0.1. Ports
-        // the host does not hold stay private, so concurrent sessions still bind
-        // the same port without colliding (#50). The CDP port is excluded so the
-        // session's own browser can always bind it.
+        // only the session's CDP port. Host listeners are reachable from the
+        // session via --tcp-ns, but pasta's default `auto` ranges omit the host's
+        // ephemeral port range. Scan every usable port with auto enabled so
+        // active listeners are forwarded while unbound ports remain
+        // private. The CDP port is excluded so the session's browser can bind it.
         let scope_unit = format!(
             "{}.scope",
             self.path.file_name().unwrap_or_default().to_string_lossy()
@@ -9641,7 +9639,10 @@ impl KwinMcp {
                 Err(error) => return cleanup_err(error, &mut startup),
             };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
-        let host_ports_spec = format!("auto,~{cdp_forward_port}");
+        // With auto, an explicit range defines the complete scan set, not
+        // an addition to the default non-ephemeral range. Include all usable
+        // ports while still forwarding only bound host listeners.
+        let host_ports_spec = format!("auto,1-{},~{cdp_forward_port}", u16::MAX);
         let host_ipv4 = host_default_ipv4().unwrap_or_else(|error| {
             eprintln!(
                 "session_start: host IPv4 lookup failed ({error:#}); pasta picks the address itself"
