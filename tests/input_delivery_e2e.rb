@@ -5,6 +5,7 @@ require 'json'
 require 'open3'
 require 'timeout'
 require 'fileutils'
+require 'uri'
 require_relative 'electron_text_fixture'
 
 class InputDeliveryProbe
@@ -14,6 +15,13 @@ class InputDeliveryProbe
       <style>body{font:20px sans-serif;margin:20px}textarea{width:95%;height:500px;font:18px monospace}</style>
       <h1>Long comment timing</h1><label for="comment">Comment</label>
       <textarea id="comment" aria-label="Comment" autofocus spellcheck="false"></textarea>
+  HTML
+  DUPLICATE_WINDOW_HTML = <<~HTML.freeze
+    <!doctype html><title>Same-caption input receipt</title>
+    <style>body{margin:20px;font:24px sans-serif}
+    textarea{display:block;width:90vw;height:260px;font:22px monospace}</style>
+    <label for="composer">Same-caption composer</label>
+    <textarea id="composer" aria-label="Same-caption composer" autofocus></textarea>
   HTML
 
 
@@ -122,6 +130,72 @@ class InputDeliveryProbe
     proof = {characters:text.length,speed:4,elapsed_seconds:elapsed,delivery:result['delivery'],independent_clipboard_match:true}
     File.write(File.join(@artifacts, 'comment-timing.json'), JSON.pretty_generate(proof))
     puts JSON.generate(proof)
+  end
+
+  # Real Chrome regression for issue #530: a second maximized window with the
+  # same caption and geometry can leave stale AT-SPI focus in the first frame.
+  # The text must be typed exactly once, without an erroneous delivery failure.
+  def duplicate_chrome_window
+    # A data URL is visible inside the isolated Chrome session without
+    # requiring access to the test harness's host-only temporary files.
+    data_url = "data:text/html,#{URI.encode_www_form_component(DUPLICATE_WINDOW_HTML).gsub('+', '%20')}"
+    command = "google-chrome-stable --no-first-run --no-default-browser-check --new-window --force-renderer-accessibility '#{data_url}'"
+    2.times do |index|
+      assert_success(call('launch_app', command: command))
+      20.times do
+        windows = assert_success(call('window_list')).fetch('windows')
+        break if windows.first['title'].include?('Same-caption input receipt')
+        sleep 0.25
+      end
+      screen("same-caption-window-#{index + 1}-before")
+      assert_success(call('mouse_click', x: 260, y: 220))
+      next unless index.zero?
+      first = assert_success(call('keyboard_type', text: 'first window seed'))
+      raise "first field was not verified: #{first}" unless first.dig('delivery', 'status') == 'verified'
+    end
+    windows = assert_success(call('window_list')).fetch('windows')
+    same_caption = windows.select { |window| window['title'].include?('Same-caption input receipt') }
+    raise "expected two Chrome windows: #{windows}" unless same_caption.length == 2
+    geometries = same_caption.map { |window| window.values_at('x', 'y', 'w', 'h') }
+    raise "window geometry differs: #{geometries}" unless geometries.uniq.length == 1
+    expected = 'second window receives the complete input'
+    response = call('keyboard_type', text: expected)
+    raise "text delivery reported failure: #{response}" if response['error'] || response.dig('result', 'isError')
+    result = response.dig('result', 'structuredContent')
+    delivery = result.fetch('delivery')
+    raise "missing compositor receipt: #{result}" unless delivery['compositor_acknowledged']
+    raise "retry was incorrectly safe: #{result}" unless result['retry_safe'] == false
+    if delivery['status'] == 'unverified'
+      raise "ambiguous frame was not identified: #{delivery}" unless delivery['method'] == 'atspi_ambiguous_window'
+    else
+      raise "unexpected delivery: #{delivery}" unless delivery['status'] == 'verified'
+    end
+    screen('same-caption-window-2-after')
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    assert_success(call('keyboard_key', key: 'ctrl+c'))
+    observed = assert_success(call('clipboard_read')).fetch('text')
+    raise "text was not delivered once to the second window: #{observed.inspect}" unless observed == expected
+    File.write(File.join(@artifacts, 'same-caption-receipt.json'), JSON.pretty_generate(
+      receipt: delivery, expected: expected, observed: observed,
+      matched_window_geometries: geometries
+    ))
+    puts JSON.generate(delivery: delivery, independent_clipboard_match: true)
+  end
+
+  def chrome_devtools_shortcuts
+    data_url = "data:text/html,#{URI.encode_www_form_component(DUPLICATE_WINDOW_HTML).gsub('+', '%20')}"
+    command = "google-chrome-stable --no-first-run --no-default-browser-check --new-window --force-renderer-accessibility '#{data_url}'"
+    assert_success(call('launch_app', command: command))
+    screen('devtools-before')
+    { 'ctrl+shift+i' => 'opened', 'F12' => 'closed', 'ctrl+shift+j' => 'console' }.each do |key, tag|
+      result = assert_success(call('keyboard_key', key: key))
+      raise "missing compositor receipt for #{key}: #{result}" unless result['compositor_acknowledged']
+      raise "application effect incorrectly claimed for #{key}: #{result}" unless result['application_effect'] == 'unverified'
+      raise "missing browser shortcut inspection advice for #{key}: #{result}" unless result['warning'].to_s.include?('Inspect a screenshot')
+      screen("devtools-#{tag}")
+      windows = assert_success(call('window_list')).fetch('windows')
+      raise "unexpected browser window count after #{key}: #{windows}" unless windows.count { |window| window['title'].include?('Same-caption input receipt') } == 1
+    end
   end
 
   def prepare_electron
