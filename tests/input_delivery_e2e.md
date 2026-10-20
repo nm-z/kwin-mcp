@@ -1,5 +1,26 @@
 # Input delivery receipt probe
 
+## Chrome DevTools and duplicate-window feedback (#530)
+
+From a KDE desktop host, build the production server and run:
+
+```bash
+cargo build --bin kwin-mcp
+KWIN_MCP_E2E_SERVER="$PWD/target/debug/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR=/tmp/kwin-mcp-530-probe \
+ruby tests/input_delivery_e2e.rb duplicate_chrome_window chrome_devtools_shortcuts
+```
+
+The duplicate-window mode opens two Chrome windows with the same title and
+geometry, focuses and types into both, and independently copies the second
+window's text back from the clipboard. A stale AT-SPI text receipt must never
+report a delivery error; an ambiguous match reports `unverified` with method
+`atspi_ambiguous_window` rather than `pending_or_mismatched`. Chrome DevTools
+mode sends Ctrl+Shift+I, F12, and Ctrl+Shift+J, checking that the production
+tool reports KWin acknowledgement separately from the unverified application
+effect. Screenshots are saved after each shortcut for visual inspection; the
+window list alone cannot tell whether docked DevTools opened.
+
 Run on a KDE desktop host with KWin, bubblewrap, pasta, input devices and Konsole.
 Build the production server separately, then give each run a fresh artifact
 directory. The probe creates an empty private HOME and stops its owned session

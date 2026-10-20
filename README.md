@@ -663,11 +663,24 @@ therefore report one observed character alongside a verified full value.
 Otherwise `unverified` warns that the application text has not been confirmed.
 When a timed-out check has seen U+FFFC in the focused text or a descendant, it
 reports `unverified` because embedded rich-text content may not be fully
-exposed through AT-SPI. Otherwise, a field that still differs after the
-bounded wait reports `pending_or_mismatched` as an error. Inspect the field
-before sending or retrying: delayed input can otherwise be duplicated.
+exposed through AT-SPI. When multiple accessibility windows have the same
+title and bounds as the active window (for example, two maximized Chrome
+windows showing the same page), AT-SPI can read stale focus from the other
+window. An unmatched receipt then reports `unverified` with method
+`atspi_ambiguous_window` after a 2-second check, not a delivery error.
+Otherwise, a field that still differs after the bounded 10-second wait reports
+`pending_or_mismatched` as an error. Inspect the active field before sending
+or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
+
+`keyboard_key` waits for a KWin compositor receipt and includes
+`compositor_acknowledged: true`, but its `application_effect: "unverified"`
+does **not** confirm that the intended browser or application action happened.
+Chrome DevTools shortcuts (`Ctrl+Shift+I`, `Ctrl+Shift+J`, `F12`) include an
+inspection warning even when browser chrome, rather than the page, has focus:
+Chrome may handle those shortcuts itself. Verify by screenshot; docked
+DevTools do not create another `window_list` window.
 
 After an editable field is cleared, AT-SPI may expose one blank newline that the
 application removes when typing starts. If the entire resulting field matches

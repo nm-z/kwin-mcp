@@ -860,7 +860,6 @@ impl InputDevice {
     fn set_tablet_tool_is_relative(&mut self, val: bool) {
         self.tablet_tool_is_relative = val;
     }
-
 }
 
 /// Manager that lists device sys-names and emits add/remove signals.
@@ -871,7 +870,10 @@ pub struct InputDeviceManager {
 
 impl InputDeviceManager {
     pub fn new(pointer_names: Vec<String>, keyboard_names: Vec<String>) -> Self {
-        Self { pointer_names, keyboard_names }
+        Self {
+            pointer_names,
+            keyboard_names,
+        }
     }
 }
 
@@ -900,10 +902,16 @@ impl InputDeviceManager {
     }
 
     #[zbus(signal)]
-    async fn device_added(signal_emitter: &zbus::object_server::SignalEmitter<'_>, sys_name: &str) -> zbus::Result<()>;
+    async fn device_added(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        sys_name: &str,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn device_removed(signal_emitter: &zbus::object_server::SignalEmitter<'_>, sys_name: &str) -> zbus::Result<()>;
+    async fn device_removed(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        sys_name: &str,
+    ) -> zbus::Result<()>;
 }
 
 /// Register devices and the manager on the given connection.
@@ -915,15 +923,22 @@ pub async fn register_devices(
     let mut pointer_names = Vec::new();
     let mut keyboard_names = Vec::new();
     for device in &devices {
-        if device.is_pointer { pointer_names.push(device.sys_name.clone()); }
-        if device.is_keyboard { keyboard_names.push(device.sys_name.clone()); }
+        if device.is_pointer {
+            pointer_names.push(device.sys_name.clone());
+        }
+        if device.is_keyboard {
+            keyboard_names.push(device.sys_name.clone());
+        }
     }
     for device in devices {
         let path = format!("/org/kde/KWin/InputDevice/{}", device.sys_name);
         conn.object_server().at(path, device).await?;
     }
     conn.object_server()
-        .at("/org/kde/KWin/InputDevice", InputDeviceManager::new(pointer_names, keyboard_names))
+        .at(
+            "/org/kde/KWin/InputDevice",
+            InputDeviceManager::new(pointer_names, keyboard_names),
+        )
         .await?;
     Ok(())
 }
@@ -932,6 +947,9 @@ pub async fn register_devices(
 // confirms compositor processing; AT-SPI independently confirms the field text.
 const TEXT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const TEXT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// When two browser windows share a title and bounds, AT-SPI cannot reliably
+// identify the active one; do not spend the full mismatch timeout on stale text.
+const TEXT_AMBIGUOUS_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const TEXT_DELIVERY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const TEXT_DISCOVERY_MAX_NODES: usize = 5000;
 const TEXT_RICH_SNAPSHOT_MAX_NODES: usize = 512;
@@ -1032,6 +1050,7 @@ pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    ambiguous_frame: bool,
     blank_line_replacement: Option<String>,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
@@ -1075,6 +1094,19 @@ impl std::fmt::Display for TerminalFocus {
 impl std::error::Error for TerminalFocus {}
 
 impl TextDelivery {
+    fn ambiguous_window(expected_count: usize, observed_count: Option<usize>) -> Self {
+        Self {
+            status: "unverified",
+            method: "atspi_ambiguous_window",
+            compositor_acknowledged: true,
+            expected_field_characters: Some(expected_count),
+            observed_field_characters: observed_count,
+            warning: Some(
+                "KWin acknowledged the keys, but multiple accessibility windows match the active window's title and bounds. AT-SPI may have read a stale focused field in another window; expected/observed counts may therefore describe that field, not the active one. Inspect the active field before retrying; typing again can duplicate text.".to_owned(),
+            ),
+        }
+    }
+
     /// No characters were submitted, and focus is on a control that is not
     /// editable text. Non-editable focus alone cannot prove sent keys missed
     /// the active application.
@@ -1209,8 +1241,9 @@ impl TextReceipt {
         let mut focus = None;
         for app_object in root.get_children().await? {
             let app = app_object.as_accessible_proxy(&bus).await?;
-            for frame in app.get_children().await? {
-                let frame = frame.as_accessible_proxy(&bus).await?;
+            let mut matching_frames = Vec::new();
+            for frame_object in app.get_children().await? {
+                let frame = frame_object.as_accessible_proxy(&bus).await?;
                 let name = frame.name().await.unwrap_or_default();
                 if !name.starts_with(title) {
                     continue;
@@ -1233,6 +1266,14 @@ impl TextReceipt {
                 {
                     continue;
                 }
+                matching_frames.push(frame_object);
+            }
+            // Chrome does not expose the Active state on its accessibility
+            // frames. Two maximized windows on the same URL can have identical
+            // captions and bounds; an old frame may still claim Focused.
+            let ambiguous_frame = matching_frames.len() > 1;
+            for frame_object in matching_frames {
+                let frame = frame_object.as_accessible_proxy(&bus).await?;
                 let mut stack = frame.get_children().await?;
                 if prefer_chrome_toolbar_focus {
                     stack.reverse();
@@ -1334,6 +1375,7 @@ impl TextReceipt {
                             bus: bus.clone(),
                             object,
                             expected,
+                            ambiguous_frame,
                             blank_line_replacement,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
@@ -1423,7 +1465,12 @@ impl TextReceipt {
                 tokio::time::sleep(TEXT_DELIVERY_POLL).await;
             }
         };
-        match tokio::time::timeout(TEXT_DELIVERY_TIMEOUT, check).await {
+        let timeout = if self.ambiguous_frame {
+            TEXT_AMBIGUOUS_WINDOW_TIMEOUT
+        } else {
+            TEXT_DELIVERY_TIMEOUT
+        };
+        match tokio::time::timeout(timeout, check).await {
             Ok(Ok(method @ "atspi_transformed_blank_line")) => TextDelivery {
                 status: "unverified",
                 method,
@@ -1443,6 +1490,9 @@ impl TextReceipt {
                 warning: None,
             },
             Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
+            Err(_) if self.ambiguous_frame => {
+                TextDelivery::ambiguous_window(expected_count, observed_count)
+            }
             Err(_) if has_embedded_object => {
                 let snapshot_error = last_snapshot_error
                     .as_deref()
@@ -1480,6 +1530,20 @@ mod text_receipt_tests {
 
     fn non_editable_focus() -> anyhow::Error {
         FocusNotEditable("panel \"Tools\"".to_owned()).into()
+    }
+
+    #[test]
+    fn ambiguous_window_focus_is_unverified_not_a_delivery_failure() {
+        let delivery = TextDelivery::ambiguous_window(27, Some(0));
+        assert_eq!(delivery.status, "unverified");
+        assert_eq!(delivery.method, "atspi_ambiguous_window");
+        assert!(delivery.compositor_acknowledged);
+        assert_eq!(delivery.expected_field_characters, Some(27));
+        assert_eq!(delivery.observed_field_characters, Some(0));
+        assert!(delivery.warning.as_deref().is_some_and(|warning| {
+            warning.contains("multiple accessibility windows")
+                && warning.contains("Inspect the active field")
+        }));
     }
 
     #[test]

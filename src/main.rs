@@ -9040,6 +9040,59 @@ async fn atspi_node(
 /// AT-SPI application names of Chromium-family browsers.
 const CHROMIUM_APP_NAMES: [&str; 4] = ["chrom", "edge", "brave", "vivaldi"];
 
+/// DevTools shortcuts are handled by the browser, not necessarily its web
+/// page. A successful compositor receipt cannot establish that DevTools opened.
+fn is_chromium_devtools_shortcut(title: &str, mods: &[u32], key: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    if !CHROMIUM_APP_NAMES
+        .iter()
+        .any(|browser| lower.contains(browser))
+    {
+        return false;
+    }
+    let main = key.rsplit('+').next().unwrap_or("").trim();
+    (mods.is_empty() && main.eq_ignore_ascii_case("f12"))
+        || (mods.len() == 2
+            && mods.contains(&KEY_LEFTCTRL)
+            && mods.contains(&LINUX_KEY_LEFTSHIFT)
+            && (main.eq_ignore_ascii_case("i") || main.eq_ignore_ascii_case("j")))
+}
+
+#[cfg(test)]
+mod shortcut_receipt_tests {
+    use super::{KEY_LEFTCTRL, LINUX_KEY_LEFTSHIFT, is_chromium_devtools_shortcut};
+
+    #[test]
+    fn only_chromium_devtools_chords_need_specific_feedback() {
+        let chord = [KEY_LEFTCTRL, LINUX_KEY_LEFTSHIFT];
+        assert!(is_chromium_devtools_shortcut(
+            "Qwen - Google Chrome",
+            &chord,
+            "ctrl+shift+i"
+        ));
+        assert!(is_chromium_devtools_shortcut(
+            "Qwen - Google Chrome",
+            &chord,
+            "shift+ctrl+J"
+        ));
+        assert!(is_chromium_devtools_shortcut(
+            "Qwen - Google Chrome",
+            &[],
+            "F12"
+        ));
+        assert!(!is_chromium_devtools_shortcut(
+            "Qwen - Firefox",
+            &chord,
+            "ctrl+shift+i"
+        ));
+        assert!(!is_chromium_devtools_shortcut(
+            "Qwen - Google Chrome",
+            &chord,
+            "ctrl+shift+k"
+        ));
+    }
+}
+
 /// True when the active window (KWin caption `active_title`) is a
 /// Chromium-family browser whose page has no keyboard focus: the browser UI
 /// around the showing page (DocumentWeb) of that window's frame holds a Focused
@@ -13652,7 +13705,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. A combo that does not fully resolve fails with invalid_params and sends nothing. When the active window is a Chromium-family browser whose page lacks keyboard focus, the result carries a warning: the key went to the browser UI. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -13675,11 +13728,22 @@ impl KwinMcp {
             .await
             .map(|(_, _, geo)| geo.title)
             .unwrap_or_default();
-        let warning = browser_page_unfocused(&conn, &active_title).await.then_some(
-            "the browser page did not have keyboard focus when the key was sent (its window was active), \
-             so the key went to the browser's own UI, such as the address bar, not to the page; \
-             to reach the page, click inside it and send the key again",
-        );
+        let page_unfocused = browser_page_unfocused(&conn, &active_title).await;
+        let warning = if is_chromium_devtools_shortcut(&active_title, &mods, &params.key) {
+            Some(
+                "KWin can acknowledge the shortcut without Chrome opening or closing DevTools. \
+                 Browser-level shortcuts can work even when the page lacks focus. \
+                 Inspect a screenshot to confirm the actual browser state before retrying.",
+            )
+        } else if page_unfocused {
+            Some(
+                "AT-SPI did not find page keyboard focus (it may be stale across matching browser windows). \
+                 Browser chrome may have focus, but this does not prove the shortcut failed. \
+                 Inspect the UI before retrying.",
+            )
+        } else {
+            None
+        };
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
@@ -13702,6 +13766,19 @@ impl KwinMcp {
             sent.key(*m, false, None).map_err(KwinError::from)?;
         }
         drop(sent);
+        sess.eis.roundtrip().await.map_err(|error| {
+            McpError::internal_error(
+                format!(
+                    "Key events were submitted, but KWin acknowledgement failed: {error}. \
+                     The shortcut may still have taken effect; inspect the UI before retrying."
+                ),
+                Some(serde_json::json!({
+                    "compositor_acknowledged": false,
+                    "application_effect": "unverified",
+                    "retry_safe": false,
+                })),
+            )
+        })?;
         drop(guard);
         self.mark_input().await;
         let text = match warning {
@@ -13713,6 +13790,8 @@ impl KwinMcp {
             text,
             serde_json::json!({
                 "action": "key", "key": params.key, "warning": warning,
+                "compositor_acknowledged": true,
+                "application_effect": "unverified",
             }),
         )
         .await)
