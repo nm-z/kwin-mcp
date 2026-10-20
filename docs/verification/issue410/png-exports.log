@@ -1,0 +1,9 @@
+   Compiling kwin-mcp v0.1.2 (/home/nate/codex/tenfix-20261020-0309/kwin-mcp/issue410)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.00s
+     Running tests/session_lifecycle_e2e.rs (/home/nate/codex/tenfix-20261020-0309/kwin-mcp/target/debug/deps/session_lifecycle_e2e-a30187a60a7dea18)
+
+running 1 test
+test starting_another_session_preserves_existing_file_exports ... PASS: two distinct live handles, three byte-exact PNG exports, earlier handle survives later stop, stopped handle rejected, both workdirs removed
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 8.44s
