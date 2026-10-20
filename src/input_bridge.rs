@@ -966,6 +966,33 @@ fn normalize_accessible_text(text: &str) -> String {
         .collect()
 }
 
+/// Whether `after` is `before` with `inserted` added at one position. The
+/// candidate positions are those where `before`'s prefix and suffix both
+/// survive in `after`; a typing receipt then needs the inserted text there.
+fn is_insertion(before: &str, after: &str, inserted: &str) -> bool {
+    if after.len() != before.len() + inserted.len() {
+        return false;
+    }
+    let (before_bytes, after_bytes) = (before.as_bytes(), after.as_bytes());
+    let prefix = before_bytes
+        .iter()
+        .zip(after_bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before_bytes
+        .iter()
+        .rev()
+        .zip(after_bytes.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    // after[..index] == before[..index] needs index <= prefix, and
+    // after[index + len..] == before[index..] needs index >= len - suffix.
+    let shift = inserted.len();
+    (before.len().saturating_sub(suffix)..=prefix.min(before.len()))
+        .filter(|&index| before.is_char_boundary(index))
+        .any(|index| after.get(index..index + shift) == Some(inserted))
+}
+
 fn normalize_accessible_offset(text: &str, offset: usize) -> usize {
     text.chars()
         .take(offset)
@@ -1050,6 +1077,9 @@ pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    // The typed text alone, for editors whose descendants also hold text that
+    // was there before typing, such as a mention chip.
+    input: String,
     ambiguous_frame: bool,
     blank_line_replacement: Option<String>,
     placeholder_replacement: Option<String>,
@@ -1552,6 +1582,7 @@ impl TextReceipt {
                             bus: bus.clone(),
                             object,
                             expected,
+                            input: normalize_accessible_text(input),
                             ambiguous_frame,
                             blank_line_replacement,
                             placeholder_replacement,
@@ -1646,7 +1677,18 @@ impl TextReceipt {
                                 .is_some_and(|initial| {
                                     snapshot.text == self.expected && initial.text != self.expected
                                 });
-                            if changed_descendant_matches || joined_text_matches {
+                            // Text already in the editor, such as a mention
+                            // chip, stays around the typed text.
+                            let joined_text_inserted = !self.input.is_empty()
+                                && self.initial_descendant_snapshot.as_ref().is_some_and(
+                                    |initial| {
+                                        is_insertion(&initial.text, &snapshot.text, &self.input)
+                                    },
+                                );
+                            if changed_descendant_matches
+                                || joined_text_matches
+                                || joined_text_inserted
+                            {
                                 // Keep this as the focused node's actual count. The
                                 // method identifies descendant-based verification.
                                 return Ok("atspi_rich_text");
@@ -1740,7 +1782,7 @@ impl TextReceipt {
 mod text_receipt_tests {
     use super::{
         FocusNotEditable, TerminalFocus, TextDelivery, TextFocusError, caption_starts_with,
-        keep_checking,
+        is_insertion, keep_checking,
     };
 
     #[test]
@@ -1781,6 +1823,31 @@ mod text_receipt_tests {
         .await;
         assert!(matches!(changed, Err(TextFocusError::Changed)));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn insertion_after_existing_editor_text_is_recognized() {
+        assert!(is_insertion(
+            "kwin-mcp\u{a0}",
+            "kwin-mcp\u{a0} list windows",
+            " list windows"
+        ));
+        assert!(is_insertion("ab", "aXYb", "XY"));
+        assert!(is_insertion("", "typed", "typed"));
+        assert!(is_insertion("éé", "éXé", "X"));
+        assert!(is_insertion("aaaa", "aaXaa", "X"));
+        assert!(!is_insertion(
+            "kwin-mcp",
+            "kwin-mcp list window",
+            " list windows"
+        ));
+        assert!(!is_insertion(
+            "kwin-mcp",
+            "kwin-mcp  list windows",
+            " list windows"
+        ));
+        assert!(!is_insertion("abc", "aXbYc", "XY"));
+        assert!(!is_insertion("abc", "XYbc", "XY"));
     }
 
     fn non_editable_focus() -> anyhow::Error {
