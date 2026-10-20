@@ -4246,6 +4246,10 @@ impl OverlayPlan {
             .iter()
             .filter(|entry| inventory.graphical_sockets.contains(&entry.inode))
             .filter_map(|entry| entry.path.as_ref())
+            // Other servers' control sockets come and go while this session
+            // starts, and a mask over one that disappears fails startup. They
+            // reject peers from another PID namespace, so they need no mask.
+            .filter(|path| !is_session_control_socket(path))
             .flat_map(|path| {
                 let mut names = vec![path.clone()];
                 if let Ok(canonical) = std::fs::canonicalize(path) {
@@ -16631,6 +16635,27 @@ fn session_control_socket_path(server_pid: u32) -> anyhow::Result<PathBuf> {
         .join(format!("{SESSION_CONTROL_SOCKET_PREFIX}{server_pid}.sock")))
 }
 
+/// Whether `path` names a kwin-mcp server's control socket.
+fn is_session_control_socket(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(SESSION_CONTROL_SOCKET_PREFIX))
+        .and_then(|rest| rest.strip_suffix(".sock"))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether process `pid` (as this server sees it) shares this server's PID
+/// namespace. A sandboxed session process does not.
+fn same_pid_namespace(pid: i32) -> bool {
+    match (
+        std::fs::read_link("/proc/self/ns/pid"),
+        std::fs::read_link(format!("/proc/{pid}/ns/pid")),
+    ) {
+        (Ok(own), Ok(peer)) => own == peer,
+        _ => false,
+    }
+}
+
 struct SessionControlSocket {
     listener: tokio::net::UnixListener,
     path: PathBuf,
@@ -16703,12 +16728,24 @@ impl SessionControlSocket {
             tokio::select! {
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        let authorized = stream
-                            .peer_cred()
-                            .is_ok_and(|credentials| credentials.uid() == uid);
+                        let credentials = stream.peer_cred().ok();
+                        let authorized = credentials
+                            .is_some_and(|credentials| credentials.uid() == uid);
                         if !authorized {
                             eprintln!(
                                 "session control: rejected peer with a different effective UID"
+                            );
+                            continue;
+                        }
+                        // Every session process runs in a sandbox PID namespace
+                        // with the host UID; only peers in this server's own PID
+                        // namespace may drive sessions through this socket.
+                        let same_namespace = credentials
+                            .and_then(|credentials| credentials.pid())
+                            .is_some_and(same_pid_namespace);
+                        if !same_namespace {
+                            eprintln!(
+                                "session control: rejected peer outside this server's PID namespace"
                             );
                             continue;
                         }
@@ -20089,6 +20126,33 @@ mod launch_failure_context_tests {
         assert_eq!(data["path"], "/tmp/hidden");
         assert_eq!(data["stage"], "path preflight");
         assert_eq!(data["retry_safe"], false);
+    }
+}
+
+#[cfg(test)]
+mod session_control_socket_tests {
+    use super::{is_session_control_socket, same_pid_namespace};
+    use std::path::Path;
+
+    #[test]
+    fn control_sockets_are_recognized_by_name() {
+        assert!(is_session_control_socket(Path::new(
+            "/run/user/1000/kwin-mcp-control-387755.sock"
+        )));
+        assert!(!is_session_control_socket(Path::new(
+            "/run/user/1000/kwin-mcp-control-.sock"
+        )));
+        assert!(!is_session_control_socket(Path::new(
+            "/run/user/1000/kwin-mcp-control-12x.sock"
+        )));
+        assert!(!is_session_control_socket(Path::new("/run/user/1000/bus")));
+    }
+
+    #[test]
+    fn this_process_shares_its_own_pid_namespace() {
+        let own = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        assert!(same_pid_namespace(own));
+        assert!(!same_pid_namespace(i32::MAX));
     }
 }
 
