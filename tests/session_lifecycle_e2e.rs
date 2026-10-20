@@ -1912,7 +1912,112 @@ fn viewer_input_only_pauses_agent_input_for_the_recent_quiet_period() {
     next_client_id += 1;
     let _date_before_image = save_inline_screenshot(&date_before, "date-field-before");
 
-    thread::sleep(Duration::from_millis(1100));
+    // A minimized Wayland window may stop submitting frames while its event
+    // loop remains live. Its status heartbeat must not depend on rendering.
+    let viewer_before = call_tool(
+        &mut desktop,
+        9000,
+        "screenshot",
+        json!({"session_id":desktop_id}),
+    );
+    if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
+        std::fs::create_dir_all(&proof).expect("create before idle evidence");
+        let path = viewer_before["result"]["structuredContent"]["path"]
+            .as_str()
+            .expect("before idle screenshot");
+        std::fs::copy(path, proof.join("before-idle-viewer.png")).expect("copy before idle viewer");
+    }
+    let status_path = session_dir.join("viewer-status.json");
+    let viewer_pid = opened["result"]["structuredContent"]["viewer"]["pid"]
+        .as_u64()
+        .expect("owned viewer pid");
+    let covered = call_tool(
+        &mut desktop,
+        9001,
+        "launch_app",
+        json!({"session_id":desktop_id,"command":"konsole --separate"}),
+    );
+    assert!(covered["error"].is_null(), "{covered}");
+    let activate_for_minimize = call_tool(
+        &mut desktop,
+        9010,
+        "window_activate",
+        json!({"session_id":desktop_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(
+        activate_for_minimize["error"].is_null(),
+        "{activate_for_minimize}"
+    );
+    call_tool(
+        &mut desktop,
+        9011,
+        "keyboard_key",
+        json!({"session_id":desktop_id,"key":"alt+F3"}),
+    );
+    call_tool(
+        &mut desktop,
+        9012,
+        "mouse_click",
+        json!({"session_id":desktop_id,"x":90,"y":37}),
+    );
+    let minimize_deadline = Instant::now() + Duration::from_secs(5);
+    let mut check_id = 9020;
+    loop {
+        let windows = call_tool(
+            &mut desktop,
+            check_id,
+            "window_list",
+            json!({"session_id":desktop_id}),
+        );
+        check_id += 1;
+        let minimized = windows["result"]["structuredContent"]["windows"]
+            .as_array()
+            .is_some_and(|windows| {
+                windows.iter().any(|window| {
+                    window["id"] == viewer_window["id"] && window["minimized"] == true
+                })
+            });
+        if minimized {
+            break;
+        }
+        assert!(
+            Instant::now() < minimize_deadline,
+            "viewer did not minimize: {windows}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(1200));
+    let activity_before = std::fs::metadata(session_dir.join("viewer-input-activity"))
+        .expect("viewer activity file")
+        .modified()
+        .expect("activity timestamp");
+    thread::sleep(Duration::from_secs(35));
+    let status: Value = serde_json::from_str(
+        &std::fs::read_to_string(&status_path).expect("viewer heartbeat report"),
+    )
+    .expect("viewer heartbeat JSON");
+    assert_eq!(
+        status["pid"], viewer_pid,
+        "idle refresh replaced the viewer"
+    );
+    let status_age = std::fs::metadata(&status_path)
+        .expect("viewer status metadata")
+        .modified()
+        .expect("viewer status timestamp")
+        .elapsed()
+        .expect("viewer status age");
+    assert!(
+        status_age < Duration::from_secs(3),
+        "idle viewer status became stale: {status_age:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(session_dir.join("viewer-input-activity"))
+            .expect("idle activity metadata")
+            .modified()
+            .expect("idle activity timestamp"),
+        activity_before,
+        "idle heartbeat falsely recorded human input"
+    );
     let idle_input = call_tool(
         &mut client,
         next_client_id,
@@ -1921,6 +2026,79 @@ fn viewer_input_only_pauses_agent_input_for_the_recent_quiet_period() {
     );
     next_client_id += 1;
     assert!(idle_input["error"].is_null(), "{idle_input}");
+
+    // An actually frozen event loop must still fail closed. A background
+    // heartbeat thread would incorrectly hide this condition.
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(viewer_pid).expect("viewer pid range"));
+    let resume_viewer = ResumeProcess(pid);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).expect("pause owned viewer");
+    thread::sleep(Duration::from_secs(4));
+    let frozen = call_tool(
+        &mut client,
+        next_client_id,
+        "keyboard_key",
+        json!({"session_id":session_id,"key":"Escape"}),
+    );
+    next_client_id += 1;
+    assert!(
+        !frozen["error"].is_null() && frozen.to_string().contains("stale"),
+        "{frozen}"
+    );
+    drop(resume_viewer);
+    let heartbeat_deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let age = std::fs::metadata(&status_path)
+            .expect("resumed status metadata")
+            .modified()
+            .expect("resumed status timestamp")
+            .elapsed()
+            .expect("resumed status age");
+        if age < Duration::from_secs(2) {
+            break;
+        }
+        assert!(
+            Instant::now() < heartbeat_deadline,
+            "resumed viewer did not refresh status"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    call_tool(
+        &mut desktop,
+        9002,
+        "keyboard_key",
+        json!({"session_id":desktop_id,"key":"alt+F4"}),
+    );
+    let reactivated = call_tool(
+        &mut desktop,
+        9003,
+        "window_activate",
+        json!({"session_id":desktop_id,"window_id":viewer_window["id"]}),
+    );
+    assert!(reactivated["error"].is_null(), "{reactivated}");
+    let viewer_after = call_tool(
+        &mut desktop,
+        9004,
+        "screenshot",
+        json!({"session_id":desktop_id}),
+    );
+    if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
+        std::fs::create_dir_all(&proof).expect("create idle viewer evidence");
+        let path = viewer_after["result"]["structuredContent"]["path"]
+            .as_str()
+            .expect("viewer recovery screenshot");
+        std::fs::copy(path, proof.join("after-idle-viewer.png")).expect("copy idle viewer image");
+        std::fs::write(
+            proof.join("idle-viewer.json"),
+            serde_json::to_vec_pretty(&json!({
+                "idle_seconds":35,"minimized":true,"status_age_ms":status_age.as_millis(),"viewer_pid":viewer_pid,
+                "idle_input":idle_input,"frozen_input":frozen,
+                "before_window":viewer_before["result"]["structuredContent"]["window"],
+                "after_window":viewer_after["result"]["structuredContent"]["window"]
+            }))
+            .expect("encode viewer evidence"),
+        )
+        .expect("write viewer evidence");
+    }
 
     let (typed, during_typing) = thread::scope(|scope| {
         let (started_tx, started_rx) = mpsc::channel();

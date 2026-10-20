@@ -42,7 +42,7 @@ use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v
     Pointer as ScPointer, ZkdeScreencastUnstableV1,
 };
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::keyboard::PhysicalKey;
 
 // Bindings ceilings — the wayland-protocols-plasma 0.3.12 XMLs cap here even
@@ -882,7 +882,7 @@ fn window_loop(
     let mut first_frame_consumed = false;
     let mut startup_error = None;
     let started = Instant::now();
-    let mut last_status_heartbeat = started;
+    let last_status_heartbeat = Cell::new(started);
     let window_closed = Cell::new(false);
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
@@ -921,43 +921,6 @@ fn window_loop(
             }
             next_title_check = Instant::now() + Duration::from_millis(250);
         }
-        let mut close_requested = false;
-        for event in frame.events.iter() {
-            if matches!(
-                event,
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    ..
-                }
-            ) {
-                window_closed.set(true);
-                if let Some(dir) = status_dir {
-                    write_status(dir, "closed", "host window closed");
-                }
-                close_requested = true;
-                break;
-            }
-            if let Event::WindowEvent {
-                event: WindowEvent::Resized(size),
-                ..
-            } = event
-            {
-                aspect.resize(frame.window, *size);
-            }
-            forward_input(
-                event,
-                (frame.width, frame.height),
-                virt,
-                input_state,
-                numlock,
-            );
-        }
-        if close_requested {
-            shutdown.request();
-            frame.exit();
-            return;
-        }
-
         // Consume the latest frame if one arrived; upload into src_image.
         // Retain src_image across frames so when the mailbox is momentarily
         // empty we still re-blit the last known picture instead of flashing
@@ -1044,32 +1007,64 @@ fn window_loop(
         // PipeWire's async frame arrivals get picked up.
         frame.window.request_redraw();
     };
-    window.run_with_submission_callback(&mut draw_frame, || {
-        if !ready_reported.get() && first_frame_queued.get() {
-            ready_reported.set(true);
-            eprintln!("kwin-viewer: first frame submitted for presentation");
-            if let Some(dir) = status_dir {
-                write_status(
-                    dir,
-                    "ready",
-                    "first session frame render submitted to the host window",
-                );
+    window.run_with_submission_idle_and_event_callbacks(
+        &mut draw_frame,
+        || {
+            if !ready_reported.get() && first_frame_queued.get() {
+                ready_reported.set(true);
+                eprintln!("kwin-viewer: first frame submitted for presentation");
+                if let Some(dir) = status_dir {
+                    write_status(
+                        dir,
+                        "ready",
+                        "first session frame render submitted to the host window",
+                    );
+                }
+                last_status_heartbeat.set(Instant::now());
+                if let Some(pipe) = remote_output.as_ref() {
+                    send_remote_op(pipe, Op::Presented);
+                }
+            } else if ready_reported.get()
+                && !window_closed.get()
+                && last_status_heartbeat.get().elapsed() >= VIEWER_STATUS_HEARTBEAT
+            {
+                if let Some(dir) = status_dir {
+                    write_status(dir, "ready", "host window is showing the session");
+                }
+                last_status_heartbeat.set(Instant::now());
             }
-            last_status_heartbeat = Instant::now();
-            if let Some(pipe) = remote_output.as_ref() {
-                send_remote_op(pipe, Op::Presented);
+        },
+        Some(VIEWER_STATUS_HEARTBEAT),
+        || {
+            if ready_reported.get()
+                && !window_closed.get()
+                && last_status_heartbeat.get().elapsed() >= VIEWER_STATUS_HEARTBEAT
+            {
+                if let Some(dir) = status_dir {
+                    write_status(dir, "ready", "host window event loop is responsive");
+                }
+                last_status_heartbeat.set(Instant::now());
             }
-        } else if ready_reported.get()
-            && !window_closed.get()
-            && last_status_heartbeat.elapsed() >= VIEWER_STATUS_HEARTBEAT
-        {
-            if let Some(dir) = status_dir {
-                write_status(dir, "ready", "host window is showing the session");
+        },
+        |window, event| {
+            // Input and focus-loss releases must run even when a minimized surface
+            // receives no redraws. The idle heartbeat follows this same event loop.
+            if matches!(event, WindowEvent::CloseRequested) {
+                window_closed.set(true);
+                if let Some(dir) = status_dir {
+                    write_status(dir, "closed", "host window closed");
+                }
+                shutdown.request();
             }
-            last_status_heartbeat = Instant::now();
-        }
-    })?;
-    if let Some(error)=startup_error {anyhow::bail!(error);}
+            if let WindowEvent::Resized(size) = event {
+                aspect.resize(window, *size);
+            }
+            let size = window.inner_size();
+            forward_input(event, (size.width, size.height), virt, input_state, numlock);
+            true
+        },
+    )?;
+if let Some(error)=startup_error {anyhow::bail!(error);}
     Ok(())
 }
 
@@ -1506,15 +1501,12 @@ fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u3
 }
 
 fn forward_input(
-    event: &Event<()>,
+    event: &WindowEvent,
     window_size: (u32, u32),
     virt: (u32, u32),
     state: &mut InputState,
     numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
 ) {
-    let Event::WindowEvent { event, .. } = event else {
-        return;
-    };
     if let WindowEvent::Focused(true) = event
         && let Some((numlock, fake_input, conn)) = numlock
         && let Err(error) = numlock.apply(fake_input, conn)
