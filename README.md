@@ -543,6 +543,17 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
+File screenshot responses expose capture metadata in `structuredContent`: the
+PNG path, dimensions, window, region, and optional settling information. Inline
+responses always include the PNG image and the same metadata as JSON text.
+Clients that consume structured metadata can request
+`{"inline": true, "structured_metadata": true}` to also receive it in
+`structuredContent`. This is opt-in because some clients, including Claude Code,
+hide image content when a result contains `structuredContent`; leave the option
+unset in those clients. File captures always retain structured metadata. If saving
+the file fails, an inline capture still returns the image, with `path: null` and
+`write_error` in its metadata.
+
 Inline PNGs request original-detail presentation on supporting Codex clients
 through the image block's `_meta["codex/imageDetail"]`. The hint does not change
 the image bytes, capture dimensions, or click coordinates. Other clients may
@@ -550,7 +561,6 @@ ignore it. If a preview appears blank or loses small text, inspect the saved PNG
 at original detail or request a narrow `region` crop before diagnosing a
 compositor failure. An inline image and its saved PNG can contain identical,
 correct pixels even when a client presents them differently (see #435).
-
 
 Virtual display is 2000×1875 (3.75MP). By default all windows open maximized. `session_start` with `window_mode: "native"` maps each window at the size its app requests instead, so a relaunched app reopens at its own size. Windows have no decorations or shadows in either mode. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 

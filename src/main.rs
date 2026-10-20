@@ -9286,6 +9286,12 @@ struct ScreenshotParams {
     /// The file is still written to disk either way.
     #[serde(default)]
     inline: bool,
+    /// For inline captures, also expose metadata in structuredContent. Opt-in:
+    /// some clients hide image content when structuredContent is present.
+    /// Metadata remains in a JSON text block either way. File captures always
+    /// include structuredContent, regardless of this option.
+    #[serde(default)]
+    structured_metadata: bool,
 }
 
 const GENERATED_SECRET_MIME: &str = kwin_mcp::clipboard::GENERATED_SECRET_MIME;
@@ -12535,7 +12541,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Inline metadata is always included as JSON text; pass structured_metadata=true to also expose structuredContent, only in clients that keep displaying image content alongside structured results. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -12727,11 +12733,9 @@ impl KwinMcp {
             Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
         };
         if params.inline {
-            // Claude Code's MCP client hides content[] when structured_content is also
-            // set, so we can't return both the image AND a structured field at the
-            // same time. Instead, serialize the payload into a text block so the
-            // image renders AND the machine-readable data is still recoverable by
-            // parsing that block as JSON.
+            // Claude Code can hide content[] when structuredContent is present.
+            // Preserve image rendering by default and let clients explicitly
+            // opt into the same structured metadata as file captures.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
             let mut image = Content::image(b64, "image/png");
@@ -12750,11 +12754,15 @@ impl KwinMcp {
                     serde_json::json!(text),
                 ))
                 .await;
-            Ok(CallToolResult::success(vec![
+            let mut result = CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
                 image,
-            ]))
+            ]);
+            if params.structured_metadata {
+                result.structured_content = Some(payload);
+            }
+            Ok(result)
         } else {
             Ok(structured_result(&peer, text, payload).await)
         }
