@@ -5,6 +5,7 @@ require 'open3'
 require 'timeout'
 require 'fileutils'
 require 'tmpdir'
+require_relative 'fixture_paths'
 
 server=File.realpath(ARGV.fetch(0));old_server=File.realpath(ARGV.fetch(1));evidence=File.expand_path(ARGV.fetch(2))
 FileUtils.mkdir_p(evidence)
@@ -57,7 +58,7 @@ def legacy_valid?(r)
     r['server_pid'].positive? && r['finished_at_unix_seconds'].positive? && r['session_id'].match?(/\As#{r['server_pid']}-[1-9][0-9]*\z/)
 end
 
-Dir.mktmpdir('kmlc-','/var/tmp') do |root|
+Dir.mktmpdir('kmlc-',FixturePaths.root) do |root|
   home=File.join(root,'home');state=File.join(root,'state');runtime=File.join(root,'runtime')
   FileUtils.mkdir_p([state,runtime]+%w[.config .cache .local/share .local/state .kde].map { |name|File.join(home,name) })
   directory=File.join(state,'kwin-mcp');FileUtils.mkdir_p(directory)

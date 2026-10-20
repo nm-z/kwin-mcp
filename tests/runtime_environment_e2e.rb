@@ -7,6 +7,7 @@ require 'shellwords'
 require 'socket'
 require 'timeout'
 require 'tmpdir'
+require_relative 'fixture_paths'
 
 desktop_variables = %w[DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET]
 if desktop_variables.any? { |name| ENV[name] && !ENV[name].empty? }
@@ -26,7 +27,7 @@ class RuntimeProof
   def initialize(binary, directory, overrides)
     @binary, @directory = binary, directory
     # Socket addresses must fit sockaddr_un independently of artifact paths.
-    @fixture_root = Dir.mktmpdir('kmr-', '/var/tmp')
+    @fixture_root = Dir.mktmpdir('kmr-', FixturePaths.root)
     private_home = File.join(@fixture_root, 'home')
     @private_home = private_home
     %w[.config .local/share .cache .local/state .kde].each do |name|

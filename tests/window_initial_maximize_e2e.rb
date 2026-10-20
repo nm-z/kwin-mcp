@@ -4,6 +4,7 @@ require 'json'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'timeout'
 
 desktop_variables = %w[DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET]
@@ -19,7 +20,7 @@ binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
 home = File.join(evidence, 'home')
-temp_root = Dir.mktmpdir('kwin-mcp-263-', '/var/tmp')
+temp_root = Dir.mktmpdir('kwin-mcp-263-', FixturePaths.root)
 %w[.config .local/share .cache .local/state .kde].each do |name|
   FileUtils.mkdir_p(File.join(home, name))
 end
