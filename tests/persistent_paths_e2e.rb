@@ -122,6 +122,9 @@ begin
   results << 'reject_browser_alias=PASS'
   proof.call('session_start', {persistent_paths: [profile], writable_paths: [profile]}, error: true)
   results << 'reject_private_copy_overlap=PASS'
+  proof.call('session_start', {persistent_paths: [profile], host_write_paths: [profile]}, error: true)
+  raise 'overlap rejection left a session' unless proof.call('session_list').fetch('sessions').empty?
+  results << 'reject_host_write_overlap=PASS'
   3.times do |cycle|
     if cycle == 2
       proof.close
