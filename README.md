@@ -296,9 +296,8 @@ script storage until it is recreated.
 By default, live host SQLite databases with open WAL files are mounted read-only
 with their WAL and shared-memory files, except browser cookie jars. Explicit
 `writable_paths` selections instead receive private snapshots as described above;
-`host_write_paths` selections use the shared host directory. Startup mounts default
-read-only databases
-databases without copying their contents, and reads use the host inodes and
+`host_write_paths` selections use the shared host directory. Startup mounts
+default read-only databases without copying their contents, and reads use the host inodes and
 SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their
 private session overlay; writes cannot reach the host jar.
