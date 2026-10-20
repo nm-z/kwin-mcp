@@ -44,7 +44,13 @@ def capture(evidence, tag, arguments, saved: true)
   result = call('screenshot', arguments)
   content = result.fetch('content')
   inline = arguments[:inline]
-  metadata = result.fetch('structuredContent')
+  metadata = inline ? JSON.parse(content.fetch(1).fetch('text')) : result.fetch('structuredContent')
+  structured = !inline || arguments.fetch(:structured_metadata, false)
+  if structured
+    raise 'text and structured metadata differ' unless result.fetch('structuredContent') == metadata
+  else
+    raise 'default inline response can hide its image in Claude Code' if result.key?('structuredContent')
+  end
   raise 'missing settle metadata' unless metadata.fetch('settle').fetch('settled') == true
   raise 'missing settle duration' unless metadata.fetch('settle').fetch('waited_ms').is_a?(Integer)
   if inline
@@ -71,7 +77,7 @@ def capture(evidence, tag, arguments, saved: true)
   raise 'region dimensions disagree with PNG' unless dimensions == [x2 - x1, y2 - y1]
   File.binwrite(File.join(evidence, "#{tag}.png"), png)
   File.write(File.join(evidence, "#{tag}.json"), JSON.pretty_generate(metadata))
-  puts "#{tag}=PASS (#{dimensions.join('x')}, structured metadata#{inline ? ', inline image' : ''})"
+  puts "#{tag}=PASS (#{dimensions.join('x')}, #{structured ? 'structured' : 'JSON text'} metadata#{inline ? ', inline image' : ''})"
   metadata
 end
 
@@ -96,6 +102,8 @@ File.open(File.join(evidence, 'rpc.jsonl'), 'w') do |trace|
       begin
         rpc('initialize', protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {name: 'screenshot-metadata-e2e', version: '1'})
         input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
+        tool = rpc('tools/list', {}).fetch('tools').find { |entry| entry.fetch('name') == 'screenshot' }
+        schema = tool.fetch('inputSchema')
         @session_id = call('session_start').fetch('structuredContent').fetch('session_id')
         call('launch_app', command: 'kdialog --title "Screenshot metadata fixture" --inputbox "Synthetic capture for issue #365"')
         windows = call('window_list').fetch('structuredContent').fetch('windows')
@@ -103,23 +111,28 @@ File.open(File.join(evidence, 'rpc.jsonl'), 'w') do |trace|
         raise 'private fixture window missing' unless window
         file = capture(evidence, 'file', {})
         raise 'capture names wrong window' unless file.fetch('window').fetch('id') == window.fetch('id')
-        full = capture(evidence, 'inline-full', {inline: true})
+        capture(evidence, 'inline-default', {inline: true})
+        capture(evidence, 'inline-disabled', {inline: true, structured_metadata: false})
+        full = capture(evidence, 'inline-full', {inline: true, structured_metadata: true})
         raise 'full inline metadata differs from file capture' unless full.reject { |key, _| key == 'settle' } == file.reject { |key, _| key == 'settle' }
-        crop = capture(evidence, 'inline-crop', {inline: true, region: [0, 0, 120, 80]})
+        crop = capture(evidence, 'inline-crop', {inline: true, structured_metadata: true, region: [0, 0, 120, 80]})
         raise 'requested crop not applied' unless crop.fetch('region') == [0, 0, 120, 80]
-        capture(evidence, 'inline-cursor', {inline: true, cursor: true})
+        capture(evidence, 'inline-cursor', {inline: true, structured_metadata: true, cursor: true})
         # Force only this capture's atomic rename to fail, without filling /tmp
         # or changing permissions or quotas for another session.
         path = file.fetch('path')
         File.unlink(path)
         Dir.mkdir(path)
         begin
-          capture(evidence, 'inline-write-failure', {inline: true}, saved: false)
+          capture(evidence, 'inline-write-failure-default', {inline: true}, saved: false)
+          capture(evidence, 'inline-write-failure', {inline: true, structured_metadata: true}, saved: false)
           raise 'write failure left a partial PNG' unless File.directory?(path) && Dir.empty?(path)
         ensure
           Dir.rmdir(path)
         end
         capture(evidence, 'file-recovered', {})
+        raise 'structured metadata option missing from schema' unless schema.fetch('properties').fetch('structured_metadata').fetch('type') == 'boolean'
+        raise 'structured metadata option must remain optional' if schema.fetch('required', []).include?('structured_metadata')
       ensure
         call('session_stop') if @session_id
         input.close

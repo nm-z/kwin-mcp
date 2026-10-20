@@ -55,12 +55,14 @@ begin
   tool.call('launch_app', {command:command.shelljoin})
   # Pause only this real fixture's AT-SPI provider. Matching both the unique
   # title argument and executable excludes shells and other desktop apps.
-  candidates, = Open3.capture2('pgrep','-f',title)
-  providers = candidates.lines.map(&:to_i).select do |pid|
+  providers = Dir.glob('/proc/[0-9]*').filter_map do |proc_dir|
+    pid = File.basename(proc_dir).to_i
     begin
-      File.basename(File.readlink("/proc/#{pid}/exe"))=='kdialog' && File.binread("/proc/#{pid}/cmdline").split("\0").include?(title)
-    rescue Errno::ENOENT
-      false
+      next unless File.stat(proc_dir).uid == Process.uid
+      next unless File.basename(File.readlink(File.join(proc_dir,'exe'))) == 'kdialog'
+      pid if File.binread(File.join(proc_dir,'cmdline')).split("\0").include?(title)
+    rescue Errno::ENOENT, Errno::EACCES
+      nil
     end
   end
   raise "expected exactly one owned kdialog provider: #{providers}" unless providers.length==1
@@ -69,32 +71,34 @@ begin
   before = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   stopper = Thread.new { sleep 0.3; Process.kill('STOP',provider_pid) }
   begin
-    result = tool.call('accessibility_tree', {max_depth:12,show_elements:true,app_name:'kdialog'})
+    default_result = tool.call('accessibility_tree', {max_depth:12,show_elements:true,app_name:'kdialog'})
+  ensure
+    stopper.join
+    Process.kill('CONT',provider_pid)
+  end
+  default_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
+  default_info = default_result.fetch('structuredContent')
+  raise "expected default traversal timeout, got #{default_info}" unless default_info['incomplete']
+  raise "wrong default timeout reason: #{default_info}" unless default_info['reason']=='traversal reached the 5 second limit'
+  raise "wrong default timeout metadata: #{default_info}" unless default_info['timeout_seconds']==5
+  raise "default traversal ended outside its budget: #{default_elapsed}" unless default_elapsed >= 4.5 && default_elapsed < 8
+
+  before = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  stopper = Thread.new { sleep 0.3; Process.kill('STOP',provider_pid) }
+  begin
+    result = tool.call('accessibility_tree', {max_depth:12,show_elements:true,app_name:'kdialog',timeout_seconds:6})
   ensure
     stopper.join
     Process.kill('CONT',provider_pid)
   end
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
   info = result.fetch('structuredContent')
-  # A fast host may finish before the pause. That is valid; explicitly stall
-  # the provider before another real traversal to exercise the empty partial
-  # response and its actionable fallback without assuming machine speed.
-  unless info['incomplete']
-    raise "complete tree exceeded budget: #{info}" unless info['chars'] <= 30_000
-    Process.kill('STOP',provider_pid)
-    before = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    begin
-      result = tool.call('accessibility_tree', {max_depth:12,show_elements:true,app_name:'kdialog'})
-    ensure
-      Process.kill('CONT',provider_pid)
-    end
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-before
-    info = result.fetch('structuredContent')
-  end
   text = result.fetch('content').select { |item| item['type']=='text' }.map { |item| item['text'] }.join("\n")
   raise "expected bounded partial tree, got #{info}" unless info['incomplete']
   raise "tree exceeded character budget: #{info}" unless info['chars'] <= 30_000
-  raise "tree exceeded bounded time: #{elapsed}" unless elapsed < 8
+  raise "wrong timeout reason: #{info}" unless info['reason']=='traversal reached the 6 second limit'
+  raise "wrong timeout metadata: #{info}" unless info['timeout_seconds']==6
+  raise "tree exceeded or missed its requested time budget: #{elapsed}" unless elapsed >= 5.5 && elapsed < 10
   root = text[/root=([^\s]+)/,1]
   if info['nodes'].positive?
     raise 'missing actionable root' unless root
