@@ -180,6 +180,23 @@ A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste
 
 `clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
+Agent `keyboard_key` calls for Ctrl+V or Shift+Insert now return a `paste` receipt.
+`shortcut_acknowledged` records the compositor's acknowledgment of the native
+shortcut; `editable_value` separately reports whether the focused field contains
+the expected insertion. Multiline UTF-8 clipboard text can be verified without
+converting it to generated keystrokes. A verified value is still followed by
+`form_submission: "not_observed"`: an application-managed editor may maintain
+additional form state, so verify the application's submission result separately.
+
+If the field is inaccessible, the text exceeds the one MiB verification limit,
+or the bounded readback cannot establish the result, the receipt is unverified.
+A readable mismatch is an error. Both require inspection before another paste;
+blind retries can duplicate text. Verification has a 12-second outer deadline
+after compositor acknowledgment. Generated-secret selections are pasted natively
+but are not read back; their receipt contains no expected or observed field value
+or count. These receipts apply to the session clipboard used by agent shortcuts,
+not the viewer's host-clipboard paste path.
+
 ## KWallet safety
 
 A session never talks to the host wallet or Secret Service. `session_start` takes one read-only copy of the host KWallet, and the session's apps then use a session-local `org.kde.kwalletd6` served from memory; their writes stay in the session and end with it. The copy is taken only when `kwalletd6` and `ksecretd` already run and the wallet is unlocked: kwin-mcp never starts, unlocks or prompts a host wallet service, never calls `org.freedesktop.secrets`, and serializes copies across servers, at least 100 ms apart, within 12 s per `session_start`. If `kwalletd6` is missing or does not answer, the same wallet is read from `ksecretd` with the standard Secret Service calls, and copies in the next 60 s read `ksecretd` directly. If any check fails the session gets a disabled KWallet, `session_start` reports why, and `launch_app` of a Chromium-family browser says that the browser cannot decrypt the copied profile: Chrome drops every cookie it cannot decrypt (a recovered 3,606-cookie profile fell to 8 rows with the `basic` store, and kept 3,311 with the wallet). The host session D-Bus socket and the `keyring` and `p11-kit` entries of the user runtime directory are never reachable from a session.

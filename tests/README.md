@@ -1,5 +1,12 @@
 # Real-system test storage
 
+`ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
+native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks
+multiline UTF-8 field receipts and independently receives the complete values
+through ordinary HTML form POSTs to a local Ruby fixture. It also verifies that
+a generated-secret selection returns only protected/unverified paste metadata.
+The fixture submits no external form and cleans up its own desktop.
+
 The Rust lifecycle harness and Ruby fixtures use `KWIN_MCP_TEST_TMPDIR`,
 then `TMPDIR`, then `/var/tmp` as the fixture parent. The lifecycle harness
 creates a unique private HOME there and removes it when the client is dropped.

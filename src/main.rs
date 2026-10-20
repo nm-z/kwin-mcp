@@ -14114,7 +14114,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -14124,6 +14124,7 @@ impl KwinMcp {
         let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
         let (mods, main) = parse_combo(&params.key)?;
+        let is_paste = is_native_paste_combo(&mods, main);
         let (conn, kwin_unique, xdg) = self
             .with_session(|s| {
                 Ok((
@@ -14133,9 +14134,12 @@ impl KwinMcp {
                 ))
             })
             .await?;
-        let active_title = active_window_info(&conn, &kwin_unique, &xdg)
+        let active = active_window_info(&conn, &kwin_unique, &xdg)
             .await
-            .map(|(_, _, geo)| geo.title)
+            .map(|(_, _, geometry)| geometry);
+        let active_title = active
+            .as_ref()
+            .map(|geometry| geometry.title.clone())
             .unwrap_or_default();
         let page_unfocused = browser_page_unfocused(&conn, &active_title).await;
         let warning = if is_chromium_devtools_shortcut(&active_title, &mods, &params.key) {
@@ -14150,6 +14154,51 @@ impl KwinMcp {
                  Browser chrome may have focus, but this does not prove the shortcut failed. \
                  Inspect the UI before retrying.",
             )
+        } else {
+            None
+        };
+        let paste_preparation = if is_paste {
+            match &active {
+                Ok(geometry) => {
+                    let (address, socket) = self
+                        .with_session(|session| {
+                            Ok((
+                                session.atspi_bus_address.clone(),
+                                session.host_xdg_dir.join("wayland-0"),
+                            ))
+                        })
+                        .await?;
+                    let store = self.clipboards.clone();
+                    let snapshot = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        store
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
+                            .entry(&socket, "session")?
+                            .clipboard
+                            .read_text()
+                    })
+                    .await;
+                    Some(match snapshot {
+                        Ok(Ok(snapshot)) => {
+                            prepare_paste_text(
+                                snapshot,
+                                &address,
+                                &geometry.title,
+                                [geometry.x, geometry.y, geometry.w, geometry.h],
+                            )
+                            .await
+                        }
+                        _ => PreparedPaste::Unavailable {
+                            method: "paste_text_unavailable",
+                            warning: "The session clipboard text could not be observed. The native paste shortcut was still submitted.",
+                        },
+                    })
+                }
+                Err(_) => Some(PreparedPaste::Unavailable {
+                    method: "paste_target_unobservable",
+                    warning: "The active window could not be observed for paste verification. The native shortcut was still submitted.",
+                }),
+            }
         } else {
             None
         };
@@ -14175,8 +14224,13 @@ impl KwinMcp {
             sent.key(*m, false, None).map_err(KwinError::from)?;
         }
         drop(sent);
-        sess.eis.roundtrip().await.map_err(|error| {
-            McpError::internal_error(
+        let acknowledgment = sess.eis.roundtrip().await;
+        drop(guard);
+        self.mark_input().await;
+        if let Err(error) = acknowledgment
+            && !is_paste
+        {
+            return Err(McpError::internal_error(
                 format!(
                     "Key events were submitted, but KWin acknowledgement failed: {error}. \
                      The shortcut may still have taken effect; inspect the UI before retrying."
@@ -14186,24 +14240,55 @@ impl KwinMcp {
                     "application_effect": "unverified",
                     "retry_safe": false,
                 })),
-            )
-        })?;
-        drop(guard);
-        self.mark_input().await;
+            ));
+        } else if let Err(error) = acknowledgment {
+            return Err(McpError::internal_error(
+                format!(
+                    "The paste shortcut was submitted, but compositor acknowledgment failed: {error}"
+                ),
+                Some(serde_json::json!({
+                    "action":"key", "key":params.key, "shortcut_submitted":true,
+                    "submission_complete":true, "compositor_acknowledged":false,
+                    "application_text":"unverified", "form_submission":"not_observed", "retry_safe":false,
+                })),
+            ));
+        }
+        let paste_delivery = match paste_preparation {
+            Some(preparation) => Some(finish_prepared_paste(preparation).await),
+            None => None,
+        };
+        let paste_is_error = paste_delivery.as_ref().is_some_and(|delivery| {
+            matches!(delivery.status, "pending_or_mismatched" | "not_in_field")
+        });
         let text = match warning {
             Some(warning) => format!("key: {}. warning: {warning}", params.key),
             None => format!("key: {}", params.key),
         };
-        Ok(structured_result(
-            &peer,
-            text,
-            serde_json::json!({
-                "action": "key", "key": params.key, "warning": warning,
-                "compositor_acknowledged": true,
-                "application_effect": "unverified",
-            }),
-        )
-        .await)
+        let text = if let Some(delivery) = &paste_delivery {
+            format!(
+                "{text}; paste value {}. {} Form submission was not observed.",
+                delivery.status,
+                delivery.warning.as_deref().unwrap_or("")
+            )
+        } else {
+            text
+        };
+        let mut data = serde_json::json!({
+            "action": "key", "key": params.key, "warning": warning,
+            "compositor_acknowledged": true,
+            "application_effect": "unverified",
+        });
+        if let Some(delivery) = paste_delivery {
+            data["paste"] = serde_json::json!({
+                "clipboard_scope":"session", "shortcut_acknowledged":true,
+                "editable_value":delivery, "form_submission":"not_observed", "retry_safe":false,
+            });
+        }
+        let mut result = structured_result(&peer, text, data).await;
+        if is_paste {
+            result.is_error = Some(paste_is_error);
+        }
+        Ok(result)
     }
 
     #[rmcp::tool(
@@ -15526,6 +15611,101 @@ impl tower::Service<SessionCall> for KwinMcp {
             }
             result
         })
+    }
+}
+
+const PASTE_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
+const PASTE_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
+
+enum PreparedPaste {
+    Ready(input_bridge::TextReceipt),
+    Unavailable {
+        method: &'static str,
+        warning: &'static str,
+    },
+}
+
+fn is_native_paste_combo(modifiers: &[u32], key: u32) -> bool {
+    ["ctrl+v", "shift+insert"].into_iter().any(|combo| {
+        parse_combo(combo).is_ok_and(|(expected, expected_key)| {
+            key == expected_key
+                && modifiers.len() == expected.len()
+                && modifiers.iter().all(|modifier| expected.contains(modifier))
+        })
+    })
+}
+
+async fn prepare_paste_text(
+    snapshot: kwin_mcp::clipboard::ClipboardText,
+    address: &str,
+    title: &str,
+    bounds: [f64; 4],
+) -> PreparedPaste {
+    use kwin_mcp::clipboard::ClipboardText;
+    let bytes = match snapshot {
+        ClipboardText::Secret(_) => {
+            return PreparedPaste::Unavailable {
+                method: "paste_protected_clipboard",
+                warning: "Editable-value verification was skipped for a protected clipboard selection.",
+            };
+        }
+        ClipboardText::Empty => {
+            return PreparedPaste::Unavailable {
+                method: "paste_text_unavailable",
+                warning: "No clipboard text snapshot was available for editable-value verification.",
+            };
+        }
+        ClipboardText::Text(bytes) => bytes,
+    };
+    if bytes.len() > PASTE_VERIFICATION_MAX_BYTES {
+        return PreparedPaste::Unavailable {
+            method: "paste_text_too_large",
+            warning: "Clipboard text exceeds the one MiB verification limit. The native paste shortcut was still submitted.",
+        };
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return PreparedPaste::Unavailable {
+            method: "paste_text_unavailable",
+            warning: "The clipboard did not provide supported UTF-8 text for editable-value verification.",
+        };
+    };
+    match input_bridge::TextReceipt::capture_paste(address, title, bounds, &text).await {
+        Ok(receipt) => PreparedPaste::Ready(receipt),
+        Err(_) => PreparedPaste::Unavailable {
+            method: "paste_target_unobservable",
+            warning: "The native paste shortcut was submitted, but the focused editable value could not be observed.",
+        },
+    }
+}
+
+fn unverified_paste_delivery(
+    method: &'static str,
+    warning: &'static str,
+) -> input_bridge::TextDelivery {
+    input_bridge::TextDelivery {
+        status: "unverified",
+        method,
+        compositor_acknowledged: true,
+        expected_field_characters: None,
+        observed_field_characters: None,
+        warning: Some(warning.to_owned()),
+    }
+}
+
+async fn finish_prepared_paste(preparation: PreparedPaste) -> input_bridge::TextDelivery {
+    match preparation {
+        PreparedPaste::Ready(receipt) => {
+            match tokio::time::timeout(PASTE_VERIFICATION_TIMEOUT, receipt.confirm()).await {
+                Ok(delivery) => delivery,
+                Err(_) => unverified_paste_delivery(
+                    "paste_verification_timeout",
+                    "The paste shortcut was acknowledged, but editable-value verification timed out. Inspect the field before retrying; do not paste again blindly.",
+                ),
+            }
+        }
+        PreparedPaste::Unavailable { method, warning } => {
+            unverified_paste_delivery(method, warning)
+        }
     }
 }
 

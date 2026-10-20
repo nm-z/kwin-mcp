@@ -1229,6 +1229,15 @@ impl TextReceipt {
         if input.contains(['\t', '\n']) {
             anyhow::bail!("Tab or Return may change focus or submit the field");
         }
+        Self::capture_paste(address, title, bounds, input).await
+    }
+
+    pub async fn capture_paste(
+        address: &str,
+        title: &str,
+        bounds: [f64; 4],
+        input: &str,
+    ) -> anyhow::Result<Self> {
         if title.is_empty() {
             anyhow::bail!("there is no active window");
         }
