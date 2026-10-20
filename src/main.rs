@@ -9907,20 +9907,26 @@ async fn window_baseline(
     conn: &zbus::Connection,
     kwin_unique: &str,
     xdg: &Path,
-) -> (Option<String>, Option<Vec<WindowSnapshot>>) {
-    let windows = window_snapshots(conn, kwin_unique, xdg).await.ok();
+) -> Result<(Option<String>, Vec<WindowSnapshot>), String> {
+    let windows = tokio::time::timeout(
+        LAUNCH_BASELINE_TIMEOUT,
+        window_snapshots(conn, kwin_unique, xdg),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "KWin {kwin_unique} did not answer the window inventory within {} seconds",
+            LAUNCH_BASELINE_TIMEOUT.as_secs()
+        )
+    })?
+    .map_err(|error| format!("KWin {kwin_unique} window inventory failed: {error}"))?;
+    // A complete empty inventory is authoritative in a newly started desktop.
+    // Do not make a second active-window request when there is no active window.
     let active = windows
-        .as_ref()
-        .and_then(|windows| windows.iter().find(|window| window.active))
+        .iter()
+        .find(|window| window.active)
         .map(|window| window.id.clone());
-    let active = match active {
-        Some(id) => Some(id),
-        None => active_window_info(conn, kwin_unique, xdg)
-            .await
-            .ok()
-            .map(|(_, _, geometry)| geometry.id),
-    };
-    (active, windows)
+    Ok((active, windows))
 }
 
 /// When the window list a launch compares against was read.
@@ -9981,6 +9987,7 @@ impl Drop for LaunchResolutionFile {
 struct LaunchProgress {
     stage: &'static str,
     command_submitted: bool,
+    window_baseline_errors: Vec<serde_json::Value>,
 }
 
 struct PendingLaunchFile {
@@ -10006,6 +10013,7 @@ fn launch_timeout(progress: &LaunchProgress, timeout: Duration) -> McpError {
         ),
         Some(serde_json::json!({
             "reason": "launch_timeout", "stage": progress.stage,
+            "window_baseline_errors": progress.window_baseline_errors,
             "command_submitted": progress.command_submitted,
             "timeout_seconds": timeout.as_secs(),
         })),
@@ -14162,6 +14170,7 @@ impl KwinMcp {
         let progress = Arc::new(std::sync::Mutex::new(LaunchProgress {
             stage: "waiting for the session",
             command_submitted: false,
+            window_baseline_errors: Vec::new(),
         }));
         let observed = progress.clone();
         let service = tower::service_fn(|(peer, params)| {
@@ -14231,18 +14240,20 @@ impl KwinMcp {
             progress.stage = "reading windows before launch";
         }
         let mut baseline = WindowBaseline::PreLaunch;
-        let (mut prev_window_id, mut previous_windows) = match tokio::time::timeout(
-            LAUNCH_BASELINE_TIMEOUT,
-            window_baseline(&conn, &kwin_unique, &xdg),
-        )
-        .await
-        {
-            Ok(read) => read,
-            Err(_) => {
-                baseline = WindowBaseline::AfterSubmit;
-                (None, None)
-            }
-        };
+        let mut baseline_errors = Vec::new();
+        let (mut prev_window_id, mut previous_windows) =
+            match window_baseline(&conn, &kwin_unique, &xdg).await {
+                Ok((active, windows)) => (active, Some(windows)),
+                Err(reason) => {
+                    baseline = WindowBaseline::AfterSubmit;
+                    baseline_errors
+                        .push(serde_json::json!({"stage": "pre_launch", "reason": reason}));
+                    (None, None)
+                }
+            };
+        if let Ok(mut progress) = progress.lock() {
+            progress.window_baseline_errors.clone_from(&baseline_errors);
+        }
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
@@ -14349,22 +14360,22 @@ impl KwinMcp {
         }
 
         if baseline == WindowBaseline::AfterSubmit {
-            match tokio::time::timeout(
-                LAUNCH_BASELINE_TIMEOUT,
-                window_baseline(&conn, &kwin_unique, &xdg),
-            )
-            .await
-            {
+            match window_baseline(&conn, &kwin_unique, &xdg).await {
                 Ok((active, windows)) => {
                     prev_window_id = active;
-                    previous_windows = windows;
+                    previous_windows = Some(windows);
                 }
-                Err(_) => baseline = WindowBaseline::Unavailable,
+                Err(reason) => {
+                    baseline = WindowBaseline::Unavailable;
+                    baseline_errors
+                        .push(serde_json::json!({"stage": "after_submit", "reason": reason}));
+                }
             }
         }
 
         if let Ok(mut progress) = progress.lock() {
             progress.stage = "waiting for a window";
+            progress.window_baseline_errors.clone_from(&baseline_errors);
         }
         let chromium_launch = launches_chromium(&params.command);
         let waiting = tower::service_fn(|()| {
@@ -14537,13 +14548,13 @@ impl KwinMcp {
                     ("new", format!("window: {}", geo.id))
                 };
                 Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), serde_json::json!({
-                    "action": "launch", "command": params.command, "window": geo.id,
+                    "action": "launch", "command": params.command, "window": geo.id, "command_submitted": true,
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_title": geo.title,
                     "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
-                    "window_baseline": baseline.as_str(),
+                    "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                 })).await)
             }
             (None, Some(status)) => {
@@ -14586,13 +14597,13 @@ impl KwinMcp {
                     "exited"
                 };
                 let mut payload = serde_json::json!({
-                    "action": "launch", "command": params.command,
+                    "action": "launch", "command": params.command, "command_submitted": true,
                     "window": if browser_unattributed { "unattributed" } else { "exited" },
                     "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "cdp_port": null, "warning": warning,
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
-                    "window_baseline": baseline.as_str(),
+                    "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                     "stderr_tail": diagnostics.stderr,
                     "sandbox_log_line": diagnostics.sandbox_line,
                     "stderr_error": diagnostics.unavailable,
@@ -14615,7 +14626,7 @@ impl KwinMcp {
                 "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
                 "stage": "waiting for a window", "command_submitted": true,
                 "window_timeout_seconds": window_timeout.as_secs(),
-                "window_baseline": baseline.as_str(),
+                "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
             })).await),
         }
     }

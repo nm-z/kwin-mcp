@@ -7216,6 +7216,21 @@ fn launch_app_submits_despite_its_own_frozen_compositor_and_recovers() {
         payload["window_baseline"], "unavailable",
         "{fault_response}"
     );
+    let failures = payload["window_baseline_errors"]
+        .as_array()
+        .expect("baseline diagnostics");
+    assert_eq!(failures.len(), 2, "{fault_response}");
+    assert_eq!(failures[0]["stage"], "pre_launch");
+    assert_eq!(failures[1]["stage"], "after_submit");
+    for failure in failures {
+        let reason = failure["reason"]
+            .as_str()
+            .expect("inventory failure reason");
+        assert!(
+            reason.contains("KWin") && reason.contains("within 5 seconds"),
+            "{reason}"
+        );
+    }
     assert!(
         (24_000..29_000).contains(&elapsed_ms),
         "launch duration {elapsed_ms}ms"
@@ -10418,4 +10433,57 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
         json!({"session_id":host_id}),
     );
     desktop.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn launch_app_reads_the_initial_empty_desktop_without_a_second_active_window_probe() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session_id = session_handle(&started);
+    let workdir = workdir(&started);
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "session_id": session_id,
+            "command": "printf submitted-once > \"$XDG_RUNTIME_DIR/first-launch-proof\"; konsole --separate --hold -e bash -c 'printf first-launch-window'"
+        }),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let payload = &launched["result"]["structuredContent"];
+    assert_eq!(payload["command_submitted"], true, "{launched}");
+    assert_eq!(payload["window_baseline"], "pre_launch", "{launched}");
+    assert_eq!(payload["window_baseline_errors"], json!([]), "{launched}");
+    assert_eq!(payload["window_outcome"], "new", "{launched}");
+    assert_eq!(
+        std::fs::read_to_string(workdir.join("first-launch-proof"))
+            .expect("independent launch marker"),
+        "submitted-once"
+    );
+    let windows = call_tool(
+        &mut client,
+        4,
+        "window_list",
+        json!({"session_id": session_id}),
+    );
+    assert!(
+        windows.to_string().to_lowercase().contains("konsole"),
+        "{windows}"
+    );
+    call_tool(
+        &mut client,
+        5,
+        "session_stop",
+        json!({"session_id": session_id}),
+    );
+    client.stop_process();
 }
