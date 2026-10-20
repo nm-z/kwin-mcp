@@ -22,6 +22,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `mouse_scroll` | Scroll at window-relative coordinates. |
 | `mouse_drag` | Drag from one window-relative position to another. |
 | `keyboard_type` | Type a string of text. |
+| `keyboard_paste` | Paste UTF-8 text through the session clipboard with an acknowledged shortcut. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window. |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
@@ -336,9 +337,37 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## Fast clipboard input
+
+Use `keyboard_paste({"text":"..."})` for long text, Unicode, or terminal commands
+that do not need paced character events. Focus the target first. The call writes
+the session clipboard and PRIMARY selection, sends Shift+Insert, and waits for
+KWin to acknowledge the shortcut. Both selections retain the pasted text; the
+host clipboard remains separate.
+
+For a terminal command, paste without a trailing newline, inspect the terminal,
+and use `keyboard_key({"key":"Return"})` when you intend to execute it. Pasted
+newlines are clipboard content, but applications can interpret them as
+submission; this tool never adds a Return key automatically.
+
+The receipt reports `clipboard_characters`, `shortcut_submitted`,
+`submission_complete`, and `compositor_acknowledged` separately. These establish
+the offered clipboard length and input submission. `application_text` is
+`unverified` and `form_submission` is `not_observed`: this tool does not read back
+the application value or confirm command execution. Check the field, terminal
+output, or a command-produced file before continuing. `retry_safe: false` means
+inspect before repeating a paste, since it can duplicate text or commands.
+
+Run the production-stdio regression with
+`ruby tests/keyboard_paste_e2e.rb /absolute/path/to/kwin-mcp /absolute/evidence/directory`.
+It checks fast 120-character terminal input, UTF-8 and multiline clipboard
+content, a native Qt field, and empty-input rejection using independently
+exported application results. `--baseline` records the old paced-input timing
+and fails when the paste tool is absent.
+
 ## Input timing
 
-Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
+Paced mouse and keyboard tools accept `speed`, a positive timing multiplier
 (default `1.0`). `keyboard_type` defaults to approximately 100 WPM; `speed: 2`
 requests approximately twice that rate. A 900-character comment can therefore
 need roughly two minutes at the default rate. For a longer comment, pass a
