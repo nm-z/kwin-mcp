@@ -1,0 +1,2 @@
+{"check":"same_path_session_exports","first_session":"s901516-1","second_session":"s901516-2","first_bytes":"s901516-1\n","second_bytes":"s901516-2\n","passed":true}
+session_registry=PASS (s901516-1 and s901516-2 live together; export and window_list from the earlier handle; stops confirmed)
