@@ -3396,13 +3396,19 @@ impl Eis {
         let delivery = self.flush();
         if let Some(log) = &self.audit {
             for pressed in [true, false] {
-                log.event(serde_json::json!({
-                    "event": "key", "keycode": code,
-                    "pressed": pressed, "character": character
-                }), &delivery).map_err(|error| anyhow::anyhow!(
-                    "input was submitted but log {} could not be appended: {error}",
-                    log.path.display()
-                ))?;
+                log.event(
+                    serde_json::json!({
+                        "event": "key", "keycode": code,
+                        "pressed": pressed, "character": character
+                    }),
+                    &delivery,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "input was submitted but log {} could not be appended: {error}",
+                        log.path.display()
+                    )
+                })?;
             }
         }
         delivery
@@ -15040,13 +15046,18 @@ impl KwinMcp {
                     let progress = observed.lock().map_err(|_| {
                         McpError::internal_error("launch progress lock poisoned", None)
                     })?;
-                    Err(launch_failure(launch_timeout(&progress, call_timeout), &progress))
+                    Err(launch_failure(
+                        launch_timeout(&progress, call_timeout),
+                        &progress,
+                    ))
                 } else {
                     let error = match error.downcast::<McpError>() {
                         Ok(error) => *error,
                         Err(error) => McpError::internal_error(error.to_string(), None),
                     };
-                    let progress = observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let progress = observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Err(launch_failure(error, &progress))
                 }
             }

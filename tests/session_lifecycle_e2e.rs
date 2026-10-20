@@ -234,10 +234,13 @@ impl RpcClient {
             command.env("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY", "1");
         }
         command.envs(extra_env.iter().copied());
-        if extra_env.iter().any(|(name, value)|
-            *name == "KWIN_MCP_E2E_NATIVE_EXECUTABLE_WATCH" && *value == "1")
+        if extra_env
+            .iter()
+            .any(|(name, value)| *name == "KWIN_MCP_E2E_NATIVE_EXECUTABLE_WATCH" && *value == "1")
         {
-            command.env_remove("KWIN_MCP_BINARY").env_remove("KWIN_MCP_REPO");
+            command
+                .env_remove("KWIN_MCP_BINARY")
+                .env_remove("KWIN_MCP_REPO");
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -8572,14 +8575,24 @@ fn check_reexecution(source_reload: bool, provider_install: bool) {
             .env("PATH", std::env::join_paths(paths).expect("installer PATH"))
             .output()
             .expect("run exact provider installer");
-        assert!(output.status.success(), "installer stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "installer stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
-            "Configured MCP provider command: {}", binary.display())));
-        assert_eq!(std::fs::read_link(path_bin.join("kwin-mcp")).expect("unrelated PATH remains"),
-            PathBuf::from("/usr/bin/true"));
-        assert_eq!(std::fs::read(&binary).expect("installed server"),
-            std::fs::read(source.join("kwin-mcp")).expect("source server"));
+            "Configured MCP provider command: {}",
+            binary.display()
+        )));
+        assert_eq!(
+            std::fs::read_link(path_bin.join("kwin-mcp")).expect("unrelated PATH remains"),
+            PathBuf::from("/usr/bin/true")
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("installed server"),
+            std::fs::read(source.join("kwin-mcp")).expect("source server")
+        );
         println!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
         let replacement = binary.with_extension("next");
@@ -8599,8 +8612,11 @@ fn check_reexecution(source_reload: bool, provider_install: bool) {
         use std::os::unix::fs::MetadataExt;
         let running = std::fs::metadata(format!("/proc/{pid}/exe")).expect("reloaded executable");
         let installed = std::fs::metadata(&binary).expect("installed executable");
-        assert_eq!((running.dev(), running.ino()), (installed.dev(), installed.ino()),
-            "live provider must execute the installed artifact, not its deleted predecessor");
+        assert_eq!(
+            (running.dev(), running.ino()),
+            (installed.dev(), installed.ino()),
+            "live provider must execute the installed artifact, not its deleted predecessor"
+        );
     }
     client.wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
     assert_eq!(client.child.id(), pid);
@@ -11688,16 +11704,42 @@ fn starting_another_session_preserves_existing_file_exports() {
     let session_path = "/tmp/prior-session-capture.png";
     let mut sessions = Vec::new();
     let mut expected = Vec::new();
-    for (index, title) in ["earlier-export-window", "later-export-window"].into_iter().enumerate() {
+    for (index, title) in ["earlier-export-window", "later-export-window"]
+        .into_iter()
+        .enumerate()
+    {
         let request = 2 + u64::try_from(index).expect("request index") * 4;
-        let started = call_tool(&mut client, request, "session_start", json!({"width":800,"height":600,"browser_profiles":"fresh"}));
+        let started = call_tool(
+            &mut client,
+            request,
+            "session_start",
+            json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+        );
         let id = session_handle(&started);
-        let launched = call_tool(&mut client, request + 1, "launch_app", json!({"session_id":id,"command":format!("kdialog --title {title} --msgbox {title}")}));
-        assert_eq!(launched["result"]["structuredContent"]["window_outcome"], "new", "{launched}");
-        let captured = call_tool(&mut client, request + 2, "screenshot", json!({"session_id":id}));
-        let capture = captured["result"]["structuredContent"]["path"].as_str().expect("session screenshot path");
+        let launched = call_tool(
+            &mut client,
+            request + 1,
+            "launch_app",
+            json!({"session_id":id,"command":format!("kdialog --title {title} --msgbox {title}")}),
+        );
+        assert_eq!(
+            launched["result"]["structuredContent"]["window_outcome"], "new",
+            "{launched}"
+        );
+        let captured = call_tool(
+            &mut client,
+            request + 2,
+            "screenshot",
+            json!({"session_id":id}),
+        );
+        let capture = captured["result"]["structuredContent"]["path"]
+            .as_str()
+            .expect("session screenshot path");
         let bytes = std::fs::read(capture).expect("independent screenshot bytes");
-        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "capture is not PNG");
+        assert!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "capture is not PNG"
+        );
         if let Some(artifacts) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
             let artifacts = PathBuf::from(artifacts);
             std::fs::create_dir_all(&artifacts).expect("artifact directory");
@@ -11705,38 +11747,114 @@ fn starting_another_session_preserves_existing_file_exports() {
         }
         // Both desktops use the same private /tmp name. Export must select
         // the requested desktop rather than the most recently created one.
-        let command = format!("cp -- {} {session_path}", shlex::try_quote(capture).expect("quote capture path"));
-        let copied = call_tool(&mut client, request + 3, "launch_app", json!({"session_id":id,"command":command,"window_timeout_seconds":1}));
-        assert_eq!(copied["result"]["structuredContent"]["exit_status"], 0, "{copied}");
+        let command = format!(
+            "cp -- {} {session_path}",
+            shlex::try_quote(capture).expect("quote capture path")
+        );
+        let copied = call_tool(
+            &mut client,
+            request + 3,
+            "launch_app",
+            json!({"session_id":id,"command":command,"window_timeout_seconds":1}),
+        );
+        assert_eq!(
+            copied["result"]["structuredContent"]["exit_status"], 0,
+            "{copied}"
+        );
         sessions.push((id, workdir(&started)));
         expected.push(bytes);
     }
-    assert_ne!(sessions[0].0, sessions[1].0, "second start reused the first handle");
-    assert_ne!(expected[0], expected[1], "distinct GUI fixtures produced identical captures");
+    assert_ne!(
+        sessions[0].0, sessions[1].0,
+        "second start reused the first handle"
+    );
+    assert_ne!(
+        expected[0], expected[1],
+        "distinct GUI fixtures produced identical captures"
+    );
     let listed = call_tool(&mut client, 10, "session_list", json!({}));
-    let records = listed["result"]["structuredContent"]["sessions"].as_array().expect("live session records");
+    let records = listed["result"]["structuredContent"]["sessions"]
+        .as_array()
+        .expect("live session records");
     for (id, _) in &sessions {
-        assert!(records.iter().any(|record| record["session_id"] == id.as_str()), "live handle missing: {listed}");
+        assert!(
+            records
+                .iter()
+                .any(|record| record["session_id"] == id.as_str()),
+            "live handle missing: {listed}"
+        );
     }
     for (index, (id, _)) in sessions.iter().enumerate() {
         let destination = output.join(format!("session-{index}.png"));
-        let exported = call_tool(&mut client, 11 + u64::try_from(index).expect("export index"), "export_file", json!({"session_id":id,"session_path":session_path,"host_path":destination}));
-        assert_eq!(exported["result"]["structuredContent"]["status"], "exported", "{exported}");
-        assert_eq!(std::fs::read(&destination).expect("independent exported bytes"), expected[index], "export came from another session");
+        let exported = call_tool(
+            &mut client,
+            11 + u64::try_from(index).expect("export index"),
+            "export_file",
+            json!({"session_id":id,"session_path":session_path,"host_path":destination}),
+        );
+        assert_eq!(
+            exported["result"]["structuredContent"]["status"], "exported",
+            "{exported}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("independent exported bytes"),
+            expected[index],
+            "export came from another session"
+        );
     }
-    let stopped = call_tool(&mut client, 13, "session_stop", json!({"session_id":sessions[1].0}));
-    assert_eq!(stopped["result"]["structuredContent"]["status"], "stopped", "{stopped}");
+    let stopped = call_tool(
+        &mut client,
+        13,
+        "session_stop",
+        json!({"session_id":sessions[1].0}),
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
     assert!(!sessions[1].1.exists(), "later session workdir remains");
     let again = output.join("earlier-after-later-stop.png");
-    let exported = call_tool(&mut client, 14, "export_file", json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":again}));
-    assert_eq!(exported["result"]["structuredContent"]["status"], "exported", "{exported}");
-    assert_eq!(std::fs::read(&again).expect("earlier export after later stop"), expected[0]);
-    let stopped = call_tool(&mut client, 15, "session_stop", json!({"session_id":sessions[0].0}));
-    assert_eq!(stopped["result"]["structuredContent"]["status"], "stopped", "{stopped}");
+    let exported = call_tool(
+        &mut client,
+        14,
+        "export_file",
+        json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":again}),
+    );
+    assert_eq!(
+        exported["result"]["structuredContent"]["status"], "exported",
+        "{exported}"
+    );
+    assert_eq!(
+        std::fs::read(&again).expect("earlier export after later stop"),
+        expected[0]
+    );
+    let stopped = call_tool(
+        &mut client,
+        15,
+        "session_stop",
+        json!({"session_id":sessions[0].0}),
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["status"], "stopped",
+        "{stopped}"
+    );
     assert!(!sessions[0].1.exists(), "earlier session workdir remains");
-    let stale = call_tool(&mut client, 16, "export_file", json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":output.join("must-not-exist.png")}));
-    assert_eq!(stale["error"]["data"]["session_status"], "stopped", "{stale}");
-    assert!(!output.join("must-not-exist.png").exists(), "stopped-session export wrote a file");
-    eprintln!("PASS: two distinct live handles, three byte-exact PNG exports, earlier handle survives later stop, stopped handle rejected, both workdirs removed");
+    let stale = call_tool(
+        &mut client,
+        16,
+        "export_file",
+        json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":output.join("must-not-exist.png")}),
+    );
+    assert_eq!(
+        stale["error"]["data"]["session_status"], "stopped",
+        "{stale}"
+    );
+    assert!(
+        !output.join("must-not-exist.png").exists(),
+        "stopped-session export wrote a file"
+    );
+    eprintln!(
+        "PASS: two distinct live handles, three byte-exact PNG exports, earlier handle survives later stop, stopped handle rejected, both workdirs removed"
+    );
     client.stop_process();
 }
