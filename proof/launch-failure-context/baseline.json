@@ -1,0 +1,22 @@
+{
+  "status": "passed",
+  "mode": "baseline",
+  "failed": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "error": {
+      "code": -32603,
+      "message": "launch_app could not write its command script: writing /tmp/kwin-mcp-470761-1/launch-0.sh failed: Permission denied (os error 13). Nothing was submitted.",
+      "data": {
+        "command_submitted": false,
+        "path": "/tmp/kwin-mcp-470761-1/launch-0.sh",
+        "reason": "write_failed",
+        "stage": "writing the launch script"
+      }
+    }
+  },
+  "command_marker_absent": true,
+  "same_session_recovered": true,
+  "errno_exercised": "EACCES",
+  "quota_not_changed": true
+}

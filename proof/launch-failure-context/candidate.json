@@ -1,0 +1,26 @@
+{
+  "status": "passed",
+  "mode": "candidate",
+  "failed": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "error": {
+      "code": -32603,
+      "message": "launch_app could not write its command script: writing /tmp/kwin-mcp-565569-1/launch-0.sh failed: Permission denied (os error 13). Nothing was submitted. [launch stage: writing the launch script; command submitted: false]. No command was submitted. Inspect the reported path and its filesystem/quota (free blocks alone do not establish available user quota), then retry only after the underlying error is corrected. The session remains open.",
+      "data": {
+        "command_submitted": false,
+        "operation": "launch_app",
+        "os_error": 13,
+        "path": "/tmp/kwin-mcp-565569-1/launch-0.sh",
+        "reason": "write_failed",
+        "recovery_action": "No command was submitted. Inspect the reported path and its filesystem/quota (free blocks alone do not establish available user quota), then retry only after the underlying error is corrected. The session remains open.",
+        "retry_safe": true,
+        "stage": "writing the launch script"
+      }
+    }
+  },
+  "command_marker_absent": true,
+  "same_session_recovered": true,
+  "errno_exercised": "EACCES",
+  "quota_not_changed": true
+}

@@ -644,3 +644,21 @@ are external prerequisites.
 
 See [deployment instructions](docs/deployment.md) for commands, private build and
 install paths, runtime compatibility requirements and unit configuration.
+
+### Launch failure recovery
+
+Every error produced during `launch_app` includes the launch `stage`,
+`command_submitted`, `operation`, `retry_safe`, and `recovery_action`. More specific
+error data (such as a path-not-visible reason) is preserved. Command-script write
+errors also include the exact `path` and numeric `os_error`; quota diagnostics do
+not treat free filesystem blocks as proof of available per-user quota.
+
+A pre-submission failure may be retried only after correcting its cause. Once any
+submission is confirmed, a later error cannot authorize replay: inspect
+`window_list` and `screenshot` in that same session before launching again. An
+error does not automatically stop the desktop or rerun the command.
+
+The real stdio regression `tests/launch_failure_context_e2e.rb` makes only its own
+session workdir temporarily unwritable, verifies that no command ran, restores its
+permissions, and verifies a new window in the same session. It does not fill a
+host disk or change a user quota.
