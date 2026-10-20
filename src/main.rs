@@ -11079,7 +11079,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use only IDs from your own session_start calls. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
@@ -15537,7 +15537,7 @@ fn ordered_tool(name: &str) -> bool {
     input_tool(name) || matches!(name, "clipboard_write" | "clipboard_read")
 }
 
-const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use only session IDs returned by your own session_start calls; a session you created through another live same-user kwin-mcp process on this host can also be reached.";
+const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other agents' sessions. Use IDs from your own session_start calls, or explicitly attach to a specific existing session authorized by the user with session_attach. Attachment transfers no lifecycle ownership.";
 const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, expired, or start_blocked to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
 const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -15680,10 +15680,159 @@ impl Drop for SessionControlSocket {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionAttachArgs {
+    session_id: String,
+    owner_pid: u32,
+    user_authorized: bool,
+    application: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionOwnerIdentity {
+    pid: u32,
+    uid: u32,
+    start_ticks: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AttachedSession {
+    session_id: String,
+    owner: SessionOwnerIdentity,
+    sandbox_pid: u32,
+    workdir: PathBuf,
+    scope_unit: Option<String>,
+}
+
+fn session_attach_error(reason: &'static str, message: impl Into<String>) -> McpError {
+    McpError::invalid_params(
+        message.into(),
+        Some(serde_json::json!({
+            "reason":reason, "submitted":false, "retry_safe":false,
+        })),
+    )
+}
+
+fn session_owner_identity(pid: u32) -> Result<SessionOwnerIdentity, String> {
+    use std::os::unix::fs::MetadataExt;
+    let signed = i32::try_from(pid).map_err(|_| "session owner PID is out of range".to_owned())?;
+    if signed <= 0 {
+        return Err("session owner PID must be positive".to_owned());
+    }
+    let process = procfs::process::Process::new(signed)
+        .map_err(|error| format!("session owner {pid} is unavailable: {error}"))?;
+    let stat = process
+        .stat()
+        .map_err(|error| format!("cannot verify owner {pid}: {error}"))?;
+    if matches!(stat.state, 'Z' | 'X' | 'x') {
+        return Err(format!("owner {pid} has exited"));
+    }
+    let metadata = std::fs::metadata(format!("/proc/{pid}"))
+        .map_err(|error| format!("cannot verify owner UID: {error}"))?;
+    Ok(SessionOwnerIdentity {
+        pid,
+        uid: metadata.uid(),
+        start_ticks: stat.starttime,
+    })
+}
+
+fn verify_attached_owner(pid: u32, expected: SessionOwnerIdentity) -> Result<(), McpError> {
+    let observed = session_owner_identity(pid)
+        .map_err(|error| session_attach_error("attached_session_owner_changed", error))?;
+    if observed != expected {
+        return Err(session_attach_error(
+            "attached_session_owner_changed",
+            "The attached owner has exited or changed. The operation was not forwarded.",
+        ));
+    }
+    Ok(())
+}
+
+fn attached_session_from_owner_list(
+    args: &SessionAttachArgs,
+    owner: SessionOwnerIdentity,
+    list: &serde_json::Value,
+) -> Result<AttachedSession, McpError> {
+    if list["server_pid"].as_u64() != Some(u64::from(owner.pid))
+        || list["scope"].as_str() != Some("current_process")
+    {
+        return Err(session_attach_error(
+            "session_owner_mismatch",
+            "The responding server did not identify the requested owner.",
+        ));
+    }
+    let sessions = list["sessions"].as_array().ok_or_else(|| {
+        session_attach_error(
+            "invalid_session_list",
+            "The owner returned no structured session list.",
+        )
+    })?;
+    let session = sessions
+        .iter()
+        .find(|session| session["session_id"].as_str() == Some(&args.session_id))
+        .ok_or_else(|| {
+            session_attach_error(
+                "session_not_found",
+                "The selected session is not registered with its owner.",
+            )
+        })?;
+    if session["status"].as_str() != Some("running") {
+        return Err(session_attach_error(
+            "session_not_running",
+            "Only an already-running session can be attached.",
+        ));
+    }
+    if session["pid"].as_u64() != Some(u64::from(owner.pid)) {
+        return Err(session_attach_error(
+            "session_owner_mismatch",
+            "The selected session record belongs to a different owner.",
+        ));
+    }
+    let sandbox_pid = session["sandbox_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| {
+            session_attach_error(
+                "invalid_session_identity",
+                "The session has no valid sandbox PID.",
+            )
+        })?;
+    let workdir = session["workdir"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            session_attach_error(
+                "invalid_session_identity",
+                "The session has no absolute work directory.",
+            )
+        })?;
+    Ok(AttachedSession {
+        session_id: args.session_id.clone(),
+        owner,
+        sandbox_pid,
+        workdir,
+        scope_unit: session["scope_unit"].as_str().map(str::to_owned),
+    })
+}
+
 async fn forward_session_call(
     server_pid: u32,
     request: rmcp::model::CallToolRequestParams,
 ) -> Result<Option<CallToolResult>, McpError> {
+    forward_session_call_checked(server_pid, request, None).await
+}
+
+async fn forward_session_call_checked(
+    server_pid: u32,
+    request: rmcp::model::CallToolRequestParams,
+    expected_owner: Option<SessionOwnerIdentity>,
+) -> Result<Option<CallToolResult>, McpError> {
+    if let Some(expected) = expected_owner {
+        verify_attached_owner(server_pid, expected)?;
+    }
     let connected = tokio::time::timeout(SESSION_CONTROL_CONNECT_TIMEOUT, async {
         let path = match session_control_socket_path(server_pid) {
             Ok(path) => path,
@@ -15708,8 +15857,18 @@ async fn forward_session_call(
     })
     .await;
     let Ok(Some(mut service)) = connected else {
-        return Ok(None);
+        return if expected_owner.is_some() {
+            Err(session_attach_error(
+                "attached_session_owner_unavailable",
+                "The attached owner could not be reached. The operation was not forwarded.",
+            ))
+        } else {
+            Ok(None)
+        };
     };
+    if let Some(expected) = expected_owner {
+        verify_attached_owner(server_pid, expected)?;
+    }
     let result = match service.peer().call_tool(request).await {
         Ok(result) => Ok(Some(result)),
         Err(rmcp::service::ServiceError::McpError(error)) => Err(error),
@@ -15919,6 +16078,7 @@ fn unknown_session_error(id: &str) -> McpError {
 
 #[derive(Clone)]
 struct SessionRouter {
+    attached: Arc<tokio::sync::RwLock<std::collections::BTreeMap<String, AttachedSession>>>,
     remote_input_orders:
         Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Weak<InputOrder>>>>,
     clipboards: Arc<std::sync::Mutex<ClipboardStore>>,
@@ -15932,6 +16092,7 @@ struct SessionRouter {
 impl SessionRouter {
     fn new(display: DisplayConfig) -> Self {
         Self {
+            attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
             sessions: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
@@ -16062,6 +16223,102 @@ impl SessionRouter {
             Some(_) | None => Ok(None),
         }
     }
+    async fn attach(
+        &self,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: SessionAttachArgs =
+            serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
+                .map_err(|error| {
+                    session_attach_error(
+                        "invalid_attach_arguments",
+                        format!("Invalid session_attach arguments: {error}"),
+                    )
+                })?;
+        if !args.user_authorized {
+            return Err(session_attach_error(
+                "explicit_authorization_required",
+                "session_attach requires explicit user authorization for the selected existing session.",
+            ));
+        }
+        let application = args.application.trim();
+        if application.is_empty() || application.chars().count() > 512 {
+            return Err(session_attach_error(
+                "invalid_authorization_context",
+                "application must describe the authorized application or desktop in 1–512 characters.",
+            ));
+        }
+        if session_owner_pid(&args.session_id) != Some(args.owner_pid) {
+            return Err(session_attach_error(
+                "session_owner_mismatch",
+                "owner_pid must match the owner encoded in session_id.",
+            ));
+        }
+        let before = session_owner_identity(args.owner_pid)
+            .map_err(|error| session_attach_error("session_owner_unavailable", error))?;
+        if before.uid != unsafe { nix::libc::geteuid() } {
+            return Err(session_attach_error(
+                "session_owner_uid_mismatch",
+                "The existing session must belong to the current Unix user.",
+            ));
+        }
+        let listed = if args.owner_pid == std::process::id() {
+            self.list(peer).await?
+        } else {
+            let request =
+                serde_json::from_value(serde_json::json!({"name":"session_list", "arguments":{}}))
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!("Construct session identity query: {error}"),
+                            None,
+                        )
+                    })?;
+            forward_session_call_checked(args.owner_pid, request, Some(before))
+                .await?
+                .ok_or_else(|| {
+                    session_attach_error(
+                        "session_owner_unavailable",
+                        "The existing owner could not be reached.",
+                    )
+                })?
+        };
+        if listed.is_error == Some(true) {
+            return Err(session_attach_error(
+                "session_identity_query_failed",
+                "The existing owner could not report live sessions.",
+            ));
+        }
+        let payload = listed.structured_content.as_ref().ok_or_else(|| {
+            session_attach_error(
+                "invalid_session_list",
+                "The owner returned no structured identity.",
+            )
+        })?;
+        let attached = attached_session_from_owner_list(&args, before, payload)?;
+        verify_attached_owner(args.owner_pid, before)?;
+        let response = serde_json::json!({
+            "status":"attached", "session_id":attached.session_id,
+            "owner_pid":attached.owner.pid, "owner_uid":attached.owner.uid,
+            "owner_start_ticks":attached.owner.start_ticks,
+            "sandbox_pid":attached.sandbox_pid, "workdir":attached.workdir,
+            "scope_unit":attached.scope_unit, "requested_application":application,
+            "attaching_router_pid":std::process::id(),
+            "attachment_owns_lifecycle":false, "new_desktop_created":false,
+            "ownership_notice":"The original owner retains lifecycle ownership. Dropping this attachment does not stop the existing session.",
+        });
+        self.attached
+            .write()
+            .await
+            .insert(args.session_id, attached);
+        Ok(structured_result(
+            peer,
+            "Attached to the authorized existing session; no new desktop was created.",
+            response,
+        )
+        .await)
+    }
+
     async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut records = Vec::new();
         for (id, service) in self.entries()? {
@@ -16144,7 +16401,7 @@ impl SessionRouter {
             }
             let description = tool.description.take().unwrap_or_default();
             tool.description = Some(
-                format!("{description} Pass a session_id returned by your own session_start call; a live session you created through another local same-user process is forwarded to its owner.")
+                format!("{description} Pass a session_id from your own session_start or an explicitly authorized session_attach; a live session you created through another local same-user process is forwarded to its owner.")
                     .into(),
             );
         }
@@ -16155,6 +16412,21 @@ impl SessionRouter {
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
             ),
+        ));
+        tools.push(rmcp::model::Tool::new(
+            "session_attach",
+            "Attach to a specific already-running kwin-mcp desktop explicitly authorized by the user. Reuses its exact session_id without creating a desktop or transferring lifecycle ownership. owner_pid must match the handle. Set user_authorized only after the user authorizes this existing session; discovery is not authorization. application describes that authorization. Do not stop the attached session unless the user requests it.",
+            Arc::new(serde_json::from_value(serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "session_id":{"type":"string","minLength":1},
+                    "owner_pid":{"type":"integer","minimum":1,"maximum":4294967295_u64},
+                    "user_authorized":{"type":"boolean","const":true},
+                    "application":{"type":"string","minLength":1,"maxLength":512}
+                },
+                "required":["session_id","owner_pid","user_authorized","application"],
+                "additionalProperties":false
+            })).unwrap_or_default()),
         ));
         tools
     }
@@ -16169,7 +16441,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new desktop; keep its ID. Same-user local owners receive forwarded calls after PID/UID checks; session_list is process-local. Dead handles cannot resume: errors report lifecycle/recovery details. Clear dead/stopped/expired/start_blocked handles with session_stop, then start anew and relaunch apps.",
+            "{} Each session_start creates a new desktop; keep its ID. Use session_attach only for an existing session the user explicitly authorized; it creates no desktop and transfers no lifecycle ownership. Same-user local owners receive forwarded calls after PID/UID checks; session_list is process-local. Dead handles cannot resume: errors report lifecycle/recovery details. Clear dead/stopped/expired/start_blocked handles with session_stop, then start anew and relaunch apps.",
             info.instructions.unwrap_or_default()
         ));
         info
@@ -16203,6 +16475,9 @@ impl rmcp::ServerHandler for SessionRouter {
                 .oneshot(context.peer)
                 .await;
         }
+        if request.name == "session_attach" {
+            return self.attach(&context.peer, request.arguments.clone()).await;
+        }
         let requested_id = request
             .arguments
             .as_ref()
@@ -16219,7 +16494,19 @@ impl rmcp::ServerHandler for SessionRouter {
             if let Some(turn) = &turn {
                 turn.wait().await;
             }
-            if let Some(result) = forward_session_call(owner_pid, request.clone()).await? {
+            let expected = self
+                .attached
+                .read()
+                .await
+                .get(id)
+                .map(|attached| attached.owner);
+            let forwarded = match expected {
+                Some(expected) => {
+                    forward_session_call_checked(owner_pid, request.clone(), Some(expected)).await?
+                }
+                None => forward_session_call(owner_pid, request.clone()).await?,
+            };
+            if let Some(result) = forwarded {
                 return Ok(result);
             }
         }
