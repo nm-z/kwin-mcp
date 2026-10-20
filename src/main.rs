@@ -13088,6 +13088,8 @@ impl KwinMcp {
         let mut elements = Vec::new();
         let mut out = Vec::new();
         let mut frame_identity = None;
+        let mut accessibility_bounds = None;
+        let mut accessibility_coordinate_frame = None;
         let traversal = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
             use atspi::proxy::accessible::ObjectRefExt;
             use atspi::proxy::proxy_ext::ProxyExt;
@@ -13129,14 +13131,29 @@ impl KwinMcp {
                         .get_extents(atspi::CoordType::Screen)
                         .await
                         .map_err(KwinError::from)?;
-                    if [bounds.0, bounds.1, bounds.2, bounds.3]
+                    let same_size = [bounds.2, bounds.3]
                         .into_iter()
-                        .zip([window.x, window.y, window.w, window.h])
+                        .zip([window.w, window.h])
                         .all(|(actual, expected)| {
                             (f64::from(actual) - expected).abs() <= A11Y_WINDOW_BOUNDS_TOLERANCE
-                        })
-                    {
-                        frames.push(object.clone());
+                        });
+                    let screen_origin = [bounds.0, bounds.1]
+                        .into_iter()
+                        .zip([origin_x, origin_y])
+                        .all(|(actual, expected)| {
+                            (f64::from(actual) - f64::from(expected)).abs()
+                                <= A11Y_WINDOW_BOUNDS_TOLERANCE
+                        });
+                    // Qt Wayland can return client-local extents even for a
+                    // Screen query. Bind by title and size, and retain that
+                    // observed frame origin instead of subtracting it twice.
+                    let client_origin = bounds.0 == 0 && bounds.1 == 0;
+                    if same_size && (screen_origin || client_origin) {
+                        frames.push((object.clone(), bounds, if screen_origin {
+                            "screen_pixels"
+                        } else {
+                            "window_client_pixels"
+                        }));
                     }
                 }
             }
@@ -13153,9 +13170,11 @@ impl KwinMcp {
                     })),
                 ));
             }
-            let object = frames.pop().ok_or_else(|| {
+            let (object, bounds, coordinates) = frames.pop().ok_or_else(|| {
                 McpError::internal_error("The accessibility frame disappeared", None)
             })?;
+            accessibility_bounds = Some(bounds);
+            accessibility_coordinate_frame = Some(coordinates);
             let frame = object.as_accessible_proxy(&bus).await.map_err(KwinError::from)?;
             frame_identity = Some(format!("{}{}", frame.inner().destination(), frame.inner().path()));
             drop(frame);
@@ -13177,22 +13196,22 @@ impl KwinMcp {
                 }
                 if let Ok(node) = atspi_node(&acc).await {
                     let (x, y, w, h) = node.bounds;
-                    let in_window = f64::from(x) < window.x + window.w
-                        && f64::from(y) < window.y + window.h
-                        && f64::from(x) + f64::from(w) > window.x
-                        && f64::from(y) + f64::from(h) > window.y;
+                    let in_window = i64::from(x) < i64::from(bounds.0) + i64::from(bounds.2)
+                        && i64::from(y) < i64::from(bounds.1) + i64::from(bounds.3)
+                        && i64::from(x) + i64::from(w) > i64::from(bounds.0)
+                        && i64::from(y) + i64::from(h) > i64::from(bounds.1);
                     if node.is_useful()
                         && in_window
                         && node.states.iter().any(|state| state == "visible")
                         && (node.name.to_lowercase().contains(&query)
                             || node.role.to_lowercase().contains(&query))
                     {
-                        // AT-SPI reports screen pixels; input and screenshots
-                        // use the active client area's origin.
-                        let Some(relative_x) = x.checked_sub(origin_x) else {
+                        // Project from the matched accessibility frame into
+                        // the same client pixels used by input and screenshots.
+                        let Some(relative_x) = x.checked_sub(bounds.0) else {
                             continue;
                         };
-                        let Some(relative_y) = y.checked_sub(origin_y) else {
+                        let Some(relative_y) = y.checked_sub(bounds.1) else {
                             continue;
                         };
                         let flags = node.states.iter()
@@ -13253,6 +13272,8 @@ impl KwinMcp {
             serde_json::json!({
                 "matches": out.len(), "query": params.query, "results": results,
                 "elements": elements, "window": window, "accessibility_frame": frame_identity,
+            "accessibility_bounds": accessibility_bounds,
+            "accessibility_coordinate_frame": accessibility_coordinate_frame,
                 "coordinate_frame": "window_client_pixels",
             "coordinate_origin": {"x": origin_x, "y": origin_y},
                 "visibility": "accessibility_reported", "occlusion": "not_checked",

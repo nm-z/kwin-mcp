@@ -62,6 +62,8 @@ class WindowLookupProbe
   end
   def lookup(query, baseline:false)
     expected = active
+    tree = call('accessibility_tree', max_depth:3, show_elements:true)
+    File.write(File.join(@evidence,'window-frames.json'),JSON.pretty_generate(tree))
     result = data('find_ui_elements',query:query)
     File.write(File.join(@evidence,"lookup-#{query.gsub(/\W/,'-')}.json"),JSON.pretty_generate(result))
     if baseline
