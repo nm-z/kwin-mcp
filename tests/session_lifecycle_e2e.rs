@@ -7166,6 +7166,114 @@ fn child_named_process(server: u32, name: &str) -> i32 {
     owned[0]
 }
 
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
+fn screenshot_timeout_is_retryable_and_preserves_the_desktop() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+    );
+    let session_id = session_handle(&started);
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session_id,"command":"konsole --separate --hold -e bash -c 'printf screenshot-timeout-proof'"}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let before = call_tool(
+        &mut client,
+        4,
+        "screenshot",
+        json!({"session_id":session_id}),
+    );
+    assert!(before["error"].is_null(), "{before}");
+    let proof = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from);
+    if let Some(path) = &proof {
+        std::fs::create_dir_all(path).expect("evidence directory");
+        std::fs::copy(
+            before["result"]["structuredContent"]["path"]
+                .as_str()
+                .expect("before image"),
+            path.join("before.png"),
+        )
+        .expect("copy before image");
+    }
+    let resumed = ResumeProcess(nix::unistd::Pid::from_raw(child_compositor(
+        client.child.id(),
+    )));
+    nix::sys::signal::kill(resumed.0, nix::sys::signal::Signal::SIGSTOP)
+        .expect("pause owned compositor");
+    let begun = Instant::now();
+    client.send(
+        5,
+        "tools/call",
+        json!({"name":"screenshot","arguments":{"session_id":session_id}}),
+    );
+    thread::sleep(Duration::from_millis(300));
+    client.send(6, "ping", json!({}));
+    assert_eq!(
+        client.response(6, Duration::from_secs(2))["result"],
+        json!({})
+    );
+    let fault = client.response(5, Duration::from_secs(25));
+    let elapsed_ms = begun.elapsed().as_millis();
+    let data = &fault["error"]["data"];
+    assert_eq!(data["reason"], "frame_unavailable", "{fault}");
+    assert_eq!(data["retry_safe"], true, "{fault}");
+    assert_eq!(data["retry_after_ms"], 1000, "{fault}");
+    assert_eq!(data["stage"], "screenshot", "{fault}");
+    assert!(
+        (19_000..25_000).contains(&elapsed_ms),
+        "{elapsed_ms}: {fault}"
+    );
+    drop(resumed);
+    let windows = call_tool(
+        &mut client,
+        7,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert!(
+        windows.to_string().to_lowercase().contains("konsole"),
+        "{windows}"
+    );
+    let after = call_tool(
+        &mut client,
+        8,
+        "screenshot",
+        json!({"session_id":session_id}),
+    );
+    assert!(after["error"].is_null(), "{after}");
+    assert_eq!(
+        after["result"]["structuredContent"]["window"]["id"],
+        before["result"]["structuredContent"]["window"]["id"]
+    );
+    if let Some(path) = &proof {
+        std::fs::copy(
+            after["result"]["structuredContent"]["path"]
+                .as_str()
+                .expect("after image"),
+            path.join("after.png"),
+        )
+        .expect("copy after image");
+        std::fs::write(path.join("timeout.json"), serde_json::to_vec_pretty(&json!({"elapsed_ms":elapsed_ms,"fault":fault,"before":before,"after":after,"windows":windows})).expect("evidence JSON")).expect("save timeout evidence");
+    }
+    let stopped = call_tool(
+        &mut client,
+        9,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+}
+
 struct ResumeProcess(nix::unistd::Pid);
 impl Drop for ResumeProcess {
     fn drop(&mut self) {
