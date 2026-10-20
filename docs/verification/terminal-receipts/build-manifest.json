@@ -1,0 +1,20 @@
+{
+  "source_ref": "05b937d1c2ce50c52b80c878e0d1c12555a3ef44",
+  "hostname": "engi",
+  "uid": 1000,
+  "boot": "d42b112a-aedc-4dc4-9985-4a514d300317",
+  "binary_sha256": "bedff7d794d5e327c007fb3e185badda7338e43d1616e6da1faa32dd263783bf",
+  "binary_bytes": 366693616,
+  "binary_version": "kwin-mcp v0.1.2.2 (05b937d)",
+  "binary_version_exit": 0,
+  "kwin_version": "kwin 6.8.0",
+  "kwin_version_exit": 0,
+  "kernel": "7.2.9-arch1-1",
+  "fixture_sha256": "49d1dbea3d72a7c8214af6f2a0fbf5764a84cab9636a6a9c0c46082572bedd34",
+  "build_command": "cargo build --locked --offline -j1 --bin kwin-mcp",
+  "runtime": "Normal user runtime and bus validated by the built server; no scope guard changes.",
+  "earlier_attempts": [
+    "Nested desktop rejected missing host runtime before any terminal input.",
+    "First host invocation was stopped by the command tool timeout before input; owned server and launcher were subsequently confirmed absent."
+  ]
+}

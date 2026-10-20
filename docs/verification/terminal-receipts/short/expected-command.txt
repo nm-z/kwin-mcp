@@ -1,0 +1,1 @@
+printf '%s\n' 'receipt-b15a20ab7f6f6ce4: AaZz 0123456789 !? [] {} () +=_-/.:,;@#%' >> "$HOME/terminal-proof-b15a20ab7f6f6ce4.txt"
