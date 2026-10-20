@@ -1423,10 +1423,19 @@ impl TextReceipt {
         let mut visited = 0;
         let mut focus = None;
         for app_object in root.get_children().await? {
-            let app = app_object.as_accessible_proxy(&bus).await?;
+            // The registry lists apps that have no usable root yet or are gone as
+            // null references; one of those must not hide every other app.
+            let Ok(app) = app_object.as_accessible_proxy(&bus).await else {
+                continue;
+            };
             let mut matching_frames = Vec::new();
-            for frame_object in app.get_children().await? {
-                let frame = frame_object.as_accessible_proxy(&bus).await?;
+            let Ok(frame_objects) = app.get_children().await else {
+                continue;
+            };
+            for frame_object in frame_objects {
+                let Ok(frame) = frame_object.as_accessible_proxy(&bus).await else {
+                    continue;
+                };
                 let name = frame.name().await.unwrap_or_default();
                 if !caption_starts_with(&name, title) {
                     continue;
@@ -1471,7 +1480,9 @@ impl TextReceipt {
                     if visited > TEXT_DISCOVERY_MAX_NODES {
                         anyhow::bail!("focused text discovery exceeded its node limit");
                     }
-                    let node = object.as_accessible_proxy(&bus).await?;
+                    let Ok(node) = object.as_accessible_proxy(&bus).await else {
+                        continue;
+                    };
                     let inside_web_document =
                         inside_web_document || node.get_role().await? == atspi::Role::DocumentWeb;
                     let states = node.get_state().await?;
@@ -1942,5 +1953,86 @@ mod text_receipt_tests {
         );
         assert_eq!(delivery.status, "unverified");
         assert_eq!(delivery.method, "eis_roundtrip");
+    }
+}
+
+#[cfg(test)]
+mod null_ref_tests {
+    use super::TextReceipt;
+    use std::io::{BufRead, Write};
+
+    struct Bus {
+        child: std::process::Child,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Bus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // A registry whose only child is the null reference AT-SPI lists for an
+    // app that has no usable root.
+    struct NullRegistry;
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl NullRegistry {
+        #[zbus(name = "GetChildren")]
+        fn get_children(&self) -> zbus::fdo::Result<Vec<(String, zbus::zvariant::OwnedObjectPath)>> {
+            let null = zbus::zvariant::OwnedObjectPath::try_from("/org/a11y/atspi/null")
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            Ok(vec![(String::new(), null)])
+        }
+    }
+
+    fn start_bus() -> anyhow::Result<(Bus, String)> {
+        let dir = std::env::temp_dir().join(format!("kwin-mcp-nullref-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let config = dir.join("bus.conf");
+        let mut file = std::fs::File::create(&config)?;
+        write!(
+            file,
+            "<busconfig><type>session</type><listen>unix:path={}/bus</listen>\
+             <auth>ANONYMOUS</auth><allow_anonymous/>\
+             <policy context=\"default\"><allow send_destination=\"*\"/>\
+             <allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>",
+            dir.display()
+        )?;
+        let mut child = std::process::Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .args(["--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut address = String::new();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("dbus-daemon stdout"))?;
+        std::io::BufReader::new(stdout).read_line(&mut address)?;
+        Ok((Bus { child, dir }, address.trim().to_owned()))
+    }
+
+    #[tokio::test]
+    async fn a_null_app_reference_does_not_hide_the_other_apps() -> anyhow::Result<()> {
+        let (_bus, address) = start_bus()?;
+        let _registry = zbus::connection::Builder::address(address.as_str())?
+            .auth_mechanism(zbus::AuthMechanism::Anonymous)
+            .name("org.a11y.atspi.Registry")?
+            .serve_at("/org/a11y/atspi/accessible/root", NullRegistry)?
+            .build()
+            .await?;
+        let Err(error) = TextReceipt::capture(&address, "Some Window", [0.0; 4], "x").await
+        else {
+            anyhow::bail!("an empty accessibility tree produced a focused field");
+        };
+        assert!(
+            error.to_string().contains("no focused editable text"),
+            "the null reference aborted the search: {error}"
+        );
+        Ok(())
     }
 }
