@@ -1935,6 +1935,11 @@ const KEY_FOCUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 const KEY_FOCUS_CHECK_NODES: usize = 5000;
 const SCREENSHOT_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+// A click that closes one window leaves KWin without an active window until
+// the next one maps and takes focus; screenshot waits this long for one.
+const ACTIVE_WINDOW_WAIT: Duration = Duration::from_secs(2);
+const ACTIVE_WINDOW_POLL: Duration = Duration::from_millis(100);
+const NO_ACTIVE_WINDOW: &str = "KWin script error: No active window";
 
 // Largest accessibility_tree reply, in characters. The tree is returned as the
 // deepest run of whole levels that fits, so one call cannot blow an agent's
@@ -8520,6 +8525,7 @@ set -e
 name=${0##*/}
 real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
 ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
+first_run=0 default_check=0
 for arg in "$@"; do
   if (( profile_value )); then
     [[ -n "$arg" ]] && custom_profile=1
@@ -8533,6 +8539,8 @@ for arg in "$@"; do
     --user-data-dir=*) [[ -n "${arg#*=}" ]] && custom_profile=1 ;;
     --silent-debugger-extension-api) silent_debugger=1 ;;
     --test-type) test_type=1 ;;
+    --no-first-run) first_run=1 ;;
+    --no-default-browser-check) default_check=1 ;;
   esac
 done
 flags=()
@@ -8547,6 +8555,10 @@ case "$name" in
   *)
     (( silent_debugger )) || flags+=(--silent-debugger-extension-api)
     (( test_type )) || flags+=(--test-type)
+    # A fresh profile otherwise opens Chrome's first-run terms page in place of
+    # the requested URL, and its default-browser infobar shifts page content.
+    (( first_run )) || flags+=(--no-first-run)
+    (( default_check )) || flags+=(--no-default-browser-check)
     ;;
 esac
 cdp=1
@@ -8971,14 +8983,36 @@ async fn active_window_info(
     )
     .await?;
     if json == "null" {
-        return Err(KwinError::Msg(
-            "KWin script error: No active window".to_owned(),
-        ));
+        return Err(KwinError::Msg(NO_ACTIVE_WINDOW.to_owned()));
     }
     let info: WindowGeometry = serde_json::from_str(&json)?;
     #[expect(clippy::as_conversions)]
     let (x, y) = (info.x.round() as i32, info.y.round() as i32);
     Ok((x, y, info))
+}
+
+/// The active window, waiting up to `ACTIVE_WINDOW_WAIT` while focus is
+/// between windows, e.g. after a click closes one dialog and opens another.
+async fn awaited_active_window_info(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &std::path::Path,
+) -> Result<(i32, i32, WindowGeometry), KwinError> {
+    let deadline = tokio::time::Instant::now() + ACTIVE_WINDOW_WAIT;
+    loop {
+        match active_window_info(conn, kwin_unique, host_xdg_dir).await {
+            Err(KwinError::Msg(message)) if message == NO_ACTIVE_WINDOW => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(KwinError::Msg(format!(
+                        "{NO_ACTIVE_WINDOW} after waiting {} seconds; inspect window_list and call window_activate for the intended window",
+                        ACTIVE_WINDOW_WAIT.as_secs()
+                    )));
+                }
+                tokio::time::sleep(ACTIVE_WINDOW_POLL).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -10156,15 +10190,25 @@ fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
     let path = std::fs::read_to_string(path_error_file).ok();
     let _ = std::fs::remove_file(path_error_file);
     let path = path?;
-    let detail = if Path::new(&path).starts_with("/tmp") {
-        "/tmp is private to the session"
-    } else {
-        "use a path available inside the session"
+    // The marker lives in the session workdir, which is host_shared_dir: the
+    // one host directory the session sees at the same path.
+    let shared = path_error_file.parent();
+    let detail = match shared {
+        Some(shared) if Path::new(&path).starts_with("/tmp") => format!(
+            "/tmp is private to the session; copy what the command needs into host_shared_dir {}, which the host and the session see at the same path",
+            shared.display()
+        ),
+        Some(shared) => format!(
+            "use a path available inside the session, such as one under host_shared_dir {}",
+            shared.display()
+        ),
+        None => "use a path available inside the session".to_owned(),
     };
     Some(McpError::invalid_params(
         format!("{path} is not visible in the session; {detail}"),
         Some(serde_json::json!({
             "reason": "path_not_visible", "path": path, "command_submitted": true,
+            "host_shared_dir": shared,
         })),
     ))
 }
@@ -13197,7 +13241,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this to see the UI, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this to see the UI, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -13228,7 +13272,7 @@ impl KwinMcp {
                 None,
             ));
         }
-        let (win_x, win_y, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let (win_x, win_y, win_geo) = awaited_active_window_info(&conn, &kwin_unique, &xdg).await?;
         #[expect(clippy::as_conversions)]
         let (win_w, win_h) = (win_geo.w.round() as i32, win_geo.h.round() as i32);
         // Every coordinate here is window-relative, matching mouse input: by
@@ -15017,7 +15061,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. By default wait 15 seconds for a new or attributable existing browser window (window_timeout_seconds: 1-120). Set expect_window=false for background or non-GUI work: return after submission with the command shell's session PID and exit_status if already available; this is not proof of successful completion. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded; write output under host_shared_dir returned by session_start for host access. Other /tmp paths are private. Absolute path arguments that exist on the host, or whose parents do, must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet and accessibility switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. By default wait 15 seconds for a new or attributable existing browser window (window_timeout_seconds: 1-120). Set expect_window=false for background or non-GUI work: return after submission with the command shell's session PID and exit_status if already available; this is not proof of successful completion. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded; write output under host_shared_dir returned by session_start for host access. Other /tmp paths are private. Absolute path arguments that exist on the host, or whose parents do, must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
