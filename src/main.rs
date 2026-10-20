@@ -13927,7 +13927,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "wait_for_file",
-        description = "Wait for an absolute session file path to exist as a regular file and remain unchanged for a bounded interval. Readiness compares its inode, byte size, and modification time; this does not prove the producer has exited. A timeout reports whether the file is still missing or changing. Call export_file after the file is ready."
+        description = "Wait for an absolute session file path to exist as a regular file and remain unchanged for a bounded interval. Readiness compares its inode, byte size, and modification time; this does not prove the producer has exited or that the file is nonempty. The observation is inside the isolated session, not the host view of the same path. Before uploading a host-created file, compare size_bytes with the expected host size; a chooser accepting the path does not verify its contents. HOME overlays and private /tmp can expose different bytes. If the session copy is missing or differs, transfer the intended file into the session, or start a separate session with the existing host file in writable_paths for a private copy. A timeout reports missing or changing files. Call export_file after a session output is ready."
     )]
     async fn wait_for_file(
         &self,
