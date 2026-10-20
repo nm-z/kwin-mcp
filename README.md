@@ -24,6 +24,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_type` | Type a string of text. The result names the window that received the keys (`window`: id, title, `resourceClass`, pid, `hidden`), so text sent to a terminal running a full-screen program or to a hidden window can be told from lost input. |
 | `keyboard_paste` | Paste UTF-8 text through the session clipboard with an acknowledged shortcut. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
+| `keyboard_press` / `keyboard_release` | Hold a key or combo down across calls, then release it with the same string. For a shortcut use `keyboard_key`: a modifier left held makes every typed character a shortcut (`h` becomes Ctrl+H), so `keyboard_type` refuses with `modifier_held` until it is released. |
 | `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
