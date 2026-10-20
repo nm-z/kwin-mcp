@@ -37,7 +37,7 @@ Dir.mktmpdir('kw450-', '/var/tmp') do |root|
     #!/usr/bin/env bash
     set -eu
     for arg in "$@"; do
-      if [[ "$arg" == --config-file=/tmp/mcp-dbus.conf && "$KW450_MODE" != normal ]]; then
+      if [[ "$arg" == --config-file=/tmp/mcp-dbus.conf && ( "$KW450_MODE" == invalid || "$KW450_MODE" == noisy ) ]]; then
         printf '<busconfig><broken/></busconfig>\n' > /tmp/mcp-dbus.conf
         if [[ "$KW450_MODE" == noisy ]]; then
           head -c 131072 /dev/zero | tr '\000' x >&2
@@ -53,14 +53,17 @@ Dir.mktmpdir('kw450-', '/var/tmp') do |root|
   upstream_pid = Process.spawn(daemon,'--session','--nofork','--nopidfile',"--address=unix:path=#{upstream}",out:File::NULL,err:upstream_log)
   begin
     Timeout.timeout(5) { sleep 0.02 until File.socket?(upstream) }
-    %w[invalid noisy normal].each do |mode|
+    modes = ENV.fetch('KWIN_MCP_E2E_STARTUP_CASES', 'invalid noisy normal stopped').split
+    raise 'unknown startup case' unless !modes.empty? && (modes - %w[invalid noisy normal stopped]).empty?
+    modes.each do |mode|
       home = File.join(root,mode,'home')
       FileUtils.mkdir_p(%w[.config .cache .local/share .local/state .kde].map { |name| File.join(home,name) })
       env = {'HOME'=>home,'XDG_CONFIG_HOME'=>"#{home}/.config",'XDG_DATA_HOME'=>"#{home}/.local/share",
         'XDG_CACHE_HOME'=>"#{home}/.cache",'XDG_STATE_HOME'=>"#{home}/.local/state",'KDEHOME'=>"#{home}/.kde",
         'TMPDIR'=>runtime,'XDG_RUNTIME_DIR'=>"/run/user/#{Process.uid}",'DBUS_SESSION_BUS_ADDRESS'=>"unix:path=#{upstream}",
         'KWIN_MCP_REPO'=>"#{home}/no-repository",'CARGO'=>'/usr/bin/false','PATH'=>"#{wrappers}:#{ENV.fetch('PATH')}",
-        'KW450_MODE'=>mode,'KW450_DAEMON'=>daemon}
+        'KW450_MODE'=>mode,'KW450_DAEMON'=>daemon,
+        'KWIN_MCP_TEST_STOP_BWRAP'=>(mode == 'stopped' ? '1' : nil)}
       errors = File.open(File.join(evidence,"#{mode}.stderr"),'w')
       input,output,process = Open3.popen2(env,server,'--autoclean',err:errors)
       session = nil
@@ -69,7 +72,7 @@ Dir.mktmpdir('kw450-', '/var/tmp') do |root|
         raise initialized.inspect if initialized['error']
         input.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized')); input.flush
         began = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        response = request(input,output,2,'tools/call',name:'session_start',arguments:{width:800,height:600,browser_profiles:'fresh'})
+        response = request(input,output,2,'tools/call',name:'session_start',arguments:{width:800,height:600,browser_profiles:'fresh',startup_timeout_seconds:(mode == 'stopped' ? 60 : 20)})
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-began
         File.write(File.join(evidence,"#{mode}.json"),JSON.pretty_generate(response))
         if mode == 'normal'
@@ -85,6 +88,20 @@ Dir.mktmpdir('kw450-', '/var/tmp') do |root|
           data(request(input,output,6,'tools/call',name:'session_stop',arguments:{session_id:session}))
           session = nil
           raise 'workdir retained' if File.exist?(workdir)
+        elsif mode == 'stopped'
+          raise "stopped startup did not fail: #{response}" unless response['error']
+          unless baseline
+            message = response.fetch('error').fetch('message')
+            raise "wrong failed stage: #{message}" unless message.include?('dbus-ready marker did not appear')
+            match = message.match(/startup sandbox process pid=(\d+) state=T \(stopped\) wait_channel=([^;]*)/)
+            raise "stopped-process evidence was lost before cleanup: #{message}" unless match
+            owned_pid = File.read(errors.path)[/test stopped bwrap pid=(\d+)/, 1]
+            raise 'diagnostic did not identify the owned stopped process' unless match[1] == owned_pid
+            raise 'stopped process survived cleanup' if File.exist?("/proc/#{owned_pid}")
+            raise "startup timeout was unbounded: #{elapsed}" unless elapsed < 45
+            diagnostics = response.fetch('error').fetch('data')
+            raise 'owned stderr path retained' if File.exist?(diagnostics.fetch('sandbox_stderr_path'))
+          end
         else
           raise "startup did not fail: #{response}" unless response['error']
           unless baseline

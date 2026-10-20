@@ -1,0 +1,4 @@
+PASS invalid: elapsed=2.373s; real daemon, response and cleanup checked; baseline=false
+PASS noisy: elapsed=2.543s; real daemon, response and cleanup checked; baseline=false
+PASS normal: elapsed=1.156s; real daemon, response and cleanup checked; baseline=false
+PASS stopped: elapsed=15.768s; real daemon, response and cleanup checked; baseline=false
