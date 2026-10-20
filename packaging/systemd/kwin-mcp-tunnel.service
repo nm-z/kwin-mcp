@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare tunnel for kwin-mcp
+PartOf=graphical-session.target
+After=kwin-mcp-gateway.service
+BindsTo=kwin-mcp-gateway.service
+ConditionFileIsExecutable=/usr/bin/cloudflared
+ConditionPathExists=%h/.cloudflared/kwin-mcp.yml
+
+[Service]
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --config %h/.cloudflared/kwin-mcp.yml run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target
