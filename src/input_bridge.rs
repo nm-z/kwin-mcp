@@ -1301,10 +1301,7 @@ impl TextReceipt {
     /// `check_focus`, repeating a timed-out query once: a stall of this
     /// process can expire the timer of a query the target answered promptly.
     pub(crate) async fn recheck_focus(&self) -> Result<(), TextFocusError> {
-        match self.check_focus().await {
-            Err(TextFocusError::QueryTimedOut) => self.check_focus().await,
-            result => result,
-        }
+        keep_checking(|| self.check_focus()).await
     }
     pub(crate) async fn watch_focus(&self) -> TextFocusError {
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -1314,6 +1311,31 @@ impl TextReceipt {
             if let Err(error) = self.recheck_focus().await {
                 return error;
             }
+        }
+    }
+}
+
+/// How long a focus or window check may go unanswered before typing stops. A
+/// loaded host can delay AT-SPI and KWin replies by seconds; that alone is not
+/// evidence that focus moved, and a moved focus is reported at once.
+pub(crate) const FOCUS_UNANSWERED_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run `check` until it answers: a change is returned at once, while a timed
+/// out or failed query is repeated until `FOCUS_UNANSWERED_LIMIT` passes.
+pub(crate) async fn keep_checking<F, Fut>(mut check: F) -> Result<(), TextFocusError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), TextFocusError>>,
+{
+    let deadline = tokio::time::Instant::now() + FOCUS_UNANSWERED_LIMIT;
+    loop {
+        match check().await {
+            Err(TextFocusError::QueryTimedOut | TextFocusError::QueryFailed(_))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            result => return result,
         }
     }
 }
@@ -1716,7 +1738,10 @@ impl TextReceipt {
 
 #[cfg(test)]
 mod text_receipt_tests {
-    use super::{FocusNotEditable, TerminalFocus, TextDelivery, caption_starts_with};
+    use super::{
+        FocusNotEditable, TerminalFocus, TextDelivery, TextFocusError, caption_starts_with,
+        keep_checking,
+    };
 
     #[test]
     fn frame_names_match_captions_regardless_of_whitespace_runs() {
@@ -1730,6 +1755,32 @@ mod text_receipt_tests {
             "other.pdf — Okular"
         ));
         assert!(!caption_starts_with("doc", "doc.pdf — Okular"));
+    }
+
+    #[tokio::test]
+    async fn slow_focus_answers_are_waited_for_but_changes_stop_at_once() {
+        let mut calls = 0;
+        let answered = keep_checking(|| {
+            calls += 1;
+            let result = if calls < 4 {
+                Err(TextFocusError::QueryTimedOut)
+            } else {
+                Ok(())
+            };
+            std::future::ready(result)
+        })
+        .await;
+        assert!(answered.is_ok());
+        assert_eq!(calls, 4);
+
+        let mut calls = 0;
+        let changed = keep_checking(|| {
+            calls += 1;
+            std::future::ready(Err(TextFocusError::Changed))
+        })
+        .await;
+        assert!(matches!(changed, Err(TextFocusError::Changed)));
+        assert_eq!(calls, 1);
     }
 
     fn non_editable_focus() -> anyhow::Error {

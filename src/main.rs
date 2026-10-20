@@ -2641,15 +2641,12 @@ async fn check_typing_window(
     }
 }
 
-/// `check_typing_window`, repeating a timed-out query once: a stall of this
-/// process can expire the timer of a KWin query that answered promptly.
+/// `check_typing_window`, repeated while KWin does not answer; a changed
+/// window is still reported at once.
 async fn recheck_typing_window(
     window: &TypingWindow<'_>,
 ) -> Result<(), input_bridge::TextFocusError> {
-    match check_typing_window(window).await {
-        Err(input_bridge::TextFocusError::QueryTimedOut) => check_typing_window(window).await,
-        result => result,
-    }
+    input_bridge::keep_checking(|| check_typing_window(window)).await
 }
 
 async fn watch_typing_window(window: &TypingWindow<'_>) -> input_bridge::TextFocusError {
