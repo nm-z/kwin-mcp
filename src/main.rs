@@ -7659,6 +7659,7 @@ fn launch_script_write_error(path: &Path, error: &std::io::Error) -> McpError {
             "stage": "writing the launch script",
             "command_submitted": false,
             "path": path.display().to_string(),
+            "os_error": error.raw_os_error(),
         })),
     )
 }
@@ -10016,6 +10017,36 @@ impl Drop for PendingLaunchFile {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Every launch failure retains its exact submission stage, including errors
+/// outside command-script writes. Never turn a submitted command into safe replay.
+fn launch_failure(mut error: McpError, progress: &LaunchProgress) -> McpError {
+    let mut data = error.data.take().unwrap_or_else(|| serde_json::json!({}));
+    if !data.is_object() {
+        data = serde_json::json!({"original_data": data});
+    }
+    let submitted = progress.command_submitted || data["command_submitted"] == true;
+    if data["stage"].is_null() {
+        data["stage"] = serde_json::json!(progress.stage);
+    }
+    data["operation"] = serde_json::json!("launch_app");
+    data["command_submitted"] = serde_json::json!(submitted);
+    data["retry_safe"] = serde_json::json!(!submitted);
+    let action = if submitted {
+        "The command may still be running. Inspect window_list and screenshot in the same session before any retry; do not launch a duplicate command."
+    } else {
+        "No command was submitted. Inspect the reported path and its filesystem/quota (free blocks alone do not establish available user quota), then retry only after the underlying error is corrected. The session remains open."
+    };
+    data["recovery_action"] = serde_json::json!(action);
+    error.message = format!(
+        "{} [launch stage: {}; command submitted: {submitted}]. {action}",
+        error.message,
+        data["stage"].as_str().unwrap_or(progress.stage)
+    )
+    .into();
+    error.data = Some(data);
+    error
 }
 
 fn launch_timeout(progress: &LaunchProgress, timeout: Duration) -> McpError {
@@ -14196,12 +14227,14 @@ impl KwinMcp {
                     let progress = observed.lock().map_err(|_| {
                         McpError::internal_error("launch progress lock poisoned", None)
                     })?;
-                    Err(launch_timeout(&progress, call_timeout))
+                    Err(launch_failure(launch_timeout(&progress, call_timeout), &progress))
                 } else {
-                    Err(match error.downcast::<McpError>() {
+                    let error = match error.downcast::<McpError>() {
                         Ok(error) => *error,
                         Err(error) => McpError::internal_error(error.to_string(), None),
-                    })
+                    };
+                    let progress = observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Err(launch_failure(error, &progress))
                 }
             }
         }
@@ -14321,7 +14354,7 @@ impl KwinMcp {
         let sandbox_log = session_disk_path(&xdg).join("sandbox.log");
         let sandbox_log_offset = std::fs::metadata(&sandbox_log).map(|meta| meta.len());
         if let Ok(mut progress) = progress.lock() {
-            progress.stage = "submitting the command to the session shell";
+            progress.stage = "writing the launch script";
         }
         let command_path = xdg.join(format!("launch-{launch_id}.sh"));
         let mut script = std::fs::OpenOptions::new()
@@ -14349,6 +14382,9 @@ impl KwinMcp {
             ));
         }
         {
+            if let Ok(mut progress) = progress.lock() {
+                progress.stage = "submitting the command to the session shell";
+            }
             let guard = self.session.read().await;
             let sess = guard.as_ref().ok_or_else(|| {
                 McpError::internal_error("no session — call session_start first", None)
@@ -18149,5 +18185,87 @@ mod session_memory_warning_tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(warning, Some("memory_high"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_failure_context_tests {
+    use super::{LaunchProgress, McpError, launch_failure, launch_script_write_error};
+    use std::path::Path;
+
+    #[test]
+    fn issue500_quota_failure_retains_errno_path_and_pre_submit_recovery() {
+        let io = std::io::Error::from_raw_os_error(nix::libc::EDQUOT);
+        let failure = launch_failure(
+            launch_script_write_error(Path::new("/nonexistent-issue500/launch.sh"), &io),
+            &LaunchProgress {
+                stage: "writing the launch script",
+                command_submitted: false,
+            },
+        );
+        let data = failure.data.unwrap_or_default();
+        assert_eq!(data["os_error"], nix::libc::EDQUOT);
+        assert_eq!(data["path"], "/nonexistent-issue500/launch.sh");
+        assert_eq!(data["stage"], "writing the launch script");
+        assert_eq!(data["operation"], "launch_app");
+        assert_eq!(data["retry_safe"], true);
+        assert_eq!(data["command_submitted"], false);
+        assert!(failure.message.contains("Disk quota exceeded"));
+        assert!(failure.message.contains("free blocks alone"));
+    }
+
+    #[test]
+    fn issue500_generic_post_submit_failure_never_authorizes_replay() {
+        let failure = launch_failure(
+            McpError::internal_error("connection failed", None),
+            &LaunchProgress {
+                stage: "connecting to browser accessibility",
+                command_submitted: true,
+            },
+        );
+        let data = failure.data.unwrap_or_default();
+        assert_eq!(data["stage"], "connecting to browser accessibility");
+        assert_eq!(data["command_submitted"], true);
+        assert_eq!(data["retry_safe"], false);
+        assert!(failure.message.contains("do not launch a duplicate"));
+    }
+
+    #[test]
+    fn issue500_submission_evidence_cannot_be_downgraded_by_error_data() {
+        let failure = launch_failure(
+            McpError::internal_error(
+                "late error",
+                Some(serde_json::json!({"command_submitted":false})),
+            ),
+            &LaunchProgress {
+                stage: "waiting for a window",
+                command_submitted: true,
+            },
+        );
+        let data = failure.data.unwrap_or_default();
+        assert_eq!(data["command_submitted"], true);
+        assert_eq!(data["retry_safe"], false);
+    }
+
+    #[test]
+    fn issue500_specific_error_fields_survive_generic_annotation() {
+        let failure = launch_failure(
+            McpError::invalid_params(
+                "invisible path",
+                Some(
+                    serde_json::json!({"reason":"path_not_visible", "path":"/tmp/hidden",
+                "stage":"path preflight", "command_submitted":true}),
+                ),
+            ),
+            &LaunchProgress {
+                stage: "fallback",
+                command_submitted: false,
+            },
+        );
+        let data = failure.data.unwrap_or_default();
+        assert_eq!(data["reason"], "path_not_visible");
+        assert_eq!(data["path"], "/tmp/hidden");
+        assert_eq!(data["stage"], "path preflight");
+        assert_eq!(data["retry_safe"], false);
     }
 }
