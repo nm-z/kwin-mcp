@@ -15,7 +15,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
-| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters. |
+| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). |
 | `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
@@ -24,7 +24,32 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `keyboard_type` | Type a string of text. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. |
+| `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+
+When a producer writes an artifact asynchronously, call `wait_for_file` with
+its absolute session path before `export_file`. The file is ready when it is a
+regular file whose inode, size, and modification time remain unchanged for
+`stable_for_ms` (default 500 ms, range 100–5000), within `timeout_seconds`
+(default 30, range 1–300). A timeout distinguishes a missing file from one
+that is still changing. This bounded observation does not prove that the
+producer has exited.
+
+## Large accessibility trees
+
+`accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
+
+## Browser CDP
+
+`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port. Google Chrome and Edge need a non-default user data directory; for example:
+
+```text
+google-chrome-stable --user-data-dir="$HOME/.cache/kwin-mcp/cdp-profile" https://example.com/
+```
+
+The session assigns the CDP port. Do not pass `--remote-debugging-port`; if supplied, `launch_app` replaces it with the session port. A successful connection returns `cdp_port` in the structured result, and that port is forwarded to the host on `127.0.0.1`. Chrome 136 and later ignore remote-debugging switches for the default data directory, so use a private, non-default profile as shown in [Chrome's remote debugging guidance](https://developer.chrome.com/blog/remote-debugging-port).
+
+Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
 
 ## Resize a maximized session window
 
@@ -97,7 +122,7 @@ The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Conf
 
 Each session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host clipboard, and Ctrl+V or Shift+Insert pastes from the host clipboard. The viewer restores the session's prior selection afterward. Put anything the user should paste through the viewer on the **host** clipboard.
 
-Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
+Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste from PRIMARY can consume it. In XTerm, the default fast paste shortcut is Shift+Insert; Ctrl+V is not bound to paste by default. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
 
 `clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
@@ -117,6 +142,37 @@ To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
 Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
+
+### Live application state (Codex / ChatGPT desktop)
+
+Codex needs to write its SQLite state, logs and thread history. These can exceed
+the 64 MiB copy limit, and databases open in WAL mode on the host are normally
+read-only in a session regardless of size. A private `writable_paths` copy also
+cannot deliver a message to the real host thread.
+
+To run against live host state, explicitly share the application state directory
+when starting a **new** session. For example, with HOME `/home/nate`:
+
+```json
+{"host_write_paths":["/home/nate/.codex"]}
+```
+
+Then use `launch_app` with `chatgpt`. Use the actual state directory if Codex has
+a custom `CODEX_HOME`. Each selected directory is bound directly into the session;
+its databases, WAL, shared memory and newly created sidecars use the host inodes
+and SQLite locks. Startup does not copy this subtree or impose the staging size
+limit. Writes, messages and deletions in these directories persist on the host,
+including after `session_stop`. Do not use this option for disposable work.
+
+`host_write_paths` accepts existing directories strictly beneath HOME. It rejects
+symlinked paths, parent traversal and HOME itself. Selections cannot overlap
+browser profile directories, Chrome's cache, saved browser-cookie state, session
+storage or the host runtime directory, including their ancestors and descendants.
+They also cannot overlap private `writable_paths`. Existing host Unix sockets
+within shared directories remain blocked. Other HOME paths retain their private
+overlays. `session_start` and `session_list` report the selected directories; the
+setting survives server reload.
+Omitting the option retains the default isolation.
 
 ### Session memory limits
 
@@ -154,6 +210,12 @@ remain positive. For example:
 ```
 
 The result and `session_list` report the actual byte limits and owned scope.
+Input and screenshot calls sample the session cgroup before and after the
+operation. When RAM reaches `memory.high`, the cgroup's `memory.events high`
+counter increases during the call, or `memory.pressure full avg10` reaches 10%,
+the result includes warning text and a `memory_warning` field when structured
+content is available, with the RAM, swap, and pressure values available.
+Screenshot timeout errors name active memory pressure as a likely cause.
 When the sandbox exits, the server tears down its resources and keeps a dead
 entry until `session_stop`. Later calls return the exit cause and recovery
 guidance. An OOM diagnosis includes the scope result, RAM/swap limits and
@@ -162,6 +224,13 @@ as proof of an OOM kill. After upgrading an older server, scope identity and
 limits are recovered from the sandbox PID cgroup; values that cannot be
 recovered remain unknown. Stop the dead handle, start a new desktop without
 `session_id`, and relaunch the applications to continue.
+
+Every handle `session_list` shows is accepted by `session_stop`: a running desktop
+is stopped, and a dead, expired, or blocked-start handle is cleared with its
+lifecycle record. A `session_start` whose host call stays blocked past its budget
+is listed as `start_blocked`; `session_stop` answers `cleanup_pending` until that
+call returns, then clears the handle. A stop of an ID whose record is already
+cleared is a confirmed no-op.
 
 Configure MCP clients to launch the current `kwin-mcp` executable directly.
 The historical `kwin-mcp-shim` has its own session listing and hides these
@@ -506,7 +575,7 @@ compositor failure. An inline image and its saved PNG can contain identical,
 correct pixels even when a client presents them differently (see #435).
 
 
-Virtual display is 2000×1875 (3.75MP). All windows open maximized, no decorations, no shadows. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
+Virtual display is 2000×1875 (3.75MP). By default all windows open maximized. `session_start` with `window_mode: "native"` maps each window at the size its app requests instead, so a relaunched app reopens at its own size. Windows have no decorations or shadows in either mode. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
 Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
 
@@ -537,9 +606,19 @@ before sending or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 
+After an editable field is cleared, AT-SPI may expose one blank newline that the
+application removes when typing starts. If the entire resulting field matches
+the requested text, `atspi_transformed_blank_line` reports `unverified` with
+inspection guidance. It retains the original expected and observed counts;
+preservation of that initial newline is ambiguous. A newline retained by the
+application still follows the normal exact-text verification path.
+
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
+
+The [input delivery regression](tests/input_delivery_e2e.md) covers clearing and
+retyping the same text followed immediately by repeated screenshots.
 
 ### Startup budgets and fresh browser profiles
 
