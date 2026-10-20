@@ -1,0 +1,21 @@
+{
+  "action": "paste",
+  "application_text": "unverified",
+  "clipboard_characters": 11,
+  "compositor_acknowledged": true,
+  "delivery": {
+    "compositor_acknowledged": true,
+    "expected_field_characters": null,
+    "method": "eis_roundtrip",
+    "observed_field_characters": null,
+    "status": "unverified",
+    "warning": "KWin acknowledged all key events, but field text could not be verified: the paste shortcut does not independently read back the application's value; a compositor acknowledgement does not prove that the application consumed the clipboard or submitted a form. Inspect the field before sending or retrying; retyping can duplicate text."
+  },
+  "elapsed_ms": 357,
+  "form_submission": "not_observed",
+  "retry_safe": false,
+  "shortcut": "shift+Insert",
+  "shortcut_submitted": true,
+  "submission_complete": true,
+  "wall_seconds": 0.36932489497121423
+}

@@ -2311,6 +2311,7 @@ const TYPED_KEY_HOLD_MAX: Duration = Duration::from_millis(250);
 // the caller, and never go below the profile's 10 ms interval floor.
 const TYPING_BUDGET: Duration = Duration::from_secs(45);
 const TYPING_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
+const KEYBOARD_PASTE_SHORTCUT: &str = "shift+Insert";
 const TYPED_KEY_INTERVAL_FLOOR: Duration = Duration::from_millis(10);
 
 #[derive(Deserialize)]
@@ -2544,10 +2545,12 @@ fn typing_log_failure(
                 .unwrap_or_else(|| serde_json::json!({}));
             McpError::internal_error(
                 format!(
-                    "Typing key submission completed, but its input log summary failed: {log_error}. Inspect the field and retained input_result before sending or retrying; do not retype blindly."
+                    "Text input submission completed, but its input log summary failed: {log_error}. Inspect the field and retained input_result before sending or retrying; do not retype blindly."
                 ),
                 Some(serde_json::json!({
                     "submitted_characters": input["submitted_characters"],
+                    "clipboard_characters": input["clipboard_characters"],
+                    "shortcut_submitted": input["shortcut_submitted"],
                     "submission_complete": true, "retry_safe": false,
                     "compositor_acknowledged": input["delivery"]["compositor_acknowledged"],
                     "input_result": input, "input_log_summary_error": log_error.to_string(),
@@ -9939,6 +9942,11 @@ struct KeyboardTypeParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct KeyboardPasteParams {
+    text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct KeyboardKeyParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
@@ -14170,7 +14178,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 clipboard input use keyboard_paste."
     )]
     async fn keyboard_type(
         &self,
@@ -14376,6 +14384,103 @@ impl KwinMcp {
             delivery.status,
             "pending_or_mismatched" | "not_in_field"
         ));
+        Ok(result)
+    }
+
+    #[rmcp::tool(
+        name = "keyboard_paste",
+        description = "Paste UTF-8 text into the focused application using the session clipboard and one Shift+Insert shortcut. Use this for fast long-text or terminal input; keyboard_type remains paced ASCII key input. Click or Tab into the target first. Leaves this text in the session clipboard and PRIMARY selection; the host clipboard is separate. Pasted newlines are clipboard content, not separate Return key presses, but the application may interpret them. Use keyboard_key Return when you intend to submit a terminal command. Reports clipboard length, shortcut submission, and compositor acknowledgement separately. Application text is always unverified by this tool, and form submission is not observed. Inspect the application or its output before retrying, because another paste can duplicate text or commands."
+    )]
+    async fn keyboard_paste(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<KeyboardPasteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.text.is_empty() {
+            return Err(McpError::invalid_params("text must not be empty", None));
+        }
+        let pace = InputPace::new(None, None)?;
+        let (mods, main) = parse_combo(KEYBOARD_PASTE_SHORTCUT)?;
+        self.touch_activity().await;
+        let started = std::time::Instant::now();
+        let guard = self.session.read().await;
+        let sess = guard.as_ref().ok_or_else(|| {
+            McpError::internal_error("no session — call session_start first", None)
+        })?;
+        let socket = sess.host_xdg_dir.join("wayland-0");
+        let store = self.clipboards.clone();
+        let text = params.text;
+        let length = tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
+                .write(socket, "session", text, false, true)
+        })
+        .await
+        .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
+        .map_err(KwinError::from)?;
+        let mut shortcut_submitted = false;
+        let mut submission_complete = false;
+        let sent: anyhow::Result<()> = async {
+            let mut sent = SentInput::new(&sess.eis);
+            for modifier in &mods {
+                sent.key(*modifier, true, None)?;
+            }
+            tokio::time::sleep(pace.hold()?).await;
+            sent.key(main, true, None)?;
+            shortcut_submitted = true;
+            tokio::time::sleep(pace.key_hold()?).await;
+            sent.key(main, false, None)?;
+            tokio::time::sleep(pace.hold()?).await;
+            for modifier in mods.iter().rev() {
+                sent.key(*modifier, false, None)?;
+            }
+            drop(sent);
+            submission_complete = true;
+            sess.eis.roundtrip().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = sent {
+            return Err(McpError::internal_error(
+                format!(
+                    "Session clipboard contains {length} characters, but the paste shortcut did not complete with compositor acknowledgement: {error}. Some input may already have arrived; inspect the application before retrying."
+                ),
+                Some(serde_json::json!({
+                    "action": "paste", "clipboard_characters": length,
+                    "shortcut": KEYBOARD_PASTE_SHORTCUT,
+                    "shortcut_submitted": shortcut_submitted,
+                    "submission_complete": submission_complete,
+                    "compositor_acknowledged": false,
+                    "application_text": "unverified", "retry_safe": false,
+                })),
+            ));
+        }
+        let delivery = input_bridge::TextDelivery::unavailable(
+            "the paste shortcut does not independently read back the application's value; a compositor acknowledgement does not prove that the application consumed the clipboard or submitted a form"
+                .to_owned(),
+        );
+        drop(guard);
+        self.mark_input().await;
+        let result = structured_result(
+            &peer,
+            format!(
+                "paste {}: offered {length} clipboard characters and KWin acknowledged {KEYBOARD_PASTE_SHORTCUT}{}",
+                delivery.status,
+                delivery.warning.as_ref()
+                    .map(|warning| format!(". {warning}"))
+                    .unwrap_or_default()
+            ),
+            serde_json::json!({
+                "action": "paste", "clipboard_characters": length,
+                "shortcut": KEYBOARD_PASTE_SHORTCUT,
+                "shortcut_submitted": true, "submission_complete": true,
+                "compositor_acknowledged": true, "retry_safe": false,
+                "application_text": "unverified", "form_submission": "not_observed",
+                "delivery": delivery, "elapsed_ms": started.elapsed().as_millis(),
+            }),
+        )
+        .await;
         Ok(result)
     }
 
@@ -15828,7 +15933,7 @@ impl tower::Service<SessionCall> for KwinMcp {
         let session = self.clone();
         Box::pin(async move {
             let operation = call.request.name.to_string();
-            let typing = operation == "keyboard_type";
+            let typing = matches!(operation.as_str(), "keyboard_type" | "keyboard_paste");
             let screenshot = operation == "screenshot";
             let report_memory = screenshot || input_tool(&operation);
             let audit = if input_tool(&operation) {
@@ -17080,7 +17185,7 @@ impl rmcp::ServerHandler for SessionRouter {
         let result = if !start && !stop && result.is_err() {
             match session.check_liveness().await {
                 Some(mut death) => result.map_err(|error| {
-                    if operation == "keyboard_type"
+                    if matches!(operation.as_str(), "keyboard_type" | "keyboard_paste")
                         && let Some(data) = death.as_object_mut()
                     {
                             data.insert("typing_error".to_owned(), serde_json::json!(error.message));
@@ -17092,7 +17197,7 @@ impl rmcp::ServerHandler for SessionRouter {
                             }
                             data.insert("retry_safe".to_owned(), serde_json::json!(false));
                     }
-                    let original = if operation == "keyboard_type" {
+                    let original = if matches!(operation.as_str(), "keyboard_type" | "keyboard_paste") {
                         format!(". Typing report: {}. Some input may have arrived; do not retype blindly", error.message)
                     } else { String::new() };
                     McpError::internal_error(
