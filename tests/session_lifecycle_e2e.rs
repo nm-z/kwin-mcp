@@ -1634,6 +1634,182 @@ fn screenshot_meta(response: &Value) -> Value {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
+fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":1280,"height":800}),
+    );
+    let sid = session_handle(&started);
+    let page = workdir(&started).join("cursor-capture.html");
+    std::fs::write(
+        &page,
+        "<html><head><title>Cursor Capture Fixture</title><style>\
+         html,body{margin:0;min-height:100%;background:#204060}\
+         </style></head><body></body></html>",
+    )
+    .expect("write static cursor fixture");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":sid,"command":format!(
+            "google-chrome-stable --no-first-run --new-window 'file://{}'",
+            page.display()
+        )}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    let mut id = 4;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(&mut client, id, "Cursor Capture Fixture").is_none() {
+        id += 1;
+        assert!(Instant::now() < deadline, "static cursor page did not load");
+        thread::sleep(Duration::from_millis(200));
+    }
+    id += 1;
+    call_tool(
+        &mut client,
+        id,
+        "mouse_move",
+        json!({"session_id":sid,"x":240,"y":240}),
+    );
+    id += 1;
+    let before = call_tool(
+        &mut client,
+        id,
+        "screenshot",
+        json!({"session_id":sid,"inline":true,"region":[150,200,900,700]}),
+    );
+    id += 1;
+    let hidden = call_tool(
+        &mut client,
+        id,
+        "screenshot",
+        json!({"session_id":sid,"inline":true,"region":[150,200,900,700],"include_cursor":false}),
+    );
+    assert_eq!(screenshot_meta(&before)["include_cursor"], true);
+    assert_eq!(screenshot_meta(&hidden)["include_cursor"], false);
+    assert_eq!(
+        screenshot_meta(&before)["window"],
+        screenshot_meta(&hidden)["window"]
+    );
+    let before_pixels = decode_rgba(&before);
+    let hidden_pixels = decode_rgba(&hidden);
+    if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
+        use base64::Engine;
+        std::fs::create_dir_all(&proof).expect("create initial cursor evidence");
+        for (name, shot) in [
+            ("before-default-cursor", &before),
+            ("after-no-cursor", &hidden),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(shot))
+                .expect("decode initial cursor evidence");
+            std::fs::write(proof.join(format!("{name}.png")), bytes)
+                .expect("write initial cursor evidence");
+        }
+    }
+    let background = pixel(&hidden_pixels, 0, 0);
+    assert_eq!(background, pixel(&before_pixels, 0, 0));
+    let mut colors = std::collections::BTreeMap::new();
+    for rgba in hidden_pixels.1.chunks_exact(4) {
+        *colors.entry(rgba.to_vec()).or_insert(0usize) += 1;
+    }
+    let mut colors: Vec<_> = colors.into_iter().collect();
+    colors.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    eprintln!(
+        "cursor-free dominant colors: {:?}",
+        &colors[..colors.len().min(8)]
+    );
+    let changed = before_pixels
+        .1
+        .chunks_exact(4)
+        .zip(hidden_pixels.1.chunks_exact(4))
+        .filter(|(before, after)| before != after)
+        .count();
+    assert!(
+        changed > 20,
+        "default pointer was not visible: {changed} changed pixels"
+    );
+    assert!(
+        hidden_pixels
+            .1
+            .chunks_exact(4)
+            .all(|rgba| rgba == background),
+        "cursor-free static body contains unexpected pixels"
+    );
+    id += 1;
+    call_tool(
+        &mut client,
+        id,
+        "mouse_move",
+        json!({"session_id":sid,"x":700,"y":400}),
+    );
+    id += 1;
+    let moved = call_tool(
+        &mut client,
+        id,
+        "screenshot",
+        json!({"session_id":sid,"inline":true,"region":[150,200,900,700],"include_cursor":false}),
+    );
+    assert_eq!(
+        hidden_pixels,
+        decode_rgba(&moved),
+        "moving the pointer changed cursor-free pixels"
+    );
+    id += 1;
+    let zoom = call_tool(
+        &mut client,
+        id,
+        "screenshot",
+        json!({"session_id":sid,"inline":true,"cursor":true,"include_cursor":false}),
+    );
+    assert!(
+        decode_rgba(&zoom)
+            .1
+            .chunks_exact(4)
+            .all(|rgba| rgba == background),
+        "cursor crop unexpectedly drew a pointer"
+    );
+    if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
+        use base64::Engine;
+        std::fs::create_dir_all(&proof).expect("create cursor evidence directory");
+        for (name, shot) in [
+            ("before-default-cursor", &before),
+            ("after-no-cursor", &hidden),
+            ("after-pointer-moved", &moved),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(inline_png(shot))
+                .expect("decode cursor evidence");
+            std::fs::write(proof.join(format!("{name}.png")), bytes)
+                .expect("write cursor evidence");
+        }
+        std::fs::write(
+            proof.join("cursor-result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "changed_pixels":changed,"before":screenshot_meta(&before),
+                "after":screenshot_meta(&hidden),"after_pointer_moved":screenshot_meta(&moved),
+                "cursor_crop":screenshot_meta(&zoom)
+            }))
+            .expect("encode cursor evidence"),
+        )
+        .expect("write cursor result");
+    }
+    eprintln!(
+        "cursor overlay removed: {changed} pixels; cursor-free pixels unchanged after pointer move"
+    );
+    id += 1;
+    call_tool(&mut client, id, "session_stop", json!({"session_id":sid}));
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, kdialog, konsole, input devices, and a live GPU session"]
 fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windows() {
     assert_eq!(
