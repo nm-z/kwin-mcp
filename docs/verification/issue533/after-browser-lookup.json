@@ -1,0 +1,83 @@
+{
+  "accessibility_bounds": [
+    0,
+    0,
+    640,
+    480
+  ],
+  "accessibility_coordinate_frame": "window_buffer_pixels",
+  "accessibility_frame": ":1.13/org/a11y/atspi/accessible/4",
+  "accessibility_to_window_offset": [
+    -16,
+    -10
+  ],
+  "coordinate_frame": "window_client_pixels",
+  "coordinate_origin": {
+    "x": 217,
+    "y": 146
+  },
+  "elements": [
+    {
+      "height": 17,
+      "node_id": ":1.13/org/a11y/atspi/accessible/196",
+      "role": "static",
+      "states": [
+        "enabled",
+        "visible"
+      ],
+      "text": "Browser field 533",
+      "width": 116,
+      "window_id": "{9e12f65f-f302-4522-8b79-90c0e297ea5d}",
+      "x": 8,
+      "y": 96
+    },
+    {
+      "height": 21,
+      "node_id": ":1.13/org/a11y/atspi/accessible/195",
+      "role": "entry",
+      "states": [
+        "current",
+        "enabled",
+        "focused",
+        "focusable",
+        "visible"
+      ],
+      "text": "Browser field 533",
+      "width": 186,
+      "window_id": "{9e12f65f-f302-4522-8b79-90c0e297ea5d}",
+      "x": 123,
+      "y": 95
+    }
+  ],
+  "incomplete": false,
+  "matches": 2,
+  "occlusion": "not_checked",
+  "query": "Browser field 533",
+  "results": "static\tBrowser field 533\t(8, 96, 116x17)\nentry\tBrowser field 533\t(123, 95, 186x21)\tfocused",
+  "visibility": "accessibility_reported",
+  "window": {
+    "active": true,
+    "buffer_geometry": [
+      200.83333333333337,
+      135.58333333333334,
+      640.0,
+      480.0
+    ],
+    "dialog": false,
+    "h": 438.0,
+    "id": "{9e12f65f-f302-4522-8b79-90c0e297ea5d}",
+    "minimized": false,
+    "modal": false,
+    "pid": 90,
+    "popup": false,
+    "resourceClass": "google-chrome",
+    "resourceName": "chrome",
+    "stackingOrder": 1,
+    "title": "Browser two 533 - Google Chrome",
+    "transient": false,
+    "transientFor": null,
+    "w": 608.0,
+    "x": 216.83333333333337,
+    "y": 145.58333333333334
+  }
+}

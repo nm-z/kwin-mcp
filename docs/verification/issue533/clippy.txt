@@ -1,0 +1,2 @@
+   Compiling kwin-mcp v0.1.2 (/home/nate/codex/codex-mcp-workspace/issue-batch-20261020-ec25/kwin-533)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.13s

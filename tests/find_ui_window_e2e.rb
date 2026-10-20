@@ -15,7 +15,9 @@ FileUtils.mkdir_p(evidence)
 baseline = ENV['KWIN_MCP_E2E_BASELINE'] == '1'
 
 class WindowLookupProbe
-  def initialize(binary, home, evidence)
+  attr_reader :session
+  attr_writer :lookup_peer
+  def initialize(binary, home, evidence, session:nil)
     @home, @evidence, @id = home, evidence, 0
     %w[.config .cache .local/share .local/state .kde].each { |path| FileUtils.mkdir_p(File.join(home, path)) }
     env = {
@@ -31,8 +33,13 @@ class WindowLookupProbe
     @input, @output, @process = Open3.popen2(env, binary, '--autoclean', err:@errors)
     rpc('initialize', protocolVersion:'2024-11-05', capabilities:{}, clientInfo:{name:'find-ui-window-proof',version:'1'})
     @input.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized')); @input.flush
-    start = call('session_start', width:1000, height:700, browser_profiles:'fresh', window_mode:'native')
-    @session = start.fetch('structuredContent').fetch('session_id')
+    @owns_session = session.nil?
+    if session
+      @session = session
+    else
+      start = call('session_start', width:1000, height:700, browser_profiles:'fresh', window_mode:'native')
+      @session = start.fetch('structuredContent').fetch('session_id')
+    end
   end
   def rpc(method, params)
     @id += 1
@@ -64,7 +71,7 @@ class WindowLookupProbe
     expected = active
     tree = call('accessibility_tree', max_depth:3, show_elements:true)
     File.write(File.join(@evidence,'window-frames.json'),JSON.pretty_generate(tree))
-    result = data('find_ui_elements',query:query)
+    result = (@lookup_peer || self).data('find_ui_elements',query:query)
     File.write(File.join(@evidence,"lookup-#{query.gsub(/\W/,'-')}.json"),JSON.pretty_generate(result))
     if baseline
       raise 'baseline did not expose multiple-window matches' unless result.fetch('matches') >= 2
@@ -78,7 +85,7 @@ class WindowLookupProbe
     raise 'missing accessibility identity' if result.fetch('accessibility_frame').to_s.empty?
     raise 'unexpectedly claims occlusion was checked' unless result.fetch('occlusion') == 'not_checked'
     elements = result.fetch('elements')
-    raise 'no field matches' if elements.empty?
+    raise 'lookup mixed multiple windows or lost the label/field pair' unless elements.length == 2
     raise 'mixed window identities' unless elements.all? { |element| element.fetch('window_id') == expected.fetch('id') }
     [expected,elements]
   end
@@ -150,7 +157,7 @@ class WindowLookupProbe
     puts JSON.generate(case:'chrome',window_id:expected.fetch('id'),title:expected.fetch('title'),independent_clipboard_value:true)
   end
   def close
-    call('session_stop') if @session
+    call('session_stop') if @session && @owns_session
   ensure
     @input&.close
     if @process
@@ -167,11 +174,20 @@ end
 
 Dir.mktmpdir('k533-',ENV.fetch('KWIN_MCP_TEST_TMPDIR','/var/tmp')) do |home|
   client = nil
+  gateway = nil
   begin
     client = WindowLookupProbe.new(binary,home,evidence)
+    unless baseline
+      gateway_evidence = File.join(evidence,'gateway')
+      FileUtils.mkdir_p(gateway_evidence)
+      gateway = WindowLookupProbe.new(binary,home,gateway_evidence,session:client.session)
+      client.lookup_peer = gateway
+    end
     client.kdialog(baseline)
     client.chrome unless baseline
+    puts JSON.generate(forwarded_lookup:!baseline,owner_and_gateway_separate_processes:!baseline)
   ensure
+    gateway&.close
     client&.close
   end
 end
