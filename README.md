@@ -418,11 +418,14 @@ Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` 
 at most 107 bytes, excluding the terminating NUL, for the entire socket path.
 The session's D-Bus sockets have a stricter 99-byte limit imposed by
 [libdbus](https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html).
-`session_start` checks both constraints before creating its workdir or starting
-processes. If a path is too long, the error names it, reports its byte length,
-and asks for a shorter `TMPDIR`; set that variable before launching the server.
 The limit includes the generated `kwin-mcp-<pid>-<number>` directory and socket
-filename, and counts UTF-8 bytes rather than characters.
+filename, and counts UTF-8 bytes rather than characters. When the session's
+longest socket path under `TMPDIR` would exceed 99 bytes (for example a GPU
+queue or build staging `TMPDIR`), `session_start` puts the workdir under `/tmp`
+instead and reports `runtime_root_fallback` with the original `TMPDIR`; the
+returned `workdir` and `host_shared_dir` are the paths to use. `session_start`
+still checks both constraints before creating its workdir or starting
+processes, and names any path that does not fit with its byte length.
 
 Temporary KWin scripts also live in that disk directory, exposed to the sandbox
 through a read-only `kwin-scripts` mount in its runtime directory. A full `/tmp`

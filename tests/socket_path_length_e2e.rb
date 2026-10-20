@@ -7,11 +7,11 @@ require 'tmpdir'
 require 'timeout'
 
 binary, evidence = ARGV
-abort 'usage: socket_path_length_e2e.rb SERVER EVIDENCE [--reject-only]' unless binary && evidence
+abort 'usage: socket_path_length_e2e.rb SERVER EVIDENCE [--long-only]' unless binary && evidence
 binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
-reject_only = ARGV.include?('--reject-only')
+reject_only = ARGV.include?('--long-only') || ARGV.include?('--reject-only')
 
 # Exec preserves the child's PID, so each fixture can hit an exact pathname
 # byte length despite different server PID widths. This still runs production
@@ -98,30 +98,28 @@ Dir.mktmpdir('k353-', '/tmp') do |root|
             response = call.call('session_start')
             elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
             if bytes > 99
-              message = response.dig('error', 'message') || response.dig('result', 'content')&.map { |item| item['text'] }.join(' ')
-              raise "expected path-length rejection, got #{response.inspect}" unless response['error'] || response.dig('result', 'isError')
-              fragments = ['TMPDIR', 'bytes', bytes >= 109 ? 'sockaddr_un.sun_path' : 'libdbus pathname limit of 99 bytes']
-              fragments.each do |fragment|
-                raise "missing #{fragment}: #{response.inspect}" unless message&.include?(fragment)
-              end
-              rejected = bytes == 100 ? socket : File.join(workdir, 'system_bus_socket')
-              raise "missing offending path/byte count: #{message}" unless message.include?(rejected) && message.include?("#{rejected.bytesize} bytes")
-              raise "proxy timeout concealed validation (#{elapsed}s)" if elapsed >= 3
-              raise 'failed startup created runtime workdir' if File.exist?(workdir)
-              raise 'failed startup created disk twin' if File.exist?(File.join(home, '.cache', 'kwin-mcp', File.basename(workdir)))
-              raise 'failed startup left a session' unless result.call(call.call('session_list')).dig('structuredContent', 'sessions') == []
-              # Failure leaves the server usable, and the next generated name
-              # receives the same validation before acquiring any resources.
-              retry_response = call.call('session_start')
-              retry_message = retry_response.dig('error', 'message').to_s
-              raise 'retry did not validate the next session path' unless retry_message.include?("kwin-mcp-#{process.pid}-2/") && retry_message.include?('TMPDIR')
-              raise 'retry created runtime resources' unless Dir.children(tmpdir).empty?
+              # A TMPDIR too long for the session sockets (for example a GPU
+              # queue staging directory) falls back to /tmp and says so (#586).
+              started = result.call(response).fetch('structuredContent')
+              fallback = started['runtime_root_fallback'] || raise("no runtime_root_fallback: #{started}")
+              raise "fallback names the wrong TMPDIR: #{fallback}" unless fallback['tmpdir'] == tmpdir && fallback['reason'].to_s.include?('99 bytes')
+              short_workdir = "/tmp/kwin-mcp-#{process.pid}-1"
+              raise "workdir not under /tmp: #{started['workdir']}" unless started['workdir'] == short_workdir && started['host_shared_dir'] == short_workdir
+              raise 'the long TMPDIR received runtime resources' unless Dir.children(tmpdir).empty?
+              raise 'proxy did not bind under /tmp' unless File.socket?(File.join(short_workdir, 'service_bus_socket'))
+              session_id = started.fetch('session_id')
+              result.call(call.call('window_list', {session_id: session_id}))
+              result.call(call.call('session_stop', {session_id: session_id}))
+              raise 'stopped workdir remains' if File.exist?(short_workdir)
+              raise 'stopped disk twin remains' if File.exist?(File.join(home, '.cache', 'kwin-mcp', File.basename(short_workdir)))
+              raise 'stopped session remains listed' unless result.call(call.call('session_list')).dig('structuredContent', 'sessions') == []
             else
               started = result.call(response).fetch('structuredContent')
               session_id = started.fetch('session_id')
               sessions = result.call(call.call('session_list')).dig('structuredContent', 'sessions')
               record = sessions.find { |session| session['session_id'] == session_id }
               raise 'workdir mismatch' unless record && record['workdir'] == workdir
+              raise "unexpected runtime_root_fallback: #{started}" unless started['runtime_root_fallback'].nil?
               raise 'proxy did not bind at the requested byte boundary' unless File.socket?(socket)
               sandbox_pid = record.fetch('sandbox_pid')
               raise 'sandbox absent' unless File.directory?("/proc/#{sandbox_pid}")

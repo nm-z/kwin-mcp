@@ -1921,6 +1921,10 @@ const DBUS_PROXY_POLL: Duration = Duration::from_millis(20);
 // https://dbus.freedesktop.org/doc/api/html/group__DBusSysdeps.html
 // (_DBUS_MAX_SUN_PATH_LENGTH). Session apps also connect through libdbus.
 const DBUS_SOCKET_PATH_MAX: usize = 99;
+// The longest socket name bound directly in a session workdir, and the root
+// used instead of TMPDIR when TMPDIR would push it past DBUS_SOCKET_PATH_MAX.
+const WORKDIR_LONGEST_SOCKET: &str = "service_bus_socket";
+const SHORT_RUNTIME_ROOT: &str = "/tmp";
 
 // KWin unique-name discovery: per-candidate introspect probe timeout.
 const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -6969,6 +6973,29 @@ fn session_workdir_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("kwin-mcp-{}", std::process::id()))
 }
 
+/// The directory for a new session workdir named `name`: TMPDIR when the
+/// workdir's longest socket path fits libdbus's limit there, otherwise
+/// `SHORT_RUNTIME_ROOT`. A GPU queue or build staging TMPDIR can be too long.
+fn session_runtime_root(name: &str) -> std::path::PathBuf {
+    let temp = std::env::temp_dir();
+    let longest = temp.join(name).join(WORKDIR_LONGEST_SOCKET);
+    if longest.as_os_str().len() <= DBUS_SOCKET_PATH_MAX {
+        temp
+    } else {
+        std::path::PathBuf::from(SHORT_RUNTIME_ROOT)
+    }
+}
+
+/// Every directory that can hold this user's session workdirs.
+fn session_runtime_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    let short = std::path::PathBuf::from(SHORT_RUNTIME_ROOT);
+    if !roots.contains(&short) {
+        roots.push(short);
+    }
+    roots
+}
+
 /// Disk-backed root for session overlay layers.
 fn session_disk_root() -> std::path::PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -7047,7 +7074,9 @@ fn repair_workdir_directory_tree(dir: std::os::fd::OwnedFd, depth: u32) {
 fn remove_session_workdir(dir: &std::path::Path) -> std::io::Result<()> {
     let expected = session_workdir_path();
     if dir != expected
-        && !(dir.parent() == expected.parent()
+        && !(dir
+            .parent()
+            .is_some_and(|parent| session_runtime_roots().iter().any(|root| root == parent))
             && dir
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -7131,11 +7160,14 @@ fn mounted_paths() -> std::io::Result<Vec<PathBuf>> {
 fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> std::io::Result<()> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let temp = std::env::temp_dir();
     let uid = std::fs::metadata("/proc/self")?.uid();
     let mounts = mounted_paths()?;
-    for entry in std::fs::read_dir(&temp)? {
-        let entry = entry?;
+    let entries = session_runtime_roots()
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for entry in entries {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(pid_text) = name.strip_prefix("kwin-mcp-") else {
@@ -7233,7 +7265,7 @@ fn sweep_dead_owner_workdirs(
     owners: Option<&std::collections::HashSet<u32>>,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let temp = std::env::temp_dir();
+    let runtimes = session_runtime_roots();
     let uid = std::fs::metadata("/proc/self")?.uid();
     let mounts = mounted_paths()?;
     let cmdlines: Vec<Vec<String>> = procfs::process::all_processes()
@@ -7243,7 +7275,8 @@ fn sweep_dead_owner_workdirs(
         .collect();
     // Disk twins (session_disk_root) count too: a twin whose workdir is gone,
     // removed above or cleared from /tmp by a reboot, is leaked the same way.
-    for root in [temp.clone(), session_disk_root()] {
+    for root in runtimes.iter().cloned().chain([session_disk_root()]) {
+        let runtime = runtimes.contains(&root);
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
@@ -7268,7 +7301,11 @@ fn sweep_dead_owner_workdirs(
             }) {
                 continue;
             }
-            if root != temp && std::fs::symlink_metadata(temp.join(name)).is_ok() {
+            if !runtime
+                && runtimes
+                    .iter()
+                    .any(|temp| std::fs::symlink_metadata(temp.join(name)).is_ok())
+            {
                 continue;
             }
             let dir = entry.path();
@@ -7294,7 +7331,7 @@ fn sweep_dead_owner_workdirs(
             let disk = session_disk_path(&dir);
             if mounts
                 .iter()
-                .any(|mount| mount.starts_with(&dir) || (root == temp && mount.starts_with(&disk)))
+                .any(|mount| mount.starts_with(&dir) || (runtime && mount.starts_with(&disk)))
             {
                 continue;
             }
@@ -12513,6 +12550,15 @@ impl KwinMcp {
             .map(|n| n.to_string())
             .unwrap_or_default();
         let workdir = host_xdg_dir.display().to_string();
+        let temp = std::env::temp_dir();
+        let runtime_root_fallback = (host_xdg_dir.parent() != Some(temp.as_path())).then(|| {
+            serde_json::json!({
+                "tmpdir": temp,
+                "reason": format!(
+                    "session socket paths under TMPDIR would exceed the libdbus limit of {DBUS_SOCKET_PATH_MAX} bytes"
+                ),
+            })
+        });
         let msg = format!(
             "{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}"
         );
@@ -12616,6 +12662,7 @@ impl KwinMcp {
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
             "host_shared_dir": workdir,
+            "runtime_root_fallback": runtime_root_fallback,
             "width": screen_w,
             "height": screen_h,
             "viewer": viewer,
@@ -15907,7 +15954,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sweep_dead_owner_workdirs(owners)?;
             if let Some(owners) = owners {
                 for owner in owners {
-                    for root in [std::env::temp_dir(), session_disk_root()] {
+                    for root in session_runtime_roots()
+                        .into_iter()
+                        .chain([session_disk_root()])
+                    {
                         let dir = root.join(format!("kwin-mcp-{owner}"));
                         match std::fs::symlink_metadata(&dir) {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -16768,8 +16818,8 @@ impl SessionRouter {
             session.clipboards = self.clipboards.clone();
             session.input_log =
                 Some(InputLog::open(&id, InputHistory::default(), None).map_err(KwinError::from)?);
-            session.path =
-                std::env::temp_dir().join(format!("kwin-mcp-{}-{number}", std::process::id()));
+            let name = format!("kwin-mcp-{}-{number}", std::process::id());
+            session.path = session_runtime_root(&name).join(name);
             sessions.insert(id.clone(), session.clone());
             return Ok((id, session));
         }
