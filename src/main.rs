@@ -10729,9 +10729,12 @@ fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
         }
     };
     Some(McpError::invalid_params(
-        format!("{path} is not visible in the session; {detail}"),
+        format!(
+            "{path} is not visible in the session, so the command did not start; {detail}. A path the command creates inside its own namespace (bwrap --tmpfs, --dir) is checked as written: launch a script file under host_shared_dir instead"
+        ),
         Some(serde_json::json!({
             "reason": "path_not_visible", "path": path, "command_submitted": true,
+            "command_started": false,
             "host_shared_dir": shared, "import_tool": "import_file",
         })),
     ))
@@ -10993,8 +10996,11 @@ fn launch_failure(mut error: McpError, progress: &LaunchProgress) -> McpError {
     }
     data["operation"] = serde_json::json!("launch_app");
     data["command_submitted"] = serde_json::json!(submitted);
-    data["retry_safe"] = serde_json::json!(!submitted);
-    let action = if submitted {
+    let started = data["command_started"] != false;
+    data["retry_safe"] = serde_json::json!(!submitted || !started);
+    let action = if !started {
+        "The command did not start: the session shell stopped before running it. Correct what the message names, then retry; nothing is running."
+    } else if submitted {
         "The command may still be running. Inspect window_list and screenshot in the same session before any retry; do not launch a duplicate command."
     } else {
         "No command was submitted. Inspect the reported path and its filesystem/quota (free blocks alone do not establish available user quota), then retry only after the underlying error is corrected. The session remains open."

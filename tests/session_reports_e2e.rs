@@ -11,6 +11,7 @@
 //!   launch_attribution (#615) a window that is only reactivated while the command still
 //!                 runs is not the launch's window
 //!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
+//!   unstarted_launch (#631) a launch refused for an invisible path says the command did not start
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
@@ -634,4 +635,38 @@ fn chooser_typing() {
         typed["error"].is_null() && typed["result"]["isError"] != json!(true),
         "typing the chooser's location was refused: {typed}"
     );
+}
+
+#[test]
+#[ignore = "needs a real KDE session and bubblewrap"]
+fn unstarted_launch() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let started = server.start_session(json!({}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let marker = shared.join("ran");
+    // The command names /run/user, which the session does not see, so the
+    // session shell stops before running it.
+    let refused = server.call(
+        "launch_app",
+        json!({"command":format!("sh -c 'printf x > {}' /run/user", marker.display()),
+               "expect_window":false}),
+    );
+    let data = &refused["error"]["data"];
+    assert_eq!(data["reason"], json!("path_not_visible"), "{refused}");
+    assert_eq!(data["command_started"], json!(false), "{refused}");
+    assert_eq!(data["retry_safe"], json!(true), "{refused}");
+    assert!(!marker.exists(), "the refused command ran");
+    // The recovery the message names: the same work from a script file.
+    let script = shared.join("probe.sh");
+    std::fs::write(&script, format!("printf ok > {}\n", marker.display())).expect("write script");
+    server.data(
+        "launch_app",
+        json!({"command":format!("sh {}", script.display()), "expect_window":false}),
+    );
+    wait_until(10, "the script's output", || file_holds(&marker, "ok"));
 }
