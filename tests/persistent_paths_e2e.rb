@@ -145,8 +145,10 @@ begin
     started = proof.call('session_start', {persistent_paths: [profile, other], host_write_paths: [live_state]})
     id = started.fetch('session_id')
     raise 'mounts not reported' unless started.fetch('persistent_paths') == [profile, other]
+    raise 'shared state not reported at start' unless started.fetch('host_write_paths') == [live_state]
     raise 'unexpected cookie processing error' unless started.fetch('cookie_errors').empty?
     record = proof.call('session_list').fetch('sessions').find { |s| s['session_id'] == id }
+    raise 'shared state not reported in session list' unless record.fetch('host_write_paths') == [live_state]
     marker = File.join(profile, 'owned-marker')
     # Only fixture data is read here; no browser, authentication or cookie jars.
     command = "test \"$(cat #{Shellwords.escape(marker)})\" = generation-#{cycle} && " \
