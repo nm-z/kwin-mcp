@@ -375,6 +375,57 @@ Each call ends with a summary of its pointer path and peak speed, typing timing,
 and scroll totals and event rate. A flushed event means the EIS socket accepted
 the data; it does not confirm that an application consumed it.
 
+### Investigating extra or duplicated characters
+
+A `keyboard_type` mismatch reports a difference between the expected field
+value and the accessibility observation. It does not identify the source of
+an extra character. Compositor acknowledgement confirms processing of the
+submitted input events; applications can still repeat, transform, or misdirect
+them. Inspect the field before submitting or retrying. Preserve the typing
+response and screenshot. Where native copy is available, select and copy the
+field into the session clipboard and compare its exact text with the request.
+Character counts alone do not identify which character differs.
+
+For a harmless reproduction in a dedicated session, use the `input_log` path
+reported by `session_start` or `session_list`. Correlate the `call_start` and
+`call_summary` records by request ID, tool, and monotonic timestamps, then
+inspect the ordered key events and `typing.keys` in the summary:
+
+- Compare character-bearing key-down events with the requested text, keeping
+  modifier events separate. Two generated key-down events at the duplicated
+  position are evidence that the server emitted the duplication.
+- Check corresponding releases, `hold_ns`, `since_last_release_ns` on events,
+  and `gap_before_ns` in the summary. An unusually long hold can make key repeat
+  relevant; interpret it against the compositor's actual repeat settings.
+- Check each event's delivery outcome. `flushed` describes transport delivery,
+  not a guarantee that one application character resulted from each event.
+  An uncertain outcome also makes the delivered sequence inconclusive.
+
+The summary's `typing.characters` and `character_count` describe generated
+key-down events, not a separate reading of the application's field.
+
+Viewer activity is coarse evidence. The server checks it during operations
+and can stop with `viewer_input_interrupted`; the quiet period prevents
+immediate agent input after detected user activity. The activity file's
+modification time does not record which characters the viewer sent. Detected
+overlap establishes concurrent activity, while absence of an interruption
+does not establish the origin of an extra character.
+
+To isolate the viewer, reproduce in a fresh empty test field after a confirmed
+`viewer_close`, with no other input producer controlling that session. Type
+the same harmless text once and independently inspect or copy the result.
+Reproduction with the viewer closed excludes that viewer for that run.
+Reproduction only with the viewer open narrows the conditions, but timing or
+application behavior can still be involved.
+
+Retain the server commit, application version, viewer state, exact request and
+observed text, typing receipt, screenshots, and only the relevant journal
+interval. If the generated sequence is correct and the evidence cannot
+distinguish application repeat, another input producer, or viewer input,
+report the discrepancy as unattributed. The extra `s` reported in
+[#529](https://github.com/nm-z/kwin-mcp/issues/529) does not by itself establish
+which source produced it.
+
 ## Sessions and reloads
 
 ### Browser cookie continuity
