@@ -1,0 +1,13 @@
+   Compiling kwin-mcp v0.1.2 (/home/nate/codex/tenfix-20261020-0309/kwin-mcp/issue493)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 15s
+     Running tests/session_lifecycle_e2e.rs (/home/nate/codex/tenfix-20261020-0309/kwin-mcp/target/debug/deps/session_lifecycle_e2e-a30187a60a7dea18)
+
+running 1 test
+test configured_provider_install_preserves_pid_pipes_live_windows_and_partial_requests ... Installed /var/tmp/kwin-mcp-e2e-home-1348009-1792471219413887683/kwin-mcp and /var/tmp/kwin-mcp-e2e-home-1348009-1792471219413887683/kwin-viewer
+Configured MCP provider command: /var/tmp/kwin-mcp-e2e-home-1348009-1792471219413887683/kwin-mcp
+Version: kwin-mcp v0.1.2.2 (b3a67e0)
+Existing compatible providers can reload this artifact in place; verify their session IDs and build identity before resuming work.
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 21.72s

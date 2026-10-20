@@ -1,0 +1,4 @@
+provider_exact_path=PASS
+provider_unrelated_path_preserved=PASS
+provider_symlink_rejected=PASS
+provider_invalid_modes_rejected=PASS
