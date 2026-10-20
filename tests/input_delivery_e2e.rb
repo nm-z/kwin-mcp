@@ -187,14 +187,20 @@ class InputDeliveryProbe
     command = "google-chrome-stable --no-first-run --no-default-browser-check --new-window --force-renderer-accessibility '#{data_url}'"
     assert_success(call('launch_app', command: command))
     screen('devtools-before')
+    # Earlier modes in the same desktop can leave same-caption windows open;
+    # docked DevTools must not add one.
+    caption_windows = lambda do
+      assert_success(call('window_list')).fetch('windows').select { |window| window['title'].include?('Same-caption input receipt') }
+    end
+    expected_windows = caption_windows.call.length
     { 'ctrl+shift+i' => 'opened', 'F12' => 'closed', 'ctrl+shift+j' => 'console' }.each do |key, tag|
       result = assert_success(call('keyboard_key', key: key))
       raise "missing compositor receipt for #{key}: #{result}" unless result['compositor_acknowledged']
       raise "application effect incorrectly claimed for #{key}: #{result}" unless result['application_effect'] == 'unverified'
       raise "missing browser shortcut inspection advice for #{key}: #{result}" unless result['warning'].to_s.include?('Inspect a screenshot')
       screen("devtools-#{tag}")
-      windows = assert_success(call('window_list')).fetch('windows')
-      raise "unexpected browser window count after #{key}: #{windows}" unless windows.count { |window| window['title'].include?('Same-caption input receipt') } == 1
+      windows = caption_windows.call
+      raise "unexpected browser window count after #{key} (expected #{expected_windows}): #{windows}" unless windows.length == expected_windows
     end
   end
 
