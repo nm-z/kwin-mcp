@@ -8911,6 +8911,17 @@ struct WindowGeometry {
     cy: f64,
 }
 
+fn capture_target_metadata(window: &WindowGeometry) -> serde_json::Value {
+    serde_json::json!({
+        "id": window.id,
+        "title": window.title,
+        "x": window.x,
+        "y": window.y,
+        "width": window.w,
+        "height": window.h,
+    })
+}
+
 struct AtspiNode {
     name: String,
     role: String,
@@ -12514,7 +12525,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image. Success reports target_verification.method=active_window_before_and_after. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -12580,6 +12591,41 @@ impl KwinMcp {
             .map_err(KwinError::from)?;
         let (width, height, stride, pixels, settle) =
             capture_settled_frame(&proxy, self.last_input().await).await?;
+        // CaptureScreen returns the composited display, which can change focus
+        // while we wait for it to settle. Do not crop or label another window's
+        // pixels using the identity and geometry sampled before that wait.
+        let (_, _, observed_window) = active_window_info(&conn, &kwin_unique, &xdg)
+            .await
+            .map_err(|error| {
+                McpError::internal_error(
+                    format!(
+                        "screenshot could not recheck its active window after capture: {error}. No image was returned or saved; inspect window_list and capture again."
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "capture_target_unavailable",
+                        "stage": "checking the capture target",
+                        "retry_safe": true,
+                        "expected_window": capture_target_metadata(&win_geo),
+                    })),
+                )
+            })?;
+        if win_geo.id != observed_window.id
+            || win_geo.x != observed_window.x
+            || win_geo.y != observed_window.y
+            || win_geo.w != observed_window.w
+            || win_geo.h != observed_window.h
+        {
+            return Err(McpError::internal_error(
+                "screenshot target changed or moved during capture. No image was returned or saved; inspect window_list, activate the intended window, and capture again.",
+                Some(serde_json::json!({
+                    "reason": "capture_target_changed",
+                    "stage": "checking the capture target",
+                    "retry_safe": true,
+                    "expected_window": capture_target_metadata(&win_geo),
+                    "observed_window": capture_target_metadata(&observed_window),
+                })),
+            ));
+        }
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
@@ -12685,11 +12731,16 @@ impl KwinMcp {
             "region": out_region,
             "window": {
                 "id": win_geo.id,
-                "title": win_geo.title,
+                "title": observed_window.title,
                 "x": win_x,
                 "y": win_y,
                 "width": win_w,
                 "height": win_h,
+            },
+            "target_verification": {
+                "method": "active_window_before_and_after",
+                "matched": true,
+                "after": capture_target_metadata(&observed_window),
             },
         });
         if let Some(settle) = &settle {
