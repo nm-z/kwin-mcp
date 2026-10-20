@@ -11,6 +11,7 @@
 //!   launch_attribution (#615) a window that is only reactivated while the command still
 //!                 runs is not the launch's window
 //!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
+//!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
 //! KWIN_MCP_E2E_SERVER selects another server binary.
@@ -603,5 +604,34 @@ fn held_modifier() {
     assert!(
         !failure_text(&typed).contains("still held"),
         "typing was refused after release: {typed}"
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn chooser_typing() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({}));
+    server.data(
+        "launch_app",
+        json!({"command":"google-chrome-stable --user-data-dir=$HOME/chrome-chooser about:blank",
+               "window_timeout_seconds":40}),
+    );
+    // Chrome's file chooser is a transient GTK window that exposes nothing to
+    // AT-SPI, so typing its location is unverified, not refused.
+    server.data("keyboard_key", json!({"key":"ctrl+o"}));
+    wait_until(20, "Chrome's file chooser", || {
+        server.windows()["windows"]
+            .as_array()?
+            .iter()
+            .any(|window| window["transient"] == json!(true) && window["active"] == json!(true))
+            .then_some(())
+    });
+    server.data("keyboard_key", json!({"key":"ctrl+l"}));
+    let typed = server.call("keyboard_type", json!({"text":"/tmp"}));
+    assert!(
+        typed["error"].is_null() && typed["result"]["isError"] != json!(true),
+        "typing the chooser's location was refused: {typed}"
     );
 }
