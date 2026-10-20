@@ -1,0 +1,1 @@
+terminal		enabled|focused|focusable|visible	(0, 46, 1232, 878)

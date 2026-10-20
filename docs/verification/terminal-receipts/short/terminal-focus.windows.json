@@ -1,0 +1,21 @@
+[
+  {
+    "active": true,
+    "dialog": false,
+    "h": 924.0,
+    "id": "{ece6842a-1cf2-43bf-b333-dd5465691a2e}",
+    "minimized": false,
+    "modal": false,
+    "pid": 74,
+    "popup": false,
+    "resourceClass": "org.kde.konsole",
+    "resourceName": "konsole",
+    "stackingOrder": 0,
+    "title": "codex : bash — Konsole",
+    "transient": false,
+    "transientFor": null,
+    "w": 1232.0,
+    "x": 0.0,
+    "y": 0.0
+  }
+]

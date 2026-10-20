@@ -1,0 +1,32 @@
+{
+  "session_id": "s1503220-1",
+  "window_id": "{766993dd-4048-4fda-a363-1494864b8bd9}",
+  "command_characters": 777,
+  "typing_seconds": 71.90396829496603,
+  "session_clipboard_paste_seconds": 0.3819677890278399,
+  "speedup": 188.24615677141634,
+  "typing_delivery": {
+    "compositor_acknowledged": true,
+    "expected_field_characters": null,
+    "method": "terminal",
+    "observed_field_characters": null,
+    "status": "unverified",
+    "warning": "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output before sending or retrying; retyping can run the command again."
+  },
+  "typing_retry_safe": false,
+  "clipboard_receipt": {
+    "length": 777,
+    "target": "session"
+  },
+  "paste_key_receipt": {
+    "action": "key",
+    "key": "ctrl+shift+v",
+    "warning": null
+  },
+  "independent_typed_bytes": 715,
+  "independent_pasted_bytes": 1430,
+  "exact_single_execution_per_trial": true,
+  "keyboard_type_calls": 1,
+  "session_clipboard_writes": 1,
+  "key_calls": 3
+}

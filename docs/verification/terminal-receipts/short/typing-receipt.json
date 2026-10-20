@@ -1,0 +1,29 @@
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "typing unverified: printf '%s\\n' 'receipt-b15a20ab7f6f6ce4: AaZz 0123456789 !? [] {} () +=_-/.:,;@#%' >> \"$HOME/terminal-proof-b15a20ab7f6f6ce4.txt\". KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output before sending or retrying; retyping can run the command again."
+      }
+    ],
+    "structuredContent": {
+      "action": "type",
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": null,
+        "method": "terminal",
+        "observed_field_characters": null,
+        "status": "unverified",
+        "warning": "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output before sending or retrying; retyping can run the command again."
+      },
+      "elapsed_ms": 16405,
+      "retry_safe": false,
+      "submission_complete": true,
+      "submitted_characters": 129,
+      "text": "printf '%s\\n' 'receipt-b15a20ab7f6f6ce4: AaZz 0123456789 !? [] {} () +=_-/.:,;@#%' >> \"$HOME/terminal-proof-b15a20ab7f6f6ce4.txt\""
+    },
+    "isError": false
+  }
+}
