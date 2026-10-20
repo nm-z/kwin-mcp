@@ -10127,3 +10127,191 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
     );
     desktop.stop_process();
 }
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_without_expected_window_returns_its_pid_promptly() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let pid_record = workdir(&started).join("self-pid");
+
+    let begun = Instant::now();
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "command": format!("echo $$ > '{}'; sleep 60", pid_record.display()),
+            "expect_window": false,
+        }),
+    );
+    assert_ne!(launched["result"]["isError"], true, "{launched}");
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "launch without a window took {:?}",
+        begun.elapsed()
+    );
+    let content = &launched["result"]["structuredContent"];
+    assert_eq!(content["window_outcome"], "not_expected", "{launched}");
+    assert!(content["exit_status"].is_null(), "{launched}");
+    let pid = content["pid"].as_u64().expect("launch PID");
+    let recorded = std::fs::read_to_string(&pid_record).expect("command shell PID record");
+    assert_eq!(recorded.trim(), pid.to_string(), "{launched}");
+
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn session_shares_only_host_shared_dir_with_the_host() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let shared = workdir(&started);
+    assert_eq!(
+        started["result"]["structuredContent"]["host_shared_dir"],
+        shared.display().to_string(),
+        "{started}"
+    );
+    let probe = shared.join("probe");
+    let private = format!("/tmp/kwin-mcp-e2e-private-{}", std::process::id());
+
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "command": format!(
+                "printf shared > '{}'; printf private > '{private}'; echo stdout-marker; echo stderr-marker >&2",
+                probe.display()
+            ),
+            "window_timeout_seconds": 1,
+        }),
+    );
+    assert_eq!(
+        launched["result"]["structuredContent"]["exit_status"], 0,
+        "{launched}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probe).expect("host_shared_dir probe"),
+        "shared"
+    );
+    assert!(
+        !std::path::Path::new(&private).exists(),
+        "a file in the session's private /tmp reached the host"
+    );
+    // Session stderr is kept on the host in the disk-backed sandbox log; stdout is discarded.
+    let sandbox_log = client
+        .home
+        .join(".cache/kwin-mcp")
+        .join(shared.file_name().expect("workdir name"))
+        .join("sandbox.log");
+    let sandbox_log = std::fs::read_to_string(&sandbox_log).expect("sandbox.log");
+    assert!(sandbox_log.contains("stderr-marker"), "{sandbox_log}");
+    assert!(!sandbox_log.contains("stdout-marker"), "{sandbox_log}");
+
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn session_ssh_drop_ins_are_owned_by_the_session_user() {
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    let host_uid = std::fs::metadata("/proc/self")
+        .expect("host process metadata")
+        .uid();
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    // Owner, mode and name only: the drop-in contents are never read.
+    let report = workdir(&started).join("ssh-report");
+    let launched = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "command": format!(
+                "stat -L -c '%u %a %n' /etc/ssh/ssh_config.d/*.conf > '{0}'; ssh -G example.invalid >/dev/null 2>> '{0}'; printf 'ssh %s\\n' $? >> '{0}'",
+                report.display()
+            ),
+            "window_timeout_seconds": 1,
+        }),
+    );
+    assert_eq!(
+        launched["result"]["structuredContent"]["exit_status"], 0,
+        "{launched}"
+    );
+    let report = std::fs::read_to_string(&report).expect("ssh report");
+    let mut checked = 0;
+    for line in report.lines() {
+        if let [owner, mode, _name] = line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            checked += 1;
+            assert_eq!(owner.parse::<u32>().ok(), Some(host_uid), "{report}");
+            let bits = u32::from_str_radix(mode, 8).expect("drop-in mode");
+            assert_eq!(bits & 0o022, 0, "{report}");
+        }
+    }
+    assert!(checked > 0, "no drop-ins were checked: {report}");
+    assert!(!report.contains("Bad owner"), "{report}");
+    assert!(report.contains("ssh 0"), "ssh -G failed: {report}");
+
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(
+        !stopped["result"]["isError"].as_bool().unwrap_or(false),
+        "{stopped}"
+    );
+    client.stop_process();
+}
