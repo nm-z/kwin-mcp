@@ -1,0 +1,49 @@
+{
+  "status": "passed",
+  "mode": "baseline",
+  "native": {
+    "matches": 2,
+    "query": "Stop",
+    "results": "push button\tStop\t(135, 65, 80x25)\tfocused\nlabel\tStop is explanatory text, not the button.\t(77, 11, 224x48)"
+  },
+  "direct": {
+    "matches": 3,
+    "query": "Stop",
+    "results": "button\tStop ui418-free\t(80, 60, 250x60)\nbutton\tStop ui418-covered\t(80, 170, 250x60)\ntext\tStop is only explanatory text here\t(0, 312, 325x26)"
+  },
+  "forwarded": {
+    "matches": 3,
+    "query": "Stop",
+    "results": "button\tStop ui418-free\t(80, 60, 250x60)\nbutton\tStop ui418-covered\t(80, 170, 250x60)\ntext\tStop is only explanatory text here\t(0, 312, 325x26)"
+  },
+  "owner_pid": 1289564,
+  "forwarder_pid": 1291450,
+  "native_click_verified": false,
+  "browser_click_verified": false,
+  "zoom175": {
+    "query": {
+      "matches": 1,
+      "query": "Add a comment",
+      "results": "textarea\tAdd a comment\t(100, 180, 300x65)"
+    },
+    "typed": {
+      "action": "type",
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": 13,
+        "method": "atspi_focused_text",
+        "observed_field_characters": 13,
+        "status": "verified",
+        "warning": null
+      },
+      "elapsed_ms": 277,
+      "retry_safe": false,
+      "submission_complete": true,
+      "submitted_characters": 13,
+      "text": "zoom407-proof"
+    },
+    "actual_title": "MILESTONE_WRONG407 - Google Chrome",
+    "expected_title": "MILESTONE_WRONG407",
+    "independent_field_verified": true
+  }
+}
