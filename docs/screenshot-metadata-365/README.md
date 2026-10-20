@@ -7,17 +7,17 @@ metadata in `structuredContent`. File captures always include structured metadat
 This opt-in addresses the review concern that Claude Code can hide `content[]`
 when a result also has `structuredContent`.
 
-## Original capture comparison
+## Capture comparison on engi, 2026-10-20
 
-These historical captures use a synthetic KDialog in a private 1920×1080 desktop
+These captures use a synthetic KDialog in a private 1920×1080 desktop
 on KWin 6.7.5, with a private HOME and no host browser profiles.
 
-| Default branch (`3dffc29`) | Initial metadata implementation |
+| Default branch (`05b937d`), default inline | Fixed build (`e5f700d`), metadata opted in |
 | --- | --- |
 | ![Inline capture before the fix](before.png) | ![Inline capture with metadata](after.png) |
 
 The independently captured PNGs are byte identical (SHA-256
-`10cb8b03bc897efce3b6600ae2b612c849e4186ad168156e31bd6e769cd2bc6d`).
+`c2c8e564f536796935a8bb2db95159a36cb3d41a3f7ce04b80848bad49d733cc`).
 The change concerns the response envelope; it does not change capture pixels.
 
 ## Current regression
@@ -45,3 +45,9 @@ screenshot destination. The response must still include the image, with
 
 Client-specific rendering is not inferred from the protocol checks. Clients that
 hide images alongside structured results should use the unchanged default.
+
+On engi, all nine capture cases passed in the fixed build (exit 0;
+[output](after.log)). The unchanged baseline passed the file, default-inline,
+and explicitly-disabled cases, then failed at the opted-in inline case with
+`key not found: "structuredContent"` (exit 1). Both sessions stopped and their
+workdirs were cleaned up.
