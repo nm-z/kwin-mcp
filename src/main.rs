@@ -15013,9 +15013,12 @@ impl KwinMcp {
             &params.text,
         )
         .await;
+        // A transient window of the browser (its GTK file chooser) is not web
+        // content and exposes nothing to AT-SPI; it types unverified like any app.
         if !params.text.is_empty()
             && !params.text.contains(['\t', '\n'])
             && chrome
+            && !snapshot.transient
             && let Err(error) = &receipt
             && !error.is::<input_bridge::TerminalFocus>()
             && !error.is::<input_bridge::ProtectedFocus>()
