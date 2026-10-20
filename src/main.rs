@@ -3130,6 +3130,24 @@ impl Eis {
         u64::try_from(self.start.elapsed().as_micros()).unwrap_or(0)
     }
 
+    /// Modifiers a `keyboard_press` left down: text typed now would arrive as shortcuts.
+    fn held_modifiers(&self) -> Vec<&'static str> {
+        let Some(log) = &self.audit else {
+            return Vec::new();
+        };
+        let history = log.history();
+        [
+            (KEY_LEFTCTRL, "ctrl"),
+            (LINUX_KEY_LEFTSHIFT, "shift"),
+            (KEY_LEFTALT, "alt"),
+            (KEY_LEFTMETA, "super"),
+        ]
+        .into_iter()
+        .filter(|(code, _)| history.held.contains_key(code))
+        .map(|(_, name)| name)
+        .collect()
+    }
+
     fn from_fd(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
         let stream = std::os::unix::net::UnixStream::from(fd);
         let context = reis::ei::Context::new(stream)?;
@@ -14932,6 +14950,19 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
+        let held = sess.eis.held_modifiers();
+        if !held.is_empty() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Typing was not started: {} is still held from keyboard_press, so each character would arrive as a shortcut. Call keyboard_release with the same combo first.",
+                    held.join("+")
+                ),
+                Some(serde_json::json!({
+                    "reason":"modifier_held", "held_modifiers":held, "submitted_characters":0,
+                    "submission_complete":false, "retry_safe":true,
+                })),
+            ));
+        }
         // Resolve every character before sending anything, so an unsupported
         // character never leaves half the text typed.
         let keys = params
@@ -15422,7 +15453,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_press",
-        description = "Press a key or combo WITHOUT releasing — useful when you need to hold the chord across a screenshot to verify a transient UI (e.g. a menu that opens on combo). Call keyboard_release with the same combo afterwards to release."
+        description = "Press a key or combo WITHOUT releasing — useful when you need to hold the chord across a screenshot to verify a transient UI (e.g. a menu that opens on combo). The keys stay down until keyboard_release with the same combo; keyboard_type refuses while a modifier is held. To send a shortcut (Ctrl+L, Ctrl+A, Alt+F4), use keyboard_key."
     )]
     async fn keyboard_press(
         &self,
@@ -15448,9 +15479,12 @@ impl KwinMcp {
         self.mark_input().await;
         Ok(structured_result(
             &peer,
-            format!("press: {}", params.key),
+            format!(
+                "press: {}. Still held until keyboard_release {}.",
+                params.key, params.key
+            ),
             serde_json::json!({
-                "action": "press", "key": params.key,
+                "action": "press", "key": params.key, "held": true,
             }),
         )
         .await)

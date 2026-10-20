@@ -10,6 +10,7 @@
 //!                 sees a different copy of, and agrees with what the command ran
 //!   launch_attribution (#615) a window that is only reactivated while the command still
 //!                 runs is not the launch's window
+//!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
 //! KWIN_MCP_E2E_SERVER selects another server binary.
@@ -575,5 +576,32 @@ fn launch_attribution() {
     assert!(
         attributed != first && attributed != closing,
         "the launch named an existing window: {third}"
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and a Konsole"]
+fn held_modifier() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({}));
+    server.data(
+        "launch_app",
+        json!({"command":"konsole", "window_timeout_seconds":30}),
+    );
+    // keyboard_press leaves Ctrl down; typing "h" now would be Ctrl+H.
+    let pressed = server.data("keyboard_press", json!({"key":"CTRL+L"}));
+    assert_eq!(pressed["held"], json!(true), "{pressed}");
+    let refused = server.call("keyboard_type", json!({"text":"h"}));
+    let text = failure_text(&refused);
+    assert!(
+        text.contains("still held") && text.contains("keyboard_release"),
+        "typing with Ctrl held was not refused: {refused}"
+    );
+    server.data("keyboard_release", json!({"key":"CTRL+L"}));
+    let typed = server.call("keyboard_type", json!({"text":"h"}));
+    assert!(
+        !failure_text(&typed).contains("still held"),
+        "typing was refused after release: {typed}"
     );
 }
