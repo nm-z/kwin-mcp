@@ -158,8 +158,9 @@ through the mounted filesystem. It does not modify the overlay backing layers
 directly. It refuses an existing session file unless `overwrite` is true; that
 option deliberately discards the session's private version of this file.
 Imported files have private `0600` permissions. Read-only session mounts remain
-read-only. Imports into HOME stay private to the session; host originals are
-unchanged.
+read-only. Outside explicitly shared `host_write_paths`, imports into HOME stay
+private to the session and host originals are unchanged. Imports into a shared
+directory write directly to live host state.
 
 The result confirms filesystem bytes, not application state. Save or discard
 unsaved editor changes before importing, then reopen/reload the note in
