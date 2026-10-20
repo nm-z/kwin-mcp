@@ -122,7 +122,7 @@ fn open_input_activity(session: &std::path::Path) -> anyhow::Result<std::fs::Fil
 /// ready (the first session frame's render graph was submitted successfully), closed, or failed.
 fn write_status(session: &std::path::Path, state: &str, detail: &str) {
     let temporary = session.join(format!("{VIEWER_STATUS_FILE}.tmp"));
-    let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id()});
+    let body = serde_json::json!({"state": state, "detail": detail, "pid": std::process::id(), "input_activity_reporting": true});
     if std::fs::write(&temporary, body.to_string()).is_ok() {
         let _ = std::fs::rename(&temporary, session.join(VIEWER_STATUS_FILE));
     }
