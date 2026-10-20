@@ -1164,6 +1164,89 @@ impl TextDelivery {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ProtectedFocus;
+
+impl std::fmt::Display for ProtectedFocus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the focused input is protected")
+    }
+}
+impl std::error::Error for ProtectedFocus {}
+
+#[derive(Debug)]
+pub(crate) enum TextFocusError {
+    Changed,
+    WindowChanged,
+    BrowserContextChanged,
+    QueryFailed(String),
+    QueryTimedOut,
+}
+impl TextFocusError {
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Changed | Self::WindowChanged | Self::BrowserContextChanged => "target_changed",
+            Self::QueryFailed(_) | Self::QueryTimedOut => "target_unverifiable",
+        }
+    }
+}
+impl std::fmt::Display for TextFocusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed => {
+                formatter.write_str("the original editable target lost focus or visibility")
+            }
+            Self::WindowChanged => formatter.write_str("the active window changed while typing"),
+            Self::BrowserContextChanged => formatter
+                .write_str("the active browser page or window caption changed while typing"),
+            Self::QueryFailed(detail) => write!(
+                formatter,
+                "the original typing target could not be checked: {detail}"
+            ),
+            Self::QueryTimedOut => formatter
+                .write_str("the original typing target did not answer its bounded focus check"),
+        }
+    }
+}
+impl std::error::Error for TextFocusError {}
+
+impl TextReceipt {
+    pub(crate) async fn check_focus(&self) -> Result<(), TextFocusError> {
+        let query = async {
+            let name = self
+                .object
+                .name()
+                .ok_or_else(|| anyhow::anyhow!("target has no bus name"))?;
+            let accessible = atspi::proxy::accessible::AccessibleProxy::builder(&self.bus)
+                .destination(name.to_string())?
+                .path(self.object.path().to_string())?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await?;
+            let states = accessible.get_state().await?;
+            Ok::<_, anyhow::Error>(
+                states.contains(atspi::State::Focused) && states.contains(atspi::State::Showing),
+            )
+        };
+        match tokio::time::timeout(std::time::Duration::from_millis(250), query).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(TextFocusError::Changed),
+            Ok(Err(error)) => Err(TextFocusError::QueryFailed(error.to_string())),
+            Err(_) => Err(TextFocusError::QueryTimedOut),
+        }
+    }
+    pub(crate) async fn watch_focus(&self) -> TextFocusError {
+        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(50));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = self.check_focus().await {
+                return error;
+            }
+        }
+    }
+}
+
 impl TextReceipt {
     pub async fn capture(
         address: &str,
@@ -1271,10 +1354,11 @@ impl TextReceipt {
                         && states.contains(atspi::State::Showing)
                     {
                         let role = node.get_role().await?;
-                        if role == atspi::Role::PasswordText || role == atspi::Role::Terminal {
-                            anyhow::bail!(
-                                "the focused control is a password field or terminal, not an inspectable editable field"
-                            );
+                        if role == atspi::Role::PasswordText {
+                            return Err(ProtectedFocus.into());
+                        }
+                        if role == atspi::Role::Terminal {
+                            return Err(TerminalFocus.into());
                         }
                         let text = node.proxies().await?.text().await?;
                         let count = text.character_count().await?;

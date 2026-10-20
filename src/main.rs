@@ -2546,72 +2546,179 @@ fn typing_log_failure(
     }
 }
 
+struct TypingWindow<'a> {
+    connection: &'a zbus::Connection,
+    kwin_unique: &'a str,
+    runtime: &'a Path,
+    window_id: &'a str,
+    browser_title: Option<&'a str>,
+}
+
+fn chromium_resource_class(resource_class: &str) -> bool {
+    let class = resource_class.trim().to_ascii_lowercase();
+    if matches!(
+        class.as_str(),
+        "org.chromium.chromium"
+            | "com.google.chrome"
+            | "com.brave.browser"
+            | "com.microsoft.edge"
+            | "com.vivaldi.vivaldi"
+    ) {
+        return true;
+    }
+    [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "brave-browser",
+        "microsoft-edge",
+        "vivaldi",
+    ]
+    .iter()
+    .any(|base| {
+        class == *base
+            || class.strip_prefix(base).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "-stable" | "-beta" | "-dev" | "-unstable" | "-nightly" | "-snapshot"
+                )
+            })
+    })
+}
+
+async fn check_typing_window(
+    window: &TypingWindow<'_>,
+) -> Result<(), input_bridge::TextFocusError> {
+    match tokio::time::timeout(
+        Duration::from_millis(400),
+        active_window_info(window.connection, window.kwin_unique, window.runtime),
+    )
+    .await
+    {
+        Ok(Ok((_, _, observed))) if observed.id != window.window_id => {
+            Err(input_bridge::TextFocusError::WindowChanged)
+        }
+        Ok(Ok((_, _, observed)))
+            if window
+                .browser_title
+                .is_some_and(|title| title != observed.title) =>
+        {
+            Err(input_bridge::TextFocusError::BrowserContextChanged)
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(input_bridge::TextFocusError::QueryFailed(error.to_string())),
+        Err(_) => Err(input_bridge::TextFocusError::QueryTimedOut),
+    }
+}
+
+async fn watch_typing_window(window: &TypingWindow<'_>) -> input_bridge::TextFocusError {
+    let mut ticks = tokio::time::interval(Duration::from_millis(100));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        if let Err(error) = check_typing_window(window).await {
+            return error;
+        }
+    }
+}
+
+async fn watch_typing_target(
+    target: Option<&input_bridge::TextReceipt>,
+    window: &TypingWindow<'_>,
+) -> input_bridge::TextFocusError {
+    let field = async {
+        match target {
+            Some(target) => target.watch_focus().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        error = field => error,
+        error = watch_typing_window(window) => error,
+    }
+}
+
 async fn type_with_profile(
     eis: &Eis,
     text: &str,
     keys: &[(u32, bool)],
     pace: InputPace,
+    target: Option<&input_bridge::TextReceipt>,
+    window: &TypingWindow<'_>,
 ) -> Result<(), McpError> {
     let characters: Vec<char> = text.chars().collect();
-    let mut held = SentInput::new(eis);
     let began = tokio::time::Instant::now();
     let mut next_down = Duration::ZERO;
     let mut pending: Vec<(Duration, u32, char)> = Vec::new();
     let mut shifted = false;
     let mut submitted = 0;
     let mut attempted = 0;
-    let result: anyhow::Result<()> = async {
-        for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
-            let (hold, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
-            let hold = capped_key_hold(hold);
-            let interval = budgeted_interval(
-                interval,
-                TYPING_BUDGET.saturating_sub(began.elapsed()),
-                characters.len() - i,
-            );
-            // Repeated keys must release before their next press. Shift transitions
-            // also wait for held characters so their requested case stays intact.
-            for (up, key, _) in &pending {
-                if *key == code || shift != shifted {
-                    next_down = next_down.max(*up);
+    let result: anyhow::Result<()> = {
+        let typing = async {
+            let mut held = SentInput::new(eis);
+            for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
+                let (hold, interval) =
+                    pace.key_timing(character, characters.get(i + 1).copied())?;
+                let hold = capped_key_hold(hold);
+                let interval = budgeted_interval(
+                    interval,
+                    TYPING_BUDGET.saturating_sub(began.elapsed()),
+                    characters.len() - i,
+                );
+                // Repeated keys must release before their next press. Shift transitions
+                // also wait for held characters so their requested case stays intact.
+                for (up, key, _) in &pending {
+                    if *key == code || shift != shifted {
+                        next_down = next_down.max(*up);
+                    }
                 }
+                pending.sort_by_key(|event| event.0);
+                while pending.first().is_some_and(|event| event.0 <= next_down) {
+                    let (up, key, c) = pending.remove(0);
+                    tokio::time::sleep_until(began + up).await;
+                    held.key(key, false, Some(c))?;
+                }
+                tokio::time::sleep_until(began + next_down).await;
+                if shift != shifted {
+                    held.key(LINUX_KEY_LEFTSHIFT, shift, None)?;
+                    shifted = shift;
+                }
+                attempted += 1;
+                held.key(code, true, Some(character))?;
+                submitted += 1;
+                // Socket backpressure or scheduler delay must not turn the rest of
+                // the text into a burst of overdue events. Pace from the actual send.
+                let sent_at = began.elapsed();
+                pending.push((sent_at + hold, code, character));
+                next_down = sent_at + interval;
+                tokio::task::yield_now().await;
             }
             pending.sort_by_key(|event| event.0);
-            while pending.first().is_some_and(|event| event.0 <= next_down) {
-                let (up, key, c) = pending.remove(0);
+            for (up, key, c) in pending {
                 tokio::time::sleep_until(began + up).await;
                 held.key(key, false, Some(c))?;
             }
-            tokio::time::sleep_until(began + next_down).await;
-            if shift != shifted {
-                held.key(LINUX_KEY_LEFTSHIFT, shift, None)?;
-                shifted = shift;
+            if shifted {
+                held.key(LINUX_KEY_LEFTSHIFT, false, None)?;
             }
-            attempted += 1;
-            held.key(code, true, Some(character))?;
-            submitted += 1;
-            // Socket backpressure or scheduler delay must not turn the rest of
-            // the text into a burst of overdue events. Pace from the actual send.
-            let sent_at = began.elapsed();
-            pending.push((sent_at + hold, code, character));
-            next_down = sent_at + interval;
+            check_typing_window(window).await?;
+            if let Some(target) = target {
+                target.check_focus().await?;
+            }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            error = watch_typing_target(target, window) => Err(error.into()),
+            result = typing => result,
         }
-        pending.sort_by_key(|event| event.0);
-        for (up, key, c) in pending {
-            tokio::time::sleep_until(began + up).await;
-            held.key(key, false, Some(c))?;
-        }
-        if shifted {
-            held.key(LINUX_KEY_LEFTSHIFT, false, None)?;
-        }
-        Ok(())
-    }
-    .await;
+    };
     result.map_err(|error| McpError::internal_error(
         format!("keyboard_type stopped after completing {submitted} character presses and attempting {attempted} of {} characters: {error}. Some or all attempted text may still arrive. Inspect the field and input log before sending or retrying; do not retype blindly.", characters.len()),
         Some(serde_json::json!({
+            "reason": error.downcast_ref::<input_bridge::TextFocusError>().map(input_bridge::TextFocusError::reason).unwrap_or("input_submission_failed"),
             "submitted_characters": submitted, "attempted_characters": attempted,
-            "requested_characters": characters.len(), "submission_complete": false,
+            "requested_characters": characters.len(), "submission_complete": submitted == characters.len(),
             "compositor_acknowledged": false, "application_text": "unverified", "retry_safe": false,
         })),
     ))
@@ -13486,7 +13593,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Tab/Return and inaccessible fields cannot be text-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent."
     )]
     async fn keyboard_type(
         &self,
@@ -13506,24 +13613,107 @@ impl KwinMcp {
             .chars()
             .map(char_key)
             .collect::<Result<Vec<_>, _>>()?;
+        let preflight_error = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!(
+                    "Typing was not started: {detail}. Click the intended field and inspect it before retrying."
+                ),
+                Some(serde_json::json!({
+                    "reason":reason, "submitted_characters":0, "attempted_characters":0,
+                    "requested_characters":keys.len(), "submission_complete":false,
+                    "retry_safe":true,
+                })),
+            )
+        };
         let active =
             active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
                 .await
-                .map(|(_, _, geometry)| geometry);
-        let receipt = match &active {
-            Ok(geometry) => {
-                input_bridge::TextReceipt::capture(
-                    &sess.atspi_bus_address,
-                    &geometry.title,
-                    [geometry.x, geometry.y, geometry.w, geometry.h],
-                    &params.text,
-                )
+                .map(|(_, _, geometry)| geometry)
+                .map_err(|error| preflight_error("target_unverifiable", error.to_string()))?;
+        let snapshot =
+            window_snapshots(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
                 .await
-            }
-            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                .map_err(|error| preflight_error("target_unverifiable", error.to_string()))?
+                .into_iter()
+                .find(|window| window.id == active.id && window.active && !window.minimized)
+                .ok_or_else(|| {
+                    preflight_error(
+                        "target_changed",
+                        "the original window is no longer active".to_owned(),
+                    )
+                })?;
+        if snapshot.resource_class.is_empty() {
+            return Err(preflight_error(
+                "target_unverifiable",
+                "the active application's identity is unavailable".to_owned(),
+            ));
+        }
+        let chrome = chromium_resource_class(&snapshot.resource_class);
+        let receipt = input_bridge::TextReceipt::capture(
+            &sess.atspi_bus_address,
+            &active.title,
+            [active.x, active.y, active.w, active.h],
+            &params.text,
+        )
+        .await;
+        if !params.text.is_empty()
+            && !params.text.contains(['\t', '\n'])
+            && chrome
+            && let Err(error) = &receipt
+            && !error.is::<input_bridge::TerminalFocus>()
+            && !error.is::<input_bridge::ProtectedFocus>()
+        {
+            return Err(McpError::invalid_params(
+                "Typing was not started because the browser's focused editable target could not be verified. Click the intended field and inspect it before retrying.",
+                Some(serde_json::json!({
+                    "reason":"text_target_unavailable", "submitted_characters":0,
+                    "attempted_characters":0, "requested_characters":keys.len(),
+                    "submission_complete":false, "retry_safe":true,
+                    "target_observation":error.to_string(),
+                })),
+            ));
+        }
+        if let Ok(target) = &receipt {
+            target.check_focus().await.map_err(|error| {
+                McpError::invalid_params(
+                    error.to_string(),
+                    Some(serde_json::json!({
+                        "reason":error.reason(), "submitted_characters":0,
+                        "attempted_characters":0, "requested_characters":keys.len(),
+                        "submission_complete":false, "retry_safe":true,
+                    })),
+                )
+            })?;
+        }
+        let window = TypingWindow {
+            connection: &sess.kwin_conn,
+            kwin_unique: &sess.kwin_unique_name,
+            runtime: &sess.host_xdg_dir,
+            window_id: &active.id,
+            // Chromium can retain Focused/Showing on a background tab's field.
+            // A caption change is an independent page-context signal. Tab and
+            // Return requests may intentionally navigate, so retain their path.
+            browser_title: (chrome && !params.text.contains(['\t', '\n']))
+                .then_some(active.title.as_str()),
         };
+        check_typing_window(&window)
+            .await
+            .map_err(|error| preflight_error(error.reason(), error.to_string()))?;
         let started = std::time::Instant::now();
-        type_with_profile(&sess.eis, &params.text, &keys, pace).await?;
+        if let Err(error) = type_with_profile(
+            &sess.eis,
+            &params.text,
+            &keys,
+            pace,
+            receipt.as_ref().ok(),
+            &window,
+        )
+        .await
+        {
+            drop(guard);
+            self.mark_input().await;
+            return Err(error);
+        }
         sess.eis.roundtrip().await.map_err(|error| {
             McpError::internal_error(
                 format!("All {} characters were submitted, but compositor acknowledgement failed: {error}. Text may still arrive; inspect the field before sending or retrying, and do not retype blindly.", keys.len()),
@@ -13543,18 +13733,13 @@ impl KwinMcp {
                 if error.is::<input_bridge::FocusNotEditable>()
                     || error.is::<input_bridge::TerminalFocus>() =>
             {
-                let after = match &active {
-                    Ok(geometry) => {
-                        input_bridge::TextReceipt::capture(
-                            &sess.atspi_bus_address,
-                            &geometry.title,
-                            [geometry.x, geometry.y, geometry.w, geometry.h],
-                            "",
-                        )
-                        .await
-                    }
-                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
-                };
+                let after = input_bridge::TextReceipt::capture(
+                    &sess.atspi_bus_address,
+                    &active.title,
+                    [active.x, active.y, active.w, active.h],
+                    "",
+                )
+                .await;
                 match after {
                     Err(after) => input_bridge::TextDelivery::unreadable_field_delivery(
                         keys.len(),
