@@ -16,7 +16,7 @@ For the observed focused Konsole, production `keyboard_type` returns:
 | `retry_safe` | `false` | Repeating input can duplicate the command. |
 | Field character counts | `null` | No editable-field comparison was invented. |
 
-`submission_complete` does not mean a shell command executed. The observation sends a separate Return only after inspecting the pending command. Compositor acknowledgement also does not prove application delivery. A terminal receipt marked `unverified` is compatible with a successfully delivered command; it is not a reason to retype it.
+`submission_complete` does not mean a shell command executed. The fixture captures the pending command before sending a separate Return, then verifies the command's output independently. For interactive work, inspect the pending command before executing it. Compositor acknowledgement also does not prove application delivery. A terminal receipt marked `unverified` is compatible with a successfully delivered command; it is not a reason to retype it.
 
 This distinction addresses #411 and #467. The same receipt checks cover the 777-character input size reported in #405, but its default-typing latency concern remains open.
 
@@ -57,8 +57,8 @@ Build the production server, then run from the logged-in non-root KDE host envir
 
 ```sh
 cargo build --locked --offline -j1 --bin kwin-mcp
-ruby tests/terminal_receipts_e2e.rb target/debug/kwin-mcp /tmp/terminal-receipts-short 129
-ruby tests/terminal_receipts_e2e.rb target/debug/kwin-mcp /tmp/terminal-receipts-long 777
+ruby tests/terminal_receipts_e2e.rb target/debug/kwin-mcp /var/tmp/terminal-receipts-short 129
+ruby tests/terminal_receipts_e2e.rb target/debug/kwin-mcp /var/tmp/terminal-receipts-long 777
 ```
 
 Choose fresh output paths. The fixture preserves inherited runtime and bus overrides; unset values use the server's validated host defaults. Do not run this server-starting fixture inside a desktop created by `launch_app`: it deliberately lacks the host bus and cannot supply the required user service scope.
