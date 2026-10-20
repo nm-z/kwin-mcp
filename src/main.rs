@@ -13081,6 +13081,10 @@ impl KwinMcp {
             .into_iter()
             .find(|window| window.active)
             .ok_or_else(|| McpError::internal_error("No active window", None))?;
+        // Match the rounded client origin used by active_window_info, mouse
+        // input, and screenshots, including fractional KWin window positions.
+        #[expect(clippy::as_conversions)]
+        let (origin_x, origin_y) = (window.x.round() as i32, window.y.round() as i32);
         let mut elements = Vec::new();
         let mut out = Vec::new();
         let mut frame_identity = None;
@@ -13185,14 +13189,18 @@ impl KwinMcp {
                     {
                         // AT-SPI reports screen pixels; input and screenshots
                         // use the active client area's origin.
-                        let relative_x = f64::from(x) - window.x;
-                        let relative_y = f64::from(y) - window.y;
+                        let Some(relative_x) = x.checked_sub(origin_x) else {
+                            continue;
+                        };
+                        let Some(relative_y) = y.checked_sub(origin_y) else {
+                            continue;
+                        };
                         let flags = node.states.iter()
                             .filter(|state| *state == "disabled" || *state == "focused")
                             .map(|state| format!("\t{state}"))
                             .collect::<String>();
                         out.push(format!(
-                            "{}\t{}\t({relative_x:.0}, {relative_y:.0}, {w}x{h}){flags}",
+                            "{}\t{}\t({relative_x}, {relative_y}, {w}x{h}){flags}",
                             tree_field(&node.role), tree_field(&node.name)
                         ));
                         elements.push(serde_json::json!({
@@ -13246,6 +13254,7 @@ impl KwinMcp {
                 "matches": out.len(), "query": params.query, "results": results,
                 "elements": elements, "window": window, "accessibility_frame": frame_identity,
                 "coordinate_frame": "window_client_pixels",
+            "coordinate_origin": {"x": origin_x, "y": origin_y},
                 "visibility": "accessibility_reported", "occlusion": "not_checked",
                 "incomplete": incomplete,
             }),
