@@ -1,0 +1,75 @@
+{
+  "mode": "candidate",
+  "paused_after_first_press": true,
+  "typing": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "typing verified: -a---b__c!?##//\\..~~--Repeated-Punctuation-472"
+        }
+      ],
+      "structuredContent": {
+        "action": "type",
+        "delivery": {
+          "compositor_acknowledged": true,
+          "expected_field_characters": 46,
+          "method": "atspi_focused_text",
+          "observed_field_characters": 46,
+          "status": "verified",
+          "warning": null
+        },
+        "elapsed_ms": 3358,
+        "retry_safe": false,
+        "submission_complete": true,
+        "submitted_characters": 46,
+        "text": "-a---b__c!?##//\\..~~--Repeated-Punctuation-472"
+      },
+      "isError": false
+    }
+  },
+  "expected_characters": 46,
+  "observed_characters": 46,
+  "exact_text": true,
+  "samples": [
+    {
+      "characters": 80,
+      "exact": true,
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": 80,
+        "method": "atspi_focused_text",
+        "observed_field_characters": 80,
+        "status": "verified",
+        "warning": null
+      }
+    },
+    {
+      "characters": 42,
+      "exact": true,
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": 42,
+        "method": "atspi_focused_text",
+        "observed_field_characters": 42,
+        "status": "verified",
+        "warning": null
+      }
+    },
+    {
+      "characters": 22,
+      "exact": true,
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": 22,
+        "method": "atspi_focused_text",
+        "observed_field_characters": 22,
+        "status": "verified",
+        "warning": null
+      }
+    }
+  ],
+  "status": "passed"
+}
