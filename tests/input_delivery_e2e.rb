@@ -9,6 +9,13 @@ require_relative 'electron_text_fixture'
 
 class InputDeliveryProbe
   class TerminalFocusTimeout < StandardError; end
+  ROLE_FILTER_HTML = <<~HTML.freeze
+    <!doctype html><title>KWin role filter fixture</title>
+    <style>body{font:24px sans-serif;padding:40px}button{font:inherit;padding:20px 50px}div{margin-top:30px}</style>
+    <button onclick="document.title='KWin role filter clicked'; document.getElementById('result').textContent='Clicked successfully'">Stop</button>
+    <div role="note">Stop is present in this message.</div>
+    <div id="result">Not clicked</div>
+  HTML
   LONG_COMMENT_HTML = <<~HTML.freeze
       <!doctype html><title>Long comment timing</title>
       <style>body{font:20px sans-serif;margin:20px}textarea{width:95%;height:500px;font:18px monospace}</style>
@@ -44,7 +51,7 @@ class InputDeliveryProbe
         clientInfo: { name: 'input-delivery-e2e', version: '1' })
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
-    start = call('session_start', width: width, height: height)
+    start = call('session_start', width: width, height: height, startup_timeout_seconds: 60, browser_profiles: 'fresh')
     assert_success(start)
     @started = true
     @workdir = start.dig('result','structuredContent','workdir')
@@ -122,6 +129,71 @@ class InputDeliveryProbe
     proof = {characters:text.length,speed:4,elapsed_seconds:elapsed,delivery:result['delivery'],independent_clipboard_match:true}
     File.write(File.join(@artifacts, 'comment-timing.json'), JSON.pretty_generate(proof))
     puts JSON.generate(proof)
+  end
+
+  def role_filter_atspi
+    role_filter(cdp: false)
+  end
+
+  def role_filter_cdp
+    role_filter(cdp: true)
+  end
+
+  def role_filter(cdp:)
+    tag = cdp ? 'role-filter-cdp' : 'role-filter-atspi'
+    prefix = cdp ? '' : 'env -u KWIN_MCP_CDP_PORT '
+    command = prefix +
+      'google-chrome-stable --no-first-run --no-default-browser-check --force-renderer-accessibility ' +
+      '--user-data-dir="$HOME/.kwin-' + tag + '" --app="file://$HOME/role-filter.html"'
+    launched = assert_success(call('launch_app', command: command))
+    raise "wrong accessibility backend: #{launched}" unless launched.fetch('cdp') == cdp
+    lookup = ->(arguments) { assert_success(call('find_ui_elements', arguments)) }
+    rows = ->(result) { result.fetch('results', '').lines.map { |line| line.strip.split("\t", -1) } }
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    unfiltered = nil
+    loop do
+      unfiltered = lookup.call(query: 'Stop')
+      observed = rows.call(unfiltered)
+      has_button = observed.any? { |row| row[0].downcase.include?('button') && row[1] == 'Stop' }
+      has_prose = observed.any? { |row| !row[0].downcase.include?('button') && row[1].include?('Stop is present') }
+      break if has_button && has_prose
+      raise "fixture controls not found: #{unfiltered}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.2
+    end
+    screen("#{tag}-before")
+    File.write(File.join(@artifacts, "#{tag}.tree.txt"), tree(show_elements: true))
+    filtered = lookup.call(query: 'Stop', role: 'button')
+    File.write(File.join(@artifacts, "#{tag}-filtered.json"), JSON.pretty_generate(filtered))
+    button_rows = rows.call(filtered)
+    unless button_rows.length == 1 && button_rows[0][0].downcase.include?('button') && button_rows[0][1] == 'Stop'
+      raise "role filter retained unrelated prose: #{filtered}"
+    end
+    mixed_case = lookup.call(query: 'Stop', role: 'BuTtOn')
+    raise 'role matching is not case insensitive' unless mixed_case == filtered
+    empty_role = lookup.call(query: 'Stop', role: '')
+    raise 'empty role changed default behavior' unless empty_role == unfiltered
+    missing = lookup.call(query: 'Stop', role: 'kwin-nonexistent-role')
+    raise "unknown role matched controls: #{missing}" unless missing.fetch('matches') == 0
+    File.write(File.join(@artifacts, "#{tag}-results.json"), JSON.pretty_generate(
+      unfiltered: unfiltered, filtered: filtered, mixed_case: mixed_case,
+      empty_role: empty_role, missing: missing))
+    # Verify the filtered AT-SPI control through native input and a window title.
+    unless cdp
+      match = button_rows[0][2].match(/\((-?\d+), (-?\d+), (\d+)x(\d+)\)/)
+      raise 'filtered button bounds missing' unless match
+      x, y, width, height = match.captures.map(&:to_i)
+      window = screen("#{tag}-target").fetch('window')
+      assert_success(call('mouse_click',
+        x: x + width / 2 - window.fetch('x'), y: y + height / 2 - window.fetch('y')))
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      loop do
+        windows = assert_success(call('window_list')).fetch('windows')
+        break if windows.any? { |item| item.fetch('title').include?('KWin role filter clicked') }
+        raise 'filtered button did not receive the native click' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep 0.1
+      end
+      screen("#{tag}-clicked")
+    end
   end
 
   def prepare_electron
@@ -527,6 +599,10 @@ artifacts = File.expand_path(ENV.fetch('KWIN_MCP_TEST_ARTIFACT_DIR'))
 probe = nil
 begin
   modes = ARGV.empty? ? %w[electron terminal] : ARGV
+  if modes.any? { |mode| %w[role_filter_atspi role_filter_cdp].include?(mode) }
+    FileUtils.mkdir_p(File.join(artifacts, 'home'))
+    File.write(File.join(artifacts, 'home', 'role-filter.html'), InputDeliveryProbe::ROLE_FILTER_HTML)
+  end
   if modes.include?('long_comment')
     FileUtils.mkdir_p(File.join(artifacts, 'home'))
     File.write(File.join(artifacts, 'home', 'long-comment.html'), InputDeliveryProbe::LONG_COMMENT_HTML)

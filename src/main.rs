@@ -9924,6 +9924,8 @@ struct AccessibilityTreeParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindUiElementsParams {
     query: String,
+    /// Optional case-insensitive substring of the reported role, matching accessibility_tree.role.
+    role: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -13060,7 +13062,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
+        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Optional role filters the reported role by case-insensitive substring, as in accessibility_tree; role=button matches button and push button. Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -13071,6 +13073,11 @@ impl KwinMcp {
         self.touch_activity().await;
         self.settle_input().await?;
         let query = params.query.to_lowercase();
+        let role = params.role.map(|s| s.to_lowercase());
+        let role_ok = |name: &str| {
+            role.as_ref()
+                .is_none_or(|needle| name.to_lowercase().contains(needle))
+        };
         let mut out = Vec::new();
 
         let cdp_browser = self
@@ -13119,6 +13126,7 @@ impl KwinMcp {
                             for el in &elements {
                                 if el.w > 1
                                     && el.h > 1
+                                    && role_ok(&el.role)
                                     && (el.text.to_lowercase().contains(&query)
                                         || el.role.to_lowercase().contains(&query))
                                 {
@@ -13174,6 +13182,7 @@ impl KwinMcp {
                             Err(_) => continue,
                         };
                         if node.is_useful()
+                            && role_ok(&node.role)
                             && (node.name.to_lowercase().contains(&query)
                                 || node.role.to_lowercase().contains(&query))
                         {
