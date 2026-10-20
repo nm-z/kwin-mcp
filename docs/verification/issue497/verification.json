@@ -1,0 +1,55 @@
+{
+  "session_id": "s795874-1",
+  "activation_checks": [
+    {
+      "variant": "listed",
+      "supplied_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "actual_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "title": "Activation first 497"
+    },
+    {
+      "variant": "unbraced",
+      "supplied_id": "d7c9fffe-9527-41d2-a0e1-a03e318439ad",
+      "actual_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "title": "Activation first 497"
+    },
+    {
+      "variant": "braced",
+      "supplied_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "actual_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "title": "Activation first 497"
+    },
+    {
+      "variant": "uppercase",
+      "supplied_id": "{D7C9FFFE-9527-41D2-A0E1-A03E318439AD}",
+      "actual_id": "{d7c9fffe-9527-41d2-a0e1-a03e318439ad}",
+      "title": "Activation first 497"
+    },
+    {
+      "variant": "listed",
+      "supplied_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "actual_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "title": "Activation second 497"
+    },
+    {
+      "variant": "unbraced",
+      "supplied_id": "207679f1-ee6b-479f-be35-4ef630ef0e42",
+      "actual_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "title": "Activation second 497"
+    },
+    {
+      "variant": "braced",
+      "supplied_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "actual_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "title": "Activation second 497"
+    },
+    {
+      "variant": "uppercase",
+      "supplied_id": "{207679F1-EE6B-479F-BE35-4EF630EF0E42}",
+      "actual_id": "{207679f1-ee6b-479f-be35-4ef630ef0e42}",
+      "title": "Activation second 497"
+    }
+  ],
+  "independent_dialog_receipts": true,
+  "passed": true
+}
