@@ -10731,6 +10731,14 @@ async fn poll_launch_window(
     let mut pending_reused: Option<(String, String)> = None;
     loop {
         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
+        let exit_status = std::fs::read_to_string(&exit_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok());
+        // An existing window is the launch's window only when the command has
+        // already handed off to it and exited. A command that is still running
+        // has not opened that window, so its activation for another reason
+        // (focus returning, another client raising it) says nothing about it.
+        let handed_off = exit_status == Some(0);
         let current_windows = window_snapshots(&conn, &kwin_unique, &xdg).await;
         if let Ok(windows) = &current_windows {
             if let Some(active) = windows.iter().find(|window| window.active)
@@ -10746,7 +10754,7 @@ async fn poll_launch_window(
                         reused: false,
                     }));
                 }
-                if !chromium_launch {
+                if !chromium_launch && handed_off {
                     if pending_reused.as_ref() == Some(&current) {
                         return Ok(Some(LaunchWindow {
                             geometry: launch_window_geometry(active),
@@ -10769,7 +10777,7 @@ async fn poll_launch_window(
                     reused: false,
                 }));
             }
-            if !chromium_launch {
+            if !chromium_launch && handed_off {
                 if pending_reused.as_ref() == Some(&current) {
                     return Ok(Some(LaunchWindow {
                         geometry,
@@ -10779,9 +10787,6 @@ async fn poll_launch_window(
                 pending_reused = Some(current);
             }
         }
-        let exit_status = std::fs::read_to_string(&exit_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok());
         if exit_status.is_some_and(|status| status != 0) {
             return Ok(None);
         }
@@ -14914,7 +14919,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 clipboard input use keyboard_paste."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most (timings_ms reports it); raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
     )]
     async fn keyboard_type(
         &self,

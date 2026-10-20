@@ -8,6 +8,8 @@
 //!   hidden_import (#610) path_not_visible points at import_file, and an imported copy runs
 //!   home_overlay  (#611) launch_app reports overlay arguments and a host file the session
 //!                 sees a different copy of, and agrees with what the command ran
+//!   launch_attribution (#615) a window that is only reactivated while the command still
+//!                 runs is not the launch's window
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
 //! KWIN_MCP_E2E_SERVER selects another server binary.
@@ -541,4 +543,37 @@ fn home_overlay() {
     );
     std::thread::sleep(Duration::from_secs(1));
     assert!(!output.exists(), "a session write reached the host HOME");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn launch_attribution() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({"window_mode":"native"}));
+    let window = |launched: &Value| launched["window"].as_str().expect("window id").to_owned();
+    let first = window(&server.data(
+        "launch_app",
+        json!({"command":"konsole -e sleep 600", "window_timeout_seconds":30}),
+    ));
+    // This window closes by itself while the third launch is still waiting for
+    // its own window; KWin then reactivates the first window.
+    let closing = window(&server.data(
+        "launch_app",
+        json!({"command":"konsole -e sleep 4", "window_timeout_seconds":30}),
+    ));
+    let third = server.data(
+        "launch_app",
+        json!({"command":"sleep 9; exec konsole -e sleep 600", "window_timeout_seconds":40}),
+    );
+    let attributed = window(&third);
+    assert_eq!(
+        third["window_outcome"],
+        json!("new"),
+        "a command that is still running was given an older window: {third}"
+    );
+    assert!(
+        attributed != first && attributed != closing,
+        "the launch named an existing window: {third}"
+    );
 }

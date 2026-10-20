@@ -1194,7 +1194,7 @@ impl TextDelivery {
             expected_field_characters: None,
             observed_field_characters: None,
             warning: Some(
-                "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output before sending or retrying; retyping can run the command again.".to_owned(),
+                "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output with a screenshot before sending or retrying; retyping can run the command again.".to_owned(),
             ),
         }
     }
