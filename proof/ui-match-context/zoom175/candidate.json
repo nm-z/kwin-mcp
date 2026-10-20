@@ -1,0 +1,765 @@
+{
+  "status": "passed",
+  "mode": "candidate",
+  "native": {
+    "active_window_id": "{c33c5ee2-b0a7-43bf-9b98-87e9ffc7f854}",
+    "continuation": "Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches.",
+    "elements": [
+      {
+        "backend": "atspi",
+        "bounds": {
+          "h": 25,
+          "w": 80,
+          "x": 135.0,
+          "y": 65.0
+        },
+        "center_hit": null,
+        "clickable": null,
+        "coordinate_space": "active_window_pixels",
+        "enabled": true,
+        "mapped_screen_bounds": {
+          "h": 25,
+          "w": 80,
+          "x": 479.0,
+          "y": 364.0
+        },
+        "mouse_coordinates_usable": true,
+        "name": "Stop",
+        "object_path": "/org/a11y/atspi/accessible/2147483653",
+        "occluded": null,
+        "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+        "provider_visible": true,
+        "raw_atspi_bounds": {
+          "h": 25,
+          "w": 80,
+          "x": 135,
+          "y": 65
+        },
+        "role": "push button",
+        "states": [
+          "enabled",
+          "focused",
+          "focusable",
+          "visible"
+        ],
+        "surface": {
+          "application": "kdialog",
+          "bus": ":1.3",
+          "frame_path": "/org/a11y/atspi/accessible/2147483652",
+          "frame_screen_bounds": [
+            0,
+            0,
+            312,
+            101
+          ],
+          "frame_title": "UI418-native-1294923"
+        },
+        "visible": true,
+        "window": {
+          "active": true,
+          "dialog": false,
+          "h": 101.0,
+          "id": "{c33c5ee2-b0a7-43bf-9b98-87e9ffc7f854}",
+          "minimized": false,
+          "modal": true,
+          "pid": 73,
+          "popup": false,
+          "resourceClass": "org.kde.kdialog",
+          "resourceName": "kdialog",
+          "stackingOrder": 0,
+          "title": "UI418-native-1294923",
+          "transient": false,
+          "transientFor": null,
+          "w": 312.0,
+          "x": 344.0,
+          "y": 299.0
+        },
+        "window_association": "unique_title_and_frame_size"
+      }
+    ],
+    "errors": [],
+    "incomplete": false,
+    "matches": 1,
+    "query": "Stop",
+    "results": "push button\tStop\t{\"h\":25,\"w\":80,\"x\":135.0,\"y\":65.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"kdialog\",\"bus\":\":1.3\",\"frame_path\":\"/org/a11y/atspi/accessible/2147483652\",\"frame_screen_bounds\":[0,0,312,101],\"frame_title\":\"UI418-native-1294923\"}",
+    "role": "button",
+    "sampled_at_milliseconds": 1792471017527,
+    "server_pid": 1294938,
+    "visible_only": false
+  },
+  "direct": {
+    "active_window_id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+    "continuation": "Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches.",
+    "elements": [
+      {
+        "backend": "cdp",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 60
+        },
+        "center_hit": true,
+        "center_hit_target": {
+          "name": "Stop ui418-free",
+          "role": "button"
+        },
+        "clickable": true,
+        "coordinate_space": "css_viewport_pixels",
+        "enabled": true,
+        "mouse_coordinates_usable": false,
+        "name": "Stop ui418-free",
+        "occluded": false,
+        "role": "button",
+        "surface": {
+          "page_focused": true,
+          "title": "UI418 controls",
+          "url": "file:///tmp/kwin-mcp-1294938-1/controls.html",
+          "viewport": {
+            "device_pixel_ratio": 1,
+            "height": 613,
+            "scale": 1,
+            "scroll_x": 0,
+            "scroll_y": 0,
+            "width": 1000
+          }
+        },
+        "visible": true,
+        "window": null,
+        "window_association": "unverified_cdp_target"
+      },
+      {
+        "backend": "cdp",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 170
+        },
+        "center_hit": false,
+        "center_hit_target": {
+          "name": "Overlay covers the second button",
+          "role": "div"
+        },
+        "clickable": false,
+        "coordinate_space": "css_viewport_pixels",
+        "enabled": true,
+        "mouse_coordinates_usable": false,
+        "name": "Stop ui418-covered",
+        "occluded": true,
+        "role": "button",
+        "surface": {
+          "page_focused": true,
+          "title": "UI418 controls",
+          "url": "file:///tmp/kwin-mcp-1294938-1/controls.html",
+          "viewport": {
+            "device_pixel_ratio": 1,
+            "height": 613,
+            "scale": 1,
+            "scroll_x": 0,
+            "scroll_y": 0,
+            "width": 1000
+          }
+        },
+        "visible": true,
+        "window": null,
+        "window_association": "unverified_cdp_target"
+      },
+      {
+        "backend": "atspi",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 147.0
+        },
+        "center_hit": null,
+        "clickable": null,
+        "coordinate_space": "active_window_pixels",
+        "enabled": true,
+        "mapped_screen_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 147.0
+        },
+        "mouse_coordinates_usable": true,
+        "name": "Stop ui418-free",
+        "object_path": "/org/a11y/atspi/accessible/166",
+        "occluded": null,
+        "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+        "provider_visible": true,
+        "raw_atspi_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 147
+        },
+        "role": "button",
+        "states": [
+          "enabled",
+          "focusable",
+          "visible"
+        ],
+        "surface": {
+          "application": "Google Chrome",
+          "bus": ":1.5",
+          "frame_path": "/org/a11y/atspi/accessible/1",
+          "frame_screen_bounds": [
+            0,
+            0,
+            1000,
+            700
+          ],
+          "frame_title": "UI418 controls - Google Chrome"
+        },
+        "visible": true,
+        "window": {
+          "active": true,
+          "dialog": false,
+          "h": 700.0,
+          "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+          "minimized": false,
+          "modal": false,
+          "pid": 89,
+          "popup": false,
+          "resourceClass": "google-chrome",
+          "resourceName": "chrome",
+          "stackingOrder": 0,
+          "title": "UI418 controls - Google Chrome",
+          "transient": false,
+          "transientFor": null,
+          "w": 1000.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "window_association": "unique_title_and_frame_size"
+      },
+      {
+        "backend": "atspi",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 257.0
+        },
+        "center_hit": null,
+        "clickable": null,
+        "coordinate_space": "active_window_pixels",
+        "enabled": true,
+        "mapped_screen_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 257.0
+        },
+        "mouse_coordinates_usable": true,
+        "name": "Stop ui418-covered",
+        "object_path": "/org/a11y/atspi/accessible/167",
+        "occluded": null,
+        "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+        "provider_visible": true,
+        "raw_atspi_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 257
+        },
+        "role": "button",
+        "states": [
+          "enabled",
+          "focusable",
+          "visible"
+        ],
+        "surface": {
+          "application": "Google Chrome",
+          "bus": ":1.5",
+          "frame_path": "/org/a11y/atspi/accessible/1",
+          "frame_screen_bounds": [
+            0,
+            0,
+            1000,
+            700
+          ],
+          "frame_title": "UI418 controls - Google Chrome"
+        },
+        "visible": true,
+        "window": {
+          "active": true,
+          "dialog": false,
+          "h": 700.0,
+          "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+          "minimized": false,
+          "modal": false,
+          "pid": 89,
+          "popup": false,
+          "resourceClass": "google-chrome",
+          "resourceName": "chrome",
+          "stackingOrder": 0,
+          "title": "UI418 controls - Google Chrome",
+          "transient": false,
+          "transientFor": null,
+          "w": 1000.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "window_association": "unique_title_and_frame_size"
+      }
+    ],
+    "errors": [],
+    "incomplete": false,
+    "matches": 4,
+    "query": "Stop",
+    "results": "button\tStop ui418-free\t{\"h\":60,\"w\":250,\"x\":80,\"y\":60}\tcss_viewport_pixels\tvisible=true occluded=false mouse_coordinates_usable=false\tsurface={\"page_focused\":true,\"title\":\"UI418 controls\",\"url\":\"file:///tmp/kwin-mcp-1294938-1/controls.html\",\"viewport\":{\"device_pixel_ratio\":1,\"height\":613,\"scale\":1,\"scroll_x\":0,\"scroll_y\":0,\"width\":1000}}\nbutton\tStop ui418-covered\t{\"h\":60,\"w\":250,\"x\":80,\"y\":170}\tcss_viewport_pixels\tvisible=true occluded=true mouse_coordinates_usable=false\tsurface={\"page_focused\":true,\"title\":\"UI418 controls\",\"url\":\"file:///tmp/kwin-mcp-1294938-1/controls.html\",\"viewport\":{\"device_pixel_ratio\":1,\"height\":613,\"scale\":1,\"scroll_x\":0,\"scroll_y\":0,\"width\":1000}}\nbutton\tStop ui418-free\t{\"h\":60,\"w\":250,\"x\":80.0,\"y\":147.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"UI418 controls - Google Chrome\"}\nbutton\tStop ui418-covered\t{\"h\":60,\"w\":250,\"x\":80.0,\"y\":257.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"UI418 controls - Google Chrome\"}",
+    "role": "button",
+    "sampled_at_milliseconds": 1792471020737,
+    "server_pid": 1294938,
+    "visible_only": false
+  },
+  "forwarded": {
+    "active_window_id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+    "continuation": "Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches.",
+    "elements": [
+      {
+        "backend": "cdp",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 60
+        },
+        "center_hit": true,
+        "center_hit_target": {
+          "name": "Stop ui418-free",
+          "role": "button"
+        },
+        "clickable": true,
+        "coordinate_space": "css_viewport_pixels",
+        "enabled": true,
+        "mouse_coordinates_usable": false,
+        "name": "Stop ui418-free",
+        "occluded": false,
+        "role": "button",
+        "surface": {
+          "page_focused": true,
+          "title": "UI418 controls",
+          "url": "file:///tmp/kwin-mcp-1294938-1/controls.html",
+          "viewport": {
+            "device_pixel_ratio": 1,
+            "height": 613,
+            "scale": 1,
+            "scroll_x": 0,
+            "scroll_y": 0,
+            "width": 1000
+          }
+        },
+        "visible": true,
+        "window": null,
+        "window_association": "unverified_cdp_target"
+      },
+      {
+        "backend": "cdp",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 170
+        },
+        "center_hit": false,
+        "center_hit_target": {
+          "name": "Overlay covers the second button",
+          "role": "div"
+        },
+        "clickable": false,
+        "coordinate_space": "css_viewport_pixels",
+        "enabled": true,
+        "mouse_coordinates_usable": false,
+        "name": "Stop ui418-covered",
+        "occluded": true,
+        "role": "button",
+        "surface": {
+          "page_focused": true,
+          "title": "UI418 controls",
+          "url": "file:///tmp/kwin-mcp-1294938-1/controls.html",
+          "viewport": {
+            "device_pixel_ratio": 1,
+            "height": 613,
+            "scale": 1,
+            "scroll_x": 0,
+            "scroll_y": 0,
+            "width": 1000
+          }
+        },
+        "visible": true,
+        "window": null,
+        "window_association": "unverified_cdp_target"
+      },
+      {
+        "backend": "atspi",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 147.0
+        },
+        "center_hit": null,
+        "clickable": null,
+        "coordinate_space": "active_window_pixels",
+        "enabled": true,
+        "mapped_screen_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 147.0
+        },
+        "mouse_coordinates_usable": true,
+        "name": "Stop ui418-free",
+        "object_path": "/org/a11y/atspi/accessible/166",
+        "occluded": null,
+        "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+        "provider_visible": true,
+        "raw_atspi_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 147
+        },
+        "role": "button",
+        "states": [
+          "enabled",
+          "focusable",
+          "visible"
+        ],
+        "surface": {
+          "application": "Google Chrome",
+          "bus": ":1.5",
+          "frame_path": "/org/a11y/atspi/accessible/1",
+          "frame_screen_bounds": [
+            0,
+            0,
+            1000,
+            700
+          ],
+          "frame_title": "UI418 controls - Google Chrome"
+        },
+        "visible": true,
+        "window": {
+          "active": true,
+          "dialog": false,
+          "h": 700.0,
+          "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+          "minimized": false,
+          "modal": false,
+          "pid": 89,
+          "popup": false,
+          "resourceClass": "google-chrome",
+          "resourceName": "chrome",
+          "stackingOrder": 0,
+          "title": "UI418 controls - Google Chrome",
+          "transient": false,
+          "transientFor": null,
+          "w": 1000.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "window_association": "unique_title_and_frame_size"
+      },
+      {
+        "backend": "atspi",
+        "bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 257.0
+        },
+        "center_hit": null,
+        "clickable": null,
+        "coordinate_space": "active_window_pixels",
+        "enabled": true,
+        "mapped_screen_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80.0,
+          "y": 257.0
+        },
+        "mouse_coordinates_usable": true,
+        "name": "Stop ui418-covered",
+        "object_path": "/org/a11y/atspi/accessible/167",
+        "occluded": null,
+        "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+        "provider_visible": true,
+        "raw_atspi_bounds": {
+          "h": 60,
+          "w": 250,
+          "x": 80,
+          "y": 257
+        },
+        "role": "button",
+        "states": [
+          "enabled",
+          "focusable",
+          "visible"
+        ],
+        "surface": {
+          "application": "Google Chrome",
+          "bus": ":1.5",
+          "frame_path": "/org/a11y/atspi/accessible/1",
+          "frame_screen_bounds": [
+            0,
+            0,
+            1000,
+            700
+          ],
+          "frame_title": "UI418 controls - Google Chrome"
+        },
+        "visible": true,
+        "window": {
+          "active": true,
+          "dialog": false,
+          "h": 700.0,
+          "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+          "minimized": false,
+          "modal": false,
+          "pid": 89,
+          "popup": false,
+          "resourceClass": "google-chrome",
+          "resourceName": "chrome",
+          "stackingOrder": 0,
+          "title": "UI418 controls - Google Chrome",
+          "transient": false,
+          "transientFor": null,
+          "w": 1000.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "window_association": "unique_title_and_frame_size"
+      }
+    ],
+    "errors": [],
+    "incomplete": false,
+    "matches": 4,
+    "query": "Stop",
+    "results": "button\tStop ui418-free\t{\"h\":60,\"w\":250,\"x\":80,\"y\":60}\tcss_viewport_pixels\tvisible=true occluded=false mouse_coordinates_usable=false\tsurface={\"page_focused\":true,\"title\":\"UI418 controls\",\"url\":\"file:///tmp/kwin-mcp-1294938-1/controls.html\",\"viewport\":{\"device_pixel_ratio\":1,\"height\":613,\"scale\":1,\"scroll_x\":0,\"scroll_y\":0,\"width\":1000}}\nbutton\tStop ui418-covered\t{\"h\":60,\"w\":250,\"x\":80,\"y\":170}\tcss_viewport_pixels\tvisible=true occluded=true mouse_coordinates_usable=false\tsurface={\"page_focused\":true,\"title\":\"UI418 controls\",\"url\":\"file:///tmp/kwin-mcp-1294938-1/controls.html\",\"viewport\":{\"device_pixel_ratio\":1,\"height\":613,\"scale\":1,\"scroll_x\":0,\"scroll_y\":0,\"width\":1000}}\nbutton\tStop ui418-free\t{\"h\":60,\"w\":250,\"x\":80.0,\"y\":147.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"UI418 controls - Google Chrome\"}\nbutton\tStop ui418-covered\t{\"h\":60,\"w\":250,\"x\":80.0,\"y\":257.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"UI418 controls - Google Chrome\"}",
+    "role": "button",
+    "sampled_at_milliseconds": 1792471021914,
+    "server_pid": 1294938,
+    "visible_only": false
+  },
+  "owner_pid": 1294938,
+  "forwarder_pid": 1298038,
+  "native_click_verified": true,
+  "browser_click_verified": true,
+  "zoom175": {
+    "query": {
+      "active_window_id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+      "continuation": "Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches.",
+      "elements": [
+        {
+          "backend": "cdp",
+          "bounds": {
+            "h": 65,
+            "w": 300,
+            "x": 100.00000762939452,
+            "y": 180.00001525878906
+          },
+          "center_hit": true,
+          "center_hit_target": {
+            "name": "Add a comment",
+            "role": "textbox"
+          },
+          "clickable": true,
+          "coordinate_space": "css_viewport_pixels",
+          "enabled": true,
+          "mouse_coordinates_usable": false,
+          "name": "Add a comment",
+          "occluded": false,
+          "role": "textbox",
+          "surface": {
+            "page_focused": true,
+            "title": "ZOOM407 controls",
+            "url": "file:///tmp/kwin-mcp-1294938-1/zoom-controls.html",
+            "viewport": {
+              "device_pixel_ratio": 1.75,
+              "height": 350,
+              "scale": 1,
+              "scroll_x": 0,
+              "scroll_y": 0,
+              "width": 571
+            }
+          },
+          "visible": true,
+          "window": null,
+          "window_association": "unverified_cdp_target"
+        },
+        {
+          "backend": "atspi",
+          "bounds": {
+            "h": 32,
+            "w": 197,
+            "x": 35.0,
+            "y": 340.0
+          },
+          "center_hit": null,
+          "clickable": null,
+          "coordinate_space": "active_window_pixels",
+          "enabled": true,
+          "mapped_screen_bounds": {
+            "h": 32,
+            "w": 197,
+            "x": 35.0,
+            "y": 340.0
+          },
+          "mouse_coordinates_usable": true,
+          "name": "Add a comment",
+          "object_path": "/org/a11y/atspi/accessible/244",
+          "occluded": null,
+          "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+          "provider_visible": true,
+          "raw_atspi_bounds": {
+            "h": 32,
+            "w": 197,
+            "x": 35,
+            "y": 340
+          },
+          "role": "static",
+          "states": [
+            "enabled",
+            "visible"
+          ],
+          "surface": {
+            "application": "Google Chrome",
+            "bus": ":1.5",
+            "frame_path": "/org/a11y/atspi/accessible/1",
+            "frame_screen_bounds": [
+              0,
+              0,
+              1000,
+              700
+            ],
+            "frame_title": "ZOOM407 controls - Google Chrome"
+          },
+          "visible": true,
+          "window": {
+            "active": true,
+            "dialog": false,
+            "h": 700.0,
+            "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+            "minimized": false,
+            "modal": false,
+            "pid": 89,
+            "popup": false,
+            "resourceClass": "google-chrome",
+            "resourceName": "chrome",
+            "stackingOrder": 0,
+            "title": "ZOOM407 controls - Google Chrome",
+            "transient": false,
+            "transientFor": null,
+            "w": 1000.0,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "window_association": "unique_title_and_frame_size"
+        },
+        {
+          "backend": "atspi",
+          "bounds": {
+            "h": 114,
+            "w": 525,
+            "x": 175.0,
+            "y": 402.0
+          },
+          "center_hit": null,
+          "clickable": null,
+          "coordinate_space": "active_window_pixels",
+          "enabled": true,
+          "mapped_screen_bounds": {
+            "h": 114,
+            "w": 525,
+            "x": 175.0,
+            "y": 402.0
+          },
+          "mouse_coordinates_usable": true,
+          "name": "Add a comment",
+          "object_path": "/org/a11y/atspi/accessible/243",
+          "occluded": null,
+          "occlusion_note": "Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+          "provider_visible": true,
+          "raw_atspi_bounds": {
+            "h": 114,
+            "w": 525,
+            "x": 175,
+            "y": 402
+          },
+          "role": "entry",
+          "states": [
+            "current",
+            "enabled",
+            "focusable",
+            "visible"
+          ],
+          "surface": {
+            "application": "Google Chrome",
+            "bus": ":1.5",
+            "frame_path": "/org/a11y/atspi/accessible/1",
+            "frame_screen_bounds": [
+              0,
+              0,
+              1000,
+              700
+            ],
+            "frame_title": "ZOOM407 controls - Google Chrome"
+          },
+          "visible": true,
+          "window": {
+            "active": true,
+            "dialog": false,
+            "h": 700.0,
+            "id": "{8c3f0a9a-2545-41c9-b497-762f5d274b51}",
+            "minimized": false,
+            "modal": false,
+            "pid": 89,
+            "popup": false,
+            "resourceClass": "google-chrome",
+            "resourceName": "chrome",
+            "stackingOrder": 0,
+            "title": "ZOOM407 controls - Google Chrome",
+            "transient": false,
+            "transientFor": null,
+            "w": 1000.0,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "window_association": "unique_title_and_frame_size"
+        }
+      ],
+      "errors": [],
+      "incomplete": false,
+      "matches": 3,
+      "query": "Add a comment",
+      "results": "textbox\tAdd a comment\t{\"h\":65,\"w\":300,\"x\":100.00000762939452,\"y\":180.00001525878906}\tcss_viewport_pixels\tvisible=true occluded=false mouse_coordinates_usable=false\tsurface={\"page_focused\":true,\"title\":\"ZOOM407 controls\",\"url\":\"file:///tmp/kwin-mcp-1294938-1/zoom-controls.html\",\"viewport\":{\"device_pixel_ratio\":1.75,\"height\":350,\"scale\":1,\"scroll_x\":0,\"scroll_y\":0,\"width\":571}}\nstatic\tAdd a comment\t{\"h\":32,\"w\":197,\"x\":35.0,\"y\":340.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"ZOOM407 controls - Google Chrome\"}\nentry\tAdd a comment\t{\"h\":114,\"w\":525,\"x\":175.0,\"y\":402.0}\tactive_window_pixels\tvisible=true occluded=null mouse_coordinates_usable=true\tsurface={\"application\":\"Google Chrome\",\"bus\":\":1.5\",\"frame_path\":\"/org/a11y/atspi/accessible/1\",\"frame_screen_bounds\":[0,0,1000,700],\"frame_title\":\"ZOOM407 controls - Google Chrome\"}",
+      "role": null,
+      "sampled_at_milliseconds": 1792471030772,
+      "server_pid": 1294938,
+      "visible_only": false
+    },
+    "typed": {
+      "action": "type",
+      "delivery": {
+        "compositor_acknowledged": true,
+        "expected_field_characters": 13,
+        "method": "atspi_focused_text",
+        "observed_field_characters": 13,
+        "status": "verified",
+        "warning": null
+      },
+      "elapsed_ms": 196,
+      "retry_safe": false,
+      "submission_complete": true,
+      "submitted_characters": 13,
+      "text": "zoom407-proof"
+    },
+    "actual_title": "COMMENT_OK407 - Google Chrome",
+    "expected_title": "COMMENT_OK407",
+    "independent_field_verified": true
+  }
+}

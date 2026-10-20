@@ -679,3 +679,12 @@ instead of silently discarding already collected matches.
 native controls, real Chrome HTML with a covered button, and same-user session
 forwarding through the production stdio entrypoint. It uses fresh profiles and
 its own desktop; it sends no provider requests.
+
+Set `KWIN_PROOF_ZOOM=1` for the additional 175% browser-zoom reproduction from
+#407. It places an Add-a-comment field and a separate milestone field in a local
+page, then compares the original unlabelled DOM coordinates with the revised
+window-relative native match. The browser reports which field received the exact
+input through its window title. The original coordinates select the milestone
+field; the revised coordinates select the comment field while leaving the
+milestone empty. Caption confirmation is read-only and bounded; input is never
+replayed while waiting for the compositor to publish the changed caption.

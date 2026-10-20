@@ -103,7 +103,61 @@ begin
   raise 'forwarded click missed the real browser control' unless browser_click_verified
   capture.call('clicked-browser')
  end
- proof={status:'passed',mode:mode,native:native,direct:direct,forwarded:forwarded,owner_pid:owner_pid,forwarder_pid:forward_pid,native_click_verified:native_click_verified,browser_click_verified:browser_click_verified}
+ zoom_proof=nil
+ if ENV['KWIN_PROOF_ZOOM']=='1'
+  zoom_html=File.join(work,'zoom-controls.html')
+  token='zoom407-proof'
+  File.write(zoom_html,<<~HTML)
+  <!doctype html><title>ZOOM407 controls</title>
+  <style>body{margin:0;background:white;font:16px sans-serif}label{position:absolute;left:20px}input,textarea{position:absolute;box-sizing:border-box;font:16px sans-serif}#milestone{left:60px;top:50px;width:300px;height:45px}#comment{left:100px;top:180px;width:300px;height:65px}</style>
+  <label style="top:20px">Set milestone (not the intended field)</label><input id="milestone" aria-label="Set milestone">
+  <label style="top:145px">Add a comment</label><textarea id="comment" aria-label="Add a comment">Add a comment</textarea>
+  <script>
+  const comment=document.getElementById('comment'), milestone=document.getElementById('milestone');
+  function report(){document.title=comment.value==='#{token}' && milestone.value==='' ? 'COMMENT_OK407' : milestone.value==='#{token}' ? 'MILESTONE_WRONG407' : 'ZOOM407 input';}
+  comment.addEventListener('input',report);milestone.addEventListener('input',report);
+  </script>
+  HTML
+  tool.call(owner,'keyboard_key',{key:'CTRL+L'})
+  tool.call(owner,'keyboard_type',{text:"file://#{zoom_html}",speed:8.0})
+  tool.call(owner,'keyboard_key',{key:'ENTER'})
+  sleep 0.5
+  tool.call(owner,'keyboard_key',{key:'CTRL+0'})
+  4.times {tool.call(owner,'keyboard_key',{key:'CTRL+EQUAL'})}
+  sleep 1
+  zoom=tool.call(forwarded_rpc,'find_ui_elements',{query:'Add a comment'})
+  capture.call('zoom175-before')
+  if mode=='candidate'
+   dom=zoom.fetch('elements').find {|el|el['backend']=='cdp' && el['role']=='textbox' && el['name']=='Add a comment'}
+   raise "missing scaled DOM target: #{zoom}" unless dom
+   raise "expected actual browser 175% zoom: #{dom}" unless (dom.dig('surface','viewport','device_pixel_ratio').to_f-1.75).abs<0.01
+   target=zoom.fetch('elements').find {|el|el['backend']=='atspi' && el['name']=='Add a comment' && ['entry','text','textbox'].include?(el['role'])}
+   raise "native scaled target unverified: #{zoom}" unless target && target['mouse_coordinates_usable']
+   box=target.fetch('bounds')
+  else
+   row=zoom.fetch('results').lines.find {|line|line.start_with?("textarea\t")}
+   raise "baseline textarea absent: #{zoom}" unless row
+   values=row.match(/\((-?\d+), (-?\d+), (\d+)x(\d+)\)/).captures.map(&:to_i)
+   box={'x'=>values[0],'y'=>values[1],'w'=>values[2],'h'=>values[3]}
+  end
+  tool.call(forwarded_rpc,'mouse_click',{x:(box['x']+box['w']/2.0).round,y:(box['y']+box['h']/2.0).round})
+  tool.call(owner,'keyboard_key',{key:'CTRL+A'})
+  typed=tool.call(owner,'keyboard_type',{text:token,speed:8.0})
+  # KWin publishes the changed browser caption asynchronously after the input event.
+  # Wait read-only for that independent observation; never replay any input.
+  expected=mode=='candidate' ? 'COMMENT_OK407' : 'MILESTONE_WRONG407'
+  deadline=Process.clock_gettime(Process::CLOCK_MONOTONIC)+3
+  title407=nil
+  loop do
+   title407=tool.call(owner,'window_list').fetch('windows').find {|w|w['active']}.fetch('title')
+   break if title407.include?(expected) || Process.clock_gettime(Process::CLOCK_MONOTONIC)>=deadline
+   sleep 0.05
+  end
+  capture.call('zoom175-after')
+  raise "wrong independent target outcome: #{title407}, #{typed}" unless title407.include?(expected)
+  zoom_proof={query:zoom,typed:typed,actual_title:title407,expected_title:expected,independent_field_verified:true}
+ end
+ proof={status:'passed',mode:mode,native:native,direct:direct,forwarded:forwarded,owner_pid:owner_pid,forwarder_pid:forward_pid,native_click_verified:native_click_verified,browser_click_verified:browser_click_verified,zoom175:zoom_proof}
  File.write(evidence+'/verification.json',JSON.pretty_generate(proof));puts JSON.generate({status:'passed',mode:mode,native_matches:native['matches'],browser_matches:direct['matches'],native_click_verified:native_click_verified,browser_click_verified:browser_click_verified})
 ensure
  tool.call(owner,'session_stop') if session
