@@ -71,3 +71,23 @@ that reached the new field before cancellation. A focused noneditable browser
 button must fail preflight with zero key events. The script saves JSON, input
 journal and screenshots, then stops its session and removes its private HOME
 and temp root. Chrome and the ordinary desktop dependencies are required.
+
+## File chooser capture identity
+
+```bash
+ruby tests/transient_chooser_e2e.rb /path/to/kwin-mcp /path/to/evidence candidate
+```
+
+This production-stdio test opens an owned fresh Chrome window and its native
+file chooser. It requires a successful pixel-verified chooser image, then
+closes the chooser during a pending capture and requires an explicit
+`transient_capture_unverified` error without an image. It also checks the
+restored parent and a region extending outside the window. `baseline` mode
+records the older misleading capture for comparison. The script saves RPC
+evidence and PNGs, stops its session, and removes its private HOME and temp
+root. Chrome and the normal session dependencies are required.
+
+The checked-in `evidence/396` images show the baseline race returning parent
+pixels under the chooser's identity, and the candidate's verified chooser and
+subsequent parent capture. The candidate rejects the race, so that response
+intentionally has no PNG.

@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "error": {
+    "code": -32603,
+    "message": "screenshot: active dialog pixels could not be verified: org.kde.KWin.ScreenShot2.Error.InvalidWindow: Invalid window requested. Wait for the dialog to finish drawing and retry.",
+    "data": {
+      "detail": "org.kde.KWin.ScreenShot2.Error.InvalidWindow: Invalid window requested",
+      "reason": "transient_capture_unverified",
+      "retry_after_ms": 200,
+      "retry_safe": true,
+      "window_id": "{e934c89f-b4a4-4bbf-b3da-cdaa0bac5c60}"
+    }
+  }
+}
