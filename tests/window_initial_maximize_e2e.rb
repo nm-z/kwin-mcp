@@ -24,7 +24,6 @@ temp_root = Dir.mktmpdir('kwin-mcp-263-', FixturePaths.root)
 %w[.config .local/share .cache .local/state .kde].each do |name|
   FileUtils.mkdir_p(File.join(home, name))
 end
-File.write(File.join(home, '.config', 'kglobalshortcutsrc'), "[kwin][Global Shortcuts]\nWindow Maximize=Meta+Backspace,Meta+Backspace,Maximize Window\n")
 runtime = ENV.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}")
 bus = ENV.fetch('DBUS_SESSION_BUS_ADDRESS', "unix:path=#{runtime}/bus")
 environment = {
@@ -48,7 +47,7 @@ environment = {
 begin
   File.open(File.join(evidence, 'rpc.jsonl'), 'w') do |trace|
     File.open(File.join(evidence, 'server.stderr'), 'w') do |diagnostic|
-      Open3.popen3(environment, binary, '--autoclean', '--width', '1600', '--height', '1000') do |input, output, error, server|
+      Open3.popen3(environment, binary, '--autoclean', '--width', '1920', '--height', '1080') do |input, output, error, server|
         stderr_reader = Thread.new { IO.copy_stream(error, diagnostic) }
         number = 0
         session_id = nil
@@ -89,15 +88,39 @@ begin
           end
           raise 'Konsole window not found after launch' unless before
           initial_geometry = before.slice('x', 'y', 'w', 'h')
-          raise "new window did not start maximized: #{initial_geometry.inspect}" unless initial_geometry == { 'x' => 0, 'y' => 0, 'w' => 1600, 'h' => 1000 }
+          raise "new window did not start maximized: #{initial_geometry.inspect}" unless initial_geometry == { 'x' => 0, 'y' => 0, 'w' => 1920, 'h' => 1080 }
 
           content.call(call.call('window_activate', args.merge(window_id: before.fetch('id'))))
-          content.call(call.call('keyboard_key', args.merge(key: 'super+Backspace')))
-          restored = content.call(call.call('window_list', args)).fetch('windows').find do |window|
-            window['id'] == before['id']
+          before_capture = content.call(call.call('screenshot', args))
+          FileUtils.cp(before_capture.fetch('path'), File.join(evidence, 'before-maximized.png'))
+          content.call(call.call('keyboard_key', args.merge(key: 'alt+F3')))
+          menu_capture = content.call(call.call('screenshot', args))
+          FileUtils.cp(menu_capture.fetch('path'), File.join(evidence, 'maximize-menu.png'))
+          # Maximize is the first item in KWin's window menu; use the same mouse
+          # toggle path as #510, without installing a custom keyboard shortcut.
+          content.call(call.call('mouse_click', args.merge(x: 90, y: 12)))
+          restore_deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+          restored = loop do
+            current = content.call(call.call('window_list', args)).fetch('windows').find { |window| window['id'] == before['id'] }
+            raise 'Konsole window disappeared after restore' unless current
+            break current if current['w'] < 1920 && current['h'] < 1080
+            if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= restore_deadline
+              failed_capture = content.call(call.call('screenshot', args))
+              FileUtils.cp(failed_capture.fetch('path'), File.join(evidence, 'restore-failed.png'))
+              raise "KWin did not restore the maximized window: #{current.slice('w', 'h').inspect}"
+            end
+            sleep 0.1
           end
-          raise 'Konsole window disappeared after restore' unless restored
-          raise "KWin did not restore the maximized window: #{restored.slice('w', 'h').inspect}" if restored['w'] >= 1600 || restored['h'] >= 1000
+          # Keep observing after the menu has closed, catching forced rules that
+          # briefly restore a window before snapping it back to the display size.
+          5.times do
+            sleep 0.25
+            current = content.call(call.call('window_list', args)).fetch('windows').find { |window| window['id'] == before['id'] }
+            raise "restored window snapped back: #{current.inspect}" unless current && current.slice('w', 'h') == restored.slice('w', 'h')
+          end
+          restored_capture = content.call(call.call('screenshot', args))
+          FileUtils.cp(restored_capture.fetch('path'), File.join(evidence, 'after-menu-restore.png'))
+          raise 'restore screenshot has the wrong window identity' unless restored_capture.dig('window', 'id') == before['id']
 
           drag = {
             button: 'right',
@@ -143,7 +166,7 @@ begin
             window['resourceClass'] == 'org.kde.konsole'
           end
           raise 'native Konsole window not found after launch' unless native_window
-          raise "native window opened at the full display: #{native_window.slice('x', 'y', 'w', 'h').inspect}" if native_window['w'] == 1600 && native_window['h'] == 1000
+          raise "native window opened at the full display: #{native_window.slice('x', 'y', 'w', 'h').inspect}" if native_window['w'] == 1920 && native_window['h'] == 1080
           File.write(File.join(evidence, 'native.json'), JSON.pretty_generate(native: native_window))
           content.call(call.call('session_stop', args))
           session_id = nil
