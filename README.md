@@ -583,6 +583,17 @@ before sending or retrying: delayed input can otherwise be duplicated.
 Passwords, terminals and Tab/Return actions do not expose an application-text
 receipt.
 
+For a focused terminal, `keyboard_type({"text":"command\n","speed":4})`
+requests faster paced input; the final newline also submits the command. Inspect
+`submission_complete`, `submitted_characters`, and
+`delivery.compositor_acknowledged` to distinguish completed input from a failed
+submission. A terminal's `delivery.status: "unverified"` means its application
+text was not read back; it is not a reason to resend a completed command.
+Confirm execution by inspecting terminal output or a known result file. For
+result files, wait for readiness and export the file to check its contents.
+The [accelerated terminal probe](tests/input_delivery_e2e.md#accelerated-terminal-command-476)
+checks this route with a 120-character command including Return.
+
 After an editable field is cleared, AT-SPI may expose one blank newline that the
 application removes when typing starts. If the entire resulting field matches
 the requested text, `atspi_transformed_blank_line` reports `unverified` with
