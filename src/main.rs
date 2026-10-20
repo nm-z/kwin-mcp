@@ -9333,7 +9333,9 @@ struct GenerateSecretParams {
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ClipboardWriteParams {
-    /// Use host for content the user will paste through the local viewer.
+    /// Both targets require a live isolated session. Session is its private
+    /// clipboard; host is the server desktop clipboard used by local viewer
+    /// copy/paste, not a remote viewer client's clipboard.
     target: ClipboardTarget,
     /// Plain UTF-8 text. Specify exactly one of text and generate_secret.
     text: Option<String>,
@@ -11906,7 +11908,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "clipboard_write",
-        description = "Write UTF-8 text to the session or host clipboard. Specify target (session or host) and exactly one of text or generate_secret. Host means this server's desktop; use host for anything the user should paste through the local viewer, because viewer Ctrl+V and Shift+Insert read the host clipboard. Session writes also populate PRIMARY for X11 clients such as XTerm that use Shift+Insert by default. generate_secret takes length (1..4096) and character_classes (lowercase, uppercase, digits, symbols); generation uses operating-system randomness and includes every selected class. The result contains only target and character length. Generated values are marked as secrets and are withheld by clipboard_read."
+        description = "Write UTF-8 text with a live isolated KWin MCP session, even for target=host. This server controls its own isolated desktop, not the user's active desktop session. target=session writes that session's CLIPBOARD and PRIMARY for agent input, including X11 Shift+Insert. target=host writes the server host's Wayland clipboard used by the local viewer: viewer Ctrl+V/Shift+Insert pastes from it, and Ctrl+C/Ctrl+X copies to it. Host does not select a remote viewer client's clipboard or an arbitrary user desktop. For a request to change the user's active desktop clipboard outside this session/viewer workflow, use the appropriate separate desktop mechanism. Specify target and exactly one of text or generate_secret. generate_secret uses operating-system randomness, length 1..4096, and includes every selected character class (lowercase, uppercase, digits, symbols). The result returns only target and character length; clipboard_read withholds generated values."
     )]
     async fn clipboard_write(
         &self,
@@ -11962,7 +11964,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "clipboard_read",
-        description = "Read UTF-8 text from this session's clipboard. The session clipboard is separate from the host clipboard; local viewer paste reads the host clipboard instead. A selection marked as a generated secret returns only its length and protected=true, with text=null. This tool does not read the host clipboard.",
+        description = "Read UTF-8 text from the selected live isolated KWin MCP session's clipboard. Requires a live session, just like clipboard_write with either target. This is the isolated desktop's selection, not the server host's or remote viewer client's clipboard. Local viewer Ctrl+V/Shift+Insert reads the server host clipboard instead. This tool does not read the user's active desktop clipboard; use an appropriate separate desktop mechanism for that request. A generated secret returns only length and protected=true, with text=null.",
         annotations(read_only_hint = true)
     )]
     async fn clipboard_read(

@@ -120,9 +120,28 @@ The plugin packages the [KWin MCP routing skill](skills/kwin-mcp/SKILL.md). Conf
 
 ## Clipboard isolation
 
-Each session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host clipboard, and Ctrl+V or Shift+Insert pastes from the host clipboard. The viewer restores the session's prior selection afterward. Put anything the user should paste through the viewer on the **host** clipboard.
+KWin MCP operates its own isolated desktop session. The viewer displays and
+controls that session; it does not turn the tools into controls for the user's
+active desktop session. Both clipboard tools require a live KWin MCP session,
+including `clipboard_write` with `target: "host"`.
 
-Use `clipboard_write` with `target: "session"` for agent input or `target: "host"` for local viewer paste. A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste from PRIMARY can consume it. In XTerm, the default fast paste shortcut is Shift+Insert; Ctrl+V is not bound to paste by default. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
+| Operation | Clipboard and scope |
+|---|---|
+| `clipboard_write`, `target: "session"` | The selected isolated session's CLIPBOARD and PRIMARY, used for agent input. |
+| `clipboard_write`, `target: "host"` | The Wayland clipboard on the desktop where the server runs, used by the local viewer's copy/paste bridge. |
+| `clipboard_read` | The selected isolated session's text selection only. |
+| Local viewer Ctrl+C / Ctrl+X | Copies or cuts from the isolated application to the server host clipboard. |
+| Local viewer Ctrl+V / Shift+Insert | Pastes the server host clipboard into the isolated application. |
+
+`host` does not mean a remote viewer client's desktop or whichever active
+desktop a user names. A request to change the user's active desktop clipboard
+outside this live session/viewer workflow should use the appropriate separate
+desktop mechanism; starting a KWin MCP session does not change that request's
+destination.
+
+The local viewer restores the isolated session's prior selection after a clipboard handoff.
+
+A session write fills both CLIPBOARD and PRIMARY, so X11 applications that paste from PRIMARY can consume it. In XTerm, the default fast paste shortcut is Shift+Insert; Ctrl+V is not bound to paste by default. Provide exactly one of `text` or `generate_secret`. For example, `{"target":"host","generate_secret":{"length":20,"character_classes":["lowercase","uppercase","digits","symbols"]}}` generates a value using operating-system randomness and includes every selected class. The response contains only its target and character length.
 
 `clipboard_read` reads session text only. Generated selections carry a secret marker, so this tool returns `text: null`, `protected: true`, and the length while that marker is present. This prevents an accidental tool readback; it does not restrict applications that can read the clipboard. Clipboard ownership survives server reload and ends when the server exits. Session clipboard ownership also ends when its session stops. The host target means the server's desktop, not a remote viewer client's desktop.
 
