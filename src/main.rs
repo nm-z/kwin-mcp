@@ -1907,7 +1907,7 @@ const SESSION_START_MAX_SECONDS: u64 = 300;
 
 // Session overlay layers and the FUSE bridge image live on disk under
 // ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
-// session_start needs this much free there.
+// session_start needs this much free there unless disk_min_free_mib says otherwise.
 const SESSION_DISK_MIN_FREE: u64 = 2 << 30;
 const DEFAULT_STATS_SECONDS: u64 = 3600;
 
@@ -5305,6 +5305,14 @@ fn validate_host_write_paths(
 
 /// Blocking host scan for session_start: mount inventory, HOME overlay plan,
 /// host socket exposure, and the host kdeglobals.
+/// session_start choices that shape the host view.
+#[derive(Clone, Copy)]
+struct HostViewOptions {
+    browser_profiles: BrowserProfiles,
+    /// Bytes the disk-backed HOME overlay needs free before startup.
+    disk_min_free: u64,
+}
+
 fn prepare_host_view(
     target: &Path,
     host_xdg_dir: &Path,
@@ -5312,8 +5320,12 @@ fn prepare_host_view(
     writable_paths: &[PathBuf],
     host_write_paths: &[PathBuf],
     service: &KwinMcp,
-    browser_profiles: BrowserProfiles,
+    options: HostViewOptions,
 ) -> anyhow::Result<HostView> {
+    let HostViewOptions {
+        browser_profiles,
+        disk_min_free,
+    } = options;
     service.host_step("validating host_write_paths")?;
     let host_write_paths =
         validate_host_write_paths(target, host_runtime, writable_paths, host_write_paths)?;
@@ -5348,12 +5360,12 @@ fn prepare_host_view(
     let stat = nix::sys::statvfs::statvfs(&disk)
         .map_err(|e| anyhow::anyhow!("statvfs {}: {e}", disk.display()))?;
     let free = stat.blocks_available().saturating_mul(stat.fragment_size());
-    if free < SESSION_DISK_MIN_FREE {
+    if free < disk_min_free {
         let _ = std::fs::remove_dir(&disk);
         anyhow::bail!(
-            "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free",
+            "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free. Free space there, or pass a smaller disk_min_free_mib to session_start",
             disk.display(),
-            gib(SESSION_DISK_MIN_FREE),
+            gib(disk_min_free),
             gib(free)
         );
     }
@@ -9287,6 +9299,17 @@ async fn awaited_active_window_info(
     }
 }
 
+// KDE's show desktop (super+d) hides windows without minimizing them, and
+// KWin scripts cannot see it; its D-Bus interface can.
+const SHOWING_DESKTOP_WARNING: &str = "KDE show desktop (super+d) is on: windows are hidden without being minimized, so screenshots show the desktop while keys still reach the active window. window_activate or super+d again shows them.";
+
+async fn showing_desktop(conn: &zbus::Connection, kwin_unique: &str) -> Result<bool, KwinError> {
+    Ok(zbus::Proxy::new(conn, kwin_unique, "/KWin", "org.kde.KWin")
+        .await?
+        .get_property::<bool>("showingDesktop")
+        .await?)
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct WindowSnapshot {
     id: String,
@@ -9298,6 +9321,9 @@ struct WindowSnapshot {
     pid: i32,
     active: bool,
     minimized: bool,
+    /// Not shown: KWin hid it (an auto-hide panel), or show desktop is on.
+    #[serde(default)]
+    hidden: bool,
     modal: bool,
     transient: bool,
     dialog: bool,
@@ -9320,6 +9346,9 @@ impl WindowSnapshot {
         }
         if self.minimized {
             flags.push("minimized");
+        }
+        if self.hidden {
+            flags.push("hidden");
         }
         if self.modal {
             flags.push("modal");
@@ -9378,7 +9407,8 @@ async fn window_snapshots(
            result.push({\
              id:w.internalId.toString(),title:w.caption,\
              resourceClass:w.resourceClass,resourceName:w.resourceName,pid:w.pid,\
-             active:w.active,minimized:w.minimized,modal:w.modal,transient:w.transient,\
+             active:w.active,minimized:w.minimized,hidden:w.hidden === true,\
+             modal:w.modal,transient:w.transient,\
              dialog:w.dialog,popup:w.popupWindow,\
              transientFor:w.transientFor ? w.transientFor.internalId.toString() : null,\
              x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder\
@@ -10473,20 +10503,23 @@ fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
     let shared = path_error_file.parent();
     let detail = match shared {
         Some(shared) if Path::new(&path).starts_with("/tmp") => format!(
-            "/tmp is private to the session; copy what the command needs into host_shared_dir {}, which the host and the session see at the same path",
+            "/tmp is private to the session; copy what the command needs into host_shared_dir {}, which the host and the session see at the same path, or copy a host file into the session with import_file",
             shared.display()
         ),
         Some(shared) => format!(
-            "use a path available inside the session, such as one under host_shared_dir {}",
+            "use a path available inside the session, such as one under host_shared_dir {}, or copy the host file into the session with import_file (session_path defaults to the same path)",
             shared.display()
         ),
-        None => "use a path available inside the session".to_owned(),
+        None => {
+            "use a path available inside the session, or copy the host file in with import_file"
+                .to_owned()
+        }
     };
     Some(McpError::invalid_params(
         format!("{path} is not visible in the session; {detail}"),
         Some(serde_json::json!({
             "reason": "path_not_visible", "path": path, "command_submitted": true,
-            "host_shared_dir": shared,
+            "host_shared_dir": shared, "import_tool": "import_file",
         })),
     ))
 }
@@ -10948,6 +10981,10 @@ struct SessionStartParams {
     /// browser profiles/cache, saved browser cookies, session storage or host runtime.
     /// Existing host Unix sockets in these directories remain blocked.
     host_write_paths: Option<Vec<PathBuf>>,
+    /// Free space in MiB the disk-backed HOME overlay needs under
+    /// ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp before startup. Default 2048. A lower
+    /// value starts on a fuller disk, but session HOME writes fail once it fills.
+    disk_min_free_mib: Option<u64>,
 }
 
 impl SessionStartParams {
@@ -11629,7 +11666,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
@@ -11903,6 +11940,12 @@ impl KwinMcp {
             }
         }
         let host_write_paths = params.host_write_paths.unwrap_or_default();
+        let disk_min_free = match params.disk_min_free_mib {
+            None => SESSION_DISK_MIN_FREE,
+            Some(mib) => mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| McpError::invalid_params("disk_min_free_mib is too large", None))?,
+        };
         // Mount, socket, and /proc scans can block in the kernel on a hung
         // FUSE or network mount, or on a process stuck in D state. Run them on
         // a blocking thread so the hard limit can still answer; the handle
@@ -11922,7 +11965,10 @@ impl KwinMcp {
                 &writable_paths,
                 &host_write_paths,
                 &view_service,
-                browser_profiles,
+                HostViewOptions {
+                    browser_profiles,
+                    disk_min_free,
+                },
             ));
         });
         if let Ok(mut slot) = host_work.lock() {
@@ -12905,6 +12951,9 @@ impl KwinMcp {
             "kwin_unique": kwin_unique_name,
             "workdir": workdir,
             "host_shared_dir": workdir,
+            // Server flags, not session_start parameters, decide this.
+            "workdir_removed_on_stop": self.display.autoclean,
+            "ttl_minutes": self.display.ttl.map(|ttl| ttl.as_secs() / 60),
             "runtime_root_fallback": runtime_root_fallback,
             "width": screen_w,
             "height": screen_h,
@@ -13251,7 +13300,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and its container processes. With --autoclean or --ttl, remove the session workdir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
+        description = "Tear down the current session and its container processes. With --autoclean or --ttl (session_start reports workdir_removed_on_stop), remove the session workdir, including files the host wrote to host_shared_dir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(
@@ -13399,7 +13448,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "window_list",
-        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized state, and modal/transient relationships. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
+        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized/hidden state, and modal/transient relationships; showing_desktop=true means KDE show desktop (super+d) hides every listed window without minimizing it. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
         annotations(read_only_hint = true)
     )]
     async fn window_list(
@@ -13410,8 +13459,17 @@ impl KwinMcp {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
-        let windows = window_snapshots(&conn, &kwin_unique, &xdg).await?;
-        let text = if windows.is_empty() {
+        let mut windows = window_snapshots(&conn, &kwin_unique, &xdg).await?;
+        // Listed windows exclude the desktop and docks, which show desktop keeps.
+        // null when KWin does not answer; the list itself is still useful.
+        let showing = showing_desktop(&conn, &kwin_unique).await.ok();
+        let desktop_shown = showing == Some(true);
+        if desktop_shown {
+            for window in &mut windows {
+                window.hidden = true;
+            }
+        }
+        let mut text = if windows.is_empty() {
             "no managed windows".to_owned()
         } else {
             windows
@@ -13421,12 +13479,14 @@ impl KwinMcp {
                 .join("\n")
         };
         let count = windows.len();
-        Ok(structured_result(
-            &peer,
-            text,
-            serde_json::json!({"count": count, "windows": windows}),
-        )
-        .await)
+        let mut data = serde_json::json!({
+            "count": count, "showing_desktop": showing, "windows": windows,
+        });
+        if desktop_shown {
+            text = format!("{SHOWING_DESKTOP_WARNING}\n{text}");
+            data["warning"] = serde_json::json!(SHOWING_DESKTOP_WARNING);
+        }
+        Ok(structured_result(&peer, text, data).await)
     }
 
     #[rmcp::tool(
@@ -13881,10 +13941,16 @@ impl KwinMcp {
         if let Some(error) = &write_error {
             payload["write_error"] = serde_json::json!(error);
         }
-        let text = match &write_error {
+        let mut text = match &write_error {
             None => format!("{path_str} size={out_w}x{out_h}"),
             Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
         };
+        // The capture matched the active window, but show desktop hides it.
+        if showing_desktop(&conn, &kwin_unique).await.unwrap_or(false) {
+            payload["showing_desktop"] = serde_json::json!(true);
+            payload["warning"] = serde_json::json!(SHOWING_DESKTOP_WARNING);
+            text = format!("{text}. {SHOWING_DESKTOP_WARNING}");
+        }
         if params.inline {
             // Claude Code can hide content[] when structuredContent is present.
             // Preserve image rendering by default and let clients explicitly
@@ -14827,25 +14893,42 @@ impl KwinMcp {
         let verification_elapsed_ms = verification_started.elapsed().as_millis();
         let verification_context = delivery.verification_context();
         let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
+        // Names where the keys went, so a caller can tell a terminal's other
+        // window or a hidden window from lost input.
+        let desktop_shown = showing_desktop(&sess.kwin_conn, &sess.kwin_unique_name)
+            .await
+            .unwrap_or(false);
         drop(guard);
         self.mark_input().await;
         let mut result = structured_result(
             &peer,
             format!(
-                "typing {}: {}{}",
+                "typing {} into {:?}: {}{}{}",
                 delivery.status,
+                snapshot.title,
                 params.text,
                 delivery
                     .warning
                     .as_ref()
                     .map(|warning| format!(". {warning}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if desktop_shown {
+                    format!(". {SHOWING_DESKTOP_WARNING}")
+                } else {
+                    String::new()
+                }
             ),
             serde_json::json!({
                 "action": "type", "text": params.text,
                 "submitted_characters": keys.len(), "submission_complete": true,
                 "retry_safe": retry_safe, "delivery": delivery,
                 "verification_context": verification_context,
+                "warning": desktop_shown.then_some(SHOWING_DESKTOP_WARNING),
+                "window": {
+                    "id": snapshot.id, "title": snapshot.title,
+                    "resourceClass": snapshot.resource_class, "pid": snapshot.pid,
+                    "hidden": snapshot.hidden || desktop_shown,
+                },
                 "timings_ms": {
                     "typing": typing_elapsed_ms,
                     "compositor_acknowledgment": acknowledgment_elapsed_ms,
@@ -19131,6 +19214,7 @@ mod window_resolution_tests {
             pid: 1,
             active: false,
             minimized: false,
+            hidden: false,
             modal: false,
             transient: false,
             dialog: false,
@@ -20203,6 +20287,7 @@ mod ui_match_context_tests {
             pid: 1,
             active: true,
             minimized: false,
+            hidden: false,
             modal: false,
             transient: false,
             dialog: true,
