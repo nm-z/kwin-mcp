@@ -1033,6 +1033,7 @@ pub struct TextReceipt {
     object: atspi::ObjectRefOwned,
     expected: String,
     blank_line_replacement: Option<String>,
+    browser_toolbar: bool,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
 }
@@ -1075,6 +1076,27 @@ impl std::fmt::Display for TerminalFocus {
 impl std::error::Error for TerminalFocus {}
 
 impl TextDelivery {
+    pub fn verification_context(&self) -> Option<serde_json::Value> {
+        (self.method == "atspi_focused_text").then(|| {
+            serde_json::json!({
+                "observed_count_source": "focused_atspi_text",
+                "observed_count_unit": "unicode_scalar_values",
+                "observed_count_normalization": "none",
+                "comparison_normalization": "remove_u_fffc_only",
+                "application_specific_normalization": false,
+            })
+        })
+    }
+
+    pub fn verification_timed_out(timeout: std::time::Duration) -> Self {
+        let mut delivery = Self::unavailable(format!(
+            "the complete post-acknowledgment verification phase exceeded {} seconds",
+            timeout.as_secs(),
+        ));
+        delivery.method = "atspi_verification_timeout";
+        delivery
+    }
+
     /// No characters were submitted, and focus is on a control that is not
     /// editable text. Non-editable focus alone cannot prove sent keys missed
     /// the active application.
@@ -1233,16 +1255,23 @@ impl TextReceipt {
                 {
                     continue;
                 }
-                let mut stack = frame.get_children().await?;
+                let mut stack = frame
+                    .get_children()
+                    .await?
+                    .into_iter()
+                    .map(|object| (object, false))
+                    .collect::<Vec<_>>();
                 if prefer_chrome_toolbar_focus {
                     stack.reverse();
                 }
-                while let Some(object) = stack.pop() {
+                while let Some((object, inside_web_document)) = stack.pop() {
                     visited += 1;
                     if visited > TEXT_DISCOVERY_MAX_NODES {
                         anyhow::bail!("focused text discovery exceeded its node limit");
                     }
                     let node = object.as_accessible_proxy(&bus).await?;
+                    let inside_web_document =
+                        inside_web_document || node.get_role().await? == atspi::Role::DocumentWeb;
                     let states = node.get_state().await?;
                     // Konsole's focused terminal does not report Editable. Its
                     // hidden plugin widgets can also report Focused/Showing,
@@ -1335,6 +1364,7 @@ impl TextReceipt {
                             object,
                             expected,
                             blank_line_replacement,
+                            browser_toolbar: prefer_chrome_toolbar_focus && !inside_web_document,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
                         });
@@ -1343,7 +1373,11 @@ impl TextReceipt {
                     if prefer_chrome_toolbar_focus {
                         children.reverse();
                     }
-                    stack.extend(children);
+                    stack.extend(
+                        children
+                            .into_iter()
+                            .map(|child| (child, inside_web_document)),
+                    );
                 }
             }
         }
@@ -1443,6 +1477,14 @@ impl TextReceipt {
                 warning: None,
             },
             Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
+            Err(_) if self.browser_toolbar && expected_count > 0 && observed_count == Some(0) => TextDelivery {
+                status: "unverified",
+                method: "atspi_browser_toolbar",
+                compositor_acknowledged: true,
+                expected_field_characters: Some(expected_count),
+                observed_field_characters: observed_count,
+                warning: Some("KWin acknowledged all keys, but this browser-toolbar field returned an empty accessibility readback. Its application value could not be verified. Inspect the address bar before pressing Enter or retrying; do not retype blindly.".to_owned()),
+            },
             Err(_) if has_embedded_object => {
                 let snapshot_error = last_snapshot_error
                     .as_deref()

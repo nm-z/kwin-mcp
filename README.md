@@ -597,6 +597,46 @@ or writing the input summary fails. No partially submitted text is restarted.
 The [input delivery regression](tests/input_delivery_e2e.md) covers clearing and
 retyping the same text followed immediately by repeated screenshots.
 
+The complete verification phase after compositor acknowledgement has a
+12-second deadline, including any fallback focus observation. Expiry returns
+`unverified` with method `atspi_verification_timeout`; it does not submit the
+text again. `timings_ms` separates key submission, compositor acknowledgement,
+and field verification. This is a verification deadline, not a deadline for
+the whole typing operation: long paced input can take longer. Tab/newline
+input remains explicitly unverified because those keys can change focus or
+submit a field.
+
+Chrome's address bar can return an empty AT-SPI readback despite accepting
+the URL. When an editable control belongs to browser chrome outside a web
+document and its nonempty expected value remains unobservable as empty,
+`atspi_browser_toolbar` reports `unverified` without treating the observation
+limitation as a confirmed input failure. A readable full URL still verifies
+normally. An empty web-page field remains a mismatch. Inspect the address bar
+before pressing Enter or retrying.
+
+#### Interpreting character-count mismatches
+
+For `atspi_focused_text`, `verification_context` identifies the observed count
+as the raw Unicode scalar count returned by the focused AT-SPI text object.
+Comparison removes embedded-object markers (`U+FFFC`); the reported observed
+count is taken before that normalization. The verifier does not apply Gmail
+search-chip rules or remove ordinary punctuation.
+
+A count difference does not identify which characters changed or why. Inspect
+the field and, where supported, use native copy to compare its exact value
+before retrying. Accessibility can expose an incomplete or transformed
+representation; its count does not independently establish the application's
+submitted value.
+
+For [#528](https://github.com/nm-z/kwin-mcp/issues/528), the retained journal
+records the exact 75-character query, including flushed press/release events
+for both hyphens and the underscore. The original observed field value was
+unavailable in the evidence inspected. That evidence does not establish Gmail
+chip normalization, punctuation loss, or the cause of the discrepancy. The
+native regression verifies all 75 characters in an unrestricted search field
+and deliberately limits another to 72: that mismatch removes the final `:1d`,
+showing why the count alone cannot identify the missing characters.
+
 ### Startup budgets and fresh browser profiles
 
 `session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).

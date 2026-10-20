@@ -2306,6 +2306,7 @@ const TYPED_KEY_HOLD_MAX: Duration = Duration::from_millis(250);
 // Longer inputs compress their intervals to fit this budget instead of outlasting
 // the caller, and never go below the profile's 10 ms interval floor.
 const TYPING_BUDGET: Duration = Duration::from_secs(45);
+const TYPING_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
 const TYPED_KEY_INTERVAL_FLOOR: Duration = Duration::from_millis(10);
 
 #[derive(Deserialize)]
@@ -13524,6 +13525,8 @@ impl KwinMcp {
         };
         let started = std::time::Instant::now();
         type_with_profile(&sess.eis, &params.text, &keys, pace).await?;
+        let typing_elapsed_ms = started.elapsed().as_millis();
+        let acknowledgment_started = std::time::Instant::now();
         sess.eis.roundtrip().await.map_err(|error| {
             McpError::internal_error(
                 format!("All {} characters were submitted, but compositor acknowledgement failed: {error}. Text may still arrive; inspect the field before sending or retrying, and do not retype blindly.", keys.len()),
@@ -13534,41 +13537,51 @@ impl KwinMcp {
                 })),
             )
         })?;
-        let delivery = match receipt {
-            Ok(receipt) => receipt.confirm().await,
-            // A terminal or other inaccessible target can receive these key
-            // events even when AT-SPI reports focus on a non-editable control.
-            // That focus report cannot prove that submitted text missed the app.
-            Err(error)
-                if error.is::<input_bridge::FocusNotEditable>()
-                    || error.is::<input_bridge::TerminalFocus>() =>
-            {
-                let after = match &active {
-                    Ok(geometry) => {
-                        input_bridge::TextReceipt::capture(
-                            &sess.atspi_bus_address,
-                            &geometry.title,
-                            [geometry.x, geometry.y, geometry.w, geometry.h],
-                            "",
-                        )
-                        .await
+        let acknowledgment_elapsed_ms = acknowledgment_started.elapsed().as_millis();
+        let verification_started = std::time::Instant::now();
+        let delivery = tokio::time::timeout(TYPING_VERIFICATION_TIMEOUT, async {
+            match receipt {
+                Ok(receipt) => receipt.confirm().await,
+                // A terminal or other inaccessible target can receive these key
+                // events even when AT-SPI reports focus on a non-editable control.
+                // That focus report cannot prove that submitted text missed the app.
+                Err(error)
+                    if error.is::<input_bridge::FocusNotEditable>()
+                        || error.is::<input_bridge::TerminalFocus>() =>
+                {
+                    let after = match &active {
+                        Ok(geometry) => {
+                            input_bridge::TextReceipt::capture(
+                                &sess.atspi_bus_address,
+                                &geometry.title,
+                                [geometry.x, geometry.y, geometry.w, geometry.h],
+                                "",
+                            )
+                            .await
+                        }
+                        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                    };
+                    match after {
+                        Err(after) => input_bridge::TextDelivery::unreadable_field_delivery(
+                            keys.len(),
+                            &error,
+                            &after,
+                        ),
+                        Ok(_) => input_bridge::TextDelivery::unavailable(
+                            "keyboard focus moved into an editable field while the keys were sent"
+                                .to_owned(),
+                        ),
                     }
-                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
-                };
-                match after {
-                    Err(after) => input_bridge::TextDelivery::unreadable_field_delivery(
-                        keys.len(),
-                        &error,
-                        &after,
-                    ),
-                    Ok(_) => input_bridge::TextDelivery::unavailable(
-                        "keyboard focus moved into an editable field while the keys were sent"
-                            .to_owned(),
-                    ),
                 }
+                Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
             }
-            Err(error) => input_bridge::TextDelivery::unavailable(error.to_string()),
-        };
+        })
+        .await
+        .unwrap_or_else(|_| {
+            input_bridge::TextDelivery::verification_timed_out(TYPING_VERIFICATION_TIMEOUT)
+        });
+        let verification_elapsed_ms = verification_started.elapsed().as_millis();
+        let verification_context = delivery.verification_context();
         let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
         drop(guard);
         self.mark_input().await;
@@ -13588,6 +13601,12 @@ impl KwinMcp {
                 "action": "type", "text": params.text,
                 "submitted_characters": keys.len(), "submission_complete": true,
                 "retry_safe": retry_safe, "delivery": delivery,
+                "verification_context": verification_context,
+                "timings_ms": {
+                    "typing": typing_elapsed_ms,
+                    "compositor_acknowledgment": acknowledgment_elapsed_ms,
+                    "field_verification": verification_elapsed_ms,
+                },
                 "elapsed_ms": started.elapsed().as_millis(),
             }),
         )
