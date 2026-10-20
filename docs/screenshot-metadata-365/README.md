@@ -10,7 +10,7 @@ when a result also has `structuredContent`.
 ## Capture comparison on engi, 2026-10-20
 
 These captures use a synthetic KDialog in a private 1920×1080 desktop
-on KWin 6.7.5, with a private HOME and no host browser profiles.
+on KWin 6.8.0, with a private HOME and no host browser profiles.
 
 | Default branch (`05b937d`), default inline | Fixed build (`e5f700d`), metadata opted in |
 | --- | --- |
