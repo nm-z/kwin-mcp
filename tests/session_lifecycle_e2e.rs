@@ -4256,7 +4256,39 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "{partial}"
     );
     assert!(!home.join("out/partial.zip").exists());
-    call_tool(&mut client, 14, "session_stop", json!({}));
+
+    // A directory must be rejected before touching even an explicitly
+    // replaceable host file, with recovery guidance using the caller's path.
+    let destination = home.join("out/directory-refusal.txt");
+    std::fs::write(&destination, "preserve host contents").expect("host sentinel");
+    let directory = home.join("Downloads");
+    let refused_directory = call_tool(
+        &mut client,
+        14,
+        "export_file",
+        json!({"session_path": directory, "host_path": destination, "overwrite": true}),
+    );
+    let error = &refused_directory["error"];
+    assert_eq!(error["data"]["status"], json!("not_exported"));
+    assert_eq!(error["data"]["session_path"], json!(directory));
+    let message = error["message"].as_str().expect("directory error message");
+    assert!(
+        message.contains("is a directory") && message.contains("archive"),
+        "{message}"
+    );
+    assert!(
+        message.contains("export each file individually"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("/proc/"),
+        "internal session path leaked: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&destination).expect("untouched host sentinel"),
+        "preserve host contents"
+    );
+    call_tool(&mut client, 15, "session_stop", json!({}));
     client.stop_process();
 }
 
