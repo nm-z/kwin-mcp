@@ -5725,6 +5725,51 @@ impl SessionMemorySnapshot {
         self.pressure_full_avg10
             .is_some_and(|percent| percent >= SESSION_MEMORY_PSI_WARNING_PERCENT)
     }
+
+    fn as_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "current_bytes": self.current,
+            "high_bytes": self.high,
+            "swap_current_bytes": self.swap_current,
+            "swap_max_bytes": self.swap_max,
+            "pressure_full_avg10_percent": self.pressure_full_avg10,
+            "high_events": self.high_events,
+        })
+    }
+}
+
+/// A failed call carries the session's memory state even when no limit was
+/// reached, so a timeout can be told apart from memory pressure.
+fn attach_memory_snapshot_to_failure(
+    result: Result<CallToolResult, McpError>,
+    snapshot: SessionMemorySnapshot,
+) -> Result<CallToolResult, McpError> {
+    match result {
+        Err(mut error) => {
+            let mut data = match error.data.take() {
+                Some(serde_json::Value::Object(data)) => data,
+                Some(value) => serde_json::Map::from_iter([("original_data".to_owned(), value)]),
+                None => serde_json::Map::new(),
+            };
+            if !data.contains_key("memory_warning") {
+                data.insert("memory".to_owned(), snapshot.as_json());
+            }
+            error.data = Some(serde_json::Value::Object(data));
+            Err(error)
+        }
+        Ok(mut result) => {
+            if result.is_error == Some(true)
+                && let Some(data) = result
+                    .structured_content
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                && !data.contains_key("memory_warning")
+            {
+                data.insert("memory".to_owned(), snapshot.as_json());
+            }
+            Ok(result)
+        }
+    }
 }
 
 struct SessionMemoryWarning {
@@ -16178,6 +16223,12 @@ impl tower::Service<SessionCall> for KwinMcp {
                 result = session
                     .attach_memory_warning(result, memory_before, screenshot)
                     .await;
+                let failed = result
+                    .as_ref()
+                    .map_or(true, |result| result.is_error == Some(true));
+                if failed && let Some(snapshot) = session.session_memory_snapshot().await {
+                    result = attach_memory_snapshot_to_failure(result, snapshot);
+                }
             }
             result
         })
@@ -17092,6 +17143,7 @@ impl SessionRouter {
                             "workdir": session.host_xdg_dir, "host_shared_dir": session.host_xdg_dir, "width": session.screen_width,
                             "host_write_paths": session.host_write_paths,
                             "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
+                            "memory": session.scope.memory_snapshot(session.sandbox_child.id()).map(SessionMemorySnapshot::as_json),
                         }));
                     }
                 }
@@ -19414,9 +19466,59 @@ mod window_mode_tests {
 mod session_memory_warning_tests {
     use super::{
         BYTES_PER_GIB, CallToolResult, Content, McpError, SessionMemorySnapshot,
-        SessionMemoryWarning, attach_memory_warning_to_result, parse_memory_event,
-        parse_pressure_avg10,
+        SessionMemoryWarning, attach_memory_snapshot_to_failure, attach_memory_warning_to_result,
+        parse_memory_event, parse_pressure_avg10,
     };
+
+    #[test]
+    fn failures_carry_the_memory_snapshot_unless_a_warning_already_does() -> Result<(), String> {
+        let calm = snapshot(BYTES_PER_GIB, Some(3 * BYTES_PER_GIB), Some(0.5), Some(0));
+        let timeout = McpError::internal_error(
+            "screenshot: frame unavailable",
+            Some(serde_json::json!({"reason": "frame_unavailable"})),
+        );
+        let failed = match attach_memory_snapshot_to_failure(Err(timeout), calm) {
+            Err(error) => error.data.unwrap_or_default(),
+            Ok(_) => return Err("a failure became a success".to_owned()),
+        };
+        assert_eq!(failed["reason"], "frame_unavailable");
+        assert_eq!(failed["memory"]["current_bytes"], BYTES_PER_GIB);
+        assert_eq!(failed["memory"]["high_bytes"], 3 * BYTES_PER_GIB);
+        assert_eq!(failed["memory"]["pressure_full_avg10_percent"], 0.5);
+
+        let warned = McpError::internal_error(
+            "screenshot: frame unavailable",
+            Some(serde_json::json!({"memory_warning": {"reason": "memory_high"}})),
+        );
+        let warned = match attach_memory_snapshot_to_failure(Err(warned), calm) {
+            Err(error) => error.data.unwrap_or_default(),
+            Ok(_) => return Err("a failure became a success".to_owned()),
+        };
+        assert!(warned.get("memory").is_none(), "{warned}");
+
+        let mut error_result = CallToolResult::success(vec![Content::text("timed out")]);
+        error_result.is_error = Some(true);
+        error_result.structured_content = Some(serde_json::json!({"window_outcome": "timeout"}));
+        let reported = attach_memory_snapshot_to_failure(Ok(error_result), calm)
+            .map_err(|error| error.message.to_string())?;
+        assert_eq!(
+            reported.structured_content.unwrap_or_default()["memory"]["current_bytes"],
+            BYTES_PER_GIB
+        );
+
+        let mut success = CallToolResult::success(vec![Content::text("ok")]);
+        success.structured_content = Some(serde_json::json!({"status": "ok"}));
+        let unchanged = attach_memory_snapshot_to_failure(Ok(success), calm)
+            .map_err(|error| error.message.to_string())?;
+        assert!(
+            unchanged
+                .structured_content
+                .unwrap_or_default()
+                .get("memory")
+                .is_none()
+        );
+        Ok(())
+    }
 
     fn snapshot(
         current: u64,

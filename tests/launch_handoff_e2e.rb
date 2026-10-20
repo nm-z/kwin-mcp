@@ -5,6 +5,7 @@
 #   hidden_path (#577) a host /tmp path names host_shared_dir, and a copy there runs
 #   window_timeout (#254) a still-running command without a window fails; exit 0 and expect_window=false succeed
 #   host_output (#507) expect_window=false stdout, export_file create_parents, screenshot save_as
+#   memory_report (#572) failed calls and session_list report the session's memory use and pressure
 require 'fileutils'
 require 'json'
 require 'open3'
@@ -13,11 +14,11 @@ require 'tmpdir'
 require 'timeout'
 
 binary, evidence, *cases = ARGV
-abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path window_timeout host_output]' unless binary && evidence
+abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path window_timeout host_output memory_report]' unless binary && evidence
 binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
-cases = %w[focus_gap first_run hidden_path window_timeout host_output] if cases.empty?
+cases = %w[focus_gap first_run hidden_path window_timeout host_output memory_report] if cases.empty?
 
 class LaunchHandoffProbe
   def initialize(binary, home, evidence)
@@ -202,6 +203,20 @@ class LaunchHandoffProbe
     raise "an existing save_as was replaced: #{again}" unless again['error'].to_s.include?('already exists')
     data('keyboard_key', key: 'Return')
     {stdout_path: stdout, export: destination, kept: kept}
+  end
+
+  # A failed input or screenshot call, and session_list, carry the session's
+  # memory use and pressure even when no limit was reached (#572).
+  def memory_report
+    data('launch_app', command: 'kdialog --title kwin-572 --msgbox memory')
+    failed = call('screenshot', region: [0, 0, 10, 10], cursor: true)
+    memory = failed.dig('error', 'data', 'memory') || (raise "failed screenshot has no memory snapshot: #{failed}")
+    raise "memory.current_bytes #{memory['current_bytes'].inspect}" unless memory['current_bytes'].to_i.positive?
+    raise 'memory snapshot has no pressure field' unless memory.key?('pressure_full_avg10_percent')
+    listed = data('session_list').fetch('sessions').find { |session| session['session_id'] == @session } || (raise 'session not listed')
+    raise "session_list has no memory: #{listed}" unless listed.dig('memory', 'current_bytes').to_i.positive?
+    data('keyboard_key', key: 'Return')
+    {failed_call_memory: memory, listed_memory: listed['memory']}
   end
 
   def close
