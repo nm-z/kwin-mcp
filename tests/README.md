@@ -18,3 +18,12 @@ KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
 ```
 
 The desktop cases require the dependencies stated on each ignored test.
+# DevTools placeholder receipt
+
+Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`
+on a KDE/KWin host. The fixture starts its own stdio server and isolated fresh
+Chrome profile, opens DevTools Network, and locates the Filter field through
+accessibility. It checks both the empty placeholder and a genuine `Filter`
+value, independently reads each completed value through native copy and the
+session clipboard, and saves screenshots and receipts. It closes only its own
+session and removes its private HOME.

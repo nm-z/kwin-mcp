@@ -1033,6 +1033,7 @@ pub struct TextReceipt {
     object: atspi::ObjectRefOwned,
     expected: String,
     blank_line_replacement: Option<String>,
+    placeholder_replacement: Option<String>,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
 }
@@ -1310,6 +1311,22 @@ impl TextReceipt {
                         if start > before_count || end > before_count {
                             anyhow::bail!("focused field supplied invalid text insertion offsets");
                         }
+                        // Chromium can expose a rendered placeholder through
+                        // Text.GetText. Real text can equal that label too, so
+                        // retain the ordinary expectation and recognize this
+                        // alternative only as an unverified post-input change.
+                        let attributes = node.get_attributes().await.unwrap_or_default();
+                        let accessible_name = node.name().await.unwrap_or_default();
+                        let placeholder = attributes
+                            .get("placeholder-text")
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        let placeholder_replacement = (start == end
+                            && !before.is_empty()
+                            && !input.is_empty()
+                            && (before == normalize_accessible_text(placeholder)
+                                || before == normalize_accessible_text(&accessible_name)))
+                        .then(|| input.to_owned());
                         let expected = before
                             .chars()
                             .take(start)
@@ -1335,6 +1352,7 @@ impl TextReceipt {
                             object,
                             expected,
                             blank_line_replacement,
+                            placeholder_replacement,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
                         });
@@ -1355,6 +1373,10 @@ impl TextReceipt {
 
     pub async fn confirm(self) -> TextDelivery {
         let expected_count = self.expected.chars().count();
+        let placeholder_expected_count = self
+            .placeholder_replacement
+            .as_ref()
+            .map(|replacement| replacement.chars().count());
         let initial_descendant_snapshot_error = self.initial_descendant_snapshot_error.clone();
         let mut observed_count = None;
         let mut has_embedded_object = false;
@@ -1384,6 +1406,13 @@ impl TextReceipt {
                     .is_some_and(|replacement| replacement == &normalized_observed)
                 {
                     return Ok("atspi_transformed_blank_line");
+                }
+                if self
+                    .placeholder_replacement
+                    .as_ref()
+                    .is_some_and(|replacement| replacement == &normalized_observed)
+                {
+                    return Ok("atspi_placeholder_transition");
                 }
                 has_embedded_object |= observed.contains(EMBEDDED_OBJECT_CHARACTER);
                 if poll_count == 0 || poll_count % 5 == 4 {
@@ -1432,6 +1461,16 @@ impl TextReceipt {
                 observed_field_characters: observed_count,
                 warning: Some(
                     "KWin acknowledged all keys and the complete field matches the requested text, but the application replaced its initial blank line. The blank line may have been an empty-editor placeholder; its preservation could not be verified. Inspect the field before sending or retrying; do not retype blindly.".to_owned(),
+                ),
+            },
+            Ok(Ok(method @ "atspi_placeholder_transition")) => TextDelivery {
+                status: "unverified",
+                method,
+                compositor_acknowledged: true,
+                expected_field_characters: placeholder_expected_count,
+                observed_field_characters: observed_count,
+                warning: Some(
+                    "KWin acknowledged all keys and the focused field contains exactly the submitted text. Its initial accessible text matched its placeholder or label, so AT-SPI could not distinguish a placeholder from an existing value that the application replaced. The count excludes that ambiguous initial text. Inspect the field before sending; do not retype blindly.".to_owned(),
                 ),
             },
             Ok(Ok(method)) => TextDelivery {

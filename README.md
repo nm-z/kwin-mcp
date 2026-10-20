@@ -590,6 +590,15 @@ inspection guidance. It retains the original expected and observed counts;
 preservation of that initial newline is ambiguous. A newline retained by the
 application still follows the normal exact-text verification path.
 
+Chromium can also expose a placeholder or accessible label as if it were the
+field's current text. If that initial text matches the label or placeholder
+and the complete resulting field equals the submitted text,
+`atspi_placeholder_transition` reports `unverified` without counting the
+ambiguous initial label as missing input. A real existing value equal to the
+label still follows ordinary exact-text verification when it remains in the
+field. Inspect the result before sending; do not retype an already complete
+value merely because placeholder preservation could not be verified.
+
 Errors after submission retain requested/attempted/submitted progress when
 available and explicitly disallow blind retry, including when the session dies
 or writing the input summary fails. No partially submitted text is restarted.
