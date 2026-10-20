@@ -11,6 +11,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_LIFECYCLE_LOG_MAX_BYTES: usize = 1024 * 1024;
 
+/// Keep fixture storage configurable independently of the checkout location.
+fn fixture_temp_root() -> PathBuf {
+    let root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("TMPDIR").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+    assert!(
+        root.is_absolute(),
+        "fixture root must be absolute: {}",
+        root.display()
+    );
+    root
+}
+
 struct RemoveDirOnDrop(PathBuf);
 
 impl Drop for RemoveDirOnDrop {
@@ -96,13 +111,8 @@ impl RpcClient {
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let home_root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
-            .map(PathBuf::from)
-            // Nested fixture sockets must fit sockaddr_un even when the
-            // checkout/target path is long. /tmp is hidden inside the session,
-            // so use the short, host-visible /var/tmp root by default.
-            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
-        let home = home_root.join(format!("kwin-mcp-e2e-home-{}-{nonce}", std::process::id()));
+        // Short generated names leave room for nested Unix socket paths.
+        let home = fixture_temp_root().join(format!("kmh-{}-{nonce:x}", std::process::id()));
         for directory in [
             home.join(".config"),
             home.join(".local/share"),
@@ -4909,7 +4919,7 @@ fn session_start_binds_large_live_codex_state_without_copying_it() {
 }
 
 #[test]
-#[ignore = "requires KDE, bubblewrap, Konsole, squashfuse, mksquashfs, input devices and a filtered test D-Bus proxy; set KWIN_MCP_TEST_TMPDIR under /var/tmp"]
+#[ignore = "requires KDE, bubblewrap, Konsole, squashfuse, mksquashfs, input devices and a filtered test D-Bus proxy; set KWIN_MCP_TEST_TMPDIR to a short path outside the real HOME and /tmp"]
 fn session_can_explicitly_share_live_codex_state() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let address = require_filtered_cookie_test_bus();
@@ -4918,7 +4928,9 @@ fn session_can_explicitly_share_live_codex_state() {
         ("KWIN_MCP_E2E_COPY_BINARY", "1"),
     ]);
     assert!(
-        client.home.starts_with("/var/tmp"),
+        !client
+            .home
+            .starts_with(PathBuf::from(std::env::var_os("HOME").expect("real HOME"))),
         "mount fixture must stay outside the real HOME"
     );
     let codex = client.home.join(".codex");
@@ -5429,7 +5441,7 @@ fn launch_chatgpt_with_disk_backed_host_tmpdir() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_nanos();
-    let temp_root = PathBuf::from("/var/tmp").join(format!(
+    let temp_root = fixture_temp_root().join(format!(
         "kwin-mcp-e2e-tmpdir-{}-{nonce}",
         std::process::id()
     ));
@@ -7050,11 +7062,8 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         .expect("clock")
         .as_nanos();
     // Keep the test mount outside the real HOME so other agents' overlay plans
-    // do not change while this fixture is mounted. /var/tmp is disk-backed.
-    let fixture = PathBuf::from("/var/tmp").join(format!(
-        "kwin-mcp-e2e-nested-{}-{nonce}",
-        std::process::id()
-    ));
+    // do not change while this fixture is mounted. Use a short fixture root.
+    let fixture = fixture_temp_root().join(format!("kmn-{}-{nonce:x}", std::process::id()));
     struct Fixture(PathBuf);
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -7122,6 +7131,11 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         thread::sleep(Duration::from_millis(20));
     }
     let graphical_socket = home.join("project/host-graphical.sock");
+    assert!(
+        graphical_socket.as_os_str().as_encoded_bytes().len() <= 107,
+        "fixture socket path exceeds 107 bytes: {}; choose a shorter KWIN_MCP_TEST_TMPDIR or TMPDIR",
+        graphical_socket.display()
+    );
     struct GraphicalFixture(Child);
     impl Drop for GraphicalFixture {
         fn drop(&mut self) {
@@ -7237,11 +7251,9 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         disk.join("overlay-root/project/explicit.bin").is_file(),
         "explicit writable copy missing"
     );
-    let repeat = call_tool(&mut client, 3, "session_start", json!({}));
-    assert_eq!(
-        repeat["result"]["structuredContent"]["oversized_read_only_files"],
-        json!(fallback)
-    );
+    // session_start always creates a new desktop. Keep the original handle
+    // throughout this fixture so all checks exercise its writable_paths.
+    let session_id = session_handle(&started);
     let report = dir.join("ancestor-check.txt");
     let script = dir.join("ancestor-check.sh");
     let oversized_write = if reflink {
@@ -7294,7 +7306,7 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         4,
         "launch_app",
         json!({
-            "command": format!("konsole --hold -e bash {}", quote(&script))
+            "session_id": session_id, "command": format!("konsole --hold -e bash {}", quote(&script))
         }),
     );
     assert!(launched["error"].is_null(), "{launched}");
@@ -7309,7 +7321,12 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    let screenshot = call_tool(&mut client, 5, "screenshot", json!({"inline":true}));
+    let screenshot = call_tool(
+        &mut client,
+        5,
+        "screenshot",
+        json!({"session_id": session_id, "inline":true}),
+    );
     assert!(
         !inline_png(&screenshot).is_empty(),
         "missing rendered output"
@@ -7343,7 +7360,12 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
             "host hardlink created"
         );
     }
-    let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
+    let stopped = call_tool(
+        &mut client,
+        6,
+        "session_stop",
+        json!({"session_id": session_id}),
+    );
     assert!(stopped["error"].is_null(), "{stopped}");
     assert!(!dir.exists() && !disk.exists(), "owned workdirs remain");
     client.stop_process();
@@ -8676,8 +8698,7 @@ fn viewer_displays_current_pixels_after_a_second_fresh_session() {
     assert!(display.exists(), "private viewer display missing");
     // Force PipeWire to become ready after WirePlumber would otherwise start.
     // Both are still real daemons; only their startup ordering is controlled.
-    let wrappers =
-        PathBuf::from("/var/tmp").join(format!("km-viewer-media-{}", std::process::id()));
+    let wrappers = fixture_temp_root().join(format!("km-viewer-media-{}", std::process::id()));
     std::fs::create_dir(&wrappers).expect("media wrapper directory");
     let _wrappers = RemoveDirOnDrop(wrappers.clone());
     use std::os::unix::fs::PermissionsExt;

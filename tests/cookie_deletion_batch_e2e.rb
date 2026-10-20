@@ -5,6 +5,7 @@ require 'json'
 require 'open3'
 require 'fileutils'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'timeout'
 require 'digest'
 
@@ -39,7 +40,7 @@ ensure
   db&.close
 end
 
-Dir.mktmpdir('kmcb-','/var/tmp') do |root|
+Dir.mktmpdir('kmcb-',FixturePaths.root) do |root|
   home = File.join(root,'home')
   FileUtils.mkdir_p(%w[.config .cache .local/share .local/state .kde].map { |name| File.join(home,name) })
   relative = '.config/google-chrome/Default/Cookies'

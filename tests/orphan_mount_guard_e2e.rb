@@ -5,6 +5,7 @@ require 'json'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require_relative 'fixture_paths'
 
 if ARGV.first == '--namespace'
   _, server, root, mode, uid, gid, groups = ARGV
@@ -32,7 +33,7 @@ server = File.realpath(server)
 FileUtils.mkdir_p(evidence)
 abort 'fixture PID is not outside the kernel PID range' unless Integer(File.read('/proc/sys/kernel/pid_max')) < 2_000_000_000
 %w[leased unleased].each do |mode|
-  Dir.mktmpdir('km-orphan-mount-', '/var/tmp') do |root|
+  Dir.mktmpdir('km-orphan-mount-', FixturePaths.root) do |root|
     runtime = File.join(root,'runtime space','kwin-mcp-2000000000-1')
     disk = File.join(root,'cache space','kwin-mcp','kwin-mcp-2000000000-1')
     FileUtils.mkdir_p([runtime,File.join(disk,'mounted'),File.join(root,'outside'),File.join(root,'home')])

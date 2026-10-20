@@ -4,6 +4,7 @@ require 'json'
 require 'open3'
 require 'fileutils'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'timeout'
 
 server = File.realpath(ARGV.fetch(0) { abort 'usage: startup_profiles_e2e.rb SERVER EVIDENCE' })
@@ -13,7 +14,7 @@ FileUtils.mkdir_p(evidence)
 class StartupProbe
   attr_reader :home
   def initialize(server, evidence, name, delay: nil)
-    @home = Dir.mktmpdir('km-profiles-', '/var/tmp')
+    @home = Dir.mktmpdir('km-profiles-', FixturePaths.root)
     @log = File.open(File.join(evidence, "#{name}.jsonl"), 'w')
     @diagnostic = File.open(File.join(evidence, "#{name}.stderr"), 'w')
     @id = 0

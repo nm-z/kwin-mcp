@@ -4,6 +4,7 @@ require 'json'
 require 'open3'
 require 'timeout'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'fileutils'
 
 server=File.realpath(ARGV.fetch(0));proof=File.expand_path(ARGV.fetch(1));FileUtils.mkdir_p(proof)
@@ -53,7 +54,7 @@ class ViewerUpgradeClient
   end
 end
 
-Dir.mktmpdir('kmvup-','/var/tmp') do |root|
+Dir.mktmpdir('kmvup-',FixturePaths.root) do |root|
   daemon=ENV.fetch('PATH').split(':').map { |p|File.join(p,'dbus-daemon') }.find { |p|File.executable?(p) }
   bus=File.join(root,'bus');bus_log=File.open(File.join(proof,'bus.stderr'),'w')
   pid=Process.spawn(daemon,'--session','--nofork','--nopidfile',"--address=unix:path=#{bus}",out:File::NULL,err:bus_log)

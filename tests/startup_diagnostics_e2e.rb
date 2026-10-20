@@ -4,6 +4,7 @@ require 'fileutils'
 require 'json'
 require 'open3'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'timeout'
 
 server = File.realpath(ARGV.fetch(0))
@@ -29,7 +30,7 @@ def data(response)
   response.fetch('result').fetch('structuredContent')
 end
 
-Dir.mktmpdir('kw450-', '/var/tmp') do |root|
+Dir.mktmpdir('kw450-', FixturePaths.root) do |root|
   wrappers = File.join(root,'bin')
   runtime = File.join(root,'runtime')
   FileUtils.mkdir_p([wrappers,runtime])

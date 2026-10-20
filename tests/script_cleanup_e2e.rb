@@ -4,6 +4,7 @@ require 'json'
 require 'open3'
 require 'fileutils'
 require 'tmpdir'
+require_relative 'fixture_paths'
 require 'timeout'
 
 server=File.realpath(ARGV.fetch(0))
@@ -27,7 +28,7 @@ def compositor_under(root,workdir)
   raise 'owned compositor not found under sandbox launcher'
 end
 
-Dir.mktmpdir('kmscript-','/var/tmp') do |root|
+Dir.mktmpdir('kmscript-',FixturePaths.root) do |root|
   home=File.join(root,'home'); gate=File.join(root,'gate')
   FileUtils.mkdir_p([gate]+%w[.config .cache .local/share .local/state .kde].map { |name| File.join(home,name) })
   daemon=ENV.fetch('PATH').split(':').map { |part| File.join(part,'dbus-daemon') }.find { |path| File.executable?(path) }
