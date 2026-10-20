@@ -5,23 +5,27 @@ pub use self::frame::FrameContext;
 use {
     log::{info, trace, warn},
     screen_13::{
+        Display, DisplayError, DisplayInfoBuilder,
         driver::{
+            DriverError,
             ash::vk,
             device::{Device, DeviceInfo},
             surface::Surface,
             swapchain::{Swapchain, SwapchainInfo},
-            DriverError,
         },
         graph::RenderGraph,
         pool::hash::HashPool,
-        Display, DisplayError, DisplayInfoBuilder,
     },
-    std::{error, fmt, sync::Arc},
+    std::{
+        error, fmt,
+        sync::Arc,
+        time::{Duration, Instant},
+    },
     winit::{
         application::ApplicationHandler,
         error::EventLoopError,
         event::{DeviceEvent, DeviceId, Event, WindowEvent},
-        event_loop::{ActiveEventLoop, EventLoop},
+        event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
         monitor::MonitorHandle,
         window::{WindowAttributes, WindowId},
     },
@@ -71,17 +75,47 @@ impl Window {
         F: FnMut(FrameContext),
         P: FnMut(),
     {
-        struct Application<F, P> {
+        self.run_with_submission_idle_and_event_callbacks(
+            draw_fn,
+            on_submission,
+            None,
+            || {},
+            |_, _| false,
+        )
+    }
+
+    /// Calls `on_idle` on the responsive event loop even when rendering is
+    /// suspended. Window events reach `on_event` immediately; returning true
+    /// consumes the event instead of also buffering it for the draw callback.
+    pub fn run_with_submission_idle_and_event_callbacks<F, P, I, E>(
+        self,
+        draw_fn: F,
+        on_submission: P,
+        idle_interval: Option<Duration>,
+        on_idle: I,
+        on_event: E,
+    ) -> Result<(), WindowError>
+    where
+        F: FnMut(FrameContext),
+        P: FnMut(),
+        I: FnMut(),
+        E: FnMut(&winit::window::Window, &WindowEvent) -> bool,
+    {
+        struct Application<F, P, I, E> {
             active_window: Option<ActiveWindow>,
             data: WindowData,
             device: Arc<Device>,
             draw_fn: F,
             on_submission: P,
+            on_idle: I,
+            on_event: E,
+            idle_interval: Option<Duration>,
+            next_idle: Instant,
             error: Option<WindowError>,
             primary_monitor: Option<MonitorHandle>,
         }
 
-        impl<F, P> Application<F, P> {
+        impl<F, P, I, E> Application<F, P, I, E> {
             fn create_display(
                 &mut self,
                 window: &winit::window::Window,
@@ -198,12 +232,28 @@ impl Window {
             }
         }
 
-        impl<F, P> ApplicationHandler for Application<F, P>
+        impl<F, P, I, E> ApplicationHandler for Application<F, P, I, E>
         where
             F: FnMut(FrameContext),
             P: FnMut(),
+            I: FnMut(),
+            E: FnMut(&winit::window::Window, &WindowEvent) -> bool,
         {
-            fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                if let Some(interval) = self.idle_interval {
+                    let now = Instant::now();
+                    if now >= self.next_idle {
+                        let can_report_idle = self
+                            .active_window
+                            .as_ref()
+                            .is_some_and(|window| window.configured);
+                        if can_report_idle {
+                            (self.on_idle)();
+                        }
+                        self.next_idle = now + interval;
+                    }
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_idle));
+                }
                 // Wait for Wayland's initial xdg configure before requesting a
                 // redraw. pre_present_notify on an unconfigured surface can
                 // leave its first frame callback outstanding indefinitely.
@@ -283,6 +333,7 @@ impl Window {
                 event: WindowEvent,
             ) {
                 if let Some(active_window) = self.active_window.as_mut() {
+                    let consumed = (self.on_event)(&active_window.window, &event);
                     match &event {
                         WindowEvent::CloseRequested => {
                             info!("close requested");
@@ -324,9 +375,11 @@ impl Window {
                         _ => (),
                     }
 
-                    active_window
-                        .events
-                        .push(Event::WindowEvent { window_id, event });
+                    if !consumed {
+                        active_window
+                            .events
+                            .push(Event::WindowEvent { window_id, event });
+                    }
                 }
             }
         }
@@ -405,6 +458,10 @@ impl Window {
             device: self.device,
             draw_fn,
             on_submission,
+            on_idle,
+            on_event,
+            idle_interval: idle_interval.map(|interval| interval.max(Duration::from_millis(1))),
+            next_idle: Instant::now(),
             error: None,
             primary_monitor: None,
         };
