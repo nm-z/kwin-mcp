@@ -34,3 +34,13 @@ accessibility. It checks both the empty placeholder and a genuine `Filter`
 value, independently reads each completed value through native copy and the
 session clipboard, and saves screenshots and receipts. It closes only its own
 session and removes its private HOME.
+
+# Typing receipt diagnostics
+
+Run `ruby tests/typing_receipts_e2e.rb /path/to/kwin-mcp /path/to/evidence`
+on a KDE/KWin host. The isolated fresh-Chrome fixture checks a 71-character
+address-bar value, the exact 75-character search query from issue 528, a
+controlled 72-character limit, a zero-length web field, and a 1,700-character
+multiline Markdown value. It independently copies application text through
+native Ctrl+A/Ctrl+C and the session clipboard, records phase timings, saves
+screenshots, and cleans up its own session.
