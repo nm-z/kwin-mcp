@@ -10127,3 +10127,173 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
     );
     desktop.stop_process();
 }
+fn attach_test_data(reply: &Value) -> &Value {
+    assert!(
+        reply["error"].is_null() && reply["result"]["isError"] != true,
+        "{reply}"
+    );
+    &reply["result"]["structuredContent"]
+}
+
+fn attach_test_windows(reply: &Value) -> Vec<String> {
+    let mut ids: Vec<_> = attach_test_data(reply)["windows"]
+        .as_array()
+        .expect("window array")
+        .iter()
+        .map(|window| window["id"].as_str().expect("window id").to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+#[ignore = "requires real isolated KWin and Konsole sessions"]
+fn session_attach_reuses_foreign_desktop_without_owning_lifecycle() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut owner = RpcClient::start();
+    let mut attacher = RpcClient::start();
+    initialize(&mut owner);
+    initialize(&mut attacher);
+    let owner_pid = owner.child.id();
+    let started = call_tool(
+        &mut owner,
+        2,
+        "session_start",
+        json!({
+            "browser_profiles":"fresh", "width":1280, "height":800,
+        }),
+    );
+    let session_id = session_handle(&started);
+    let original_workdir = workdir(&started);
+    let launched = call_tool(
+        &mut owner,
+        3,
+        "launch_app",
+        json!({
+            "session_id":session_id,
+            "command":"konsole --separate --hold -e /usr/bin/printf 'kwin-attach-fixture\\n'",
+        }),
+    );
+    attach_test_data(&launched);
+    let original_list = call_tool(&mut owner, 4, "session_list", json!({}));
+    let original_records = attach_test_data(&original_list)["sessions"]
+        .as_array()
+        .expect("sessions");
+    assert_eq!(original_records.len(), 1);
+    let original = original_records[0].clone();
+    assert_eq!(original["workdir"].as_str(), original_workdir.to_str());
+    let windows = call_tool(
+        &mut owner,
+        5,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    let original_ids = attach_test_windows(&windows);
+    assert!(!original_ids.is_empty());
+    assert!(windows.to_string().to_lowercase().contains("konsole"));
+    let attach_args = json!({
+        "session_id":session_id, "owner_pid":owner_pid, "user_authorized":true,
+        "application":"owned Konsole attachment regression",
+    });
+    let mut denied_args = attach_args.clone();
+    denied_args["user_authorized"] = json!(false);
+    let denied = call_tool(&mut attacher, 2, "session_attach", denied_args);
+    assert_eq!(
+        denied["error"]["data"]["reason"],
+        "explicit_authorization_required"
+    );
+    let mut wrong_pid = attach_args.clone();
+    wrong_pid["owner_pid"] = json!(owner_pid + 1);
+    let denied = call_tool(&mut attacher, 3, "session_attach", wrong_pid);
+    assert_eq!(denied["error"]["data"]["reason"], "session_owner_mismatch");
+    let attached = call_tool(&mut attacher, 4, "session_attach", attach_args.clone());
+    let data = attach_test_data(&attached);
+    assert_eq!(data["status"], "attached");
+    assert_eq!(data["session_id"], session_id);
+    assert_eq!(data["owner_pid"], owner_pid);
+    let ticks = procfs::process::Process::new(i32::try_from(owner_pid).expect("pid"))
+        .expect("owner process")
+        .stat()
+        .expect("owner stat")
+        .starttime;
+    assert_eq!(data["owner_start_ticks"], ticks);
+    for field in ["sandbox_pid", "workdir", "scope_unit"] {
+        assert_eq!(data[field], original[field], "changed {field}");
+    }
+    assert_eq!(data["attachment_owns_lifecycle"], false);
+    assert_eq!(data["new_desktop_created"], false);
+    eprintln!("verified_session_attachment={data}");
+    let windows = call_tool(
+        &mut attacher,
+        5,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(attach_test_windows(&windows), original_ids);
+    let screenshot = call_tool(
+        &mut attacher,
+        6,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    save_inline_screenshot(&screenshot, "session-attach-existing");
+    let list = call_tool(&mut attacher, 7, "session_list", json!({}));
+    assert_eq!(
+        attach_test_data(&list)["sessions"]
+            .as_array()
+            .expect("sessions")
+            .len(),
+        0
+    );
+    attacher.stop_process();
+    assert!(owner.child.try_wait().expect("owner wait").is_none());
+    let retained = call_tool(&mut owner, 6, "session_list", json!({}));
+    let records = attach_test_data(&retained)["sessions"]
+        .as_array()
+        .expect("sessions");
+    assert_eq!(records.len(), 1);
+    for field in ["session_id", "pid", "sandbox_pid", "workdir", "scope_unit"] {
+        assert_eq!(records[0][field], original[field], "owner changed {field}");
+    }
+    let windows = call_tool(
+        &mut owner,
+        7,
+        "window_list",
+        json!({"session_id":session_id}),
+    );
+    assert_eq!(attach_test_windows(&windows), original_ids);
+    let screenshot = call_tool(
+        &mut owner,
+        8,
+        "screenshot",
+        json!({"session_id":session_id,"inline":true}),
+    );
+    save_inline_screenshot(&screenshot, "session-attach-owner-after-client-exit");
+    let stopped = call_tool(
+        &mut owner,
+        9,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    attach_test_data(&stopped);
+    let mut checker = RpcClient::start();
+    initialize(&mut checker);
+    let denied = call_tool(&mut checker, 2, "session_attach", attach_args);
+    assert!(
+        matches!(
+            denied["error"]["data"]["reason"].as_str(),
+            Some("session_not_found" | "session_not_running")
+        ),
+        "{denied}"
+    );
+    let list = call_tool(&mut checker, 3, "session_list", json!({}));
+    assert_eq!(
+        attach_test_data(&list)["sessions"]
+            .as_array()
+            .expect("sessions")
+            .len(),
+        0
+    );
+    checker.stop_process();
+    owner.stop_process();
+}

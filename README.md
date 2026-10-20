@@ -132,6 +132,28 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
+### Reusing an explicitly authorized existing desktop
+
+`session_start` always creates a new isolated desktop. To reach an application
+already open in another live same-user kwin-mcp session, first obtain the user's
+authorization for that specific session, then call `session_attach` with its
+exact `session_id`, the `owner_pid` encoded in that handle,
+`user_authorized: true`, and an `application` description of the authorization.
+Discovering another session does not authorize operating it.
+
+Attachment verifies the owner's Unix UID, process start time, authenticated
+control socket and running-session record. It returns the existing sandbox PID,
+work directory and scope, creates no desktop, and copies no credentials or browser
+profiles. Subsequent tools use that same `session_id`; the attaching process pins
+the owner's process identity and rejects a changed or unreachable owner before
+forwarding. Reattach after restarting or reloading the attaching server.
+
+The original server retains lifecycle ownership. Closing the attaching server
+does not stop the existing desktop. `session_list` continues to list this server's
+owned desktops; the attachment response identifies the selected foreign desktop.
+Only stop an attached session when the user requests it. An exited owner or a
+stopped session cannot be revived by attachment.
+
 Nested mounts under HOME require separate overlays. Regular files directly in
 their ancestor directories are copied into the private session. For files larger
 than 64 MiB, kwin-mcp first tries a copy-on-write reflink. If the filesystem cannot
