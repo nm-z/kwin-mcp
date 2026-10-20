@@ -502,11 +502,30 @@ class InputDeliveryProbe
     delivery = receipt&.fetch('delivery', nil)
     raise "Chrome address-bar typing omitted its delivery receipt: #{typing}" unless receipt && delivery
     raise "Chrome address-bar typing lacks compositor acknowledgement: #{delivery}" unless delivery['compositor_acknowledged']
-    unless delivery['status'] == 'unverified' && delivery['method'] == 'chromium_browser_ui'
-      raise "Chrome browser UI text was not classified as unverified: #{delivery}"
+    case delivery['status']
+    when 'verified'
+      unless delivery['method'] == 'atspi_focused_text' &&
+             delivery['expected_field_characters'] == 'chrome://extensions'.length &&
+             delivery['observed_field_characters'] == 'chrome://extensions'.length
+        raise "Invalid verified Chrome address-bar receipt: #{delivery}"
+      end
+    when 'unverified'
+      raise "Unexpected browser UI fallback: #{delivery}" unless delivery['method'] == 'chromium_browser_ui'
+    else
+      raise "Chrome address-bar text was treated as failed delivery: #{delivery}"
     end
     raise "Chrome browser UI text suggested a retry: #{receipt}" unless receipt['retry_safe'] == false
     raise "Chrome address-bar typing was reported as an error: #{typing}" if typing['error'] || typing.dig('result', 'isError')
+    unless receipt['submission_complete'] && receipt['submitted_characters'] == 'chrome://extensions'.length
+      raise "Chrome address-bar submission incomplete: #{receipt}"
+    end
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    assert_success(call('keyboard_key', key: 'ctrl+c'))
+    observed = assert_success(call('clipboard_read')).fetch('text')
+    File.write(File.join(@artifacts, 'browser-address-observed.txt'), observed)
+    raise "Address bar differs from submitted URL: #{observed.inspect}" unless observed == 'chrome://extensions'
+    File.write(File.join(@artifacts, 'browser-address-receipt.json'), JSON.pretty_generate(receipt))
+    screen('browser-address-before-navigation')
     return_key = assert_success(call('keyboard_key', key: 'Return'))
     unless return_key.fetch('warning', '').include?("the key went to the browser's own UI")
       raise "Return did not report browser UI focus: #{return_key}"
