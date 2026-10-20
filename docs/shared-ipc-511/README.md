@@ -14,6 +14,6 @@ assertion fails because the explicit host_shared_dir metadata is absent. The
 candidate supplies that alias consistently in session_start and session_list.
 The JSON files contain the actual outcomes; no host profile or service is changed.
 
-The final run uses merged head b3a67e0, retaining the existing provider/launch
+The final run uses merged head 9a22cd3, retaining the existing provider/launch
 changes from PR #517. The server unit suite passed 77 cases (1 ignored), and
 `cargo clippy --locked --bin kwin-mcp -j1` passed with existing warnings.
