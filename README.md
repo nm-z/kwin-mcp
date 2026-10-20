@@ -415,6 +415,9 @@ restores the caller's credentials before launching the server.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
+Screenshots check the active window identity and geometry before and after the frame is captured. A changed target returns `capture_target_changed` with `expected_window` and `observed_window`; if the target cannot be read afterward, the reason is `capture_target_unavailable`. Neither failure returns or saves an image. Inspect `window_list`, activate the intended window, and capture again. Successful metadata records `target_verification.method=active_window_before_and_after` and the final observation. These two observations detect a different or moved target at the end of capture; they do not establish that focus never briefly changed and returned between observations.
+
+
 ### Host socket exposure
 
 At `session_start`, active pathname sockets beneath `$HOME` and non-graphical user-runtime sockets are exposed automatically. Sockets owned by processes attached to the host display, desktop application scopes, input devices, or the desktop session slice remain isolated. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each exposed socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths, except the host session D-Bus socket and the `keyring` and `p11-kit` entries of the user runtime directory, which are masked and never exposed. Socket replacements at discovered names remain live; new socket names require a new session.
