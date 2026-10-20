@@ -92,7 +92,7 @@ Dir.mktmpdir('kmipc-', '/var/tmp') do |root|
               [overlay, shared, private_marker, ready].each { |path| File.unlink(path) if File.exist?(path) }
             end
           LISTENER
-          launched = call('launch_app', command: ['ruby', script, shared_socket, ready, quit, private_marker, payload].shelljoin, window_timeout_seconds: 1)
+          launched = call('launch_app', command: ['ruby', script, shared_socket, ready, quit, private_marker, payload].shelljoin, expect_window: false)
           raise 'helper submission not reported' unless launched.fetch('command_submitted')
           Timeout.timeout(10) { sleep 0.02 until File.file?(ready) && File.socket?(shared_socket) }
           received = Timeout.timeout(5) { UNIXSocket.open(shared_socket, &:gets) }.to_s.strip
