@@ -62,6 +62,23 @@ This mode opens a synthetic message dialog and expects the focus wait to time
 out without any `keyboard_type` or `keyboard_key` call. Both modes log their
 production stdio requests and responses in `rpc.jsonl`.
 
+## Accelerated terminal command (#476)
+
+```bash
+KWIN_MCP_E2E_SERVER="$PWD/target/debug/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/terminal-fast" \
+ruby tests/input_delivery_e2e.rb terminal_fast
+```
+
+This mode uses a 1920×1080 desktop and the same terminal-focus preflight. It
+types exactly 120 ASCII characters at `speed: 4`, including a final newline,
+and requires the complete RPC to finish within ten seconds. It checks the
+unverified application-text receipt separately from acknowledged, complete
+submission, waits for the command's output file, and independently exports and
+compares its exact bytes. The private `/tmp` output is synthetic and the command
+does not touch user files. Artifacts retain the request, exported output,
+timing/receipt JSON, screenshots, and full stdio responses.
+
 ## Cleared composer after Delete (#288)
 
 Build the production server, then run this mode in a new artifact directory:

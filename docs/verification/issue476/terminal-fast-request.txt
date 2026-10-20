@@ -1,0 +1,1 @@
+printf '%s\n' 'terminal-fast-476_Aa09./:-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > /tmp/kw476-terminal-proof

@@ -1,0 +1,24 @@
+{
+  "characters": 120,
+  "speed": 4,
+  "elapsed_seconds": 3.917363206972368,
+  "delivery": {
+    "compositor_acknowledged": true,
+    "expected_field_characters": null,
+    "method": "eis_roundtrip",
+    "observed_field_characters": null,
+    "status": "unverified",
+    "warning": "KWin acknowledged all key events, but field text could not be verified: Tab or Return may change focus or submit the field. Inspect the field before sending or retrying; retyping can duplicate text."
+  },
+  "submission_complete": true,
+  "retry_safe": false,
+  "observed_bytes": 76,
+  "independent_output_match": true,
+  "ready": {
+    "session_path": "/tmp/kw476-terminal-proof",
+    "size_bytes": 76,
+    "stable_for_ms": 100,
+    "status": "ready",
+    "timeout_seconds": 10
+  }
+}

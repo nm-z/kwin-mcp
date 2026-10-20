@@ -52,7 +52,7 @@ class InputDeliveryProbe
         clientInfo: { name: 'input-delivery-e2e', version: '1' })
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
-    start = call('session_start', width: width, height: height)
+    start = call('session_start', width: width, height: height, browser_profiles: 'fresh', startup_timeout_seconds: 60)
     assert_success(start)
     @started = true
     @workdir = start.dig('result','structuredContent','workdir')
@@ -506,6 +506,40 @@ class InputDeliveryProbe
     screen('terminal-after-return')
   end
 
+  def terminal_fast
+    launched = assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
+    wait_for_terminal(launched.fetch('window'))
+    session_path = '/tmp/kw476-terminal-proof'
+    prefix = "printf '%s\\n' '"
+    suffix = "' > #{session_path}\n"
+    payload = 'terminal-fast-476_Aa09./:-'.ljust(120 - prefix.length - suffix.length, 'x')
+    command = "#{prefix}#{payload}#{suffix}"
+    raise 'fixture must contain 120 ASCII characters' unless command.ascii_only? && command.length == 120
+    File.write(File.join(@artifacts, 'terminal-fast-request.txt'), command)
+    began = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    result = assert_success(call('keyboard_type', text: command, speed: 4))
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - began
+    delivery = result.fetch('delivery')
+    raise "terminal falsely verified application text: #{delivery}" unless delivery['status'] == 'unverified'
+    raise 'compositor did not acknowledge input' unless delivery['compositor_acknowledged']
+    raise 'input was not completely submitted' unless result['submission_complete'] && result['submitted_characters'] == command.length
+    raise 'input suggested blind retry' unless result['retry_safe'] == false
+    raise 'terminal exposed unverified text counts' unless delivery['expected_field_characters'].nil? && delivery['observed_field_characters'].nil?
+    ready = assert_success(call('wait_for_file', session_path: session_path, timeout_seconds: 10, stable_for_ms: 100))
+    destination = File.join(@artifacts, 'terminal-fast-output.txt')
+    assert_success(call('export_file', session_path: session_path, host_path: destination))
+    observed = File.binread(destination)
+    proof = { characters: command.length, speed: 4, elapsed_seconds: elapsed,
+              delivery: delivery, submission_complete: result['submission_complete'],
+              retry_safe: result['retry_safe'], observed_bytes: observed.bytesize,
+              independent_output_match: observed == "#{payload}\n", ready: ready }
+    File.write(File.join(@artifacts, 'terminal-fast-timing.json'), JSON.pretty_generate(proof))
+    screen('terminal-fast-after-return')
+    raise 'accelerated command output differs' unless proof[:independent_output_match]
+    raise "120-character terminal input exceeded 10 seconds: #{elapsed}" unless elapsed < 10
+    puts JSON.generate(proof)
+  end
+
   def terminal_blocked
     launched = assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
     assert_success(call('launch_app', command: 'kdialog --title "Terminal focus blocker" --msgbox "Leave the terminal probe blocked"'))
@@ -605,7 +639,7 @@ begin
     FileUtils.mkdir_p(File.join(artifacts, 'home'))
     File.write(File.join(artifacts, 'home', 'long-comment.html'), InputDeliveryProbe::LONG_COMMENT_HTML)
   end
-  dimensions = modes.include?('clear_retype') ? { width: 1920, height: 1080 } : {}
+  dimensions = (modes & %w[clear_retype terminal_fast]).any? ? { width: 1920, height: 1080 } : {}
   probe = InputDeliveryProbe.new(server, artifacts, **dimensions)
   modes.each { |mode| probe.public_send(mode) }
   puts "PASS: #{modes.join(', ')}; evidence #{artifacts}"
