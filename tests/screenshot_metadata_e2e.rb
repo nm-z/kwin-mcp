@@ -114,7 +114,7 @@ File.open(File.join(evidence, 'rpc.jsonl'), 'w') do |trace|
         capture(evidence, 'inline-default', {inline: true})
         capture(evidence, 'inline-disabled', {inline: true, structured_metadata: false})
         full = capture(evidence, 'inline-full', {inline: true, structured_metadata: true})
-        raise 'full inline metadata differs from file capture' unless full.reject { |key, _| key == 'settle' } == file.reject { |key, _| key == 'settle' }
+        raise 'full inline metadata differs from file capture' unless full.reject { |key, _| %w[settle transient_pixel_check].include?(key) } == file.reject { |key, _| %w[settle transient_pixel_check].include?(key) }
         crop = capture(evidence, 'inline-crop', {inline: true, structured_metadata: true, region: [0, 0, 120, 80]})
         raise 'requested crop not applied' unless crop.fetch('region') == [0, 0, 120, 80]
         capture(evidence, 'inline-cursor', {inline: true, structured_metadata: true, cursor: true})

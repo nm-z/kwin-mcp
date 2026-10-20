@@ -71,6 +71,27 @@ For Chrome's chooser, click the file input, press Ctrl+L, enter the verified
 absolute session path, and use Alt+O. Then verify the application's selected
 filename and byte size or upload outcome before submitting the form.
 
+## Transient-window screenshots
+
+For an active dialog, modal, or transient window, `screenshot` compares the
+composited image with a separate KWin `CaptureWindow` reference before returning
+an image. The comparison uses the opaque client interior, excluding a 97-pixel
+square around each sampled cursor position and an eight-pixel border. Success includes `transient_pixel_check` with the
+reference window ID and pixel counts. Qt's native-word and byte-ordered 32-bit
+capture formats are normalized before comparison and PNG encoding.
+
+If the dialog disappears, its identity or geometry changes, its pixels differ,
+or a sufficient opaque interior cannot be compared, the tool returns
+`transient_capture_unverified` without an image. Wait at least the reported
+`retry_after_ms` and observe again. `settle.settled` alone only describes an
+unchanging sequence of frames; it cannot prove that a dialog was drawn.
+
+The returned image still comes from the composited screen so it can include
+popups and regions extending outside the client window. A changing or
+translucent dialog, or a popup covering its interior, can therefore require a
+retry. The reference comparison does not prove that application content is
+semantically up to date.
+
 ## Large accessibility trees
 
 `accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
