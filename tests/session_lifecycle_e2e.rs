@@ -234,6 +234,11 @@ impl RpcClient {
             command.env("KWIN_MCP_TEST_FAIL_AFTER_FIRST_PROXY", "1");
         }
         command.envs(extra_env.iter().copied());
+        if extra_env.iter().any(|(name, value)|
+            *name == "KWIN_MCP_E2E_NATIVE_EXECUTABLE_WATCH" && *value == "1")
+        {
+            command.env_remove("KWIN_MCP_BINARY").env_remove("KWIN_MCP_REPO");
+        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -8207,19 +8212,29 @@ fn one_process_routes_parallel_sessions_and_orders_input_on_stdio() {
 #[test]
 #[ignore = "requires private KWin sessions, bubblewrap, input devices, and kdialog"]
 fn reexecution_preserves_pid_pipes_live_windows_and_partial_requests() {
-    check_reexecution(false);
+    check_reexecution(false, false);
 }
 
 #[test]
 #[ignore = "requires private KWin sessions, kdialog, and a Rust build toolchain"]
 fn source_rebuild_preserves_sessions_and_changes_published_tools() {
-    check_reexecution(true);
+    check_reexecution(true, false);
 }
 
-fn check_reexecution(source_reload: bool) {
+#[test]
+#[ignore = "requires private KWin sessions, bubblewrap, input devices, kdialog, and jq"]
+fn configured_provider_install_preserves_pid_pipes_live_windows_and_partial_requests() {
+    check_reexecution(false, true);
+}
+
+fn check_reexecution(source_reload: bool, provider_install: bool) {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start_with_env(&[
         ("KWIN_MCP_E2E_COPY_BINARY", "1"),
+        (
+            "KWIN_MCP_E2E_NATIVE_EXECUTABLE_WATCH",
+            if provider_install { "1" } else { "0" },
+        ),
         (
             "KWIN_MCP_E2E_SOURCE_RELOAD",
             if source_reload { "1" } else { "0" },
@@ -8302,6 +8317,42 @@ fn check_reexecution(source_reload: bool) {
             ),
         )
         .expect("edit private tool description");
+    } else if provider_install {
+        let source = std::env::var_os("KWIN_MCP_E2E_INSTALL_SOURCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp"))
+                    .parent()
+                    .expect("build output directory")
+                    .to_path_buf()
+            });
+        let path_bin = client.home.join("unrelated-path");
+        std::fs::create_dir(&path_bin).expect("create unrelated PATH directory");
+        std::os::unix::fs::symlink("/usr/bin/true", path_bin.join("kwin-mcp"))
+            .expect("create unrelated PATH command");
+        let inherited_path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+        let mut paths = vec![path_bin.clone()];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let output = Command::new("bash")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .arg("--source-dir")
+            .arg(&source)
+            .arg("--provider-bin")
+            .arg(&binary)
+            .arg("--replace")
+            .env("HOME", &client.home)
+            .env("PATH", std::env::join_paths(paths).expect("installer PATH"))
+            .output()
+            .expect("run exact provider installer");
+        assert!(output.status.success(), "installer stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "Configured MCP provider command: {}", binary.display())));
+        assert_eq!(std::fs::read_link(path_bin.join("kwin-mcp")).expect("unrelated PATH remains"),
+            PathBuf::from("/usr/bin/true"));
+        assert_eq!(std::fs::read(&binary).expect("installed server"),
+            std::fs::read(source.join("kwin-mcp")).expect("source server"));
+        println!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
         let replacement = binary.with_extension("next");
         let replacement_source = std::env::var_os("KWIN_MCP_E2E_REEXEC_REPLACEMENT")
@@ -8316,6 +8367,13 @@ fn check_reexecution(source_reload: bool) {
         Duration::from_secs(if source_reload { 300 } else { 30 }),
     );
 
+    if provider_install {
+        use std::os::unix::fs::MetadataExt;
+        let running = std::fs::metadata(format!("/proc/{pid}/exe")).expect("reloaded executable");
+        let installed = std::fs::metadata(&binary).expect("installed executable");
+        assert_eq!((running.dev(), running.ino()), (installed.dev(), installed.ino()),
+            "live provider must execute the installed artifact, not its deleted predecessor");
+    }
     client.wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
     assert_eq!(client.child.id(), pid);
     for (index, fd) in [0, 1].iter().enumerate() {

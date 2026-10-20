@@ -124,4 +124,49 @@ fi
 rg -q 'installed successfully, but PATH selects' "$evidence/shadowed.stderr"
 rg -q 'first in PATH' "$evidence/shadowed.stderr"
 cmp "$source_dir/kwin-mcp" "$scratch/shadowed/kwin-mcp"
+# A configured provider artifact is independent of the ordinary PATH command.
+provider_dir="$scratch/configured provider/target/release"
+mkdir -p -- "$provider_dir"
+cp -- "$source_dir/kwin-mcp" "$provider_dir/kwin-mcp"
+cp -- "$source_dir/kwin-viewer" "$provider_dir/kwin-viewer"
+if PATH="$scratch/other-package:$PATH" bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" \
+    --provider-bin "$provider_dir/kwin-mcp" > "$evidence/provider-conflict.stdout" 2> "$evidence/provider-conflict.stderr"; then
+    printf 'provider artifact was replaced without --replace\n' >&2
+    exit 1
+fi
+rg -q -- '--replace' "$evidence/provider-conflict.stderr"
+PATH="$scratch/other-package:$PATH" bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" \
+    --provider-bin "$provider_dir/kwin-mcp" --replace > "$evidence/provider.stdout" 2> "$evidence/provider.stderr"
+cmp "$source_dir/kwin-mcp" "$provider_dir/kwin-mcp"
+cmp "$source_dir/kwin-viewer" "$provider_dir/kwin-viewer"
+rg -Fx "Configured MCP provider command: $provider_dir/kwin-mcp" "$evidence/provider.stdout"
+rg -Fx "Version: $(<"$evidence/source-version.stdout")" "$evidence/provider.stdout"
+"$provider_dir/kwin-mcp" --version > "$evidence/provider-version.stdout"
+cmp "$evidence/source-version.stdout" "$evidence/provider-version.stdout"
+sha256sum --check "$evidence/original-package.sha256"
+mkdir -p -- "$scratch/provider-link"
+ln -s -- "$scratch/other-package/kwin-mcp" "$scratch/provider-link/kwin-mcp"
+if PATH="$scratch/other-package:$PATH" bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" \
+    --provider-bin "$scratch/provider-link/kwin-mcp" --replace > "$evidence/provider-link.stdout" 2> "$evidence/provider-link.stderr"; then
+    printf 'provider mode accepted a symlink artifact\n' >&2
+    exit 1
+fi
+rg -q 'resolved executable path' "$evidence/provider-link.stderr"
+[[ -L "$scratch/provider-link/kwin-mcp" ]]
+sha256sum --check "$evidence/original-package.sha256"
+if bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" --provider-bin relative/kwin-mcp \
+    > "$evidence/provider-relative.stdout" 2> "$evidence/provider-relative.stderr"; then
+    printf 'provider mode accepted a relative configured path\n' >&2
+    exit 1
+fi
+rg -q 'absolute path' "$evidence/provider-relative.stderr"
+if bash "$repo_dir/scripts/install.sh" --source-dir "$source_dir" --provider-bin "$provider_dir/kwin-mcp" \
+    --bin-dir "$scratch/conflicting-mode" --replace > "$evidence/provider-mode.stdout" 2> "$evidence/provider-mode.stderr"; then
+    printf 'provider mode accepted a conflicting bin directory\n' >&2
+    exit 1
+fi
+rg -q 'cannot be combined' "$evidence/provider-mode.stderr"
+[[ ! -e "$scratch/conflicting-mode" ]]
+printf 'provider_exact_path=PASS\nprovider_unrelated_path_preserved=PASS\nprovider_symlink_rejected=PASS\nprovider_invalid_modes_rejected=PASS\n' | tee "$evidence/provider-results.txt"
+
 printf 'conflict=PASS\nsymlink_targets_preserved=PASS\ninstalled_help=PASS\ninstalled_describe=PASS\ninstalled_version=PASS\ninstalled_short_version=PASS\nversion_identity_reported=PASS\nsilent_source_rejected=PASS\ninvalid_schemas_rejected=PASS\ninvalid_versions_rejected=PASS (silent, silent-short, malformed, failed, stderr, multiline, mismatch)\nshadowing_reported=PASS\n' | tee "$evidence/results.txt"

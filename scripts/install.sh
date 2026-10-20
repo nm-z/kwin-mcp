@@ -9,6 +9,7 @@ Install the built Rust server and viewer as real executables.
 
   --source-dir DIR  Build output directory (default: repository target/release)
   --bin-dir DIR     Installation directory (default: $HOME/.local/bin)
+  --provider-bin FILE  Install to this absolute configured kwin-mcp artifact path
   --replace         Replace existing files or symlinks at the destination
   -h, --help        Print this help
 
@@ -16,7 +17,11 @@ Build first with: cargo build --release --bins
 Requires Bash, GNU coreutils, and jq.
 The installer checks --help, --describe, and both version flags before replacing
 any executable. It reports the installed package version, build, and Git commit.
-It exits unsuccessfully if PATH still selects a different kwin-mcp afterward.
+Normally it exits unsuccessfully if PATH selects a different kwin-mcp afterward.
+With --provider-bin, it verifies that exact MCP provider command instead of PATH.
+The provider must be a real kwin-mcp file, not a symlink; its adjacent viewer is
+installed too. Use --replace for an existing provider after verifying reload
+compatibility. No provider is restarted and no MCP client config is changed.
 EOF
 }
 
@@ -29,14 +34,20 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 source_dir="$repo_dir/target/release"
 bin_dir=${HOME:+$HOME/.local/bin}
 replace=false
+provider_bin=
+bin_dir_explicit=false
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --source-dir|--bin-dir)
+        --source-dir|--bin-dir|--provider-bin)
             [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a directory"
             if [[ $1 == --source-dir ]]; then
                 source_dir=$2
+            elif [[ $1 == --provider-bin ]]; then
+                [[ -z $provider_bin ]] || fail '--provider-bin may be supplied only once'
+                provider_bin=$2
             else
                 bin_dir=$2
+                bin_dir_explicit=true
             fi
             shift 2
             ;;
@@ -45,6 +56,14 @@ while [[ $# -gt 0 ]]; do
         *) fail "unknown argument '$1'; use --help" ;;
     esac
 done
+if [[ -n $provider_bin ]]; then
+    $bin_dir_explicit && fail '--provider-bin and --bin-dir cannot be combined'
+    [[ $provider_bin == /* && ${provider_bin##*/} == kwin-mcp ]] ||
+        fail '--provider-bin requires an absolute path ending in /kwin-mcp'
+    [[ ! -L $provider_bin ]] ||
+        fail 'the configured provider command is a symlink; use its resolved executable path so existing providers observe the replacement'
+    bin_dir=${provider_bin%/*}
+fi
 [[ -n $bin_dir ]] || fail 'HOME is unset; provide --bin-dir'
 command -v jq > /dev/null || fail 'jq is required to validate --describe output; install jq and rerun'
 
@@ -102,6 +121,12 @@ for name in kwin-viewer kwin-mcp; do
     fi
 done
 printf 'Installed %s and %s\n' "$bin_dir/kwin-mcp" "$bin_dir/kwin-viewer"
+if [[ -n $provider_bin ]]; then
+    printf 'Configured MCP provider command: %s\n' "$bin_dir/kwin-mcp"
+    printf 'Version: %s\n' "$version_text"
+    printf 'Existing compatible providers can reload this artifact in place; verify their session IDs and build identity before resuming work.\n'
+    exit 0
+fi
 resolved=$(type -P kwin-mcp || true)
 if [[ -z $resolved || ! $resolved -ef "$bin_dir/kwin-mcp" ]]; then
     fail "installed successfully, but PATH selects ${resolved:-no kwin-mcp command}. Put $bin_dir first in PATH, clear your shell command cache (hash -r in Bash), or invoke $bin_dir/kwin-mcp by its absolute path"

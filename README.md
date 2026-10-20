@@ -648,6 +648,21 @@ commands: uv can recreate or remove its console entry point during later package
 operations. Configure MCP clients with the absolute installed Rust path, such
 as `~/.local/bin/kwin-mcp` expanded to your home directory.
 
+To update a configured absolute MCP command that is separate from PATH, install
+its artifact explicitly (the adjacent viewer is updated with it):
+
+```bash
+bash scripts/install.sh --source-dir target/release \
+  --provider-bin /absolute/configured/path/kwin-mcp --replace
+```
+
+This mode validates and reports the configured command instead of treating an
+unrelated PATH entry as an installation failure. It does not change client
+configuration or restart providers. The provider path must be a real file;
+for a symlink, inspect its resolved executable and use that artifact path so
+existing processes observe the replacement. Verify compatible in-place reload
+with owned test sessions before replacing a live artifact.
+
 MCP clients may still name an older absolute build-artifact path even after PATH
 is corrected. Check the configured command as well as `kwin-mcp --version`.
 For an existing provider, verify an old-to-new in-place reload before replacing
@@ -662,6 +677,11 @@ To check installation behavior against built artifacts without changing your
 real installation, run `bash tests/install_cli_e2e.sh target/release /tmp/kwin-install-evidence`.
 It installs into temporary directories and exercises help, schemas, and both
 version flags through `PATH`, including rejection of silent version entrypoints.
+
+For a configured artifact, also exercise the actual installer across two owned
+live desktops. [The provider installation regression](docs/provider-install-493/README.md)
+documents the old-server/new-build command and verifies the installed inode,
+stable PID and pipes, partially buffered input, surviving windows, and cleanup.
 
 ### Host runtime environment
 
