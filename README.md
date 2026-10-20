@@ -644,3 +644,38 @@ are external prerequisites.
 
 See [deployment instructions](docs/deployment.md) for commands, private build and
 install paths, runtime compatibility requirements and unit configuration.
+
+### Attributable element lookup
+
+`find_ui_elements` accepts optional `role` and `visible_only` filters. `role:
+"button"` includes native push/toggle buttons but not a label that merely mentions
+a button. Structured `elements` retain backend, role, name, states, application or
+page/frame identity, coordinate space, and the matched KWin window when known.
+The legacy `matches`, `query`, and `results` keys remain. Both accessibility
+backends can report the same physical control; these are attributed observations,
+not a count of unique physical widgets.
+
+Use a match's `bounds` with `mouse_click` only when `mouse_coordinates_usable` is
+true. Native coordinates are normalized against the accessibility provider's own
+frame origin after a unique title match and matching frame dimensions. This also
+handles Qt/Wayland providers that report a local origin for AT-SPI Screen extents.
+Ambiguous window titles or unmatched dimensions do not produce usable mouse
+coordinates. CDP bounds remain explicitly labelled CSS viewport pixels: browser
+chrome is not part of that viewport, so those bounds are never advertised as
+window-relative input coordinates. Native accessibility is queried even when CDP
+is connected, making browser chrome attributable too.
+
+Visibility is not clickability. CDP performs a read-only center hit test with
+`elementFromPoint`; covered controls cannot be marked clickable. Native matches
+report compositor-window coverage where known but leave in-application occlusion
+and positive clickability unknown. Inspect the screenshot for those cases.
+
+The result records the active window ID, serving PID and sample time. It is a
+snapshot, not a window lock: re-query after navigation, scrolling, layout changes,
+or changing windows. Page/node/match caps and timeouts report incomplete results
+instead of silently discarding already collected matches.
+
+`ruby tests/ui_match_context_e2e.rb SERVER EVIDENCE baseline|candidate` exercises
+native controls, real Chrome HTML with a covered button, and same-user session
+forwarding through the production stdio entrypoint. It uses fresh profiles and
+its own desktop; it sends no provider requests.

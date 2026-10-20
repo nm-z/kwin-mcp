@@ -9921,9 +9921,107 @@ struct AccessibilityTreeParams {
     root: Option<String>,
 }
 
+const FIND_UI_MAX_MATCHES: usize = 200;
+const FIND_UI_MAX_NODES: usize = 2000;
+const FIND_UI_MAX_PAGES: usize = 10;
+
+fn find_ui_role_matches(wanted: Option<&str>, actual: &str) -> bool {
+    let Some(wanted) = wanted else {
+        return true;
+    };
+    let wanted = wanted.trim().to_lowercase();
+    let actual = actual.trim().to_lowercase();
+    wanted == actual
+        || wanted == "button" && matches!(actual.as_str(), "push button" | "toggle button")
+}
+
+fn find_ui_frame_window<'a>(
+    windows: &'a [WindowSnapshot],
+    name: &str,
+    _bounds: (i32, i32, i32, i32),
+) -> Option<&'a WindowSnapshot> {
+    if name.is_empty() {
+        return None;
+    }
+    let candidates = windows
+        .iter()
+        .filter(|window| {
+            !window.title.is_empty()
+                && (window.title == name
+                    || window.title.starts_with(name)
+                    || name.starts_with(&window.title))
+        })
+        .collect::<Vec<_>>();
+    // A provider can report a window-local origin even for CoordType::Screen.
+    // Do not use that origin to disambiguate equal-titled windows.
+    if let [window] = candidates.as_slice() {
+        Some(*window)
+    } else {
+        None
+    }
+}
+
+fn find_ui_frame_aligned(window: &WindowSnapshot, bounds: (i32, i32, i32, i32)) -> bool {
+    (f64::from(bounds.2) - window.w).abs() <= 2.0 && (f64::from(bounds.3) - window.h).abs() <= 2.0
+}
+
+fn find_ui_native_match(
+    node: &AtspiNode,
+    window: Option<&WindowSnapshot>,
+    windows: &[WindowSnapshot],
+    frame: (i32, i32, i32, i32),
+) -> serde_json::Value {
+    let (x, y, w, h) = node.bounds;
+    // Subtract the provider's own frame origin, not the compositor origin. This
+    // works for both real screen-relative extents and Qt's local-origin extents.
+    let relative_x = f64::from(x) - f64::from(frame.0);
+    let relative_y = f64::from(y) - f64::from(frame.1);
+    let cx = relative_x + f64::from(w) / 2.0;
+    let cy = relative_y + f64::from(h) / 2.0;
+    let in_frame = cx >= 0.0 && cy >= 0.0 && cx < f64::from(frame.2) && cy < f64::from(frame.3);
+    let provider_visible = node.states.iter().any(|state| state == "visible");
+    let visible = provider_visible && in_frame && window.is_none_or(|window| !window.minimized);
+    let aligned = window.is_some_and(|window| find_ui_frame_aligned(window, frame));
+    let covered = aligned
+        && window.is_some_and(|matched| {
+            windows.iter().any(|other| {
+                other.id != matched.id
+                    && !other.minimized
+                    && other.stacking_order > matched.stacking_order
+                    && matched.x + cx >= other.x
+                    && matched.y + cy >= other.y
+                    && matched.x + cx < other.x + other.w
+                    && matched.y + cy < other.y + other.h
+            })
+        });
+    let enabled = !node.states.iter().any(|state| state == "disabled");
+    let compatible = aligned && window.is_some_and(|window| window.active);
+    let bounds = if compatible {
+        serde_json::json!({"x":relative_x,"y":relative_y,"w":w,"h":h})
+    } else {
+        serde_json::json!({"x":x,"y":y,"w":w,"h":h})
+    };
+    let mapped = window.filter(|_| aligned).map(|window| {
+        serde_json::json!({
+        "x":window.x+relative_x,"y":window.y+relative_y,"w":w,"h":h})
+    });
+    serde_json::json!({"backend":"atspi","role":node.role,"name":node.name,"states":node.states,
+        "bounds":bounds,"raw_atspi_bounds":{"x":x,"y":y,"w":w,"h":h},"mapped_screen_bounds":mapped,"window":window,
+        "coordinate_space":if compatible {"active_window_pixels"} else {"atspi_screen_pixels"},
+        "mouse_coordinates_usable":compatible,"window_association":if aligned {"unique_title_and_frame_size"} else if window.is_some() {"title_match_geometry_unverified"} else {"unverified"},
+        "visible":visible,"provider_visible":provider_visible,"enabled":enabled,
+        "occluded":if covered {serde_json::json!(true)} else {serde_json::Value::Null},
+        "clickable":if !visible || !enabled || covered || !compatible {serde_json::json!(false)} else {serde_json::Value::Null},
+        "center_hit":serde_json::Value::Null,"occlusion_note":"Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay."})
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindUiElementsParams {
     query: String,
+    /// Semantic role filter; "button" includes native push/toggle buttons.
+    role: Option<String>,
+    /// Keep only matches reported visible; visibility alone does not prove clickability.
+    visible_only: Option<bool>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -13060,7 +13158,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
+        description = "Find widgets by case-insensitive name/role text. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -13071,161 +13169,146 @@ impl KwinMcp {
         self.touch_activity().await;
         self.settle_input().await?;
         let query = params.query.to_lowercase();
-        let mut out = Vec::new();
-
+        let visible_only = params.visible_only.unwrap_or(false);
+        let mut elements = Vec::new();
+        let mut errors = Vec::new();
+        let windows = match window_snapshots(
+            &self.kwin_conn().await?,
+            &self.kwin_unique_name().await?,
+            &self.host_xdg_dir().await?,
+        )
+        .await
+        {
+            Ok(windows) => windows,
+            Err(error) => {
+                errors.push(format!("window association unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let active_id = windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.id.clone());
         let cdp_browser = self
             .session
             .read()
             .await
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
-
-        match cdp_browser {
-            Some(browser) => {
-                // CDP path for Chromium/Electron apps — query all non-chrome:// pages
-                if let Ok(pages) = browser.pages().await {
-                    let js = r#"JSON.stringify(
-                        [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
-                            .filter(el => el.offsetParent !== null)
-                            .map(el => {
-                                const r = el.getBoundingClientRect();
-                                return {
-                                    role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                                    text: (el.textContent || '').trim().slice(0, 80),
-                                    x: Math.round(r.x), y: Math.round(r.y),
-                                    w: Math.round(r.width), h: Math.round(r.height)
-                                };
-                            })
-                    )"#;
-                    #[derive(Deserialize)]
-                    struct CdpElement {
-                        role: String,
-                        text: String,
-                        x: i32,
-                        y: i32,
-                        w: i32,
-                        h: i32,
+        if let Some(browser) = cdp_browser {
+            let cdp = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
+                let pages = browser.pages().await.map_err(|error| error.to_string())?;
+                for page in pages.iter().take(FIND_UI_MAX_PAGES) {
+                    let url = page.url().await.ok().flatten().unwrap_or_default();
+                    if url.starts_with("chrome://") || url.starts_with("chrome-extension://") { continue; }
+                    let result = page.evaluate(include_str!("find_ui_dom.js")).await.map_err(|error| error.to_string())?;
+                    let text = result.value().and_then(serde_json::Value::as_str).ok_or("CDP search did not return JSON")?;
+                    let snapshot: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+                    if snapshot["truncated"] == true { errors.push(format!("CDP DOM element limit reached on {url}")); }
+                    for element in snapshot["elements"].as_array().into_iter().flatten() {
+                        if elements.len() >= FIND_UI_MAX_MATCHES { return Err("match limit reached".to_owned()); }
+                        let name = element["name"].as_str().unwrap_or_default();
+                        let role = element["role"].as_str().unwrap_or_default();
+                        if !(name.to_lowercase().contains(&query) || role.to_lowercase().contains(&query))
+                            || !find_ui_role_matches(params.role.as_deref(), role)
+                            || visible_only && element["visible"] != true { continue; }
+                        let mut matched = element.clone();
+                        matched["backend"] = serde_json::json!("cdp");
+                        matched["surface"] = serde_json::json!({"url":url,"title":snapshot["title"],
+                            "page_focused":snapshot["page_focused"],"viewport":snapshot["viewport"]});
+                        matched["coordinate_space"] = serde_json::json!("css_viewport_pixels");
+                        matched["mouse_coordinates_usable"] = serde_json::json!(false);
+                        matched["window"] = serde_json::Value::Null;
+                        matched["window_association"] = serde_json::json!("unverified_cdp_target");
+                        elements.push(matched);
                     }
-                    for page in &pages {
-                        let url = page.url().await.ok().flatten().unwrap_or_default();
-                        if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
-                            continue;
+                }
+                if pages.len() > FIND_UI_MAX_PAGES { return Err("page limit reached".to_owned()); }
+                Ok::<(), String>(())
+            }).await;
+            match cdp {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("CDP search incomplete: {error}")),
+                Err(_) => errors.push("CDP search reached its five-second limit".to_owned()),
+            }
+        }
+
+        // Native accessibility also exposes browser chrome, which a page DOM cannot describe.
+        // Keep frame provenance with every descendant instead of flattening all apps together.
+        let native = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
+            use atspi::proxy::accessible::ObjectRefExt;
+            let conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
+            let address = atspi::proxy::bus::BusProxy::new(&conn).await.map_err(KwinError::from)?
+                .get_address().await.map_err(KwinError::from)?;
+            let bus = connect_session_bus(&address, std::time::Instant::now() + ATSPI_TRAVERSAL_TIMEOUT)
+                .await.map_err(|error| McpError::internal_error(format!("AT-SPI bus: {error}"), None))?;
+            let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
+                .destination("org.a11y.atspi.Registry").map_err(KwinError::from)?
+                .cache_properties(zbus::proxy::CacheProperties::No).build().await.map_err(KwinError::from)?;
+            let mut visited = 0;
+            for app_obj in root.get_children().await.map_err(KwinError::from)? {
+                let Ok(app) = app_obj.as_accessible_proxy(&bus).await else { continue; };
+                let app_name = app.name().await.unwrap_or_default();
+                for frame_obj in app.get_children().await.unwrap_or_default() {
+                    let Ok(frame) = frame_obj.as_accessible_proxy(&bus).await else { continue; };
+                    let Ok(frame_node) = atspi_node(&frame).await else { continue; };
+                    let associated = find_ui_frame_window(&windows, &frame_node.name, frame_node.bounds);
+                    let surface = serde_json::json!({"application":app_name,"frame_title":frame_node.name,
+                        "frame_screen_bounds":frame_node.bounds,"bus":frame.inner().destination().to_string(),
+                        "frame_path":frame.inner().path().to_string()});
+                    let mut stack = vec![frame_obj];
+                    while let Some(obj) = stack.pop() {
+                        visited += 1;
+                        if visited > FIND_UI_MAX_NODES || elements.len() >= FIND_UI_MAX_MATCHES {
+                            return Err(McpError::internal_error("native search reached its node/match limit", None));
                         }
-                        if let Ok(result) = page.evaluate(js).await
-                            && let Some(val) = result.value()
-                            && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
-                            && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
-                        {
-                            for el in &elements {
-                                if el.w > 1
-                                    && el.h > 1
-                                    && (el.text.to_lowercase().contains(&query)
-                                        || el.role.to_lowercase().contains(&query))
-                                {
-                                    out.push(format!(
-                                        "{}\t{}\t({}, {}, {}x{})",
-                                        el.role, el.text, el.x, el.y, el.w, el.h
-                                    ));
-                                }
+                        let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
+                        let Ok(node) = atspi_node(&acc).await else { continue; };
+                        if node.is_useful()
+                            && (node.name.to_lowercase().contains(&query) || node.role.to_lowercase().contains(&query))
+                            && find_ui_role_matches(params.role.as_deref(), &node.role) {
+                            let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
+                            if !visible_only || matched["visible"] == true {
+                                matched["surface"] = surface.clone();
+                                matched["object_path"] = serde_json::json!(acc.inner().path().to_string());
+                                elements.push(matched);
                             }
                         }
+                        stack.extend(acc.get_children().await.unwrap_or_default().into_iter().rev());
                     }
                 }
             }
-            None => {
-                // AT-SPI path for native apps (5s timeout)
-                let atspi_result = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
-                    use atspi::proxy::accessible::ObjectRefExt;
-                    let zbus_conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
-                    let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
-                        .await
-                        .map_err(KwinError::from)?
-                        .get_address()
-                        .await
-                        .map_err(KwinError::from)?;
-                    let a11y_bus = connect_session_bus(
-                        &a11y_addr,
-                        std::time::Instant::now() + STARTUP_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
-                    let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
-                        .destination("org.a11y.atspi.Registry")
-                        .map_err(KwinError::from)?
-                        .cache_properties(zbus::proxy::CacheProperties::No)
-                        .build()
-                        .await
-                        .map_err(KwinError::from)?;
-                    let mut stack = root
-                        .get_children()
-                        .await
-                        .map_err(KwinError::from)?
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>();
-                    let mut results = Vec::new();
-                    while let Some(obj) = stack.pop() {
-                        let acc = match obj.as_accessible_proxy(&a11y_bus).await {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        let node = match atspi_node(&acc).await {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
-                        if node.is_useful()
-                            && (node.name.to_lowercase().contains(&query)
-                                || node.role.to_lowercase().contains(&query))
-                        {
-                            let (x, y, w, h) = node.bounds;
-                            let flags = node
-                                .states
-                                .iter()
-                                .filter(|state| *state == "disabled" || *state == "focused")
-                                .map(|state| format!("\t{state}"))
-                                .collect::<String>();
-                            results.push(format!(
-                                "{}\t{}\t({}, {}, {}x{}){flags}",
-                                node.role, node.name, x, y, w, h
-                            ));
-                        }
-                        for child in acc
-                            .get_children()
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .rev()
-                        {
-                            stack.push(child);
-                        }
-                    }
-                    Ok::<Vec<String>, McpError>(results)
-                })
-                .await;
-                match atspi_result {
-                    Ok(Ok(results)) => out.extend(results),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => eprintln!("find_ui_elements: AT-SPI traversal timed out after 5s"),
-                }
-            }
+            Ok::<(), McpError>(())
+        }).await;
+        match native {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => errors.push(format!("AT-SPI search incomplete: {error}")),
+            Err(_) => errors.push("AT-SPI search reached its five-second limit; already collected matches are retained".to_owned()),
         }
-
-        if out.is_empty() {
-            Ok(structured_result(
-                &peer,
-                format!("no elements matching '{}'", params.query),
-                serde_json::json!({"matches": 0, "query": params.query}),
-            )
-            .await)
+        let lines = elements.iter().map(|element| format!("{}\t{}\t{}\t{}\tvisible={} occluded={} mouse_coordinates_usable={}\tsurface={}",
+            element["role"].as_str().unwrap_or_default(), tree_field(element["name"].as_str().unwrap_or_default()),
+            element["bounds"], element["coordinate_space"].as_str().unwrap_or_default(), element["visible"],
+            element["occluded"], element["mouse_coordinates_usable"], element["surface"])).collect::<Vec<_>>();
+        let results = if lines.is_empty() {
+            format!("no observed elements matching '{}'", params.query)
         } else {
-            let results = out.join("\n");
-            Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
-        }
+            lines.join("\n")
+        };
+        let sampled_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        Ok(structured_result(&peer, results.clone(), serde_json::json!({
+            "matches":elements.len(),"query":params.query,"role":params.role,"visible_only":visible_only,
+            "results":results,"elements":elements,"active_window_id":active_id,"server_pid":std::process::id(),
+            "sampled_at_milliseconds":sampled_at,"incomplete":!errors.is_empty(),"errors":errors,
+            "continuation":"Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches."
+        })).await)
     }
 
     #[rmcp::tool(
         name = "mouse_click",
-        description = "Move the cursor to (x,y) and click. Coordinates are pixels relative to the active window's top-left — the same frame returned by find_ui_elements and accessibility_tree, no manual offset needed. button defaults to left (use right for context menus, middle rarely). double=true for file-manager-style open, triple=true to select a whole paragraph. No need to call mouse_move first; the click already positions the cursor."
+        description = "Move the cursor to (x,y) and click. Coordinates are pixels relative to the active window's top-left. For find_ui_elements use only bounds marked mouse_coordinates_usable=true; CDP CSS-viewport bounds are not in this frame. button defaults to left (use right for context menus, middle rarely). double=true for file-manager-style open, triple=true to select a whole paragraph. No need to call mouse_move first; the click already positions the cursor."
     )]
     async fn mouse_click(
         &self,
@@ -17871,5 +17954,120 @@ mod session_memory_warning_tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(warning, Some("memory_high"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ui_match_context_tests {
+    use super::{
+        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match, find_ui_role_matches,
+    };
+
+    fn window() -> WindowSnapshot {
+        WindowSnapshot {
+            id: "owned-window".to_owned(),
+            title: "Dialog".to_owned(),
+            resource_class: "kdialog".to_owned(),
+            resource_name: "kdialog".to_owned(),
+            pid: 1,
+            active: true,
+            minimized: false,
+            modal: false,
+            transient: false,
+            dialog: true,
+            popup: false,
+            transient_for: None,
+            x: 344.0,
+            y: 299.0,
+            w: 312.0,
+            h: 101.0,
+            stacking_order: 0,
+        }
+    }
+    fn node(bounds: (i32, i32, i32, i32)) -> AtspiNode {
+        AtspiNode {
+            name: "Stop".to_owned(),
+            role: "push button".to_owned(),
+            states: vec!["visible".to_owned(), "enabled".to_owned()],
+            bounds,
+        }
+    }
+
+    #[test]
+    fn issue418_button_filter_never_matches_explanatory_static_text() {
+        assert!(find_ui_role_matches(Some(" Button "), "push button"));
+        assert!(find_ui_role_matches(Some("button"), "toggle button"));
+        assert!(!find_ui_role_matches(Some("button"), "static text"));
+        assert!(!find_ui_role_matches(Some("button"), "label"));
+        assert!(find_ui_role_matches(None, "static text"));
+    }
+
+    #[test]
+    fn issue533_native_local_origin_is_normalized_against_its_own_frame() {
+        let win = window();
+        let result = find_ui_native_match(
+            &node((135, 65, 80, 25)),
+            Some(&win),
+            &[win.clone()],
+            (0, 0, 312, 101),
+        );
+        assert_eq!(result["mouse_coordinates_usable"], true);
+        assert_eq!(result["bounds"]["x"], 135.0);
+        assert_eq!(result["bounds"]["y"], 65.0);
+        assert_eq!(result["mapped_screen_bounds"]["x"], 479.0);
+        assert_eq!(result["mapped_screen_bounds"]["y"], 364.0);
+        assert_eq!(result["visible"], true);
+        assert!(
+            result["clickable"].is_null(),
+            "native geometry cannot prove absence of an in-app overlay"
+        );
+    }
+
+    #[test]
+    fn issue533_true_screen_origin_produces_the_same_window_coordinates() {
+        let win = window();
+        let result = find_ui_native_match(
+            &node((479, 364, 80, 25)),
+            Some(&win),
+            &[win.clone()],
+            (344, 299, 312, 101),
+        );
+        assert_eq!(result["bounds"]["x"], 135.0);
+        assert_eq!(result["bounds"]["y"], 65.0);
+        assert_eq!(result["mouse_coordinates_usable"], true);
+    }
+
+    #[test]
+    fn issue533_unverified_scale_and_ambiguous_windows_never_offer_mouse_coordinates() {
+        let win = window();
+        let result = find_ui_native_match(
+            &node((50, 20, 80, 25)),
+            Some(&win),
+            &[win.clone()],
+            (0, 0, 156, 50),
+        );
+        assert_eq!(result["mouse_coordinates_usable"], false);
+        assert_eq!(result["clickable"], false);
+        let mut second = win.clone();
+        second.id = "other-window".to_owned();
+        second.x = 0.0;
+        second.y = 0.0;
+        assert!(find_ui_frame_window(&[win, second], "Dialog", (0, 0, 312, 101)).is_none());
+    }
+
+    #[test]
+    fn issue418_covering_window_is_not_reported_as_a_clickable_native_button() {
+        let win = window();
+        let mut cover = win.clone();
+        cover.id = "cover".to_owned();
+        cover.stacking_order = 1;
+        let result = find_ui_native_match(
+            &node((135, 65, 80, 25)),
+            Some(&win),
+            &[win.clone(), cover],
+            (0, 0, 312, 101),
+        );
+        assert_eq!(result["occluded"], true);
+        assert_eq!(result["clickable"], false);
     }
 }
