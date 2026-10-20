@@ -1898,6 +1898,8 @@ use std::time::Duration;
 // Session startup: general session-bus / wayland socket wait.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_POLL: Duration = Duration::from_millis(50);
+// The session entrypoint writes kwin_wayland's exit status here when it exits.
+const KWIN_EXIT_FILE: &str = "kwin-exit";
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
@@ -3484,11 +3486,15 @@ fn startup_sandbox_process_diagnostic(pid: u32) -> String {
     format!("startup sandbox process pid={pid} state={state} wait_channel={wait_channel}")
 }
 
+/// Wait for `path` to appear inside the starting sandbox. `producer_exit` is
+/// a file the producing process's wrapper writes with its exit status, so a
+/// producer that died is reported as such rather than as a slow socket.
 async fn wait_for_sandbox_path(
     path: &std::path::Path,
     description: &str,
     deadline: std::time::Instant,
     sandbox: &mut Option<std::process::Child>,
+    producer_exit: Option<(&std::path::Path, &str)>,
 ) -> Result<(), String> {
     let child = sandbox
         .as_mut()
@@ -3505,9 +3511,21 @@ async fn wait_for_sandbox_path(
         if path.exists() {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if let Some((exit_file, producer)) = producer_exit
+            && let Ok(status) = std::fs::read_to_string(exit_file)
+        {
             return Err(format!(
-                "{description} did not appear at {} within {}s; {}",
+                "{producer} exited with status {} before creating its {description} at {}",
+                status.trim(),
+                path.display()
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let producer_state = producer_exit
+                .map(|(_, producer)| format!("{producer} is still running; "))
+                .unwrap_or_default();
+            return Err(format!(
+                "{description} did not appear at {} within {}s; {producer_state}{}",
                 path.display(),
                 STARTUP_TIMEOUT.as_secs(),
                 startup_sandbox_process_diagnostic(child.id())
@@ -12019,8 +12037,9 @@ impl KwinMcp {
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             touch '{xdg_dir_str}/dbus-ready'\n\
             n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
-            KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h} &\n\
+            {{ KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
+            kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h}; \
+            echo $? > '{xdg_dir_str}/{KWIN_EXIT_FILE}'; }} &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
             at-spi-bus-launcher --launch-immediately &\n\
@@ -12569,6 +12588,7 @@ impl KwinMcp {
             "dbus-ready marker",
             std::time::Instant::now() + STARTUP_TIMEOUT,
             &mut startup.sandbox_child,
+            None,
         )
         .await
         {
@@ -12640,6 +12660,7 @@ impl KwinMcp {
             "wayland-0 socket",
             std::time::Instant::now() + STARTUP_TIMEOUT,
             &mut startup.sandbox_child,
+            Some((&host_xdg_dir.join(KWIN_EXIT_FILE), "kwin_wayland")),
         )
         .await
         {
