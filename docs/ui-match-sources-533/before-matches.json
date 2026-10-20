@@ -1,0 +1,5 @@
+{
+  "matches": 8,
+  "query": "OK",
+  "results": "dialog\tlookup-left-533-632499\t(0, 0, 200x101)\nlabel\tSynthetic lookup fixture\t(11, 11, 178x17)\ntext\tSynthetic lookup fixture\t(11, 34, 178x25)\npush button\tOK\t(23, 65, 80x25)\ndialog\tlookup-right-533-632499\t(0, 0, 200x101)\nlabel\tSynthetic lookup fixture\t(11, 11, 178x17)\ntext\tSynthetic lookup fixture\t(11, 34, 178x25)\tfocused\npush button\tOK\t(23, 65, 80x25)"
+}

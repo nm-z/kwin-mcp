@@ -8911,6 +8911,59 @@ struct WindowGeometry {
     cy: f64,
 }
 
+/// A match keeps its source coordinate space and surface identity. In
+/// particular, CDP viewport coordinates are not active-window mouse pixels.
+#[derive(Serialize)]
+struct UiElementMatch {
+    role: String,
+    text: String,
+    bounds: (i32, i32, i32, i32),
+    coordinate_space: &'static str,
+    source: serde_json::Value,
+    states: Vec<String>,
+}
+
+impl UiElementMatch {
+    fn summary(&self) -> String {
+        let (x, y, w, h) = self.bounds;
+        let flags = self
+            .states
+            .iter()
+            .filter(|state| *state == "disabled" || *state == "focused")
+            .map(|state| format!("\t{state}"))
+            .collect::<String>();
+        let source = if self.coordinate_space == "page_viewport_css" {
+            format!(
+                "page={:?} url={:?} target={}",
+                self.source["page_title"].as_str().unwrap_or_default(),
+                self.source["page_url"].as_str().unwrap_or_default(),
+                self.source["target_id"].as_str().unwrap_or_default(),
+            )
+        } else {
+            format!(
+                "app={:?} surface={:?} surface_id={}",
+                self.source["application"]["name"]
+                    .as_str()
+                    .unwrap_or_default(),
+                self.source["surface"]["name"].as_str().unwrap_or_default(),
+                self.source["surface"]["node_id"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+        };
+        format!(
+            "{}\t{}\t({}, {}, {}x{}){flags}\tcoordinates={}\t{source}",
+            tree_field(&self.role),
+            tree_field(&self.text),
+            x,
+            y,
+            w,
+            h,
+            self.coordinate_space,
+        )
+    }
+}
+
 struct AtspiNode {
     name: String,
     role: String,
@@ -13060,7 +13113,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
+        description = "Search exposed browser pages or accessibility apps for widgets whose name or role contains query (case-insensitive). Matches may come from other tabs or windows. Each result identifies its source page or accessibility application/surface and its coordinate_space. atspi_screen_reported bounds are raw AT-SPI replies to a Screen-coordinate request; some Wayland toolkits report a surface-local origin, so the mapping is unverified. Locate the named surface and control in a fresh screenshot before input. page_viewport_css bounds exclude browser chrome and use page CSS pixels; locate those controls in a screenshot before clicking. active_window and active_window_after describe the window observed around the search, not the owner of every match. If window_changed is true, or focus, tabs, position, scale or zoom changes, obtain a fresh screenshot and search. Returns role, text (including native field placeholders), bounds, and native disabled/focused states. Use accessibility_tree only when you need structure.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -13070,19 +13123,32 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         self.settle_input().await?;
+        let started = std::time::Instant::now();
+        let (conn, kwin_unique, xdg, cdp_browser) = self
+            .with_session(|s| {
+                Ok((
+                    s.kwin_conn.clone(),
+                    s.kwin_unique_name.clone(),
+                    s.host_xdg_dir.clone(),
+                    s.cdp_browser.clone(),
+                ))
+            })
+            .await?;
+        let window_context = |(x, y, window): (i32, i32, WindowGeometry)| {
+            serde_json::json!({
+                "id": window.id, "title": window.title,
+                "x": x, "y": y, "width": window.w, "height": window.h,
+            })
+        };
+        let active_window = window_context(active_window_info(&conn, &kwin_unique, &xdg).await?);
         let query = params.query.to_lowercase();
         let mut out = Vec::new();
-
-        let cdp_browser = self
-            .session
-            .read()
-            .await
-            .as_ref()
-            .and_then(|s| s.cdp_browser.clone());
+        let mut incomplete = false;
 
         match cdp_browser {
             Some(browser) => {
-                // CDP path for Chromium/Electron apps — query all non-chrome:// pages
+                // Keep source-native bounds. Viewport CSS coordinates cannot be
+                // attributed to the active KWin window or used as mouse pixels.
                 if let Ok(pages) = browser.pages().await {
                     let js = r#"JSON.stringify(
                         [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
@@ -13111,21 +13177,32 @@ impl KwinMcp {
                         if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
                             continue;
                         }
+                        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                        let source = serde_json::json!({
+                            "kind": "cdp",
+                            "target_id": page.target_id().inner(),
+                            "page_url": url,
+                            "page_title": title,
+                        });
                         if let Ok(result) = page.evaluate(js).await
                             && let Some(val) = result.value()
                             && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
                             && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
                         {
-                            for el in &elements {
+                            for el in elements {
                                 if el.w > 1
                                     && el.h > 1
                                     && (el.text.to_lowercase().contains(&query)
                                         || el.role.to_lowercase().contains(&query))
                                 {
-                                    out.push(format!(
-                                        "{}\t{}\t({}, {}, {}x{})",
-                                        el.role, el.text, el.x, el.y, el.w, el.h
-                                    ));
+                                    out.push(UiElementMatch {
+                                        role: el.role,
+                                        text: el.text,
+                                        bounds: (el.x, el.y, el.w, el.h),
+                                        coordinate_space: "page_viewport_css",
+                                        source: source.clone(),
+                                        states: Vec::new(),
+                                    });
                                 }
                             }
                         }
@@ -13133,11 +13210,9 @@ impl KwinMcp {
                 }
             }
             None => {
-                // AT-SPI path for native apps (5s timeout)
                 let atspi_result = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
                     use atspi::proxy::accessible::ObjectRefExt;
-                    let zbus_conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
-                    let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
+                    let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&conn)
                         .await
                         .map_err(KwinError::from)?
                         .get_address()
@@ -13156,15 +13231,27 @@ impl KwinMcp {
                         .build()
                         .await
                         .map_err(KwinError::from)?;
+                    // The registry's children are applications; their children
+                    // identify the exposed top-level surfaces. Carry both source
+                    // identities through the walk instead of implying that every
+                    // object belongs to the currently active window.
                     let mut stack = root
                         .get_children()
                         .await
                         .map_err(KwinError::from)?
                         .into_iter()
                         .rev()
+                        .map(|object| {
+                            (
+                                object,
+                                0usize,
+                                serde_json::Value::Null,
+                                serde_json::Value::Null,
+                            )
+                        })
                         .collect::<Vec<_>>();
                     let mut results = Vec::new();
-                    while let Some(obj) = stack.pop() {
+                    while let Some((obj, depth, mut application, mut surface)) = stack.pop() {
                         let acc = match obj.as_accessible_proxy(&a11y_bus).await {
                             Ok(a) => a,
                             Err(_) => continue,
@@ -13173,21 +13260,33 @@ impl KwinMcp {
                             Ok(n) => n,
                             Err(_) => continue,
                         };
+                        let node_id =
+                            format!("{}{}", acc.inner().destination(), acc.inner().path());
+                        if depth == 0 {
+                            application =
+                                serde_json::json!({"name": node.name, "node_id": node_id});
+                        } else if depth == 1 {
+                            surface = serde_json::json!({
+                                "name": node.name, "role": node.role,
+                                "node_id": node_id, "bounds": node.bounds,
+                                "coordinate_space": "atspi_screen_reported",
+                            });
+                        }
                         if node.is_useful()
                             && (node.name.to_lowercase().contains(&query)
                                 || node.role.to_lowercase().contains(&query))
                         {
-                            let (x, y, w, h) = node.bounds;
-                            let flags = node
-                                .states
-                                .iter()
-                                .filter(|state| *state == "disabled" || *state == "focused")
-                                .map(|state| format!("\t{state}"))
-                                .collect::<String>();
-                            results.push(format!(
-                                "{}\t{}\t({}, {}, {}x{}){flags}",
-                                node.role, node.name, x, y, w, h
-                            ));
+                            results.push(UiElementMatch {
+                                role: node.role,
+                                text: node.name,
+                                bounds: node.bounds,
+                                coordinate_space: "atspi_screen_reported",
+                                source: serde_json::json!({
+                                    "kind": "atspi", "node_id": node_id,
+                                    "application": application, "surface": surface,
+                                }),
+                                states: node.states,
+                            });
                         }
                         for child in acc
                             .get_children()
@@ -13196,36 +13295,66 @@ impl KwinMcp {
                             .into_iter()
                             .rev()
                         {
-                            stack.push(child);
+                            stack.push((
+                                child,
+                                depth.saturating_add(1),
+                                application.clone(),
+                                surface.clone(),
+                            ));
                         }
                     }
-                    Ok::<Vec<String>, McpError>(results)
+                    Ok::<Vec<UiElementMatch>, McpError>(results)
                 })
                 .await;
                 match atspi_result {
                     Ok(Ok(results)) => out.extend(results),
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => eprintln!("find_ui_elements: AT-SPI traversal timed out after 5s"),
+                    Err(_) => {
+                        incomplete = true;
+                        eprintln!("find_ui_elements: AT-SPI traversal timed out after 5s");
+                    }
                 }
             }
         }
 
-        if out.is_empty() {
-            Ok(structured_result(
-                &peer,
-                format!("no elements matching '{}'", params.query),
-                serde_json::json!({"matches": 0, "query": params.query}),
+        let active_window_after = active_window_info(&conn, &kwin_unique, &xdg)
+            .await
+            .ok()
+            .map(window_context);
+        let window_changed = active_window_after.as_ref() != Some(&active_window);
+        let guidance = "Match sources may be other windows or pages. Confirm the named source in a fresh screenshot before input. atspi_screen_reported is the raw reply to an AT-SPI Screen-coordinate request, not a verified global origin: some Wayland toolkits return surface-local bounds. Compare the source surface bounds with the screenshot and locate the control visually before input. page_viewport_css bounds cannot be passed directly to mouse_click. Re-observe after a window, tab, position, scale or zoom change; matching before/after windows do not guarantee an atomic snapshot.";
+        let results = out
+            .iter()
+            .map(UiElementMatch::summary)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let heading = format!(
+            "observed active window={} title={:?}; window_changed={window_changed}; bounds use each match's coordinate_space",
+            active_window["id"].as_str().unwrap_or_default(),
+            active_window["title"].as_str().unwrap_or_default(),
+        );
+        let text = if out.is_empty() {
+            format!(
+                "{heading}\nno elements matching {:?}\n{guidance}",
+                params.query
             )
-            .await)
         } else {
-            let results = out.join("\n");
-            Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
-        }
+            format!("{heading}\n{results}\n{guidance}")
+        };
+        let payload = serde_json::json!({
+            "matches": out.len(), "query": params.query, "results": results,
+            "elements": out, "active_window": active_window,
+            "active_window_after": active_window_after, "window_changed": window_changed,
+            "incomplete": incomplete,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "guidance": guidance,
+        });
+        Ok(structured_result(&peer, text, payload).await)
     }
 
     #[rmcp::tool(
         name = "mouse_click",
-        description = "Move the cursor to (x,y) and click. Coordinates are pixels relative to the active window's top-left — the same frame returned by find_ui_elements and accessibility_tree, no manual offset needed. button defaults to left (use right for context menus, middle rarely). double=true for file-manager-style open, triple=true to select a whole paragraph. No need to call mouse_move first; the click already positions the cursor."
+        description = "Move the cursor to (x,y) and click. Coordinates are pixels relative to the active window's client top-left, as in screenshot. find_ui_elements labels each match's source coordinate space; locate its named surface and control in a fresh screenshot before input. AT-SPI reported origins and page_viewport_css bounds are not verified mouse coordinates. button defaults to left (use right for context menus, middle rarely). double=true for file-manager-style open, triple=true to select a whole paragraph. No need to call mouse_move first; the click already positions the cursor."
     )]
     async fn mouse_click(
         &self,

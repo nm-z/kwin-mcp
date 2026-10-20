@@ -16,7 +16,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
 | `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). |
-| `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
+| `find_ui_elements` | Search UI elements by name/role with source page/surface identities and explicitly labelled coordinate spaces. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
 | `mouse_scroll` | Scroll at window-relative coordinates. |
@@ -34,6 +34,21 @@ regular file whose inode, size, and modification time remain unchanged for
 (default 30, range 1–300). A timeout distinguishes a missing file from one
 that is still changing. This bounded observation does not prove that the
 producer has exited.
+
+## UI lookup sources and coordinates
+
+`find_ui_elements` searches the connected browser's exposed pages, or the session's AT-SPI applications when CDP is not connected. A match can belong to a background tab or another window. The text response labels each source and coordinate space; `structuredContent.elements` also contains the complete source identity:
+
+| Source | Identity | `coordinate_space` | Using the bounds |
+|---|---|---|---|
+| AT-SPI | Application name/node ID, top-level surface name/role/node ID, and matched node ID | `atspi_screen_reported` | Raw reply to an AT-SPI `Screen` coordinate request. Some Wayland toolkits return a surface-local origin, so this is not a verified global or mouse-input frame. Compare the source surface bounds and locate the named control in a fresh screenshot before input. |
+| CDP | Target ID, page title, and page URL | `page_viewport_css` | These bounds exclude browser chrome and use the page's CSS pixels. Locate the named control in a screenshot for mouse coordinates; do not pass these bounds directly to `mouse_click`. |
+
+Bounds use `[x, y, width, height]`. `active_window` and `active_window_after` identify the active KWin window observed before and after lookup, including its client origin and size. These fields describe the observation context; they do not attribute every match to that window. `window_changed=true` means the window identity, caption, position, or size changed, or the final window could not be read. Obtain a fresh screenshot and repeat the search before input in that case. Matching observations do not make the traversal atomic or detect a window that changed and changed back. Re-observe after switching tabs or changing focus, position, scale, or zoom.
+
+Empty results retain the same observation metadata. `incomplete=true` identifies an AT-SPI search that reached its existing five-second traversal limit. The existing `matches`, `query`, and `results` fields remain available.
+
+Run `ruby tests/ui_match_sources_e2e.rb /path/to/kwin-mcp /path/to/evidence` on a KDE host to verify two native surfaces with the same button label, a source-guided click checked against the native surface and screenshot, two CDP pages with the same label, and empty-result metadata through the production stdio server. See [the captured observation](docs/ui-match-sources-533/README.md) for the raw before/after metadata and images.
 
 ## Large accessibility trees
 

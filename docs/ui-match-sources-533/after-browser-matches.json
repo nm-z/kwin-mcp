@@ -1,0 +1,63 @@
+{
+  "active_window": {
+    "height": 738.0,
+    "id": "{b4158e64-1d71-48ba-8c4d-45979ec1beac}",
+    "title": "lookup-page-b-533-495208 - Google Chrome",
+    "width": 1018.0,
+    "x": 64,
+    "y": 48
+  },
+  "active_window_after": {
+    "height": 738.0,
+    "id": "{b4158e64-1d71-48ba-8c4d-45979ec1beac}",
+    "title": "lookup-page-b-533-495208 - Google Chrome",
+    "width": 1018.0,
+    "x": 64,
+    "y": 48
+  },
+  "elapsed_ms": 20,
+  "elements": [
+    {
+      "bounds": [
+        8,
+        8,
+        80,
+        21
+      ],
+      "coordinate_space": "page_viewport_css",
+      "role": "button",
+      "source": {
+        "kind": "cdp",
+        "page_title": "lookup-page-a-533-495208",
+        "page_url": "data:text/html,<title>lookup-page-a-533-495208</title><button>Needle533</button>",
+        "target_id": "65B320CCB3FFEDFE30CC95DC594BF922"
+      },
+      "states": [],
+      "text": "Needle533"
+    },
+    {
+      "bounds": [
+        8,
+        8,
+        80,
+        21
+      ],
+      "coordinate_space": "page_viewport_css",
+      "role": "button",
+      "source": {
+        "kind": "cdp",
+        "page_title": "lookup-page-b-533-495208",
+        "page_url": "data:text/html,<title>lookup-page-b-533-495208</title><button>Needle533</button>",
+        "target_id": "8B544406857B973E32D6B08E4377131F"
+      },
+      "states": [],
+      "text": "Needle533"
+    }
+  ],
+  "guidance": "Match sources may be other windows or pages. Confirm the named source in a fresh screenshot before input. atspi_screen_reported is the raw reply to an AT-SPI Screen-coordinate request, not a verified global origin: some Wayland toolkits return surface-local bounds. Compare the source surface bounds with the screenshot and locate the control visually before input. page_viewport_css bounds cannot be passed directly to mouse_click. Re-observe after a window, tab, position, scale or zoom change; matching before/after windows do not guarantee an atomic snapshot.",
+  "incomplete": false,
+  "matches": 2,
+  "query": "Needle533",
+  "results": "button\tNeedle533\t(8, 8, 80x21)\tcoordinates=page_viewport_css\tpage=\"lookup-page-a-533-495208\" url=\"data:text/html,<title>lookup-page-a-533-495208</title><button>Needle533</button>\" target=65B320CCB3FFEDFE30CC95DC594BF922\nbutton\tNeedle533\t(8, 8, 80x21)\tcoordinates=page_viewport_css\tpage=\"lookup-page-b-533-495208\" url=\"data:text/html,<title>lookup-page-b-533-495208</title><button>Needle533</button>\" target=8B544406857B973E32D6B08E4377131F",
+  "window_changed": false
+}

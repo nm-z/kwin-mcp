@@ -1,0 +1,317 @@
+{
+  "active_window": {
+    "height": 101.0,
+    "id": "{ce8bdbb9-f07d-4ab7-a28f-13fc28aead03}",
+    "title": "lookup-left-533-495208",
+    "width": 200.0,
+    "x": 450,
+    "y": 349
+  },
+  "active_window_after": {
+    "height": 101.0,
+    "id": "{ce8bdbb9-f07d-4ab7-a28f-13fc28aead03}",
+    "title": "lookup-left-533-495208",
+    "width": 200.0,
+    "x": 450,
+    "y": 349
+  },
+  "elapsed_ms": 66,
+  "elements": [
+    {
+      "bounds": [
+        0,
+        0,
+        200,
+        101
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "dialog",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.3/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.3/org/a11y/atspi/accessible/2147483649",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-left-533-495208",
+          "node_id": ":1.3/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "current",
+        "enabled",
+        "visible"
+      ],
+      "text": "lookup-left-533-495208"
+    },
+    {
+      "bounds": [
+        11,
+        11,
+        178,
+        17
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "label",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.3/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.3/org/a11y/atspi/accessible/2147483651",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-left-533-495208",
+          "node_id": ":1.3/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "enabled",
+        "readonly",
+        "visible"
+      ],
+      "text": "Synthetic lookup fixture"
+    },
+    {
+      "bounds": [
+        11,
+        34,
+        178,
+        25
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "text",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.3/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.3/org/a11y/atspi/accessible/2147483650",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-left-533-495208",
+          "node_id": ":1.3/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "current",
+        "enabled",
+        "focused",
+        "focusable",
+        "visible"
+      ],
+      "text": "Synthetic lookup fixture"
+    },
+    {
+      "bounds": [
+        23,
+        65,
+        80,
+        25
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "push button",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.3/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.3/org/a11y/atspi/accessible/2147483653",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-left-533-495208",
+          "node_id": ":1.3/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "enabled",
+        "focusable",
+        "visible"
+      ],
+      "text": "OK"
+    },
+    {
+      "bounds": [
+        0,
+        0,
+        200,
+        101
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "dialog",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.4/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.4/org/a11y/atspi/accessible/2147483649",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-right-533-495208",
+          "node_id": ":1.4/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "enabled",
+        "visible"
+      ],
+      "text": "lookup-right-533-495208"
+    },
+    {
+      "bounds": [
+        11,
+        11,
+        178,
+        17
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "label",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.4/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.4/org/a11y/atspi/accessible/2147483651",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-right-533-495208",
+          "node_id": ":1.4/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "enabled",
+        "readonly",
+        "visible"
+      ],
+      "text": "Synthetic lookup fixture"
+    },
+    {
+      "bounds": [
+        11,
+        34,
+        178,
+        25
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "text",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.4/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.4/org/a11y/atspi/accessible/2147483650",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-right-533-495208",
+          "node_id": ":1.4/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "current",
+        "enabled",
+        "focusable",
+        "visible"
+      ],
+      "text": "Synthetic lookup fixture"
+    },
+    {
+      "bounds": [
+        23,
+        65,
+        80,
+        25
+      ],
+      "coordinate_space": "atspi_screen_reported",
+      "role": "push button",
+      "source": {
+        "application": {
+          "name": "kdialog",
+          "node_id": ":1.4/org/a11y/atspi/accessible/root"
+        },
+        "kind": "atspi",
+        "node_id": ":1.4/org/a11y/atspi/accessible/2147483653",
+        "surface": {
+          "bounds": [
+            0,
+            0,
+            200,
+            101
+          ],
+          "coordinate_space": "atspi_screen_reported",
+          "name": "lookup-right-533-495208",
+          "node_id": ":1.4/org/a11y/atspi/accessible/2147483649",
+          "role": "dialog"
+        }
+      },
+      "states": [
+        "enabled",
+        "focusable",
+        "visible"
+      ],
+      "text": "OK"
+    }
+  ],
+  "guidance": "Match sources may be other windows or pages. Confirm the named source in a fresh screenshot before input. atspi_screen_reported is the raw reply to an AT-SPI Screen-coordinate request, not a verified global origin: some Wayland toolkits return surface-local bounds. Compare the source surface bounds with the screenshot and locate the control visually before input. page_viewport_css bounds cannot be passed directly to mouse_click. Re-observe after a window, tab, position, scale or zoom change; matching before/after windows do not guarantee an atomic snapshot.",
+  "incomplete": false,
+  "matches": 8,
+  "query": "OK",
+  "results": "dialog\tlookup-left-533-495208\t(0, 0, 200x101)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-left-533-495208\" surface_id=:1.3/org/a11y/atspi/accessible/2147483649\nlabel\tSynthetic lookup fixture\t(11, 11, 178x17)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-left-533-495208\" surface_id=:1.3/org/a11y/atspi/accessible/2147483649\ntext\tSynthetic lookup fixture\t(11, 34, 178x25)\tfocused\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-left-533-495208\" surface_id=:1.3/org/a11y/atspi/accessible/2147483649\npush button\tOK\t(23, 65, 80x25)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-left-533-495208\" surface_id=:1.3/org/a11y/atspi/accessible/2147483649\ndialog\tlookup-right-533-495208\t(0, 0, 200x101)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-right-533-495208\" surface_id=:1.4/org/a11y/atspi/accessible/2147483649\nlabel\tSynthetic lookup fixture\t(11, 11, 178x17)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-right-533-495208\" surface_id=:1.4/org/a11y/atspi/accessible/2147483649\ntext\tSynthetic lookup fixture\t(11, 34, 178x25)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-right-533-495208\" surface_id=:1.4/org/a11y/atspi/accessible/2147483649\npush button\tOK\t(23, 65, 80x25)\tcoordinates=atspi_screen_reported\tapp=\"kdialog\" surface=\"lookup-right-533-495208\" surface_id=:1.4/org/a11y/atspi/accessible/2147483649",
+  "window_changed": false
+}

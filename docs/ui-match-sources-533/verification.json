@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "native_surfaces": [
+    "lookup-left-533-495208",
+    "lookup-right-533-495208"
+  ],
+  "native_click_closed": "{ce8bdbb9-f07d-4ab7-a28f-13fc28aead03}",
+  "browser_pages": [
+    "lookup-page-a-533-495208",
+    "lookup-page-b-533-495208"
+  ],
+  "browser_targets": [
+    "65B320CCB3FFEDFE30CC95DC594BF922",
+    "8B544406857B973E32D6B08E4377131F"
+  ],
+  "session_id": "s495268-1"
+}
