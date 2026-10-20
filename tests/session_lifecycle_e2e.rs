@@ -5418,6 +5418,58 @@ fn launch_app_names_a_socket_path_in_a_host_directory_the_session_cannot_see() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_without_expected_window_rejects_invisible_socket_path() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The socket does not exist yet, so only its host parent directory is probed.
+    let directory =
+        std::env::temp_dir().join(format!("kwin-mcp-e2e-socket-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("host directory");
+    let socket = directory.join("sock");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let refused = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command": format!("true {}", socket.display()), "expect_window": false}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["reason"], "path_not_visible",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["data"]["path"],
+        json!(socket.display().to_string()),
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not visible in the session")),
+        "{refused}"
+    );
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, ChatGPT, input devices, and a live GPU session"]
 fn launch_chatgpt_with_disk_backed_host_tmpdir() {
     assert_eq!(
@@ -10244,7 +10296,41 @@ fn session_shares_only_host_shared_dir_with_the_host() {
     assert!(sandbox_log.contains("stderr-marker"), "{sandbox_log}");
     assert!(!sandbox_log.contains("stdout-marker"), "{sandbox_log}");
 
-    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    let socket = shared.join("host-connect.sock");
+    let launched_socket = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({
+            "command": format!(
+                "ruby -rsocket -e 'server = UNIXServer.new(ARGV.fetch(0)); client = server.accept; client.write(\"shared-socket-ok\"); client.close; server.close' '{}'",
+                socket.display()
+            ),
+            "expect_window": false,
+        }),
+    );
+    assert_ne!(
+        launched_socket["result"]["isError"], true,
+        "{launched_socket}"
+    );
+    assert!(launched_socket["error"].is_null(), "{launched_socket}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut connected = UnixStream::connect(&socket).expect("host connects to session socket");
+    connected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("socket deadline");
+    let mut reply = String::new();
+    connected
+        .read_to_string(&mut reply)
+        .expect("read session reply");
+    assert_eq!(reply, "shared-socket-ok");
+
+    let stopped = call_tool(&mut client, 5, "session_stop", json!({}));
     assert!(
         !stopped["result"]["isError"].as_bool().unwrap_or(false),
         "{stopped}"

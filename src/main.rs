@@ -9755,7 +9755,7 @@ fn parse_launch_pid(text: &str) -> Option<u32> {
 /// Waits up to LAUNCH_PID_TIMEOUT for the command shell to record its PID. The
 /// shell writes it before running the command, so this normally returns within
 /// one poll interval.
-async fn poll_launch_pid(path: &Path) -> Option<u32> {
+async fn poll_launch_pid(path: &Path, path_error: &Path, exit_status: &Path) -> Option<u32> {
     let deadline = tokio::time::Instant::now() + LAUNCH_PID_TIMEOUT;
     loop {
         if let Some(pid) = std::fs::read_to_string(path)
@@ -9764,7 +9764,7 @@ async fn poll_launch_pid(path: &Path) -> Option<u32> {
         {
             return Some(pid);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if path_error.exists() || exit_status.exists() || tokio::time::Instant::now() >= deadline {
             return None;
         }
         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
@@ -14156,16 +14156,20 @@ impl KwinMcp {
             progress.stage = "reading windows before launch";
         }
         let mut baseline = WindowBaseline::PreLaunch;
-        let (mut prev_window_id, mut previous_windows) = match tokio::time::timeout(
-            LAUNCH_BASELINE_TIMEOUT,
-            window_baseline(&conn, &kwin_unique, &xdg),
-        )
-        .await
-        {
-            Ok(read) => read,
-            Err(_) => {
-                baseline = WindowBaseline::AfterSubmit;
-                (None, None)
+        let (mut prev_window_id, mut previous_windows) = if params.expect_window == Some(false) {
+            (None, None)
+        } else {
+            match tokio::time::timeout(
+                LAUNCH_BASELINE_TIMEOUT,
+                window_baseline(&conn, &kwin_unique, &xdg),
+            )
+            .await
+            {
+                Ok(read) => read,
+                Err(_) => {
+                    baseline = WindowBaseline::AfterSubmit;
+                    (None, None)
+                }
             }
         };
 
@@ -14173,12 +14177,8 @@ impl KwinMcp {
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
         let command_paths = launch_path_words(&params.command);
-        // The command shell records its own PID before anything else runs.
         let pid_file = xdg.join(format!("launch-{launch_id}.pid"));
-        let mut checked_command = format!(
-            "echo $$ > {}\n",
-            shell_quote(&pid_file.display().to_string())
-        );
+        let mut checked_command = String::new();
         for (path, probe) in launch_path_probes(&params.command, |path| {
             std::fs::symlink_metadata(path).is_ok()
         }) {
@@ -14189,6 +14189,11 @@ impl KwinMcp {
                 shell_quote(&path_error_file.display().to_string()),
             ));
         }
+        // Record the command shell only after all path preflight checks pass.
+        checked_command.push_str(&format!(
+            "echo $$ > {}\n",
+            shell_quote(&pid_file.display().to_string())
+        ));
         checked_command.push_str(&params.command);
         // The command's exit status, written when it exits: a launch that ends
         // before a window appears is reported instead of waited out.
@@ -14264,7 +14269,7 @@ impl KwinMcp {
             if let Ok(mut progress) = progress.lock() {
                 progress.stage = "reading the command's PID";
             }
-            let pid = poll_launch_pid(&pid_file).await;
+            let pid = poll_launch_pid(&pid_file, &path_error_file, &exit_file).await;
             let _ = std::fs::remove_file(&pid_file);
             if let Some(error) = invisible_launch_path(&path_error_file) {
                 return Err(error);
