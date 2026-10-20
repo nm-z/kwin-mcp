@@ -233,6 +233,8 @@ class InputDeliveryProbe
     result = response.fetch('result').fetch('structuredContent')
     raise 'cleared composer suggested blind retry' unless result['retry_safe'] == false && result['submission_complete']
     raise 'cleared composer lacks independent complete text' unless tree.include?(text)
+    # Verify the application contents independently of the accessibility receipt.
+    copy_field(text, 'context-cleared')
 
     nested_rich_contenteditable
     unverified_embedded_rich_text
