@@ -587,6 +587,30 @@ and word-boundary timing. Scrolls preserve the requested total in timed bursts.
 See [profile sources and fitting method](data/README.md) for assumptions and
 source-data terms. No host input is recorded.
 
+## Typing target changes
+
+For single-line printable ASCII in a Chromium-family window, `keyboard_type`
+requires an observable focused editable target before sending keys. If that
+preflight fails, `text_target_unavailable` reports zero submitted characters
+and a safe retry after inspecting and focusing the intended field. Password
+fields and terminals retain their explicit unverified paths; Tab/Return input
+can intentionally change the focused field and is not field-verified.
+
+While typing, the server watches the original accessible object's focus and
+visibility when available, and the active KWin window identity. For single-line
+browser text it also watches the window caption, because Chromium can retain
+focus/visibility states on a background tab's old field. A caption update can
+therefore conservatively stop typing even when the same editor remains open. A lost target
+or unavailable bounded observation cancels the remaining keystrokes, releases
+keys held by this operation, and returns `target_changed` or
+`target_unverifiable` with partial submission counts and `retry_safe: false`.
+Inspect both the original field and the newly focused surface before retrying.
+
+These checks are polling observations, not an atomic reservation of focus.
+Some input may already have arrived when a change is detected. The counters
+describe submitted key presses, not application receipt, and a successful
+editable-value check does not establish application form submission.
+
 ## Input logs
 
 `session_start` and `session_list` report each session's `input_log` path.

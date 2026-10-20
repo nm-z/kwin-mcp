@@ -51,3 +51,23 @@ controlled 72-character limit, a zero-length web field, and a 1,700-character
 multiline Markdown value. It independently copies application text through
 native Ctrl+A/Ctrl+C and the session clipboard, records phase timings, saves
 screenshots, and cleans up its own session.
+
+## Typing focus changes
+
+```bash
+ruby tests/typing_focus_e2e.rb /path/to/kwin-mcp /path/to/evidence
+```
+
+This production-stdio regression creates fresh Chrome profiles in an owned
+session and verifies normal typing by native copy. An application process
+already launched inside the session waits for a fixture gate, then opens a
+different window or a different tab after the journal confirms eight uppercase
+key presses. The tab case requires the KWin window ID to remain unchanged.
+
+Both cases require a partial `target_changed` error, flushed key releases in
+the input journal, and correct lowercase typing afterward. Native copies from
+both fields record the characters actually observed, including any character
+that reached the new field before cancellation. A focused noneditable browser
+button must fail preflight with zero key events. The script saves JSON, input
+journal and screenshots, then stops its session and removes its private HOME
+and temp root. Chrome and the ordinary desktop dependencies are required.
