@@ -834,7 +834,7 @@ storage. Do not remove that storage manually while the operation still uses it.
 When sandbox startup fails, the response preserves available sandbox stderr
 before autoclean removes its log. Long logs include only a bounded tail and a
 truncation flag. The D-Bus readiness marker is published only after its socket
-exists; a sandbox that exits before a startup signal reports its exit status.
+exists; a sandbox that exits before a startup signal reports its exit status. A readiness timeout also reports the owned sandbox PID, its process state, and its kernel wait channel before cleanup. This distinguishes a stopped launcher from a running or blocked one even when stderr is empty. Only bounded process-state fields are captured; command lines and environments are not included.
 Run `ruby tests/startup_diagnostics_e2e.rb SERVER EVIDENCE` to exercise real
 D-Bus failures, noisy diagnostics, normal KWin startup, and cleanup.
 

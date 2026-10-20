@@ -3312,6 +3312,36 @@ impl Eis {
     }
 }
 
+/// Preserve the owned startup process's state before cleanup destroys the
+/// evidence. Only bounded state and wait-channel fields are read, never its
+/// command line, environment, or another session's process inventory.
+fn startup_sandbox_process_diagnostic(pid: u32) -> String {
+    use std::io::Read;
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let read = |name: &str| -> std::io::Result<String> {
+        let mut text = String::new();
+        std::fs::File::open(root.join(name))?
+            .take(4096)
+            .read_to_string(&mut text)?;
+        Ok(text)
+    };
+    let state = read("status")
+        .map(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("State:"))
+                .map(str::trim)
+                .unwrap_or("unavailable")
+                .chars()
+                .take(128)
+                .collect::<String>()
+        })
+        .unwrap_or_else(|error| format!("unavailable ({error})"));
+    let wait_channel = read("wchan")
+        .map(|text| text.trim().chars().take(128).collect::<String>())
+        .unwrap_or_else(|error| format!("unavailable ({error})"));
+    format!("startup sandbox process pid={pid} state={state} wait_channel={wait_channel}")
+}
+
 async fn wait_for_sandbox_path(
     path: &std::path::Path,
     description: &str,
@@ -3335,9 +3365,10 @@ async fn wait_for_sandbox_path(
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "{description} did not appear at {} within {}s",
+                "{description} did not appear at {} within {}s; {}",
                 path.display(),
-                STARTUP_TIMEOUT.as_secs()
+                STARTUP_TIMEOUT.as_secs(),
+                startup_sandbox_process_diagnostic(child.id())
             ));
         }
         tokio::time::sleep(STARTUP_POLL).await;

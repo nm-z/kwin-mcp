@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32603,
+    "message": "kwin-mcp v0.1.2.1 (05b937d) — dbus-ready marker did not appear at /var/tmp/kw450-20261019-982298-m10rdd/runtime/kwin-mcp-982306-1/dbus-ready within 15s; sandbox stderr was empty before cleanup; retry session_stop with session_id=s982306-1",
+    "data": {
+      "input_log": "/var/tmp/kw450-20261019-982298-m10rdd/stopped/home/.local/state/kwin-mcp/input/s982306-1.jsonl",
+      "sandbox_stderr_path": "/var/tmp/kw450-20261019-982298-m10rdd/stopped/home/.cache/kwin-mcp/kwin-mcp-982306-1/sandbox.log",
+      "sandbox_stderr_tail": "",
+      "sandbox_stderr_truncated": false,
+      "session_id": "s982306-1"
+    }
+  }
+}
