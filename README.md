@@ -374,6 +374,44 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## Chrome Load unpacked
+
+Chrome's **Load unpacked** dialog selects a directory. Use this procedure instead
+of assuming the file-upload Ctrl+L / file path / Alt+O sequence proves that an
+extension loaded:
+
+1. Make the extension directory, including `manifest.json`, available **inside
+   the isolated session**. A directory created on the host after `session_start`
+   may be hidden by the session's HOME overlay; create it through `launch_app`
+   in the session or confirm the session can read it.
+2. Launch Chrome with a separate profile for a probe, for example
+   `google-chrome-stable --user-data-dir="$HOME/.cache/kwin-extension-probe" --no-first-run`.
+   Open `chrome://extensions`, enable **Developer mode**, then click **Load unpacked**.
+3. In the chooser, send `keyboard_key` with `ctrl+l`, then `keyboard_type` with
+   the absolute extension directory path (for example,
+   `/tmp/kwin-extension-probe/`). Inspect a screenshot to confirm the
+   path. This chooser may report `delivery.status: unverified` when accessible
+   field text is unavailable; inspect the path before retrying the input.
+4. Click the chooser's top-right **Open**. The bottom **Select Folder** control
+   selects the chooser mode; it is not the accept button. If **Open** is disabled,
+   inspect the path and confirm the directory exists inside the session.
+5. Verify the named extension card appears and is enabled in `chrome://extensions`.
+   A dismissed chooser or an **Extension loaded** toast alone does not verify
+   that the extension is active. For an extension with a background service or
+   relay, also verify its expected operation.
+   Use a screenshot for this check: Chrome internal pages can return no
+   matching elements from `find_ui_elements` even when the card is visible.
+
+See the [raw chooser and enabled-card proof](docs/evidence/375/README.md) for a
+generated extension loaded through the production stdio server.
+
+The [#375 follow-up](https://github.com/nm-z/kwin-mcp/issues/375#issuecomment-6202937506)
+confirmed that `--disable-extensions-except` caused a load toast without the
+expected extension card or relay connection. For manual loading, launch the
+owned probe browser without that flag; if it is already running, restart only
+that owned browser. This launch configuration failure does not demonstrate an
+input-delivery failure.
+
 ## Input timing
 
 Agent mouse and keyboard tools accept `speed`, a positive timing multiplier
