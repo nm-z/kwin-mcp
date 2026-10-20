@@ -10127,3 +10127,67 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
     );
     desktop.stop_process();
 }
+
+#[test]
+#[ignore = "requires private KWin sessions, bubblewrap, input devices, and kdialog"]
+fn starting_another_session_preserves_existing_file_exports() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let output = client.home.join("exported-session-captures");
+    std::fs::create_dir_all(&output).expect("private export directory");
+    let session_path = "/tmp/prior-session-capture.png";
+    let mut sessions = Vec::new();
+    let mut expected = Vec::new();
+    for (index, title) in ["earlier-export-window", "later-export-window"].into_iter().enumerate() {
+        let request = 2 + u64::try_from(index).expect("request index") * 4;
+        let started = call_tool(&mut client, request, "session_start", json!({"width":800,"height":600,"browser_profiles":"fresh"}));
+        let id = session_handle(&started);
+        let launched = call_tool(&mut client, request + 1, "launch_app", json!({"session_id":id,"command":format!("kdialog --title {title} --msgbox {title}")}));
+        assert_eq!(launched["result"]["structuredContent"]["window_outcome"], "new", "{launched}");
+        let captured = call_tool(&mut client, request + 2, "screenshot", json!({"session_id":id}));
+        let capture = captured["result"]["structuredContent"]["path"].as_str().expect("session screenshot path");
+        let bytes = std::fs::read(capture).expect("independent screenshot bytes");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "capture is not PNG");
+        if let Some(artifacts) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+            let artifacts = PathBuf::from(artifacts);
+            std::fs::create_dir_all(&artifacts).expect("artifact directory");
+            std::fs::write(artifacts.join(format!("{title}.png")), &bytes).expect("retain capture");
+        }
+        // Both desktops use the same private /tmp name. Export must select
+        // the requested desktop rather than the most recently created one.
+        let command = format!("cp -- {} {session_path}", shlex::try_quote(capture).expect("quote capture path"));
+        let copied = call_tool(&mut client, request + 3, "launch_app", json!({"session_id":id,"command":command,"window_timeout_seconds":1}));
+        assert_eq!(copied["result"]["structuredContent"]["exit_status"], 0, "{copied}");
+        sessions.push((id, workdir(&started)));
+        expected.push(bytes);
+    }
+    assert_ne!(sessions[0].0, sessions[1].0, "second start reused the first handle");
+    assert_ne!(expected[0], expected[1], "distinct GUI fixtures produced identical captures");
+    let listed = call_tool(&mut client, 10, "session_list", json!({}));
+    let records = listed["result"]["structuredContent"]["sessions"].as_array().expect("live session records");
+    for (id, _) in &sessions {
+        assert!(records.iter().any(|record| record["session_id"] == id.as_str()), "live handle missing: {listed}");
+    }
+    for (index, (id, _)) in sessions.iter().enumerate() {
+        let destination = output.join(format!("session-{index}.png"));
+        let exported = call_tool(&mut client, 11 + u64::try_from(index).expect("export index"), "export_file", json!({"session_id":id,"session_path":session_path,"host_path":destination}));
+        assert_eq!(exported["result"]["structuredContent"]["status"], "exported", "{exported}");
+        assert_eq!(std::fs::read(&destination).expect("independent exported bytes"), expected[index], "export came from another session");
+    }
+    let stopped = call_tool(&mut client, 13, "session_stop", json!({"session_id":sessions[1].0}));
+    assert_eq!(stopped["result"]["structuredContent"]["status"], "stopped", "{stopped}");
+    assert!(!sessions[1].1.exists(), "later session workdir remains");
+    let again = output.join("earlier-after-later-stop.png");
+    let exported = call_tool(&mut client, 14, "export_file", json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":again}));
+    assert_eq!(exported["result"]["structuredContent"]["status"], "exported", "{exported}");
+    assert_eq!(std::fs::read(&again).expect("earlier export after later stop"), expected[0]);
+    let stopped = call_tool(&mut client, 15, "session_stop", json!({"session_id":sessions[0].0}));
+    assert_eq!(stopped["result"]["structuredContent"]["status"], "stopped", "{stopped}");
+    assert!(!sessions[0].1.exists(), "earlier session workdir remains");
+    let stale = call_tool(&mut client, 16, "export_file", json!({"session_id":sessions[0].0,"session_path":session_path,"host_path":output.join("must-not-exist.png")}));
+    assert_eq!(stale["error"]["data"]["session_status"], "stopped", "{stale}");
+    assert!(!output.join("must-not-exist.png").exists(), "stopped-session export wrote a file");
+    eprintln!("PASS: two distinct live handles, three byte-exact PNG exports, earlier handle survives later stop, stopped handle rejected, both workdirs removed");
+    client.stop_process();
+}
