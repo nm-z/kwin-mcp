@@ -8,7 +8,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 
 | Tool | Description |
 |---|---|
-| `session_start` | Start an isolated KDE Wayland session without opening a host viewer. Must be called first. |
+| `session_start` | Start an isolated KDE Wayland session without opening a host viewer. Must be called first. Returns `host_shared_dir`, the one `/tmp` directory shared with the host. |
 | `session_stop` | Tear down the session and all container processes. |
 | `viewer_open` | Open the live host viewer for the current session (reports ready, starting, or unavailable with the reason). |
 | `viewer_close` | Close the host viewer without stopping the isolated session. |
@@ -23,7 +23,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `mouse_drag` | Drag from one window-relative position to another. |
 | `keyboard_type` | Type a string of text. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
-| `launch_app` | Launch an application and wait for its window. |
+| `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 | `import_file` | Refresh a running session's file from the host, with byte verification and explicit overwrite control. |
@@ -343,7 +343,7 @@ kwin-mcp (host process)
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
 ```
 
-Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
+Session storage: sockets and small files stay in `/tmp/kwin-mcp-<pid>-<number>` (RAM; see [Host visibility](#host-visibility) for what the host can reach). The `$HOME` overlay upper, work and staging layers are on disk in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/kwin-mcp-<pid>-<number>`, which the session itself sees as an empty directory. `session_start` refuses to start with less than 2 GiB free there, and `session_stop` (or the leaked-workdir sweep) deletes it. With `--autoclean`, failed startup also removes the disk overlay before removing the temporary workdir. If either removal fails, cleanup keeps ownership for a `session_stop` retry and reports the failing path.
 
 `TMPDIR` overrides the runtime storage root. Linux pathname Unix sockets allow
 at most 107 bytes, excluding the terminating NUL, for the entire socket path.
@@ -418,6 +418,32 @@ All coordinates are window-relative — window position is added internally via 
 ### Host socket exposure
 
 At `session_start`, active pathname sockets beneath `$HOME` and non-graphical user-runtime sockets are exposed automatically. Sockets owned by processes attached to the host display, desktop application scopes, input devices, or the desktop session slice remain isolated. Parent directories are mounted read-only, which prevents host file writes but does not restrict operations offered by each exposed socket protocol. Hidden parent mounts also expose sibling files through their internal `/run/kwin-mcp-host-sockets` paths, except the host session D-Bus socket and the `keyring` and `p11-kit` entries of the user runtime directory, which are masked and never exposed. Socket replacements at discovered names remain live; new socket names require a new session.
+
+### Host visibility
+
+The [live Unix socket regression](docs/shared-ipc-511/README.md) verifies shared
+connections, the overlay backing-path failure, private `/tmp`, and cleanup.
+
+The session and the host share the paths listed here. Other session writes stay in the session: `/tmp` is private, and writes under `$HOME` go to an overlay on the host.
+
+- `host_shared_dir` is the directory `session_start` and running entries in `session_list` return; it equals `workdir`, `/tmp/kwin-mcp-<pid>-<number>`. It is bind-mounted at the same absolute path inside the session and is the session's `XDG_RUNTIME_DIR`. It is the only `/tmp` directory shared with the host, so sockets, FIFOs, logs and output that host processes must read or connect to belong there. Host tools use the same path.
+- The rest of `/tmp` inside the session is a private tmpfs. Its files and sockets are invisible to the host, and host `/tmp` contents other than `host_shared_dir` are hidden from the session. `launch_app` checks literal absolute path arguments and reports one that the session cannot see.
+- `$HOME` inside the session is an overlay. Reads see the live host home. Writes go to `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/<name>/overlay-upper` on the host and do not appear at the host's `$HOME`; `export_file` copies one out. A Unix socket that a session process creates under `$HOME` cannot be connected from the host: `connect()` fails with `Connection refused` even though the file exists in the overlay. Put host-facing sockets under `host_shared_dir`.
+- `/sys/fs/cgroup` is read-only in the session, so `mkdir` under it fails with `Read-only file system`. A program that needs a writable delegated cgroup runs on the host, under `systemd-run --user --scope -p Delegate=yes`, and reaches session processes through sockets in `host_shared_dir`.
+- Session stdout is discarded. Session stderr, including each application's stderr, goes to `sandbox.log` in `${XDG_CACHE_HOME:-~/.cache}/kwin-mcp/<name>/`, a host-only directory. To read a command's output from the host, redirect it into `host_shared_dir`.
+- `launch_app` with `expect_window: false` returns as soon as a command is submitted, for a command that backgrounds itself or never maps a window. It reports the command shell's PID inside the session (not a host PID) and `exit_status` if the command has already exited.
+- `/etc/ssh/ssh_config.d/*.conf` files that ssh would reject inside the sandbox (root-owned, which the sandbox shows with an unmapped owner, or group- or other-writable) are replaced by copies owned by the session user with mode 600. The copies are taken at `session_start`, so host edits to those files apply to the next session.
+
+For a host helper that must reach a session daemon, start the daemon inside the session with its socket under `host_shared_dir`, and run the client on the host with the same path:
+
+```bash
+# Inside the session, through launch_app with expect_window: false
+mkdir -p "$XDG_RUNTIME_DIR/obs"
+<daemon> "$XDG_RUNTIME_DIR/obs/daemon.sock" >"$XDG_RUNTIME_DIR/obs/daemon.log" 2>&1 &
+
+# On the host, using the host_shared_dir from session_start
+systemd-run --user --scope -q -p Delegate=yes <client> /tmp/kwin-mcp-<pid>-<number>/obs/daemon.sock
+```
 
 ## Build
 

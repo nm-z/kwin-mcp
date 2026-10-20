@@ -1,0 +1,9 @@
+{
+  "session_start_alias": true,
+  "session_list_alias": true,
+  "shared_socket_reply": "shared-511-1418004",
+  "overlay_backing_socket": "ECONNREFUSED",
+  "private_tmp_isolated": true,
+  "helper_stopped": true,
+  "session_cleanup": true
+}
