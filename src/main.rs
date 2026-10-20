@@ -8669,6 +8669,9 @@ struct WindowSnapshot {
     h: f64,
     #[serde(rename = "stackingOrder")]
     stacking_order: i32,
+    /// Screen rectangle including client-side shadows, before client cropping.
+    #[serde(default)]
+    buffer_geometry: [f64; 4],
 }
 
 impl WindowSnapshot {
@@ -8740,7 +8743,9 @@ async fn window_snapshots(
              active:w.active,minimized:w.minimized,modal:w.modal,transient:w.transient,\
              dialog:w.dialog,popup:w.popupWindow,\
              transientFor:w.transientFor ? w.transientFor.internalId.toString() : null,\
-             x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder\
+             x:g.x,y:g.y,w:g.width,h:g.height,stackingOrder:w.stackingOrder,\
+             buffer_geometry:[w.bufferGeometry.x,w.bufferGeometry.y,\
+               w.bufferGeometry.width,w.bufferGeometry.height]\
            });\
          }",
     )
@@ -13090,6 +13095,7 @@ impl KwinMcp {
         let mut frame_identity = None;
         let mut accessibility_bounds = None;
         let mut accessibility_coordinate_frame = None;
+        let mut accessibility_to_window_offset = None;
         let traversal = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
             use atspi::proxy::accessible::ObjectRefExt;
             use atspi::proxy::proxy_ext::ProxyExt;
@@ -13131,29 +13137,38 @@ impl KwinMcp {
                         .get_extents(atspi::CoordType::Screen)
                         .await
                         .map_err(KwinError::from)?;
-                    let same_size = [bounds.2, bounds.3]
-                        .into_iter()
-                        .zip([window.w, window.h])
-                        .all(|(actual, expected)| {
-                            (f64::from(actual) - expected).abs() <= A11Y_WINDOW_BOUNDS_TOLERANCE
-                        });
-                    let screen_origin = [bounds.0, bounds.1]
-                        .into_iter()
-                        .zip([origin_x, origin_y])
-                        .all(|(actual, expected)| {
-                            (f64::from(actual) - f64::from(expected)).abs()
-                                <= A11Y_WINDOW_BOUNDS_TOLERANCE
-                        });
-                    // Qt Wayland can return client-local extents even for a
-                    // Screen query. Bind by title and size, and retain that
-                    // observed frame origin instead of subtracting it twice.
-                    let client_origin = bounds.0 == 0 && bounds.1 == 0;
-                    if same_size && (screen_origin || client_origin) {
-                        frames.push((object.clone(), bounds, if screen_origin {
-                            "screen_pixels"
-                        } else {
-                            "window_client_pixels"
-                        }));
+                    // Wayland apps can report local bounds for Screen queries.
+                    // Qt uses the client, while Chrome includes its buffer's
+                    // invisible shadows. Match an observed KWin rectangle and
+                    // carry its actual offset into screenshot/client pixels.
+                    for (geometry, local_frame) in [
+                        ([window.x, window.y, window.w, window.h], "window_client_pixels"),
+                        (window.buffer_geometry, "window_buffer_pixels"),
+                    ] {
+                        let same_size = [bounds.2, bounds.3]
+                            .into_iter()
+                            .zip([geometry[2], geometry[3]])
+                            .all(|(actual, expected)| {
+                                (f64::from(actual) - expected).abs() <= A11Y_WINDOW_BOUNDS_TOLERANCE
+                            });
+                        #[expect(clippy::as_conversions)]
+                        let screen_origin = [geometry[0].round() as i32, geometry[1].round() as i32];
+                        let global = [bounds.0, bounds.1]
+                            .into_iter()
+                            .zip(screen_origin)
+                            .all(|(actual, expected)| {
+                                (f64::from(actual) - f64::from(expected)).abs()
+                                    <= A11Y_WINDOW_BOUNDS_TOLERANCE
+                            });
+                        let local = bounds.0 == 0 && bounds.1 == 0;
+                        if same_size && (global || local) {
+                            let offset = [
+                                i64::from(screen_origin[0]) - i64::from(origin_x) - i64::from(bounds.0),
+                                i64::from(screen_origin[1]) - i64::from(origin_y) - i64::from(bounds.1),
+                            ];
+                            frames.push((object.clone(), bounds, if global { "screen_pixels" } else { local_frame }, offset));
+                            break;
+                        }
                     }
                 }
             }
@@ -13170,11 +13185,12 @@ impl KwinMcp {
                     })),
                 ));
             }
-            let (object, bounds, coordinates) = frames.pop().ok_or_else(|| {
+            let (object, bounds, coordinates, offset) = frames.pop().ok_or_else(|| {
                 McpError::internal_error("The accessibility frame disappeared", None)
             })?;
             accessibility_bounds = Some(bounds);
             accessibility_coordinate_frame = Some(coordinates);
+            accessibility_to_window_offset = Some(offset);
             let frame = object.as_accessible_proxy(&bus).await.map_err(KwinError::from)?;
             frame_identity = Some(format!("{}{}", frame.inner().destination(), frame.inner().path()));
             drop(frame);
@@ -13196,24 +13212,22 @@ impl KwinMcp {
                 }
                 if let Ok(node) = atspi_node(&acc).await {
                     let (x, y, w, h) = node.bounds;
-                    let in_window = i64::from(x) < i64::from(bounds.0) + i64::from(bounds.2)
-                        && i64::from(y) < i64::from(bounds.1) + i64::from(bounds.3)
-                        && i64::from(x) + i64::from(w) > i64::from(bounds.0)
-                        && i64::from(y) + i64::from(h) > i64::from(bounds.1);
+                    let Ok(relative_x) = i32::try_from(i64::from(x) + offset[0]) else {
+                        continue;
+                    };
+                    let Ok(relative_y) = i32::try_from(i64::from(y) + offset[1]) else {
+                        continue;
+                    };
+                    let in_window = f64::from(relative_x) < window.w
+                        && f64::from(relative_y) < window.h
+                        && i64::from(relative_x) + i64::from(w) > 0
+                        && i64::from(relative_y) + i64::from(h) > 0;
                     if node.is_useful()
                         && in_window
                         && node.states.iter().any(|state| state == "visible")
                         && (node.name.to_lowercase().contains(&query)
                             || node.role.to_lowercase().contains(&query))
                     {
-                        // Project from the matched accessibility frame into
-                        // the same client pixels used by input and screenshots.
-                        let Some(relative_x) = x.checked_sub(bounds.0) else {
-                            continue;
-                        };
-                        let Some(relative_y) = y.checked_sub(bounds.1) else {
-                            continue;
-                        };
                         let flags = node.states.iter()
                             .filter(|state| *state == "disabled" || *state == "focused")
                             .map(|state| format!("\t{state}"))
@@ -13241,10 +13255,17 @@ impl KwinMcp {
             }
             Err(_) => true,
         };
-        let (_, _, after) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let after = window_snapshots(&conn, &kwin_unique, &xdg)
+            .await?
+            .into_iter()
+            .find(|window| window.active)
+            .ok_or_else(|| {
+                McpError::internal_error("The active window disappeared during lookup", None)
+            })?;
         if after.id != window.id
             || after.title != window.title
             || [after.x, after.y, after.w, after.h] != [window.x, window.y, window.w, window.h]
+            || after.buffer_geometry != window.buffer_geometry
         {
             return Err(McpError::internal_error(
                 "The active window changed during lookup; observe it again before clicking.",
@@ -13272,10 +13293,11 @@ impl KwinMcp {
             serde_json::json!({
                 "matches": out.len(), "query": params.query, "results": results,
                 "elements": elements, "window": window, "accessibility_frame": frame_identity,
-            "accessibility_bounds": accessibility_bounds,
-            "accessibility_coordinate_frame": accessibility_coordinate_frame,
+                "accessibility_bounds": accessibility_bounds,
+                "accessibility_coordinate_frame": accessibility_coordinate_frame,
+                "accessibility_to_window_offset": accessibility_to_window_offset,
                 "coordinate_frame": "window_client_pixels",
-            "coordinate_origin": {"x": origin_x, "y": origin_y},
+                "coordinate_origin": {"x": origin_x, "y": origin_y},
                 "visibility": "accessibility_reported", "occlusion": "not_checked",
                 "incomplete": incomplete,
             }),
@@ -17082,6 +17104,7 @@ mod window_resolution_tests {
             w: 100.0,
             h: 100.0,
             stacking_order: 0,
+            buffer_geometry: [0.0, 0.0, 100.0, 100.0],
         }
     }
 
