@@ -1,0 +1,39 @@
+{
+  "base_revision": "05b937d1c2ce50c52b80c878e0d1c12555a3ef44",
+  "host": "engi",
+  "session_id": "s1011399-1",
+  "browser_profiles": "fresh",
+  "secure_parse_exit": 0,
+  "insecure_include_exit": 255,
+  "insecure_include_diagnostic": "Bad owner or permissions on /tmp/kwin-mcp-1011399-1/insecure.conf\n",
+  "host_unchanged": true,
+  "system_files": {
+    "/etc/ssh/ssh_config": {
+      "target": "/etc/ssh/ssh_config",
+      "uid": 0,
+      "gid": 0,
+      "mode": 420,
+      "device": 66307,
+      "inode": 1180833,
+      "sha256": "95eadabb50f4a05a900c516aebfafbb87e69c6867c2ceb2363ce654dcbbfe795"
+    },
+    "/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf": {
+      "target": "/usr/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf",
+      "uid": 0,
+      "gid": 0,
+      "mode": 420,
+      "device": 66307,
+      "inode": 2384292,
+      "sha256": "245d24bad54579db838f4cab0a472b5880e60a4851fc75d6ca0df49263ebe767"
+    },
+    "/etc/ssh/ssh_config.d/30-libvirt-ssh-proxy.conf": {
+      "target": "/etc/ssh/ssh_config.d/30-libvirt-ssh-proxy.conf",
+      "uid": 0,
+      "gid": 0,
+      "mode": 420,
+      "device": 66307,
+      "inode": 1179710,
+      "sha256": "ba270f40ef7d7120736d7c22f39f2c24104d24ef5a2d8a078bc1f85df7294a26"
+    }
+  }
+}

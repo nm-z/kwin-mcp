@@ -11267,6 +11267,8 @@ impl KwinMcp {
         use std::os::unix::fs::MetadataExt;
         let identity = std::fs::metadata("/proc/self")
             .map_err(|error| ver_err(format!("read current UID and GID: {error}")))?;
+        let ssh_config_bindings = prepare_ssh_config_bindings(&self.path, identity.uid())
+            .map_err(|error| ver_err(format!("prepare system SSH configuration: {error:#}")))?;
         let uid = identity.uid().to_string();
         let gid = identity.gid().to_string();
         // pasta gives the session its own loopback. Into the host it forwards
@@ -11469,6 +11471,9 @@ impl KwinMcp {
             &fonts_conf_str,
             &home_fonts_conf,
         ]);
+        for (copy, source) in &ssh_config_bindings {
+            cmd.arg("--ro-bind").arg(copy).arg(source);
+        }
         // NVIDIA Vulkan clients need character devices outside /dev/dri. Keep them
         // available when all DRM nodes are exposed or a selected node is NVIDIA-backed,
         // without granting them to sessions selecting only another renderer.
@@ -14496,6 +14501,132 @@ fn parse_memory_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Resu
 
 /// IPv4 address and prefix on the host interface with the preferred default route.
 /// Leave pasta's address selection unchanged when the host has no IPv4 default.
+/// Preserve OpenSSH's secure system config semantics across the user namespace.
+fn prepare_ssh_config_bindings(
+    xdg_dir: &std::path::Path,
+    session_uid: u32,
+) -> anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    use anyhow::Context;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    fn needs_copy(metadata: &std::fs::Metadata, session_uid: u32) -> bool {
+        metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.uid() != session_uid
+            && metadata.mode() & 0o022 == 0
+    }
+
+    let include_dir = std::path::Path::new("/etc/ssh/ssh_config.d");
+    let mut candidates = vec![std::path::PathBuf::from("/etc/ssh/ssh_config")];
+    match std::fs::read_dir(include_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .context("read system SSH configuration directory entry")?
+                    .path();
+                if path.extension() == Some(std::ffi::OsStr::new("conf")) {
+                    candidates.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read system SSH configuration directory {}",
+                    include_dir.display()
+                )
+            });
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let owned_dir = xdg_dir.join("ssh-config-owned");
+    let mut owned_dir_created = false;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut bindings = Vec::new();
+    for source in candidates {
+        let initial_metadata = match std::fs::metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect system SSH configuration {}", source.display())
+                });
+            }
+        };
+        if !needs_copy(&initial_metadata, session_uid) {
+            continue;
+        }
+        let mut source_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&source)
+            .with_context(|| format!("open system SSH configuration {}", source.display()))?;
+        let opened_metadata = source_file
+            .metadata()
+            .with_context(|| format!("inspect opened SSH configuration {}", source.display()))?;
+        if !needs_copy(&opened_metadata, session_uid) {
+            continue;
+        }
+        let canonical = source
+            .canonicalize()
+            .with_context(|| format!("resolve system SSH configuration {}", source.display()))?;
+        let canonical_metadata = std::fs::metadata(&canonical)
+            .with_context(|| format!("inspect SSH configuration target {}", canonical.display()))?;
+        if opened_metadata.dev() != canonical_metadata.dev()
+            || opened_metadata.ino() != canonical_metadata.ino()
+        {
+            anyhow::bail!(
+                "system SSH configuration {} changed while preparing the session",
+                source.display()
+            );
+        }
+        if !needs_copy(&canonical_metadata, session_uid) || !seen.insert(canonical.clone()) {
+            continue;
+        }
+        if !owned_dir_created {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&owned_dir)
+                .with_context(|| {
+                    format!(
+                        "create private SSH configuration directory {}",
+                        owned_dir.display()
+                    )
+                })?;
+            std::fs::set_permissions(&owned_dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "protect SSH configuration directory {}",
+                        owned_dir.display()
+                    )
+                })?;
+            owned_dir_created = true;
+        }
+        let copy = owned_dir.join(format!("{:04}.conf", bindings.len()));
+        let mut copy_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&copy)
+            .with_context(|| format!("create owned SSH configuration {}", copy.display()))?;
+        copy_file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("protect owned SSH configuration {}", copy.display()))?;
+        std::io::copy(&mut source_file, &mut copy_file).with_context(|| {
+            format!(
+                "copy system SSH configuration {} to {}",
+                source.display(),
+                copy.display()
+            )
+        })?;
+        bindings.push((copy, canonical));
+    }
+    Ok(bindings)
+}
+
 fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
     let routes = std::fs::read_to_string("/proc/net/route")?;
     let mut default: Option<(&str, u32)> = None;
