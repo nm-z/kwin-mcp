@@ -41,6 +41,28 @@ This mode opens a synthetic message dialog and expects the focus wait to time
 out without any `keyboard_type` or `keyboard_key` call. Both modes log their
 production stdio requests and responses in `rpc.jsonl`.
 
+## Held terminal punctuation (#472)
+
+```bash
+KWIN_MCP_E2E_SERVER="$PWD/target/debug/kwin-mcp" \
+KWIN_MCP_TEST_ARTIFACT_DIR="$PWD/tests/evidence/terminal-punctuation" \
+ruby tests/input_delivery_e2e.rb terminal_punctuation
+```
+
+This mode opens a real Konsole in a 2560×1440 desktop. A shell `read -r`
+accepts literal input and writes it to a private session file; the typed payload
+is never executed. It includes the reported hyphenated pathname and an
+intentional double hyphen, so both extra repeats and omitted repeats change the
+independently exported result.
+
+Typing uses `speed: 0.1` to exercise long sampled holds and the existing hold
+cap added in commit `ebc9ad8`. The run checks the actual terminal bytes separately
+from compositor acknowledgment and generated-key counts. It records the input
+journal, observed hold durations, receipt, exact requested/exported bytes, and a
+screenshot. At least five character holds must last 200ms to establish that the
+slow-input path was exercised. Matching bytes in this finite run do not prove
+delivery under every possible compositor or host stall.
+
 ## Cleared composer after Delete (#288)
 
 Build the production server, then run this mode in a new artifact directory:

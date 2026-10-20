@@ -5,6 +5,7 @@ require 'json'
 require 'open3'
 require 'timeout'
 require 'fileutils'
+require 'shellwords'
 require_relative 'electron_text_fixture'
 
 class InputDeliveryProbe
@@ -44,12 +45,13 @@ class InputDeliveryProbe
         clientInfo: { name: 'input-delivery-e2e', version: '1' })
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
-    start = call('session_start', width: width, height: height)
+    start = call('session_start', width: width, height: height, browser_profiles: 'fresh', startup_timeout_seconds: 60)
     assert_success(start)
     @started = true
     @workdir = start.dig('result','structuredContent','workdir')
     @scope = start.dig('result','structuredContent','memory_limits','unit')
     @session_id = start.dig('result', 'structuredContent', 'session_id')
+    @input_log = start.dig('result', 'structuredContent', 'input_log')
     raise 'server lacks per-session IDs' unless @session_id
   rescue StandardError
     stop
@@ -432,6 +434,54 @@ class InputDeliveryProbe
     screen('terminal-after-return')
   end
 
+  def terminal_punctuation
+    # Read literal input rather than executing it. Keep a shell open after the
+    # read so the real Konsole window remains available for a final screenshot.
+    reader = %q{printf 'Punctuation input> '; IFS= read -r line; printf '%s\n' "$line" > /tmp/kw472-punctuation; printf '\nRecorded\n'; exec bash --noprofile --norc}
+    command = ['konsole', '--separate', '--nofork', '-e', 'bash', '--noprofile', '--norc', '-c', reader].shelljoin
+    launched = assert_success(call('launch_app', command: command))
+    wait_for_terminal(launched.fetch('window'))
+    requested = "/tmp/asmux35-old2560.ctl --flag=1\n"
+    File.write(File.join(@artifacts, 'terminal-punctuation-request.txt'), requested)
+    began = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    result = assert_success(call('keyboard_type', text: requested, speed: 0.1))
+    type_request_id = @id
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - began
+    delivery = result.fetch('delivery')
+    raise 'terminal punctuation submission did not complete' unless result['submission_complete'] && result['submitted_characters'] == requested.length
+    raise 'terminal punctuation lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise 'terminal punctuation incorrectly verified application text' unless delivery['status'] == 'unverified'
+    raise 'terminal punctuation suggested blind retry' unless result['retry_safe'] == false
+    assert_success(call('wait_for_file', session_path: '/tmp/kw472-punctuation', timeout_seconds: 10, stable_for_ms: 100))
+    destination = File.join(@artifacts, 'terminal-punctuation-output.txt')
+    assert_success(call('export_file', session_path: '/tmp/kw472-punctuation', host_path: destination))
+    observed = File.binread(destination)
+    raise 'session_start did not report its input journal' unless @input_log
+    FileUtils.cp(@input_log, File.join(@artifacts, 'terminal-punctuation-input.jsonl'))
+    records = File.readlines(@input_log).map { |line| JSON.parse(line) }
+    keys = records.select do |record|
+      record.dig('tool', 'name') == 'keyboard_type' &&
+        record.dig('tool', 'request_id') == type_request_id &&
+        record['type'] == 'event' && record['event'] == 'key'
+    end
+    presses = keys.select { |key| key['pressed'] }.filter_map { |key| key['character'] }.join
+    holds = keys.reject { |key| key['pressed'] }.filter_map { |key| key['hold_ns'] if key['character'] }
+    long_holds = holds.count { |hold| hold >= 200_000_000 }
+    proof = { requested_characters: requested.length, observed_bytes: observed.bytesize,
+              speed: 0.1, elapsed_seconds: elapsed, independent_output_match: observed == requested,
+              generated_presses_match: presses == requested, completed_character_holds: holds.length,
+              holds_at_least_200ms: long_holds, longest_observed_hold_ms: holds.max.to_f / 1_000_000,
+              delivery: delivery, retry_safe: result['retry_safe'] }
+    File.write(File.join(@artifacts, 'terminal-punctuation-proof.json'), JSON.pretty_generate(proof))
+    screen('terminal-punctuation-after')
+    raise 'typed punctuation was duplicated, omitted, or changed in Konsole' unless observed == requested
+    raise 'generated press journal differs from requested text' unless presses == requested
+    raise 'character key-up journal is incomplete' unless holds.length == requested.length
+    raise 'key journal contains uncertain delivery' unless keys.all? { |key| key['delivery'] == 'flushed' }
+    raise 'slow-input fixture did not exercise held characters' unless long_holds >= 5
+    puts JSON.generate(proof)
+  end
+
   def terminal_blocked
     launched = assert_success(call('launch_app', command: 'konsole --separate --nofork -e bash --noprofile --norc'))
     assert_success(call('launch_app', command: 'kdialog --title "Terminal focus blocker" --msgbox "Leave the terminal probe blocked"'))
@@ -531,7 +581,13 @@ begin
     FileUtils.mkdir_p(File.join(artifacts, 'home'))
     File.write(File.join(artifacts, 'home', 'long-comment.html'), InputDeliveryProbe::LONG_COMMENT_HTML)
   end
-  dimensions = modes.include?('clear_retype') ? { width: 1920, height: 1080 } : {}
+  dimensions = if modes.include?('terminal_punctuation')
+                 { width: 2560, height: 1440 }
+               elsif modes.include?('clear_retype')
+                 { width: 1920, height: 1080 }
+               else
+                 {}
+               end
   probe = InputDeliveryProbe.new(server, artifacts, **dimensions)
   modes.each { |mode| probe.public_send(mode) }
   puts "PASS: #{modes.join(', ')}; evidence #{artifacts}"
