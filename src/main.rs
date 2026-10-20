@@ -7797,21 +7797,44 @@ async fn read_frame_file(frame: &std::fs::File, expected: usize) -> Result<Vec<u
 }
 
 async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
+    capture_source_inner(proxy, None).await
+}
+
+async fn capture_source_inner(
+    proxy: &KWinScreenShot2Proxy<'_>,
+    window: Option<&str>,
+) -> Result<Frame, McpError> {
     let frame = std::fs::File::from(
         nix::sys::memfd::memfd_create("kwin-mcp-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
             .map_err(KwinError::from)?,
     );
     let writer = std::os::fd::OwnedFd::from(frame.try_clone().map_err(KwinError::from)?);
     let mut opts = std::collections::HashMap::new();
-    opts.insert("include-cursor", zbus::zvariant::Value::from(true));
-    opts.insert("include-decoration", zbus::zvariant::Value::from(true));
+    opts.insert(
+        "include-cursor",
+        zbus::zvariant::Value::from(window.is_none()),
+    );
+    opts.insert(
+        "include-decoration",
+        zbus::zvariant::Value::from(window.is_none()),
+    );
+    opts.insert("include-shadow", zbus::zvariant::Value::from(false));
     opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
     // CaptureScreen composites all surfaces including popups (xdg_popup menus);
     // CaptureWindow only grabs the toplevel's own framebuffer and misses popups.
-    let meta = proxy
-        .capture_screen("Virtual-0", opts, zbus::zvariant::OwnedFd::from(writer))
-        .await
-        .map_err(KwinError::from)?;
+    let meta = match window {
+        Some(handle) => {
+            proxy
+                .capture_window(handle, opts, zbus::zvariant::OwnedFd::from(writer))
+                .await
+        }
+        None => {
+            proxy
+                .capture_screen("Virtual-0", opts, zbus::zvariant::OwnedFd::from(writer))
+                .await
+        }
+    }
+    .map_err(KwinError::from)?;
     let get_u32 = |k: &str| -> Result<u32, McpError> {
         let val = meta
             .get(k)
@@ -7820,10 +7843,130 @@ async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, 
         Ok(n)
     };
     let (width, height, stride) = (get_u32("width")?, get_u32("height")?, get_u32("stride")?);
+    let format = get_u32("format")?;
+    // Qt's RGB32/ARGB32 formats are native-endian words (BGRA bytes on
+    // little-endian hosts); RGBX/RGBA8888 are byte-ordered RGBA on every host.
+    // Normalize both capture paths before comparing their opaque interiors.
+    if !matches!(format, 16..=18) && !(cfg!(target_endian = "little") && matches!(format, 4..=6)) {
+        return Err(McpError::internal_error(
+            format!("unsupported screenshot QImage format {format}"),
+            None,
+        ));
+    }
+    if width == 0 || height == 0 || u64::from(stride) < u64::from(width) * 4 {
+        return Err(McpError::internal_error(
+            "invalid screenshot dimensions or stride",
+            None,
+        ));
+    }
+
     let expected =
         usize::try_from(u64::from(stride) * u64::from(height)).map_err(KwinError::from)?;
-    let pixels = read_frame_file(&frame, expected).await?;
+    let mut pixels = read_frame_file(&frame, expected).await?;
+    if matches!(format, 16..=18) {
+        let row_bytes = usize::try_from(u64::from(width) * 4).map_err(KwinError::from)?;
+        for row in pixels.chunks_exact_mut(usize::try_from(stride).map_err(KwinError::from)?) {
+            for pixel in row[..row_bytes].chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+    }
     Ok((width, height, stride, pixels))
+}
+
+fn transient_capture_error(window_id: &str, detail: impl Into<String>) -> McpError {
+    let detail = detail.into();
+    McpError::internal_error(
+        format!(
+            "screenshot: active dialog pixels could not be verified: {detail}. Wait for the dialog to finish drawing and retry."
+        ),
+        Some(serde_json::json!({
+            "reason":"transient_capture_unverified", "window_id":window_id,
+            "detail":detail, "retry_safe":true, "retry_after_ms":200,
+        })),
+    )
+}
+
+fn frame_pixel(frame: &Frame, x: u32, y: u32) -> Result<&[u8], String> {
+    if x >= frame.0 || y >= frame.1 {
+        return Err("pixel lies outside its frame".to_owned());
+    }
+    let start = usize::try_from(u64::from(y) * u64::from(frame.2) + u64::from(x) * 4)
+        .map_err(|_| "pixel offset overflow".to_owned())?;
+    let end = start.checked_add(4).ok_or("pixel end overflow")?;
+    frame
+        .3
+        .get(start..end)
+        .ok_or_else(|| "capture buffer is incomplete".to_owned())
+}
+
+/// Compare only the opaque client interior. A native window capture excludes
+/// separately composited popups; it is a verification reference, not our output.
+fn compare_transient_capture(
+    composite: &Frame,
+    reference: &Frame,
+    client_origin: (i32, i32),
+    client_size: (u32, u32),
+    cursor_positions: &[(i32, i32)],
+) -> Result<serde_json::Value, String> {
+    if (reference.0, reference.1) != client_size {
+        return Err(format!(
+            "window reference is {}x{}, expected client {}x{}",
+            reference.0, reference.1, client_size.0, client_size.1
+        ));
+    }
+    let inset_x = 8_u32.min(reference.0 / 4);
+    let inset_y = 8_u32.min(reference.1 / 4);
+    let mut visible = 0_u64;
+    let mut excluded = 0_u64;
+    let mut compared = 0_u64;
+    let mut mismatches = 0_u64;
+    for y in inset_y..reference.1.saturating_sub(inset_y) {
+        for x in inset_x..reference.0.saturating_sub(inset_x) {
+            let sx = i64::from(client_origin.0) + i64::from(x);
+            let sy = i64::from(client_origin.1) + i64::from(y);
+            if sx < 0 || sy < 0 || sx >= i64::from(composite.0) || sy >= i64::from(composite.1) {
+                continue;
+            }
+            visible += 1;
+            if cursor_positions.iter().any(|(cx, cy)| {
+                (sx - i64::from(*cx)).abs() <= 48 && (sy - i64::from(*cy)).abs() <= 48
+            }) {
+                excluded += 1;
+                continue;
+            }
+            let a = frame_pixel(
+                composite,
+                u32::try_from(sx).map_err(|_| "invalid screen x")?,
+                u32::try_from(sy).map_err(|_| "invalid screen y")?,
+            )?;
+            let b = frame_pixel(reference, x, y)?;
+            if a[3] != 255 || b[3] != 255 {
+                continue;
+            }
+            compared += 1;
+            if a[..3] != b[..3] {
+                mismatches += 1;
+            }
+        }
+    }
+    let eligible = visible.saturating_sub(excluded);
+    let required = (eligible - eligible / 5).max(1_024.min(visible));
+    if compared == 0 || compared < required {
+        return Err(format!(
+            "insufficient opaque dialog interior: compared {compared}, required {required}"
+        ));
+    }
+    if mismatches != 0 {
+        return Err(format!(
+            "{mismatches} of {compared} opaque dialog pixels differ from the independent window capture"
+        ));
+    }
+    Ok(serde_json::json!({
+        "status":"matches_window_capture", "reference_method":"CaptureWindow",
+        "compared_pixels":compared, "mismatching_pixels":mismatches,
+        "visible_interior_pixels":visible, "cursor_excluded_pixels":excluded,
+    }))
 }
 
 /// Capture a frame that reflects recent input. Input tools return once their
@@ -12551,6 +12694,27 @@ impl KwinMcp {
             ));
         }
         let (win_x, win_y, win_geo) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        let windows = window_snapshots(&conn, &kwin_unique, &xdg).await?;
+        let observed = windows
+            .iter()
+            .find(|window| window.id == win_geo.id)
+            .filter(|window| window.active && !window.minimized)
+            .ok_or_else(|| {
+                transient_capture_error(
+                    &win_geo.id,
+                    "capture target changed before dialog classification",
+                )
+            })?;
+        if [observed.x, observed.y, observed.w, observed.h]
+            != [win_geo.x, win_geo.y, win_geo.w, win_geo.h]
+        {
+            return Err(transient_capture_error(
+                &win_geo.id,
+                "capture target geometry changed before dialog classification",
+            ));
+        }
+        let transient = observed.dialog || observed.modal || observed.transient;
+
         #[expect(clippy::as_conversions)]
         let (win_w, win_h) = (win_geo.w.round() as i32, win_geo.h.round() as i32);
         // Every coordinate here is window-relative, matching mouse input: by
@@ -12578,9 +12742,54 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let (width, height, stride, pixels, settle) =
+        let (width, height, stride, mut pixels, settle) =
             capture_settled_frame(&proxy, self.last_input().await).await?;
-        // BGRA premultiplied → RGBA
+        let transient_pixel_check = if transient {
+            let reference = tokio::time::timeout(
+                SCREENSHOT_FRAME_TIMEOUT,
+                capture_source_inner(&proxy, Some(&win_geo.id)),
+            )
+            .await
+            .map_err(|_| {
+                transient_capture_error(&win_geo.id, "independent dialog capture timed out")
+            })?
+            .map_err(|error| transient_capture_error(&win_geo.id, error.message.to_string()))?;
+            let (_, _, after) = active_window_info(&conn, &kwin_unique, &xdg)
+                .await
+                .map_err(|error| transient_capture_error(&win_geo.id, error.to_string()))?;
+            if after.id != win_geo.id
+                || [after.x, after.y, after.w, after.h]
+                    != [win_geo.x, win_geo.y, win_geo.w, win_geo.h]
+            {
+                return Err(transient_capture_error(
+                    &win_geo.id,
+                    "the active dialog or its client geometry changed during capture",
+                ));
+            }
+            #[expect(clippy::as_conversions)]
+            let cursors = [
+                (win_geo.cx.round() as i32, win_geo.cy.round() as i32),
+                (after.cx.round() as i32, after.cy.round() as i32),
+            ];
+            let composite = (width, height, stride, pixels);
+            let mut evidence = compare_transient_capture(
+                &composite,
+                &reference,
+                (win_x, win_y),
+                (
+                    u32::try_from(win_w).map_err(KwinError::from)?,
+                    u32::try_from(win_h).map_err(KwinError::from)?,
+                ),
+                &cursors,
+            )
+            .map_err(|detail| transient_capture_error(&win_geo.id, detail))?;
+            evidence["reference_window_id"] = serde_json::json!(win_geo.id);
+            pixels = composite.3;
+            Some(evidence)
+        } else {
+            None
+        };
+        // The composited screen is opaque; convert normalized BGRA to RGBA.
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
         for row in 0..height {
@@ -12692,6 +12901,9 @@ impl KwinMcp {
                 "height": win_h,
             },
         });
+        if let Some(evidence) = transient_pixel_check {
+            payload["transient_pixel_check"] = evidence;
+        }
         if let Some(settle) = &settle {
             payload["settle"] = serde_json::json!({
                 "settled": settle.settled,
