@@ -6513,7 +6513,7 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        capture_settled_frame(&proxy, Some(last_input)).await?;
+        capture_settled_frame(&proxy, Some(last_input), true).await?;
         Ok(())
     }
     async fn host_xdg_dir(&self) -> Result<std::path::PathBuf, McpError> {
@@ -7845,10 +7845,16 @@ fn screenshot_timeout(stage: &'static str, timeout: Duration) -> McpError {
 }
 
 /// One complete CaptureScreen frame.
-async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
-    tokio::time::timeout(SCREENSHOT_FRAME_TIMEOUT, capture_frame_inner(proxy))
-        .await
-        .map_err(|_| screenshot_timeout("capture_frame", SCREENSHOT_FRAME_TIMEOUT))?
+async fn capture_frame(
+    proxy: &KWinScreenShot2Proxy<'_>,
+    include_cursor: bool,
+) -> Result<Frame, McpError> {
+    tokio::time::timeout(
+        SCREENSHOT_FRAME_TIMEOUT,
+        capture_frame_inner(proxy, include_cursor),
+    )
+    .await
+    .map_err(|_| screenshot_timeout("capture_frame", SCREENSHOT_FRAME_TIMEOUT))?
 }
 
 /// The frame KWin writes into `frame`, once all `expected` bytes are there.
@@ -7865,14 +7871,20 @@ async fn read_frame_file(frame: &std::fs::File, expected: usize) -> Result<Vec<u
     Ok(pixels)
 }
 
-async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
+async fn capture_frame_inner(
+    proxy: &KWinScreenShot2Proxy<'_>,
+    include_cursor: bool,
+) -> Result<Frame, McpError> {
     let frame = std::fs::File::from(
         nix::sys::memfd::memfd_create("kwin-mcp-frame", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
             .map_err(KwinError::from)?,
     );
     let writer = std::os::fd::OwnedFd::from(frame.try_clone().map_err(KwinError::from)?);
     let mut opts = std::collections::HashMap::new();
-    opts.insert("include-cursor", zbus::zvariant::Value::from(true));
+    opts.insert(
+        "include-cursor",
+        zbus::zvariant::Value::from(include_cursor),
+    );
     opts.insert("include-decoration", zbus::zvariant::Value::from(true));
     opts.insert("hide-caller-windows", zbus::zvariant::Value::from(false));
     // CaptureScreen composites all surfaces including popups (xdg_popup menus);
@@ -7902,9 +7914,10 @@ async fn capture_frame_inner(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, 
 async fn capture_settled_frame(
     proxy: &KWinScreenShot2Proxy<'_>,
     last_input: Option<std::time::Instant>,
+    include_cursor: bool,
 ) -> Result<(u32, u32, u32, Vec<u8>, Option<SettleReport>), McpError> {
     let started = std::time::Instant::now();
-    let mut frame = capture_frame(proxy).await?;
+    let mut frame = capture_frame(proxy, include_cursor).await?;
     let Some(input_at) = last_input.filter(|at| at.elapsed() < SCREENSHOT_SETTLE_LIMIT) else {
         let (width, height, stride, pixels) = frame;
         return Ok((width, height, stride, pixels, None));
@@ -7922,7 +7935,7 @@ async fn capture_settled_frame(
             break false;
         }
         tokio::time::sleep(SCREENSHOT_SETTLE_POLL).await;
-        let next = capture_frame(proxy).await?;
+        let next = capture_frame(proxy, include_cursor).await?;
         if next.3 != frame.3 {
             unchanged_since = std::time::Instant::now();
         }
@@ -9462,6 +9475,11 @@ struct ScreenshotParams {
     /// where a click would land. Mutually exclusive with `region`.
     #[serde(default)]
     cursor: bool,
+    /// Whether to draw the pointer in the image. Defaults to true. Set false
+    /// for pixel comparisons or clean captures without moving the pointer.
+    /// Independent of `cursor`, which selects a crop around its position.
+    #[serde(default)]
+    include_cursor: Option<bool>,
     /// When true, attach the PNG inline (base64) to the tool result so the
     /// calling model can see the image directly without a follow-up read.
     /// The file is still written to disk either way.
@@ -12836,7 +12854,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Inline metadata is always included as JSON text; pass structured_metadata=true to also expose structuredContent, only in clients that keep displaying image content alongside structured results. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this when you need to see what the UI looks like, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true to get an image of the region centered on the cursor. Set include_cursor=false to omit both pointer layers without moving it; this also works with cursor crops. Pointer drawing defaults to true. Use this after clicking to verify the click landed: a screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (metadata settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog) — prefer cropping over full captures when you already know which area matters, it returns a much smaller file. region and cursor are mutually exclusive. Pass inline=true to get the PNG returned directly in the tool result (base64) so you can see it immediately without a separate file read; the file on disk is written either way. Inline metadata is always included as JSON text; pass structured_metadata=true to also expose structuredContent, only in clients that keep displaying image content alongside structured results. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -12895,8 +12913,9 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
+        let include_cursor = params.include_cursor.unwrap_or(true);
         let (width, height, stride, pixels, settle) =
-            capture_settled_frame(&proxy, self.last_input().await).await?;
+            capture_settled_frame(&proxy, self.last_input().await, include_cursor).await?;
         // BGRA premultiplied → RGBA
         let px = usize::try_from(width * height).map_err(KwinError::from)?;
         let mut rgba = vec![0u8; px * 4];
@@ -12957,13 +12976,15 @@ impl KwinMcp {
         let cursor_abs_y = win_geo.cy.round() as i32;
         let crop_ox_i = i32::try_from(cx1).unwrap_or(0);
         let crop_oy_i = i32::try_from(cy1).unwrap_or(0);
-        Self::overlay_cursor(
-            &mut out_rgba,
-            out_w,
-            out_h,
-            cursor_abs_x - crop_ox_i,
-            cursor_abs_y - crop_oy_i,
-        );
+        if include_cursor {
+            Self::overlay_cursor(
+                &mut out_rgba,
+                out_w,
+                out_h,
+                cursor_abs_x - crop_ox_i,
+                cursor_abs_y - crop_oy_i,
+            );
+        }
         let path = xdg.join("screenshot.png");
         let mut png_bytes: Vec<u8> = Vec::new();
         {
@@ -12997,6 +13018,7 @@ impl KwinMcp {
             "path": if write_error.is_some() { serde_json::Value::Null } else { serde_json::json!(path_str) },
             "width": out_w,
             "height": out_h,
+            "include_cursor": include_cursor,
             // Window-relative rectangle the image covers: image pixel (px,py)
             // is mouse_click (px + region[0], py + region[1]).
             "region": out_region,
