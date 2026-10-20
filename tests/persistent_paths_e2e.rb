@@ -17,6 +17,8 @@ FileUtils.mkdir_p(home, mode: 0o700)
 profile = File.join(home, '.local/share/gateway-chrome')
 other = File.join(home, ".local/share/other app's data")
 [profile, other].each { |p| FileUtils.mkdir_p(p, mode: 0o700) }
+live_state = File.join(home, '.local/share/live-state')
+FileUtils.mkdir_p(live_state, mode: 0o700)
 File.write(File.join(profile, 'owned-marker'), 'generation-0')
 profile_identity = [File.stat(profile).dev, File.stat(profile).ino]
 File.write(File.join(home, 'plain-file'), 'plain-host')
@@ -98,6 +100,12 @@ results = []
 proof = nil
 begin
   proof = PersistentProof.new(binary, environment, evidence, 1)
+  tools = proof.rpc('tools/list', {}).fetch('result').fetch('tools')
+  start_tool = tools.find { |tool| tool['name'] == 'session_start' }
+  properties = start_tool&.dig('inputSchema', 'properties') || {}
+  unless properties.key?('persistent_paths')
+    raise "wrong kwin-mcp binary: session_start schema lacks persistent_paths: #{binary}"
+  end
   invalid = {
     relative: ['relative'], parent: [File.join(home, '../escape')],
     home: [home], outside: ['/var/lib'], missing: [File.join(home, 'missing')],
@@ -122,15 +130,19 @@ begin
   results << 'reject_browser_alias=PASS'
   proof.call('session_start', {persistent_paths: [profile], writable_paths: [profile]}, error: true)
   results << 'reject_private_copy_overlap=PASS'
-  proof.call('session_start', {persistent_paths: [profile], host_write_paths: [profile]}, error: true)
-  raise 'overlap rejection left a session' unless proof.call('session_list').fetch('sessions').empty?
-  results << 'reject_host_write_overlap=PASS'
+  nested_shared = File.join(profile, 'nested-shared')
+  FileUtils.mkdir_p(nested_shared, mode: 0o700)
+  {same: profile, ancestor: File.dirname(profile), descendant: nested_shared}.each do |kind, shared|
+    proof.call('session_start', {persistent_paths: [profile], host_write_paths: [shared]}, error: true)
+    raise 'mixed-path rejection left a session' unless proof.call('session_list').fetch('sessions').empty?
+    results << "reject_live_state_#{kind}_overlap=PASS"
+  end
   3.times do |cycle|
     if cycle == 2
       proof.close
       proof = PersistentProof.new(binary, environment, evidence, 2)
     end
-    started = proof.call('session_start', {persistent_paths: [profile, other]})
+    started = proof.call('session_start', {persistent_paths: [profile, other], host_write_paths: [live_state]})
     id = started.fetch('session_id')
     raise 'mounts not reported' unless started.fetch('persistent_paths') == [profile, other]
     raise 'unexpected cookie processing error' unless started.fetch('cookie_errors').empty?
@@ -143,7 +155,9 @@ begin
               "printf generation-#{cycle + 1} > #{Shellwords.escape(marker)} && " \
               "printf disposable > #{Shellwords.escape(File.join(home, 'plain-file'))} && " \
               "printf second-mount > #{Shellwords.escape(File.join(other, 'marker'))}"
+    command += " && printf live-generation-#{cycle + 1} > #{Shellwords.escape(File.join(live_state, 'marker'))}"
     proof.call('launch_app', {session_id: id, command: command})
+    raise 'live state did not reach host' unless File.read(File.join(live_state, 'marker')) == "live-generation-#{cycle + 1}"
     raise 'session did not write through persistent mount' unless File.read(marker) == "generation-#{cycle + 1}"
     raise 'second mount not writable' unless File.read(File.join(other, 'marker')) == 'second-mount'
     raise 'ordinary write escaped overlay' unless File.read(File.join(home, 'plain-file')) == 'plain-host'
@@ -156,6 +170,7 @@ begin
     raise 'unexpected cookie save error' unless stopped.fetch('cookie_errors').empty?
     raise 'workdir survived autoclean' if File.exist?(record.fetch('workdir')) || File.exist?(disk)
     raise 'persistent contents removed on stop' unless File.read(marker) == "generation-#{cycle + 1}"
+    raise 'live state removed on stop' unless File.read(File.join(live_state, 'marker')) == "live-generation-#{cycle + 1}"
     results << "replacement_cycle_#{cycle + 1}=PASS"
   end
   proof.close

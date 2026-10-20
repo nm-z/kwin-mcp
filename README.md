@@ -178,7 +178,7 @@ the persistent directory.
 Directories must belong to the server's effective UID with mode `0700`, and
 every ancestor must belong to that UID or root and must not be writable by
 group or others. Symlinks in the path, `..`, overlapping or duplicate paths,
-overlap with `writable_paths`, nested mounted filesystems, standard browser profile locations, desktop config
+overlap with `writable_paths` or `host_write_paths`, nested mounted filesystems, standard browser profile locations, desktop config
 overrides, cookie state, and session storage are rejected. Use a dedicated
 profile rather than a normal host browser directory. The validated source inode
 is pinned until the mount is installed, so replacing its pathname during startup
