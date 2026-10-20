@@ -147,8 +147,28 @@ make existing read-only host mounts writable or change a running session.
 
 Codex needs to write its SQLite state, logs and thread history. These can exceed
 the 64 MiB copy limit, and databases open in WAL mode on the host are normally
-read-only in a session regardless of size. A private `writable_paths` copy also
-cannot deliver a message to the real host thread.
+read-only in a session regardless of size. For a disposable Codex session, request
+a private writable snapshot of the state directory at startup. For HOME
+`/home/nate`, use:
+
+```json
+{"writable_paths":["/home/nate/.codex"]}
+```
+
+Live SQLite databases in that selection are copied from consistent committed
+database/WAL observations without opening the host shared-memory file for writing.
+The private databases can be reopened by later application processes, and new
+databases, WAL files and shared-memory files stay in the session. These changes
+are discarded when the session stops; they cannot deliver a message to the real
+host thread. Each initial database plus WAL must fit the 64 MiB snapshot limit.
+An inconsistent, oversized or otherwise failed explicit snapshot fails startup
+with its preparation error; it does not silently substitute a read-only database.
+
+`session_start.sqlite_access` reports `private_writable_snapshot`,
+`live_read_only`, or `shared_host` for the live databases it discovers. The list
+contains at most 128 entries; `total_databases` reports the full count. If an
+application reports SQLite error 14 or cannot open its state, check this policy
+and the startup error before concluding that its host database is damaged.
 
 To run against live host state, explicitly share the application state directory
 when starting a **new** session. For example, with HOME `/home/nate`:
@@ -273,8 +293,11 @@ with `path: null` and `write_error`. Freeing storage allows later screenshots
 to save normally. A session restored from an older server keeps its original
 script storage until it is recreated.
 
-Live host SQLite databases with open WAL files are mounted read-only with their
-WAL and shared-memory files, except browser cookie jars. Startup mounts these
+By default, live host SQLite databases with open WAL files are mounted read-only
+with their WAL and shared-memory files, except browser cookie jars. Explicit
+`writable_paths` selections instead receive private snapshots as described above;
+`host_write_paths` selections use the shared host directory. Startup mounts default
+read-only databases
 databases without copying their contents, and reads use the host inodes and
 SQLite locks. Session applications cannot write them. Browser history databases
 still start empty in the private overlay. Cookie jars remain writable in their

@@ -10127,3 +10127,226 @@ fn viewer_reuses_and_reopens_after_presenting_a_frame() {
     );
     desktop.stop_process();
 }
+fn private_sqlite_rows(connection: &rusqlite::Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = connection.prepare("SELECT value FROM goals ORDER BY value")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn private_sqlite_sidecar(database: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn private_sqlite_tool_ok(reply: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    if reply.get("error").is_some() || reply["result"]["isError"] == true {
+        return Err(format!("MCP operation failed: {reply}").into());
+    }
+    Ok(())
+}
+
+fn wait_for_private_sqlite_report(
+    path: &std::path::Path,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "SQLite application probe did not report: {}",
+                path.display()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "invoked as an application process inside the owned KWin session"]
+fn session_private_sqlite_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let database =
+        PathBuf::from(std::env::var_os("KWIN_MCP_SQLITE_PROBE_DB").ok_or("missing database")?);
+    let report =
+        PathBuf::from(std::env::var_os("KWIN_MCP_SQLITE_PROBE_REPORT").ok_or("missing report")?);
+    let phase = std::env::var("KWIN_MCP_SQLITE_PROBE_PHASE")?;
+    assert!(matches!(phase.as_str(), "first" | "second"));
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    connection.execute_batch("PRAGMA wal_autocheckpoint=0;")?;
+    let before = private_sqlite_rows(&connection)?;
+    assert_eq!(
+        before,
+        if phase == "first" {
+            vec!["host"]
+        } else {
+            vec!["first", "host"]
+        }
+    );
+    connection.execute("INSERT INTO goals(value) VALUES (?1)", [phase.as_str()])?;
+    let wal_present = private_sqlite_sidecar(&database, "-wal").is_file();
+    let shm_present = private_sqlite_sidecar(&database, "-shm").is_file();
+    assert!(wal_present && shm_present, "private WAL/SHM missing");
+    let rows = private_sqlite_rows(&connection)?;
+    assert_eq!(
+        rows,
+        if phase == "first" {
+            vec!["first", "host"]
+        } else {
+            vec!["first", "host", "second"]
+        }
+    );
+    let new_database = database
+        .parent()
+        .ok_or("missing parent")?
+        .join("new.sqlite");
+    let new_connection = if phase == "second" {
+        let created = rusqlite::Connection::open(&new_database)?;
+        let mode: String = created.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        created.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE created_after_start(value TEXT NOT NULL); INSERT INTO created_after_start VALUES ('second');")?;
+        Some(created)
+    } else {
+        None
+    };
+    let new_sidecars_present = new_connection.as_ref().map(|_| {
+        private_sqlite_sidecar(&new_database, "-wal").is_file()
+            && private_sqlite_sidecar(&new_database, "-shm").is_file()
+    });
+    if phase == "second" {
+        assert_eq!(new_sidecars_present, Some(true));
+    }
+    let payload = json!({
+        "phase": phase, "pid": std::process::id(), "journal_mode": mode,
+        "count": rows.len(), "rows": rows, "wal_present": wal_present,
+        "shm_present": shm_present, "new_database_created": new_connection.is_some(),
+        "new_sidecars_present": new_sidecars_present,
+    });
+    let temporary = report.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&payload)?)?;
+    std::fs::rename(&temporary, &report)?;
+    drop(new_connection);
+    drop(connection);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires real isolated KWin and Konsole sessions"]
+fn session_private_sqlite_reopens_with_new_sidecars() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let codex_directory = client.home.join(".codex");
+    std::fs::create_dir_all(&codex_directory)?;
+    let database = codex_directory.join("goals_1.sqlite");
+    let host_connection = rusqlite::Connection::open(&database)?;
+    host_connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE goals(value TEXT NOT NULL UNIQUE); INSERT INTO goals VALUES ('host');")?;
+    assert!(private_sqlite_sidecar(&database, "-wal").is_file());
+    assert!(private_sqlite_sidecar(&database, "-shm").is_file());
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({
+            "browser_profiles": "fresh", "writable_paths": [codex_directory],
+        }),
+    );
+    private_sqlite_tool_ok(&started)?;
+    let session_id = session_handle(&started);
+    let session_workdir = workdir(&started);
+    let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let probe = session_workdir.join("private-sqlite-probe");
+        std::fs::copy(std::env::current_exe()?, &probe)?;
+        let mut reports = Vec::new();
+        for (rpc_id, phase, window_option, expected_count) in [
+            (3_u64, "first", "--separate", 2_u64),
+            (4_u64, "second", "--new-tab", 3_u64),
+        ] {
+            let report = session_workdir.join(format!("private-sqlite-{phase}.json"));
+            let command = format!(
+                "konsole {window_option} --hold -e env KWIN_MCP_SQLITE_PROBE_DB={} KWIN_MCP_SQLITE_PROBE_REPORT={} KWIN_MCP_SQLITE_PROBE_PHASE={} {} --ignored --exact session_private_sqlite_probe --nocapture",
+                shlex::try_quote(database.to_string_lossy().as_ref())?,
+                shlex::try_quote(report.to_string_lossy().as_ref())?,
+                shlex::try_quote(phase)?,
+                shlex::try_quote(probe.to_string_lossy().as_ref())?,
+            );
+            let launched = call_tool(
+                &mut client,
+                rpc_id,
+                "launch_app",
+                json!({
+                    "session_id": session_id, "command": command,
+                }),
+            );
+            private_sqlite_tool_ok(&launched)?;
+            let observed = wait_for_private_sqlite_report(&report)?;
+            assert_eq!(observed["phase"], phase);
+            assert_eq!(observed["count"], expected_count);
+            assert_eq!(observed["journal_mode"], "wal");
+            assert_eq!(observed["wal_present"], true);
+            assert_eq!(observed["shm_present"], true);
+            if phase == "second" {
+                assert_eq!(observed["new_database_created"], true);
+                assert_eq!(observed["new_sidecars_present"], true);
+            }
+            eprintln!("private_sqlite_{phase}={observed}");
+            reports.push(observed);
+        }
+        assert_ne!(reports[0]["pid"], reports[1]["pid"]);
+        assert_eq!(private_sqlite_rows(&host_connection)?, vec!["host"]);
+        assert!(
+            !codex_directory.join("new.sqlite").exists(),
+            "private database leaked to host"
+        );
+        let windows = call_tool(
+            &mut client,
+            5,
+            "window_list",
+            json!({"session_id":session_id}),
+        );
+        private_sqlite_tool_ok(&windows)?;
+        assert!(windows.to_string().to_ascii_lowercase().contains("konsole"));
+        let screenshot = call_tool(
+            &mut client,
+            6,
+            "screenshot",
+            json!({"session_id":session_id, "inline":true}),
+        );
+        private_sqlite_tool_ok(&screenshot)?;
+        let path = save_inline_screenshot(&screenshot, "private-sqlite-reopen");
+        assert!(path.is_file());
+        eprintln!("private_sqlite_screenshot={}", path.display());
+        let access = &started["result"]["structuredContent"]["sqlite_access"];
+        let entries = access["databases"]
+            .as_array()
+            .ok_or("missing SQLite access list")?;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["path"] == database.to_string_lossy().as_ref()
+                    && entry["mode"] == "private_writable_snapshot")
+        );
+        assert!(
+            access["total_databases"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        Ok(())
+    })();
+    let stopped = call_tool(
+        &mut client,
+        7,
+        "session_stop",
+        json!({"session_id":session_id}),
+    );
+    outcome?;
+    private_sqlite_tool_ok(&stopped)?;
+    Ok(())
+}
