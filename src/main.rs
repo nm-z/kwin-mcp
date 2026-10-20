@@ -3865,6 +3865,22 @@ impl Drop for SocketLinks {
         }
     }
 }
+#[derive(Default, Serialize)]
+struct SqliteAccessReport {
+    databases: Vec<serde_json::Value>,
+    total_databases: usize,
+}
+
+impl SqliteAccessReport {
+    fn record(&mut self, path: &Path, mode: &'static str) {
+        self.total_databases += 1;
+        if self.databases.len() < 128 {
+            self.databases
+                .push(serde_json::json!({"path": path, "mode": mode}));
+        }
+    }
+}
+
 struct OverlayPlan {
     /// Explicitly shared application state; writes reach these host directories.
     host_write_paths: Vec<PathBuf>,
@@ -3876,6 +3892,7 @@ struct OverlayPlan {
     graphical_socket_paths: Vec<PathBuf>,
     /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
     sqlite_binds: Vec<PathBuf>,
+    sqlite_access: SqliteAccessReport,
     sqlite_blocked_sockets: Vec<PathBuf>,
     socket_links: SocketLinks,
     /// The host user runtime directory, when sockets from it are exposed. Its
@@ -4523,6 +4540,7 @@ fn prepare_overlay_plan(
             socket_binds: Vec::new(),
             graphical_socket_paths: Vec::new(),
             sqlite_binds: Vec::new(),
+            sqlite_access: SqliteAccessReport::default(),
             sqlite_blocked_sockets: Vec::new(),
             socket_links: SocketLinks::default(),
             host_runtime: None,
@@ -4579,6 +4597,7 @@ fn prepare_overlay_plan(
         socket_binds: Vec::new(),
         graphical_socket_paths: Vec::new(),
         sqlite_binds: Vec::new(),
+        sqlite_access: SqliteAccessReport::default(),
         sqlite_blocked_sockets: Vec::new(),
         socket_links: SocketLinks::default(),
         host_runtime: None,
@@ -4598,6 +4617,7 @@ fn bind_live_sqlite(
     plan: &mut OverlayPlan,
     target: &Path,
     databases: &[PathBuf],
+    writable_paths: &[PathBuf],
     service: &KwinMcp,
     browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<()> {
@@ -4613,6 +4633,7 @@ fn bind_live_sqlite(
             .iter()
             .any(|path| database.starts_with(path))
         {
+            plan.sqlite_access.record(database, "shared_host");
             continue;
         }
         let name = database
@@ -4628,20 +4649,66 @@ fn bind_live_sqlite(
         {
             continue;
         }
+        let private_write_requested = writable_paths.iter().any(|path| database.starts_with(path));
         if plan
             .read_only_binds
             .iter()
             .any(|mount| database != mount && database.starts_with(mount))
         {
+            anyhow::ensure!(
+                !private_write_requested,
+                "private SQLite copy is covered by a read-only ancestor: {}",
+                database.display()
+            );
             // A directory bind already provides fresh read-only name lookup.
+            plan.sqlite_access.record(database, "live_read_only");
             continue;
         }
         plan.read_only_binds.retain(|mount| {
             mount != database
-                && !["-wal", "-shm"].iter().any(|suffix| {
+                && !["-wal", "-shm", "-journal"].iter().any(|suffix| {
                     mount == &database.with_file_name(format!("{}{suffix}", name.to_string_lossy()))
                 })
         });
+        if private_write_requested {
+            let destination = if plan.upper_path(database).is_some() {
+                upper_file(plan, database)?
+            } else {
+                plan.staging_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no private layer for writable SQLite database")
+                    })?
+                    .join(database.strip_prefix(target)?)
+            };
+            let parent = destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("private database has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            service.host_step(format!(
+                "snapshotting private writable SQLite: {}",
+                database.display()
+            ))?;
+            kwin_mcp::browser_cookies::snapshot_host(database, &destination).map_err(|error| {
+                anyhow::anyhow!(
+                    "private writable SQLite snapshot {}: {error:#}",
+                    database.display()
+                )
+            })?;
+            // A later host rollback journal must not appear beside the private
+            // database through the overlay's lower layer.
+            let mut journal = destination.as_os_str().to_os_string();
+            journal.push("-journal");
+            let journal = PathBuf::from(journal);
+            std::fs::write(&journal, [])?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))?;
+            }
+            plan.sqlite_access
+                .record(database, "private_writable_snapshot");
+            continue;
+        }
         let parent = database
             .parent()
             .ok_or_else(|| anyhow::anyhow!("database has no parent"))?;
@@ -4666,6 +4733,7 @@ fn bind_live_sqlite(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
             upper,
         )?;
+        plan.sqlite_access.record(database, "live_read_only");
         eprintln!(
             "session_start: live SQLite database read-only: {}",
             database.display()
@@ -5156,7 +5224,7 @@ fn prepare_host_view(
     overlay_plan
         .expose_sockets(target, host_runtime, host_xdg_dir, &inventory, service)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
-    service.host_step("mounting live SQLite databases read-only")?;
+    service.host_step("preparing live SQLite access modes")?;
     if matches!(browser_profiles, BrowserProfiles::Fresh) {
         // Mask the profile roots before alias mounts are constructed, too.
         overlay_plan
@@ -5167,6 +5235,7 @@ fn prepare_host_view(
         &mut overlay_plan,
         target,
         &inventory.live_databases,
+        writable_paths,
         service,
         browser_profiles,
     )?;
@@ -10317,9 +10386,10 @@ struct SessionStartParams {
     /// Virtual display height in pixels for this session. Omit to use the
     /// server default. Ignored when the server was launched with --no-override.
     height: Option<u32>,
-    /// Absolute paths under HOME whose oversized ancestor files need writable
-    /// private copies. Default: files over 64 MiB use reflink or a read-only
-    /// bind. Explicit copies share startup_timeout_seconds (default 20).
+    /// Absolute HOME paths requiring private writable copies. Live SQLite
+    /// databases in these paths use consistent private snapshots (database plus
+    /// WAL must fit 64 MiB) instead of live read-only aliases. Oversized ancestor
+    /// files are also copied. Shares startup_timeout_seconds (default 20).
     writable_paths: Option<Vec<PathBuf>>,
     /// Existing application state directories under HOME to share with the host.
     /// Writes persist on the host, including SQLite databases and WAL sidecars.
@@ -12166,6 +12236,14 @@ impl KwinMcp {
             )
         };
         let oversized_read_only_files = std::mem::take(&mut overlay_plan.oversized_read_only_files);
+        let sqlite_access = std::mem::take(&mut overlay_plan.sqlite_access);
+        let msg = if sqlite_access.total_databases == 0 {
+            msg
+        } else {
+            format!(
+                "{msg}; SQLite access modes are listed in sqlite_access. live_read_only databases cannot support application writes; request writable_paths on a new session for private writable snapshots."
+            )
+        };
         let msg = if oversized_read_only_files.is_empty() {
             msg
         } else {
@@ -12247,6 +12325,7 @@ impl KwinMcp {
             "viewer": viewer,
             "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
+            "sqlite_access": sqlite_access,
             "host_write_paths": host_write_paths,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
