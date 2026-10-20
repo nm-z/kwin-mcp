@@ -143,6 +143,32 @@ absolute paths under HOME in `writable_paths` when starting a new session.
 Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
+### Host–session files and Unix sockets
+
+`session_start` and each running entry in `session_list` return
+`host_shared_dir`, an explicit alias for `workdir`. This server-owned directory
+is bound into the session at the **same absolute path**. For a helper that must
+communicate with a host process, create its Unix socket beneath this returned
+directory and give both processes that exact socket path. Regular files placed
+there are also immediately visible from both sides. Use a unique filename for
+each helper; do not replace the server's own files or sockets.
+
+The rest of `/tmp` is private to the session. A socket created under the
+session's `$HOME` is also private, because HOME uses an overlay filesystem.
+Finding its socket file in `overlay-upper` on the host does **not** provide the
+same live socket endpoint: connecting through that backing path can fail with
+`Connection refused` while the session listener is running. Do not reconstruct
+an IPC address from the overlay cache, a process ID, or a previous session's
+path. Use the current `host_shared_dir` instead.
+
+The shared directory belongs to that session and is temporary. Stop helpers
+before stopping the session, and do not depend on files or endpoints there
+after teardown; `--autoclean` removes the directory. For a finished download or
+another regular file that should persist on the host, use `export_file` with an
+explicit destination. Exporting or copying a socket does not transfer its live
+listener. Sharing a persistent application state directory is a separate,
+explicit choice described below.
+
 ### Live application state (Codex / ChatGPT desktop)
 
 Codex needs to write its SQLite state, logs and thread history. These can exceed
