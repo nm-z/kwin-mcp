@@ -4261,6 +4261,200 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 }
 
 #[test]
+#[ignore = "requires KDE, KWin, bubblewrap, kdialog, and input devices"]
+fn import_file_refreshes_host_notes_without_restarting_the_session() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    let vault = client.home.join("vault");
+    std::fs::create_dir_all(&vault).expect("private vault");
+    let note = vault.join("event.md");
+    let edited = vault.join("edited.md");
+    let deleted = vault.join("deleted.md");
+    for path in [&edited, &deleted] {
+        std::fs::write(path, "original host note\n").expect("initial note");
+    }
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":800,"height":600}),
+    );
+    let session = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session started")
+        .to_owned();
+    let setup = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({
+            "session_id":session,
+            "command":": > \"$HOME/vault/event.md\"; printf 'private edit\\n' > \"$HOME/vault/edited.md\"; rm \"$HOME/vault/deleted.md\"; ln -s /tmp \"$HOME/vault/tmp-link\""
+        }),
+    );
+    assert!(setup["error"].is_null(), "{setup}");
+
+    // Host additions and atomic replacements after session_start cannot replace
+    // a blank upper file, a private edit, or a session whiteout on their own.
+    let contents = "---\ntitle: Import refresh proof\ndate: 2026-10-15\nallDay: true\n---\nHost calendar note is visible.\n";
+    for path in [&note, &edited, &deleted] {
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, contents).expect("host write");
+        std::fs::rename(pending, path).expect("atomic host replacement");
+    }
+    let mut next_id = 4;
+    let mut call = |name: &str, mut arguments: Value| {
+        arguments["session_id"] = json!(session);
+        next_id += 1;
+        call_tool(&mut client, next_id, name, arguments)
+    };
+    let baseline = vault.join("baseline.txt");
+    let exported = call(
+        "export_file",
+        json!({"session_path":note,"host_path":baseline}),
+    );
+    assert_eq!(
+        exported["result"]["structuredContent"]["verified"], true,
+        "{exported}"
+    );
+    assert_eq!(std::fs::read(&baseline).expect("blank baseline"), b"");
+    let private = vault.join("private.txt");
+    call(
+        "export_file",
+        json!({"session_path":edited,"host_path":private}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&private).expect("private baseline"),
+        "private edit\n"
+    );
+    let missing = call(
+        "export_file",
+        json!({"session_path":deleted,"host_path":vault.join("absent.txt")}),
+    );
+    assert!(
+        !missing["error"].is_null(),
+        "whiteout disappeared: {missing}"
+    );
+
+    for path in [&note, &edited] {
+        let refused = call("import_file", json!({"host_path":path}));
+        assert_eq!(
+            refused["error"]["data"]["status"], "not_imported",
+            "{refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("overwrite=true"),
+            "{refused}"
+        );
+    }
+    for (index, path) in [&note, &edited, &deleted].into_iter().enumerate() {
+        let imported = call("import_file", json!({"host_path":path,"overwrite":true}));
+        let result = &imported["result"]["structuredContent"];
+        assert_eq!(result["status"], "imported", "{imported}");
+        assert_eq!(result["session_path"], json!(path), "{imported}");
+        assert_eq!(result["bytes"], contents.len(), "{imported}");
+        assert_eq!(result["verified"], true, "{imported}");
+        assert_eq!(result["application_reload_required"], true, "{imported}");
+        // Read back through a separate MCP operation, not the import receipt.
+        let actual = vault.join(format!("actual-{index}.md"));
+        let exported = call(
+            "export_file",
+            json!({"session_path":path,"host_path":actual}),
+        );
+        assert_eq!(
+            exported["result"]["structuredContent"]["verified"], true,
+            "{exported}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(actual).expect("session bytes"),
+            contents
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("host preserved"),
+            contents
+        );
+    }
+    // Absolute parent symlinks must resolve into the session's private /tmp.
+    let host_sentinel =
+        std::env::temp_dir().join(format!("kwin-mcp-import-{}", std::process::id()));
+    std::fs::write(&host_sentinel, "host sentinel").expect("host sentinel");
+    let link = vault.join("tmp-link");
+    let linked = call(
+        "import_file",
+        json!({"host_path":note,"session_path":link.join(host_sentinel.file_name().expect("sentinel name"))}),
+    );
+    assert_eq!(
+        linked["result"]["structuredContent"]["status"], "imported",
+        "{linked}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&host_sentinel).expect("sentinel unchanged"),
+        "host sentinel"
+    );
+    std::fs::remove_file(&host_sentinel).expect("remove host sentinel");
+    let linked_copy = vault.join("linked-copy.md");
+    let exported = call(
+        "export_file",
+        json!({"session_path":format!("/tmp/{}",host_sentinel.file_name().expect("sentinel name").to_string_lossy()),"host_path":linked_copy}),
+    );
+    assert_eq!(
+        exported["result"]["structuredContent"]["verified"], true,
+        "{exported}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(linked_copy).expect("symlink destination"),
+        contents
+    );
+
+    let fifo = vault.join("host.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("host FIFO fixture");
+    for arguments in [
+        json!({"host_path":note,"session_path":"relative.md"}),
+        json!({"host_path":vault}),
+        json!({"host_path":fifo,"session_path":note,"overwrite":true}),
+        json!({"host_path":vault.join("missing.md"),"session_path":note,"overwrite":true}),
+        json!({"host_path":note,"session_path":"/tmp/missing-import-parent/note.md"}),
+        json!({"host_path":note,"session_path":format!("/etc/kwin-mcp-import-{}.md",std::process::id())}),
+        json!({"host_path":note,"session_path":"/proc/self/fd/1/note.md"}),
+    ] {
+        let refused = call("import_file", arguments);
+        assert!(
+            !refused["error"].is_null(),
+            "unsafe/invalid import accepted: {refused}"
+        );
+    }
+    let shown = call(
+        "launch_app",
+        json!({"command":"kdialog --title 'Refreshed host note' --textbox \"$HOME/vault/event.md\" 700 400"}),
+    );
+    assert!(shown["error"].is_null(), "{shown}");
+    let capture = call("screenshot", json!({}));
+    assert!(
+        capture["result"]["structuredContent"]["window"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Refreshed host note"),
+        "{capture}"
+    );
+    if let Some(directory) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+        std::fs::copy(
+            capture["result"]["structuredContent"]["path"]
+                .as_str()
+                .expect("capture path"),
+            PathBuf::from(directory).join("import-refreshed-note.png"),
+        )
+        .expect("save capture evidence");
+    }
+    let stopped = call("session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Chrome, input devices, and a live GPU session"]
 fn chrome_file_chooser_attaches_host_and_session_files_with_the_documented_keys() {
     assert_eq!(

@@ -7,6 +7,8 @@ macro_rules! eprintln {
     }};
 }
 
+mod file_import;
+
 mod fuse_bridge {
     //! FUSE inside the isolated session.
     //!
@@ -7694,16 +7696,24 @@ fn sandbox_root(sandbox_pid: u32) -> Option<PathBuf> {
 
 /// Stream-compare two files byte for byte.
 fn same_contents(left: &Path, right: &Path) -> std::io::Result<bool> {
-    use std::io::Read;
     let (mut a, mut b) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
     if a.metadata()?.len() != b.metadata()?.len() {
         return Ok(false);
     }
+    same_reader_contents(&mut a, &mut b)
+}
+
+fn same_reader_contents(
+    a: &mut impl std::io::Read,
+    b: &mut impl std::io::Read,
+) -> std::io::Result<bool> {
     let (mut left_buf, mut right_buf) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let read = a.read(&mut left_buf)?;
         if read == 0 {
-            return Ok(true);
+            // The source can shrink after the initial file-size comparison.
+            // A matching prefix is insufficient if the copy still has bytes.
+            return Ok(b.read(&mut right_buf[..1])? == 0);
         }
         b.read_exact(&mut right_buf[..read])?;
         if left_buf[..read] != right_buf[..read] {
@@ -9573,6 +9583,18 @@ struct ExportFileParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ImportFileParams {
+    /// Absolute path of a regular file on the host.
+    host_path: String,
+    /// Absolute session file path. Defaults to host_path. Its parent directory
+    /// must already exist in the session and be writable there.
+    session_path: Option<String>,
+    /// Replace an existing session file, including private edits. Default false.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct WaitForFileParams {
     /// Absolute path of the file as the session sees it.
     session_path: String,
@@ -10689,7 +10711,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. window_mode=maximized (default) maximizes every new window when it maps; window_mode=native maps each window at the size its app requests, so an app relaunched after a stop reopens at its own size (use it for window-geometry repros). Both modes remove window decorations. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. By default, writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory. To operate an application against live host state, explicitly set host_write_paths to its existing state directory under HOME (for Codex, ~/.codex as an absolute path). This skips copies and read-only SQLite mounts for that subtree; all writes and deletions there persist on the host, including after session_stop. session_start and session_list report the shared directories."
+        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. window_mode=maximized (default) maximizes every new window when it maps; window_mode=native maps each window at the size its app requests, so an app relaunched after a stop reopens at its own size (use it for window-geometry repros). Both modes remove window decorations. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. By default, writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer. Host additions and edits are not reliably synchronized into a running overlay; use import_file to refresh a specific file, then reload it in the application. Use export_file to hand a session file (e.g. a download) to a real host directory. To operate an application against live host state, explicitly set host_write_paths to its existing state directory under HOME (for Codex, ~/.codex as an absolute path). This skips copies and read-only SQLite mounts for that subtree; all writes and deletions there persist on the host, including after session_stop. session_start and session_list report the shared directories."
     )]
     async fn session_start(
         &self,
@@ -13769,6 +13791,59 @@ impl KwinMcp {
     }
 
     #[rmcp::tool(
+        name = "import_file",
+        description = "Refresh a file inside an already-running session from a regular host file, without restarting the desktop. HOME is an overlay: session copies, deletions, and application caches can hide later host additions or edits; host updates are not a reliable live sync. host_path is an absolute host file path; session_path defaults to that same path and must name a file in an existing writable session directory. Existing session files (including private edits) are preserved unless overwrite=true. The copy is verified byte for byte before atomic replacement through the session filesystem; it never writes the overlay upper layer directly. Returns imported paths and bytes. Reload/reopen the note in its application afterward; application caches and unsaved buffers are not refreshed by this tool. Read-only mounts cannot be imported into. Outside explicitly shared host_write_paths, HOME imports remain private; importing into a shared directory writes to live host state."
+    )]
+    async fn import_file(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<ImportFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
+        let sandbox_pid = self
+            .with_session(|sess| Ok(sess.sandbox_child.id()))
+            .await?;
+        let source = PathBuf::from(&params.host_path);
+        let destination =
+            PathBuf::from(params.session_path.as_deref().unwrap_or(&params.host_path));
+        if !source.is_absolute() || !destination.is_absolute() || destination.file_name().is_none()
+        {
+            return Err(McpError::invalid_params(
+                "host_path and session_path must be absolute file paths",
+                None,
+            ));
+        }
+        let overwrite = params.overwrite;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let root = sandbox_root(sandbox_pid).ok_or_else(|| {
+                "cannot reach the session filesystem (sandbox not running)".to_owned()
+            })?;
+            file_import::import_host_file(&root, &source, &destination, overwrite)
+                .map(|bytes| (destination, bytes))
+        })
+        .await
+        .map_err(|error| McpError::internal_error(format!("import task: {error}"), None))?;
+        match outcome {
+            Ok((destination, bytes)) => Ok(structured_result(
+                &peer,
+                format!("imported {} -> {} ({bytes} bytes, verified); reload/reopen the file in its application", params.host_path, destination.display()),
+                serde_json::json!({
+                    "status": "imported",
+                    "host_path": params.host_path,
+                    "session_path": destination,
+                    "bytes": bytes,
+                    "verified": true,
+                    "application_reload_required": true,
+                }),
+            ).await),
+            Err(reason) => Err(McpError::internal_error(
+                format!("import_file did not replace the session file: {reason}"),
+                Some(serde_json::json!({"status": "not_imported", "reason": reason})),
+            )),
+        }
+    }
+
+    #[rmcp::tool(
         name = "wait_for_file",
         description = "Wait for an absolute session file path to exist as a regular file and remain unchanged for a bounded interval. Readiness compares its inode, byte size, and modification time; this does not prove the producer has exited. A timeout reports whether the file is still missing or changing. Call export_file after the file is ready."
     )]
@@ -16817,6 +16892,40 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         result?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod file_content_tests {
+    use super::same_reader_contents;
+    use std::io::Cursor;
+
+    #[test]
+    fn source_eof_does_not_accept_a_longer_copy() -> std::io::Result<()> {
+        for (source, copy) in [
+            (b"".as_slice(), b"stale copied contents".as_slice()),
+            (
+                b"same prefix".as_slice(),
+                b"same prefix plus stale tail".as_slice(),
+            ),
+        ] {
+            assert!(!same_reader_contents(
+                &mut Cursor::new(source),
+                &mut Cursor::new(copy),
+            )?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equal_readers_are_verified() -> std::io::Result<()> {
+        for contents in [b"".as_slice(), b"matching file contents".as_slice()] {
+            assert!(same_reader_contents(
+                &mut Cursor::new(contents),
+                &mut Cursor::new(contents),
+            )?);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

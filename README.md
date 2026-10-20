@@ -26,6 +26,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `launch_app` | Launch an application and wait for its window. |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+| `import_file` | Refresh a running session's file from the host, with byte verification and explicit overwrite control. |
 
 When a producer writes an artifact asynchronously, call `wait_for_file` with
 its absolute session path before `export_file`. The file is ready when it is a
@@ -131,6 +132,43 @@ Use `clipboard_write` with `target: "session"` for agent input or `target: "host
 A session never talks to the host wallet or Secret Service. `session_start` takes one read-only copy of the host KWallet, and the session's apps then use a session-local `org.kde.kwalletd6` served from memory; their writes stay in the session and end with it. The copy is taken only when `kwalletd6` and `ksecretd` already run and the wallet is unlocked: kwin-mcp never starts, unlocks or prompts a host wallet service, never calls `org.freedesktop.secrets`, and serializes copies across servers, at least 100 ms apart, within 12 s per `session_start`. If `kwalletd6` is missing or does not answer, the same wallet is read from `ksecretd` with the standard Secret Service calls, and copies in the next 60 s read `ksecretd` directly. If any check fails the session gets a disabled KWallet, `session_start` reports why, and `launch_app` of a Chromium-family browser says that the browser cannot decrypt the copied profile: Chrome drops every cookie it cannot decrypt (a recovered 3,606-cookie profile fell to 8 rows with the `basic` store, and kept 3,311 with the wallet). The host session D-Bus socket and the `keyring` and `p11-kit` entries of the user runtime directory are never reachable from a session.
 
 ## Session Architecture
+
+### Host file changes and refreshing a running session
+
+Treat `session_start` as the boundary for the initial HOME view. HOME uses a
+private writable overlay over host files, not a continuously synchronized copy.
+Some untouched host files can appear live, but session copies, deletions
+(whiteouts), split-mount staging copies, and application caches can hide later
+host additions or edits. Changes to the host lower layer also do not reliably
+notify applications watching the overlay. A path appearing in Obsidian's Quick
+Switcher does not establish that its editor or calendar cache has current bytes.
+
+After creating or editing a host note, explicitly import it into the existing
+desktop. For example, call `import_file` with:
+
+```json
+{"session_id":"<your session ID>","host_path":"/home/<user>/vault/calendar/event.md","overwrite":true}
+```
+
+`session_path` defaults to `host_path`; set it to a different absolute file path
+when needed (including a path in the session's private `/tmp`). Its parent
+directory must already exist and be writable inside the session. The tool copies
+one regular file, verifies its bytes, then atomically replaces the session path
+through the mounted filesystem. It does not modify the overlay backing layers
+directly. It refuses an existing session file unless `overwrite` is true; that
+option deliberately discards the session's private version of this file.
+Imported files have private `0600` permissions. Read-only session mounts remain
+read-only. Outside explicitly shared `host_write_paths`, imports into HOME stay
+private to the session and host originals are unchanged. Imports into a shared
+directory write directly to live host state.
+
+The result confirms filesystem bytes, not application state. Save or discard
+unsaved editor changes before importing, then reopen/reload the note in
+Obsidian and reset the calendar's event cache if necessary. If an application
+still holds stale data, restart that application inside the same desktop.
+Stopping and starting the session remains an option when a fresh HOME view is
+preferred over preserving session edits. Use `export_file` to save any session
+files that must survive that restart.
 
 Nested mounts under HOME require separate overlays. Regular files directly in
 their ancestor directories are copied into the private session. For files larger
