@@ -74,6 +74,9 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(1);
 const PASTE_SETTLE: Duration = Duration::from_millis(200);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
+// A drag delivers a Resized per pointer step; the aspect correction waits until
+// the size has held this long, so it never fights the compositor mid-drag.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 const VIEWER_STATUS_HEARTBEAT: Duration = Duration::from_secs(1);
 const INITIAL_VIEWER_WIDTH: f64 = 1920.0;
@@ -887,6 +890,7 @@ fn window_loop(
     let mut shown_title = initial_title;
     let mut next_title_check = Instant::now();
     let mut aspect = ViewerAspect::new(virt);
+    let resized = Cell::new(None::<(PhysicalSize<u32>, Instant)>);
 
     let remote_output = match &input_state.out {
         InputOut::Local { .. } => None,
@@ -912,6 +916,12 @@ fn window_loop(
             shutdown.request();
             frame.exit();
             return;
+        }
+        if let Some((size, at)) = resized.get()
+            && at.elapsed() >= RESIZE_SETTLE
+        {
+            resized.set(None);
+            aspect.resize(frame.window, size);
         }
         if Instant::now() >= next_title_check {
             let next = title.text();
@@ -1057,7 +1067,7 @@ fn window_loop(
                 shutdown.request();
             }
             if let WindowEvent::Resized(size) = event {
-                aspect.resize(window, *size);
+                resized.set(Some((*size, Instant::now())));
             }
             let size = window.inner_size();
             forward_input(event, (size.width, size.height), virt, input_state, numlock);
