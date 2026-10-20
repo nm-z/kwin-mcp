@@ -14599,21 +14599,20 @@ impl KwinMcp {
         let acknowledgment = sess.eis.roundtrip().await;
         drop(guard);
         self.mark_input().await;
-        if let Err(error) = acknowledgment
-            && !is_paste
-        {
-            return Err(McpError::internal_error(
-                format!(
-                    "Key events were submitted, but KWin acknowledgement failed: {error}. \
-                     The shortcut may still have taken effect; inspect the UI before retrying."
-                ),
-                Some(serde_json::json!({
-                    "compositor_acknowledged": false,
-                    "application_effect": "unverified",
-                    "retry_safe": false,
-                })),
-            ));
-        } else if let Err(error) = acknowledgment {
+        if let Err(error) = acknowledgment {
+            if !is_paste {
+                return Err(McpError::internal_error(
+                    format!(
+                        "Key events were submitted, but KWin acknowledgement failed: {error}. \
+                         The shortcut may still have taken effect; inspect the UI before retrying."
+                    ),
+                    Some(serde_json::json!({
+                        "compositor_acknowledged": false,
+                        "application_effect": "unverified",
+                        "retry_safe": false,
+                    })),
+                ));
+            }
             return Err(McpError::internal_error(
                 format!(
                     "The paste shortcut was submitted, but compositor acknowledgment failed: {error}"
