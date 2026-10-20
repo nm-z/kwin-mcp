@@ -35,6 +35,40 @@ regular file whose inode, size, and modification time remain unchanged for
 that is still changing. This bounded observation does not prove that the
 producer has exited.
 
+## Uploading a host-created file
+
+The browser and its file chooser read the **isolated session's filesystem**.
+The same absolute path on the host can contain different bytes: HOME uses an
+overlay, files can have startup-time copies or read-only mounts, and the
+session has a private `/tmp`. A chooser accepting a path does not establish
+that the selected file matches the host attachment.
+
+Before selecting an attachment, call `wait_for_file` with its absolute
+`session_path` and compare the returned `size_bytes` with the known host file
+size. `status: "ready"` means stable, and can include a zero-byte file; it does
+not compare the host and session contents. If exact content identity matters,
+also compare the file hashes using the session application or terminal and
+the host source.
+
+If the session copy is missing, empty, or different, transfer the intended
+bytes into a file in the current session before selecting it. Alternatively,
+start a separate session after the host file exists, with that absolute file
+under HOME in `writable_paths` to request a private writable copy. For example:
+
+```json
+{"writable_paths":["/home/nate/Uploads/proof.png"]}
+```
+
+Keep the current session alive while preserving any work it contains. Verify
+the new session's file size before upload. Host `/tmp/proof.png` is not the
+session's `/tmp/proof.png`; copying into host `/tmp` alone is not a transfer.
+`export_file` moves a session result to the host and does not import an
+attachment.
+
+For Chrome's chooser, click the file input, press Ctrl+L, enter the verified
+absolute session path, and use Alt+O. Then verify the application's selected
+filename and byte size or upload outcome before submitting the form.
+
 ## Large accessibility trees
 
 `accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
