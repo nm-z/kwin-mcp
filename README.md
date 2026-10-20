@@ -186,6 +186,15 @@ A session never talks to the host wallet or Secret Service. `session_start` take
 
 ## Session Architecture
 
+The isolated system bus does not provide PolicyKit authentication. When an
+application starts `pkttyagent`, its known missing-service registration diagnostic
+is saved to `polkit-agent.log` in the session `workdir` instead of being printed
+over the application's terminal UI. The agent still returns its original failure
+status. Other errors remain on stderr, and the original diagnostic also remains
+on stderr if the session log cannot be written. This does not grant access to the
+host PolicyKit service. The wrapper closes inherited descriptors in its stderr
+filter so `--notify-fd` readiness cannot be held open by the filter process.
+
 ### Host file changes and refreshing a running session
 
 Treat `session_start` as the boundary for the initial HOME view. HOME uses a
