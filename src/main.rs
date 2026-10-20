@@ -7696,16 +7696,24 @@ fn sandbox_root(sandbox_pid: u32) -> Option<PathBuf> {
 
 /// Stream-compare two files byte for byte.
 fn same_contents(left: &Path, right: &Path) -> std::io::Result<bool> {
-    use std::io::Read;
     let (mut a, mut b) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
     if a.metadata()?.len() != b.metadata()?.len() {
         return Ok(false);
     }
+    same_reader_contents(&mut a, &mut b)
+}
+
+fn same_reader_contents(
+    a: &mut impl std::io::Read,
+    b: &mut impl std::io::Read,
+) -> std::io::Result<bool> {
     let (mut left_buf, mut right_buf) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let read = a.read(&mut left_buf)?;
         if read == 0 {
-            return Ok(true);
+            // The source can shrink after the initial file-size comparison.
+            // A matching prefix is insufficient if the copy still has bytes.
+            return Ok(b.read(&mut right_buf[..1])? == 0);
         }
         b.read_exact(&mut right_buf[..read])?;
         if left_buf[..read] != right_buf[..read] {
@@ -9579,7 +9587,6 @@ struct ImportFileParams {
     #[serde(default)]
     overwrite: bool,
 }
-
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitForFileParams {
@@ -16829,6 +16836,40 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         result?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod file_content_tests {
+    use super::same_reader_contents;
+    use std::io::Cursor;
+
+    #[test]
+    fn source_eof_does_not_accept_a_longer_copy() -> std::io::Result<()> {
+        for (source, copy) in [
+            (b"".as_slice(), b"stale copied contents".as_slice()),
+            (
+                b"same prefix".as_slice(),
+                b"same prefix plus stale tail".as_slice(),
+            ),
+        ] {
+            assert!(!same_reader_contents(
+                &mut Cursor::new(source),
+                &mut Cursor::new(copy),
+            )?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equal_readers_are_verified() -> std::io::Result<()> {
+        for contents in [b"".as_slice(), b"matching file contents".as_slice()] {
+            assert!(same_reader_contents(
+                &mut Cursor::new(contents),
+                &mut Cursor::new(contents),
+            )?);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
