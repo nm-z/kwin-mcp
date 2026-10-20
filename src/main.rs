@@ -2485,6 +2485,12 @@ impl<'a> SentInput<'a> {
         }
         Ok(())
     }
+    fn tap(&mut self, code: u32, character: char) -> anyhow::Result<()> {
+        self.keys.insert(code, Some(character));
+        self.eis.tap_with_character(code, Some(character))?;
+        self.keys.remove(&code);
+        Ok(())
+    }
     fn button(&mut self, code: u32, pressed: bool) -> anyhow::Result<()> {
         if pressed {
             self.button = Some(code);
@@ -2556,50 +2562,31 @@ async fn type_with_profile(
     let mut held = SentInput::new(eis);
     let began = tokio::time::Instant::now();
     let mut next_down = Duration::ZERO;
-    let mut pending: Vec<(Duration, u32, char)> = Vec::new();
     let mut shifted = false;
     let mut submitted = 0;
     let mut attempted = 0;
     let result: anyhow::Result<()> = async {
         for (i, (&character, &(code, shift))) in characters.iter().zip(keys).enumerate() {
-            let (hold, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
-            let hold = capped_key_hold(hold);
+            let (_, interval) = pace.key_timing(character, characters.get(i + 1).copied())?;
             let interval = budgeted_interval(
                 interval,
                 TYPING_BUDGET.saturating_sub(began.elapsed()),
                 characters.len() - i,
             );
-            // Repeated keys must release before their next press. Shift transitions
-            // also wait for held characters so their requested case stays intact.
-            for (up, key, _) in &pending {
-                if *key == code || shift != shifted {
-                    next_down = next_down.max(*up);
-                }
-            }
-            pending.sort_by_key(|event| event.0);
-            while pending.first().is_some_and(|event| event.0 <= next_down) {
-                let (up, key, c) = pending.remove(0);
-                tokio::time::sleep_until(began + up).await;
-                held.key(key, false, Some(c))?;
-            }
+            // Wait only between complete keystrokes. Scheduler delays must
+            // not extend a printable key hold into application autorepeat.
             tokio::time::sleep_until(began + next_down).await;
             if shift != shifted {
                 held.key(LINUX_KEY_LEFTSHIFT, shift, None)?;
                 shifted = shift;
             }
             attempted += 1;
-            held.key(code, true, Some(character))?;
+            held.tap(code, character)?;
             submitted += 1;
             // Socket backpressure or scheduler delay must not turn the rest of
             // the text into a burst of overdue events. Pace from the actual send.
             let sent_at = began.elapsed();
-            pending.push((sent_at + hold, code, character));
             next_down = sent_at + interval;
-        }
-        pending.sort_by_key(|event| event.0);
-        for (up, key, c) in pending {
-            tokio::time::sleep_until(began + up).await;
-            held.key(key, false, Some(c))?;
         }
         if shifted {
             held.key(LINUX_KEY_LEFTSHIFT, false, None)?;
@@ -3284,6 +3271,29 @@ impl Eis {
         });
         self.key_with_character(code, pressed, character)
     }
+    fn tap_with_character(&self, code: u32, character: Option<char>) -> anyhow::Result<()> {
+        let timestamp = self.now_us();
+        self.kbd.key(code, reis::ei::keyboard::KeyState::Press);
+        self.kbd_dev.frame(self.next_serial(), timestamp);
+        self.kbd.key(code, reis::ei::keyboard::KeyState::Released);
+        self.kbd_dev.frame(self.next_serial(), timestamp);
+        // Queue both transitions before flushing. A paced text key must not
+        // remain pressed while the typing task waits for its next timer.
+        let delivery = self.flush();
+        if let Some(log) = &self.audit {
+            for pressed in [true, false] {
+                log.event(serde_json::json!({
+                    "event": "key", "keycode": code,
+                    "pressed": pressed, "character": character
+                }), &delivery).map_err(|error| anyhow::anyhow!(
+                    "input was submitted but log {} could not be appended: {error}",
+                    log.path.display()
+                ))?;
+            }
+        }
+        delivery
+    }
+
     fn key_with_character(
         &self,
         code: u32,
