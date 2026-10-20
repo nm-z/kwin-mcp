@@ -94,3 +94,25 @@ pub fn import_host_file(
     }
     outcome
 }
+
+/// `path` as the session sees it, resolved inside the session root like an
+/// import destination. Without `read` it is an O_PATH handle for metadata
+/// only; with it, a non-blocking read handle, so check it is a regular file
+/// before reading.
+pub fn session_file(root: &Path, path: &Path, read: bool) -> std::io::Result<std::fs::File> {
+    let root = std::fs::File::open(root)?;
+    let flags = if read {
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOCTTY | OFlag::O_CLOEXEC
+    } else {
+        OFlag::O_PATH | OFlag::O_CLOEXEC
+    };
+    let file = openat2(
+        &root,
+        path,
+        OpenHow::new()
+            .flags(flags)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(std::fs::File::from(file))
+}
