@@ -7945,7 +7945,10 @@ fn prepare_ssh_config_overrides(workdir: &Path, session_uid: u32) -> Vec<(PathBu
         let written = std::fs::canonicalize(&path).and_then(|target| {
             // Validate the same opened file whose bytes are copied. Replacing
             // a symlink between path lookups must not sanitize an unsafe file.
-            let mut source = std::fs::File::open(&target)?;
+            let mut source = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&target)?;
             let metadata = source.metadata()?;
             if !metadata.is_file()
                 || !ssh_config_needs_copy(metadata.uid(), metadata.mode(), session_uid)
@@ -18048,7 +18051,7 @@ mod ssh_config_tests {
     use super::ssh_config_needs_copy;
 
     #[test]
-    fn host_root_owned_or_group_writable_drop_ins_need_a_session_copy() {
+    fn only_safe_root_owned_drop_ins_need_a_session_copy() {
         // A root-owned drop-in is unmapped inside the sandbox.
         assert!(ssh_config_needs_copy(0, 0o100644, 1000));
         assert!(!ssh_config_needs_copy(1000, 0o100664, 1000));
