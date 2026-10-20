@@ -11369,6 +11369,29 @@ impl KwinMcp {
             None
         };
         let mut pre_overlay_binds = Vec::new();
+        // Keep the real agent inside the same filtered bus and sandbox. Only
+        // its known missing-PolicyKit registration diagnostic moves to a log;
+        // startup status and unrelated stderr remain visible to applications.
+        if let Some(agent) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("pkttyagent"))
+                .find(|candidate| candidate.is_file())
+        }) {
+            use std::os::unix::fs::PermissionsExt;
+            let agent = std::fs::canonicalize(agent)
+                .map_err(|error| ver_err(format!("resolve session pkttyagent: {error}")))?;
+            let shim = host_xdg_dir.join("pkttyagent-session.sh");
+            std::fs::write(&shim, include_str!("../data/pkttyagent-session.sh"))
+                .and_then(|_| {
+                    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                })
+                .map_err(|error| ver_err(format!("write session pkttyagent wrapper: {error}")))?;
+            pre_overlay_binds.push((
+                agent.clone(),
+                PathBuf::from("/run/kwin-mcp-pkttyagent/real"),
+            ));
+            pre_overlay_binds.push((shim, agent));
+        }
         if let (Some(binaries), Some(exe)) = (&fuse, &fuse_exe) {
             pre_overlay_binds.push((exe.clone(), PathBuf::from(fuse_bridge::BRIDGE_EXECUTABLE)));
             for (real, program) in binaries {
