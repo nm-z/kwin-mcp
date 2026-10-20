@@ -18502,6 +18502,7 @@ mod launch_failure_context_tests {
             &LaunchProgress {
                 stage: "writing the launch script",
                 command_submitted: false,
+                window_baseline_errors: Vec::new(),
             },
         );
         let data = failure.data.unwrap_or_default();
@@ -18522,6 +18523,7 @@ mod launch_failure_context_tests {
             &LaunchProgress {
                 stage: "connecting to browser accessibility",
                 command_submitted: true,
+                window_baseline_errors: Vec::new(),
             },
         );
         let data = failure.data.unwrap_or_default();
@@ -18541,6 +18543,7 @@ mod launch_failure_context_tests {
             &LaunchProgress {
                 stage: "waiting for a window",
                 command_submitted: true,
+                window_baseline_errors: Vec::new(),
             },
         );
         let data = failure.data.unwrap_or_default();
@@ -18561,6 +18564,7 @@ mod launch_failure_context_tests {
             &LaunchProgress {
                 stage: "fallback",
                 command_submitted: false,
+                window_baseline_errors: Vec::new(),
             },
         );
         let data = failure.data.unwrap_or_default();
