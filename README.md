@@ -35,6 +35,32 @@ regular file whose inode, size, and modification time remain unchanged for
 that is still changing. This bounded observation does not prove that the
 producer has exited.
 
+## Share files and IPC with host tools
+
+Use the exact `workdir` returned by `session_start` for files, logs, FIFOs,
+and Unix sockets that a host tool must read or connect to. That directory is
+mounted read-write at the same absolute path inside the session and on the
+host. Its name normally resembles `/tmp/kwin-mcp-<pid>-<number>/`; use the
+returned path because the parent directory and suffix can vary.
+
+For example, if `workdir` is `/tmp/kwin-mcp-12345-1`, create a task directory
+there and launch a socket server at `/tmp/kwin-mcp-12345-1/task/drawd.sock`.
+The host-side client connects to that same absolute socket path. Put the
+server's logs and any output that the host needs in the same task directory.
+
+Other paths under the session's `/tmp` are private: a socket or file at
+`/tmp/task/drawd.sock` inside the desktop is not the host's `/tmp/task/drawd.sock`.
+By default, writes under `$HOME` also stay in the session's overlay. The
+overlay's `overlay-upper` directory is backing storage, not a shared IPC path;
+a Unix socket visible there does not provide the listening socket's host
+endpoint. Bind live IPC endpoints in the returned `workdir` instead.
+
+Use `wait_for_file` and `export_file` to copy completed regular files from
+private session paths to a durable host destination. Preserve anything you
+need before stopping the session: `--autoclean` and `--ttl` remove its workdir.
+Explicit `host_write_paths` provide a separate way to share selected host
+state directories, with writes and deletions persisting on the host.
+
 ## Large accessibility trees
 
 `accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
