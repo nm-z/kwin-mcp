@@ -1925,6 +1925,8 @@ const KWIN_NAME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 // Default AT-SPI tree deadline and find_ui_elements hard timeout.
 const ATSPI_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(5);
+const A11Y_WINDOW_BOUNDS_TOLERANCE: f64 = 2.0;
+const A11Y_FIND_MAX_NODES: usize = 5000;
 const ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS: u32 = 1;
 const ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS: u32 = 30;
 // keyboard_key checks a browser page's focus over AT-SPI (#180) within this
@@ -13060,7 +13062,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Search the active app for widgets whose name or role contains query (case-insensitive). Returns each match's role, text (a field's placeholder when it has no name), and bounding box for mouse_click/mouse_move, followed by disabled or focused when they apply. Use this compact result for a known control; if no useful match appears, inspect a screenshot and continue with visual input. Use a filtered accessibility_tree only when you need structure.",
+        description = "Search the active window for widgets whose name or role contains query (case-insensitive). Matches include their accessibility identity and window-relative bounds in the screenshot/mouse input coordinate frame. The result names the observed KWin window and accessibility frame; if the window changes during lookup, observe it again before clicking. Accessibility visibility does not prove a control is unobscured. If the active window has no matching accessible frame, use screenshot; use accessibility_tree for wider app inspection.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -13071,156 +13073,184 @@ impl KwinMcp {
         self.touch_activity().await;
         self.settle_input().await?;
         let query = params.query.to_lowercase();
+        let conn = self.kwin_conn().await?;
+        let kwin_unique = self.kwin_unique_name().await?;
+        let xdg = self.host_xdg_dir().await?;
+        let window = window_snapshots(&conn, &kwin_unique, &xdg)
+            .await?
+            .into_iter()
+            .find(|window| window.active)
+            .ok_or_else(|| McpError::internal_error("No active window", None))?;
+        let mut elements = Vec::new();
         let mut out = Vec::new();
-
-        let cdp_browser = self
-            .session
-            .read()
-            .await
-            .as_ref()
-            .and_then(|s| s.cdp_browser.clone());
-
-        match cdp_browser {
-            Some(browser) => {
-                // CDP path for Chromium/Electron apps — query all non-chrome:// pages
-                if let Ok(pages) = browser.pages().await {
-                    let js = r#"JSON.stringify(
-                        [...document.querySelectorAll('button, a, input, select, textarea, [role], [onclick], [tabindex]')]
-                            .filter(el => el.offsetParent !== null)
-                            .map(el => {
-                                const r = el.getBoundingClientRect();
-                                return {
-                                    role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                                    text: (el.textContent || '').trim().slice(0, 80),
-                                    x: Math.round(r.x), y: Math.round(r.y),
-                                    w: Math.round(r.width), h: Math.round(r.height)
-                                };
-                            })
-                    )"#;
-                    #[derive(Deserialize)]
-                    struct CdpElement {
-                        role: String,
-                        text: String,
-                        x: i32,
-                        y: i32,
-                        w: i32,
-                        h: i32,
-                    }
-                    for page in &pages {
-                        let url = page.url().await.ok().flatten().unwrap_or_default();
-                        if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
-                            continue;
-                        }
-                        if let Ok(result) = page.evaluate(js).await
-                            && let Some(val) = result.value()
-                            && let Ok(json_str) = serde_json::from_value::<String>(val.clone())
-                            && let Ok(elements) = serde_json::from_str::<Vec<CdpElement>>(&json_str)
-                        {
-                            for el in &elements {
-                                if el.w > 1
-                                    && el.h > 1
-                                    && (el.text.to_lowercase().contains(&query)
-                                        || el.role.to_lowercase().contains(&query))
-                                {
-                                    out.push(format!(
-                                        "{}\t{}\t({}, {}, {}x{})",
-                                        el.role, el.text, el.x, el.y, el.w, el.h
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                // AT-SPI path for native apps (5s timeout)
-                let atspi_result = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
-                    use atspi::proxy::accessible::ObjectRefExt;
-                    let zbus_conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
-                    let a11y_addr: String = atspi::proxy::bus::BusProxy::new(&zbus_conn)
-                        .await
-                        .map_err(KwinError::from)?
-                        .get_address()
-                        .await
-                        .map_err(KwinError::from)?;
-                    let a11y_bus = connect_session_bus(
-                        &a11y_addr,
-                        std::time::Instant::now() + STARTUP_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("AT-SPI bus: {e}"), None))?;
-                    let root = atspi::proxy::accessible::AccessibleProxy::builder(&a11y_bus)
-                        .destination("org.a11y.atspi.Registry")
-                        .map_err(KwinError::from)?
-                        .cache_properties(zbus::proxy::CacheProperties::No)
-                        .build()
-                        .await
-                        .map_err(KwinError::from)?;
-                    let mut stack = root
-                        .get_children()
-                        .await
-                        .map_err(KwinError::from)?
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>();
-                    let mut results = Vec::new();
-                    while let Some(obj) = stack.pop() {
-                        let acc = match obj.as_accessible_proxy(&a11y_bus).await {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        let node = match atspi_node(&acc).await {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
-                        if node.is_useful()
-                            && (node.name.to_lowercase().contains(&query)
-                                || node.role.to_lowercase().contains(&query))
-                        {
-                            let (x, y, w, h) = node.bounds;
-                            let flags = node
-                                .states
-                                .iter()
-                                .filter(|state| *state == "disabled" || *state == "focused")
-                                .map(|state| format!("\t{state}"))
-                                .collect::<String>();
-                            results.push(format!(
-                                "{}\t{}\t({}, {}, {}x{}){flags}",
-                                node.role, node.name, x, y, w, h
-                            ));
-                        }
-                        for child in acc
-                            .get_children()
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .rev()
-                        {
-                            stack.push(child);
-                        }
-                    }
-                    Ok::<Vec<String>, McpError>(results)
-                })
-                .await;
-                match atspi_result {
-                    Ok(Ok(results)) => out.extend(results),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => eprintln!("find_ui_elements: AT-SPI traversal timed out after 5s"),
-                }
-            }
-        }
-
-        if out.is_empty() {
-            Ok(structured_result(
-                &peer,
-                format!("no elements matching '{}'", params.query),
-                serde_json::json!({"matches": 0, "query": params.query}),
+        let mut frame_identity = None;
+        let traversal = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
+            use atspi::proxy::accessible::ObjectRefExt;
+            use atspi::proxy::proxy_ext::ProxyExt;
+            let address = self
+                .with_session(|session| Ok(session.atspi_bus_address.clone()))
+                .await?;
+            let bus = connect_session_bus(
+                &address,
+                std::time::Instant::now() + ATSPI_TRAVERSAL_TIMEOUT,
             )
-            .await)
-        } else {
-            let results = out.join("\n");
-            Ok(structured_result(&peer, results.clone(), serde_json::json!({"matches": out.len(), "query": params.query, "results": results})).await)
+            .await
+            .map_err(|error| McpError::internal_error(format!("AT-SPI bus: {error}"), None))?;
+            let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
+                .destination("org.a11y.atspi.Registry")
+                .map_err(KwinError::from)?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .map_err(KwinError::from)?;
+            let mut frames = Vec::new();
+            for app in root.get_children().await.map_err(KwinError::from)? {
+                let Ok(app) = app.as_accessible_proxy(&bus).await else {
+                    continue;
+                };
+                for object in app.get_children().await.unwrap_or_default() {
+                    let Ok(frame) = object.as_accessible_proxy(&bus).await else {
+                        continue;
+                    };
+                    // Chrome may append the profile to its accessible frame
+                    // caption. Geometry also binds the frame to KWin's target.
+                    let name = frame.name().await.unwrap_or_default();
+                    if window.title.is_empty() || !name.starts_with(&window.title) {
+                        continue;
+                    }
+                    let Ok(component) = frame.proxies().await.map_err(KwinError::from)?.component().await else {
+                        continue;
+                    };
+                    let bounds = component
+                        .get_extents(atspi::CoordType::Screen)
+                        .await
+                        .map_err(KwinError::from)?;
+                    if [bounds.0, bounds.1, bounds.2, bounds.3]
+                        .into_iter()
+                        .zip([window.x, window.y, window.w, window.h])
+                        .all(|(actual, expected)| {
+                            (f64::from(actual) - expected).abs() <= A11Y_WINDOW_BOUNDS_TOLERANCE
+                        })
+                    {
+                        frames.push(object.clone());
+                    }
+                }
+            }
+            if frames.len() != 1 {
+                return Err(McpError::internal_error(
+                    format!(
+                        "Found {} accessibility frames for the active window; use screenshot or observe the window again.",
+                        frames.len()
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "accessibility_window_ambiguous",
+                        "window": window,
+                        "matching_frames": frames.len(),
+                    })),
+                ));
+            }
+            let object = frames.pop().ok_or_else(|| {
+                McpError::internal_error("The accessibility frame disappeared", None)
+            })?;
+            let frame = object.as_accessible_proxy(&bus).await.map_err(KwinError::from)?;
+            frame_identity = Some(format!("{}{}", frame.inner().destination(), frame.inner().path()));
+            drop(frame);
+            let mut stack = vec![object];
+            let mut visited = std::collections::HashSet::new();
+            while let Some(object) = stack.pop() {
+                let Ok(acc) = object.as_accessible_proxy(&bus).await else {
+                    continue;
+                };
+                let identity = format!("{}{}", acc.inner().destination(), acc.inner().path());
+                if !visited.insert(identity.clone()) {
+                    continue;
+                }
+                if visited.len() > A11Y_FIND_MAX_NODES {
+                    return Err(McpError::internal_error(
+                        "Active-window accessibility lookup reached its node limit; use a screenshot.",
+                        Some(serde_json::json!({"reason": "accessibility_node_limit", "window": window})),
+                    ));
+                }
+                if let Ok(node) = atspi_node(&acc).await {
+                    let (x, y, w, h) = node.bounds;
+                    let in_window = f64::from(x) < window.x + window.w
+                        && f64::from(y) < window.y + window.h
+                        && f64::from(x) + f64::from(w) > window.x
+                        && f64::from(y) + f64::from(h) > window.y;
+                    if node.is_useful()
+                        && in_window
+                        && node.states.iter().any(|state| state == "visible")
+                        && (node.name.to_lowercase().contains(&query)
+                            || node.role.to_lowercase().contains(&query))
+                    {
+                        // AT-SPI reports screen pixels; input and screenshots
+                        // use the active client area's origin.
+                        let relative_x = f64::from(x) - window.x;
+                        let relative_y = f64::from(y) - window.y;
+                        let flags = node.states.iter()
+                            .filter(|state| *state == "disabled" || *state == "focused")
+                            .map(|state| format!("\t{state}"))
+                            .collect::<String>();
+                        out.push(format!(
+                            "{}\t{}\t({relative_x:.0}, {relative_y:.0}, {w}x{h}){flags}",
+                            tree_field(&node.role), tree_field(&node.name)
+                        ));
+                        elements.push(serde_json::json!({
+                            "role": node.role, "text": node.name,
+                            "x": relative_x, "y": relative_y, "width": w, "height": h,
+                            "states": node.states, "node_id": identity,
+                            "window_id": window.id,
+                        }));
+                    }
+                }
+                stack.extend(acc.get_children().await.unwrap_or_default().into_iter().rev());
+            }
+            Ok::<(), McpError>(())
+        }).await;
+        let incomplete = match traversal {
+            Ok(result) => {
+                result?;
+                false
+            }
+            Err(_) => true,
+        };
+        let (_, _, after) = active_window_info(&conn, &kwin_unique, &xdg).await?;
+        if after.id != window.id
+            || after.title != window.title
+            || [after.x, after.y, after.w, after.h] != [window.x, window.y, window.w, window.h]
+        {
+            return Err(McpError::internal_error(
+                "The active window changed during lookup; observe it again before clicking.",
+                Some(serde_json::json!({
+                    "reason": "window_changed", "window": window,
+                    "current_window_id": after.id,
+                })),
+            ));
         }
+        let results = out.join("\n");
+        let mut text = if out.is_empty() {
+            format!(
+                "no elements matching '{}' in window {}",
+                params.query, window.id
+            )
+        } else {
+            results.clone()
+        };
+        if incomplete {
+            text.push_str("\nAccessibility lookup reached its time limit; results are incomplete.");
+        }
+        Ok(structured_result(
+            &peer,
+            text,
+            serde_json::json!({
+                "matches": out.len(), "query": params.query, "results": results,
+                "elements": elements, "window": window, "accessibility_frame": frame_identity,
+                "coordinate_frame": "window_client_pixels",
+                "visibility": "accessibility_reported", "occlusion": "not_checked",
+                "incomplete": incomplete,
+            }),
+        )
+        .await)
     }
 
     #[rmcp::tool(
