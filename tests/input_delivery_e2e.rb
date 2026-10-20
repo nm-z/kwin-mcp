@@ -496,6 +496,23 @@ class InputDeliveryProbe
     window = screen('browser-address-before').fetch('window')
     assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
                         y: (y + height / 2 - window.fetch('y')).round))
+    # Page editing must retain verified receipts before focus moves to the
+    # browser UI; the browser fallback must not hide a page-delivery regression.
+    page_text = 'Page receipt stays verified'
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    page_result = assert_success(call('keyboard_type', text: page_text))
+    page_delivery = page_result.fetch('delivery')
+    unless page_delivery['status'] == 'verified' && page_delivery['method'] == 'atspi_focused_text' &&
+           page_delivery['expected_field_characters'] == page_text.length &&
+           page_delivery['observed_field_characters'] == page_text.length
+      raise "Page input did not retain its verified receipt: #{page_delivery}"
+    end
+    unless page_result['submission_complete'] && page_result['submitted_characters'] == page_text.length &&
+           page_result['retry_safe'] == false
+      raise "Page input submission was incomplete or invited retry: #{page_result}"
+    end
+    copy_field(page_text, 'browser-page')
+    File.write(File.join(@artifacts, 'browser-page-receipt.json'), JSON.pretty_generate(page_result))
     assert_success(call('keyboard_key', key: 'ctrl+l'))
     typing = call('keyboard_type', text: 'chrome://extensions')
     receipt = typing.dig('result', 'structuredContent')
@@ -519,11 +536,7 @@ class InputDeliveryProbe
     unless receipt['submission_complete'] && receipt['submitted_characters'] == 'chrome://extensions'.length
       raise "Chrome address-bar submission incomplete: #{receipt}"
     end
-    assert_success(call('keyboard_key', key: 'ctrl+a'))
-    assert_success(call('keyboard_key', key: 'ctrl+c'))
-    observed = assert_success(call('clipboard_read')).fetch('text')
-    File.write(File.join(@artifacts, 'browser-address-observed.txt'), observed)
-    raise "Address bar differs from submitted URL: #{observed.inspect}" unless observed == 'chrome://extensions'
+    copy_field('chrome://extensions', 'browser-address')
     File.write(File.join(@artifacts, 'browser-address-receipt.json'), JSON.pretty_generate(receipt))
     screen('browser-address-before-navigation')
     return_key = assert_success(call('keyboard_key', key: 'Return'))
