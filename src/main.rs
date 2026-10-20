@@ -9768,12 +9768,10 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
                 };
                 // Chromium sets no Active state on its frames; the KWin caption of the
                 // active window starts its frame name (which adds the profile name).
-                if !frame
-                    .name()
-                    .await
-                    .unwrap_or_default()
-                    .starts_with(active_title)
-                {
+                if !input_bridge::caption_starts_with(
+                    &frame.name().await.unwrap_or_default(),
+                    active_title,
+                ) {
                     continue;
                 }
                 let mut stack: Vec<(atspi::ObjectRefOwned, bool)> = frame
@@ -10799,9 +10797,8 @@ fn find_ui_frame_window<'a>(
         .iter()
         .filter(|window| {
             !window.title.is_empty()
-                && (window.title == name
-                    || window.title.starts_with(name)
-                    || name.starts_with(&window.title))
+                && (input_bridge::caption_starts_with(&window.title, name)
+                    || input_bridge::caption_starts_with(name, &window.title))
         })
         .collect::<Vec<_>>();
     // A provider can report a window-local origin even for CoordType::Screen.

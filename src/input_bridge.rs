@@ -1068,6 +1068,14 @@ pub struct TextDelivery {
     pub warning: Option<String>,
 }
 
+/// Whether an accessibility frame name starts with a KWin window caption.
+/// The two can space the same caption differently (Okular's frame is named
+/// "doc.pdf  — Okular" with two spaces), so runs of whitespace compare equal.
+pub fn caption_starts_with(name: &str, caption: &str) -> bool {
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapse(name).starts_with(&collapse(caption))
+}
+
 /// Accessibility shows keyboard focus on a control that is not editable text.
 #[derive(Debug)]
 pub struct FocusNotEditable(pub String);
@@ -1368,7 +1376,7 @@ impl TextReceipt {
             for frame_object in app.get_children().await? {
                 let frame = frame_object.as_accessible_proxy(&bus).await?;
                 let name = frame.name().await.unwrap_or_default();
-                if !name.starts_with(title) {
+                if !caption_starts_with(&name, title) {
                     continue;
                 }
                 // Electron may retain Focused on nodes in several windows with
@@ -1708,7 +1716,21 @@ impl TextReceipt {
 
 #[cfg(test)]
 mod text_receipt_tests {
-    use super::{FocusNotEditable, TerminalFocus, TextDelivery};
+    use super::{FocusNotEditable, TerminalFocus, TextDelivery, caption_starts_with};
+
+    #[test]
+    fn frame_names_match_captions_regardless_of_whitespace_runs() {
+        assert!(caption_starts_with("doc.pdf  — Okular", "doc.pdf — Okular"));
+        assert!(caption_starts_with(
+            "Issues - Google Chrome - Nate",
+            "Issues - Google Chrome"
+        ));
+        assert!(!caption_starts_with(
+            "doc.pdf — Okular",
+            "other.pdf — Okular"
+        ));
+        assert!(!caption_starts_with("doc", "doc.pdf — Okular"));
+    }
 
     fn non_editable_focus() -> anyhow::Error {
         FocusNotEditable("panel \"Tools\"".to_owned()).into()
