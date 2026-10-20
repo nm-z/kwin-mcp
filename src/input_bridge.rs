@@ -1290,12 +1290,20 @@ impl TextReceipt {
             Err(_) => Err(TextFocusError::QueryTimedOut),
         }
     }
+    /// `check_focus`, repeating a timed-out query once: a stall of this
+    /// process can expire the timer of a query the target answered promptly.
+    pub(crate) async fn recheck_focus(&self) -> Result<(), TextFocusError> {
+        match self.check_focus().await {
+            Err(TextFocusError::QueryTimedOut) => self.check_focus().await,
+            result => result,
+        }
+    }
     pub(crate) async fn watch_focus(&self) -> TextFocusError {
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(50));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
-            if let Err(error) = self.check_focus().await {
+            if let Err(error) = self.recheck_focus().await {
                 return error;
             }
         }
