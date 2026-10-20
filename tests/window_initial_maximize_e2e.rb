@@ -131,6 +131,21 @@ begin
           File.write(File.join(evidence, 'verification.json'), JSON.pretty_generate(initial: before, restored: restored, resized: resized, screenshot: capture))
           content.call(call.call('session_stop', args))
           session_id = nil
+
+          native = content.call(call.call('session_start', {window_mode: 'native'}))
+          session_id = native.fetch('session_id')
+          args = {session_id: session_id}
+          native_rules = File.read(File.join(native.fetch('workdir'), 'kwinrulesrc'))
+          raise 'native session still writes maximize rules' if native_rules.include?('maximize')
+          content.call(call.call('launch_app', args.merge(command: 'konsole --separate')))
+          native_window = content.call(call.call('window_list', args)).fetch('windows').find do |window|
+            window['resourceClass'] == 'org.kde.konsole'
+          end
+          raise 'native Konsole window not found after launch' unless native_window
+          raise "native window opened at the full display: #{native_window.slice('x', 'y', 'w', 'h').inspect}" if native_window['w'] == 1600 && native_window['h'] == 1000
+          File.write(File.join(evidence, 'native.json'), JSON.pretty_generate(native: native_window))
+          content.call(call.call('session_stop', args))
+          session_id = nil
           puts 'window_initial_maximize_e2e=PASS'
         rescue StandardError => error
           File.write(File.join(evidence, 'failure.txt'), "#{error.class}: #{error.message}\n")

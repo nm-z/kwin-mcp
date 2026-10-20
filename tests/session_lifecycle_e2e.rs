@@ -3880,6 +3880,18 @@ fn host_graphical_socket_fixture() {
 }
 
 #[test]
+#[ignore = "helper launched by session_start_bounds_large_ancestor_copies_with_a_nested_mount"]
+fn session_graphical_home_socket_probe() {
+    let socket = std::env::var("KWIN_GRAPHICAL_HOME_SOCKET").expect("graphical socket path");
+    let report = std::env::var("KWIN_GRAPHICAL_HOME_REPORT").expect("graphical socket report");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_err(),
+        "split HOME exposed a graphical host socket through its ordinary path"
+    );
+    std::fs::write(report, "GRAPHICAL_SOCKET_BLOCKED\n").expect("graphical socket report");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, and a live GPU session"]
 fn session_follows_host_sqlite_wal_rotation() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
@@ -4101,9 +4113,66 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "session write leaked to the host without export"
     );
 
-    let exported = call_tool(
+    let not_ready = call_tool(
         &mut client,
         4,
+        "wait_for_file",
+        json!({
+            "session_path": home.join("Downloads/not-yet-created.txt"),
+            "timeout_seconds": 1,
+            "stable_for_ms": 100,
+        }),
+    );
+    assert_eq!(not_ready["error"]["data"]["status"], json!("not_ready"));
+    assert_eq!(not_ready["error"]["data"]["reason"], json!("missing"));
+
+    let delayed = home.join("Downloads/capture.txt");
+    let producer = format!(
+        "sleep 3; printf 'capture complete\\n' > {}; exec bash",
+        shlex::try_quote(&delayed.display().to_string()).expect("quote delayed session path")
+    );
+    let command = format!(
+        "konsole --separate -e bash -c {}",
+        shlex::try_quote(&producer).expect("quote delayed producer command")
+    );
+    let launched = call_tool(&mut client, 5, "launch_app", json!({"command": command}));
+    assert_eq!(
+        launched["result"]["structuredContent"]["window_outcome"],
+        json!("new"),
+        "{launched}"
+    );
+    let ready = call_tool(
+        &mut client,
+        6,
+        "wait_for_file",
+        json!({
+            "session_path": delayed,
+            "timeout_seconds": 10,
+            "stable_for_ms": 500,
+        }),
+    );
+    let readiness = &ready["result"]["structuredContent"];
+    assert_eq!(readiness["status"], json!("ready"), "{ready}");
+    assert_eq!(readiness["size_bytes"], json!(17), "{ready}");
+    let delayed_export = call_tool(
+        &mut client,
+        7,
+        "export_file",
+        json!({"session_path": delayed, "host_path": home.join("out")}),
+    );
+    assert_eq!(
+        delayed_export["result"]["structuredContent"]["status"],
+        json!("exported"),
+        "{delayed_export}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("out/capture.txt")).expect("exported capture"),
+        "capture complete\n"
+    );
+
+    let exported = call_tool(
+        &mut client,
+        8,
         "export_file",
         json!({"session_path": download, "host_path": home.join("out")}),
     );
@@ -4120,7 +4189,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let refused = call_tool(
         &mut client,
-        5,
+        9,
         "export_file",
         json!({"session_path": download, "host_path": home.join("out")}),
     );
@@ -4133,7 +4202,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
     );
     let replaced = call_tool(
         &mut client,
-        6,
+        10,
         "export_file",
         json!({"session_path": download, "host_path": host_copy, "overwrite": true}),
     );
@@ -4146,7 +4215,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
     // Default destination: the same path on the host (the directory the user named).
     let default = call_tool(
         &mut client,
-        7,
+        11,
         "export_file",
         json!({"session_path": download}),
     );
@@ -4159,7 +4228,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let note = call_tool(
         &mut client,
-        8,
+        12,
         "export_file",
         json!({"session_path": "/tmp/session-note.txt", "host_path": home.join("out")}),
     );
@@ -4175,7 +4244,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
 
     let partial = call_tool(
         &mut client,
-        9,
+        13,
         "export_file",
         json!({"session_path": home.join("Downloads/partial.zip"), "host_path": home.join("out")}),
     );
@@ -4187,7 +4256,7 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "{partial}"
     );
     assert!(!home.join("out/partial.zip").exists());
-    call_tool(&mut client, 10, "session_stop", json!({}));
+    call_tool(&mut client, 14, "session_stop", json!({}));
     client.stop_process();
 }
 
@@ -4840,6 +4909,311 @@ fn session_start_binds_large_live_codex_state_without_copying_it() {
 }
 
 #[test]
+#[ignore = "requires KDE, bubblewrap, Konsole, squashfuse, mksquashfs, input devices and a filtered test D-Bus proxy; set KWIN_MCP_TEST_TMPDIR under /var/tmp"]
+fn session_can_explicitly_share_live_codex_state() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let address = require_filtered_cookie_test_bus();
+    let mut client = RpcClient::start_with_env(&[
+        ("DBUS_SESSION_BUS_ADDRESS", address.as_str()),
+        ("KWIN_MCP_E2E_COPY_BINARY", "1"),
+    ]);
+    assert!(
+        client.home.starts_with("/var/tmp"),
+        "mount fixture must stay outside the real HOME"
+    );
+    let codex = client.home.join(".codex");
+    std::fs::create_dir(&codex).expect("create Codex state directory");
+    // Force the split overlay path responsible for oversized ancestor files.
+    let portal = codex.join("portal");
+    let source = client.home.join("mount-source");
+    std::fs::create_dir(&portal).expect("mountpoint");
+    std::fs::create_dir(&source).expect("mount source");
+    std::fs::write(source.join("fixture"), "mounted").expect("mount fixture");
+    let image = client.home.join("mount.squashfs");
+    assert!(
+        Command::new("mksquashfs")
+            .arg(&source)
+            .arg(&image)
+            .args(["-noappend", "-processors", "1", "-quiet"])
+            .stdout(Stdio::null())
+            .status()
+            .expect("create fixture image")
+            .success()
+    );
+    struct FixtureMount(Child, PathBuf);
+    impl Drop for FixtureMount {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3").arg("-u").arg(&self.1).status();
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mount = FixtureMount(
+        Command::new("squashfuse")
+            .arg("-f")
+            .arg(&image)
+            .arg(&portal)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("mount owned fixture"),
+        portal.clone(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !procfs::process::Process::myself()
+        .expect("self")
+        .mountinfo()
+        .expect("mount inventory")
+        .0
+        .iter()
+        .any(|mount| mount.mount_point == portal)
+    {
+        assert!(Instant::now() < deadline, "fixture mount did not appear");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let socket_path = codex.join("host-app.sock");
+    let _socket =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("host socket fixture");
+    let oversized = codex.join("large-state.bin");
+    std::fs::File::create(&oversized)
+        .expect("inactive state fixture")
+        .set_len(128 * 1024 * 1024)
+        .expect("oversized sparse state");
+    let database = codex.join("state_5.sqlite");
+    let host = rusqlite::Connection::open(&database).expect("open host fixture");
+    host.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE state (value TEXT);
+         INSERT INTO state VALUES ('host');
+         CREATE TABLE large (body BLOB);
+         INSERT INTO large VALUES (zeroblob(67108865));",
+    )
+    .expect("seed oversized live state");
+    std::fs::write(client.home.join("private.txt"), "host").expect("private fixture");
+    initialize(&mut client);
+
+    let alias = client.home.join("state-alias");
+    std::os::unix::fs::symlink(&codex, &alias).expect("fixture symlink");
+    for private in [
+        ".cache/google-chrome",
+        ".local/state/kwin-mcp/browser-cookies",
+    ] {
+        std::fs::create_dir_all(client.home.join(private)).expect("private state fixture");
+    }
+    for (index, paths) in [
+        json!([client.home]),
+        json!([client.home.join("missing")]),
+        json!([database]),
+        json!([alias]),
+        json!([codex.join("..")]),
+        json!([client.home.join(".config")]),
+        json!([client.home.join(".cache")]),
+        json!([client.home.join(".cache/google-chrome")]),
+        json!([client.home.join(".local")]),
+        json!([client.home.join(".local/state")]),
+        json!([client.home.join(".local/state/kwin-mcp/browser-cookies")]),
+        json!(["/var/tmp"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rejected = call_tool(
+            &mut client,
+            100 + u64::try_from(index).expect("request ID"),
+            "session_start",
+            json!({"host_write_paths":paths}),
+        );
+        assert!(
+            rejected["result"]["isError"] == true || !rejected["error"].is_null(),
+            "{rejected}"
+        );
+        assert!(
+            rejected.to_string().contains("host_write_paths"),
+            "{rejected}"
+        );
+    }
+    let conflicting = call_tool(
+        &mut client,
+        20,
+        "session_start",
+        json!({"host_write_paths":[codex], "writable_paths":[database]}),
+    );
+    assert!(
+        conflicting.to_string().contains("conflicts"),
+        "{conflicting}"
+    );
+
+    for (index, shared) in [false, true].into_iter().enumerate() {
+        let request = 30 + 10 * u64::try_from(index).expect("request ID");
+        let mut params = json!({"width":640,"height":480});
+        if shared {
+            params["host_write_paths"] = json!([codex]);
+        }
+        let started = call_tool(&mut client, request, "session_start", params);
+        let directory = workdir(&started);
+        if shared {
+            let binary = client.binary_copy.as_ref().expect("private executable");
+            let replacement = binary.with_extension("next");
+            std::fs::copy(binary, &replacement).expect("stage replacement executable");
+            std::fs::rename(&replacement, binary).expect("publish replacement executable");
+            client.wait_for_stderr("reload: reattached 1 sessions", Duration::from_secs(30));
+            client
+                .wait_for_notification("notifications/tools/list_changed", Duration::from_secs(10));
+        }
+        let layers = client
+            .home
+            .join(".cache/kwin-mcp")
+            .join(directory.file_name().expect("workdir name"));
+        if shared {
+            for name in ["state_5.sqlite", "state_5.sqlite-wal", "large-state.bin"] {
+                assert!(
+                    !layers.join("overlay-root/.codex").join(name).exists(),
+                    "copied shared state: {name}"
+                );
+            }
+        }
+        let expected_paths = if shared { json!([codex]) } else { json!([]) };
+        assert_eq!(
+            started["result"]["structuredContent"]["host_write_paths"], expected_paths,
+            "{started}"
+        );
+        let listed = call_tool(&mut client, request + 1, "session_list", json!({}));
+        assert_eq!(
+            listed["result"]["structuredContent"]["sessions"][0]["host_write_paths"],
+            expected_paths,
+            "{listed}"
+        );
+        if shared {
+            assert!(
+                !started["result"]["structuredContent"]["oversized_read_only_files"]
+                    .as_array()
+                    .expect("oversized report")
+                    .contains(&json!(oversized)),
+                "shared state reported read-only: {started}"
+            );
+        }
+        let report = directory.join("live-state-report");
+        let probe = directory.join("live-state-probe");
+        std::fs::copy(std::env::current_exe().expect("test executable"), &probe)
+            .expect("copy Rust probe");
+        let quote = |path: &std::path::Path| {
+            shlex::try_quote(path.to_str().expect("UTF-8 path"))
+                .expect("quote path")
+                .into_owned()
+        };
+        let private_file = client.home.join("private.txt");
+        let launched = call_tool(
+            &mut client,
+            request + 2,
+            "launch_app",
+            json!({"command":format!(
+            "KWIN_LIVE_STATE_DB={} KWIN_LIVE_STATE_PRIVATE={} KWIN_LIVE_STATE_REPORT={} KWIN_LIVE_STATE_SOCKET={} KWIN_LIVE_STATE_SHARED={} {} --ignored --exact session_live_state_probe --nocapture; konsole",
+            quote(&database), quote(&private_file), quote(&report), quote(&socket_path), shared, quote(&probe),
+            )}),
+        );
+        assert!(launched["error"].is_null(), "{launched}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while std::fs::read_to_string(&report).ok().as_deref() != Some("PASS\n") {
+            assert!(
+                Instant::now() < deadline,
+                "live state probe failed: {launched}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        let count: i64 = host
+            .query_row(
+                "SELECT count(*) FROM state WHERE value='session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("host observes session writes");
+        assert_eq!(count, i64::from(shared));
+        if shared {
+            use std::io::Read;
+            let mut header = [0; 13];
+            std::fs::File::open(&oversized)
+                .expect("oversized host state")
+                .read_exact(&mut header)
+                .expect("host write evidence");
+            assert_eq!(&header, b"session-state");
+        }
+        assert_eq!(
+            std::fs::read_to_string(client.home.join("private.txt")).expect("host private file"),
+            "host"
+        );
+        let stopped = call_tool(&mut client, request + 3, "session_stop", json!({}));
+        assert!(
+            !stopped["result"]["isError"].as_bool().unwrap_or(false),
+            "{stopped}"
+        );
+        assert!(!directory.exists(), "session cleanup");
+    }
+    drop(host);
+    let reopened = rusqlite::Connection::open(&database).expect("persistent state");
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT count(*) FROM state WHERE value='session'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("persistent row"),
+        1
+    );
+    assert_eq!(
+        reopened
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .expect("integrity"),
+        "ok"
+    );
+    drop(reopened);
+    drop(mount);
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "helper launched by session_can_explicitly_share_live_codex_state"]
+fn session_live_state_probe() {
+    let database = std::env::var("KWIN_LIVE_STATE_DB").expect("database path");
+    let shared = std::env::var("KWIN_LIVE_STATE_SHARED").expect("sharing mode") == "true";
+    if shared {
+        assert!(
+            std::os::unix::net::UnixStream::connect(
+                std::env::var("KWIN_LIVE_STATE_SOCKET").expect("socket path")
+            )
+            .is_err(),
+            "shared state exposed a host app socket"
+        );
+    }
+    let connection = rusqlite::Connection::open(&database).expect("open session state");
+    let inserted = connection.execute("INSERT INTO state VALUES ('session')", []);
+    assert_eq!(inserted.is_ok(), shared, "{inserted:?}");
+    if shared {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(PathBuf::from(&database).with_file_name("large-state.bin"))
+            .expect("open oversized live state writable")
+            .write_all(b"session-state")
+            .expect("write oversized live state");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint live WAL");
+        drop(connection);
+        let connection = rusqlite::Connection::open(&database).expect("reopen live database");
+        connection.execute_batch("CREATE TABLE recreated_sidecar (value TEXT); INSERT INTO recreated_sidecar VALUES ('live');").expect("write after checkpoint");
+    }
+    std::fs::write(
+        std::env::var("KWIN_LIVE_STATE_PRIVATE").expect("private file"),
+        "session",
+    )
+    .expect("private overlay write");
+    std::fs::write(
+        std::env::var("KWIN_LIVE_STATE_REPORT").expect("report"),
+        "PASS\n",
+    )
+    .expect("probe report");
+}
+
+#[test]
 #[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
 fn application_binary_stderr_keeps_screenshots_and_shutdown_working() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
@@ -4922,21 +5296,12 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{missing}"
     );
     assert_eq!(
-        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
-        "{missing}"
-    );
-    assert!(
-        missing["result"]["structuredContent"]["stderr"]
-            .as_str()
-            .is_some_and(|stderr| {
-                stderr.contains("kwin-mcp-e2e-no-such-command")
-                    && stderr.contains("command not found")
-            }),
-        "missing command stderr was not returned: {missing}"
-    );
-    assert_eq!(
         missing["result"]["structuredContent"]["command_resolution"],
         "kwin-mcp-e2e-no-such-command -> not found in session PATH",
+        "{missing}"
+    );
+    assert_eq!(
+        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
         "{missing}"
     );
     assert!(
@@ -4945,31 +5310,54 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         begun.elapsed()
     );
 
-    let failed = call_tool(
-        &mut client,
-        4,
-        "launch_app",
-        json!({"command":"printf 'synthetic Obsidian startup failure\\n' >&2; exit 3"}),
-    );
+    let failed = call_tool(&mut client, 4, "launch_app", json!({"command":"exit 3"}));
     assert_eq!(failed["result"]["isError"], true, "{failed}");
     assert_eq!(
         failed["result"]["structuredContent"]["exit_status"], 3,
         "{failed}"
     );
     assert_eq!(
-        failed["result"]["structuredContent"]["stderr"], "synthetic Obsidian startup failure\n",
+        failed["result"]["structuredContent"]["command_resolution"], "exit -> shell builtin",
         "{failed}"
     );
+    // The command's stderr comes back with its exit status.
+    let noisy = call_tool(
+        &mut client,
+        7,
+        "launch_app",
+        json!({"command":"sh -c 'echo boom >&2; exit 3'"}),
+    );
+    assert_eq!(noisy["result"]["isError"], true, "{noisy}");
     assert_eq!(
-        failed["result"]["structuredContent"]["command_resolution"], "printf -> shell builtin",
-        "{failed}"
+        noisy["result"]["structuredContent"]["exit_status"], 3,
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["structuredContent"]["command_resolution"]
+            .as_str()
+            .is_some_and(
+                |resolution| resolution.starts_with("sh -> /") && resolution.ends_with("/sh")
+            ),
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["structuredContent"]["stderr_tail"]
+            .as_array()
+            .is_some_and(|lines| lines.contains(&json!("boom"))),
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stderr (last") && text.contains("boom")),
+        "{noisy}"
     );
 
     let finished = call_tool(
         &mut client,
         5,
         "launch_app",
-        json!({"command":"bash -c 'exit 0'","window_timeout_seconds":1}),
+        json!({"command":"true","window_timeout_seconds":1}),
     );
     assert_ne!(finished["result"]["isError"], true, "{finished}");
     assert_eq!(
@@ -4977,22 +5365,32 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{finished}"
     );
     assert_eq!(
-        finished["result"]["structuredContent"]["stderr"], "",
+        finished["result"]["structuredContent"]["command_resolution"], "true -> shell builtin",
         "{finished}"
     );
-    assert!(
-        finished["result"]["structuredContent"]["command_resolution"]
-            .as_str()
-            .is_some_and(
-                |resolution| resolution.starts_with("bash -> ") && resolution.ends_with("/bash")
-            ),
-        "first command PATH resolution was not returned: {finished}"
+    let assigned = call_tool(
+        &mut client,
+        8,
+        "launch_app",
+        json!({"command":"KWIN_MCP_DIAGNOSTIC_FIXTURE=1 sh -c 'exit 3'"}),
+    );
+    assert_eq!(
+        assigned["result"]["structuredContent"]["exit_status"], 3,
+        "{assigned}"
     );
     assert!(
-        finished
-            .to_string()
-            .contains("no stderr output was captured"),
-        "empty diagnostics were not explained: {finished}"
+        assigned["result"]["structuredContent"]["command_resolution"].is_null(),
+        "assignment prefixes must not be misreported as missing executables: {assigned}"
+    );
+    assert!(
+        std::fs::read_dir(workdir(&started))
+            .expect("workdir")
+            .flatten()
+            .all(|entry| entry
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "resolution")),
+        "command-resolution sidecars remain after completed launches"
     );
     let retained = std::fs::read_dir(workdir(&started))
         .expect("workdir")
@@ -5003,27 +5401,6 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         })
         .count();
     assert_eq!(retained, 0, "launch command files were retained");
-    let retained_diagnostics = std::fs::read_dir(workdir(&started))
-        .expect("workdir")
-        .flatten()
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with("launch-")
-                && entry.path().extension().is_some_and(|ext| ext == "stderr")
-        })
-        .count();
-    assert_eq!(retained_diagnostics, 0, "launch diagnostics were retained");
-    let retained_resolutions = std::fs::read_dir(workdir(&started))
-        .expect("workdir")
-        .flatten()
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with("launch-")
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "resolution")
-        })
-        .count();
-    assert_eq!(retained_resolutions, 0, "launch resolutions were retained");
 
     let stopped = call_tool(&mut client, 6, "session_stop", json!({}));
     assert!(
@@ -5031,6 +5408,58 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{stopped}"
     );
     client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and a live GPU session"]
+fn launch_app_names_a_socket_path_in_a_host_directory_the_session_cannot_see() {
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
+    // The socket does not exist yet, so only its host parent directory is probed.
+    let directory =
+        std::env::temp_dir().join(format!("kwin-mcp-e2e-socket-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("host directory");
+    let socket = directory.join("sock");
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"width":640,"height":480}),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "started",
+        "{started}"
+    );
+    let refused = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"command": format!("true {}", socket.display())}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["reason"], "path_not_visible",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["data"]["path"],
+        json!(socket.display().to_string()),
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not visible in the session")),
+        "{refused}"
+    );
+    let stopped = call_tool(&mut client, 4, "session_stop", json!({}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    client.stop_process();
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -6508,7 +6937,7 @@ impl Drop for ResumeProcess {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, Konsole, input devices, and a live GPU session"]
-fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
+fn launch_app_submits_despite_its_own_frozen_compositor_and_recovers() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut client = RpcClient::start();
     initialize(&mut client);
@@ -6537,28 +6966,24 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
         json!({})
     );
     let ping_ms = ping_started.elapsed().as_millis();
-    let timed_out = client.response(3, Duration::from_secs(25));
+    // The window baselines are bounded at 5 seconds each and never hold the
+    // command back, so it is submitted; the window wait then ends at its own 15.
+    let fault_response = client.response(3, Duration::from_secs(45));
     let elapsed_ms = begun.elapsed().as_millis();
+    let payload = &fault_response["result"]["structuredContent"];
+    assert!(fault_response["error"].is_null(), "{fault_response}");
+    assert_eq!(payload["command_submitted"], true, "{fault_response}");
+    assert_eq!(payload["window"], "timeout", "{fault_response}");
     assert_eq!(
-        timed_out["error"]["data"]["reason"], "launch_timeout",
-        "{timed_out}"
-    );
-    assert_eq!(
-        timed_out["error"]["data"]["command_submitted"], false,
-        "{timed_out}"
+        payload["window_baseline"], "unavailable",
+        "{fault_response}"
     );
     assert!(
-        timed_out["error"]["data"]["stage"]
-            .as_str()
-            .expect("stage")
-            .contains("windows before launch")
-    );
-    assert!(
-        (19_000..23_000).contains(&elapsed_ms),
-        "timeout duration {elapsed_ms}ms"
+        (24_000..29_000).contains(&elapsed_ms),
+        "launch duration {elapsed_ms}ms"
     );
     eprintln!(
-        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} timeout_ms={elapsed_ms} response={timed_out}",
+        "launch fault proof: server={} compositor={compositor} ping_ms={ping_ms} launch_ms={elapsed_ms} response={fault_response}",
         client.child.id()
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -6649,7 +7074,7 @@ fn launch_app_times_out_on_its_own_frozen_compositor_and_recovers() {
             .as_str()
             .expect("screenshot path");
         std::fs::copy(capture, directory.join("launch-recovery.png")).expect("copy screenshot");
-        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"timeout_ms":elapsed_ms,"response":timed_out,
+        std::fs::write(directory.join("launch-fault.json"), json!({"server":client.child.id(),"compositor":compositor,"ping_ms":ping_ms,"launch_ms":elapsed_ms,"response":fault_response,
             "commit":started["result"]["structuredContent"]["commit"],"version":started["result"]["structuredContent"]["version"]}).to_string()).expect("write fault proof");
     }
     let stopped = call_tool(&mut client, 8, "session_stop", json!({}));
@@ -6741,6 +7166,33 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    let graphical_socket = home.join("project/host-graphical.sock");
+    struct GraphicalFixture(Child);
+    impl Drop for GraphicalFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _graphical = GraphicalFixture(
+        Command::new(std::env::current_exe().expect("fixture executable"))
+            .args(["--ignored", "--exact", "host_graphical_socket_fixture"])
+            .env("KWIN_GRAPHICAL_SOCKET_FIXTURE", &graphical_socket)
+            // Only this owned helper is marked graphical; no host connection is made.
+            .env("WAYLAND_DISPLAY", "wayland-0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start graphical fixture"),
+    );
+    let socket_deadline = Instant::now() + Duration::from_secs(5);
+    while !graphical_socket.exists() {
+        assert!(
+            Instant::now() < socket_deadline,
+            "graphical fixture did not start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let ordinary = home.join("project/ordinary.bin");
     let large = home.join("project/large.bin");
     let explicit = home.join("project/explicit.bin");
@@ -6797,6 +7249,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         "startup exceeded deadline: {started}"
     );
     let dir = workdir(&started);
+    let socket_probe = dir.join("graphical-socket-probe");
+    std::fs::copy(
+        std::env::current_exe().expect("probe executable"),
+        &socket_probe,
+    )
+    .expect("copy graphical socket probe");
+    let socket_report = dir.join("graphical-socket-report.txt");
     let disk = home
         .join(".cache/kwin-mcp")
         .join(dir.file_name().expect("workdir name"));
@@ -6866,6 +7325,15 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         ),
     )
     .expect("session check script");
+    let script_contents = std::fs::read_to_string(&script).expect("read session check script");
+    let socket_check = format!(
+        "KWIN_GRAPHICAL_HOME_SOCKET={} KWIN_GRAPHICAL_HOME_REPORT={} {} --ignored --exact session_graphical_home_socket_probe --nocapture\n",
+        quote(&graphical_socket),
+        quote(&socket_report),
+        quote(&socket_probe)
+    );
+    std::fs::write(&script, format!("{script_contents}{socket_check}"))
+        .expect("add graphical socket check");
     let launched = call_tool(
         &mut client,
         4,
@@ -6876,10 +7344,13 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
     );
     assert!(launched["error"].is_null(), "{launched}");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n") {
+    while std::fs::read_to_string(&report).ok().as_deref() != Some("ANCESTOR_COPY_PASS\n")
+        || std::fs::read_to_string(&socket_report).ok().as_deref()
+            != Some("GRAPHICAL_SOCKET_BLOCKED\n")
+    {
         assert!(
             Instant::now() < deadline,
-            "session file checks did not pass: {launched}"
+            "session file or graphical socket checks did not pass: {launched}"
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -7284,7 +7755,11 @@ fn check_reexecution(source_reload: bool) {
         .expect("edit private tool description");
     } else {
         let replacement = binary.with_extension("next");
-        std::fs::copy(&binary, &replacement).expect("stage rebuilt executable");
+        let replacement_source = std::env::var_os("KWIN_MCP_E2E_REEXEC_REPLACEMENT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| binary.clone());
+        std::fs::copy(&replacement_source, &replacement).expect("stage rebuilt executable");
+
         std::fs::rename(&replacement, &binary).expect("publish rebuilt executable");
     }
     client.wait_for_stderr(
@@ -8851,7 +9326,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
 }
 
 #[test]
-#[ignore = "requires private KWin desktops, kdialog, and wl-paste"]
+#[ignore = "requires private KWin desktops, kdialog, wl-paste, and xterm"]
 fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut desktop = RpcClient::start();
@@ -8905,6 +9380,49 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     assert_eq!(
         run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
         agent_text
+    );
+    let long_command = format!("{}printf 'paste probe';", "echo x;".repeat(82));
+    assert_eq!(long_command.chars().count(), 595);
+    assert_eq!(
+        run(
+            &mut client,
+            "clipboard_write",
+            json!({"session_id":id,"target":"session","text":&long_command})
+        ),
+        json!({"target":"session","length":595})
+    );
+    let xterm_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_command}),
+    );
+    let paste_started = Instant::now();
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    assert_eq!(
+        submitted_text(&dir.join("xterm.txt")),
+        format!("{long_command}\n")
+    );
+    assert!(
+        paste_started.elapsed() < Duration::from_secs(5),
+        "595-character XTerm paste exceeded five seconds"
+    );
+    run(
+        &mut client,
+        "clipboard_write",
+        json!({"session_id":id,"target":"session","text":agent_text}),
     );
     run(
         &mut client,
@@ -9067,6 +9585,35 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
             json!({"target":"session","length":32,"text":null,"protected":true})
         );
     }
+    let xterm_secret_command = format!(
+        "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm-secret.txt\"'",
+        dir.display()
+    );
+    run(
+        &mut client,
+        "launch_app",
+        json!({"session_id":id,"command":xterm_secret_command}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"shift+Insert"}),
+    );
+    run(
+        &mut client,
+        "keyboard_key",
+        json!({"session_id":id,"key":"Return"}),
+    );
+    let restored_secret = submitted_text(&dir.join("xterm-secret.txt"));
+    let restored_secret = restored_secret.trim_end_matches('\n');
+    assert!(
+        restored_secret.len() == 32
+            && restored_secret.bytes().any(|b| b.is_ascii_lowercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_uppercase())
+            && restored_secret.bytes().any(|b| b.is_ascii_digit())
+            && restored_secret.bytes().any(|b| b.is_ascii_punctuation()),
+        "reloaded PRIMARY selection must retain the protected generated value"
+    );
     // Replacing a selection from an app must prevent reload from resurrecting it.
     run(
         &mut client,
@@ -9108,7 +9655,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
     run(&mut desktop, "session_stop", json!({"session_id":host_id}));
     desktop.stop_process();
     println!(
-        "PASS: separate clipboards; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
+        "PASS: separate clipboards; 595-character XTerm Shift+Insert paste; Unicode paste; viewer copy and paste; generated secret classes and length without readback; reload preserves owners and newer app selections; invalid writes preserve selection"
     );
 }
 
