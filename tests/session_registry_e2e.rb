@@ -6,6 +6,7 @@
 require 'fileutils'
 require 'json'
 require 'open3'
+require 'shellwords'
 require 'tmpdir'
 require 'timeout'
 
@@ -70,9 +71,16 @@ Dir.mktmpdir('kw-registry-', '/tmp') do |root|
           input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
           input.flush
 
-          first = structured(call(input, output, 2, 'session_start', {})).fetch('session_id')
-          second = structured(call(input, output, 3, 'session_start', {})).fetch('session_id')
+          first = structured(call(input, output, 2, 'session_start', browser_profiles: 'fresh', startup_timeout_seconds: 60)).fetch('session_id')
+          # Both sessions write the same private /tmp pathname. Unlike
+          # /etc/hostname, these bytes distinguish the owner serving an export.
+          session_file = '/tmp/kw410-session-token'
+          succeeded(call(input, output, 20, 'launch_app', session_id: first,
+                         command: "printf '%s\\n' #{Shellwords.escape(first)} > #{session_file}; exec kdialog --title 'First session' --msgbox 'Earlier session stays usable'"))
+          second = structured(call(input, output, 3, 'session_start', browser_profiles: 'fresh', startup_timeout_seconds: 60)).fetch('session_id')
           raise 'session ids collide' if first == second
+          succeeded(call(input, output, 21, 'launch_app', session_id: second,
+                         command: "printf '%s\\n' #{Shellwords.escape(second)} > #{session_file}; exec kdialog --title 'Second session' --msgbox 'Later session has different export bytes'"))
 
           listed = structured(rpc(input, output, 4, 'tools/call', name: 'session_list', arguments: {}))
           running = listed.fetch('sessions').select { |session| session['status'] == 'running' }.map { |session| session['session_id'] }
@@ -80,10 +88,17 @@ Dir.mktmpdir('kw-registry-', '/tmp') do |root|
 
           # The later start must leave the earlier handle usable: window_list and export both succeed.
           succeeded(call(input, output, 5, 'window_list', session_id: first))
-          hostname = File.join(root, 'exported-hostname')
+          first_export = File.join(root, 'first-session-token')
           succeeded(call(input, output, 6, 'export_file', session_id: first,
-                                                          session_path: '/etc/hostname', host_path: hostname))
-          raise 'export from the earlier session did not copy the file' unless File.file?(hostname)
+                                                          session_path: session_file, host_path: first_export))
+          raise 'earlier export came from the wrong session' unless File.binread(first_export) == "#{first}\n"
+          second_export = File.join(root, 'second-session-token')
+          succeeded(call(input, output, 22, 'export_file', session_id: second,
+                                                          session_path: session_file, host_path: second_export))
+          raise 'later export came from the wrong session' unless File.binread(second_export) == "#{second}\n"
+          puts JSON.generate(check: 'same_path_session_exports', first_session: first,
+                             second_session: second, first_bytes: File.binread(first_export),
+                             second_bytes: File.binread(second_export), passed: true)
           succeeded(call(input, output, 7, 'window_list', session_id: second))
 
           stopped = structured(call(input, output, 8, 'session_stop', session_id: first))
