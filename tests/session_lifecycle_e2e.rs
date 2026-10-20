@@ -5296,6 +5296,11 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{missing}"
     );
     assert_eq!(
+        missing["result"]["structuredContent"]["command_resolution"],
+        "kwin-mcp-e2e-no-such-command -> not found in session PATH",
+        "{missing}"
+    );
+    assert_eq!(
         missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
         "{missing}"
     );
@@ -5311,6 +5316,10 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         failed["result"]["structuredContent"]["exit_status"], 3,
         "{failed}"
     );
+    assert_eq!(
+        failed["result"]["structuredContent"]["command_resolution"], "exit -> shell builtin",
+        "{failed}"
+    );
     // The command's stderr comes back with its exit status.
     let noisy = call_tool(
         &mut client,
@@ -5321,6 +5330,14 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     assert_eq!(noisy["result"]["isError"], true, "{noisy}");
     assert_eq!(
         noisy["result"]["structuredContent"]["exit_status"], 3,
+        "{noisy}"
+    );
+    assert!(
+        noisy["result"]["structuredContent"]["command_resolution"]
+            .as_str()
+            .is_some_and(
+                |resolution| resolution.starts_with("sh -> /") && resolution.ends_with("/sh")
+            ),
         "{noisy}"
     );
     assert!(
@@ -5346,6 +5363,34 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
     assert_eq!(
         finished["result"]["structuredContent"]["exit_status"], 0,
         "{finished}"
+    );
+    assert_eq!(
+        finished["result"]["structuredContent"]["command_resolution"], "true -> shell builtin",
+        "{finished}"
+    );
+    let assigned = call_tool(
+        &mut client,
+        8,
+        "launch_app",
+        json!({"command":"KWIN_MCP_DIAGNOSTIC_FIXTURE=1 sh -c 'exit 3'"}),
+    );
+    assert_eq!(
+        assigned["result"]["structuredContent"]["exit_status"], 3,
+        "{assigned}"
+    );
+    assert!(
+        assigned["result"]["structuredContent"]["command_resolution"].is_null(),
+        "assignment prefixes must not be misreported as missing executables: {assigned}"
+    );
+    assert!(
+        std::fs::read_dir(workdir(&started))
+            .expect("workdir")
+            .flatten()
+            .all(|entry| entry
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "resolution")),
+        "command-resolution sidecars remain after completed launches"
     );
     let retained = std::fs::read_dir(workdir(&started))
         .expect("workdir")

@@ -9873,6 +9873,27 @@ fn launch_window_geometry(window: &WindowSnapshot) -> WindowGeometry {
     }
 }
 
+// Resolve only a literal leading command word. Assignment prefixes and shell
+// expressions need evaluation to identify their executable; leave those unknown
+// instead of reporting a guessed PATH result.
+fn launch_program_name(command: &str) -> Option<String> {
+    let word = shlex::split(command)?.into_iter().next()?;
+    if word.is_empty()
+        || word.contains(['=', '$', '`', ';', '|', '&', '(', ')', '<', '>', '{', '}'])
+    {
+        return None;
+    }
+    Some(word)
+}
+
+struct LaunchResolutionFile(PathBuf);
+
+impl Drop for LaunchResolutionFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 struct LaunchProgress {
     stage: &'static str,
     command_submitted: bool,
@@ -13942,7 +13963,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. The server assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Branded Google Chrome ignores --load-extension; when requested, the result reports this and points to chrome://extensions > Load unpacked. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. For a literal leading command word, command_resolution identifies its session PATH executable, shell builtin, or missing-command result; assignment prefixes and dynamic command words leave it null. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. The server assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Branded Google Chrome ignores --load-extension; when requested, the result reports this and points to chrome://extensions > Load unpacked. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
     )]
     async fn launch_app(
         &self,
@@ -14002,6 +14023,7 @@ impl KwinMcp {
         self.touch_activity().await;
         use futures::StreamExt;
         use std::os::fd::AsFd;
+        use std::os::unix::fs::OpenOptionsExt;
         use tokio::io::AsyncWriteExt;
         use tower::ServiceExt;
 
@@ -14052,6 +14074,24 @@ impl KwinMcp {
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
         let command_paths = launch_path_words(&params.command);
         let mut checked_command = String::new();
+        let resolution_file = xdg.join(format!("launch-{launch_id}.resolution"));
+        let resolution_guard = launch_program_name(&params.command).and_then(|program| {
+            // Diagnostics must not prevent the requested command from running
+            // when its small sidecar cannot be created, e.g. at a /tmp quota.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&resolution_file)
+                .ok()?;
+            drop(file);
+            let destination = shell_quote(&resolution_file.display().to_string());
+            checked_command.push_str(&format!(
+                "_kwin_mcp_launch_name={}; _kwin_mcp_launch_kind=$(type -t -- \"$_kwin_mcp_launch_name\"); case \"$_kwin_mcp_launch_kind\" in file) printf '%s -> %s' \"$_kwin_mcp_launch_name\" \"$(type -P -- \"$_kwin_mcp_launch_name\")\" > {destination} ;; builtin|keyword|function|alias) printf '%s -> shell %s' \"$_kwin_mcp_launch_name\" \"$_kwin_mcp_launch_kind\" > {destination} ;; *) printf '%s -> not found in session PATH' \"$_kwin_mcp_launch_name\" > {destination} ;; esac\n",
+                shell_quote(&program),
+            ));
+            Some(LaunchResolutionFile(resolution_file.clone()))
+        });
         for (path, probe) in launch_path_probes(&params.command, |path| {
             std::fs::symlink_metadata(path).is_ok()
         }) {
@@ -14235,6 +14275,10 @@ impl KwinMcp {
                 }
             }
         }
+        let command_resolution = resolution_guard
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(&file.0).ok())
+            .filter(|resolution| !resolution.is_empty());
         let invisible_path = std::fs::read_to_string(&path_error_file).ok();
         let _ = std::fs::remove_file(&path_error_file);
         if let Some(path) = invisible_path {
@@ -14357,7 +14401,10 @@ impl KwinMcp {
                         params.command
                     ),
                 };
-                let text = format!("{text}{}", exit_diagnostics_text(&diagnostics));
+                let mut text = format!("{text}{}", exit_diagnostics_text(&diagnostics));
+                if let Some(resolution) = command_resolution.as_deref() {
+                    text.push_str(&format!("\nfirst command token resolution: {resolution}"));
+                }
                 let window_outcome = if browser_unattributed {
                     "unattributed"
                 } else {
@@ -14374,6 +14421,7 @@ impl KwinMcp {
                     "stderr_tail": diagnostics.stderr,
                     "sandbox_log_line": diagnostics.sandbox_line,
                     "stderr_error": diagnostics.unavailable,
+                    "command_resolution": command_resolution,
                 });
                 if browser_unattributed {
                     payload["handoff"] = serde_json::json!({
