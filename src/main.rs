@@ -15108,7 +15108,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. By default wait 15 seconds for a new or attributable existing browser window (window_timeout_seconds: 1-120). Set expect_window=false for background or non-GUI work: return after submission with the command shell's session PID and exit_status if already available; this is not proof of successful completion. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded; write output under host_shared_dir returned by session_start for host access. Other /tmp paths are private. Absolute path arguments that exist on the host, or whose parents do, must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded; write output under host_shared_dir returned by session_start for host access. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -15632,14 +15632,25 @@ impl KwinMcp {
                 result.is_error = Some(status != 0);
                 Ok(result)
             }
-            (None, None) => Ok(structured_result(&peer, format!("launched: {} (no window after {}s){suffix}", params.command, window_timeout.as_secs()), serde_json::json!({
-                "action": "launch", "command": params.command, "window": "timeout",
-                "window_outcome": "timeout",
-                "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
-                "stage": "waiting for a window", "command_submitted": true,
-                "window_timeout_seconds": window_timeout.as_secs(),
-                "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
-            })).await),
+            // The command is still running and no window appeared: a GUI that
+            // never mapped, or a background command that should have passed
+            // expect_window=false. Neither is a successful window launch.
+            (None, None) => {
+                let mut result = structured_result(&peer, format!(
+                    "{} opened no window within {}s and is still running. It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.{suffix}",
+                    params.command,
+                    window_timeout.as_secs()
+                ), serde_json::json!({
+                    "action": "launch", "command": params.command, "window": "timeout",
+                    "window_outcome": "timeout", "reason": "window_not_observed",
+                    "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
+                    "stage": "waiting for a window", "command_submitted": true, "retry_safe": false,
+                    "window_timeout_seconds": window_timeout.as_secs(),
+                    "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
+                })).await;
+                result.is_error = Some(true);
+                Ok(result)
+            }
         }
     }
 }

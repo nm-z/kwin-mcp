@@ -1,8 +1,9 @@
 #!/usr/bin/env ruby
-# Production-stdio checks for three launch handoffs:
+# Production-stdio checks for launch handoffs:
 #   focus_gap   (#574) screenshot while one dialog has closed and the next is mapping
 #   first_run   (#576) a fresh Chrome profile opens the requested URL, not first-run terms
 #   hidden_path (#577) a host /tmp path names host_shared_dir, and a copy there runs
+#   window_timeout (#254) a still-running command without a window fails; exit 0 and expect_window=false succeed
 require 'fileutils'
 require 'json'
 require 'open3'
@@ -11,11 +12,11 @@ require 'tmpdir'
 require 'timeout'
 
 binary, evidence, *cases = ARGV
-abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path]' unless binary && evidence
+abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path window_timeout]' unless binary && evidence
 binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
-cases = %w[focus_gap first_run hidden_path] if cases.empty?
+cases = %w[focus_gap first_run hidden_path window_timeout] if cases.empty?
 
 class LaunchHandoffProbe
   def initialize(binary, home, evidence)
@@ -153,6 +154,25 @@ class LaunchHandoffProbe
       wait_until(10, 'the shared script marker') { File.exist?(marker) && File.read(marker) == 'ran' }
       {error_message: error['message'], host_shared_dir: @shared}
     end
+  end
+
+  # A command still running with no window at the deadline is a failed window
+  # launch, but it keeps running; exit 0 and expect_window=false still succeed.
+  def window_timeout
+    late = call('launch_app', command: 'sleep 3; kdialog --title kwin-254-late --msgbox late', window_timeout_seconds: 1)
+    payload = late.dig('result', 'structuredContent') || (raise "timeout returned no result: #{late}")
+    raise "timeout was not an error: #{late}" unless late.dig('result', 'isError') == true
+    expected = {'window_outcome' => 'timeout', 'reason' => 'window_not_observed', 'command_submitted' => true, 'retry_safe' => false}
+    expected.each { |key, value| raise "#{key} is #{payload[key].inspect}: #{late}" unless payload[key] == value }
+    wait_until(15, 'the late dialog') { windows.any? { |window| window['title'].include?('kwin-254-late') } }
+    count = windows.count { |window| window['title'].include?('kwin-254-late') }
+    raise "the timed-out command ran #{count} times" unless count == 1
+    data('keyboard_key', key: 'Return')
+    exited = data('launch_app', command: "printf ok > #{@shared}/zero-exit")
+    raise "zero exit without a window: #{exited}" unless exited['window_outcome'] == 'exited' && exited['exit_status'].zero?
+    background = data('launch_app', command: 'sleep 2', expect_window: false)
+    raise "expect_window=false: #{background}" unless background['window_outcome'] == 'not_expected'
+    {timeout_text: late.dig('result', 'content', 0, 'text').to_s[0, 160], late_windows: count}
   end
 
   def close
