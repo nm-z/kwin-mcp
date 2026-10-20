@@ -361,6 +361,11 @@ extension loaded:
    A dismissed chooser or an **Extension loaded** toast alone does not verify
    that the extension is active. For an extension with a background service or
    relay, also verify its expected operation.
+   Use a screenshot for this check: Chrome internal pages can return no
+   matching elements from `find_ui_elements` even when the card is visible.
+
+See the [raw chooser and enabled-card proof](docs/evidence/375/README.md) for a
+generated extension loaded through the production stdio server.
 
 The [#375 follow-up](https://github.com/nm-z/kwin-mcp/issues/375#issuecomment-6202937506)
 confirmed that `--disable-extensions-except` caused a load toast without the
