@@ -17,7 +17,7 @@ class InputDeliveryProbe
   HTML
 
 
-  def initialize(server, artifacts)
+  def initialize(server, artifacts, width: 1232, height: 924)
     @artifacts = artifacts
     @baseline = ENV['KWIN_MCP_E2E_BASELINE'] == '1'
     @home = File.join(artifacts, 'home')
@@ -33,7 +33,7 @@ class InputDeliveryProbe
   'XDG_DATA_HOME'=>@home+'/.local/share','XDG_STATE_HOME'=>@home+'/.local/state',
   'KDEHOME'=>@home+'/.kde','XDG_RUNTIME_DIR'=>"/run/user/#{Process.euid}",
   'DBUS_SESSION_BUS_ADDRESS'=>"unix:path=/run/user/#{Process.euid}/bus" },
-      server, '--width', '1232', '--height', '924', '--autoclean'
+      server, '--width', width.to_s, '--height', height.to_s, '--autoclean'
     )
     @stderr = Thread.new do
       File.open(File.join(artifacts, 'server.stderr.log'), 'w') do |file|
@@ -44,7 +44,7 @@ class InputDeliveryProbe
         clientInfo: { name: 'input-delivery-e2e', version: '1' })
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
-    start = call('session_start', width: 1232, height: 924)
+    start = call('session_start', width: width, height: height)
     assert_success(start)
     @started = true
     @workdir = start.dig('result','structuredContent','workdir')
@@ -84,8 +84,8 @@ class InputDeliveryProbe
     response.dig('result', 'structuredContent')
   end
 
-  def screen(tag)
-    data = assert_success(call('screenshot'))
+  def screen(tag, arguments = {})
+    data = assert_success(call('screenshot', arguments))
     FileUtils.cp(data.fetch('path'), File.join(@artifacts, "#{tag}.png"))
     data
   end
@@ -147,7 +147,7 @@ class InputDeliveryProbe
     visible
   end
 
-  def electron
+  def prepare_electron
     visible = launch_electron_fixture
     # The composer starts focused; an explicit click verifies active-window routing.
     match = visible.match(/entry\tDo anything\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
@@ -156,6 +156,10 @@ class InputDeliveryProbe
     window = screen('electron-before').fetch('window')
     assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
                         y: (y + height / 2 - window.fetch('y')).round))
+  end
+
+  def electron
+    prepare_electron
     [550, 250].each do |length|
       # Replace the complete selection. Chromium turns a cleared contenteditable
       # into a synthetic newline; deleting first would test that transformation
@@ -223,7 +227,7 @@ class InputDeliveryProbe
     raise "unexpected protocol error: #{response}" if response['error']
     delivery = response.fetch('result').fetch('structuredContent').fetch('delivery')
     File.write(File.join(@artifacts, 'cleared-composer.json'), JSON.pretty_generate(response))
-    raise "cleared composer did not preserve mismatch: #{delivery}" unless delivery['status'] == 'pending_or_mismatched' && response.dig('result', 'isError')
+    raise "cleared composer lost its transformation receipt: #{delivery}" unless delivery['status'] == 'unverified' && delivery['method'] == 'atspi_transformed_blank_line' && !response.dig('result', 'isError')
     raise "wrong cleared expected count: #{delivery}" unless delivery['expected_field_characters'] == 34
     assert_field_context(delivery, initial: [1, 0, 1], range: [0, 0], observed: [33, 0, 0])
     result = response.fetch('result').fetch('structuredContent')
@@ -256,6 +260,83 @@ class InputDeliveryProbe
     raise "field ID returned no accessible nodes: #{response}" unless response.fetch('nodes').positive?
   end
 
+  # Issue #288: selecting and replacing text alone misses the explicit Delete
+  # and immediate capture sequence that originally stalled the compositor.
+  def clear_retype
+    prepare_electron
+    text = ('Claude check-in: run only once; never start twice. AaZz 0123456789, repeated letters: start staaart. ' * 3)[0, 250]
+    File.write(File.join(@artifacts, 'clear-retype-expected.txt'), text)
+    2.times do |round|
+      response = call('keyboard_type', text: text)
+      # No accessibility read or sleep between typing and the first capture.
+      screen("clear-retype-#{round}-immediate")
+      screen("clear-retype-#{round}-cropped", region: [0, 0, 960, 540])
+      copy_field(text, "clear-retype-#{round}")
+      visible = tree
+      File.write(File.join(@artifacts, "clear-retype-#{round}.tree.txt"), visible)
+      raise 'accessibility tree lacks complete text' unless visible.include?(text)
+      result = assert_success(response)
+      delivery = result.fetch('delivery')
+      raise "incomplete typing: #{result}" unless result['submission_complete'] && result['submitted_characters'] == text.length
+      raise "unsafe retry receipt: #{result}" unless result['retry_safe'] == false
+      raise "missing compositor acknowledgement: #{delivery}" unless delivery['compositor_acknowledged']
+      if delivery['status'] == 'verified'
+        raise "wrong field length: #{delivery}" unless delivery['expected_field_characters'] == text.length && delivery['observed_field_characters'] == text.length
+      elsif round == 1 && delivery['status'] == 'unverified' && delivery['method'] == 'atspi_transformed_blank_line'
+        # The copy above must still be exact. Removing the empty-editor newline
+        # is an explicit ambiguity, never a verified preservation of that line.
+        raise "wrong transformed counts: #{delivery}" unless delivery['expected_field_characters'] == text.length + 1 && delivery['observed_field_characters'] == text.length
+        raise "missing transformation guidance: #{delivery}" unless delivery.fetch('warning').include?('do not retype blindly')
+      else
+        raise "unconfirmed text: #{delivery}"
+      end
+
+      next if round == 1
+      assert_success(call('keyboard_key', key: 'ctrl+a'))
+      assert_success(call('keyboard_key', key: 'Delete'))
+      screen('clear-retype-deleted')
+      raise 'Delete left the previous text in the field' if tree.include?(text)
+    end
+    screen('clear-retype-final')
+    preserved_blank_line
+  end
+
+  def copy_field(expected, tag)
+    # Replace the session clipboard first so a stale copy of the identical
+    # previous round cannot satisfy this independent application-side check.
+    sentinel = "copy-not-received-#{tag}"
+    assert_success(call('clipboard_write', target: 'session', text: sentinel))
+    assert_success(call('keyboard_key', key: 'ctrl+a'))
+    assert_success(call('keyboard_key', key: 'ctrl+c'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    copied = nil
+    loop do
+      copied = assert_success(call('clipboard_read')).fetch('text')
+      break if copied == expected
+      pending = copied.nil? || copied == sentinel
+      raise "copied field differs: #{copied.inspect}" unless pending && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      sleep 0.05
+    end
+    File.write(File.join(@artifacts, "#{tag}-copied.txt"), copied)
+  end
+
+  def preserved_blank_line
+    match = tree.match(/entry\tIntentional blank line\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
+    raise 'intentional blank-line textarea bounds missing' unless match
+    x, y, width, height = match.captures.map(&:to_i)
+    window = screen('preserved-blank-line-before').fetch('window')
+    assert_success(call('mouse_click', x: (x + width / 2 - window.fetch('x')).round,
+                        y: (y + height / 2 - window.fetch('y')).round))
+    assert_success(call('keyboard_key', key: 'Return'))
+    text = 'Preserved blank line'
+    result = assert_success(call('keyboard_type', text: text))
+    screen('preserved-blank-line-after')
+    copy_field("\n#{text}", 'preserved-blank-line')
+    delivery = result.fetch('delivery')
+    raise "real newline was treated as transformed: #{delivery}" unless delivery['status'] == 'verified' && delivery['method'] == 'atspi_focused_text'
+    raise "wrong preserved counts: #{delivery}" unless delivery['expected_field_characters'] == text.length + 1 && delivery['observed_field_characters'] == text.length + 1
+  end
+
   def rich_contenteditable
     visible = tree
     match = visible.match(/entry\tRich contenteditable\t[^\t]*\t\((-?\d+), (-?\d+), (\d+), (\d+)\)/)
@@ -279,6 +360,53 @@ class InputDeliveryProbe
     File.write(File.join(@artifacts, 'electron-rich-contenteditable.tree.txt'), visible)
     raise 'rich contenteditable lacks complete text after acknowledged input' unless visible.include?(text)
     screen('electron-rich-after-return')
+  end
+
+  def chrome_omnibox
+    command = 'google-chrome-stable --no-first-run --no-default-browser-check --new-window'
+    assert_success(call('launch_app', command: command))
+    assert_success(call('keyboard_key', key: 'ctrl+l'))
+    initial = assert_success(call('keyboard_type', text: 'https://www.perplexity.ai/'))
+    raise "initial Chrome navigation was not verified: #{initial}" unless initial.dig('delivery', 'status') == 'verified'
+    assert_success(call('keyboard_key', key: 'Return'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    loop do
+      windows = assert_success(call('window_list')).fetch('windows')
+      break if windows.any? { |window| window.fetch('title').downcase.include?('perplexity') }
+      raise 'Chrome did not navigate to Perplexity' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.25
+    end
+    screen('chrome-omnibox-populated-page')
+    assert_success(call('keyboard_key', key: 'ctrl+l'))
+    screen('chrome-omnibox-before-type')
+    visible = tree
+    File.write(File.join(@artifacts, 'chrome-omnibox-before-type.tree.txt'), visible)
+    focused_omnibox = visible.lines.any? do |line|
+      line.include?("entry\tAddress and search bar\t") && line.include?('|focused|')
+    end
+    raise 'Ctrl+L did not focus Chrome address bar' unless focused_omnibox
+    text = 'chrome://extensions/'
+    result = assert_success(call('keyboard_type', text: text))
+    delivery = result.fetch('delivery')
+    screen('chrome-omnibox-after-type')
+    File.write(File.join(@artifacts, 'chrome-omnibox-after-type.tree.txt'), tree)
+    raise 'omnibox omitted completed submission' unless result['submission_complete']
+    raise 'omnibox lacks compositor acknowledgement' unless delivery['compositor_acknowledged']
+    raise "omnibox suggested retry: #{delivery}" unless result['retry_safe'] == false
+    raise "omnibox URL was not verified: #{delivery}" unless delivery['status'] == 'verified'
+    raise "omnibox used the wrong verification path: #{delivery}" unless delivery['method'] == 'atspi_focused_text'
+    raise "wrong omnibox expected length: #{delivery}" unless delivery['expected_field_characters'] == text.length
+    raise "wrong omnibox observed length: #{delivery}" unless delivery['observed_field_characters'] == text.length
+    screen('chrome-omnibox-before-return')
+    assert_success(call('keyboard_key', key: 'Return'))
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    visible = nil
+    loop do
+      visible = screen('chrome-omnibox-after-return')
+      break if visible.dig('window', 'title').downcase.include?('extensions')
+      raise 'omnibox URL did not navigate to Extensions' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.25
+    end
   end
 
   def nested_rich_contenteditable
@@ -478,7 +606,8 @@ begin
     FileUtils.mkdir_p(File.join(artifacts, 'home'))
     File.write(File.join(artifacts, 'home', 'long-comment.html'), InputDeliveryProbe::LONG_COMMENT_HTML)
   end
-  probe = InputDeliveryProbe.new(server, artifacts)
+  dimensions = modes.include?('clear_retype') ? { width: 1920, height: 1080 } : {}
+  probe = InputDeliveryProbe.new(server, artifacts, **dimensions)
   modes.each { |mode| probe.public_send(mode) }
   puts "PASS: #{modes.join(', ')}; evidence #{artifacts}"
 ensure
