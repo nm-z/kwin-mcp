@@ -4,6 +4,7 @@
 #   first_run   (#576) a fresh Chrome profile opens the requested URL, not first-run terms
 #   hidden_path (#577) a host /tmp path names host_shared_dir, and a copy there runs
 #   window_timeout (#254) a still-running command without a window fails; exit 0 and expect_window=false succeed
+#   host_output (#507) expect_window=false stdout, export_file create_parents, screenshot save_as
 require 'fileutils'
 require 'json'
 require 'open3'
@@ -12,11 +13,11 @@ require 'tmpdir'
 require 'timeout'
 
 binary, evidence, *cases = ARGV
-abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path window_timeout]' unless binary && evidence
+abort 'usage: launch_handoff_e2e.rb SERVER EVIDENCE [focus_gap first_run hidden_path window_timeout host_output]' unless binary && evidence
 binary = File.realpath(binary)
 evidence = File.expand_path(evidence)
 FileUtils.mkdir_p(evidence)
-cases = %w[focus_gap first_run hidden_path window_timeout] if cases.empty?
+cases = %w[focus_gap first_run hidden_path window_timeout host_output] if cases.empty?
 
 class LaunchHandoffProbe
   def initialize(binary, home, evidence)
@@ -173,6 +174,34 @@ class LaunchHandoffProbe
     background = data('launch_app', command: 'sleep 2', expect_window: false)
     raise "expect_window=false: #{background}" unless background['window_outcome'] == 'not_expected'
     {timeout_text: late.dig('result', 'content', 0, 'text').to_s[0, 160], late_windows: count}
+  end
+
+  # Host-readable output without an export round trip (#507).
+  def host_output
+    launched = data('launch_app', command: "printf 'line1\\nline2\\n'; echo out-$((1+1))", expect_window: false)
+    stdout = launched['stdout_path'] || (raise "no stdout_path: #{launched}")
+    raise "stdout_path #{stdout} is not in host_shared_dir #{@shared}" unless File.dirname(stdout) == @shared
+    wait_until(10, 'the captured stdout') { File.exist?(stdout) && File.read(stdout) == "line1\nline2\nout-2\n" }
+    if launched['exit_status']
+      raise "stdout_tail #{launched['stdout_tail'].inspect}" unless launched['stdout_tail'] == File.read(stdout)
+    end
+    data('launch_app', command: 'printf exported > /tmp/kwin-507.txt', expect_window: false)
+    data('wait_for_file', session_path: '/tmp/kwin-507.txt', timeout_seconds: 10)
+    destination = File.join(@evidence, 'export-parents', 'a', 'b', 'kwin-507.txt')
+    refused = call('export_file', session_path: '/tmp/kwin-507.txt', host_path: destination)
+    refusal = (refused['error'] || {})['message'].to_s + refused.dig('result', 'content', 0, 'text').to_s
+    raise "missing directory was not refused: #{refused}" unless refusal.include?('create_parents') && !File.exist?(destination)
+    data('export_file', session_path: '/tmp/kwin-507.txt', host_path: destination, create_parents: true)
+    raise 'export with create_parents wrote the wrong bytes' unless File.read(destination) == 'exported'
+    data('launch_app', command: 'kdialog --title kwin-507-shot --msgbox kept')
+    kept = File.join(@evidence, 'kept-screenshot.png')
+    shot = data('screenshot', save_as: kept)
+    raise "saved_as #{shot['saved_as'].inspect}" unless shot['saved_as'] == kept
+    raise 'kept copy differs from the workdir capture' unless File.binread(kept) == File.binread(shot.fetch('path'))
+    again = call('screenshot', save_as: kept)
+    raise "an existing save_as was replaced: #{again}" unless again['error'].to_s.include?('already exists')
+    data('keyboard_key', key: 'Return')
+    {stdout_path: stdout, export: destination, kept: kept}
   end
 
   def close

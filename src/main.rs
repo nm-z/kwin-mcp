@@ -1975,6 +1975,8 @@ const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
+// The most stdout an expect_window=false result quotes; the file has the rest.
+const LAUNCH_STDOUT_TAIL_BYTES: usize = 4096;
 // The window baseline is read before submission, but a KWin that does not answer
 // within this bound must not hold the command back: it is read after submission.
 const LAUNCH_BASELINE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -8023,7 +8025,7 @@ fn export_session_file(source: &Path, destination: &Path, overwrite: bool) -> Re
         .ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
     if !parent.is_dir() {
         return Err(format!(
-            "host directory {} does not exist",
+            "host directory {} does not exist; create it or pass create_parents=true",
             parent.display()
         ));
     }
@@ -9769,6 +9771,10 @@ struct ScreenshotParams {
     /// include structuredContent, regardless of this option.
     #[serde(default)]
     structured_metadata: bool,
+    /// Absolute host path to also save this PNG to, so the next screenshot
+    /// does not replace it. The file must not exist; its directory must.
+    #[serde(default)]
+    save_as: Option<String>,
 }
 
 const GENERATED_SECRET_MIME: &str = kwin_mcp::clipboard::GENERATED_SECRET_MIME;
@@ -10055,6 +10061,10 @@ struct ExportFileParams {
     /// alone and the export fails.
     #[serde(default)]
     overwrite: bool,
+    /// Create missing host parent directories of host_path. Default false: a
+    /// missing directory fails the export without writing anything.
+    #[serde(default)]
+    create_parents: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -13288,7 +13298,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 with the display (no scaling) and the image is window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), including for a non-maximized dialog at any screen position. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Use this to see the UI, verify a state change visually, or read text/images the accessibility tree can't expose. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -13482,9 +13492,41 @@ impl KwinMcp {
                 ));
             }
         }
+        // A kept copy: the workdir's screenshot.png is replaced on every call.
+        let saved_as = match params.save_as.as_deref().map(Path::new) {
+            None => None,
+            Some(target) => {
+                if !target.is_absolute() {
+                    return Err(McpError::invalid_params(
+                        "save_as must be an absolute host path",
+                        None,
+                    ));
+                }
+                if std::fs::symlink_metadata(target).is_ok() {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "screenshot captured but not saved: {} already exists; choose a new save_as path",
+                            target.display()
+                        ),
+                        Some(serde_json::json!({"reason": "save_as_exists"})),
+                    ));
+                }
+                write_atomically(target, &png_bytes).map_err(|error| {
+                    McpError::internal_error(
+                        format!(
+                            "screenshot captured but not saved to save_as: {}",
+                            describe_write_failure(target, &error)
+                        ),
+                        Some(serde_json::json!({"reason": "save_as_failed"})),
+                    )
+                })?;
+                Some(target.display().to_string())
+            }
+        };
         let path_str = path.to_string_lossy().to_string();
         let mut payload = serde_json::json!({
             "path": if write_error.is_some() { serde_json::Value::Null } else { serde_json::json!(path_str) },
+            "saved_as": saved_as,
             "width": out_w,
             "height": out_h,
             "include_cursor": include_cursor,
@@ -15019,7 +15061,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "export_file",
-        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Except in explicitly shared host_write_paths, session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). For an asynchronously produced file, call wait_for_file first to observe it becoming stable. host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
+        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Except in explicitly shared host_write_paths, session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). For an asynchronously produced file, call wait_for_file first to observe it becoming stable. host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true; create_parents=true creates missing host directories. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
     )]
     async fn export_file(
         &self,
@@ -15050,6 +15092,19 @@ impl KwinMcp {
                 .file_name()
                 .ok_or_else(|| McpError::invalid_params("session_path has no file name", None))?;
             destination = destination.join(name);
+        }
+        if params.create_parents
+            && let Some(parent) = destination.parent()
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                McpError::invalid_params(
+                    format!(
+                        "export_file wrote nothing: could not create host directory {}: {error}",
+                        parent.display()
+                    ),
+                    Some(serde_json::json!({"status": "not_exported", "reason": "host_directory_not_created"})),
+                )
+            })?;
         }
         let overwrite = params.overwrite;
         let outcome = tokio::task::spawn_blocking(move || {
@@ -15108,7 +15163,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded; write output under host_shared_dir returned by session_start for host access. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -15270,8 +15325,16 @@ impl KwinMcp {
         // The command's exit status, written when it exits: a launch that ends
         // before a window appears is reported instead of waited out.
         let exit_file = xdg.join(format!("launch-{launch_id}.status"));
+        // Without a window to observe, stdout is the command's result. Keep it
+        // in host_shared_dir, which host tools read at the same path.
+        let stdout_file = (params.expect_window == Some(false))
+            .then(|| xdg.join(format!("launch-{launch_id}.stdout")));
+        let stdout_redirect = stdout_file
+            .as_ref()
+            .map(|file| format!(" > {}", shell_quote(&file.display().to_string())))
+            .unwrap_or_default();
         let launch_cmd = format!(
-            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}; echo $? > {}",
+            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}{stdout_redirect}; echo $? > {}",
             if fuse_enabled {
                 ""
             } else {
@@ -15368,6 +15431,14 @@ impl KwinMcp {
                     params.command
                 ),
             };
+            // Output so far; the file keeps growing while the command runs.
+            let stdout_tail = exit_status
+                .and(stdout_file.as_ref())
+                .and_then(|file| std::fs::read(file).ok())
+                .map(|bytes| {
+                    let start = bytes.len().saturating_sub(LAUNCH_STDOUT_TAIL_BYTES);
+                    String::from_utf8_lossy(&bytes[start..]).into_owned()
+                });
             let mut result = structured_result(
                 &peer,
                 text,
@@ -15376,6 +15447,7 @@ impl KwinMcp {
                     "window": "not_expected", "window_outcome": "not_expected",
                     "command_submitted": true, "retry_safe": false,
                     "pid": pid, "exit_status": exit_status,
+                    "stdout_path": stdout_file, "stdout_tail": stdout_tail,
                     "cdp": false, "warning": warning,
                 }),
             )
