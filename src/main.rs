@@ -7941,28 +7941,29 @@ fn prepare_ssh_config_overrides(workdir: &Path, session_uid: u32) -> Vec<(PathBu
         if path.extension().is_none_or(|extension| extension != "conf") {
             continue;
         }
-        // Follow symlinks: ssh checks the file it reads, not the link.
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_file()
-            || !ssh_config_needs_copy(metadata.uid(), metadata.mode(), session_uid)
-        {
-            continue;
-        }
         let copy = workdir.join(format!("ssh-{}", entry.file_name().to_string_lossy()));
         let written = std::fs::canonicalize(&path).and_then(|target| {
-            let contents = std::fs::read(&target)?;
-            std::fs::OpenOptions::new()
+            // Validate the same opened file whose bytes are copied. Replacing
+            // a symlink between path lookups must not sanitize an unsafe file.
+            let mut source = std::fs::File::open(&target)?;
+            let metadata = source.metadata()?;
+            if !metadata.is_file()
+                || !ssh_config_needs_copy(metadata.uid(), metadata.mode(), session_uid)
+            {
+                return Ok(None);
+            }
+            let mut destination = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&copy)?
-                .write_all(&contents)?;
-            Ok(target)
+                .open(&copy)?;
+            std::io::copy(&mut source, &mut destination)?;
+            destination.flush()?;
+            Ok(Some(target))
         });
         match written {
-            Ok(target) => overrides.push((copy, target)),
+            Ok(Some(target)) => overrides.push((copy, target)),
+            Ok(None) => {}
             Err(error) => eprintln!(
                 "session_start: cannot copy {} for the sandbox: {error}",
                 path.display()
