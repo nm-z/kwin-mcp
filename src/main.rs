@@ -9553,8 +9553,9 @@ struct KeyboardKeyParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ExportFileParams {
-    /// Absolute path of the file as the session sees it, e.g. the path Chrome
-    /// reported for a finished download (/home/<user>/Downloads/report.pdf).
+    /// Absolute path of one regular file as the session sees it, e.g. a finished
+    /// download (/home/<user>/Downloads/report.pdf). Archive directories inside
+    /// the session first, or export their files individually.
     session_path: String,
     /// Absolute host path to write, or an existing host directory to write
     /// into under the same file name. Omit to use session_path itself, which
@@ -13909,6 +13910,14 @@ impl KwinMcp {
                 }
                 return Err(format!("{} does not exist in the session", session_path.display()));
             }
+            let metadata = std::fs::metadata(&source)
+                .map_err(|error| format!("cannot inspect session path {}: {error}", session_path.display()))?;
+            if metadata.is_dir() {
+                return Err(format!("{} is a directory; export_file accepts one regular file. Create an archive of this directory inside the session, then export the archive, or list the directory and export each file individually", session_path.display()));
+            }
+            if !metadata.is_file() {
+                return Err(format!("{} is not a regular file in the session", session_path.display()));
+            }
             export_session_file(&source, &destination, overwrite).map(|bytes| (destination, bytes))
         })
         .await
@@ -13935,7 +13944,9 @@ impl KwinMcp {
             }
             Err(reason) => Err(McpError::internal_error(
                 format!("export_file wrote nothing: {reason}"),
-                Some(serde_json::json!({"status": "not_exported", "reason": reason})),
+                Some(
+                    serde_json::json!({"status": "not_exported", "session_path": params.session_path, "reason": reason}),
+                ),
             )),
         }
     }
