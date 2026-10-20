@@ -10641,14 +10641,14 @@ impl rmcp::ServerHandler for KwinMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_logging().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "KDE Wayland automation in an isolated desktop. Call session_start to create it; pass session_id to later tools. Call session_stop when finished. \
-                Flow: session_start → launch_app → screenshot → mouse_click / keyboard_type / keyboard_key → screenshot to verify. Prefer find_ui_elements for named controls, accessibility_tree for structure, and screenshots if either is empty or costly. If an app is missing, use window_list and window_activate. \
-                Work without a viewer by default. When the user must see or act (password, OTP, Duo, CAPTCHA, choice, result), put the relevant entry on screen, then call viewer_open; never assume it is open or stop the session for this step. You can poll screenshots without ending your turn. Continue when the page advances. The viewer can stay open; the user can close it. \
-                Clipboards are separate. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes from the host. Use clipboard_write target=host for user paste through the viewer, target=session for agent input. Session writes also populate PRIMARY for X11 clients such as XTerm that use Shift+Insert by default. clipboard_read reads session text only. generate_secret values are withheld. \
-                At a browser login, click the field and choose saved credentials without reading or typing the value. Otherwise open the viewer. \
-                Chrome file chooser: click the file input, ctrl+l, type the absolute path, alt+o (Enter in the location bar cancels). \
-                Mouse and screenshot coordinates are pixels relative to the active window's top-left, 1:1. A cropped screenshot reports region=[x1,y1,x2,y2]; its pixel (px,py) is mouse position (px+x1,py+y1). \
-                {size_line} Windows are auto-maximized unless session_start sets window_mode=native. Input and screenshot results warn (memory_warning) when session memory is throttled.",
+                "KDE Wayland automation in an isolated desktop. Flow: session_start → launch_app → screenshot → input → screenshot to verify. \
+                Prefer find_ui_elements for named controls, accessibility_tree for structure, screenshots otherwise. Use window_list and window_activate for hidden windows. \
+                Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. The viewer may stay open; the user can close it. \
+                At browser logins, select saved-credential autofill without reading or typing its value; otherwise show the entry and open the viewer. \
+                Clipboards are separate: local viewer Ctrl+C/Ctrl+X copies to the server host; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
+                Chrome chooser: click the file input, ctrl+l, type the absolute session path, alt+o. Enter in the location bar cancels. \
+                Mouse/screenshot coordinates are 1:1 pixels from the active window's top-left. For crop region=[x1,y1,x2,y2], image (px,py) maps to mouse (px+x1,py+y1). \
+                {size_line} Windows auto-maximize unless window_mode=native. Results report memory_warning when the session is throttled.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -10662,7 +10662,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Boot a black box carbon copy live session without opening a host viewer window. Required before tools that use a desktop. Every call creates a new isolated desktop and returns its session_id. Use only IDs returned by your own session_start calls; if such an ID belongs to another live same-user kwin-mcp process on this host, the request is forwarded to its owner. This tool does not accept session_id. startup_timeout_seconds sets a bounded 1..300 second startup budget (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence, starting those config directories empty for terminal-only or fresh-browser tasks; inherit is the default. window_mode=maximized (default) maximizes every new window when it maps; window_mode=native maps each window at the size its app requests, so an app relaunched after a stop reopens at its own size (use it for window-geometry repros). Both modes remove window decorations. Optional memory_high/memory_max/memory_swap_max (whole GiB) override the server limits for this session; zero disables throttling or swap, and memory_max must be positive and at least memory_high. Optional width/height (pixels) set the virtual display size for this session, overriding the server default; they are ignored if the server was launched with --no-override. The result reports the actual width/height and a separate viewer outcome (closed until viewer_open is called). Work headless until the user needs to see or do something in the session (a password, OTP, Duo push, CAPTCHA, choice or result, for example); put the relevant entry or prompt on screen, then call viewer_open and keep the session live. You may continue without closing the viewer; the user can close it directly. Never stop the session to hand a step back to the user. By default, writes to $HOME land in a per-session overlay on disk at ~/.cache/kwin-mcp/kwin-mcp-<pid>-<number>/overlay-upper/ ($XDG_CACHE_HOME when set). The lower layer remains read-only, and session_stop discards the upper layer; use export_file to hand a session file (e.g. a download) to a real host directory. To operate an application against live host state, explicitly set host_write_paths to its existing state directory under HOME (for Codex, ~/.codex as an absolute path). This skips copies and read-only SQLite mounts for that subtree; all writes and deletions there persist on the host, including after session_stop. session_start and session_list report the shared directories."
+        description = "Create a new isolated desktop and return its session_id. Required before desktop tools; each call creates a separate session and does not accept session_id. Pass IDs from your own session_start calls to later tools. A live session on another same-user local process is forwarded to its owner. startup_timeout_seconds is 1..300 (default 20). browser_profiles=fresh starts Chromium config directories empty and skips cookie persistence; inherit is the default. window_mode=maximized maximizes new windows once; native uses the app's requested size. Both modes remove decorations. width/height override the virtual display size unless the server uses --no-override. The result reports actual dimensions and viewer status. memory_high/memory_max/memory_swap_max override limits in whole GiB; see parameter constraints. Start without a viewer. Put any password, OTP, Duo, CAPTCHA, choice or result on screen before calling viewer_open. Keep the session alive for user input; the viewer may stay open. By default HOME writes stay in a private overlay under ~/.cache/kwin-mcp/ ($XDG_CACHE_HOME when set) and are discarded by session_stop. Use export_file to preserve a result on the host. For explicitly requested live application state, host_write_paths shares existing directories under HOME (e.g. the absolute ~/.codex path), skipping copies and read-only SQLite mounts there. Writes and deletions in those directories persist on the host after session_stop; session_start and session_list report them."
     )]
     async fn session_start(
         &self,
@@ -12014,7 +12014,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open the live viewer window for the current session on the user's desktop whenever the user needs to see something in the session or do something the agent cannot or must not do itself (for example a password, OTP, Duo push, CAPTCHA, choice or result), or asks to watch. Never stop the session or send the user elsewhere when the viewer can bridge the step. Pass reason with a short instruction whenever the user needs to act; it appears only in the window title. Before asking the user for information, navigate to the relevant form or prompt and put the empty entry on screen. Then call viewer_open and ask the user to enter the information there. Never assume the viewer is already open; this call reuses an open viewer and updates its title. Viewer input is forwarded immediately. If it interrupts an in-flight agent operation, remaining agent events are cancelled with retry_safe=false because some input may have arrived; inspect before retrying. New agent mouse and keyboard calls return a retry-safe error for one second after the latest viewer input; retry after one second without viewer input. The viewer can stay open while agent input resumes. You can keep your turn open and poll screenshots for the information or completed action instead of ending your turn and waiting for the user to say they are done. Opening the viewer with the entry visible may give enough context without a separate chat instruction. While waiting, keep the page open. If a Duo push expires, say so in one line and leave the page on the resend option so the user can retry. Continue as soon as the screen shows that the step is complete. You may continue without closing the viewer so the user can keep watching; the user can close it directly without asking you. Do not close it merely because the page advances. Returns ready after the host renderer successfully submits the first PipeWire frame for presentation, or unavailable with the startup failure and last PipeWire state. On a headless host the reason ends with a command to run on the machine with the screen (kwin-viewer --remote HOST DIR): it shows this same session there and sends input back, with no restart. Works even when the server runs with --no-viewer. The session has its own clipboard. In the local viewer, Ctrl+C or Ctrl+X copies to the host; Ctrl+V or Shift+Insert pastes the host clipboard. Use clipboard_write with target=host for anything the user should paste through the viewer, and target=session for agent input. clipboard_read reads session text only; generate_secret values are withheld."
+        description = "Open or reuse the live viewer for this isolated session on the server's desktop. Use it when the user asks to watch or must see or act on a password, OTP, Duo, CAPTCHA, choice or result. First navigate to the relevant form and show the entry; pass reason with a short instruction for the window title. Never assume the viewer is open or stop the session for a handoff. Keep the page open and poll screenshots; continue when the step completes. If Duo expires, leave the resend option visible and tell the user. The viewer may stay open; the user can close it. Viewer input is forwarded immediately and cancels remaining in-flight agent events with retry_safe=false: inspect before retrying. New agent input receives a retry-safe error for one second after viewer input; resume after a quiet second. Returns ready after the host renderer submits its first PipeWire frame, or unavailable with the startup failure and last PipeWire state. On a headless host, the reason gives a kwin-viewer --remote HOST DIR command to show this session elsewhere without restarting it. Works with --no-viewer. In the local viewer Ctrl+C/Ctrl+X copies to the server host clipboard and Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares local viewer paste; target=session prepares agent input. clipboard_read reads session text only and withholds generated secrets."
     )]
     async fn viewer_open(
         &self,
@@ -13942,7 +13942,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop and wait for a new window or an attributable existing browser window for 15 seconds by default; set window_timeout_seconds from 1 to 120 to change the wait. Literal absolute path arguments are checked inside the session before the app starts: one that exists on the host, or whose parent directory does, must be visible there, and an invisible path is reported by name, including when host /tmp is hidden by the session's private /tmp. A command that exits without a window returns its exit status, the last 20 lines of stderr it wrote, and the matching sandbox.log line. The call deadline adds 30 seconds for the bounded KWin window reads and browser accessibility connection; a KWin read that does not answer never blocks submission, and a timeout reports the stalled stage and whether the command was submitted, and leaves the session open. Check window_list before retrying a submitted command. Browser names resolved through PATH get Wayland, KWallet, and accessibility switches unless already set; Chromium-family programs also get CDP. When a Chromium browser hands a URL to an existing window, the result identifies that window and its title when KWin can attribute the handoff; otherwise it explains why attribution was not possible. Google Chrome and Edge need a non-default --user-data-dir for CDP. The server assigns the forwarded CDP port and replaces any --remote-debugging-port argument; a successful CDP connection returns cdp_port. Branded Google Chrome ignores --load-extension; when requested, the result reports this and points to chrome://extensions > Load unpacked. Writes under the isolated HOME stay in the session overlay; export_file copies one to the host. Inherited session browser profiles carry the user's saved passwords: at a login field, click it and choose the saved-credential suggestion so autofill fills it; never read or type the credential. If no suggestion appears, call viewer_open for the user instead of stopping."
+        description = "Run a shell command in the isolated desktop and wait for a new or attributable existing browser window. window_timeout_seconds is 1..120 (default 15); the call budget adds 30 seconds for bounded KWin reads and browser accessibility. An unanswered baseline read does not block command submission. Timeouts report the stalled stage and whether the command was submitted; check window_list before retrying a submitted command. Absolute path arguments found on the host, or with a host parent directory, must be visible inside the session. Errors name invisible paths, including host /tmp hidden by private session /tmp. A command exiting without a window returns its status, last 20 stderr lines and sandbox.log location. Browser names resolved through PATH get Wayland, KWallet and accessibility switches; Chromium-family programs also get CDP. Browser handoffs identify the existing window when attributable. Google Chrome/Edge need a non-default --user-data-dir for CDP. The session replaces any --remote-debugging-port; a connected result includes cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. HOME writes stay in the session overlay; export_file preserves results on the host. At a login, click the field and choose saved-credential autofill without reading or typing the value. If unavailable, put the entry on screen and call viewer_open."
     )]
     async fn launch_app(
         &self,
@@ -14760,11 +14760,7 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
             "\n\nNo known browser was found on this host's PATH.".to_owned()
         } else {
             format!(
-                "\n\nBrowsers installed on this host (runnable by these exact commands): {}. \
-                 CDP-capable Chromium-family commands receive a session-managed CDP port. Google \
-                 Chrome and Edge require a non-default --user-data-dir; any explicit \
-                 --remote-debugging-port is replaced with the session port. Successful CDP launches \
-                 return cdp_port. Firefox still supports launch, screenshots, and input.",
+                "\n\nInstalled browser commands: {}. Firefox supports launch, screenshots and input.",
                 browsers.join(", ")
             )
         };
@@ -15496,7 +15492,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .enable_logging()
             .build();
         info.instructions = Some(format!(
-            "{} Each session_start creates a new isolated desktop. Pass only session IDs returned by your own session_start calls. A request for an ID owned by another live kwin-mcp process on this host is forwarded over a private Unix socket after checking the owner PID and effective UID; session_list remains process-local. After the owner exits or a server restart destroys its session, an old handle cannot be resumed; its unavailable-handle error includes session_status and the recorded end time and reason when available, otherwise says cleanup is unconfirmed. session_stop clears dead, stopped, expired, and start_blocked handles. Start a new session and relaunch the applications.",
+            "{} Each session_start creates a new desktop; keep its ID. Same-user local owners receive forwarded calls after PID/UID checks; session_list is process-local. Dead handles cannot resume: errors report lifecycle/recovery details. Clear dead/stopped/expired/start_blocked handles with session_stop, then start anew and relaunch apps.",
             info.instructions.unwrap_or_default()
         ));
         info
@@ -16914,7 +16910,7 @@ mod level_tree_tests {
 
 #[cfg(test)]
 mod instructions_tests {
-    use super::{DisplayConfig, KwinMcp};
+    use super::{DisplayConfig, SessionRouter};
     use rmcp::ServerHandler;
 
     /// Claude Code cuts server instructions at 2048 characters; anything past
@@ -16922,7 +16918,7 @@ mod instructions_tests {
     #[test]
     fn server_instructions_fit_the_client_limit() {
         for locked in [false, true] {
-            let server = KwinMcp::new(DisplayConfig {
+            let server = SessionRouter::new(DisplayConfig {
                 width: 3840,
                 height: 2160,
                 locked,
@@ -16939,6 +16935,16 @@ mod instructions_tests {
                 "{} characters",
                 text.chars().count()
             );
+            for tool in server.tools() {
+                let description = tool.description.as_deref().unwrap_or_default();
+                assert!(!description.is_empty(), "{} has no description", tool.name);
+                assert!(
+                    description.chars().count() <= 2048,
+                    "{}: {} characters",
+                    tool.name,
+                    description.chars().count()
+                );
+            }
         }
     }
 }
