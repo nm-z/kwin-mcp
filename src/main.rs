@@ -7770,16 +7770,31 @@ struct SettleReport {
 
 type Frame = (u32, u32, u32, Vec<u8>);
 
+const SCREENSHOT_RETRY_AFTER_MS: u64 = 1_000;
+
+fn screenshot_timeout(stage: &'static str, timeout: Duration) -> McpError {
+    McpError::internal_error(
+        format!(
+            "screenshot: frame unavailable after {} seconds during {stage}. The compositor may be busy or a window query may be stalled. Wait at least one second, then retry screenshot. This timeout does not stop the session.",
+            timeout.as_secs(),
+        ),
+        Some(serde_json::json!({
+            "reason": "frame_unavailable",
+            "stage": stage,
+            "timeout_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            "retry_safe": true,
+            "retry_after_ms": SCREENSHOT_RETRY_AFTER_MS,
+            "possible_causes": ["compositor_busy", "capture_or_window_query_stalled"],
+            "guidance": "Wait at least one second, then retry screenshot. If the problem persists, inspect window_list and session_list to distinguish a capture failure from a wider session problem. The timeout does not identify the underlying cause.",
+        })),
+    )
+}
+
 /// One complete CaptureScreen frame.
 async fn capture_frame(proxy: &KWinScreenShot2Proxy<'_>) -> Result<Frame, McpError> {
     tokio::time::timeout(SCREENSHOT_FRAME_TIMEOUT, capture_frame_inner(proxy))
         .await
-        .map_err(|_| {
-            McpError::internal_error(
-                "screenshot: compositor did not finish a frame within 10 seconds",
-                None,
-            )
-        })?
+        .map_err(|_| screenshot_timeout("capture_frame", SCREENSHOT_FRAME_TIMEOUT))?
 }
 
 /// The frame KWin writes into `frame`, once all `expected` bytes are there.
@@ -12528,12 +12543,7 @@ impl KwinMcp {
             self.screenshot_result(peer, params),
         )
         .await
-        .map_err(|_| {
-            McpError::internal_error(
-                "screenshot: capture exceeded 20 seconds; the session remains open",
-                None,
-            )
-        })?
+        .map_err(|_| screenshot_timeout("screenshot", SCREENSHOT_TOOL_TIMEOUT))?
     }
 
     async fn screenshot_result(
