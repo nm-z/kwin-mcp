@@ -8567,6 +8567,201 @@ fn launch_path_words(command: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Files a launch argument names, as host paths: absolute words and option
+/// values, and relative words that name an existing host file in `cwd`.
+fn launch_file_words(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = launch_path_words(command);
+    for word in shlex::split(command).unwrap_or_default() {
+        if word.starts_with(['/', '-']) || word.contains('=') {
+            continue;
+        }
+        let Some(path) = cwd.map(|cwd| cwd.join(&word)) else {
+            continue;
+        };
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+// The session sees HOME through an overlay (#611): writes stay in the
+// session, and a host file replaced after session_start can stay the old copy.
+const LAUNCH_OVERLAY_CHECK_LIMIT: usize = 32;
+// Same-size files whose mtimes differ are compared byte for byte up to this.
+const LAUNCH_OVERLAY_COMPARE_BYTES: u64 = 16 << 20;
+
+/// Whether the session's regular file at `path` has the host file's bytes.
+fn same_session_contents(root: &Path, path: &Path) -> std::io::Result<bool> {
+    let mut session = file_import::session_file(root, path, true)?;
+    if !session.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut host = std::fs::File::open(path)?;
+    same_reader_contents(&mut host, &mut session)
+}
+
+#[derive(Default)]
+struct HomeOverlayReport {
+    /// Absolute arguments under HOME whose writes stay in the session.
+    overlay_paths: Vec<PathBuf>,
+    /// The command's working directory, when it is in the overlay.
+    working_directory: Option<PathBuf>,
+    /// Host files the session sees a different copy of, or none at all.
+    different_copies: Vec<serde_json::Value>,
+}
+
+impl HomeOverlayReport {
+    fn is_empty(&self) -> bool {
+        self.overlay_paths.is_empty()
+            && self.working_directory.is_none()
+            && self.different_copies.is_empty()
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "overlay_paths": self.overlay_paths,
+            "working_directory": self.working_directory,
+            "different_copies": self.different_copies,
+        })
+    }
+
+    /// Sentences for the result text; the working directory alone is not
+    /// worth one, since nearly every command runs in HOME.
+    fn notes(&self) -> Vec<String> {
+        let list = |paths: &mut dyn Iterator<Item = String>| paths.collect::<Vec<_>>().join(", ");
+        let mut notes = Vec::new();
+        if !self.different_copies.is_empty() {
+            notes.push(format!(
+                "The session sees a different copy of {} than the host (a host edit after session_start, or a session-side change); import_file with overwrite=true copies the host file in.",
+                list(&mut self.different_copies.iter().filter_map(|copy| copy["path"].as_str().map(str::to_owned)))
+            ));
+        }
+        if !self.overlay_paths.is_empty() {
+            notes.push(format!(
+                "{} {} in the session's HOME overlay: files written there stay in the session. Write outputs to host_shared_dir, pass the directory in host_write_paths to session_start, or copy them out with export_file.",
+                list(&mut self.overlay_paths.iter().map(|path| path.display().to_string())),
+                if self.overlay_paths.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        notes
+    }
+}
+
+fn modified_unix(metadata: &std::fs::Metadata) -> Option<f64> {
+    let modified = metadata.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64(),
+    )
+}
+
+/// What a launch's file arguments look like through the session's HOME
+/// overlay. `root` is the session's root seen from the host; without it only
+/// the overlay paths are reported.
+fn home_overlay_report(
+    command: &str,
+    home: &Path,
+    cwd: Option<&Path>,
+    host_write_paths: &[PathBuf],
+    root: Option<&Path>,
+) -> HomeOverlayReport {
+    let in_overlay = |path: &Path| {
+        path.starts_with(home)
+            && path != home
+            && !host_write_paths
+                .iter()
+                .any(|shared| path.starts_with(shared))
+    };
+    let mut report = HomeOverlayReport {
+        overlay_paths: launch_path_words(command)
+            .into_iter()
+            .filter(|path| in_overlay(path))
+            .collect(),
+        working_directory: cwd.filter(|cwd| in_overlay(cwd)).map(Path::to_owned),
+        different_copies: Vec::new(),
+    };
+    let Some(root) = root else {
+        return report;
+    };
+    for path in launch_file_words(command, cwd)
+        .into_iter()
+        .filter(|path| in_overlay(path))
+        .take(LAUNCH_OVERLAY_CHECK_LIMIT)
+    {
+        let Ok(host) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !host.is_file() {
+            continue;
+        }
+        let session =
+            file_import::session_file(root, &path, false).and_then(|file| file.metadata());
+        let same = match &session {
+            Ok(session) if session.len() == host.len() => {
+                session.modified().ok() == host.modified().ok()
+                    // An imported copy has the host's bytes and a new mtime.
+                    || (host.len() <= LAUNCH_OVERLAY_COMPARE_BYTES
+                        && same_session_contents(root, &path).unwrap_or(false))
+            }
+            _ => false,
+        };
+        if !same {
+            report.different_copies.push(serde_json::json!({
+                "path": path,
+                "host_bytes": host.len(),
+                "host_modified_unix": modified_unix(&host),
+                "session_bytes": session.as_ref().ok().map(std::fs::Metadata::len),
+                "session_modified_unix": session.as_ref().ok().and_then(modified_unix),
+            }));
+        }
+    }
+    report
+}
+
+/// Adds the overlay report to a launch result or error.
+fn attach_home_overlay_report(
+    result: Result<CallToolResult, McpError>,
+    report: &HomeOverlayReport,
+) -> Result<CallToolResult, McpError> {
+    if report.is_empty() {
+        return result;
+    }
+    let notes = report.notes();
+    match result {
+        Err(mut error) => {
+            let mut data = match error.data.take() {
+                Some(serde_json::Value::Object(data)) => data,
+                Some(value) => serde_json::Map::from_iter([("original_data".to_owned(), value)]),
+                None => serde_json::Map::new(),
+            };
+            data.insert("home_overlay".to_owned(), report.as_json());
+            error.data = Some(serde_json::Value::Object(data));
+            if !notes.is_empty() {
+                error.message = format!("{} {}", error.message, notes.join(" ")).into();
+            }
+            Err(error)
+        }
+        Ok(mut result) => {
+            if let Some(data) = result
+                .structured_content
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                data.insert("home_overlay".to_owned(), report.as_json());
+            }
+            if !notes.is_empty() {
+                result.content.push(Content::text(notes.join(" ")));
+            }
+            Ok(result)
+        }
+    }
+}
+
 /// The session path each absolute launch argument must reach before the program
 /// starts, paired with the argument it reports. The session shell checks these
 /// because mounts such as /tmp can hide host files even when the spelling is
@@ -15571,7 +15766,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures include the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. Browser handoffs identify an existing window only when KWin can attribute it. HOME writes stay in the overlay unless shared; export_file copies them to the host. Use saved-credential autofill without reading or typing credentials; when unavailable, open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. An existing browser window counts only when KWin can attribute it. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -15598,10 +15793,11 @@ impl KwinMcp {
             window_baseline_errors: Vec::new(),
         }));
         let observed = progress.clone();
+        let home_report = self.launch_home_overlay_report(&params.command).await;
         let service = tower::service_fn(|(peer, params)| {
             self.launch_app_inner(peer, params, progress.clone(), window_timeout)
         });
-        match tower::timeout::Timeout::new(service, call_timeout)
+        let result = match tower::timeout::Timeout::new(service, call_timeout)
             .oneshot((peer, params))
             .await
         {
@@ -15626,7 +15822,40 @@ impl KwinMcp {
                     Err(launch_failure(error, &progress))
                 }
             }
-        }
+        };
+        attach_home_overlay_report(result, &home_report)
+    }
+
+    /// The HOME overlay report for a launch, taken before the command runs so
+    /// it describes the files the command starts with.
+    async fn launch_home_overlay_report(&self, command: &str) -> HomeOverlayReport {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return HomeOverlayReport::default();
+        };
+        let Ok((sandbox_pid, host_write_paths)) = self
+            .with_session(|sess| Ok((sess.sandbox_child.id(), sess.host_write_paths.clone())))
+            .await
+        else {
+            return HomeOverlayReport::default();
+        };
+        // The session starts in the server's working directory.
+        let cwd = std::env::current_dir().ok();
+        let command = command.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let checks = launch_file_words(&command, cwd.as_deref())
+                .iter()
+                .any(|path| path.starts_with(&home));
+            let root = checks.then(|| sandbox_root(sandbox_pid)).flatten();
+            home_overlay_report(
+                &command,
+                &home,
+                cwd.as_deref(),
+                &host_write_paths,
+                root.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn launch_app_inner(
@@ -20385,5 +20614,137 @@ mod ui_match_context_tests {
         );
         assert_eq!(result["occluded"], true);
         assert_eq!(result["clickable"], false);
+    }
+}
+
+#[cfg(test)]
+mod home_overlay_report_tests {
+    use super::{home_overlay_report, launch_file_words};
+    use std::path::{Path, PathBuf};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> std::io::Result<Self> {
+            let dir = std::env::temp_dir().join(format!(
+                "kwin-611-{label}-{}-{:x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&dir)?;
+            Ok(Self(dir))
+        }
+
+        fn write(&self, relative: &str, text: &str) -> std::io::Result<PathBuf> {
+            let path = self.0.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, text)?;
+            Ok(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A session root holding `path` at the same absolute path.
+    fn copy_into_root(root: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+        let inside = root.join(path.strip_prefix("/").unwrap_or(path));
+        if let Some(parent) = inside.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(inside, text)
+    }
+
+    #[test]
+    fn relative_words_count_only_when_they_name_a_file_in_cwd() -> std::io::Result<()> {
+        let scratch = Scratch::new("words")?;
+        let script = scratch.write("work/run85.sh", "echo new\n")?;
+        let cwd = scratch.0.join("work");
+        let words = launch_file_words("bash run85.sh BIN 1 --flag=x /abs/out", Some(&cwd));
+        assert_eq!(words, vec![PathBuf::from("/abs/out"), script]);
+        Ok(())
+    }
+
+    #[test]
+    fn host_write_paths_and_paths_outside_home_are_not_overlay_paths() -> std::io::Result<()> {
+        let scratch = Scratch::new("paths")?;
+        let home = scratch.0.join("home");
+        let shared = home.join("shared");
+        let command = format!(
+            "run {} {} /usr/bin/true {}",
+            home.join("work/out").display(),
+            shared.join("out").display(),
+            home.display()
+        );
+        let report = home_overlay_report(&command, &home, Some(&home), &[shared], None);
+        assert_eq!(report.overlay_paths, vec![home.join("work/out")]);
+        assert_eq!(
+            report.working_directory, None,
+            "HOME itself is not reported"
+        );
+        assert!(report.different_copies.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_old_or_missing_session_copy_is_reported_and_a_same_view_is_not() -> std::io::Result<()> {
+        let scratch = Scratch::new("copies")?;
+        let home = scratch.0.join("home");
+        let edited = scratch.write("home/work/run85.sh", "echo queued-visual-rect-empty\n")?;
+        let missing = scratch.write("home/work/fonts.txt", "fonts\n")?;
+        let command = format!("bash run85.sh {}", missing.display());
+        let cwd = home.join("work");
+        // The host root is a session that sees exactly the host's files.
+        let same = home_overlay_report(&command, &home, Some(&cwd), &[], Some(Path::new("/")));
+        assert!(
+            same.different_copies.is_empty(),
+            "{:?}",
+            same.different_copies
+        );
+        let root = scratch.0.join("session-root");
+        copy_into_root(&root, &edited, "echo queued-rect=0,0,0,0 colors=2\n")?;
+        let stale = home_overlay_report(&command, &home, Some(&cwd), &[], Some(&root));
+        let paths: Vec<&str> = stale
+            .different_copies
+            .iter()
+            .filter_map(|copy| copy["path"].as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![missing.display().to_string(), edited.display().to_string()]
+        );
+        assert!(stale.different_copies[0]["session_bytes"].is_null());
+        assert_eq!(stale.different_copies[1]["session_bytes"], 34);
+        assert!(
+            stale.notes()[0].contains("import_file with overwrite=true"),
+            "{:?}",
+            stale.notes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_copy_with_the_host_bytes_and_a_new_mtime_is_not_reported() -> std::io::Result<()>
+    {
+        let scratch = Scratch::new("imported")?;
+        let home = scratch.0.join("home");
+        let script = scratch.write("home/work/run85.sh", "echo queued-visual-rect-empty\n")?;
+        let root = scratch.0.join("session-root");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        copy_into_root(&root, &script, "echo queued-visual-rect-empty\n")?;
+        let command = format!("bash {}", script.display());
+        let report = home_overlay_report(&command, &home, None, &[], Some(&root));
+        assert!(
+            report.different_copies.is_empty(),
+            "{:?}",
+            report.different_copies
+        );
+        assert_eq!(report.overlay_paths, vec![script]);
+        Ok(())
     }
 }

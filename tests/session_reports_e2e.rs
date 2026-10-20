@@ -6,6 +6,8 @@
 //!   show_desktop  (#608, #609) super+d hides windows unminimized; window_list, screenshot
 //!                 and keyboard_type report it, and keyboard_type names the window it typed into
 //!   hidden_import (#610) path_not_visible points at import_file, and an imported copy runs
+//!   home_overlay  (#611) launch_app reports overlay arguments and a host file the session
+//!                 sees a different copy of, and agrees with what the command ran
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
 //! KWIN_MCP_E2E_SERVER selects another server binary.
@@ -440,4 +442,103 @@ fn hidden_import() {
         file_holds(&marker, "ran")
     });
     std::fs::remove_dir_all(&host_dir).expect("remove host /tmp directory");
+}
+
+/// The result text blocks of a tool result, joined.
+fn result_text(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn reported_copies(result: &Value) -> Vec<String> {
+    result["structuredContent"]["home_overlay"]["different_copies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|copy| copy["path"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, and input devices"]
+fn home_overlay() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let work = server.home.join("work");
+    std::fs::create_dir_all(&work).expect("create HOME work directory");
+    let script = work.join("run611.sh");
+    std::fs::write(&script, "printf old-wording > \"$1\"\n").expect("write host script");
+    let started = server.start_session(json!({}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let run = |server: &mut Server, marker: &str| -> (Value, String) {
+        let marker = shared.join(marker);
+        let response = server.call(
+            "launch_app",
+            json!({"command": format!("sh {} {}", script.display(), marker.display()),
+                   "expect_window": false}),
+        );
+        assert!(response["error"].is_null(), "{response}");
+        let ran = wait_until(10, "the script's marker", || {
+            std::fs::read_to_string(&marker)
+                .ok()
+                .filter(|text| !text.is_empty())
+        });
+        (response["result"].clone(), ran)
+    };
+    let script_text = script.display().to_string();
+
+    let (first, ran) = run(&mut server, "first");
+    assert_eq!(ran, "old-wording");
+    assert_eq!(
+        first["structuredContent"]["home_overlay"]["overlay_paths"],
+        json!([script_text]),
+        "{first}"
+    );
+    assert!(reported_copies(&first).is_empty(), "{first}");
+
+    // An editor's save: a new file renamed over the old one.
+    let saved = work.join(".run611.sh.swp");
+    std::fs::write(&saved, "printf new-wording-611 > \"$1\"\n").expect("write edited script");
+    std::fs::rename(&saved, &script).expect("replace host script");
+    let (second, ran) = run(&mut server, "second");
+    let reported = reported_copies(&second) == vec![script_text.clone()];
+    assert_eq!(
+        ran == "old-wording",
+        reported,
+        "the report must match the copy that ran ({ran:?}): {second}"
+    );
+    if reported {
+        assert!(result_text(&second).contains("import_file"), "{second}");
+    }
+    eprintln!("home_overlay: after the host edit the session ran {ran:?}");
+
+    server.data(
+        "import_file",
+        json!({"host_path": script, "overwrite": true}),
+    );
+    let (third, ran) = run(&mut server, "third");
+    assert_eq!(ran, "new-wording-611");
+    assert!(reported_copies(&third).is_empty(), "{third}");
+
+    let output = work.join("out-611");
+    let made = server.data(
+        "launch_app",
+        json!({"command": format!("mkdir -p {}", output.display()), "expect_window": false}),
+    );
+    assert_eq!(
+        made["home_overlay"]["overlay_paths"],
+        json!([output.display().to_string()]),
+        "{made}"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!output.exists(), "a session write reached the host HOME");
 }
