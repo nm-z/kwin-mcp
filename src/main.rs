@@ -11051,6 +11051,13 @@ const FIND_UI_MAX_MATCHES: usize = 200;
 const FIND_UI_MAX_NODES: usize = 2000;
 const FIND_UI_MAX_PAGES: usize = 10;
 
+fn find_ui_search_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn find_ui_role_matches(wanted: Option<&str>, actual: &str) -> bool {
     let Some(wanted) = wanted else {
         return true;
@@ -14532,7 +14539,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -14542,7 +14549,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         self.settle_input().await?;
-        let query = params.query.to_lowercase();
+        let query = find_ui_search_text(&params.query);
         let visible_only = params.visible_only.unwrap_or(false);
         let mut elements = Vec::new();
         let mut errors = Vec::new();
@@ -14583,7 +14590,7 @@ impl KwinMcp {
                         if elements.len() >= FIND_UI_MAX_MATCHES { return Err("match limit reached".to_owned()); }
                         let name = element["name"].as_str().unwrap_or_default();
                         let role = element["role"].as_str().unwrap_or_default();
-                        if !(name.to_lowercase().contains(&query) || role.to_lowercase().contains(&query))
+                        if !(find_ui_search_text(name).contains(&query) || find_ui_search_text(role).contains(&query))
                             || !find_ui_role_matches(params.role.as_deref(), role)
                             || visible_only && element["visible"] != true { continue; }
                         let mut matched = element.clone();
@@ -14639,7 +14646,7 @@ impl KwinMcp {
                         let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
                         let Ok(node) = atspi_node(&acc).await else { continue; };
                         if node.is_useful()
-                            && (node.name.to_lowercase().contains(&query) || node.role.to_lowercase().contains(&query))
+                            && (find_ui_search_text(&node.name).contains(&query) || find_ui_search_text(&node.role).contains(&query))
                             && find_ui_role_matches(params.role.as_deref(), &node.role) {
                             let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
                             if !visible_only || matched["visible"] == true {
@@ -20552,7 +20559,8 @@ mod ssh_config_tests {
 #[cfg(test)]
 mod ui_match_context_tests {
     use super::{
-        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match, find_ui_role_matches,
+        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match,
+        find_ui_role_matches, find_ui_search_text,
     };
 
     fn window() -> WindowSnapshot {
@@ -20593,6 +20601,13 @@ mod ui_match_context_tests {
         assert!(!find_ui_role_matches(Some("button"), "static text"));
         assert!(!find_ui_role_matches(Some("button"), "label"));
         assert!(find_ui_role_matches(None, "static text"));
+    }
+
+    #[test]
+    fn issue633_name_query_matches_nonbreaking_space() {
+        let name = find_ui_search_text("Sign\u{00a0}in");
+        let query = find_ui_search_text("Sign in");
+        assert!(name.contains(&query));
     }
 
     #[test]

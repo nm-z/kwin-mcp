@@ -13,6 +13,7 @@
 //!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
 //!   unstarted_launch (#631) a launch refused for an invisible path says the command did not start
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
+//!   ui_name_whitespace (#633) an accessible name with a non-breaking space matches a normal-space query
 //!
 //! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
 //! KWIN_MCP_E2E_SERVER selects another server binary.
@@ -635,6 +636,62 @@ fn chooser_typing() {
         typed["error"].is_null() && typed["result"]["isError"] != json!(true),
         "typing the chooser's location was refused: {typed}"
     );
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn ui_name_whitespace() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({"width":1920, "height":1080}));
+    let fixture = server.home.join("issue633.html");
+    let accessible_name = "Sign\u{00a0}in";
+    std::fs::write(
+        &fixture,
+        format!("<!doctype html><button aria-label=\"{accessible_name}\"></button>"),
+    )
+    .expect("write accessible-name fixture");
+    server.data(
+        "launch_app",
+        json!({"command":"google-chrome-stable --user-data-dir=$HOME/chrome-issue633 file://$HOME/issue633.html",
+               "window_timeout_seconds":40}),
+    );
+    let tree = wait_until(30, "the accessible Sign in button", || {
+        let response = server.call(
+            "accessibility_tree",
+            json!({"show_elements":true, "max_depth":8, "timeout_seconds":10}),
+        );
+        let text = response["result"]["content"]
+            .as_array()?
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.contains(&format!("button\t{accessible_name}"))
+            .then_some(text)
+    });
+    assert!(
+        tree.contains(&format!("button\t{accessible_name}")),
+        "accessibility_tree did not expose the fixture button: {tree}"
+    );
+    let found = server.data(
+        "find_ui_elements",
+        json!({"query":"Sign in", "role":"button", "visible_only":true}),
+    );
+    let target = found["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|element| {
+            element["backend"] == json!("cdp")
+                && element["role"] == json!("button")
+                && element["name"] == json!(accessible_name)
+        });
+    assert!(
+        target.is_some(),
+        "find_ui_elements missed the button returned by accessibility_tree: {found}"
+    );
+    server.stop_session();
 }
 
 #[test]
