@@ -5380,12 +5380,7 @@ fn prepare_host_view(
     let free = stat.blocks_available().saturating_mul(stat.fragment_size());
     if free < disk_min_free {
         let _ = std::fs::remove_dir(&disk);
-        anyhow::bail!(
-            "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free. Free space there, or pass a smaller disk_min_free_mib to session_start",
-            disk.display(),
-            gib(disk_min_free),
-            gib(free)
-        );
+        anyhow::bail!("{}", overlay_floor_message(&disk, disk_min_free, free));
     }
     let scripts = disk.join(kwin_script::SCRIPT_DIRECTORY);
     std::fs::create_dir(&scripts)
@@ -7931,6 +7926,18 @@ fn gib(bytes: u64) -> String {
     #[expect(clippy::as_conversions)]
     let value = bytes as f64 / GIB;
     format!("{value:.2} GiB")
+}
+
+/// The refusal when the HOME overlay's filesystem has less than the floor free,
+/// with the exact retry a caller can make: half of what is free, in MiB.
+fn overlay_floor_message(disk: &Path, floor: u64, free: u64) -> String {
+    let retry = ((free >> 20) / 2).max(1);
+    format!(
+        "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free. Free space there, or retry session_start with disk_min_free_mib={retry} (MiB; the session then writes into what is left)",
+        disk.display(),
+        gib(floor),
+        gib(free)
+    )
 }
 
 /// Explain a failed write: for EDQUOT/ENOSPC, name the per-user quota (systemd
@@ -20837,5 +20844,24 @@ mod home_overlay_report_tests {
         );
         assert_eq!(report.overlay_paths, vec![script]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod overlay_floor_tests {
+    use super::overlay_floor_message;
+    use std::path::Path;
+
+    #[test]
+    fn the_refusal_names_the_retry_a_caller_can_make() {
+        let message = overlay_floor_message(
+            Path::new("/home/u/.cache/kwin-mcp/kwin-mcp-1"),
+            2 << 30,
+            607 << 20,
+        );
+        assert!(message.contains("needs 2.00 GiB free"), "{message}");
+        assert!(message.contains("0.59 GiB free"), "{message}");
+        assert!(message.contains("disk_min_free_mib=303"), "{message}");
+        assert!(overlay_floor_message(Path::new("/x"), 2 << 30, 0).contains("disk_min_free_mib=1"));
     }
 }
