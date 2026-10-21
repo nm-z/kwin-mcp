@@ -8486,6 +8486,28 @@ fn fuse_support() -> Option<Vec<(PathBuf, &'static str)>> {
     (!binaries.is_empty()).then_some(binaries)
 }
 
+/// Find the AT-SPI bus launcher in common system locations or on the host PATH.
+fn resolve_at_spi_bus_launcher() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut candidates = vec![
+        PathBuf::from("/usr/lib/at-spi-bus-launcher"),
+        PathBuf::from("/usr/lib/at-spi2-core/at-spi-bus-launcher"),
+        PathBuf::from("/usr/libexec/at-spi-bus-launcher"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path).map(|directory| directory.join("at-spi-bus-launcher")),
+        );
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let metadata = std::fs::metadata(&candidate).ok()?;
+        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .then(|| std::fs::canonicalize(candidate).ok())
+            .flatten()
+    })
+}
+
 /// Resolve the kwin-viewer binary by replacing the basename of our own
 /// current_exe. Returns None if the binary doesn't exist — the viewer is
 /// an optional convenience, not required for MCP tool operation.
@@ -12029,6 +12051,11 @@ impl KwinMcp {
             env!("GIT_HASH")
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
+        let at_spi_bus_launcher = resolve_at_spi_bus_launcher().ok_or_else(|| {
+            ver_err(
+                "required at-spi-bus-launcher was not found in /usr/lib, /usr/lib/at-spi2-core, /usr/libexec, or PATH".to_owned(),
+            )
+        })?;
         // Resolve the launcher's missing login environment without mutating
         // global variables used by concurrent sessions or the strict wrapper.
         let host_runtime = host_environment::runtime_dir()
@@ -12299,6 +12326,7 @@ impl KwinMcp {
         // bwrap. Keep session applications' temporary files in private /tmp.
         let media_wait_attempts = STARTUP_TIMEOUT.as_millis() / STARTUP_POLL.as_millis();
         let media_poll_seconds = STARTUP_POLL.as_secs_f64();
+        let at_spi_bus_launcher = shell_quote(&at_spi_bus_launcher.display().to_string());
         let entrypoint = format!(
             "set -u\n\
             export TMPDIR=/tmp\n\
@@ -12323,7 +12351,7 @@ impl KwinMcp {
             echo $? > '{xdg_dir_str}/{KWIN_EXIT_FILE}'; }} &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
-            at-spi-bus-launcher --launch-immediately &\n\
+            {at_spi_bus_launcher} --launch-immediately &\n\
             pipewire &\n\
             media_pid=$!\n\
             for ((attempt=0; attempt<{media_wait_attempts}; attempt++)); do\n\
