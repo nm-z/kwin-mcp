@@ -15,6 +15,7 @@
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
 //!   ui_name_whitespace (#633) an accessible name with a non-breaking space matches a normal-space query
 //!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
+//!   keyboard_type_under_load (#700) a long Konsole command stays exact under session CPU and memory pressure
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -617,6 +618,143 @@ fn held_modifier() {
         !failure_text(&typed).contains("still held"),
         "typing was refused after release: {typed}"
     );
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn keyboard_type_under_load() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let started = server.start_session(json!({"height":720, "memory_high":1}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let ready = shared.join("pressure-ready");
+
+    // Keep CPU workers and over 1 GiB of session memory resident while typing.
+    server.data(
+        "launch_app",
+        json!({
+            "command":"konsole --separate -e sh -c 'yes >/dev/null & yes >/dev/null & yes >/dev/null & yes >/dev/null & yes >/dev/null & yes >/dev/null & yes >/dev/null & yes >/dev/null & wait'",
+            "window_timeout_seconds":30
+        }),
+    );
+    let memory_pressure = format!(
+        "konsole --separate -e awk -v ready={} 'BEGIN {{ for (i = 0; i < 1200000; i++) memory[i] = sprintf(\"%1024d\", i); system(\"printf ready > \" ready); system(\"sleep 90\") }}'",
+        ready.display()
+    );
+    server.data(
+        "launch_app",
+        json!({"command":memory_pressure, "window_timeout_seconds":30}),
+    );
+    wait_until(30, "session memory pressure", || {
+        file_holds(&ready, "ready")
+    });
+
+    let marker = shared.join("typed-command");
+    let terminal = format!("konsole --separate -e sh -c 'cat > {}'", marker.display());
+    let launched = server.data(
+        "launch_app",
+        json!({"command":terminal, "window_timeout_seconds":30}),
+    );
+    let konsole = launched["window"].as_str().expect("Konsole window");
+    // Preserve the reported paths and quotes as terminal data; cat avoids shell evaluation.
+    let expected = "/home/nate/work/asmux-456/build/orgctl --draw \"$XDG_RUNTIME_DIR/asmux-456-branch/asmux.sock\" --px 1280 720 --ctl \"$XDG_RUNTIME_DIR/asmux-456-branch/asmux.ctl\" main - /bin/bash -- viewer - /bin/bash";
+    let log_path = PathBuf::from(started["input_log"].as_str().expect("input_log"));
+    let request_id = server.next_id + 1;
+    let server_pid =
+        nix::unistd::Pid::from_raw(i32::try_from(server.child.id()).expect("server pid fits i32"));
+    let watch_log_path = log_path.clone();
+    // Suspend only the input server for 800ms after its first keydown. Session
+    // load continues while the old scheduled key-up waits behind the pause.
+    let key_down_watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let key_down_seen = std::fs::read_to_string(&watch_log_path)
+                .ok()
+                .is_some_and(|log| {
+                    log.lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|entry| {
+                            entry["type"] == json!("event")
+                                && entry["tool"]["name"] == json!("keyboard_type")
+                                && entry["tool"]["request_id"] == json!(request_id)
+                                && entry["event"] == json!("key")
+                                && entry["pressed"] == json!(true)
+                                && entry["character"].is_string()
+                        })
+                });
+            if key_down_seen {
+                if nix::sys::signal::kill(server_pid, nix::sys::signal::Signal::SIGSTOP).is_err() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(800));
+                return nix::sys::signal::kill(server_pid, nix::sys::signal::Signal::SIGCONT)
+                    .is_ok();
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let typed = server.data("keyboard_type", json!({"text":expected}));
+    assert!(
+        key_down_watcher.join().expect("key-down watcher thread"),
+        "could not pause and resume the input server after its first keydown"
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read input log");
+    let summary = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| {
+            entry["type"] == json!("call_summary")
+                && entry["tool"]["name"] == json!("keyboard_type")
+                && entry["typing"]["characters"] == json!(expected)
+        })
+        .expect("keyboard_type call summary");
+    let printable_keys = summary["typing"]["keys"]
+        .as_array()
+        .expect("typing keys")
+        .iter()
+        .filter(|key| key["character"].is_string())
+        .collect::<Vec<_>>();
+    assert_eq!(printable_keys.len(), expected.len(), "{summary}");
+    let max_hold_ns = printable_keys
+        .iter()
+        .map(|key| key["hold_ns"].as_u64().expect("released character key"))
+        .max()
+        .expect("printable key holds");
+
+    let evidence_root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+    let screenshot = evidence_root.join(format!("kwin-mcp-700-{:x}.png", nonce()));
+    server.data("screenshot", json!({"save_as":screenshot, "inline":false}));
+    assert!(
+        screenshot.is_file(),
+        "the typed Konsole line was not captured"
+    );
+    let typed_window = typed["window"]["id"].as_str().expect("typed window id");
+    assert_eq!(typed_window, konsole, "{typed}");
+
+    server.data("keyboard_key", json!({"key":"Return"}));
+    let output_deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < output_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let observed = std::fs::read_to_string(&marker).unwrap_or_else(|_| "<missing>".to_owned());
+    assert_eq!(
+        observed,
+        format!("{expected}\n"),
+        "typed command changed; max_logged_hold_ns={max_hold_ns}; summary={summary}; screenshot={}",
+        screenshot.display()
+    );
+    server.stop_session();
+    std::fs::remove_file(&screenshot).expect("remove passing screenshot");
 }
 
 #[test]
