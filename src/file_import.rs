@@ -3,7 +3,7 @@
 
 use nix::fcntl::{OFlag, OpenHow, RenameFlags, ResolveFlag, openat2, renameat2};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 pub fn import_host_file(
@@ -73,6 +73,17 @@ pub fn import_host_file(
                 "host file changed while importing; retry after the write finishes".to_owned(),
             );
         }
+        // The copy keeps the source's permission bits, so an imported binary
+        // stays executable.
+        let mode = input
+            .metadata()
+            .map_err(|error| format!("read source mode: {error}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        output
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("set session file mode: {error}"))?;
         // NOREPLACE also protects a destination created after the check above.
         // Rename replaces a final symlink itself, never its referent.
         renameat2(
@@ -115,4 +126,35 @@ pub fn session_file(root: &Path, path: &Path, read: bool) -> std::io::Result<std
     )
     .map_err(std::io::Error::from)?;
     Ok(std::fs::File::from(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::import_host_file;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    #[test]
+    fn an_imported_binary_keeps_its_permission_bits() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("kwin-mcp-import-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let mut copies = Vec::new();
+        for mode in [0o755_u32, 0o640] {
+            let source = dir.join(format!("source-{mode:o}"));
+            let destination = dir.join(format!("copy-{mode:o}"));
+            std::fs::write(&source, b"#!/bin/sh\n").map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode))
+                .map_err(|error| error.to_string())?;
+            import_host_file(Path::new("/"), &source, &destination, false)?;
+            let copied = std::fs::metadata(&destination)
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            copies.push((mode, copied));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(copies, vec![(0o755, 0o755), (0o640, 0o640)]);
+        Ok(())
+    }
 }
