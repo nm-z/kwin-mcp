@@ -1989,8 +1989,11 @@ const LAUNCH_STDOUT_TAIL_BYTES: usize = 4096;
 const LAUNCH_BASELINE_TIMEOUT: Duration = Duration::from_secs(5);
 // The call deadline leaves room for the baseline reads and CDP retries.
 const LAUNCH_CALL_OVERHEAD_TIMEOUT: Duration = Duration::from_secs(30);
-// expect_window: false reports the command's PID once its shell has recorded it.
+// expect_window: false returns a running command's PID, or its fast exit status.
 const LAUNCH_PID_TIMEOUT: Duration = Duration::from_secs(5);
+const LAUNCH_EXIT_STATUS_GRACE: Duration = Duration::from_secs(1);
+const LAUNCH_LATE_WINDOW_GRACE: Duration = Duration::from_secs(2);
+const LAUNCH_TIMEOUT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 // A launch that exits without a window reports this many stderr lines, read
 // from the bytes sandbox.log gained since the command was submitted.
 const LAUNCH_STDERR_TAIL_LINES: usize = 20;
@@ -10666,9 +10669,10 @@ struct LaunchAppParams {
     command: String,
     /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
     window_timeout_seconds: Option<u64>,
-    /// Set false for a command that backgrounds itself or never maps a window:
-    /// the call returns once the command is submitted, with its PID, instead of
-    /// waiting for a window. Defaults to true.
+    /// Set false for a command that backgrounds itself or never maps a window.
+    /// Once its PID is recorded, the call waits up to one second for an exit
+    /// status, then returns promptly with the PID if it is still running.
+    /// Defaults to true.
     expect_window: Option<bool>,
 }
 
@@ -10676,6 +10680,20 @@ struct LaunchAppParams {
 /// not a number, such as a partially written file, are not PIDs.
 fn parse_launch_pid(text: &str) -> Option<u32> {
     text.trim().parse::<u32>().ok().filter(|pid| *pid != 0)
+}
+
+fn newly_mapped_window<'a>(
+    previous: &[WindowSnapshot],
+    current: &'a [WindowSnapshot],
+) -> Option<&'a WindowSnapshot> {
+    current
+        .iter()
+        .filter(|window| !previous.iter().any(|before| before.id == window.id))
+        .max_by_key(|window| (window.active, window.stacking_order))
+}
+
+fn launch_window_snapshot(windows: &[WindowSnapshot]) -> serde_json::Value {
+    serde_json::json!(windows)
 }
 
 /// Waits up to LAUNCH_PID_TIMEOUT for the command shell to record its PID. The
@@ -10694,6 +10712,25 @@ async fn poll_launch_pid(path: &Path, path_error: &Path, exit_status: &Path) -> 
             return None;
         }
         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
+    }
+}
+
+/// Read a fast command's exit status when it becomes available. A command that
+/// keeps running still returns promptly after the short grace period.
+async fn poll_launch_exit_status(path: &Path, timeout: Duration) -> Option<i32> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            return Some(status);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep(LAUNCH_POLL_INTERVAL.min(deadline - now)).await;
     }
 }
 
@@ -10762,6 +10799,15 @@ async fn poll_launch_window(
         let handed_off = exit_status == Some(0);
         let current_windows = window_snapshots(&conn, &kwin_unique, &xdg).await;
         if let Ok(windows) = &current_windows {
+            if let Some(window) = previous_windows
+                .as_deref()
+                .and_then(|before| newly_mapped_window(before, windows))
+            {
+                return Ok(Some(LaunchWindow {
+                    geometry: launch_window_geometry(window),
+                    reused: false,
+                }));
+            }
             if let Some(active) = windows.iter().find(|window| window.active)
                 && previous.as_deref() != Some(&active.id)
             {
@@ -15821,7 +15867,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns after submission with the session shell PID and exit_status if already available, not proof of success. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. An existing browser window counts only when KWin can attribute it. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns once the PID is recorded and waits up to one second for an exit status; a longer-running command returns promptly with its PID. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. For a literal leading command word, command_resolution reports its session PATH executable, shell builtin, or missing command. KWin reads are bounded; timeouts preserve the session and report the stalled stage and submission state. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A new window counts when it appears after the launch baseline, including when a helper process maps it. On timeout, a brief recovery check reports a late window or attaches a fresh window_snapshot. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -16104,9 +16150,13 @@ impl KwinMcp {
             if let Some(error) = invisible_launch_path(&path_error_file) {
                 return Err(error);
             }
-            let exit_status = std::fs::read_to_string(&exit_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok());
+            let exit_status = if pid.is_some() {
+                poll_launch_exit_status(&exit_file, LAUNCH_EXIT_STATUS_GRACE).await
+            } else {
+                std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+            };
             let warning = launch_wallet_warning(wallet_note, &params.command);
             let suffix = warning
                 .as_deref()
@@ -16178,6 +16228,7 @@ impl KwinMcp {
                 exit_file.clone(),
             )
         });
+        let mut window_timed_out = false;
         let (mut win_geo, mut window_reused) =
             match tower::timeout::Timeout::new(waiting, window_timeout)
                 .oneshot(())
@@ -16185,7 +16236,10 @@ impl KwinMcp {
             {
                 Ok(Some(window)) => (Some(window.geometry), window.reused),
                 Ok(None) => (None, false),
-                Err(error) if error.is::<tower::timeout::error::Elapsed>() => (None, false),
+                Err(error) if error.is::<tower::timeout::error::Elapsed>() => {
+                    window_timed_out = true;
+                    (None, false)
+                }
                 Err(error) => {
                     return Err(match error.downcast::<McpError>() {
                         Ok(error) => *error,
@@ -16193,9 +16247,43 @@ impl KwinMcp {
                     });
                 }
             };
-        let exit_status = std::fs::read_to_string(&exit_file)
+        let mut window_observed_after_timeout = false;
+        let mut timeout_window_snapshot = None;
+        let mut timeout_window_snapshot_error = None;
+        let mut exit_status = std::fs::read_to_string(&exit_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
+        if win_geo.is_none() && window_timed_out && exit_status.is_none_or(|status| status == 0) {
+            tokio::time::sleep(LAUNCH_LATE_WINDOW_GRACE).await;
+            match tokio::time::timeout(
+                LAUNCH_TIMEOUT_SNAPSHOT_TIMEOUT,
+                window_snapshots(&conn, &kwin_unique, &xdg),
+            )
+            .await
+            {
+                Ok(Ok(windows)) => {
+                    if let Some(window) = previous_windows
+                        .as_deref()
+                        .and_then(|before| newly_mapped_window(before, &windows))
+                    {
+                        win_geo = Some(launch_window_geometry(window));
+                        window_observed_after_timeout = true;
+                    } else {
+                        timeout_window_snapshot = Some(launch_window_snapshot(&windows));
+                    }
+                }
+                Ok(Err(error)) => timeout_window_snapshot_error = Some(error.to_string()),
+                Err(_) => {
+                    timeout_window_snapshot_error = Some(format!(
+                        "KWin did not answer the post-timeout window inventory within {} seconds",
+                        LAUNCH_TIMEOUT_SNAPSHOT_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+            exit_status = std::fs::read_to_string(&exit_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+        }
         let _ = std::fs::remove_file(&exit_file);
         let _ = std::fs::remove_file(&pid_file);
         let mut handoff_reason = None;
@@ -16306,7 +16394,7 @@ impl KwinMcp {
         let baseline_note = match baseline {
             WindowBaseline::PreLaunch => "",
             WindowBaseline::AfterSubmit => {
-                ". warning: KWin did not answer before the command was submitted, so the window list was read right after submission"
+                ". warning: the pre-launch inventory timed out, so the baseline was read after submission; any window already in that baseline may predate the command"
             }
             WindowBaseline::Unavailable => {
                 ". warning: KWin did not answer before or after submission, so a window reported here may predate the command"
@@ -16320,12 +16408,18 @@ impl KwinMcp {
                         "reused_existing",
                         format!("reused window: {} title: {:?}", geo.id, geo.title),
                     )
+                } else if window_observed_after_timeout {
+                    (
+                        "new",
+                        format!("new window: {} (observed during timeout recovery)", geo.id),
+                    )
                 } else {
                     ("new", format!("window: {}", geo.id))
                 };
                 Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), serde_json::json!({
                     "action": "launch", "command": params.command, "window": geo.id, "command_submitted": true,
                     "window_outcome": outcome, "window_reused": window_reused,
+                    "window_observed_after_timeout": window_observed_after_timeout,
                     "window_title": geo.title,
                     "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
                     "extension_warning": extension_warning,
@@ -16363,7 +16457,18 @@ impl KwinMcp {
                         params.command
                     ),
                 };
-                let mut text = format!("{text}{}", exit_diagnostics_text(&diagnostics));
+                let snapshot_note = if timeout_window_snapshot.is_some() {
+                    ". A fresh post-timeout window inventory is attached as window_snapshot"
+                        .to_owned()
+                } else if let Some(reason) = timeout_window_snapshot_error.as_deref() {
+                    format!(". The post-timeout window inventory was unavailable: {reason}")
+                } else {
+                    String::new()
+                };
+                let mut text = format!(
+                    "{text}{snapshot_note}{}",
+                    exit_diagnostics_text(&diagnostics)
+                );
                 if let Some(resolution) = command_resolution.as_deref() {
                     text.push_str(&format!("\nfirst command token resolution: {resolution}"));
                 }
@@ -16380,6 +16485,8 @@ impl KwinMcp {
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
+                    "window_snapshot": timeout_window_snapshot,
+                    "window_snapshot_error": timeout_window_snapshot_error,
                     "stderr_tail": diagnostics.stderr,
                     "sandbox_log_line": diagnostics.sandbox_line,
                     "stderr_error": diagnostics.unavailable,
@@ -16400,8 +16507,16 @@ impl KwinMcp {
             // never mapped, or a background command that should have passed
             // expect_window=false. Neither is a successful window launch.
             (None, None) => {
+                let snapshot_note = if timeout_window_snapshot.is_some() {
+                    ". A fresh post-timeout window inventory is attached as window_snapshot"
+                        .to_owned()
+                } else if let Some(reason) = timeout_window_snapshot_error.as_deref() {
+                    format!(". The post-timeout window inventory was unavailable: {reason}")
+                } else {
+                    String::new()
+                };
                 let mut result = structured_result(&peer, format!(
-                    "{} opened no window within {}s and is still running. It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.{suffix}",
+                    "{} opened no window within {}s and is still running. It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.{suffix}{snapshot_note}",
                     params.command,
                     window_timeout.as_secs()
                 ), serde_json::json!({
@@ -16411,6 +16526,8 @@ impl KwinMcp {
                     "stage": "waiting for a window", "command_submitted": true, "retry_safe": false,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
+                    "window_snapshot": timeout_window_snapshot,
+                    "window_snapshot_error": timeout_window_snapshot_error,
                 })).await;
                 result.is_error = Some(true);
                 Ok(result)
