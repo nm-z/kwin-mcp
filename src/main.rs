@@ -9049,7 +9049,17 @@ const BROWSER_COMMANDS: &[&str] = &[
 const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
 set -e
 name=${0##*/}
-real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
+real=$(PATH="${PATH#*:}" command -v "$name") || real=
+if [[ -z $real ]]; then
+  # The same browser often installs under only one of its names.
+  case "$name" in
+    google-chrome|google-chrome-stable) alts="google-chrome-stable google-chrome" ;;
+    chromium|chromium-browser) alts="chromium chromium-browser" ;;
+    *) alts= ;;
+  esac
+  for alt in $alts; do real=$(PATH="${PATH#*:}" command -v "$alt") && break || real=; done
+fi
+[[ -n $real ]] || exit 127
 ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
 first_run=0 default_check=0
 for arg in "$@"; do
@@ -20863,5 +20873,35 @@ mod overlay_floor_tests {
         assert!(message.contains("0.59 GiB free"), "{message}");
         assert!(message.contains("disk_min_free_mib=303"), "{message}");
         assert!(overlay_floor_message(Path::new("/x"), 2 << 30, 0).contains("disk_min_free_mib=1"));
+    }
+}
+
+#[cfg(test)]
+mod browser_alias_tests {
+    use super::create_browser_wrappers;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_browser_installed_under_its_other_name_still_launches() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!("kwin-mcp-alias-{}", std::process::id()));
+        let stubs = root.join("stubs");
+        std::fs::create_dir_all(&stubs)?;
+        let stub = stubs.join("google-chrome-stable");
+        std::fs::write(&stub, "#!/bin/sh\necho stub-ran\n")?;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+        let bin = create_browser_wrappers(&root)?;
+        // Only google-chrome-stable exists; the caller typed google-chrome.
+        let run = |name: &str| {
+            std::process::Command::new(bin.join(name))
+                .env("PATH", format!("{}:{}:/usr/bin:/bin", bin.display(), stubs.display()))
+                .env_remove("KWIN_MCP_CDP_PORT")
+                .output()
+        };
+        let aliased = run("google-chrome")?;
+        let missing = run("brave")?;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(String::from_utf8_lossy(&aliased.stdout).trim(), "stub-ran");
+        assert_eq!(missing.status.code(), Some(127));
+        Ok(())
     }
 }
