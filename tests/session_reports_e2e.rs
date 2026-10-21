@@ -10,6 +10,8 @@
 //!                 sees a different copy of, and agrees with what the command ran
 //!   launch_attribution (#615) a window that is only reactivated while the command still
 //!                 runs is not the launch's window
+//!   launch_completion (#645, #674) a short expect_window=false command reports its exit status
+//!   late_launch_window (#654, #674) a helper-created window mapped after the deadline is reported
 //!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
 //!   unstarted_launch (#631) a launch refused for an invisible path says the command did not start
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
@@ -605,6 +607,117 @@ fn held_modifier() {
     assert!(
         !failure_text(&typed).contains("still held"),
         "typing was refused after release: {typed}"
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session and bubblewrap"]
+fn launch_without_window_reports_fast_exit_status() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let started = server.start_session(json!({"window_mode":"native"}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let marker = shared.join(format!("launch-exit-{}", nonce()));
+    let begun = Instant::now();
+    let launched = server.data(
+        "launch_app",
+        json!({"command":format!("sleep 0.35; printf completed > {}", marker.display()),
+               "expect_window":false}),
+    );
+    assert_eq!(launched["exit_status"], json!(0), "{launched}");
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("command output marker"),
+        "completed"
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(5),
+        "fast no-window command took {:?}: {launched}",
+        begun.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap, KDialog, and input devices"]
+fn late_helper_window_is_reported_after_launch_timeout() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let started = server.start_session(json!({"window_mode":"native"}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let trigger = shared.join("launch-674-service-trigger");
+    let title = format!("kwin645-helper-{:x}", nonce());
+
+    // This long-lived service starts a different process to map the window.
+    // The launch being observed only signals it and has no GUI child itself.
+    let service = server.data(
+        "launch_app",
+        json!({"command":format!(
+            "while [ ! -e {} ]; do sleep 0.05; done; sleep 1.2; exec kdialog --title {} --msgbox service",
+            trigger.display(), title
+        ), "expect_window":false}),
+    );
+    assert_eq!(
+        service["window_outcome"],
+        json!("not_expected"),
+        "{service}"
+    );
+
+    let launched = server.data(
+        "launch_app",
+        json!({"command":format!("printf submitted > {}; sleep 30", trigger.display()),
+               "window_timeout_seconds":1}),
+    );
+    assert_eq!(launched["window_outcome"], json!("new"), "{launched}");
+    assert_eq!(
+        launched["window_observed_after_timeout"],
+        json!(true),
+        "{launched}"
+    );
+
+    let visible = wait_until(5, "the helper-created window in window_list", || {
+        let windows = server.windows();
+        windows["windows"]
+            .as_array()?
+            .iter()
+            .any(|window| {
+                window["id"] == launched["window"] && window["title"] == json!(title.as_str())
+            })
+            .then_some(windows)
+    });
+    assert!(
+        visible["windows"]
+            .as_array()
+            .expect("windows")
+            .iter()
+            .any(|window| window["id"] == launched["window"] && window["title"] == json!(title)),
+        "window_list did not independently verify the launch result: {visible}"
+    );
+
+    let timed_out = server.call(
+        "launch_app",
+        json!({"command":"sleep 30", "window_timeout_seconds":1}),
+    );
+    assert_eq!(timed_out["result"]["isError"], json!(true), "{timed_out}");
+    let report = &timed_out["result"]["structuredContent"];
+    assert_eq!(
+        report["reason"],
+        json!("window_not_observed"),
+        "{timed_out}"
+    );
+    assert!(
+        report["window_snapshot"]
+            .as_array()
+            .is_some_and(|windows| windows
+                .iter()
+                .any(|window| window["id"] == launched["window"])),
+        "timeout did not carry the fresh helper-window inventory: {timed_out}"
     );
 }
 
