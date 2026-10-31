@@ -10745,7 +10745,7 @@ async fn poll_launch_pid(path: &Path, path_error: &Path, exit_status: &Path) -> 
 /// cannot decrypt the copied profile's cookies and saved logins.
 fn launch_wallet_warning(wallet_note: Option<String>, command: &str) -> Option<String> {
     wallet_note.filter(|_| launches_chromium(command)).map(|reason| {
-        format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
+        format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out. To use the saved logins, start and unlock the host's KWallet before session_start (kwin-mcp never starts or unlocks it); otherwise sign in inside the session")
     })
 }
 
@@ -16338,9 +16338,7 @@ impl KwinMcp {
 
         // A Chromium-family browser without the wallet cannot decrypt the copied
         // profile's cookies and saved logins, so its sites show signed out.
-        let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
-            format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
-        });
+        let warning = launch_wallet_warning(wallet_note, &params.command);
         let extension_warning = requests_blocked_google_chrome_extension_load(&params.command)
             .then(|| {
                 "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
@@ -19780,7 +19778,24 @@ mod window_resolution_tests {
 
 #[cfg(test)]
 mod launch_warning_tests {
-    use super::{launches_chromium, requests_blocked_google_chrome_extension_load};
+    use super::{
+        launch_wallet_warning, launches_chromium, requests_blocked_google_chrome_extension_load,
+    };
+
+    #[test]
+    fn a_walletless_chromium_launch_says_how_to_get_the_saved_logins() {
+        let reason = "org.kde.ksecretd is not running on the host; kwin-mcp does not start it";
+        let warning = launch_wallet_warning(Some(reason.to_owned()), "google-chrome-stable about:blank")
+            .expect("a Chromium launch without a wallet warns");
+        assert!(warning.contains(reason), "{warning}");
+        assert!(
+            warning.contains("start and unlock the host's KWallet before session_start"),
+            "the warning must name the remedy: {warning}"
+        );
+        assert!(warning.contains("sign in inside the session"), "{warning}");
+        assert_eq!(launch_wallet_warning(Some(reason.to_owned()), "kate notes.txt"), None);
+        assert_eq!(launch_wallet_warning(None, "google-chrome-stable"), None);
+    }
 
     #[test]
     fn chromium_family_commands_are_recognized() {
