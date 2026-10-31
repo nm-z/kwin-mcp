@@ -10246,10 +10246,12 @@ impl LevelTree {
         }
         let deeper = incomplete || self.levels() > fit;
         let chars = out.chars().count();
-        (
-            out,
-            serde_json::json!({"levels": fit, "nodes": shown, "chars": chars, "more_below": deeper}),
-        )
+        // Some MCP clients show only structuredContent and drop the text
+        // content, so the tree rides in both.
+        let info = serde_json::json!({
+            "levels": fit, "nodes": shown, "chars": chars, "more_below": deeper, "tree": out,
+        });
+        (out, info)
     }
 }
 
@@ -14264,7 +14266,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level; the same text is also in structuredContent.tree for clients that show only structured results. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -19415,6 +19417,18 @@ mod level_tree_tests {
         assert_eq!(info["chars"], 29_003);
         assert!(text.len() > A11Y_TREE_MAX_CHARS);
         assert!(text.contains("\n\t界"));
+    }
+
+    #[test]
+    fn structured_info_carries_the_same_tree_text() {
+        let mut tree = LevelTree::default();
+        let root = tree.push("root".to_owned(), "root-id".to_owned(), None);
+        tree.push("child".to_owned(), "child-id".to_owned(), Some(root));
+        let (text, info) = tree.render(usize::MAX);
+        assert_eq!(text, "root\n\tchild\n");
+        assert_eq!(info["tree"], text);
+        let (text, info) = tree.render_partial(usize::MAX, true);
+        assert_eq!(info["tree"], text);
     }
 
     #[test]
