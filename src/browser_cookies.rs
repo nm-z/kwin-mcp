@@ -404,6 +404,19 @@ fn clear_sidecars(database: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The database and its WAL are over the copy limit, so no snapshot is possible
+/// and retrying cannot help.
+#[derive(Debug)]
+pub struct SnapshotTooLarge;
+
+impl std::fmt::Display for SnapshotTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the database and its WAL exceed the 64 MiB copy limit")
+    }
+}
+
+impl std::error::Error for SnapshotTooLarge {}
+
 /// Chrome keeps an EXCLUSIVE SQLite lock even between commits. Read only its
 /// files, verify unchanged file identities/timestamps around two identical
 /// observations, then let SQLite read the frozen
@@ -442,10 +455,9 @@ pub fn snapshot_host(source: &Path, destination: &Path) -> Result<()> {
                     let mut bytes = Vec::new();
                     file.take(HOST_COPY_MAX_BYTES + 1).read_to_end(&mut bytes)?;
                     total += u64::try_from(bytes.len())?;
-                    anyhow::ensure!(
-                        total <= HOST_COPY_MAX_BYTES,
-                        "host cookie database and WAL exceed the 64 MiB copy limit"
-                    );
+                    if total > HOST_COPY_MAX_BYTES {
+                        return Err(SnapshotTooLarge.into());
+                    }
                     contents.push(Some(bytes));
                 }
                 Err(error) if suffix == "-wal" && error.kind() == std::io::ErrorKind::NotFound => {
@@ -507,6 +519,7 @@ pub fn snapshot_host(source: &Path, destination: &Path) -> Result<()> {
         })();
         match attempt {
             Ok(()) => return Ok(()),
+            Err(error) if error.is::<SnapshotTooLarge>() => return Err(error),
             Err(error) => last_error = Some(error),
         }
         std::thread::sleep(HOST_COPY_RETRY_DELAY);
