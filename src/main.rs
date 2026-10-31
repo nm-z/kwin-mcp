@@ -3591,6 +3591,66 @@ fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
     }
 }
 
+/// What bwrap prints when the kernel refuses it a user namespace or its id map.
+const USER_NAMESPACE_REFUSALS: [&str; 3] = [
+    "setting up uid map",
+    "setting up gid map",
+    "No permissions to create new namespace",
+];
+
+/// Kernel settings that decide whether this process may create a user
+/// namespace, read when the refusal needs explaining.
+struct UserNamespaceFacts {
+    uid_map: String,
+    max_user_namespaces: String,
+    no_new_privs: String,
+    seccomp: String,
+    apparmor_restriction: String,
+}
+
+impl UserNamespaceFacts {
+    fn read() -> Self {
+        let file = |path: &str| {
+            std::fs::read_to_string(path)
+                .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|_| "unavailable".to_owned())
+        };
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map_or_else(|| "unavailable".to_owned(), |value| value.trim().to_owned())
+        };
+        Self {
+            uid_map: file("/proc/self/uid_map"),
+            max_user_namespaces: file("/proc/sys/user/max_user_namespaces"),
+            no_new_privs: field("NoNewPrivs:"),
+            seccomp: field("Seccomp:"),
+            apparmor_restriction: file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
+        }
+    }
+}
+
+/// Guidance for a startup that bwrap abandoned because the kernel refused its
+/// user namespace. The cause is outside the session: this process is itself
+/// confined, or the host disables unprivileged user namespaces.
+fn user_namespace_guidance(stderr: &str, facts: &UserNamespaceFacts) -> Option<String> {
+    USER_NAMESPACE_REFUSALS
+        .iter()
+        .any(|refusal| stderr.contains(refusal))
+        .then(|| {
+            format!(
+                "bwrap could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones. Start kwin-mcp outside that sandbox, or allow nested user namespaces for it, then call session_start again",
+                facts.uid_map,
+                facts.max_user_namespaces,
+                facts.no_new_privs,
+                facts.seccomp,
+                facts.apparmor_restriction,
+            )
+        })
+}
+
 fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> McpError {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
@@ -3641,8 +3701,15 @@ fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> 
         )
     }
     .into();
+    let guidance = user_namespace_guidance(&tail, &UserNamespaceFacts::read());
+    if let Some(guidance) = &guidance {
+        error.message = format!("{}; {guidance}", error.message).into();
+    }
     let data = error.data.get_or_insert_with(|| serde_json::json!({}));
     if let Some(data) = data.as_object_mut() {
+        if let Some(guidance) = guidance {
+            data.insert("guidance".to_owned(), serde_json::json!(guidance));
+        }
         data.insert("sandbox_stderr_tail".to_owned(), serde_json::json!(tail));
         data.insert(
             "sandbox_stderr_truncated".to_owned(),
@@ -19773,6 +19840,55 @@ mod window_resolution_tests {
         let message = window_closed(PARENT).to_string();
         assert!(message.contains(PARENT), "{message}");
         assert!(message.contains("closed"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod user_namespace_guidance_tests {
+    use super::{UserNamespaceFacts, user_namespace_guidance};
+
+    fn confined() -> UserNamespaceFacts {
+        UserNamespaceFacts {
+            uid_map: "0 1000 1".to_owned(),
+            max_user_namespaces: "0".to_owned(),
+            no_new_privs: "1".to_owned(),
+            seccomp: "2".to_owned(),
+            apparmor_restriction: "1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_refused_uid_map_is_explained_with_the_kernel_settings() {
+        let guidance = user_namespace_guidance(
+            "bwrap: setting up uid map: Operation not permitted\n",
+            &confined(),
+        )
+        .expect("a refused uid map gets guidance");
+        for fact in [
+            "uid_map: 0 1000 1",
+            "user.max_user_namespaces: 0",
+            "NoNewPrivs: 1",
+            "Seccomp: 2",
+            "kernel.apparmor_restrict_unprivileged_userns: 1",
+            "Start kwin-mcp outside that sandbox",
+        ] {
+            assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
+        }
+    }
+
+    #[test]
+    fn other_sandbox_failures_get_no_namespace_guidance() {
+        for stderr in [
+            "",
+            "bwrap: Can't find source path /nonexistent: No such file or directory",
+            "bwrap: execvp kwin_wayland: No such file or directory",
+        ] {
+            assert_eq!(user_namespace_guidance(stderr, &confined()), None, "{stderr}");
+        }
+        assert!(
+            user_namespace_guidance("bwrap: No permissions to create new namespace", &confined())
+                .is_some()
+        );
     }
 }
 
