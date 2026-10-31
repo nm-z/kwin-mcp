@@ -4121,6 +4121,15 @@ impl SqliteAccessReport {
                 .push(serde_json::json!({"path": path, "mode": mode}));
         }
     }
+
+    /// A database whose requested access could not be given, with the reason.
+    fn record_with_note(&mut self, path: &Path, mode: &'static str, note: String) {
+        self.total_databases += 1;
+        if self.databases.len() < 128 {
+            self.databases
+                .push(serde_json::json!({"path": path, "mode": mode, "note": note}));
+        }
+    }
 }
 
 struct OverlayPlan {
@@ -4916,6 +4925,7 @@ fn bind_live_sqlite(
                     mount == &database.with_file_name(format!("{}{suffix}", name.to_string_lossy()))
                 })
         });
+        let mut snapshot_skipped = None;
         if private_write_requested {
             let destination = if plan.upper_path(database).is_some() {
                 upper_file(plan, database)?
@@ -4935,25 +4945,37 @@ fn bind_live_sqlite(
                 "snapshotting private writable SQLite: {}",
                 database.display()
             ))?;
-            kwin_mcp::browser_cookies::snapshot_host(database, &destination).map_err(|error| {
-                anyhow::anyhow!(
-                    "private writable SQLite snapshot {}: {error:#}",
-                    database.display()
-                )
-            })?;
-            // A later host rollback journal must not appear beside the private
-            // database through the overlay's lower layer.
-            let mut journal = destination.as_os_str().to_os_string();
-            journal.push("-journal");
-            let journal = PathBuf::from(journal);
-            std::fs::write(&journal, [])?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))?;
+            match kwin_mcp::browser_cookies::snapshot_host(database, &destination) {
+                Ok(()) => {
+                    // A later host rollback journal must not appear beside the private
+                    // database through the overlay's lower layer.
+                    let mut journal = destination.as_os_str().to_os_string();
+                    journal.push("-journal");
+                    let journal = PathBuf::from(journal);
+                    std::fs::write(&journal, [])?;
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &journal,
+                            std::fs::Permissions::from_mode(0o600),
+                        )?;
+                    }
+                    plan.sqlite_access
+                        .record(database, "private_writable_snapshot");
+                    continue;
+                }
+                // One database too large to copy must not fail the whole session:
+                // it stays a live read-only alias, and the report says why.
+                Err(error) if error.is::<kwin_mcp::browser_cookies::SnapshotTooLarge>() => {
+                    snapshot_skipped = Some(format!("{error:#}"));
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "private writable SQLite snapshot {}: {error:#}",
+                        database.display()
+                    ));
+                }
             }
-            plan.sqlite_access
-                .record(database, "private_writable_snapshot");
-            continue;
         }
         let parent = database
             .parent()
@@ -4979,7 +5001,20 @@ fn bind_live_sqlite(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
             upper,
         )?;
-        plan.sqlite_access.record(database, "live_read_only");
+        match snapshot_skipped {
+            Some(reason) => {
+                plan.sqlite_access.record_with_note(
+                    database,
+                    "live_read_only",
+                    format!("private writable snapshot skipped: {reason}"),
+                );
+                eprintln!(
+                    "session_start: {} is too large for the requested private writable snapshot ({reason}); it stays live read-only",
+                    database.display()
+                );
+            }
+            None => plan.sqlite_access.record(database, "live_read_only"),
+        }
         eprintln!(
             "session_start: live SQLite database read-only: {}",
             database.display()
