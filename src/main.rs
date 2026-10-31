@@ -5754,6 +5754,9 @@ const SESSION_MEMORY_PSI_WARNING_PERCENT: f64 = 10.0;
 const SESSION_MEMORY_SWAP_NEAR_FULL_PERCENT: u32 = 99;
 const BYTES_PER_GIB: u64 = 1_073_741_824;
 
+/// Limits are fixed when a session starts, so the way out is a new session.
+const MEMORY_RAISE_HINT: &str = "limits cannot change in a running session; stop it and call session_start with a larger memory_high, memory_max and memory_swap_max (whole GiB), or start the server with --memory-high, --memory-max and --memory-swap-max";
+
 #[derive(Clone, Copy)]
 struct SessionMemorySnapshot {
     current: u64,
@@ -5905,7 +5908,7 @@ impl SessionMemoryWarning {
         };
 
         Some(Self {
-            message: format!("{message} ({})", details.join(", ")),
+            message: format!("{message} ({}); {MEMORY_RAISE_HINT}", details.join(", ")),
             reason: if throttled {
                 "memory_high"
             } else {
@@ -20314,6 +20317,13 @@ mod session_memory_warning_tests {
         assert!(warning.message.contains("RAM 4.00/3.00 GiB"));
         assert!(warning.message.contains("swap 1.00/1.00 GiB nearly full"));
         assert!(warning.message.contains("memory PSI full avg10=67.18%"));
+        assert!(
+            warning
+                .message
+                .contains("session_start with a larger memory_high, memory_max"),
+            "the warning must say how to raise the limits: {}",
+            warning.message
+        );
         assert_eq!(warning.as_json()["memory_current_bytes"], 4 * BYTES_PER_GIB);
         Ok(())
     }
