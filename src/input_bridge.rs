@@ -1101,9 +1101,26 @@ pub struct TextDelivery {
 /// Whether an accessibility frame name starts with a KWin window caption.
 /// The two can space the same caption differently (Okular's frame is named
 /// "doc.pdf  — Okular" with two spaces), so runs of whitespace compare equal.
+/// Chromium also inserts tab status segments between the page title and the
+/// application name ("page - Network error - Google Chrome", "page - Audio
+/// playing - Google Chrome") that KWin's caption lacks, so a frame name that
+/// keeps the caption's page title and ends its application segment matches too.
 pub fn caption_starts_with(name: &str, caption: &str) -> bool {
+    const SEGMENT_SEPARATOR: &str = " - ";
     let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapse(name).starts_with(&collapse(caption))
+    let (name, caption) = (collapse(name), collapse(caption));
+    if name.starts_with(&caption) {
+        return true;
+    }
+    let Some((page, application)) = caption.rsplit_once(SEGMENT_SEPARATOR) else {
+        return false;
+    };
+    name.strip_prefix(page)
+        .and_then(|rest| rest.strip_prefix(SEGMENT_SEPARATOR))
+        .is_some_and(|rest| {
+            rest.split(SEGMENT_SEPARATOR)
+                .any(|segment| segment.starts_with(application))
+        })
 }
 
 /// Accessibility shows keyboard focus on a control that is not editable text.
@@ -1808,6 +1825,31 @@ mod text_receipt_tests {
             "other.pdf — Okular"
         ));
         assert!(!caption_starts_with("doc", "doc.pdf — Okular"));
+    }
+
+    #[test]
+    fn chromium_tab_status_segments_do_not_hide_the_frame() {
+        let caption = "example.comhttps - Google Chrome";
+        assert!(caption_starts_with(
+            "example.comhttps - Network error - Google Chrome",
+            caption
+        ));
+        assert!(caption_starts_with(
+            "example.comhttps - Audio playing - Google Chrome - Nate",
+            caption
+        ));
+        assert!(caption_starts_with(
+            "A - B - Network error - Google Chrome",
+            "A - B - Google Chrome"
+        ));
+        assert!(!caption_starts_with(
+            "other - Network error - Google Chrome",
+            caption
+        ));
+        assert!(!caption_starts_with(
+            "example.comhttps - Network error - Firefox",
+            caption
+        ));
     }
 
     #[tokio::test]
