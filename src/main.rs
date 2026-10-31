@@ -19241,11 +19241,21 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
                 },
                 request = process_commands.recv() => match request {
                     Some(request) => request.execute(),
-                    None => break None,
+                    None => {
+                        eprintln!("shutdown: the process command channel closed");
+                        break None;
+                    },
                 },
             }
         }
     };
+    // Say why the server is going away: a host that respawns it looks the same
+    // as a crash from the client side, and every owned session goes with it.
+    match &waited {
+        Some(Ok(reason)) => eprintln!("shutdown: {}", quit_cause(reason)),
+        Some(Err(error)) => eprintln!("shutdown: the MCP service task failed: {error}"),
+        None => {}
+    }
     if let Some(session_control) = session_control {
         session_control.abort();
         let _ = session_control.await;
@@ -19263,6 +19273,19 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         result?;
     }
     Ok(())
+}
+
+fn quit_cause(reason: &rmcp::service::QuitReason) -> String {
+    match reason {
+        rmcp::service::QuitReason::Closed => {
+            "the MCP client closed the connection (stdin reached end of file)".to_owned()
+        }
+        rmcp::service::QuitReason::Cancelled => "the MCP service was cancelled".to_owned(),
+        rmcp::service::QuitReason::JoinError(error) => {
+            format!("the MCP service task failed: {error}")
+        }
+        other => format!("the MCP service ended: {other:?}"),
+    }
 }
 
 #[cfg(test)]
