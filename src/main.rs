@@ -11925,7 +11925,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. The viewer may stay open; the user can close it. \
                 At browser logins, select saved-credential autofill without reading or typing its value; otherwise show the entry and open the viewer. \
                 Clipboards are separate: local viewer Ctrl+C/Ctrl+X copies to the server host; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
-                Chrome chooser: click the file input, ctrl+l, type the absolute session path, alt+o. Enter in the location bar cancels. \
+                Chrome file chooser: click the file input, ctrl+l, type the absolute session path, alt+o; for folders click its top-right button, not alt+o. Enter in the location bar cancels. \
                 Mouse/screenshot coordinates are 1:1 pixels from the active window's top-left. For crop region=[x1,y1,x2,y2], image (px,py) maps to mouse (px+x1,py+y1). \
                 {size_line} Windows auto-maximize unless window_mode=native. Results report memory_warning when the session is throttled.",
                 size_line = if self.display.locked {
