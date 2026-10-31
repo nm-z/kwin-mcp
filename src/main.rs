@@ -19164,6 +19164,16 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
     {
         eprintln!("autoclean: orphan sweep skipped: {error}");
     }
+    // A disk twin whose server died without a lease, or whose /tmp workdir is
+    // gone, is not reached by the leased sweep above. Scanning every process
+    // command line is slow on a loaded host, so it stays off the startup path.
+    if display.autoclean {
+        std::thread::spawn(|| {
+            if let Err(error) = sweep_dead_owner_workdirs(None) {
+                eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+            }
+        });
+    }
     eprintln!(
         "kwin-mcp: display default {}x{}{}; viewer on demand",
         display.width,
