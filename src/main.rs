@@ -17073,6 +17073,72 @@ fn same_pid_namespace(pid: i32) -> bool {
     }
 }
 
+/// Remove control sockets that no server listens on. A server killed without
+/// a chance to unlink its socket (SIGKILL, a crash, a host that stops it hard)
+/// leaves the file behind, and each one makes a lost session look routable.
+/// A listening socket is never connected to: the connection would start a
+/// handshake that the probe then abandons, which its server logs as a failure.
+/// The kernel's socket table says which paths still have a socket behind them.
+fn sweep_stale_control_sockets() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(directory) = host_environment::runtime_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    // Without the table nothing proves a socket stale.
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return;
+    };
+    let bound: std::collections::HashSet<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(7))
+        .collect();
+    let uid = unsafe { nix::libc::geteuid() };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_session_control_socket(&path) {
+            continue;
+        }
+        let owner_running = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(SESSION_CONTROL_SOCKET_PREFIX))
+            .and_then(|rest| rest.strip_suffix(".sock"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(kwin_mcp_server_running);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if owner_running
+            || !metadata.file_type().is_socket()
+            || metadata.uid() != uid
+            || path.to_str().is_some_and(|path| bound.contains(path))
+        {
+            continue;
+        }
+        // The table is per network namespace, so a server in another one would
+        // be missing from it: only a refused connection proves nothing listens.
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => eprintln!(
+                        "session control: removed stale socket {}",
+                        path.display()
+                    ),
+                    Err(error) => eprintln!(
+                        "session control: could not remove stale socket {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct SessionControlSocket {
     listener: tokio::net::UnixListener,
     path: PathBuf,
@@ -17564,22 +17630,45 @@ fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> 
     Ok(error)
 }
 
+/// Whether `pid` is a running kwin-mcp server on this host.
+fn kwin_mcp_server_running(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|file| file.to_string_lossy().starts_with("kwin-mcp"))
+        })
+        .unwrap_or(false)
+}
+
 fn unknown_session_error(id: &str) -> McpError {
     let server_pid = std::process::id();
     let session_server_pid = session_owner_pid(id);
     let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
+    let owner_running = other_server_pid.map(kwin_mcp_server_running);
     let (reason, session_status, message, recovery) = if let Some(other_server_pid) =
         other_server_pid
     {
-        let recovery = format!(
+        let recovery = if owner_running == Some(false) {
+            "Call session_start without session_id and relaunch your applications; a session ends when its server process exits.".to_owned()
+        } else {
+            format!(
             "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
-        );
+            )
+        };
+        let message = if owner_running == Some(false) {
+            format!(
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, which is no longer running, so its sessions ended with it. This request reached process {server_pid}, which is what a server restart looks like: a host that respawns the MCP server, for example when a client session is resumed, closes the old server's connection, and a server shuts down its desktops when that happens. {recovery}"
+            )
+        } else {
+            format!(
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
+            )
+        };
         (
             "different_server_process",
             "owned_by_another_process",
-            format!(
-                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
-            ),
+            message,
             recovery,
         )
     } else {
@@ -17602,6 +17691,7 @@ fn unknown_session_error(id: &str) -> McpError {
             "session_id": id,
             "server_pid": server_pid,
             "session_server_pid": session_server_pid,
+            "session_server_running": owner_running,
             "recovery": recovery,
         })),
     )
@@ -19193,6 +19283,7 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         Some(state) => router.reattach(state).await?,
         None => Vec::new(),
     };
+    sweep_stale_control_sockets();
     let session_control = match SessionControlSocket::bind(std::process::id()) {
         Ok(socket) => Some(tokio::spawn(socket.serve(router.clone()))),
         Err(error) => {
