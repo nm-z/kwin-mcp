@@ -7045,41 +7045,22 @@ impl KwinMcp {
         }
     }
 
-    async fn viewer_input_is_recent(&self) -> Result<bool, String> {
-        // Do not queue another session read lock while an input operation
-        // holds one: a waiting liveness writer would block the activity check
-        // that must cancel that operation. The owned workdir path is stable.
-        let activity_path = self.path.join(VIEWER_INPUT_ACTIVITY_FILE);
-        let modified = match std::fs::metadata(&activity_path) {
-            Ok(metadata) => metadata.modified().map_err(|error| {
-                format!(
-                    "read {} modification time: {error}",
-                    activity_path.display()
-                )
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(format!(
-                    "read {} metadata: {error}",
-                    activity_path.display()
-                ));
-            }
-        };
-        let age = match std::time::SystemTime::now().duration_since(modified) {
-            Ok(age) => age,
-            Err(error) => error.duration(),
-        };
-        Ok(age <= VIEWER_INPUT_QUIET_PERIOD)
+    /// How much longer agent input stays paused, and what kind of viewer input
+    /// caused it; None when the viewer has been quiet for the whole period.
+    async fn viewer_input_pause(&self) -> Result<Option<(Duration, String)>, String> {
+        recent_viewer_input(&self.path.join(VIEWER_INPUT_ACTIVITY_FILE), std::time::SystemTime::now())
     }
 
-    async fn viewer_is_active_with_recent_input(&self) -> Result<bool, String> {
-        // The child exists only for a viewer on this host. A remote viewer's
-        // `--serve` relay writes the same activity file without a local child.
-        // Always reap/check a local child when present, then use the file for
-        // both local and remote input activity.
+    /// [`Self::viewer_input_pause`] after reaping a viewer that has exited. The
+    /// child exists only for a viewer on this host; a remote viewer's `--serve`
+    /// relay writes the same activity file without one, so the file decides for both.
+    /// The file is read by path, not through the session lock: a waiting liveness
+    /// writer must not block the check that cancels a running input operation.
+    async fn viewer_active_pause(&self) -> Result<Option<(Duration, String)>, String> {
         self.refresh_viewer_child().await?;
-        self.viewer_input_is_recent().await
+        self.viewer_input_pause().await
     }
+
     fn new(display: DisplayConfig) -> Self {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
@@ -9862,6 +9843,31 @@ async fn host_wayland_via_logind() -> anyhow::Result<(PathBuf, std::ffi::OsStrin
 const VIEWER_STATUS_FILE: &str = "viewer-status.json";
 const VIEWER_INPUT_ACTIVITY_FILE: &str = "viewer-input-activity";
 const VIEWER_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+
+/// The viewer's last input, when it is within the quiet period before `now`: the
+/// time left and the kind the viewer wrote into its activity marker.
+fn recent_viewer_input(
+    marker: &Path,
+    now: std::time::SystemTime,
+) -> Result<Option<(Duration, String)>, String> {
+    let modified = match std::fs::metadata(marker) {
+        Ok(metadata) => metadata
+            .modified()
+            .map_err(|error| format!("read {} modification time: {error}", marker.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {} metadata: {error}", marker.display())),
+    };
+    let age = now.duration_since(modified).unwrap_or_else(|error| error.duration());
+    if age > VIEWER_INPUT_QUIET_PERIOD {
+        return Ok(None);
+    }
+    let kind = std::fs::read_to_string(marker)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "input".to_owned());
+    Ok(Some((VIEWER_INPUT_QUIET_PERIOD - age, kind)))
+}
 const VIEWER_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// How long viewer_open waits for the first successful host render submission
 /// before reporting the viewer as still starting.
@@ -19167,9 +19173,9 @@ impl rmcp::ServerHandler for SessionRouter {
             None
         };
         if agent_input {
-            let recent_viewer_input =
+            let viewer_pause =
                 session
-                    .viewer_is_active_with_recent_input()
+                    .viewer_active_pause()
                     .await
                     .map_err(|error| {
                         McpError::internal_error(
@@ -19180,13 +19186,17 @@ impl rmcp::ServerHandler for SessionRouter {
                             })),
                         )
                     })?;
-            if recent_viewer_input {
+            if let Some((remaining, kind)) = viewer_pause {
+                let remaining_ms = remaining.as_millis();
                 return Err(McpError::internal_error(
-                    "Agent input is paused for one second after viewer input to avoid interfering with the user's recent interaction. Retry when the viewer has been idle for one second; the viewer can stay open.",
+                    format!("Agent input is paused for {remaining_ms} more ms after viewer input ({kind}) to avoid interfering with the user's recent interaction. Retry then; the viewer can stay open."),
                     Some(serde_json::json!({
                         "reason":"recent_viewer_input",
                         "retry_safe":true,
-                        "quiet_period_ms":VIEWER_INPUT_QUIET_PERIOD.as_millis()
+                        "quiet_period_ms":VIEWER_INPUT_QUIET_PERIOD.as_millis(),
+                        "remaining_ms":remaining_ms,
+                        "retry_after_ms":remaining_ms,
+                        "viewer_input":kind
                     })),
                 ));
             }
@@ -19207,13 +19217,13 @@ impl rmcp::ServerHandler for SessionRouter {
                 let viewer_activity = async {
                     loop {
                         tokio::time::sleep(VIEWER_INPUT_CHECK_INTERVAL).await;
-                        match session.viewer_input_is_recent().await {
-                            Ok(false) => {}
-                            Ok(true) => {
+                        match session.viewer_input_pause().await {
+                            Ok(None) => {}
+                            Ok(Some((remaining, kind))) => {
                                 break McpError::internal_error(
-                                    "Viewer input interrupted the agent operation. Some input may already have arrived; inspect the target before retrying.",
+                                    format!("Viewer input ({kind}) interrupted the agent operation. Some input may already have arrived; inspect the target before retrying, and wait {} ms for the viewer to be quiet.", remaining.as_millis()),
                                     Some(
-                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false}),
+                                        serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false, "remaining_ms":remaining.as_millis(), "viewer_input":kind}),
                                     ),
                                 );
                             }
@@ -21298,6 +21308,31 @@ mod startup_report_tests {
         assert_eq!(compact["resourceName"], "konsole");
         let same = WindowSnapshot { resource_name: "ORG.KDE.KONSOLE".to_owned(), ..window };
         assert!(same.compact().get("resourceName").is_none());
+    }
+
+    #[test]
+    fn viewer_input_pause_names_the_kind_and_the_time_left() -> std::io::Result<()> {
+        use super::{recent_viewer_input, VIEWER_INPUT_QUIET_PERIOD};
+        let directory = std::env::temp_dir().join(format!("kwin-mcp-viewer-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let marker = directory.join("viewer-input-activity");
+        // No marker: never any input.
+        assert_eq!(recent_viewer_input(&marker, std::time::SystemTime::now()), Ok(None));
+        std::fs::write(&marker, "scroll wheel")?;
+        let written = std::fs::metadata(&marker)?.modified()?;
+        let (remaining, kind) = recent_viewer_input(&marker, written + Duration::from_millis(300))
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other("no pause"))?;
+        assert_eq!(kind, "scroll wheel");
+        assert_eq!(remaining, VIEWER_INPUT_QUIET_PERIOD - Duration::from_millis(300));
+        // Past the quiet period the viewer no longer pauses the agent.
+        assert_eq!(recent_viewer_input(&marker, written + Duration::from_millis(1_500)), Ok(None));
+        // A marker with no kind (an older viewer) is still a pause.
+        std::fs::write(&marker, "")?;
+        let written = std::fs::metadata(&marker)?.modified()?;
+        let kind = recent_viewer_input(&marker, written).map_err(std::io::Error::other)?.map(|(_, kind)| kind);
+        assert_eq!(kind.as_deref(), Some("input"));
+        std::fs::remove_dir_all(&directory)
     }
 
     #[test]

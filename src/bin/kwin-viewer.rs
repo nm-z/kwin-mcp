@@ -1469,6 +1469,17 @@ impl Op {
         })
     }
 
+    /// What kind of input this is, for the activity marker.
+    fn kind(&self) -> &'static str {
+        match self {
+            Op::Motion(..) => "pointer motion",
+            Op::Button(..) => "mouse button",
+            Op::Axis(..) => "scroll wheel",
+            Op::Key(..) => "key",
+            Op::Presented => "presented frame",
+        }
+    }
+
     fn emit(self, fake_input: &OrgKdeKwinFakeInput) {
         match self {
             Op::Motion(x, y) => fake_input.pointer_motion_absolute(x, y),
@@ -1499,12 +1510,21 @@ impl InputOut {
                 conn,
                 activity,
             } => {
-                if !matches!(op, Op::Presented)
-                    && let Err(error) = activity.set_times(
-                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
-                    )
-                {
-                    eprintln!("kwin-viewer: update input activity marker: {error}");
+                if !matches!(op, Op::Presented) {
+                    // The marker's time is the last input; its content names the
+                    // kind, so a pause the user did not cause can be traced.
+                    let kind = op.kind();
+                    if let Err(error) = activity
+                        .set_len(kind.len() as u64)
+                        .and_then(|()| std::os::unix::fs::FileExt::write_all_at(activity, kind.as_bytes(), 0))
+                        .and_then(|()| {
+                            activity.set_times(
+                                std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+                            )
+                        })
+                    {
+                        eprintln!("kwin-viewer: update input activity marker: {error}");
+                    }
                 }
                 op.emit(fake_input);
                 let _ = conn.flush();
