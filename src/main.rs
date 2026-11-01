@@ -4290,6 +4290,53 @@ fn drop_empty_fields(payload: &mut serde_json::Value, keys: &[&str]) {
     }
 }
 
+fn remove_fields(payload: &mut serde_json::Value, keys: &[&str]) {
+    if let Some(object) = payload.as_object_mut() {
+        for key in keys {
+            object.remove(*key);
+        }
+    }
+}
+
+/// The delivery report of a typed or pasted text: what happened and why it is
+/// uncertain. A KWin acknowledgement that succeeded and counts that were not read
+/// are not repeated.
+fn compact_delivery(delivery: &mut serde_json::Value) {
+    if delivery.get("compositor_acknowledged") == Some(&serde_json::Value::Bool(true)) {
+        remove_fields(delivery, &["compositor_acknowledged"]);
+    }
+    drop_empty_fields(delivery, &["warning", "expected_field_characters", "observed_field_characters", "verification_context"]);
+}
+
+/// A keyboard_type result: the delivery verdict, whether a retry is safe, the
+/// window it went to, and a warning when there is one. The text the caller sent,
+/// its length, completion flags and timings are not returned.
+fn compact_typing_result(payload: &mut serde_json::Value) {
+    remove_fields(payload, &["action", "text", "submitted_characters", "submission_complete", "timings_ms", "elapsed_ms"]);
+    drop_empty_fields(payload, &["warning", "verification_context"]);
+    if let Some(delivery) = payload.get_mut("delivery") {
+        compact_delivery(delivery);
+    }
+    if let Some(window) = payload.get_mut("window") {
+        remove_fields(window, &["pid"]);
+        drop_empty_fields(window, &["hidden"]);
+    }
+}
+
+/// A keyboard_paste result: the delivery verdict and whether a retry is safe.
+fn compact_paste_result(payload: &mut serde_json::Value) {
+    remove_fields(
+        payload,
+        &[
+            "action", "clipboard_characters", "shortcut", "shortcut_submitted", "submission_complete",
+            "compositor_acknowledged", "form_submission", "elapsed_ms",
+        ],
+    );
+    if let Some(delivery) = payload.get_mut("delivery") {
+        compact_delivery(delivery);
+    }
+}
+
 /// A launch result for a window that was found carries the window and how it was
 /// found. What the caller supplied (the command) and defaults that need no action
 /// (no warning, no CDP, a normal baseline) are left out.
@@ -10100,6 +10147,32 @@ struct WindowSnapshot {
 }
 
 impl WindowSnapshot {
+    /// The window as a caller reads it: identity, class, pid, geometry, stacking
+    /// order, and each flag only when it is set.
+    fn compact(&self) -> serde_json::Value {
+        let mut window = serde_json::json!({
+            "id": self.id, "title": self.title, "resourceClass": self.resource_class,
+            "pid": self.pid, "x": self.x, "y": self.y, "w": self.w, "h": self.h,
+            "stackingOrder": self.stacking_order,
+        });
+        if !self.resource_name.eq_ignore_ascii_case(&self.resource_class) {
+            window["resourceName"] = serde_json::json!(self.resource_name);
+        }
+        for (key, set) in [
+            ("active", self.active), ("minimized", self.minimized), ("hidden", self.hidden),
+            ("modal", self.modal), ("transient", self.transient), ("dialog", self.dialog),
+            ("popup", self.popup),
+        ] {
+            if set {
+                window[key] = serde_json::json!(true);
+            }
+        }
+        if let Some(parent) = &self.transient_for {
+            window["transientFor"] = serde_json::json!(parent);
+        }
+        window
+    }
+
     fn summary(&self) -> String {
         let mut flags = Vec::new();
         if self.active {
@@ -14441,7 +14514,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "window_list",
-        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, active/minimized/hidden state, and modal/transient relationships; showing_desktop=true means KDE show desktop (super+d) hides every listed window without minimizing it. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
+        description = "List every managed app window in the isolated session, ordered from topmost to bottommost. Includes IDs, titles, app classes, geometry, and the active/minimized/hidden/modal/dialog/popup/transient flags (present only when true, with transientFor when set); showing_desktop=true (present only then, or null when KWin does not answer) means KDE show desktop (super+d) hides every listed window without minimizing it. Call this whenever an expected prompt or transition is not visible in screenshot; a fully covered window still appears here. Use window_activate with the returned ID to reveal and inspect it.",
         annotations(read_only_hint = true)
     )]
     async fn window_list(
@@ -14471,10 +14544,13 @@ impl KwinMcp {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let count = windows.len();
         let mut data = serde_json::json!({
-            "count": count, "showing_desktop": showing, "windows": windows,
+            "windows": windows.iter().map(WindowSnapshot::compact).collect::<Vec<_>>(),
         });
+        // Only the unusual states are reported: show desktop on, or KWin not answering.
+        if showing != Some(false) {
+            data["showing_desktop"] = serde_json::json!(showing);
+        }
         if desktop_shown {
             text = format!("{SHOWING_DESKTOP_WARNING}\n{text}");
             data["warning"] = serde_json::json!(SHOWING_DESKTOP_WARNING);
@@ -14484,7 +14560,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "window_activate",
-        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. If a visible non-popup transient descendant belongs to that window, activate the topmost such descendant instead so keyboard input reaches the displayed chooser. The returned window identifies the actual focused target; requested_window_id identifies the request. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
+        description = "Reveal a specific isolated-session window by exact ID from window_list: unminimize it, raise it above covering windows, and give it focus. If a visible non-popup transient descendant belongs to that window, activate the topmost such descendant instead so keyboard input reaches the displayed chooser. The returned window identifies the actual focused target. Then call screenshot to render it and use the normal input tools. This replaces blind Alt+Tab cycling when a modal, prompt, or app window is hidden."
     )]
     async fn window_activate(
         &self,
@@ -14501,7 +14577,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             text,
-            serde_json::json!({"status": "activated", "requested_window_id": params.window_id, "window": window}),
+            serde_json::json!({"window": window.compact()}),
         )
         .await)
     }
@@ -14584,7 +14660,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and region=[x1,y1,x2,y2], the window-relative rectangle the image covers; for any crop, image pixel (px,py) is mouse_click (px+x1, py+y1). Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -14914,12 +14990,17 @@ impl KwinMcp {
                 "width": win_w,
                 "height": win_h,
             },
-            "target_verification": {
-                "method": "active_window_before_and_after",
-                "matched": true,
-                "after": capture_target_metadata(&observed_window),
-            },
         });
+        // Defaults and what the caller can derive are left out: a target that did
+        // not match is an error, the cursor is included unless asked otherwise, and
+        // the region is the whole window unless a region or cursor crop was asked for.
+        if include_cursor {
+            remove_fields(&mut payload, &["include_cursor"]);
+        }
+        drop_empty_fields(&mut payload, &["saved_as"]);
+        if payload["region"] == serde_json::json!([0, 0, win_w, win_h]) {
+            remove_fields(&mut payload, &["region"]);
+        }
         if let Some(evidence) = transient_pixel_check {
             payload["transient_pixel_check"] = evidence;
         }
@@ -15536,9 +15617,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("clicked ({x},{y}) x{count}"),
-            serde_json::json!({
-                "action": "click", "x": x, "y": y, "count": count,
-            }),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -15586,9 +15665,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("moved ({x},{y})"),
-            serde_json::json!({
-                "action": "move", "x": x, "y": y,
-            }),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -15671,9 +15748,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("scrolled {delta} at ({x},{y})"),
-            serde_json::json!({
-                "action": "scroll", "x": x, "y": y, "delta": delta,
-            }),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -15732,9 +15807,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("dragged ({from_x},{from_y})->({to_x},{to_y})"),
-            serde_json::json!({
-                "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
-            }),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -15953,6 +16026,25 @@ impl KwinMcp {
             .unwrap_or(false);
         drop(guard);
         self.mark_input().await;
+        let mut typed = serde_json::json!({
+                "action": "type", "text": params.text,
+                "submitted_characters": keys.len(), "submission_complete": true,
+                "retry_safe": retry_safe, "delivery": delivery,
+                "verification_context": verification_context,
+                "warning": desktop_shown.then_some(SHOWING_DESKTOP_WARNING),
+                "window": {
+                    "id": snapshot.id, "title": snapshot.title,
+                    "resourceClass": snapshot.resource_class, "pid": snapshot.pid,
+                    "hidden": snapshot.hidden || desktop_shown,
+                },
+                "timings_ms": {
+                    "typing": typing_elapsed_ms,
+                    "compositor_acknowledgment": acknowledgment_elapsed_ms,
+                    "field_verification": verification_elapsed_ms,
+                },
+                "elapsed_ms": started.elapsed().as_millis(),
+        });
+        compact_typing_result(&mut typed);
         let mut result = structured_result(
             &peer,
             format!(
@@ -15971,24 +16063,7 @@ impl KwinMcp {
                     String::new()
                 }
             ),
-            serde_json::json!({
-                "action": "type", "text": params.text,
-                "submitted_characters": keys.len(), "submission_complete": true,
-                "retry_safe": retry_safe, "delivery": delivery,
-                "verification_context": verification_context,
-                "warning": desktop_shown.then_some(SHOWING_DESKTOP_WARNING),
-                "window": {
-                    "id": snapshot.id, "title": snapshot.title,
-                    "resourceClass": snapshot.resource_class, "pid": snapshot.pid,
-                    "hidden": snapshot.hidden || desktop_shown,
-                },
-                "timings_ms": {
-                    "typing": typing_elapsed_ms,
-                    "compositor_acknowledgment": acknowledgment_elapsed_ms,
-                    "field_verification": verification_elapsed_ms,
-                },
-                "elapsed_ms": started.elapsed().as_millis(),
-            }),
+            typed,
         )
         .await;
         result.is_error = Some(matches!(
@@ -16095,6 +16170,16 @@ impl KwinMcp {
         let delivery = finish_prepared_paste(preparation).await;
         drop(guard);
         self.mark_input().await;
+        let mut pasted = serde_json::json!({
+                "action": "paste", "clipboard_characters": length,
+                "shortcut": KEYBOARD_PASTE_SHORTCUT,
+                "shortcut_submitted": true, "submission_complete": true,
+                "compositor_acknowledged": true, "retry_safe": false,
+                "application_text": if delivery.status == "verified" { "verified" } else { "unverified" },
+                "form_submission": "not_observed",
+                "delivery": delivery, "elapsed_ms": started.elapsed().as_millis(),
+        });
+        compact_paste_result(&mut pasted);
         let result = structured_result(
             &peer,
             format!(
@@ -16104,15 +16189,7 @@ impl KwinMcp {
                     .map(|warning| format!(". {warning}"))
                     .unwrap_or_default()
             ),
-            serde_json::json!({
-                "action": "paste", "clipboard_characters": length,
-                "shortcut": KEYBOARD_PASTE_SHORTCUT,
-                "shortcut_submitted": true, "submission_complete": true,
-                "compositor_acknowledged": true, "retry_safe": false,
-                "application_text": if delivery.status == "verified" { "verified" } else { "unverified" },
-                "form_submission": "not_observed",
-                "delivery": delivery, "elapsed_ms": started.elapsed().as_millis(),
-            }),
+            pasted,
         )
         .await;
         Ok(result)
@@ -16279,10 +16356,10 @@ impl KwinMcp {
             text
         };
         let mut data = serde_json::json!({
-            "action": "key", "key": params.key, "warning": warning,
-            "compositor_acknowledged": true,
+            "warning": warning,
             "application_effect": "unverified",
         });
+        drop_empty_fields(&mut data, &["warning"]);
         if let Some(delivery) = paste_delivery {
             data["paste"] = serde_json::json!({
                 "clipboard_scope":"session", "shortcut_acknowledged":true,
@@ -16328,9 +16405,7 @@ impl KwinMcp {
                 "press: {}. Still held until keyboard_release {}.",
                 params.key, params.key
             ),
-            serde_json::json!({
-                "action": "press", "key": params.key, "held": true,
-            }),
+            serde_json::json!({"held": true}),
         )
         .await)
     }
@@ -16364,9 +16439,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("release: {}", params.key),
-            serde_json::json!({
-                "action": "release", "key": params.key,
-            }),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -20941,7 +21014,8 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        compact_find_elements, compact_launch_result, compact_session_result, find_elements_text,
+        WindowSnapshot, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
         screenshot_frame_timeout, screenshot_tool_timeout,
@@ -21154,6 +21228,75 @@ mod startup_report_tests {
         let text = find_elements_text(&compacted, &surfaces);
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(text.contains("surface 0: ") && text.contains("Start\t") && text.contains("click-usable") && text.contains("surface=0"), "{text}");
+    }
+
+    #[test]
+    fn a_typing_result_keeps_the_verdict_and_drops_echoes_and_timings() {
+        let warning = "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified.";
+        let mut payload = serde_json::json!({
+            "action": "type", "text": "echo hi", "submitted_characters": 7, "submission_complete": true,
+            "retry_safe": false, "verification_context": null, "warning": null,
+            "delivery": {"compositor_acknowledged": true, "expected_field_characters": null,
+                "method": "terminal", "observed_field_characters": null, "status": "unverified", "warning": warning},
+            "window": {"hidden": false, "id": "{w}", "pid": 67, "resourceClass": "org.kde.konsole", "title": "~ : bash"},
+            "timings_ms": {"compositor_acknowledgment": 51, "field_verification": 25, "typing": 594},
+            "elapsed_ms": 672,
+        });
+        let before = payload.to_string().len();
+        compact_typing_result(&mut payload);
+        assert_eq!(
+            payload,
+            serde_json::json!({"retry_safe": false,
+                "delivery": {"method": "terminal", "status": "unverified", "warning": warning},
+                "window": {"id": "{w}", "resourceClass": "org.kde.konsole", "title": "~ : bash"}})
+        );
+        assert!(payload.to_string().len() * 2 < before + warning.len());
+        // A hidden window and a show-desktop warning stay.
+        let mut hidden = serde_json::json!({"warning": "desktop shown", "window": {"hidden": true, "id": "{w}", "pid": 1, "resourceClass": "x", "title": "t"}, "delivery": {"status": "verified", "method": "field", "compositor_acknowledged": false}});
+        compact_typing_result(&mut hidden);
+        assert_eq!(hidden["warning"], "desktop shown");
+        assert_eq!(hidden["window"]["hidden"], true);
+        assert_eq!(hidden["delivery"]["compositor_acknowledged"], false);
+    }
+
+    #[test]
+    fn a_paste_result_keeps_the_verdict_only() {
+        let mut payload = serde_json::json!({
+            "action": "paste", "clipboard_characters": 6, "shortcut": "shift+Insert",
+            "shortcut_submitted": true, "submission_complete": true, "compositor_acknowledged": true,
+            "retry_safe": false, "application_text": "unverified", "form_submission": "not_observed",
+            "delivery": {"compositor_acknowledged": true, "expected_field_characters": null,
+                "method": "paste_target_unobservable", "observed_field_characters": null,
+                "status": "unverified", "warning": "The native paste shortcut was submitted, but the focused editable value could not be observed."},
+            "elapsed_ms": 391,
+        });
+        compact_paste_result(&mut payload);
+        assert_eq!(
+            payload,
+            serde_json::json!({"retry_safe": false, "application_text": "unverified",
+                "delivery": {"method": "paste_target_unobservable", "status": "unverified",
+                    "warning": "The native paste shortcut was submitted, but the focused editable value could not be observed."}})
+        );
+    }
+
+    #[test]
+    fn a_window_is_listed_with_only_the_flags_that_are_set() {
+        let window = WindowSnapshot {
+            id: "{w}".to_owned(), title: "~ : bash — Konsole".to_owned(),
+            resource_class: "org.kde.konsole".to_owned(), resource_name: "konsole".to_owned(), pid: 67,
+            active: true, minimized: false, hidden: false, modal: false, transient: false,
+            dialog: false, popup: false, transient_for: None, x: 0.0, y: 0.0, w: 3840.0, h: 2160.0,
+            stacking_order: 0,
+        };
+        let compact = window.compact();
+        assert_eq!(compact["active"], true);
+        for absent in ["minimized", "hidden", "modal", "transient", "dialog", "popup", "transientFor"] {
+            assert!(compact.get(absent).is_none(), "{absent} in {compact}");
+        }
+        // The resource name is kept only when it says something the class does not.
+        assert_eq!(compact["resourceName"], "konsole");
+        let same = WindowSnapshot { resource_name: "ORG.KDE.KONSOLE".to_owned(), ..window };
+        assert!(same.compact().get("resourceName").is_none());
     }
 
     #[test]

@@ -334,13 +334,13 @@ fn show_desktop() {
         .expect("Konsole window")
         .to_owned();
     let before = server.windows();
-    assert_eq!(before["showing_desktop"], json!(false), "{before}");
+    assert_ne!(before["showing_desktop"], json!(true), "{before}");
     assert!(
         before["windows"]
             .as_array()
             .expect("windows")
             .iter()
-            .all(|window| window["hidden"] == json!(false)),
+            .all(|window| window.get("hidden").is_none()),
         "{before}"
     );
     server.data("keyboard_key", json!({"key":"super+d"}));
@@ -353,7 +353,7 @@ fn show_desktop() {
             .as_array()
             .expect("windows")
             .iter()
-            .all(|window| window["hidden"] == json!(true) && window["minimized"] == json!(false)),
+            .all(|window| window["hidden"] == json!(true) && window.get("minimized").is_none()),
         "windows not all hidden and unminimized: {hidden}"
     );
     assert!(
@@ -392,14 +392,14 @@ fn show_desktop() {
     server.data("window_activate", json!({"window_id":konsole}));
     let shown = wait_until(5, "show desktop to end", || {
         let list = server.windows();
-        (list["showing_desktop"] == json!(false)).then_some(list)
+        (list["showing_desktop"] != json!(true)).then_some(list)
     });
     assert!(
         shown["windows"]
             .as_array()
             .expect("windows")
             .iter()
-            .all(|window| window["hidden"] == json!(false)),
+            .all(|window| window.get("hidden").is_none()),
         "windows still hidden after window_activate: {shown}"
     );
     let after = server.data("screenshot", json!({}));
