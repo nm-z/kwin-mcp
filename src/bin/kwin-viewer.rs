@@ -1297,7 +1297,53 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
 
 // Run on the host with the screen: opens the window and starts `--serve` on
 // HOST over ssh. The session keeps running where it is.
+/// The Wayland socket of the desktop session in `runtime`, found the way a login
+/// finds it: the first `wayland-N` there that still accepts a connection.
+fn find_wayland_socket(runtime: &std::path::Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(runtime)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| {
+            name.strip_prefix("wayland-")
+                .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .collect();
+    names.sort();
+    names.into_iter().find(|name| UnixStream::connect(runtime.join(name)).is_ok())
+}
+
+/// `--remote` runs on the machine with the screen, often from an SSH shell that
+/// has no display variables although the machine's desktop session is up. Point
+/// winit at that session. The local viewer never does this: its environment is
+/// set up by kwin-mcp, and a host display must not leak into it.
+fn ensure_host_display() -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let present = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    if present("WAYLAND_DISPLAY") || present("WAYLAND_SOCKET") || present("DISPLAY") {
+        return Ok(());
+    }
+    let runtime = match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime),
+        None => PathBuf::from(format!("/run/user/{}", std::fs::metadata("/proc/self")?.uid())),
+    };
+    let socket = find_wayland_socket(&runtime).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no display: WAYLAND_DISPLAY, WAYLAND_SOCKET and DISPLAY are unset and {} has no live wayland-N socket. Run this on the machine whose screen should show the session, from its desktop session or with that session's XDG_RUNTIME_DIR and WAYLAND_DISPLAY set",
+            runtime.display()
+        )
+    })?;
+    eprintln!("kwin-viewer: no display variables set; using {socket} in {}", runtime.display());
+    // SAFETY: this runs first in `--remote`, before any thread exists, so nothing
+    // can read the environment while it changes.
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        std::env::set_var("WAYLAND_DISPLAY", &socket);
+    }
+    Ok(())
+}
+
 fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    ensure_host_display()?;
     let host = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let virt = parse_size(&mut argv)?;
@@ -1925,6 +1971,36 @@ fn convert_to_rgba(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod display_discovery_tests {
+    use super::find_wayland_socket;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn the_live_wayland_socket_wins_over_stale_and_unrelated_names() {
+        let runtime = std::env::temp_dir().join(format!("kwin-viewer-display-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime).expect("create runtime directory");
+        // A bound-then-dropped listener leaves a socket file nothing answers on.
+        drop(UnixListener::bind(runtime.join("wayland-0")).expect("stale socket"));
+        let _live = UnixListener::bind(runtime.join("wayland-1")).expect("live socket");
+        std::fs::write(runtime.join("wayland-0.lock"), []).expect("lock file");
+        std::fs::write(runtime.join("wayland-x"), []).expect("unrelated file");
+        let found = find_wayland_socket(&runtime);
+        let _ = std::fs::remove_dir_all(&runtime);
+        assert_eq!(found.as_deref(), Some("wayland-1"));
+    }
+
+    #[test]
+    fn no_display_socket_is_none() {
+        let runtime = std::env::temp_dir().join(format!("kwin-viewer-nodisplay-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime).expect("create runtime directory");
+        assert_eq!(find_wayland_socket(&runtime), None);
+        assert_eq!(find_wayland_socket(&runtime.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&runtime);
     }
 }
 

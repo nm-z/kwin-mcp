@@ -15,9 +15,11 @@
 //!   held_modifier (#622) keyboard_type refuses while keyboard_press holds a modifier
 //!   unstarted_launch (#631) a launch refused for an invisible path says the command did not start
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
+//!   ui_name_whitespace (#633) an accessible name with a non-breaking space matches a normal-space query
+//!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
 //!
-//! Run with `KWIN_MCP_E2E=1 cargo test --test session_reports_e2e -- --ignored`;
-//! KWIN_MCP_E2E_SERVER selects another server binary.
+//! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
+//! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -55,6 +57,10 @@ struct Server {
 
 impl Server {
     fn start(flags: &[&str]) -> Self {
+        Self::start_with_path(flags, None)
+    }
+
+    fn start_with_path(flags: &[&str], path: Option<&str>) -> Self {
         let root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/tmp"));
@@ -65,7 +71,8 @@ impl Server {
         let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
         let program = std::env::var("KWIN_MCP_E2E_SERVER")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned());
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(flags)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -83,7 +90,11 @@ impl Server {
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
-            .env_remove("XAUTHORITY")
+            .env_remove("XAUTHORITY");
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -751,6 +762,62 @@ fn chooser_typing() {
 }
 
 #[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn ui_name_whitespace() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({"width":1920, "height":1080}));
+    let fixture = server.home.join("issue633.html");
+    let accessible_name = "Sign\u{00a0}in";
+    std::fs::write(
+        &fixture,
+        format!("<!doctype html><button aria-label=\"{accessible_name}\"></button>"),
+    )
+    .expect("write accessible-name fixture");
+    server.data(
+        "launch_app",
+        json!({"command":"google-chrome-stable --user-data-dir=$HOME/chrome-issue633 file://$HOME/issue633.html",
+               "window_timeout_seconds":40}),
+    );
+    let tree = wait_until(30, "the accessible Sign in button", || {
+        let response = server.call(
+            "accessibility_tree",
+            json!({"show_elements":true, "max_depth":8, "timeout_seconds":10}),
+        );
+        let text = response["result"]["content"]
+            .as_array()?
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.contains(&format!("button\t{accessible_name}"))
+            .then_some(text)
+    });
+    assert!(
+        tree.contains(&format!("button\t{accessible_name}")),
+        "accessibility_tree did not expose the fixture button: {tree}"
+    );
+    let found = server.data(
+        "find_ui_elements",
+        json!({"query":"Sign in", "role":"button", "visible_only":true}),
+    );
+    let target = found["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|element| {
+            element["backend"] == json!("cdp")
+                && element["role"] == json!("button")
+                && element["name"] == json!(accessible_name)
+        });
+    assert!(
+        target.is_some(),
+        "find_ui_elements missed the button returned by accessibility_tree: {found}"
+    );
+    server.stop_session();
+}
+
+#[test]
 #[ignore = "needs a real KDE session and bubblewrap"]
 fn unstarted_launch() {
     require_e2e();
@@ -782,4 +849,35 @@ fn unstarted_launch() {
         json!({"command":format!("sh {}", script.display()), "expect_window":false}),
     );
     wait_until(10, "the script's output", || file_holds(&marker, "ok"));
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap, and input devices"]
+fn at_spi_launcher_outside_path() {
+    require_e2e();
+    let mut server = Server::start_with_path(&["--autoclean"], Some("/usr/bin:/bin"));
+    let started = server.data(
+        "session_start",
+        json!({"width":1280, "height":720, "window_mode":"native",
+               "browser_profiles":"fresh", "startup_timeout_seconds":30}),
+    );
+    server.session = Some(
+        started["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_owned(),
+    );
+    let session_cache = std::fs::read_dir(server.home.join(".cache/kwin-mcp"))
+        .expect("session disk cache")
+        .next()
+        .expect("session cache directory")
+        .expect("read session cache entry")
+        .path();
+    let sandbox_log =
+        std::fs::read_to_string(session_cache.join("sandbox.log")).expect("sandbox stderr log");
+    assert!(
+        !sandbox_log.contains("at-spi-bus-launcher: command not found"),
+        "AT-SPI bus launcher was not found: {sandbox_log}"
+    );
+    let _ = server.stop_session();
 }

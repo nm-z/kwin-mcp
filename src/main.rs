@@ -3594,6 +3594,66 @@ fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
     }
 }
 
+/// What bwrap prints when the kernel refuses it a user namespace or its id map.
+const USER_NAMESPACE_REFUSALS: [&str; 3] = [
+    "setting up uid map",
+    "setting up gid map",
+    "No permissions to create new namespace",
+];
+
+/// Kernel settings that decide whether this process may create a user
+/// namespace, read when the refusal needs explaining.
+struct UserNamespaceFacts {
+    uid_map: String,
+    max_user_namespaces: String,
+    no_new_privs: String,
+    seccomp: String,
+    apparmor_restriction: String,
+}
+
+impl UserNamespaceFacts {
+    fn read() -> Self {
+        let file = |path: &str| {
+            std::fs::read_to_string(path)
+                .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|_| "unavailable".to_owned())
+        };
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map_or_else(|| "unavailable".to_owned(), |value| value.trim().to_owned())
+        };
+        Self {
+            uid_map: file("/proc/self/uid_map"),
+            max_user_namespaces: file("/proc/sys/user/max_user_namespaces"),
+            no_new_privs: field("NoNewPrivs:"),
+            seccomp: field("Seccomp:"),
+            apparmor_restriction: file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
+        }
+    }
+}
+
+/// Guidance for a startup that bwrap abandoned because the kernel refused its
+/// user namespace. The cause is outside the session: this process is itself
+/// confined, or the host disables unprivileged user namespaces.
+fn user_namespace_guidance(stderr: &str, facts: &UserNamespaceFacts) -> Option<String> {
+    USER_NAMESPACE_REFUSALS
+        .iter()
+        .any(|refusal| stderr.contains(refusal))
+        .then(|| {
+            format!(
+                "bwrap could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones. Start kwin-mcp outside that sandbox, or allow nested user namespaces for it, then call session_start again",
+                facts.uid_map,
+                facts.max_user_namespaces,
+                facts.no_new_privs,
+                facts.seccomp,
+                facts.apparmor_restriction,
+            )
+        })
+}
+
 fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> McpError {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
@@ -3644,8 +3704,15 @@ fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> 
         )
     }
     .into();
+    let guidance = user_namespace_guidance(&tail, &UserNamespaceFacts::read());
+    if let Some(guidance) = &guidance {
+        error.message = format!("{}; {guidance}", error.message).into();
+    }
     let data = error.data.get_or_insert_with(|| serde_json::json!({}));
     if let Some(data) = data.as_object_mut() {
+        if let Some(guidance) = guidance {
+            data.insert("guidance".to_owned(), serde_json::json!(guidance));
+        }
         data.insert("sandbox_stderr_tail".to_owned(), serde_json::json!(tail));
         data.insert(
             "sandbox_stderr_truncated".to_owned(),
@@ -4055,6 +4122,15 @@ impl SqliteAccessReport {
         if self.databases.len() < 128 {
             self.databases
                 .push(serde_json::json!({"path": path, "mode": mode}));
+        }
+    }
+
+    /// A database whose requested access could not be given, with the reason.
+    fn record_with_note(&mut self, path: &Path, mode: &'static str, note: String) {
+        self.total_databases += 1;
+        if self.databases.len() < 128 {
+            self.databases
+                .push(serde_json::json!({"path": path, "mode": mode, "note": note}));
         }
     }
 }
@@ -4852,6 +4928,7 @@ fn bind_live_sqlite(
                     mount == &database.with_file_name(format!("{}{suffix}", name.to_string_lossy()))
                 })
         });
+        let mut snapshot_skipped = None;
         if private_write_requested {
             let destination = if plan.upper_path(database).is_some() {
                 upper_file(plan, database)?
@@ -4871,25 +4948,37 @@ fn bind_live_sqlite(
                 "snapshotting private writable SQLite: {}",
                 database.display()
             ))?;
-            kwin_mcp::browser_cookies::snapshot_host(database, &destination).map_err(|error| {
-                anyhow::anyhow!(
-                    "private writable SQLite snapshot {}: {error:#}",
-                    database.display()
-                )
-            })?;
-            // A later host rollback journal must not appear beside the private
-            // database through the overlay's lower layer.
-            let mut journal = destination.as_os_str().to_os_string();
-            journal.push("-journal");
-            let journal = PathBuf::from(journal);
-            std::fs::write(&journal, [])?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))?;
+            match kwin_mcp::browser_cookies::snapshot_host(database, &destination) {
+                Ok(()) => {
+                    // A later host rollback journal must not appear beside the private
+                    // database through the overlay's lower layer.
+                    let mut journal = destination.as_os_str().to_os_string();
+                    journal.push("-journal");
+                    let journal = PathBuf::from(journal);
+                    std::fs::write(&journal, [])?;
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &journal,
+                            std::fs::Permissions::from_mode(0o600),
+                        )?;
+                    }
+                    plan.sqlite_access
+                        .record(database, "private_writable_snapshot");
+                    continue;
+                }
+                // One database too large to copy must not fail the whole session:
+                // it stays a live read-only alias, and the report says why.
+                Err(error) if error.is::<kwin_mcp::browser_cookies::SnapshotTooLarge>() => {
+                    snapshot_skipped = Some(format!("{error:#}"));
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "private writable SQLite snapshot {}: {error:#}",
+                        database.display()
+                    ));
+                }
             }
-            plan.sqlite_access
-                .record(database, "private_writable_snapshot");
-            continue;
         }
         let parent = database
             .parent()
@@ -4915,7 +5004,20 @@ fn bind_live_sqlite(
             PathBuf::from(format!("{HOST_SQLITE_ROOT}/{index}")).join(name),
             upper,
         )?;
-        plan.sqlite_access.record(database, "live_read_only");
+        match snapshot_skipped {
+            Some(reason) => {
+                plan.sqlite_access.record_with_note(
+                    database,
+                    "live_read_only",
+                    format!("private writable snapshot skipped: {reason}"),
+                );
+                eprintln!(
+                    "session_start: {} is too large for the requested private writable snapshot ({reason}); it stays live read-only",
+                    database.display()
+                );
+            }
+            None => plan.sqlite_access.record(database, "live_read_only"),
+        }
         eprintln!(
             "session_start: live SQLite database read-only: {}",
             database.display()
@@ -5383,12 +5485,7 @@ fn prepare_host_view(
     let free = stat.blocks_available().saturating_mul(stat.fragment_size());
     if free < disk_min_free {
         let _ = std::fs::remove_dir(&disk);
-        anyhow::bail!(
-            "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free. Free space there, or pass a smaller disk_min_free_mib to session_start",
-            disk.display(),
-            gib(disk_min_free),
-            gib(free)
-        );
+        anyhow::bail!("{}", overlay_floor_message(&disk, disk_min_free, free));
     }
     let scripts = disk.join(kwin_script::SCRIPT_DIRECTORY);
     std::fs::create_dir(&scripts)
@@ -5762,6 +5859,9 @@ const SESSION_MEMORY_PSI_WARNING_PERCENT: f64 = 10.0;
 const SESSION_MEMORY_SWAP_NEAR_FULL_PERCENT: u32 = 99;
 const BYTES_PER_GIB: u64 = 1_073_741_824;
 
+/// Limits are fixed when a session starts, so the way out is a new session.
+const MEMORY_RAISE_HINT: &str = "limits cannot change in a running session; stop it and call session_start with a larger memory_high, memory_max and memory_swap_max (whole GiB), or start the server with --memory-high, --memory-max and --memory-swap-max";
+
 #[derive(Clone, Copy)]
 struct SessionMemorySnapshot {
     current: u64,
@@ -5913,7 +6013,7 @@ impl SessionMemoryWarning {
         };
 
         Some(Self {
-            message: format!("{message} ({})", details.join(", ")),
+            message: format!("{message} ({}); {MEMORY_RAISE_HINT}", details.join(", ")),
             reason: if throttled {
                 "memory_high"
             } else {
@@ -6099,6 +6199,10 @@ struct DisplayConfig {
     locked: bool,
     autoclean: bool,
     ttl: Option<Duration>,
+    /// After the MCP client closes, keep serving running sessions to other
+    /// kwin-mcp processes until they have been idle this long; None shuts them
+    /// down with the client.
+    keep_sessions: Option<Duration>,
     /// cgroup MemoryHigh for each session's sandbox in bytes; None disables throttling.
     memory_high: Option<u64>,
     memory_max: u64,
@@ -7936,6 +8040,18 @@ fn gib(bytes: u64) -> String {
     format!("{value:.2} GiB")
 }
 
+/// The refusal when the HOME overlay's filesystem has less than the floor free,
+/// with the exact retry a caller can make: half of what is free, in MiB.
+fn overlay_floor_message(disk: &Path, floor: u64, free: u64) -> String {
+    let retry = ((free >> 20) / 2).max(1);
+    format!(
+        "the session's HOME overlay lives in {} and needs {} free there; that filesystem has {} free. Free space there, or retry session_start with disk_min_free_mib={retry} (MiB; the session then writes into what is left)",
+        disk.display(),
+        gib(floor),
+        gib(free)
+    )
+}
+
 /// Explain a failed write: for EDQUOT/ENOSPC, name the per-user quota (systemd
 /// mounts /tmp as tmpfs with usrquota, so a user can hit its limit while df
 /// still shows free space), the filesystem it applies to, and the filesystem's
@@ -8489,6 +8605,28 @@ fn fuse_support() -> Option<Vec<(PathBuf, &'static str)>> {
     (!binaries.is_empty()).then_some(binaries)
 }
 
+/// Find the AT-SPI bus launcher in common system locations or on the host PATH.
+fn resolve_at_spi_bus_launcher() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut candidates = vec![
+        PathBuf::from("/usr/lib/at-spi-bus-launcher"),
+        PathBuf::from("/usr/lib/at-spi2-core/at-spi-bus-launcher"),
+        PathBuf::from("/usr/libexec/at-spi-bus-launcher"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path).map(|directory| directory.join("at-spi-bus-launcher")),
+        );
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let metadata = std::fs::metadata(&candidate).ok()?;
+        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .then(|| std::fs::canonicalize(candidate).ok())
+            .flatten()
+    })
+}
+
 /// Resolve the kwin-viewer binary by replacing the basename of our own
 /// current_exe. Returns None if the binary doesn't exist — the viewer is
 /// an optional convenience, not required for MCP tool operation.
@@ -9023,7 +9161,17 @@ const BROWSER_COMMANDS: &[&str] = &[
 const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
 set -e
 name=${0##*/}
-real=$(PATH="${PATH#*:}" command -v "$name") || exit 127
+real=$(PATH="${PATH#*:}" command -v "$name") || real=
+if [[ -z $real ]]; then
+  # The same browser often installs under only one of its names.
+  case "$name" in
+    google-chrome|google-chrome-stable) alts="google-chrome-stable google-chrome" ;;
+    chromium|chromium-browser) alts="chromium chromium-browser" ;;
+    *) alts= ;;
+  esac
+  for alt in $alts; do real=$(PATH="${PATH#*:}" command -v "$alt") && break || real=; done
+fi
+[[ -n $real ]] || exit 127
 ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
 first_run=0 default_check=0
 for arg in "$@"; do
@@ -9143,7 +9291,59 @@ fn detect_browsers() -> Vec<String> {
         .collect()
 }
 
+/// The first `wayland-N` socket in `runtime` that still accepts a connection.
+fn live_wayland_socket(runtime: &Path) -> Option<std::ffi::OsString> {
+    let mut numbered: Vec<(u32, std::ffi::OsString)> = std::fs::read_dir(runtime)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let number = name.to_str()?.strip_prefix("wayland-")?.parse::<u32>().ok()?;
+            Some((number, name))
+        })
+        .collect();
+    numbered.sort();
+    numbered
+        .into_iter()
+        .map(|(_, name)| name)
+        .find(|name| std::os::unix::net::UnixStream::connect(runtime.join(name)).is_ok())
+}
+
+/// The host desktop's Wayland socket. logind says which session is the user's
+/// active desktop, but it is a hint: a worker in a confined environment cannot
+/// reach it, and a desktop started outside a logind graphical session is not
+/// listed as one. Either way the desktop's socket sits in the runtime directory,
+/// so look there before giving up.
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
+    use std::os::unix::fs::MetadataExt;
+    let logind_error = match host_wayland_via_logind().await {
+        Ok(found) => return Ok(found),
+        Err(error) => error,
+    };
+    let runtime = match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime),
+        None => PathBuf::from(format!(
+            "/run/user/{}",
+            std::fs::metadata("/proc/self")?.uid()
+        )),
+    };
+    match live_wayland_socket(&runtime) {
+        Some(display) => {
+            eprintln!(
+                "viewer: {logind_error:#}; using {} in {} instead",
+                display.to_string_lossy(),
+                runtime.display()
+            );
+            Ok((runtime, display))
+        }
+        None => Err(logind_error.context(format!(
+            "{} has no live wayland-N socket either",
+            runtime.display()
+        ))),
+    }
+}
+
+async fn host_wayland_via_logind() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     use std::os::unix::fs::FileTypeExt;
     let (inherited_display, inherited_runtime) = (
         std::env::var_os("WAYLAND_DISPLAY"),
@@ -10210,10 +10410,12 @@ impl LevelTree {
         }
         let deeper = incomplete || self.levels() > fit;
         let chars = out.chars().count();
-        (
-            out,
-            serde_json::json!({"levels": fit, "nodes": shown, "chars": chars, "more_below": deeper}),
-        )
+        // Some MCP clients show only structuredContent and drop the text
+        // content, so the tree rides in both.
+        let info = serde_json::json!({
+            "levels": fit, "nodes": shown, "chars": chars, "more_below": deeper, "tree": out,
+        });
+        (out, info)
     }
 }
 
@@ -10738,7 +10940,7 @@ async fn poll_launch_exit_status(path: &Path, timeout: Duration) -> Option<i32> 
 /// cannot decrypt the copied profile's cookies and saved logins.
 fn launch_wallet_warning(wallet_note: Option<String>, command: &str) -> Option<String> {
     wallet_note.filter(|_| launches_chromium(command)).map(|reason| {
-        format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
+        format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out. To use the saved logins, start and unlock the host's KWallet before session_start (kwin-mcp never starts or unlocks it); otherwise sign in inside the session")
     })
 }
 
@@ -11094,8 +11296,18 @@ struct AccessibilityTreeParams {
 }
 
 const FIND_UI_MAX_MATCHES: usize = 200;
-const FIND_UI_MAX_NODES: usize = 2000;
+// The five-second ATSPI_TRAVERSAL_TIMEOUT bounds how long a search runs and keeps
+// the matches already found; this only caps runaway trees. It was 2000, which
+// Chrome's own toolbar and a modest page exhaust before the page's tail.
+const FIND_UI_MAX_NODES: usize = 100_000;
 const FIND_UI_MAX_PAGES: usize = 10;
+
+fn find_ui_search_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
 
 fn find_ui_role_matches(wanted: Option<&str>, actual: &str) -> bool {
     let Some(wanted) = wanted else {
@@ -11920,7 +12132,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. The viewer may stay open; the user can close it. \
                 At browser logins, select saved-credential autofill without reading or typing its value; otherwise show the entry and open the viewer. \
                 Clipboards are separate: local viewer Ctrl+C/Ctrl+X copies to the server host; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
-                Chrome chooser: click the file input, ctrl+l, type the absolute session path, alt+o. Enter in the location bar cancels. \
+                Chrome file chooser: click the file input, ctrl+l, type the absolute session path, alt+o; for folders click its top-right button, not alt+o. Enter in the location bar cancels. \
                 Mouse/screenshot coordinates are 1:1 pixels from the active window's top-left. For crop region=[x1,y1,x2,y2], image (px,py) maps to mouse (px+x1,py+y1). \
                 {size_line} Windows auto-maximize unless window_mode=native. Results report memory_warning when the session is throttled.",
                 size_line = if self.display.locked {
@@ -12068,6 +12280,11 @@ impl KwinMcp {
             env!("GIT_HASH")
         );
         let ver_err = |e: String| McpError::internal_error(format!("{version_stamp} — {e}"), None);
+        let at_spi_bus_launcher = resolve_at_spi_bus_launcher().ok_or_else(|| {
+            ver_err(
+                "required at-spi-bus-launcher was not found in /usr/lib, /usr/lib/at-spi2-core, /usr/libexec, or PATH".to_owned(),
+            )
+        })?;
         // Resolve the launcher's missing login environment without mutating
         // global variables used by concurrent sessions or the strict wrapper.
         let host_runtime = host_environment::runtime_dir()
@@ -12338,6 +12555,7 @@ impl KwinMcp {
         // bwrap. Keep session applications' temporary files in private /tmp.
         let media_wait_attempts = STARTUP_TIMEOUT.as_millis() / STARTUP_POLL.as_millis();
         let media_poll_seconds = STARTUP_POLL.as_secs_f64();
+        let at_spi_bus_launcher = shell_quote(&at_spi_bus_launcher.display().to_string());
         let entrypoint = format!(
             "set -u\n\
             export TMPDIR=/tmp\n\
@@ -12362,7 +12580,7 @@ impl KwinMcp {
             echo $? > '{xdg_dir_str}/{KWIN_EXIT_FILE}'; }} &\n\
             sleep 0.3\n\
             dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR QT_QPA_PLATFORM PATH HOME USER TMPDIR ATSPI_DBUS_IMPLEMENTATION\n\
-            at-spi-bus-launcher --launch-immediately &\n\
+            {at_spi_bus_launcher} --launch-immediately &\n\
             pipewire &\n\
             media_pid=$!\n\
             for ((attempt=0; attempt<{media_wait_attempts}; attempt++)); do\n\
@@ -14258,7 +14476,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level; the same text is also in structuredContent.tree for clients that show only structured results. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -14578,7 +14796,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -14588,7 +14806,7 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
         self.settle_input().await?;
-        let query = params.query.to_lowercase();
+        let query = find_ui_search_text(&params.query);
         let visible_only = params.visible_only.unwrap_or(false);
         let mut elements = Vec::new();
         let mut errors = Vec::new();
@@ -14629,7 +14847,7 @@ impl KwinMcp {
                         if elements.len() >= FIND_UI_MAX_MATCHES { return Err("match limit reached".to_owned()); }
                         let name = element["name"].as_str().unwrap_or_default();
                         let role = element["role"].as_str().unwrap_or_default();
-                        if !(name.to_lowercase().contains(&query) || role.to_lowercase().contains(&query))
+                        if !(find_ui_search_text(name).contains(&query) || find_ui_search_text(role).contains(&query))
                             || !find_ui_role_matches(params.role.as_deref(), role)
                             || visible_only && element["visible"] != true { continue; }
                         let mut matched = element.clone();
@@ -14685,7 +14903,7 @@ impl KwinMcp {
                         let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
                         let Ok(node) = atspi_node(&acc).await else { continue; };
                         if node.is_useful()
-                            && (node.name.to_lowercase().contains(&query) || node.role.to_lowercase().contains(&query))
+                            && (find_ui_search_text(&node.name).contains(&query) || find_ui_search_text(&node.role).contains(&query))
                             && find_ui_role_matches(params.role.as_deref(), &node.role) {
                             let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
                             if !visible_only || matched["visible"] == true {
@@ -15062,6 +15280,7 @@ impl KwinMcp {
             &sess.atspi_bus_address,
             &active.title,
             [active.x, active.y, active.w, active.h],
+            Some([active.cx, active.cy]),
             &params.text,
         )
         .await;
@@ -15075,10 +15294,23 @@ impl KwinMcp {
             && !error.is::<input_bridge::TerminalFocus>()
             && !error.is::<input_bridge::ProtectedFocus>()
         {
+            // Slowness is not an unobservable field: say so, so the caller retries
+            // instead of hunting for a different field.
+            let (message, reason) = if error.is::<input_bridge::TextDiscoveryTimedOut>() {
+                (
+                    "Typing was not started because reading the browser's focused field timed out; the host or session is slow. Nothing was typed, so retrying is safe; if it keeps timing out, use keyboard_paste.",
+                    "text_discovery_timed_out",
+                )
+            } else {
+                (
+                    "Typing was not started because the browser's focused editable target could not be verified. Click the intended field and inspect it before retrying.",
+                    "text_target_unavailable",
+                )
+            };
             return Err(McpError::invalid_params(
-                "Typing was not started because the browser's focused editable target could not be verified. Click the intended field and inspect it before retrying.",
+                message,
                 Some(serde_json::json!({
-                    "reason":"text_target_unavailable", "submitted_characters":0,
+                    "reason":reason, "submitted_characters":0,
                     "attempted_characters":0, "requested_characters":keys.len(),
                     "submission_complete":false, "retry_safe":true,
                     "target_observation":error.to_string(),
@@ -15154,6 +15386,7 @@ impl KwinMcp {
                         &sess.atspi_bus_address,
                         &active.title,
                         [active.x, active.y, active.w, active.h],
+                        None,
                         "",
                     )
                     .await;
@@ -16369,9 +16602,7 @@ impl KwinMcp {
 
         // A Chromium-family browser without the wallet cannot decrypt the copied
         // profile's cookies and saved logins, so its sites show signed out.
-        let warning = wallet_note.filter(|_| launches_chromium(&params.command)).map(|reason| {
-            format!("warning: the session has no wallet ({reason}); this browser cannot decrypt the copied profile, so sites may show signed out")
-        });
+        let warning = launch_wallet_warning(wallet_note, &params.command);
         let extension_warning = requests_blocked_google_chrome_extension_load(&params.command)
             .then(|| {
                 "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
@@ -16545,6 +16776,8 @@ Options:\n\
   --no-viewer            Compatibility option; the viewer already starts on demand\n\
   --autoclean            Clean up orphaned session workdirs\n\
   --ttl MINUTES          Expire the session after MINUTES; implies --autoclean\n\
+  --keep-sessions MINUTES  After the MCP client closes, keep running sessions for other\n\
+                         kwin-mcp processes to forward to until MINUTES idle (default: stop them)\n\
   --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
   --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
   --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
@@ -16573,6 +16806,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
         locked: false,
         autoclean: false,
         ttl: None,
+        keep_sessions: None,
         memory_high: Some(DEFAULT_MEMORY_HIGH),
         memory_max: DEFAULT_MEMORY_MAX,
         memory_swap_max: DEFAULT_MEMORY_SWAP_MAX,
@@ -16586,6 +16820,9 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
             "--no-viewer" => {}
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
+            "--keep-sessions" => {
+                cfg.keep_sessions = Some(parse_minutes_arg(&mut args, "--keep-sessions")?)
+            }
             "--memory-high" => {
                 cfg.memory_high = match parse_memory_arg(&mut args, "--memory-high")? {
                     0 => None,
@@ -16739,18 +16976,23 @@ fn sandbox_launcher(
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
-    let value = args
-        .next()
-        .ok_or_else(|| "--ttl requires minutes".to_owned())?;
+    parse_minutes_arg(args, "--ttl")
+}
+
+fn parse_minutes_arg(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<Duration, String> {
+    let value = args.next().ok_or_else(|| format!("{flag} requires minutes"))?;
     let minutes: u64 = value
         .parse()
-        .map_err(|error| format!("--ttl '{value}': {error}"))?;
+        .map_err(|error| format!("{flag} '{value}': {error}"))?;
     if minutes == 0 {
-        return Err("--ttl must be positive".to_owned());
+        return Err(format!("{flag} must be positive"));
     }
     let seconds = minutes
         .checked_mul(60)
-        .ok_or_else(|| "--ttl is too large".to_owned())?;
+        .ok_or_else(|| format!("{flag} is too large"))?;
     Ok(Duration::from_secs(seconds))
 }
 
@@ -17047,7 +17289,7 @@ async fn prepare_paste_text(
             warning: "The clipboard did not provide supported UTF-8 text for editable-value verification.",
         };
     };
-    match input_bridge::TextReceipt::capture_paste(address, title, bounds, &text).await {
+    match input_bridge::TextReceipt::capture_paste(address, title, bounds, None, &text).await {
         Ok(receipt) => PreparedPaste::Ready(receipt),
         Err(_) => PreparedPaste::Unavailable {
             method: "paste_target_unobservable",
@@ -17130,6 +17372,72 @@ fn same_pid_namespace(pid: i32) -> bool {
     ) {
         (Ok(own), Ok(peer)) => own == peer,
         _ => false,
+    }
+}
+
+/// Remove control sockets that no server listens on. A server killed without
+/// a chance to unlink its socket (SIGKILL, a crash, a host that stops it hard)
+/// leaves the file behind, and each one makes a lost session look routable.
+/// A listening socket is never connected to: the connection would start a
+/// handshake that the probe then abandons, which its server logs as a failure.
+/// The kernel's socket table says which paths still have a socket behind them.
+fn sweep_stale_control_sockets() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(directory) = host_environment::runtime_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    // Without the table nothing proves a socket stale.
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return;
+    };
+    let bound: std::collections::HashSet<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(7))
+        .collect();
+    let uid = unsafe { nix::libc::geteuid() };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_session_control_socket(&path) {
+            continue;
+        }
+        let owner_running = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(SESSION_CONTROL_SOCKET_PREFIX))
+            .and_then(|rest| rest.strip_suffix(".sock"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(kwin_mcp_server_running);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if owner_running
+            || !metadata.file_type().is_socket()
+            || metadata.uid() != uid
+            || path.to_str().is_some_and(|path| bound.contains(path))
+        {
+            continue;
+        }
+        // The table is per network namespace, so a server in another one would
+        // be missing from it: only a refused connection proves nothing listens.
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => eprintln!(
+                        "session control: removed stale socket {}",
+                        path.display()
+                    ),
+                    Err(error) => eprintln!(
+                        "session control: could not remove stale socket {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -17624,22 +17932,45 @@ fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> 
     Ok(error)
 }
 
+/// Whether `pid` is a running kwin-mcp server on this host.
+fn kwin_mcp_server_running(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|file| file.to_string_lossy().starts_with("kwin-mcp"))
+        })
+        .unwrap_or(false)
+}
+
 fn unknown_session_error(id: &str) -> McpError {
     let server_pid = std::process::id();
     let session_server_pid = session_owner_pid(id);
     let other_server_pid = session_server_pid.filter(|pid| *pid != server_pid);
+    let owner_running = other_server_pid.map(kwin_mcp_server_running);
     let (reason, session_status, message, recovery) = if let Some(other_server_pid) =
         other_server_pid
     {
-        let recovery = format!(
+        let recovery = if owner_running == Some(false) {
+            "Call session_start without session_id and relaunch your applications; a session ends when its server process exits.".to_owned()
+        } else {
+            format!(
             "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
-        );
+            )
+        };
+        let message = if owner_running == Some(false) {
+            format!(
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, which is no longer running, so its sessions ended with it. This request reached process {server_pid}, which is what a server restart looks like: a host that respawns the MCP server, for example when a client session is resumed, closes the old server's connection, and a server shuts down its desktops when that happens. {recovery}"
+            )
+        } else {
+            format!(
+                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
+            )
+        };
         (
             "different_server_process",
             "owned_by_another_process",
-            format!(
-                "session_id '{id}' names kwin-mcp process {other_server_pid}, but this request reached process {server_pid}. Session IDs are scoped to the process that created them; a live same-user server can handle forwarded requests through its private control socket. This can happen after a server restart or when a request reaches a different MCP server. {recovery}"
-            ),
+            message,
             recovery,
         )
     } else {
@@ -17662,6 +17993,7 @@ fn unknown_session_error(id: &str) -> McpError {
             "session_id": id,
             "server_pid": server_pid,
             "session_server_pid": session_server_pid,
+            "session_server_running": owner_running,
             "recovery": recovery,
         })),
     )
@@ -17954,6 +18286,30 @@ impl SessionRouter {
             }),
         )
         .await)
+    }
+    /// Idle time of the least idle running session, or None when no session is
+    /// running. A session that died or expired does not count.
+    async fn least_idle_running_session(&self) -> Option<Duration> {
+        let mut least: Option<Duration> = None;
+        for service in self.entries().ok()?.into_values() {
+            let _ = service.check_liveness().await;
+            if !matches!(
+                service.registry_phase().await,
+                session_registry::Phase::Running
+            ) {
+                continue;
+            }
+            let idle = service
+                .session
+                .read()
+                .await
+                .as_ref()
+                .map(|session| session.last_activity.elapsed());
+            if let Some(idle) = idle {
+                least = Some(least.map_or(idle, |least| least.min(idle)));
+            }
+        }
+        least
     }
     async fn shutdown(&self) {
         if let Ok(entries) = self.entries() {
@@ -19227,6 +19583,16 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
     {
         eprintln!("autoclean: orphan sweep skipped: {error}");
     }
+    // A disk twin whose server died without a lease, or whose /tmp workdir is
+    // gone, is not reached by the leased sweep above. Scanning every process
+    // command line is slow on a loaded host, so it stays off the startup path.
+    if display.autoclean {
+        std::thread::spawn(|| {
+            if let Err(error) = sweep_dead_owner_workdirs(None) {
+                eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+            }
+        });
+    }
     eprintln!(
         "kwin-mcp: display default {}x{}{}; viewer on demand",
         display.width,
@@ -19237,12 +19603,14 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
             ""
         },
     );
+    let keep_sessions = display.keep_sessions;
     let router = SessionRouter::new(display);
     let shutdown = router.clone();
     let input = match restored {
         Some(state) => router.reattach(state).await?,
         None => Vec::new(),
     };
+    sweep_stale_control_sockets();
     let session_control = match SessionControlSocket::bind(std::process::id()) {
         Ok(socket) => Some(tokio::spawn(socket.serve(router.clone()))),
         Err(error) => {
@@ -19291,11 +19659,67 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
                 },
                 request = process_commands.recv() => match request {
                     Some(request) => request.execute(),
-                    None => break None,
+                    None => {
+                        eprintln!("shutdown: the process command channel closed");
+                        break None;
+                    },
                 },
             }
         }
     };
+    // Say why the server is going away: a host that respawns it looks the same
+    // as a crash from the client side, and every owned session goes with it.
+    match &waited {
+        Some(Ok(reason)) => eprintln!("shutdown: {}", quit_cause(reason)),
+        Some(Err(error)) => eprintln!("shutdown: the MCP service task failed: {error}"),
+        None => {}
+    }
+    // The client closing is how a host respawns this server. With --keep-sessions
+    // the running sessions outlive it, served through the control socket to
+    // whichever kwin-mcp the host starts next (session IDs name this process, and
+    // calls with them are forwarded here). A signal, or the launching client
+    // exiting, still ends everything at once.
+    if let Some(grace) = keep_sessions
+        && matches!(&waited, Some(Ok(rmcp::service::QuitReason::Closed)))
+        && session_control.is_some()
+        && let Some(idle) = shutdown.least_idle_running_session().await
+    {
+        reload.abort();
+        eprintln!(
+            "shutdown: keeping running sessions for forwarded requests until they have been idle {} minute(s) (idle now: {} s)",
+            grace.as_secs() / 60,
+            idle.as_secs()
+        );
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    match shutdown.least_idle_running_session().await {
+                        None => {
+                            eprintln!("shutdown: no running session remains");
+                            break;
+                        }
+                        Some(idle) if idle >= grace => {
+                            eprintln!("shutdown: sessions idle for {} s, past --keep-sessions", idle.as_secs());
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                },
+                _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
+                _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
+                _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
+                result = wire.client.readable() => {
+                    if let Err(error) = result { eprintln!("client lifetime watcher: {error}"); }
+                    eprintln!("shutdown: launching client exited; stopping owned session scopes");
+                    break;
+                },
+                request = process_commands.recv() => match request {
+                    Some(request) => request.execute(),
+                    None => break,
+                },
+            }
+        }
+    }
     if let Some(session_control) = session_control {
         session_control.abort();
         let _ = session_control.await;
@@ -19313,6 +19737,19 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         result?;
     }
     Ok(())
+}
+
+fn quit_cause(reason: &rmcp::service::QuitReason) -> String {
+    match reason {
+        rmcp::service::QuitReason::Closed => {
+            "the MCP client closed the connection (stdin reached end of file)".to_owned()
+        }
+        rmcp::service::QuitReason::Cancelled => "the MCP service was cancelled".to_owned(),
+        rmcp::service::QuitReason::JoinError(error) => {
+            format!("the MCP service task failed: {error}")
+        }
+        other => format!("the MCP service ended: {other:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -19345,6 +19782,51 @@ mod file_content_tests {
                 &mut Cursor::new(contents),
             )?);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_wayland_scan_tests {
+    use super::live_wayland_socket;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn the_live_numbered_socket_wins_over_stale_and_unrelated_names() -> std::io::Result<()> {
+        let runtime = std::env::temp_dir().join(format!("kwin-mcp-wayland-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime)?;
+        // A bound-then-dropped listener leaves a socket file nothing answers on.
+        drop(UnixListener::bind(runtime.join("wayland-0"))?);
+        let _live = UnixListener::bind(runtime.join("wayland-1"))?;
+        std::fs::write(runtime.join("wayland-0.lock"), [])?;
+        std::fs::write(runtime.join("wayland-x"), [])?;
+        let found = live_wayland_socket(&runtime);
+        std::fs::remove_dir_all(&runtime)?;
+        assert_eq!(found.as_deref(), Some(std::ffi::OsStr::new("wayland-1")));
+        assert_eq!(live_wayland_socket(&runtime), None);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keep_sessions_flag_tests {
+    use super::parse_cli_args_from;
+    use std::time::Duration;
+
+    fn parse(args: &[&str]) -> Result<Option<Duration>, String> {
+        parse_cli_args_from(args.iter().map(|arg| (*arg).to_owned())).map(|cfg| cfg.keep_sessions)
+    }
+
+    #[test]
+    fn sessions_stop_with_the_client_unless_asked_to_stay() -> Result<(), String> {
+        assert_eq!(parse(&[])?, None);
+        assert_eq!(
+            parse(&["--keep-sessions", "30"])?,
+            Some(Duration::from_secs(30 * 60))
+        );
+        assert!(parse(&["--keep-sessions", "0"]).is_err());
+        assert!(parse(&["--keep-sessions"]).is_err());
+        assert!(parse(&["--keep-sessions", "soon"]).is_err());
         Ok(())
     }
 }
@@ -19483,6 +19965,18 @@ mod level_tree_tests {
     }
 
     #[test]
+    fn structured_info_carries_the_same_tree_text() {
+        let mut tree = LevelTree::default();
+        let root = tree.push("root".to_owned(), "root-id".to_owned(), None);
+        tree.push("child".to_owned(), "child-id".to_owned(), Some(root));
+        let (text, info) = tree.render(usize::MAX);
+        assert_eq!(text, "root\n\tchild\n");
+        assert_eq!(info["tree"], text);
+        let (text, info) = tree.render_partial(usize::MAX, true);
+        assert_eq!(info["tree"], text);
+    }
+
+    #[test]
     fn oversized_root_level_is_not_cut_in_the_middle() {
         let mut tree = LevelTree::default();
         tree.push("x".repeat(A11Y_TREE_MAX_CHARS), "root-id".to_owned(), None);
@@ -19514,6 +20008,7 @@ mod instructions_tests {
                 locked,
                 autoclean: false,
                 ttl: None,
+                keep_sessions: None,
                 memory_high: None,
                 memory_max: 0,
                 memory_swap_max: 0,
@@ -19703,8 +20198,74 @@ mod window_resolution_tests {
 }
 
 #[cfg(test)]
+mod user_namespace_guidance_tests {
+    use super::{UserNamespaceFacts, user_namespace_guidance};
+
+    fn confined() -> UserNamespaceFacts {
+        UserNamespaceFacts {
+            uid_map: "0 1000 1".to_owned(),
+            max_user_namespaces: "0".to_owned(),
+            no_new_privs: "1".to_owned(),
+            seccomp: "2".to_owned(),
+            apparmor_restriction: "1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_refused_uid_map_is_explained_with_the_kernel_settings() {
+        let guidance = user_namespace_guidance(
+            "bwrap: setting up uid map: Operation not permitted\n",
+            &confined(),
+        )
+        .expect("a refused uid map gets guidance");
+        for fact in [
+            "uid_map: 0 1000 1",
+            "user.max_user_namespaces: 0",
+            "NoNewPrivs: 1",
+            "Seccomp: 2",
+            "kernel.apparmor_restrict_unprivileged_userns: 1",
+            "Start kwin-mcp outside that sandbox",
+        ] {
+            assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
+        }
+    }
+
+    #[test]
+    fn other_sandbox_failures_get_no_namespace_guidance() {
+        for stderr in [
+            "",
+            "bwrap: Can't find source path /nonexistent: No such file or directory",
+            "bwrap: execvp kwin_wayland: No such file or directory",
+        ] {
+            assert_eq!(user_namespace_guidance(stderr, &confined()), None, "{stderr}");
+        }
+        assert!(
+            user_namespace_guidance("bwrap: No permissions to create new namespace", &confined())
+                .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
 mod launch_warning_tests {
-    use super::{launches_chromium, requests_blocked_google_chrome_extension_load};
+    use super::{
+        launch_wallet_warning, launches_chromium, requests_blocked_google_chrome_extension_load,
+    };
+
+    #[test]
+    fn a_walletless_chromium_launch_says_how_to_get_the_saved_logins() {
+        let reason = "org.kde.ksecretd is not running on the host; kwin-mcp does not start it";
+        let warning = launch_wallet_warning(Some(reason.to_owned()), "google-chrome-stable about:blank")
+            .expect("a Chromium launch without a wallet warns");
+        assert!(warning.contains(reason), "{warning}");
+        assert!(
+            warning.contains("start and unlock the host's KWallet before session_start"),
+            "the warning must name the remedy: {warning}"
+        );
+        assert!(warning.contains("sign in inside the session"), "{warning}");
+        assert_eq!(launch_wallet_warning(Some(reason.to_owned()), "kate notes.txt"), None);
+        assert_eq!(launch_wallet_warning(None, "google-chrome-stable"), None);
+    }
 
     #[test]
     fn chromium_family_commands_are_recognized() {
@@ -19752,6 +20313,7 @@ mod startup_report_tests {
             locked: false,
             autoclean: false,
             ttl: None,
+            keep_sessions: None,
             memory_high: None,
             memory_max: 0,
             memory_swap_max: 0,
@@ -20355,6 +20917,13 @@ mod session_memory_warning_tests {
         assert!(warning.message.contains("RAM 4.00/3.00 GiB"));
         assert!(warning.message.contains("swap 1.00/1.00 GiB nearly full"));
         assert!(warning.message.contains("memory PSI full avg10=67.18%"));
+        assert!(
+            warning
+                .message
+                .contains("session_start with a larger memory_high, memory_max"),
+            "the warning must say how to raise the limits: {}",
+            warning.message
+        );
         assert_eq!(warning.as_json()["memory_current_bytes"], 4 * BYTES_PER_GIB);
         Ok(())
     }
@@ -20669,7 +21238,8 @@ mod ssh_config_tests {
 #[cfg(test)]
 mod ui_match_context_tests {
     use super::{
-        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match, find_ui_role_matches,
+        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match,
+        find_ui_role_matches, find_ui_search_text,
     };
 
     fn window() -> WindowSnapshot {
@@ -20710,6 +21280,13 @@ mod ui_match_context_tests {
         assert!(!find_ui_role_matches(Some("button"), "static text"));
         assert!(!find_ui_role_matches(Some("button"), "label"));
         assert!(find_ui_role_matches(None, "static text"));
+    }
+
+    #[test]
+    fn issue633_name_query_matches_nonbreaking_space() {
+        let name = find_ui_search_text("Sign\u{00a0}in");
+        let query = find_ui_search_text("Sign in");
+        assert!(name.contains(&query));
     }
 
     #[test]
@@ -20910,6 +21487,55 @@ mod home_overlay_report_tests {
             report.different_copies
         );
         assert_eq!(report.overlay_paths, vec![script]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod overlay_floor_tests {
+    use super::overlay_floor_message;
+    use std::path::Path;
+
+    #[test]
+    fn the_refusal_names_the_retry_a_caller_can_make() {
+        let message = overlay_floor_message(
+            Path::new("/home/u/.cache/kwin-mcp/kwin-mcp-1"),
+            2 << 30,
+            607 << 20,
+        );
+        assert!(message.contains("needs 2.00 GiB free"), "{message}");
+        assert!(message.contains("0.59 GiB free"), "{message}");
+        assert!(message.contains("disk_min_free_mib=303"), "{message}");
+        assert!(overlay_floor_message(Path::new("/x"), 2 << 30, 0).contains("disk_min_free_mib=1"));
+    }
+}
+
+#[cfg(test)]
+mod browser_alias_tests {
+    use super::create_browser_wrappers;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_browser_installed_under_its_other_name_still_launches() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!("kwin-mcp-alias-{}", std::process::id()));
+        let stubs = root.join("stubs");
+        std::fs::create_dir_all(&stubs)?;
+        let stub = stubs.join("google-chrome-stable");
+        std::fs::write(&stub, "#!/bin/sh\necho stub-ran\n")?;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+        let bin = create_browser_wrappers(&root)?;
+        // Only google-chrome-stable exists; the caller typed google-chrome.
+        let run = |name: &str| {
+            std::process::Command::new(bin.join(name))
+                .env("PATH", format!("{}:{}:/usr/bin:/bin", bin.display(), stubs.display()))
+                .env_remove("KWIN_MCP_CDP_PORT")
+                .output()
+        };
+        let aliased = run("google-chrome")?;
+        let missing = run("brave")?;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(String::from_utf8_lossy(&aliased.stdout).trim(), "stub-ran");
+        assert_eq!(missing.status.code(), Some(127));
         Ok(())
     }
 }
