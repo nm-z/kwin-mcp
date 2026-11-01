@@ -1909,6 +1909,8 @@ const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
 // lifecycle gates keep. Hung host calls still end the call, just later.
 const SESSION_START_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_START_MAX_SECONDS: u64 = 300;
+// How often a start that is still running records its sandbox's process tree.
+const STARTUP_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 
 // Session overlay layers and the FUSE bridge image live on disk under
 // ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
@@ -3482,9 +3484,63 @@ impl Eis {
     }
 }
 
+/// `comm`, state and parent pid from the text of /proc/<pid>/stat. The name sits
+/// in parentheses and may itself contain spaces and parentheses, so the last
+/// closing one ends it.
+fn parse_proc_stat(text: &str) -> Option<(String, char, u32)> {
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    let comm = text.get(open + 1..close)?.to_owned();
+    let mut rest = text.get(close + 1..)?.split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let parent = rest.next()?.parse().ok()?;
+    Some((comm, state, parent))
+}
+
+/// The processes below `root`, which is where a startup that stays silent is
+/// stuck: each one's name, pid, parent, state and wait channel. Never a command
+/// line or environment, and only descendants of this session's own sandbox.
+fn sandbox_process_tree(root: u32) -> String {
+    const MAX_PROCESSES: usize = 24;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return String::new();
+    };
+    let mut children: std::collections::BTreeMap<u32, Vec<(u32, String, char)>> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some((comm, state, parent)) = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|text| parse_proc_stat(&text))
+        {
+            children.entry(parent).or_default().push((pid, comm, state));
+        }
+    }
+    let mut listed = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(parent) = queue.pop_front() {
+        for (pid, comm, state) in children.get(&parent).into_iter().flatten() {
+            if listed.len() >= MAX_PROCESSES {
+                listed.push("…".to_owned());
+                return listed.join("; ");
+            }
+            let wait_channel = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+                .map(|text| text.trim().chars().take(48).collect::<String>())
+                .unwrap_or_else(|_| "?".to_owned());
+            listed.push(format!("{comm}[{pid}<-{parent} {state} {wait_channel}]"));
+            queue.push_back(*pid);
+        }
+    }
+    listed.join("; ")
+}
+
 /// Preserve the owned startup process's state before cleanup destroys the
 /// evidence. Only bounded state and wait-channel fields are read, never its
-/// command line, environment, or another session's process inventory.
+/// command line, environment, or another session's process inventory; the
+/// sandbox's own descendants are listed by name, state and wait channel.
 fn startup_sandbox_process_diagnostic(pid: u32) -> String {
     use std::io::Read;
     let root = PathBuf::from(format!("/proc/{pid}"));
@@ -3509,7 +3565,13 @@ fn startup_sandbox_process_diagnostic(pid: u32) -> String {
     let wait_channel = read("wchan")
         .map(|text| text.trim().chars().take(128).collect::<String>())
         .unwrap_or_else(|error| format!("unavailable ({error})"));
-    format!("startup sandbox process pid={pid} state={state} wait_channel={wait_channel}")
+    let tree = sandbox_process_tree(pid);
+    let tree = if tree.is_empty() {
+        "; no sandbox child processes".to_owned()
+    } else {
+        format!("; sandbox processes: {tree}")
+    };
+    format!("startup sandbox process pid={pid} state={state} wait_channel={wait_channel}{tree}")
 }
 
 /// Wait for `path` to appear inside the starting sandbox. `producer_exit` is
@@ -6430,6 +6492,11 @@ struct KwinMcp {
     /// Last startup checkpoint reached, named in the hard-limit error, with
     /// the moment it was reached so a blocked call's age can be reported.
     start_stage: Arc<std::sync::Mutex<StartStage>>,
+    /// Pid of the starting sandbox once it is spawned, and the last snapshot of
+    /// its process tree: the hard limit drops the start, which kills the
+    /// sandbox, so the evidence of a stall must be taken before that.
+    startup_sandbox_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    startup_snapshot: Arc<std::sync::Mutex<Option<String>>>,
     startup_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Workdir of a timed-out start whose blocked host call still owns the
     /// lifecycle gate. Set when that cleanup is deferred and cleared just
@@ -6775,6 +6842,8 @@ impl KwinMcp {
                 label: "waiting for the lifecycle gate".to_owned(),
                 since: std::time::Instant::now(),
             })),
+            startup_sandbox_pid: Arc::new(std::sync::Mutex::new(None)),
+            startup_snapshot: Arc::new(std::sync::Mutex::new(None)),
             startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             pending_cleanup: Arc::new(std::sync::Mutex::new(None)),
             display,
@@ -12217,12 +12286,42 @@ impl KwinMcp {
             .map_err(|_| McpError::internal_error("startup deadline lock poisoned", None))? =
             Some(deadline.into_std());
         let host_work: HostWork = Arc::new(std::sync::Mutex::new(None));
-        let outcome = match tokio::time::timeout_at(
+        if let Ok(mut slot) = self.startup_sandbox_pid.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.startup_snapshot.lock() {
+            *slot = None;
+        }
+        // A normal start takes 1-2 s and never reaches the first tick. A slow one
+        // records what its sandbox is doing, for the error if it runs out of time.
+        let snapshots = {
+            let (pid, snapshot) = (
+                self.startup_sandbox_pid.clone(),
+                self.startup_snapshot.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(STARTUP_SNAPSHOT_INTERVAL).await;
+                    let Some(pid) = pid.lock().ok().and_then(|slot| *slot) else {
+                        continue;
+                    };
+                    if let Ok(text) =
+                        tokio::task::spawn_blocking(move || startup_sandbox_process_diagnostic(pid))
+                            .await
+                        && let Ok(mut slot) = snapshot.lock()
+                    {
+                        *slot = Some(text);
+                    }
+                }
+            })
+        };
+        let outcome = tokio::time::timeout_at(
             deadline,
             self.session_start_inner(peer, params, host_work.clone()),
         )
-        .await
-        {
+        .await;
+        snapshots.abort();
+        let outcome = match outcome {
             Ok(res) => res,
             Err(_) => {
                 let (stage, blocked_for) = self.start_stage_report();
@@ -12263,13 +12362,25 @@ impl KwinMcp {
                     attempt.finish(Some(&error.message));
                     return Err(error);
                 }
-                Err(hard_timeout_error(
+                let mut error = hard_timeout_error(
                     startup_timeout,
                     &stage,
                     blocked_for,
                     false,
                     &self.path,
-                ))
+                );
+                let snapshot = self
+                    .startup_snapshot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                if let Some(snapshot) = snapshot {
+                    error.message = format!("{}; last sandbox snapshot: {snapshot}", error.message).into();
+                    if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
+                        data.insert("sandbox_snapshot".to_owned(), serde_json::json!(snapshot));
+                    }
+                }
+                Err(error)
             }
         };
         let result = match outcome {
@@ -13129,6 +13240,11 @@ impl KwinMcp {
             return cleanup_err(format!("record sandbox owner: {error}"), &mut startup);
         }
         eprintln!("session_start: pasta spawned pid={sandbox_pid:?}");
+        if sandbox_pid != 0
+            && let Ok(mut slot) = self.startup_sandbox_pid.lock()
+        {
+            *slot = Some(sandbox_pid);
+        }
         if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
         }
@@ -19827,6 +19943,46 @@ mod host_wayland_scan_tests {
         std::fs::remove_dir_all(&runtime)?;
         assert_eq!(found.as_deref(), Some(std::ffi::OsStr::new("wayland-1")));
         assert_eq!(live_wayland_socket(&runtime), None);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sandbox_process_tree_tests {
+    use super::{parse_proc_stat, sandbox_process_tree};
+
+    #[test]
+    fn stat_names_with_spaces_and_parentheses_still_parse() {
+        assert_eq!(
+            parse_proc_stat("4242 (dbus-daemon) S 4000 4242 4242 0 -1 4194560"),
+            Some(("dbus-daemon".to_owned(), 'S', 4000))
+        );
+        assert_eq!(
+            parse_proc_stat("77 (Web Content (x)) D 70 77 77 0 -1 0"),
+            Some(("Web Content (x)".to_owned(), 'D', 70))
+        );
+        assert_eq!(parse_proc_stat("garbage"), None);
+    }
+
+    #[test]
+    fn a_stuck_startup_lists_the_processes_below_the_sandbox() -> std::io::Result<()> {
+        // sh waits on a sleeping child, like an entrypoint waiting on its dbus-daemon.
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()?;
+        let mut tree = String::new();
+        for _ in 0..100 {
+            tree = sandbox_process_tree(shell.id());
+            if tree.contains("sleep[") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(tree.contains("sleep["), "child missing from: {tree}");
+        assert!(tree.contains(&format!("<-{}", shell.id())), "parent missing from: {tree}");
+        assert!(!tree.contains("sh -c"), "a command line leaked: {tree}");
         Ok(())
     }
 }
