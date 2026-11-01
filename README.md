@@ -1151,7 +1151,8 @@ host disk or change a user quota.
 `find_ui_elements` accepts optional `role` and `visible_only` filters, `exact`
 (match the whole name or role), `limit` (1 to 200, default 50) and `compact`. `role:
 "button"` includes native push/toggle buttons but not a label that merely mentions
-a button. Structured `elements` carry backend, role, name, bounds, states and the
+a button. Structured `elements` carry backend, role, name, bounds, states, `value`
+(the text of an entry or spin button, cut at 200 characters, never a password) and the
 index of the element's `surface` (the application frame or page, listed once in
 `surfaces`). `matches` counts every match found and `more` says how many the limit
 left out. `window_id` appears only for a window other than `active_window_id`, and

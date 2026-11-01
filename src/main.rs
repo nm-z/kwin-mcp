@@ -10440,6 +10440,8 @@ struct AtspiNode {
     role: String,
     states: Vec<String>,
     bounds: (i32, i32, i32, i32),
+    /// What a text input holds (never a password), when it can be read.
+    value: Option<String>,
 }
 
 impl AtspiNode {
@@ -10508,6 +10510,20 @@ const ATSPI_CONTROL_ROLES: [&str; 12] = [
     "menu item",
 ];
 
+/// The text of an input, cut at the excerpt limit; None when it cannot be read.
+async fn read_input_value(acc: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Option<String> {
+    use atspi::proxy::proxy_ext::ProxyExt;
+    let text = acc.proxies().await.ok()?.text().await.ok()?;
+    let count = text.character_count().await.ok()?;
+    let shown = count.min(i32::try_from(FIELD_EXCERPT_MAX_CHARS).ok()?);
+    let value = text.get_text(0, shown).await.ok()?;
+    Some(if count > shown {
+        format!("{value}… ({count} characters)")
+    } else {
+        value
+    })
+}
+
 async fn atspi_node(
     acc: &atspi::proxy::accessible::AccessibleProxy<'_>,
 ) -> Result<AtspiNode, KwinError> {
@@ -10543,11 +10559,17 @@ async fn atspi_node(
             .unwrap_or_default(),
         Err(_) => (0, 0, 0, 0),
     };
+    let value = if matches!(role.as_str(), "entry" | "spin button") {
+        read_input_value(acc).await
+    } else {
+        None
+    };
     Ok(AtspiNode {
         name,
         role,
         states,
         bounds,
+        value,
     })
 }
 
@@ -11816,7 +11838,7 @@ fn find_ui_native_match(
         serde_json::json!({
         "x":window.x+relative_x,"y":window.y+relative_y,"w":w,"h":h})
     });
-    serde_json::json!({"backend":"atspi","role":node.role,"name":node.name,"states":node.states,
+    serde_json::json!({"backend":"atspi","role":node.role,"name":node.name,"states":node.states,"value":node.value,
         "bounds":bounds,"raw_atspi_bounds":{"x":x,"y":y,"w":w,"h":h},"mapped_screen_bounds":mapped,"window":window,
         "coordinate_space":if compatible {"active_window_pixels"} else {"atspi_screen_pixels"},
         "mouse_coordinates_usable":compatible,"window_association":if aligned {"unique_title_and_frame_size"} else if window.is_some() {"title_match_geometry_unverified"} else {"unverified"},
@@ -11851,7 +11873,7 @@ fn compact_find_elements(
             })
         });
         if compact {
-            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "bounds" | "mouse_coordinates_usable" | "backend"));
+            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "value" | "bounds" | "mouse_coordinates_usable" | "backend"));
         } else {
             // The window is named only when it is not the active one the result names once.
             if let Some(window) = fields.remove("window")
@@ -15385,7 +15407,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -15954,6 +15976,9 @@ impl KwinMcp {
                     "text_target_unavailable",
                 )
             };
+            // Say what accessibility did find, so a missed click, a label and a
+            // read-only input are told apart.
+            let message = format!("{message} Observed: {error}.");
             return Err(McpError::invalid_params(
                 message,
                 Some(serde_json::json!({
@@ -22422,6 +22447,7 @@ mod ui_match_context_tests {
             role: "push button".to_owned(),
             states: vec!["visible".to_owned(), "enabled".to_owned()],
             bounds,
+            value: None,
         }
     }
 
