@@ -3542,6 +3542,11 @@ fn sandbox_process_tree(root: u32) -> String {
 /// command line, environment, or another session's process inventory; the
 /// sandbox's own descendants are listed by name, state and wait channel.
 fn startup_sandbox_process_diagnostic(pid: u32) -> String {
+    sandbox_process_diagnostic("startup sandbox process", pid)
+}
+
+/// The same bounded facts for a sandbox that is already running, named by `label`.
+fn sandbox_process_diagnostic(label: &str, pid: u32) -> String {
     use std::io::Read;
     let root = PathBuf::from(format!("/proc/{pid}"));
     let read = |name: &str| -> std::io::Result<String> {
@@ -3571,7 +3576,7 @@ fn startup_sandbox_process_diagnostic(pid: u32) -> String {
     } else {
         format!("; sandbox processes: {tree}")
     };
-    format!("startup sandbox process pid={pid} state={state} wait_channel={wait_channel}{tree}")
+    format!("{label} pid={pid} state={state} wait_channel={wait_channel}{tree}")
 }
 
 /// Wait for `path` to appear inside the starting sandbox. `producer_exit` is
@@ -6979,6 +6984,19 @@ impl KwinMcp {
             return result;
         };
         attach_memory_warning_to_result(result, warning, screenshot)
+    }
+    /// What this session's sandbox processes are doing, for a failure that does
+    /// not say where the compositor is: a stopped or blocked kwin_wayland shows
+    /// here. None when the session is not running or its lock does not answer.
+    async fn running_sandbox_snapshot(&self) -> Option<String> {
+        let pid = tokio::time::timeout(Duration::from_secs(1), self.session.read())
+            .await
+            .ok()?
+            .as_ref()
+            .map(|session| session.sandbox_child.id())?;
+        tokio::task::spawn_blocking(move || sandbox_process_diagnostic("sandbox process", pid))
+            .await
+            .ok()
     }
     async fn kwin_conn(&self) -> Result<zbus::Connection, McpError> {
         let guard = self.session.read().await;
@@ -17366,6 +17384,19 @@ impl tower::Service<SessionCall> for KwinMcp {
                     .map_or(true, |result| result.is_error == Some(true));
                 if failed && let Some(snapshot) = session.session_memory_snapshot().await {
                     result = attach_memory_snapshot_to_failure(result, snapshot);
+                }
+                // A frame that never arrives does not say why. Whether kwin_wayland is
+                // running, stopped or blocked does, so a screenshot stall carries it.
+                if screenshot
+                    && let Err(error) = &mut result
+                    && (error.message.contains("frame unavailable")
+                        || screenshot_timeout_error(&error.message))
+                    && let Some(snapshot) = session.running_sandbox_snapshot().await
+                {
+                    error.message = format!("{}; {snapshot}", error.message).into();
+                    if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
+                        data.insert("sandbox_snapshot".to_owned(), serde_json::json!(snapshot));
+                    }
                 }
             }
             result
