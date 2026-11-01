@@ -1161,6 +1161,10 @@ pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    // The field's text before typing, and whether a selection (not just a caret)
+    // was there to be replaced.
+    before: String,
+    selection_replaced: bool,
     // The typed text alone, for editors whose descendants also hold text that
     // was there before typing, such as a mention chip.
     input: String,
@@ -1180,6 +1184,9 @@ pub struct TextDelivery {
     pub expected_field_characters: Option<usize>,
     pub observed_field_characters: Option<usize>,
     pub warning: Option<String>,
+    /// The field's text as last read, for the caller's result; not serialized.
+    #[serde(skip)]
+    pub observed_text: Option<String>,
 }
 
 /// Whether an accessibility frame name starts with a KWin window caption.
@@ -1242,6 +1249,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: Some(expected_count),
             observed_field_characters: observed_count,
+            observed_text: None,
             warning: Some(
                 "KWin acknowledged the keys, but multiple accessibility windows match the active window's title and bounds. AT-SPI may have read a stale focused field in another window; expected/observed counts may therefore describe that field, not the active one. Inspect the active field before retrying; typing again can duplicate text.".to_owned(),
             ),
@@ -1279,6 +1287,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: None,
             observed_field_characters: None,
+            observed_text: None,
             warning: Some(format!(
                 "{focus}, so the text did not go into a field. Click the field first (a disabled field cannot take focus), then type again."
             )),
@@ -1294,6 +1303,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: None,
             observed_field_characters: None,
+            observed_text: None,
             warning: Some(
                 "KWin acknowledged the key events, but the focused terminal's text cannot be read through AT-SPI, so it was not verified. Inspect the terminal output with a screenshot before sending or retrying; retyping can run the command again.".to_owned(),
             ),
@@ -1330,6 +1340,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: None,
             observed_field_characters: None,
+            observed_text: None,
             warning: Some(format!(
                 "KWin acknowledged all key events, but field text could not be verified: {reason}. Inspect the field before sending or retrying; retyping can duplicate text."
             )),
@@ -1353,6 +1364,7 @@ impl TextDelivery {
             compositor_acknowledged: true,
             expected_field_characters: Some(expected_count),
             observed_field_characters: observed_count,
+            observed_text: None,
             warning: Some(warning),
         }
     }
@@ -1712,6 +1724,8 @@ impl TextReceipt {
                             .chain(input.chars())
                             .chain(before.chars().skip(end))
                             .collect();
+                        let selection_replaced = start != end;
+                        let prior_text = before.clone();
                         // An emptied contenteditable can expose a synthetic newline
                         // which the application removes when typing starts. Keep
                         // the exact expectation, but distinguish this observable
@@ -1730,6 +1744,8 @@ impl TextReceipt {
                             bus: bus.clone(),
                             object,
                             expected,
+                            before: prior_text,
+                            selection_replaced,
                             input: normalize_accessible_text(input),
                             ambiguous_frame,
                             blank_line_replacement,
@@ -1757,6 +1773,16 @@ impl TextReceipt {
         anyhow::bail!("the active window exposes no focused editable text through accessibility");
     }
 
+    /// The field's text before typing, when there was any.
+    pub fn prior_text(&self) -> Option<&str> {
+        (!self.before.is_empty()).then_some(self.before.as_str())
+    }
+
+    /// Whether typing replaces a selection rather than inserting at the caret.
+    pub fn selection_replaces_text(&self) -> bool {
+        self.selection_replaced
+    }
+
     pub async fn confirm(self) -> TextDelivery {
         let expected_count = self.expected.chars().count();
         let placeholder_expected_count = self
@@ -1765,6 +1791,7 @@ impl TextReceipt {
             .map(|replacement| replacement.chars().count());
         let initial_descendant_snapshot_error = self.initial_descendant_snapshot_error.clone();
         let mut observed_count = None;
+        let mut observed_text: Option<String> = None;
         let mut has_embedded_object = false;
         let mut last_snapshot_error = None;
         let check = async {
@@ -1783,6 +1810,7 @@ impl TextReceipt {
                 let observed = text.get_text(0, -1).await?;
                 let normalized_observed = normalize_accessible_text(&observed);
                 observed_count = Some(observed.chars().count());
+                observed_text = Some(normalized_observed.clone());
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
                 }
@@ -1854,13 +1882,14 @@ impl TextReceipt {
         } else {
             TEXT_DELIVERY_TIMEOUT
         };
-        match tokio::time::timeout(timeout, check).await {
+        let mut delivery = match tokio::time::timeout(timeout, check).await {
             Ok(Ok(method @ "atspi_transformed_blank_line")) => TextDelivery {
                 status: "unverified",
                 method,
                 compositor_acknowledged: true,
                 expected_field_characters: Some(expected_count),
                 observed_field_characters: observed_count,
+                observed_text: None,
                 warning: Some(
                     "KWin acknowledged all keys and the complete field matches the requested text, but the application replaced its initial blank line. The blank line may have been an empty-editor placeholder; its preservation could not be verified. Inspect the field before sending or retrying; do not retype blindly.".to_owned(),
                 ),
@@ -1871,6 +1900,7 @@ impl TextReceipt {
                 compositor_acknowledged: true,
                 expected_field_characters: placeholder_expected_count,
                 observed_field_characters: observed_count,
+                observed_text: None,
                 warning: Some(
                     "KWin acknowledged all keys and the focused field contains exactly the submitted text. Its initial accessible text matched its placeholder or label, so AT-SPI could not distinguish a placeholder from an existing value that the application replaced. The count excludes that ambiguous initial text. Inspect the field before sending; do not retype blindly.".to_owned(),
                 ),
@@ -1881,6 +1911,7 @@ impl TextReceipt {
                 compositor_acknowledged: true,
                 expected_field_characters: Some(expected_count),
                 observed_field_characters: observed_count,
+                observed_text: None,
                 warning: None,
             },
             Ok(Err(error)) => TextDelivery::unavailable(error.to_string()),
@@ -1893,6 +1924,7 @@ impl TextReceipt {
                 compositor_acknowledged: true,
                 expected_field_characters: Some(expected_count),
                 observed_field_characters: observed_count,
+                observed_text: None,
                 warning: Some("KWin acknowledged all keys, but this browser-toolbar field returned an empty accessibility readback. Its application value could not be verified. Inspect the address bar before pressing Enter or retrying; do not retype blindly.".to_owned()),
             },
             Err(_) if has_embedded_object => {
@@ -1919,10 +1951,13 @@ impl TextReceipt {
                     compositor_acknowledged: true,
                     expected_field_characters: Some(expected_count),
                     observed_field_characters: observed_count,
+                    observed_text: None,
                     warning: Some(warning),
                 }
             }
-        }
+        };
+        delivery.observed_text = observed_text;
+        delivery
     }
 }
 

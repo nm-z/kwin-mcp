@@ -11136,6 +11136,10 @@ struct KeyboardTypeParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
     text: String,
+    /// Select the field's existing text first (ctrl+a) so the typed text replaces
+    /// it. Needs a focused editable field that accessibility can read; refused for
+    /// terminals, where ctrl+a is not select-all.
+    replace: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -15815,7 +15819,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Inspect both surfaces before retrying. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most (timings_ms reports it); raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (readable editable fields, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
     )]
     async fn keyboard_type(
         &self,
@@ -15884,7 +15888,7 @@ impl KwinMcp {
             ));
         }
         let chrome = chromium_resource_class(&snapshot.resource_class);
-        let receipt = input_bridge::TextReceipt::capture(
+        let mut receipt = input_bridge::TextReceipt::capture(
             &sess.atspi_bus_address,
             &active.title,
             [active.x, active.y, active.w, active.h],
@@ -15892,6 +15896,41 @@ impl KwinMcp {
             &params.text,
         )
         .await;
+        if params.replace.unwrap_or(false) {
+            // Select all only where the selection can be read back and ctrl+a means
+            // select-all: a readable editable field, never a terminal.
+            if let Err(error) = &receipt {
+                return Err(preflight_error(
+                    "replace_unavailable",
+                    format!("replace=true needs a focused editable field that accessibility can read, and {error}"),
+                ));
+            }
+            let (modifiers, key) = parse_combo("ctrl+a")?;
+            {
+                let mut sent = SentInput::new(&sess.eis);
+                for modifier in &modifiers {
+                    sent.key(*modifier, true, None).map_err(KwinError::from)?;
+                }
+                sent.key(key, true, None).map_err(KwinError::from)?;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                sent.key(key, false, None).map_err(KwinError::from)?;
+                for modifier in modifiers.iter().rev() {
+                    sent.key(*modifier, false, None).map_err(KwinError::from)?;
+                }
+            }
+            sess.eis.roundtrip().await.map_err(KwinError::from)?;
+            // Let the toolkit publish the selection, then read the field again so the
+            // expected text accounts for the selected range.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            receipt = input_bridge::TextReceipt::capture(
+                &sess.atspi_bus_address,
+                &active.title,
+                [active.x, active.y, active.w, active.h],
+                Some([active.cx, active.cy]),
+                &params.text,
+            )
+            .await;
+        }
         // A transient window of the browser (its GTK file chooser) is not web
         // content and exposes nothing to AT-SPI; it types unverified like any app.
         if !params.text.is_empty()
@@ -15951,6 +15990,14 @@ impl KwinMcp {
         check_typing_window(&window)
             .await
             .map_err(|error| preflight_error(error.reason(), error.to_string()))?;
+        let prior_text = receipt
+            .as_ref()
+            .ok()
+            .and_then(|receipt| receipt.prior_text().map(str::to_owned));
+        let selection_replaced = receipt
+            .as_ref()
+            .ok()
+            .is_some_and(input_bridge::TextReceipt::selection_replaces_text);
         let started = std::time::Instant::now();
         if let Err(error) = type_with_profile(
             &sess.eis,
@@ -15980,7 +16027,7 @@ impl KwinMcp {
         })?;
         let acknowledgment_elapsed_ms = acknowledgment_started.elapsed().as_millis();
         let verification_started = std::time::Instant::now();
-        let delivery = tokio::time::timeout(TYPING_VERIFICATION_TIMEOUT, async {
+        let mut delivery = tokio::time::timeout(TYPING_VERIFICATION_TIMEOUT, async {
             match receipt {
                 Ok(receipt) => receipt.confirm().await,
                 // A terminal or other inaccessible target can receive these key
@@ -16018,6 +16065,17 @@ impl KwinMcp {
             input_bridge::TextDelivery::verification_timed_out(TYPING_VERIFICATION_TIMEOUT)
         });
         let verification_elapsed_ms = verification_started.elapsed().as_millis();
+        // Typing inserts at the caret: text that was already in the field stays
+        // unless it was selected, so say what was there and what is there now.
+        let value_after = delivery.observed_text.take();
+        let overwrote_nothing = prior_text.is_some() && !selection_replaced && !keys.is_empty();
+        if overwrote_nothing && let Some(prior) = &prior_text {
+            let note = existing_text_warning(prior);
+            delivery.warning = Some(match delivery.warning.take() {
+                Some(warning) => format!("{warning} {note}"),
+                None => note,
+            });
+        }
         let verification_context = delivery.verification_context();
         let retry_safe = keys.is_empty() && delivery.status == "not_in_field";
         // Names where the keys went, so a caller can tell a terminal's other
@@ -16045,6 +16103,12 @@ impl KwinMcp {
                 },
                 "elapsed_ms": started.elapsed().as_millis(),
         });
+        if let Some(prior) = &prior_text {
+            typed["value_before"] = serde_json::json!(field_excerpt(prior));
+            if let Some(after) = &value_after {
+                typed["value_after"] = serde_json::json!(field_excerpt(after));
+            }
+        }
         compact_typing_result(&mut typed);
         let mut result = structured_result(
             &peer,
@@ -17975,8 +18039,31 @@ fn unverified_paste_delivery(
         compositor_acknowledged: true,
         expected_field_characters: None,
         observed_field_characters: None,
+        observed_text: None,
         warning: Some(warning.to_owned()),
     }
+}
+
+/// How much of a field's text a result quotes; longer text is cut with its length.
+const FIELD_EXCERPT_MAX_CHARS: usize = 200;
+
+fn field_excerpt(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= FIELD_EXCERPT_MAX_CHARS {
+        text.to_owned()
+    } else {
+        let head: String = text.chars().take(FIELD_EXCERPT_MAX_CHARS).collect();
+        format!("{head}… ({total} characters)")
+    }
+}
+
+/// The warning for text typed into a field that already held text: typing inserts
+/// at the caret, so the old text stays unless it was selected.
+fn existing_text_warning(prior: &str) -> String {
+    format!(
+        "The field already held {:?} and the text was inserted at the caret, not over it. Use replace=true to overwrite the field's text.",
+        field_excerpt(prior)
+    )
 }
 
 async fn finish_prepared_paste(preparation: PreparedPaste) -> input_bridge::TextDelivery {
@@ -21025,7 +21112,7 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        WindowSnapshot, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        WindowSnapshot, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
@@ -21333,6 +21420,17 @@ mod startup_report_tests {
         let kind = recent_viewer_input(&marker, written).map_err(std::io::Error::other)?.map(|(_, kind)| kind);
         assert_eq!(kind.as_deref(), Some("input"));
         std::fs::remove_dir_all(&directory)
+    }
+
+    #[test]
+    fn typed_over_existing_text_names_it_and_long_values_are_cut() {
+        assert_eq!(field_excerpt("10.5"), "10.5");
+        let long = "x".repeat(450);
+        let cut = field_excerpt(&long);
+        assert!(cut.starts_with(&"x".repeat(200)) && cut.ends_with("… (450 characters)"), "{cut}");
+        assert!(cut.chars().count() < 230);
+        let warning = existing_text_warning("1");
+        assert!(warning.contains("\"1\"") && warning.contains("replace=true"), "{warning}");
     }
 
     #[test]
