@@ -11109,6 +11109,53 @@ struct MouseClickParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct MouseClickElementParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// Name or role text to find, as for find_ui_elements.
+    query: String,
+    /// Semantic role filter; "button" includes native push/toggle buttons.
+    role: Option<String>,
+    /// Match the whole name or role instead of any part of it.
+    exact: Option<bool>,
+    /// Which match to click, counting only visible matches whose bounds are usable
+    /// for clicking, in the order find_ui_elements lists them. Default 0.
+    index: Option<usize>,
+    button: Option<String>,
+    double: Option<bool>,
+    triple: Option<bool>,
+    /// Search time budget in seconds, from 1 to 30; defaults to 5.
+    timeout_seconds: Option<u32>,
+}
+
+/// The center of the `index`-th element whose bounds can be clicked, as
+/// window-relative pixels, with how many such elements there were.
+fn clickable_center(
+    elements: &[serde_json::Value],
+    index: usize,
+) -> Result<(i32, i32, usize, serde_json::Value), String> {
+    let usable: Vec<&serde_json::Value> = elements
+        .iter()
+        .filter(|element| element["mouse_coordinates_usable"] == true && element["visible"] != false)
+        .collect();
+    let Some(element) = usable.get(index) else {
+        return Err(format!(
+            "{} of {} matches can be clicked (visible, with bounds in the active window's pixels); index {index} is out of range",
+            usable.len(),
+            elements.len()
+        ));
+    };
+    let bounds = &element["bounds"];
+    let number = |key: &str| bounds[key].as_f64().ok_or_else(|| format!("the match has no bounds.{key}"));
+    #[expect(clippy::as_conversions)]
+    let (x, y) = (
+        (number("x")? + number("w")? / 2.0).round() as i32,
+        (number("y")? + number("h")? / 2.0).round() as i32,
+    );
+    Ok((x, y, usable.len(), serde_json::json!({"role": element["role"], "name": element["name"]})))
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct MouseMoveParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
@@ -15645,6 +15692,69 @@ impl KwinMcp {
             &peer,
             format!("clicked ({x},{y}) x{count}"),
             serde_json::json!({"ok": true}),
+        )
+        .await)
+    }
+
+    #[rmcp::tool(
+        name = "mouse_click_element",
+        description = "Find an element by name/role as find_ui_elements does, at the moment of the click, and click the center of its bounds. Use it where the layout shifts between steps (an answer check that inserts a feedback block) so coordinates from an earlier look would miss. index picks which clickable match (visible, bounds in the active window's pixels) when several match; default 0. exact, role, button, double and triple work as in find_ui_elements and mouse_click. Reports which element was clicked and how many were clickable. Fails without clicking when nothing clickable matches."
+    )]
+    async fn mouse_click_element(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<MouseClickElementParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let found = self
+            .find_ui_elements(
+                peer.clone(),
+                Parameters(FindUiElementsParams {
+                    query: params.query.clone(),
+                    role: params.role.clone(),
+                    visible_only: Some(true),
+                    timeout_seconds: params.timeout_seconds,
+                    limit: Some(FIND_UI_MAX_MATCHES),
+                    compact: None,
+                    exact: params.exact,
+                }),
+            )
+            .await?;
+        let elements = found
+            .structured_content
+            .as_ref()
+            .and_then(|content| content["elements"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        let (x, y, clickable, clicked) = clickable_center(&elements, params.index.unwrap_or(0))
+            .map_err(|detail| {
+                McpError::invalid_params(
+                    format!(
+                        "Nothing was clicked: no element matching '{}' can be clicked: {detail}. Check the query with find_ui_elements.",
+                        params.query
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "no_clickable_element", "retry_safe": true,
+                        "matches": elements.len(),
+                    })),
+                )
+            })?;
+        self.mouse_click(
+            peer.clone(),
+            Parameters(MouseClickParams {
+                speed: params.speed,
+                target_width: None,
+                x,
+                y,
+                button: params.button,
+                double: params.double,
+                triple: params.triple,
+            }),
+        )
+        .await?;
+        Ok(structured_result(
+            &peer,
+            format!("clicked {clicked} at ({x},{y})"),
+            serde_json::json!({"clicked": clicked, "at": [x, y], "clickable": clickable}),
         )
         .await)
     }
@@ -21137,7 +21247,7 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        WindowSnapshot, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        WindowSnapshot, clickable_center, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
@@ -21456,6 +21566,28 @@ mod startup_report_tests {
         assert!(cut.chars().count() < 230);
         let warning = existing_text_warning("1");
         assert!(warning.contains("\"1\"") && warning.contains("replace=true"), "{warning}");
+    }
+
+    #[test]
+    fn a_click_targets_the_center_of_the_nth_clickable_match() {
+        let element = |name: &str, x: f64, usable: bool, visible: bool| {
+            serde_json::json!({"role":"push button","name":name,"mouse_coordinates_usable":usable,
+                "visible":visible,"bounds":{"x":x,"y":100.0,"w":80,"h":24}})
+        };
+        let elements = vec![
+            element("hidden", 0.0, true, false),
+            element("css pixels", 10.0, false, true),
+            element("first", 100.0, true, true),
+            element("second", 300.0, true, true),
+        ];
+        let (x, y, clickable, clicked) = clickable_center(&elements, 0).expect("a clickable match");
+        assert_eq!((x, y, clickable), (140, 112, 2));
+        assert_eq!(clicked["name"], "first");
+        let (x, ..) = clickable_center(&elements, 1).expect("the second");
+        assert_eq!(x, 340);
+        let error = clickable_center(&elements, 2).expect_err("only two are clickable");
+        assert!(error.contains("2 of 4 matches"), "{error}");
+        assert!(clickable_center(&[], 0).is_err());
     }
 
     #[test]
