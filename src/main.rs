@@ -6196,6 +6196,10 @@ struct DisplayConfig {
     locked: bool,
     autoclean: bool,
     ttl: Option<Duration>,
+    /// After the MCP client closes, keep serving running sessions to other
+    /// kwin-mcp processes until they have been idle this long; None shuts them
+    /// down with the client.
+    keep_sessions: Option<Duration>,
     /// cgroup MemoryHigh for each session's sandbox in bytes; None disables throttling.
     memory_high: Option<u64>,
     memory_max: u64,
@@ -16603,6 +16607,8 @@ Options:\n\
   --no-viewer            Compatibility option; the viewer already starts on demand\n\
   --autoclean            Clean up orphaned session workdirs\n\
   --ttl MINUTES          Expire the session after MINUTES; implies --autoclean\n\
+  --keep-sessions MINUTES  After the MCP client closes, keep running sessions for other\n\
+                         kwin-mcp processes to forward to until MINUTES idle (default: stop them)\n\
   --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
   --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
   --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
@@ -16631,6 +16637,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
         locked: false,
         autoclean: false,
         ttl: None,
+        keep_sessions: None,
         memory_high: Some(DEFAULT_MEMORY_HIGH),
         memory_max: DEFAULT_MEMORY_MAX,
         memory_swap_max: DEFAULT_MEMORY_SWAP_MAX,
@@ -16644,6 +16651,9 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
             "--no-viewer" => {}
             "--autoclean" => cfg.autoclean = true,
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
+            "--keep-sessions" => {
+                cfg.keep_sessions = Some(parse_minutes_arg(&mut args, "--keep-sessions")?)
+            }
             "--memory-high" => {
                 cfg.memory_high = match parse_memory_arg(&mut args, "--memory-high")? {
                     0 => None,
@@ -16797,18 +16807,23 @@ fn sandbox_launcher(
 }
 
 fn parse_ttl_arg(args: &mut impl Iterator<Item = String>) -> Result<Duration, String> {
-    let value = args
-        .next()
-        .ok_or_else(|| "--ttl requires minutes".to_owned())?;
+    parse_minutes_arg(args, "--ttl")
+}
+
+fn parse_minutes_arg(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<Duration, String> {
+    let value = args.next().ok_or_else(|| format!("{flag} requires minutes"))?;
     let minutes: u64 = value
         .parse()
-        .map_err(|error| format!("--ttl '{value}': {error}"))?;
+        .map_err(|error| format!("{flag} '{value}': {error}"))?;
     if minutes == 0 {
-        return Err("--ttl must be positive".to_owned());
+        return Err(format!("{flag} must be positive"));
     }
     let seconds = minutes
         .checked_mul(60)
-        .ok_or_else(|| "--ttl is too large".to_owned())?;
+        .ok_or_else(|| format!("{flag} is too large"))?;
     Ok(Duration::from_secs(seconds))
 }
 
@@ -18103,6 +18118,30 @@ impl SessionRouter {
         )
         .await)
     }
+    /// Idle time of the least idle running session, or None when no session is
+    /// running. A session that died or expired does not count.
+    async fn least_idle_running_session(&self) -> Option<Duration> {
+        let mut least: Option<Duration> = None;
+        for service in self.entries().ok()?.into_values() {
+            let _ = service.check_liveness().await;
+            if !matches!(
+                service.registry_phase().await,
+                session_registry::Phase::Running
+            ) {
+                continue;
+            }
+            let idle = service
+                .session
+                .read()
+                .await
+                .as_ref()
+                .map(|session| session.last_activity.elapsed());
+            if let Some(idle) = idle {
+                least = Some(least.map_or(idle, |least| least.min(idle)));
+            }
+        }
+        least
+    }
     async fn shutdown(&self) {
         if let Ok(entries) = self.entries() {
             futures::future::join_all(
@@ -19395,6 +19434,7 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
             ""
         },
     );
+    let keep_sessions = display.keep_sessions;
     let router = SessionRouter::new(display);
     let shutdown = router.clone();
     let input = match restored {
@@ -19465,6 +19505,52 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         Some(Err(error)) => eprintln!("shutdown: the MCP service task failed: {error}"),
         None => {}
     }
+    // The client closing is how a host respawns this server. With --keep-sessions
+    // the running sessions outlive it, served through the control socket to
+    // whichever kwin-mcp the host starts next (session IDs name this process, and
+    // calls with them are forwarded here). A signal, or the launching client
+    // exiting, still ends everything at once.
+    if let Some(grace) = keep_sessions
+        && matches!(&waited, Some(Ok(rmcp::service::QuitReason::Closed)))
+        && session_control.is_some()
+        && let Some(idle) = shutdown.least_idle_running_session().await
+    {
+        reload.abort();
+        eprintln!(
+            "shutdown: keeping running sessions for forwarded requests until they have been idle {} minute(s) (idle now: {} s)",
+            grace.as_secs() / 60,
+            idle.as_secs()
+        );
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    match shutdown.least_idle_running_session().await {
+                        None => {
+                            eprintln!("shutdown: no running session remains");
+                            break;
+                        }
+                        Some(idle) if idle >= grace => {
+                            eprintln!("shutdown: sessions idle for {} s, past --keep-sessions", idle.as_secs());
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                },
+                _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
+                _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
+                _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
+                result = wire.client.readable() => {
+                    if let Err(error) = result { eprintln!("client lifetime watcher: {error}"); }
+                    eprintln!("shutdown: launching client exited; stopping owned session scopes");
+                    break;
+                },
+                request = process_commands.recv() => match request {
+                    Some(request) => request.execute(),
+                    None => break,
+                },
+            }
+        }
+    }
     if let Some(session_control) = session_control {
         session_control.abort();
         let _ = session_control.await;
@@ -19527,6 +19613,29 @@ mod file_content_tests {
                 &mut Cursor::new(contents),
             )?);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keep_sessions_flag_tests {
+    use super::parse_cli_args_from;
+    use std::time::Duration;
+
+    fn parse(args: &[&str]) -> Result<Option<Duration>, String> {
+        parse_cli_args_from(args.iter().map(|arg| (*arg).to_owned())).map(|cfg| cfg.keep_sessions)
+    }
+
+    #[test]
+    fn sessions_stop_with_the_client_unless_asked_to_stay() -> Result<(), String> {
+        assert_eq!(parse(&[])?, None);
+        assert_eq!(
+            parse(&["--keep-sessions", "30"])?,
+            Some(Duration::from_secs(30 * 60))
+        );
+        assert!(parse(&["--keep-sessions", "0"]).is_err());
+        assert!(parse(&["--keep-sessions"]).is_err());
+        assert!(parse(&["--keep-sessions", "soon"]).is_err());
         Ok(())
     }
 }
@@ -19708,6 +19817,7 @@ mod instructions_tests {
                 locked,
                 autoclean: false,
                 ttl: None,
+                keep_sessions: None,
                 memory_high: None,
                 memory_max: 0,
                 memory_swap_max: 0,
@@ -20012,6 +20122,7 @@ mod startup_report_tests {
             locked: false,
             autoclean: false,
             ttl: None,
+            keep_sessions: None,
             memory_high: None,
             memory_max: 0,
             memory_swap_max: 0,
