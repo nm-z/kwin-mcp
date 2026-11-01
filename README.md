@@ -306,7 +306,7 @@ startup. Other files and directory overlays keep their existing write behavior.
 `session_start` reports these fallback files in `oversized_read_only_files`.
 To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
-Explicit copies share `startup_timeout_seconds` (20 seconds by default); this option does not
+Explicit copies share `startup_timeout_seconds` (60 seconds by default); this option does not
 make existing read-only host mounts writable or change a running session.
 
 ### Live application state (Codex / ChatGPT desktop)
@@ -1068,7 +1068,7 @@ showing why the count alone cannot identify the missing characters.
 
 ### Startup budgets and fresh browser profiles
 
-`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 20).
+`session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 60).
 The budget includes waiting for the lifecycle gate and preparing host profiles;
 it does not disable bounded startup or cleanup. Increase it explicitly when a
 large profile set needs more preparation time.

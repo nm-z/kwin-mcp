@@ -1896,13 +1896,18 @@ const EIS_CALLBACK_VERSION: u32 = 1;
 use std::time::Duration;
 
 // Session startup: general session-bus / wayland socket wait.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+// Measured 6 s for KWin's own socket under moderate disk load, so 15 s left little headroom.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL: Duration = Duration::from_millis(50);
 // The session entrypoint writes kwin_wayland's exit status here when it exits.
 const KWIN_EXIT_FILE: &str = "kwin-exit";
 
 // Hard wall-clock limit for the entire session_start tool — abort if exceeded.
 const SESSION_START_HARD_TIMEOUT: Duration = Duration::from_secs(20);
+// The budget of one session_start call unless it passes startup_timeout_seconds. A start
+// under disk contention and a cold cache took 13 s here, close to the 20 s limit that
+// lifecycle gates keep. Hung host calls still end the call, just later.
+const SESSION_START_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_START_MAX_SECONDS: u64 = 300;
 
 // Session overlay layers and the FUSE bridge image live on disk under
@@ -4068,6 +4073,15 @@ const HOST_SQLITE_ROOT: &str = "/run/kwin-mcp-host-sqlite";
 /// Nested mounts require private copies of files in their ancestor directories.
 /// Avoid eager bulk copies unless the caller explicitly requests writability.
 const STAGING_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// All the files one session start may copy into its staging area. Each file may
+/// be under the cap above and still add up: thirty 60 MiB files in HOME made a
+/// 1.9 GiB copy per session, on disk and in start-up time. Files past the budget
+/// are bound read-only, as oversized ones are, and reported.
+const STAGING_COPY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+/// Files under this size are always copied: they are the configuration files an
+/// application in the session writes, and files are taken in name order, so
+/// large clutter sorted before one must not make it read-only.
+const STAGING_BUDGET_EXEMPT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Entries of the host user runtime directory that a session must never reach:
 /// the host session D-Bus (and with it the Secret Service and KWallet),
@@ -4602,6 +4616,8 @@ struct SplitOverlayContext<'a> {
     writable_paths: &'a [PathBuf],
     host_write_paths: &'a [PathBuf],
     live_databases: &'a [PathBuf],
+    /// Bytes copied so far, against STAGING_COPY_BUDGET_BYTES.
+    copied_bytes: std::cell::Cell<u64>,
 }
 
 fn clone_staging_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -4729,7 +4745,11 @@ fn prepare_split_overlay_directory(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                if size > STAGING_COPY_MAX_BYTES {
+                if size > STAGING_COPY_MAX_BYTES
+                    || (size >= STAGING_BUDGET_EXEMPT_BYTES
+                        && context.copied_bytes.get().saturating_add(size)
+                            > STAGING_COPY_BUDGET_BYTES)
+                {
                     match clone_staging_file(&source, &staged) {
                         Ok(()) => continue,
                         Err(error) => {
@@ -4740,7 +4760,7 @@ fn prepare_split_overlay_directory(
                             }
                             if !requested_writable {
                                 eprintln!(
-                                    "session_start: oversized ancestor file {} ({size} bytes) stays read-only; reflink unavailable: {error}",
+                                    "session_start: ancestor file {} ({size} bytes) is over the staging copy limit or budget and stays read-only; reflink unavailable: {error}",
                                     source.display()
                                 );
                                 oversized_read_only_files.push(source.clone());
@@ -4751,7 +4771,9 @@ fn prepare_split_overlay_directory(
                     }
                 }
                 match std::fs::copy(&source, &staged) {
-                    Ok(_) => {}
+                    Ok(copied) => context
+                        .copied_bytes
+                        .set(context.copied_bytes.get().saturating_add(copied)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error)
                         if error.kind() == std::io::ErrorKind::PermissionDenied
@@ -4825,6 +4847,7 @@ fn prepare_overlay_plan(
         writable_paths,
         host_write_paths,
         live_databases,
+        copied_bytes: std::cell::Cell::new(0),
     };
     let mut overlays = Vec::new();
     let mut read_only_binds = excluded_mounts;
@@ -11454,7 +11477,7 @@ struct SessionStartParams {
     /// Absolute HOME paths requiring private writable copies. Live SQLite
     /// databases in these paths use consistent private snapshots (database plus
     /// WAL must fit 64 MiB) instead of live read-only aliases. Oversized ancestor
-    /// files are also copied. Shares startup_timeout_seconds (default 20).
+    /// files are also copied. Shares startup_timeout_seconds (default 60).
     writable_paths: Option<Vec<PathBuf>>,
     /// Existing application state directories under HOME to share with the host.
     /// Writes persist on the host, including SQLite databases and WAL sidecars.
@@ -12148,7 +12171,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 20). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
@@ -12162,7 +12185,7 @@ impl KwinMcp {
         let startup_timeout = params
             .startup_timeout_seconds
             .map(Duration::from_secs)
-            .unwrap_or(SESSION_START_HARD_TIMEOUT);
+            .unwrap_or(SESSION_START_DEFAULT_TIMEOUT);
         if !(1..=SESSION_START_MAX_SECONDS).contains(&startup_timeout.as_secs()) {
             return Err(McpError::invalid_params(
                 "startup_timeout_seconds must be from 1 to 300",
@@ -13431,7 +13454,7 @@ impl KwinMcp {
         Ok(structured_result(&peer, msg, serde_json::json!({
             "status": "started",
             "browser_profiles": browser_profiles,
-            "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_HARD_TIMEOUT.as_secs()),
+            "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_DEFAULT_TIMEOUT.as_secs()),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
