@@ -5683,11 +5683,11 @@ fn session_can_explicitly_share_live_codex_state() {
             "{listed}"
         );
         if shared {
+            // An empty report is left out of the result.
             assert!(
                 !started["result"]["structuredContent"]["oversized_read_only_files"]
                     .as_array()
-                    .expect("oversized report")
-                    .contains(&json!(oversized)),
+                    .is_some_and(|files| files.contains(&json!(oversized))),
                 "shared state reported read-only: {started}"
             );
         }
@@ -6405,10 +6405,6 @@ fn launch_app_waits_for_a_delayed_window() {
         .as_str()
         .expect("window ID");
     assert!(window_id.starts_with('{'), "{launched}");
-    assert_eq!(
-        launched["result"]["structuredContent"]["window_timeout_seconds"], 30,
-        "{launched}"
-    );
     let windows = call_tool(&mut client, 4, "window_list", json!({}));
     assert!(
         windows["result"]["structuredContent"]["windows"]
@@ -8047,9 +8043,10 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
             "oversized file data allocated in staging"
         );
     }
+    // An empty report is left out of the result.
     let fallback = started["result"]["structuredContent"]["oversized_read_only_files"]
         .as_array()
-        .expect("fallback report");
+        .map_or(&[][..], Vec::as_slice);
     assert_eq!(fallback.contains(&json!(large)), !reflink, "{started}");
     assert!(
         !fallback.contains(&json!(ordinary)) && !fallback.contains(&json!(explicit)),
@@ -11048,9 +11045,11 @@ fn launch_app_reads_the_initial_empty_desktop_without_a_second_active_window_pro
     );
     assert!(launched["error"].is_null(), "{launched}");
     let payload = &launched["result"]["structuredContent"];
-    assert_eq!(payload["command_submitted"], true, "{launched}");
-    assert_eq!(payload["window_baseline"], "pre_launch", "{launched}");
-    assert_eq!(payload["window_baseline_errors"], json!([]), "{launched}");
+    // A found window reports how it was found; the usual baseline, the submitted
+    // command and the empty diagnostics are not repeated.
+    for omitted in ["command_submitted", "window_baseline", "window_baseline_errors", "command", "cdp", "warning"] {
+        assert!(payload.get(omitted).is_none(), "{omitted} in {launched}");
+    }
     assert_eq!(payload["window_outcome"], "new", "{launched}");
     assert_eq!(
         std::fs::read_to_string(workdir.join("first-launch-proof"))

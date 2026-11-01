@@ -4273,6 +4273,61 @@ impl Drop for SocketLinks {
         }
     }
 }
+/// Removes every listed key whose value says nothing: null, false, or an empty list.
+fn drop_empty_fields(payload: &mut serde_json::Value, keys: &[&str]) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for key in keys {
+        let empty = object.get(*key).is_some_and(|value| {
+            value.is_null()
+                || *value == serde_json::Value::Bool(false)
+                || value.as_array().is_some_and(Vec::is_empty)
+        });
+        if empty {
+            object.remove(*key);
+        }
+    }
+}
+
+/// A launch result for a window that was found carries the window and how it was
+/// found. What the caller supplied (the command) and defaults that need no action
+/// (no warning, no CDP, a normal baseline) are left out.
+fn compact_launch_result(payload: &mut serde_json::Value) {
+    if let Some(object) = payload.as_object_mut() {
+        for key in ["action", "command", "command_submitted", "window_timeout_seconds"] {
+            object.remove(key);
+        }
+        if object.get("window_baseline").is_some_and(|baseline| baseline == "pre_launch") {
+            object.remove("window_baseline");
+        }
+    }
+    drop_empty_fields(
+        payload,
+        &[
+            "cdp",
+            "cdp_port",
+            "warning",
+            "extension_warning",
+            "window_reused",
+            "window_observed_after_timeout",
+            "window_baseline_errors",
+        ],
+    );
+}
+
+/// The `session_start` result without its empty fields, and the SQLite access
+/// report in its short form.
+fn compact_session_result(payload: &mut serde_json::Value, sqlite_access: &SqliteAccessReport) {
+    drop_empty_fields(
+        payload,
+        &["runtime_root_fallback", "cookie_errors", "oversized_read_only_files", "host_write_paths"],
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.extend(sqlite_access.result_fields());
+    }
+}
+
 #[derive(Default, Serialize)]
 struct SqliteAccessReport {
     databases: Vec<serde_json::Value>,
@@ -4286,6 +4341,32 @@ impl SqliteAccessReport {
             self.databases
                 .push(serde_json::json!({"path": path, "mode": mode}));
         }
+    }
+
+    /// The report as result fields. A list of databases that are all live read-only
+    /// is one list of paths, `live_ro_dbs`, not a mode repeated per database;
+    /// any other mode, or a note, keeps the full `sqlite_access` report.
+    fn result_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        if self.total_databases == 0 {
+            return fields;
+        }
+        let all_live_read_only = self.databases.iter().all(|entry| {
+            entry["mode"] == "live_read_only" && entry.get("note").is_none()
+        });
+        if all_live_read_only {
+            let paths: Vec<_> = self.databases.iter().map(|entry| entry["path"].clone()).collect();
+            fields.insert("live_ro_dbs".to_owned(), serde_json::Value::Array(paths));
+            if self.total_databases > self.databases.len() {
+                fields.insert("live_ro_dbs_total".to_owned(), serde_json::json!(self.total_databases));
+            }
+        } else {
+            fields.insert(
+                "sqlite_access".to_owned(),
+                serde_json::json!({"databases": self.databases, "total_databases": self.total_databases}),
+            );
+        }
+        fields
     }
 
     /// A database whose requested access could not be given, with the reason.
@@ -13681,7 +13762,7 @@ impl KwinMcp {
             msg
         } else {
             format!(
-                "{msg}; SQLite access modes are listed in sqlite_access. live_read_only databases cannot support application writes; request writable_paths on a new session for private writable snapshots."
+                "{msg}; live_read_only databases (live_ro_dbs, or sqlite_access when other modes are present) cannot support application writes; request writable_paths on a new session for private writable snapshots."
             )
         };
         let msg = if oversized_read_only_files.is_empty() {
@@ -13749,7 +13830,7 @@ impl KwinMcp {
                 .is_none()
                 .then(|| wallet_snapshot.reason.clone()),
         });
-        Ok(structured_result(&peer, msg, serde_json::json!({
+        let mut started = serde_json::json!({
             "status": "started",
             "browser_profiles": browser_profiles,
             "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_DEFAULT_TIMEOUT.as_secs()),
@@ -13769,14 +13850,15 @@ impl KwinMcp {
             "viewer": viewer,
             "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
-            "sqlite_access": sqlite_access,
             "host_write_paths": host_write_paths,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
                 "reason": wallet_snapshot.reason,
             },
-        })).await)
+        });
+        compact_session_result(&mut started, &sqlite_access);
+        Ok(structured_result(&peer, msg, started).await)
     }
 
     #[rmcp::tool(
@@ -17000,7 +17082,7 @@ impl KwinMcp {
                 } else {
                     ("new", format!("window: {}", geo.id))
                 };
-                Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), serde_json::json!({
+                let mut launched = serde_json::json!({
                     "action": "launch", "command": params.command, "window": geo.id, "command_submitted": true,
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_observed_after_timeout": window_observed_after_timeout,
@@ -17009,7 +17091,9 @@ impl KwinMcp {
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
-                })).await)
+                });
+                compact_launch_result(&mut launched);
+                Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), launched).await)
             }
             (None, Some(status)) => {
                 let browser_unattributed = status == 0 && chromium_launch;
@@ -20741,8 +20825,8 @@ mod launch_warning_tests {
 #[cfg(test)]
 mod startup_report_tests {
     use super::{
-        DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT,
-        SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
+        DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
+        compact_launch_result, compact_session_result, SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
         screenshot_frame_timeout, screenshot_tool_timeout,
     };
@@ -20893,6 +20977,92 @@ mod startup_report_tests {
         // The tool limit always leaves room for a frame wait plus the window queries.
         assert!(SCREENSHOT_TOOL_TIMEOUT_PRESSURED > screenshot_frame_timeout_pressured());
         assert!(SCREENSHOT_TOOL_TIMEOUT > SCREENSHOT_FRAME_TIMEOUT);
+    }
+
+    #[test]
+    fn live_read_only_databases_are_one_list_of_paths() {
+        let mut report = SqliteAccessReport::default();
+        assert!(report.result_fields().is_empty());
+        for index in 0..3 {
+            report.record(Path::new(&format!("/home/u/.config/a/db{index}")), "live_read_only");
+        }
+        let fields = report.result_fields();
+        assert_eq!(
+            serde_json::Value::Object(fields),
+            serde_json::json!({"live_ro_dbs": ["/home/u/.config/a/db0", "/home/u/.config/a/db1", "/home/u/.config/a/db2"]})
+        );
+        // Past the list's limit the full count is still reported.
+        for index in 3..200 {
+            report.record(Path::new(&format!("/home/u/.config/a/db{index}")), "live_read_only");
+        }
+        let fields = report.result_fields();
+        assert_eq!(fields["live_ro_dbs"].as_array().map(Vec::len), Some(128));
+        assert_eq!(fields["live_ro_dbs_total"], 200);
+    }
+
+    #[test]
+    fn any_other_sqlite_mode_keeps_the_full_report() {
+        let mut report = SqliteAccessReport::default();
+        report.record(Path::new("/home/u/a.db"), "live_read_only");
+        report.record(Path::new("/home/u/b.db"), "private_writable_snapshot");
+        let fields = report.result_fields();
+        assert!(fields.get("live_ro_dbs").is_none());
+        assert_eq!(fields["sqlite_access"]["total_databases"], 2);
+        assert_eq!(fields["sqlite_access"]["databases"][1]["mode"], "private_writable_snapshot");
+        let mut noted = SqliteAccessReport::default();
+        noted.record_with_note(Path::new("/home/u/c.db"), "live_read_only", "snapshot failed".to_owned());
+        assert!(noted.result_fields().get("sqlite_access").is_some());
+    }
+
+    #[test]
+    fn a_found_window_launch_result_keeps_only_what_the_caller_can_use() {
+        let mut payload = serde_json::json!({
+            "action": "launch", "command": "google-chrome-stable https://example.test",
+            "command_submitted": true, "window": "{575c5e7e}", "window_outcome": "new",
+            "window_reused": false, "window_observed_after_timeout": false,
+            "window_title": "Untitled - Google Chrome", "cdp": false, "cdp_port": null,
+            "warning": null, "extension_warning": null, "window_timeout_seconds": 30,
+            "window_baseline": "pre_launch", "window_baseline_errors": [],
+        });
+        compact_launch_result(&mut payload);
+        assert_eq!(
+            payload,
+            serde_json::json!({"window": "{575c5e7e}", "window_outcome": "new", "window_title": "Untitled - Google Chrome"})
+        );
+        // A warning, a connected CDP port and a degraded baseline stay.
+        let mut notable = serde_json::json!({
+            "action": "launch", "command": "x", "command_submitted": true, "window": "{w}",
+            "window_outcome": "reused_existing", "window_reused": true, "cdp": true, "cdp_port": 9222,
+            "warning": "wallet unavailable", "extension_warning": null, "window_timeout_seconds": 30,
+            "window_baseline": "unavailable", "window_baseline_errors": [{"stage": "pre_launch"}],
+        });
+        compact_launch_result(&mut notable);
+        assert_eq!(notable["cdp_port"], 9222);
+        assert_eq!(notable["cdp"], true);
+        assert_eq!(notable["warning"], "wallet unavailable");
+        assert_eq!(notable["window_reused"], true);
+        assert_eq!(notable["window_baseline"], "unavailable");
+        assert_eq!(notable["window_baseline_errors"][0]["stage"], "pre_launch");
+        assert!(notable.get("command").is_none() && notable.get("extension_warning").is_none());
+    }
+
+    #[test]
+    fn a_session_start_result_leaves_out_empty_fields() {
+        let mut payload = serde_json::json!({
+            "status": "started", "runtime_root_fallback": null, "cookie_errors": [],
+            "oversized_read_only_files": [], "host_write_paths": [], "workdir": "/tmp/w",
+        });
+        let mut report = SqliteAccessReport::default();
+        report.record(Path::new("/home/u/a.db"), "live_read_only");
+        compact_session_result(&mut payload, &report);
+        assert_eq!(
+            payload,
+            serde_json::json!({"status": "started", "workdir": "/tmp/w", "live_ro_dbs": ["/home/u/a.db"]})
+        );
+        let mut kept = serde_json::json!({"cookie_errors": ["host cookie snapshot failed"], "host_write_paths": ["/home/u/.codex"]});
+        compact_session_result(&mut kept, &SqliteAccessReport::default());
+        assert_eq!(kept["cookie_errors"][0], "host cookie snapshot failed");
+        assert_eq!(kept["host_write_paths"][0], "/home/u/.codex");
     }
 
     #[test]
