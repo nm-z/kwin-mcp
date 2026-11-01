@@ -1651,10 +1651,33 @@ impl TextReceipt {
                         && !states.contains(atspi::State::Editable)
                         && node.get_role().await? != atspi::Role::Terminal
                     {
+                        let role = node.get_role().await?;
+                        let role_name = node.get_role_name().await.unwrap_or_default();
+                        let bounds = match node.proxies().await?.component().await {
+                            Ok(component) => component
+                                .get_extents(atspi::CoordType::Screen)
+                                .await
+                                .ok(),
+                            Err(_) => None,
+                        };
+                        // A text input without the Editable state is read-only or
+                        // disabled (a graded answer, a locked field), not a missed click.
+                        let input_like = matches!(
+                            role,
+                            atspi::Role::Entry | atspi::Role::SpinButton | atspi::Role::ComboBox
+                        );
                         focus = Some(format!(
-                            "{} \"{}\"",
-                            node.get_role_name().await.unwrap_or_default(),
-                            node.name().await.unwrap_or_default()
+                            "{} \"{}\"{}{}",
+                            role_name,
+                            node.name().await.unwrap_or_default(),
+                            bounds
+                                .map(|(x, y, w, h)| format!(" at screen ({x},{y} {w}x{h})"))
+                                .unwrap_or_default(),
+                            if input_like {
+                                " (a text input without the Editable state: read-only or disabled)"
+                            } else {
+                                ""
+                            }
                         ));
                     }
                     if states.contains(atspi::State::Focused)
