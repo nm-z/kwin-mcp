@@ -6591,6 +6591,9 @@ struct StartStage {
     finished: Vec<(String, std::time::Duration)>,
 }
 
+/// Most stages a start's time record keeps; the starts seen have under 20.
+const START_STAGE_TIMES_MAX: usize = 32;
+
 /// How long each startup checkpoint lasted, as `stage: 1.2s` pairs. The last
 /// entry is the checkpoint still running, so a stalled start names where the
 /// time went and not only where it stopped.
@@ -6940,7 +6943,9 @@ impl KwinMcp {
             let left = std::mem::replace(&mut current.coarse, stage.clone());
             let took = now.saturating_duration_since(current.coarse_since);
             current.coarse_since = now;
-            current.finished.push((left, took));
+            if current.finished.len() < START_STAGE_TIMES_MAX {
+                current.finished.push((left, took));
+            }
         }
         self.record_start_stage(stage);
     }
@@ -6990,11 +6995,20 @@ impl KwinMcp {
         self.set_start_stage(stage);
         Ok(())
     }
+    /// One file of the browser-profile step: it names the call for a stall and
+    /// honors the start budget, but it is not a stage of its own, so a profile
+    /// with thousands of files does not add thousands of entries to the stage times.
     fn profile_operation(&self, operation: &str, path: &Path) -> anyhow::Result<()> {
-        self.host_step(format!(
-            "preparing browser profiles: {operation} {}",
-            path.display()
-        ))
+        let stage = format!("preparing browser profiles: {operation} {}", path.display());
+        let elapsed = self
+            .startup_deadline
+            .lock()
+            .ok()
+            .and_then(|deadline| *deadline)
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        anyhow::ensure!(!elapsed, "startup deadline elapsed before {stage}");
+        self.record_start_stage(stage);
+        Ok(())
     }
     /// The workdir whose timed-out start still holds the lifecycle gate.
     fn pending_cleanup(&self) -> Option<PathBuf> {
@@ -13697,7 +13711,6 @@ impl KwinMcp {
             "status": "started",
             "browser_profiles": browser_profiles,
             "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_DEFAULT_TIMEOUT.as_secs()),
-            "stage_times": self.start_stage_times().map(|(_, json)| json),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
@@ -20802,6 +20815,33 @@ mod startup_report_tests {
             json.as_array().ok_or("stage times are not a list")?.len() <= 2,
             "{json}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn thousands_of_profile_files_do_not_grow_the_stage_times() -> Result<(), String> {
+        let service = server();
+        service.begin_start_stage_log();
+        service.set_start_stage("preparing browser profiles");
+        for file in 0..5000 {
+            service
+                .profile_operation("inspect cookie database", Path::new(&format!("/home/u/.config/p{file}/Cookies")))
+                .map_err(|error| error.to_string())?;
+        }
+        // The running checkpoint still names the file a stall is stuck on.
+        assert!(
+            service.start_stage_report().0.contains("/home/u/.config/p4999/Cookies"),
+            "{}",
+            service.start_stage_report().0
+        );
+        for stage in 0..200 {
+            service.set_start_stage(format!("stage {stage}"));
+        }
+        let (text, json) = service.start_stage_times().ok_or("no stage times")?;
+        let entries = json.as_array().ok_or("stage times are not a list")?.len();
+        assert!(entries <= super::START_STAGE_TIMES_MAX + 1, "{entries} entries");
+        assert!(text.len() < 4096, "{} bytes of stage text", text.len());
+        assert!(json.to_string().len() < 4096, "{} bytes of stage json", json.to_string().len());
         Ok(())
     }
 
