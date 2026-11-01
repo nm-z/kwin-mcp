@@ -11929,6 +11929,52 @@ fn find_ui_native_match(
 
 const FIND_UI_DEFAULT_LIMIT: usize = 50;
 
+/// How a query is compared with a (normalized) name or role.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindMatch {
+    Contains,
+    WholeWord,
+    Exact,
+}
+
+impl FindMatch {
+    fn from_params(exact: Option<bool>, whole_word: Option<bool>) -> Self {
+        if exact == Some(true) {
+            Self::Exact
+        } else if whole_word == Some(true) {
+            Self::WholeWord
+        } else {
+            Self::Contains
+        }
+    }
+
+    /// `text` and `query` are already normalized by `find_ui_search_text`.
+    fn matches(self, text: &str, query: &str) -> bool {
+        match self {
+            Self::Contains => text.contains(query),
+            Self::Exact => text == query,
+            Self::WholeWord => text.match_indices(query).any(|(start, found)| {
+                let before = text[..start].chars().next_back();
+                let after = text[start + found.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+            }),
+        }
+    }
+}
+
+/// Roles of plain text, which a matched element already carries in its own name.
+/// Anything else (every control, and any role not named here) is listed on its own:
+/// a button, link or field is something the caller may click, and a role this does
+/// not know must not be hidden.
+const TEXT_ONLY_ROLES: [&str; 9] = [
+    "static", "label", "paragraph", "heading", "section", "math", "caption", "image", "description value",
+];
+
+/// Whether a match that sits inside an already matched element is only a repeat of it.
+fn folds_into_ancestor(role: &str) -> bool {
+    TEXT_ONLY_ROLES.contains(&role)
+}
+
 /// The matches in the form a caller reads: each `surface` object is listed once and
 /// elements point at it, the KWin window is its id, and fields that restate a default
 /// or a constant (nulls, true visibility, the coordinate space, the hit-test note) are
@@ -12039,6 +12085,8 @@ struct FindUiElementsParams {
     /// Match the whole name or role (case-insensitive, whitespace collapsed)
     /// instead of any part of it.
     exact: Option<bool>,
+    /// Match the query only as whole words, so "Start" does not match "StartFraction".
+    whole_word: Option<bool>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -15486,7 +15534,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -15516,7 +15564,8 @@ impl KwinMcp {
         self.settle_input().await?;
         let query = find_ui_search_text(&params.query);
         let visible_only = params.visible_only.unwrap_or(false);
-        let mut elements = Vec::new();
+        let match_mode = FindMatch::from_params(params.exact, params.whole_word);
+        let mut elements: Vec<serde_json::Value> = Vec::new();
         let mut errors = Vec::new();
         let windows = match window_snapshots(
             &self.kwin_conn().await?,
@@ -15555,7 +15604,7 @@ impl KwinMcp {
                         if elements.len() >= FIND_UI_MAX_MATCHES { return Err("match limit reached".to_owned()); }
                         let name = element["name"].as_str().unwrap_or_default();
                         let role = element["role"].as_str().unwrap_or_default();
-                        if !(find_ui_search_text(name).contains(&query) || find_ui_search_text(role).contains(&query))
+                        if !(match_mode.matches(&find_ui_search_text(name), &query) || match_mode.matches(&find_ui_search_text(role), &query))
                             || !find_ui_role_matches(params.role.as_deref(), role)
                             || visible_only && element["visible"] != true { continue; }
                         let mut matched = element.clone();
@@ -15602,25 +15651,39 @@ impl KwinMcp {
                     let surface = serde_json::json!({"application":app_name,"frame_title":frame_node.name,
                         "frame_screen_bounds":frame_node.bounds,"bus":frame.inner().destination().to_string(),
                         "frame_path":frame.inner().path().to_string()});
-                    let mut stack = vec![frame_obj];
-                    while let Some(obj) = stack.pop() {
+                    // Each entry carries the index of the nearest matched ancestor, so a
+                    // match inside a matched element is counted there, not listed again.
+                    let mut stack = vec![(frame_obj, None::<usize>)];
+                    while let Some((obj, matched_ancestor)) = stack.pop() {
                         visited += 1;
                         if visited > FIND_UI_MAX_NODES || elements.len() >= FIND_UI_MAX_MATCHES {
                             return Err(McpError::internal_error("native search reached its node/match limit", None));
                         }
                         let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
                         let Ok(node) = atspi_node(&acc).await else { continue; };
+                        let mut descendant_of = matched_ancestor;
                         if node.is_useful()
-                            && (find_ui_search_text(&node.name).contains(&query) || find_ui_search_text(&node.role).contains(&query))
+                            && (match_mode.matches(&find_ui_search_text(&node.name), &query) || match_mode.matches(&find_ui_search_text(&node.role), &query))
                             && find_ui_role_matches(params.role.as_deref(), &node.role) {
-                            let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
-                            if !visible_only || matched["visible"] == true {
-                                matched["surface"] = surface.clone();
-                                matched["object_path"] = serde_json::json!(acc.inner().path().to_string());
-                                elements.push(matched);
+                            if let Some(ancestor) = matched_ancestor
+                                && folds_into_ancestor(&node.role)
+                            {
+                                let count = elements[ancestor]["children_matched"].as_u64().unwrap_or(0);
+                                elements[ancestor]["children_matched"] = serde_json::json!(count + 1);
+                            } else {
+                                let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
+                                if !visible_only || matched["visible"] == true {
+                                    matched["surface"] = surface.clone();
+                                    matched["object_path"] = serde_json::json!(acc.inner().path().to_string());
+                                    elements.push(matched);
+                                    descendant_of = Some(elements.len() - 1);
+                                }
                             }
                         }
-                        stack.extend(acc.get_children().await.unwrap_or_default().into_iter().rev());
+                        stack.extend(
+                            acc.get_children().await.unwrap_or_default().into_iter().rev()
+                                .map(|child| (child, descendant_of)),
+                        );
                     }
                 }
             }
@@ -15630,12 +15693,6 @@ impl KwinMcp {
             Ok(Ok(())) => {},
             Ok(Err(error)) => errors.push(format!("AT-SPI search incomplete: {error}")),
             Err(_) => errors.push(format!("AT-SPI search reached its {}-second limit; already collected matches are retained; pass timeout_seconds (up to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}) for a larger page", search_timeout.as_secs())),
-        }
-        if params.exact.unwrap_or(false) {
-            elements.retain(|element| {
-                find_ui_search_text(element["name"].as_str().unwrap_or_default()) == query
-                    || find_ui_search_text(element["role"].as_str().unwrap_or_default()) == query
-            });
         }
         let found = elements.len();
         let limit = params.limit.unwrap_or(FIND_UI_DEFAULT_LIMIT).clamp(1, FIND_UI_MAX_MATCHES);
@@ -15891,6 +15948,7 @@ impl KwinMcp {
                     limit: Some(FIND_UI_MAX_MATCHES),
                     compact: None,
                     exact: params.exact,
+                    whole_word: None,
                 }),
             )
             .await?;
@@ -21422,7 +21480,7 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        WindowSnapshot, clickable_center, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        FindMatch, WindowSnapshot, clickable_center, folds_into_ancestor, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
@@ -21781,6 +21839,36 @@ mod startup_report_tests {
         ));
         assert!(same_destination("example.test/a", "https://www.example.test/a/?x=1#top"));
         assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
+    }
+
+    #[test]
+    fn queries_match_by_part_whole_word_or_whole_name() {
+        let spoken = "upper r subscript parallel to baseline equals startfraction 1 over 2 endfraction";
+        assert!(FindMatch::Contains.matches(spoken, "start"));
+        // 'start' is only a piece of 'startfraction'.
+        assert!(!FindMatch::WholeWord.matches(spoken, "start"));
+        assert!(FindMatch::WholeWord.matches(spoken, "equals"));
+        assert!(FindMatch::WholeWord.matches("start", "start"));
+        assert!(FindMatch::WholeWord.matches("click start now", "start"));
+        assert!(FindMatch::WholeWord.matches("start, then stop", "start"));
+        assert!(!FindMatch::WholeWord.matches("restart", "start"));
+        assert!(FindMatch::WholeWord.matches("a startfraction start", "start"));
+        assert!(FindMatch::Exact.matches("start", "start"));
+        assert!(!FindMatch::Exact.matches("start now", "start"));
+        assert!(matches!(FindMatch::from_params(Some(true), Some(true)), FindMatch::Exact));
+        assert!(matches!(FindMatch::from_params(None, Some(true)), FindMatch::WholeWord));
+        assert!(matches!(FindMatch::from_params(Some(false), None), FindMatch::Contains));
+    }
+
+    #[test]
+    fn text_inside_a_matched_element_folds_but_controls_are_listed() {
+        for role in ["static", "paragraph", "section", "math", "heading", "image"] {
+            assert!(folds_into_ancestor(role), "{role}");
+        }
+        // Controls (Chrome names its buttons just "button") and unknown roles stay listed.
+        for role in ["button", "push button", "link", "entry", "check box", "menu item", "combo box", "page tab", "something new"] {
+            assert!(!folds_into_ancestor(role), "{role}");
+        }
     }
 
     #[test]
