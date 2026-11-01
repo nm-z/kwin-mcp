@@ -11544,6 +11544,9 @@ struct FindUiElementsParams {
     role: Option<String>,
     /// Keep only matches reported visible; visibility alone does not prove clickability.
     visible_only: Option<bool>,
+    /// Search time budget in seconds, from 1 to 30; defaults to 5. A large page
+    /// can need more than the default, and an unfinished search says so.
+    timeout_seconds: Option<u32>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -14990,6 +14993,24 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<FindUiElementsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let search_timeout = match params.timeout_seconds {
+            Some(seconds)
+                if (ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS
+                    ..=ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS)
+                    .contains(&seconds) =>
+            {
+                Duration::from_secs(u64::from(seconds))
+            }
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "timeout_seconds must be between {ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS} and {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}"
+                    ),
+                    None,
+                ));
+            }
+            None => ATSPI_TRAVERSAL_TIMEOUT,
+        };
         self.touch_activity().await;
         self.settle_input().await?;
         let query = find_ui_search_text(&params.query);
@@ -15020,7 +15041,7 @@ impl KwinMcp {
             .as_ref()
             .and_then(|s| s.cdp_browser.clone());
         if let Some(browser) = cdp_browser {
-            let cdp = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
+            let cdp = tokio::time::timeout(search_timeout, async {
                 let pages = browser.pages().await.map_err(|error| error.to_string())?;
                 for page in pages.iter().take(FIND_UI_MAX_PAGES) {
                     let url = page.url().await.ok().flatten().unwrap_or_default();
@@ -15053,18 +15074,18 @@ impl KwinMcp {
             match cdp {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => errors.push(format!("CDP search incomplete: {error}")),
-                Err(_) => errors.push("CDP search reached its five-second limit".to_owned()),
+                Err(_) => errors.push(format!("CDP search reached its {}-second limit", search_timeout.as_secs())),
             }
         }
 
         // Native accessibility also exposes browser chrome, which a page DOM cannot describe.
         // Keep frame provenance with every descendant instead of flattening all apps together.
-        let native = tokio::time::timeout(ATSPI_TRAVERSAL_TIMEOUT, async {
+        let native = tokio::time::timeout(search_timeout, async {
             use atspi::proxy::accessible::ObjectRefExt;
             let conn = self.with_session(|s| Ok(s.kwin_conn.clone())).await?;
             let address = atspi::proxy::bus::BusProxy::new(&conn).await.map_err(KwinError::from)?
                 .get_address().await.map_err(KwinError::from)?;
-            let bus = connect_session_bus(&address, std::time::Instant::now() + ATSPI_TRAVERSAL_TIMEOUT)
+            let bus = connect_session_bus(&address, std::time::Instant::now() + search_timeout)
                 .await.map_err(|error| McpError::internal_error(format!("AT-SPI bus: {error}"), None))?;
             let root = atspi::proxy::accessible::AccessibleProxy::builder(&bus)
                 .destination("org.a11y.atspi.Registry").map_err(KwinError::from)?
@@ -15107,7 +15128,7 @@ impl KwinMcp {
         match native {
             Ok(Ok(())) => {},
             Ok(Err(error)) => errors.push(format!("AT-SPI search incomplete: {error}")),
-            Err(_) => errors.push("AT-SPI search reached its five-second limit; already collected matches are retained".to_owned()),
+            Err(_) => errors.push(format!("AT-SPI search reached its {}-second limit; already collected matches are retained; pass timeout_seconds (up to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}) for a larger page", search_timeout.as_secs())),
         }
         let lines = elements.iter().map(|element| format!("{}\t{}\t{}\t{}\tvisible={} occluded={} mouse_coordinates_usable={}\tsurface={}",
             element["role"].as_str().unwrap_or_default(), tree_field(element["name"].as_str().unwrap_or_default()),
