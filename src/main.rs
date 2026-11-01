@@ -333,10 +333,11 @@ mod kwin_script {
         what: &str,
         call: impl std::future::Future<Output = zbus::Result<T>>,
     ) -> Result<T, KwinError> {
-        match tokio::time::timeout(SCRIPT_CALL_TIMEOUT, call).await {
+        let limit = super::scaled_for_pressure(SCRIPT_CALL_TIMEOUT);
+        match tokio::time::timeout(limit, call).await {
             Ok(result) => Ok(result?),
             Err(_) => Err(KwinError::Msg(format!(
-                "KWin did not answer {what} within {SCRIPT_CALL_TIMEOUT:?}; the compositor may be stopped or blocked"
+                "KWin did not answer {what} within {limit:?}; the compositor may be stopped or blocked"
             ))),
         }
     }
@@ -405,11 +406,12 @@ mod kwin_script {
             .to_string();
         // Held until this script is unloaded, including when a dropped caller
         // leaves the unload to the cleanup task.
-        let lock = tokio::time::timeout(SCRIPT_LOCK_TIMEOUT, script_lock(kwin_unique).lock_owned())
+        let lock_limit = super::scaled_for_pressure(SCRIPT_LOCK_TIMEOUT);
+        let lock = tokio::time::timeout(lock_limit, script_lock(kwin_unique).lock_owned())
             .await
             .map_err(|_| {
                 KwinError::Msg(format!(
-                    "KWin did not answer: an earlier query still held its script lock after {SCRIPT_LOCK_TIMEOUT:?}; the compositor may be stopped or blocked"
+                    "KWin did not answer: an earlier query still held its script lock after {lock_limit:?}; the compositor may be stopped or blocked"
                 ))
             })?;
         let mut cleanup = ScriptCleanup {
@@ -486,12 +488,13 @@ mod kwin_script {
                 .build()
                 .await?;
             answered_in_time("run", script_proxy.call::<_, (), ()>("run", &())).await?;
-            match tokio::time::timeout(SCRIPT_RESULT_TIMEOUT, rx).await {
+            let result_limit = super::scaled_for_pressure(SCRIPT_RESULT_TIMEOUT);
+            match tokio::time::timeout(result_limit, rx).await {
                 Ok(payload) => {
                     payload.map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()))
                 }
                 Err(_) => Err(KwinError::Msg(format!(
-                    "KWin script {} gave no result within {SCRIPT_RESULT_TIMEOUT:?}",
+                    "KWin script {} gave no result within {result_limit:?}",
                     cleanup.marker
                 ))),
             }
@@ -1974,6 +1977,47 @@ const KEY_FOCUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 const KEY_FOCUS_CHECK_NODES: usize = 5000;
 const SCREENSHOT_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const SCREENSHOT_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+/// A session whose memory is under pressure (PSI full above the warning level,
+/// or memory.high reached) is slow rather than stuck: its compositor's pages are
+/// being reclaimed or swapped. Waits on KWin last [`PRESSURE_WAIT_FACTOR`] times
+/// as long there, and the screenshot tool as a whole 50 s instead of 20 s.
+const SCREENSHOT_TOOL_TIMEOUT_PRESSURED: Duration = Duration::from_secs(50);
+
+tokio::task_local! {
+    /// Whether the tool call running in this task found its session's memory
+    /// under pressure when it began.
+    static SESSION_PRESSURED: bool;
+}
+
+fn session_pressured() -> bool {
+    SESSION_PRESSURED.try_with(|pressured| *pressured).unwrap_or(false)
+}
+
+/// How many times longer a wait on the compositor lasts in a pressured session.
+const PRESSURE_WAIT_FACTOR: u32 = 3;
+
+/// `base`, three times as long when this call's session is under memory pressure:
+/// KWin there answers slowly while its pages are reclaimed, and a bound sized for
+/// an idle host ends calls the compositor would still have answered.
+fn scaled_for_pressure(base: Duration) -> Duration {
+    if session_pressured() {
+        base * PRESSURE_WAIT_FACTOR
+    } else {
+        base
+    }
+}
+
+fn screenshot_frame_timeout() -> Duration {
+    scaled_for_pressure(SCREENSHOT_FRAME_TIMEOUT)
+}
+
+fn screenshot_tool_timeout(pressured: bool) -> Duration {
+    if pressured {
+        SCREENSHOT_TOOL_TIMEOUT_PRESSURED
+    } else {
+        SCREENSHOT_TOOL_TIMEOUT
+    }
+}
 // Percent of compared dialog pixels that may differ between the composited
 // screen and the window capture before a screenshot is rejected.
 const TRANSIENT_MISMATCH_PERCENT: u64 = 1;
@@ -8529,12 +8573,10 @@ async fn capture_frame(
     proxy: &KWinScreenShot2Proxy<'_>,
     include_cursor: bool,
 ) -> Result<Frame, McpError> {
-    tokio::time::timeout(
-        SCREENSHOT_FRAME_TIMEOUT,
-        capture_frame_inner(proxy, include_cursor),
-    )
-    .await
-    .map_err(|_| screenshot_timeout("capture_frame", SCREENSHOT_FRAME_TIMEOUT))?
+    let timeout = screenshot_frame_timeout();
+    tokio::time::timeout(timeout, capture_frame_inner(proxy, include_cursor))
+        .await
+        .map_err(|_| screenshot_timeout("capture_frame", timeout))?
 }
 
 /// The frame KWin writes into `frame`, once all `expected` bytes are there.
@@ -14367,12 +14409,10 @@ impl KwinMcp {
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        tokio::time::timeout(
-            SCREENSHOT_TOOL_TIMEOUT,
-            self.screenshot_result(peer, params),
-        )
-        .await
-        .map_err(|_| screenshot_timeout("screenshot", SCREENSHOT_TOOL_TIMEOUT))?
+        let timeout = screenshot_tool_timeout(session_pressured());
+        tokio::time::timeout(timeout, self.screenshot_result(peer, params))
+            .await
+            .map_err(|_| screenshot_timeout("screenshot", timeout))?
     }
 
     async fn screenshot_result(
@@ -14485,7 +14525,7 @@ impl KwinMcp {
             loop {
                 attempts += 1;
                 let reference = tokio::time::timeout(
-                    SCREENSHOT_FRAME_TIMEOUT,
+                    screenshot_frame_timeout(),
                     capture_source_inner(&proxy, Some(&win_geo.id), false),
                 )
                 .await
@@ -17508,18 +17548,26 @@ impl tower::Service<SessionCall> for KwinMcp {
             } else {
                 None
             };
-            let memory_before = if report_memory {
-                session.session_memory_snapshot().await
-            } else {
-                None
-            };
-            let mut result = call
-                .routes
-                .call(rmcp::handler::server::tool::ToolCallContext::new(
-                    &session,
-                    call.request,
-                    call.context,
-                ))
+            // Every call that waits on KWin reads this, so it is taken for all of them.
+            let current_memory = session.session_memory_snapshot().await;
+            let pressured = current_memory
+                .is_some_and(|snapshot| snapshot.full_pressure_high() || snapshot.high_reached());
+            if pressured {
+                eprintln!(
+                    "{operation}: session memory is under pressure; waits on KWin last {PRESSURE_WAIT_FACTOR} times as long"
+                );
+            }
+            let memory_before = if report_memory { current_memory } else { None };
+            let mut result = SESSION_PRESSURED
+                .scope(
+                    pressured,
+                    call.routes
+                        .call(rmcp::handler::server::tool::ToolCallContext::new(
+                            &session,
+                            call.request,
+                            call.context,
+                        )),
+                )
                 .await;
             if let Some(audit) = audit {
                 let outcome = if result
@@ -20693,7 +20741,10 @@ mod launch_warning_tests {
 #[cfg(test)]
 mod startup_report_tests {
     use super::{
-        DisplayConfig, KwinMcp, descriptor_targets, hard_timeout_error, lifecycle_busy_error,
+        DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT,
+        SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
+        descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
+        screenshot_frame_timeout, screenshot_tool_timeout,
     };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -20816,6 +20867,32 @@ mod startup_report_tests {
             "{json}"
         );
         Ok(())
+    }
+
+    fn screenshot_frame_timeout_pressured() -> Duration {
+        SCREENSHOT_FRAME_TIMEOUT * super::PRESSURE_WAIT_FACTOR
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_waits_longer_for_a_frame_when_session_memory_is_under_pressure() {
+        assert_eq!(screenshot_frame_timeout(), Duration::from_secs(10));
+        assert_eq!(screenshot_tool_timeout(false), Duration::from_secs(20));
+        assert_eq!(screenshot_tool_timeout(true), Duration::from_secs(50));
+        let pressured = SESSION_PRESSURED
+            .scope(true, async {
+                (screenshot_frame_timeout(), scaled_for_pressure(Duration::from_secs(10)))
+            })
+            .await;
+        let calm = SESSION_PRESSURED
+            .scope(false, async {
+                (screenshot_frame_timeout(), scaled_for_pressure(Duration::from_secs(10)))
+            })
+            .await;
+        assert_eq!(pressured, (Duration::from_secs(30), Duration::from_secs(30)));
+        assert_eq!(calm, (Duration::from_secs(10), Duration::from_secs(10)));
+        // The tool limit always leaves room for a frame wait plus the window queries.
+        assert!(SCREENSHOT_TOOL_TIMEOUT_PRESSURED > screenshot_frame_timeout_pressured());
+        assert!(SCREENSHOT_TOOL_TIMEOUT > SCREENSHOT_FRAME_TIMEOUT);
     }
 
     #[test]
