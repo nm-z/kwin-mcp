@@ -1987,7 +1987,10 @@ const SCROLL_VALUE120_PER_NOTCH: i32 = 120;
 
 // launch_app: window-appear polling.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
+// A browser's first window took longer than 15 s to map on loaded hosts, and appeared
+// just after the old default gave up. A command that never maps a window still ends
+// when it exits; one that keeps running without a window waits this long.
+const LAUNCH_WINDOW_TIMEOUT: Duration = Duration::from_secs(30);
 const LAUNCH_WINDOW_TIMEOUT_MAX_SECS: u64 = 120;
 // The most stdout an expect_window=false result quotes; the file has the rest.
 const LAUNCH_STDOUT_TAIL_BYTES: usize = 4096;
@@ -10979,7 +10982,7 @@ async fn wait_for_file_stability(
 #[derive(Deserialize, schemars::JsonSchema)]
 struct LaunchAppParams {
     command: String,
-    /// Seconds to wait for a new window. Defaults to 15; accepted range is 1–120.
+    /// Seconds to wait for a new window. Defaults to 30; accepted range is 1–120.
     window_timeout_seconds: Option<u64>,
     /// Set false for a command that backgrounds itself or never maps a window.
     /// Once its PID is recorded, the call waits up to one second for an exit
@@ -16250,7 +16253,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 15s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. command_resolution reports the leading command word's PATH executable, builtin, or absence. KWin reads are bounded; timeouts keep the session and report the stalled stage. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process; on timeout a late window is reported or a fresh window_snapshot attached. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 30s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. command_resolution reports the leading command word's PATH executable, builtin, or absence. KWin reads are bounded; timeouts keep the session and report the stalled stage. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process; on timeout a late window is reported or a fresh window_snapshot attached. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
