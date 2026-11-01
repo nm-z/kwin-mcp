@@ -220,7 +220,21 @@ fn apply_deleted(connection: &mut Connection, deleted: &DeletedCookies) -> Resul
 /// old host rows and stale concurrent sessions. A newer last_update_utc wins
 /// independently of session stop order; absence cannot date an unseen update.
 pub fn apply_deletions(database: &Path, saved: &Path) -> Result<()> {
+    apply_deletions_with(database, saved, true)
+}
+
+/// [`apply_deletions`] on a session's private copy. That copy is rebuilt from the
+/// host and the saved jar at every start, so it skips the fsync of each commit,
+/// which dominates a start on a busy disk.
+pub fn apply_deletions_scratch(database: &Path, saved: &Path) -> Result<()> {
+    apply_deletions_with(database, saved, false)
+}
+
+fn apply_deletions_with(database: &Path, saved: &Path, durable: bool) -> Result<()> {
     let mut database = Connection::open(database)?;
+    if !durable {
+        database.execute_batch("PRAGMA synchronous=OFF;")?;
+    }
     let deleted = read_deletions(saved, identity_columns(&database)?)?;
     apply_deleted(&mut database, &deleted)
 }
@@ -369,6 +383,17 @@ fn quote(name: &str) -> String {
 
 /// Copy through SQLite so committed WAL changes are included.
 pub fn snapshot(source: &Path, destination: &Path) -> Result<()> {
+    snapshot_with(source, destination, true)
+}
+
+/// [`snapshot`] into a private copy that is rebuilt at every start (the session's
+/// jar, the baseline it is compared with): no fsync, since losing it to a crash
+/// only means the next start copies again.
+pub fn snapshot_scratch(source: &Path, destination: &Path) -> Result<()> {
+    snapshot_with(source, destination, false)
+}
+
+fn snapshot_with(source: &Path, destination: &Path, durable: bool) -> Result<()> {
     anyhow::ensure!(
         std::fs::metadata(source)?.len() <= COOKIE_DATABASE_MAX_BYTES,
         "cookie database exceeds the 512 MiB snapshot limit"
@@ -379,6 +404,9 @@ pub fn snapshot(source: &Path, destination: &Path) -> Result<()> {
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     source.busy_timeout(Duration::ZERO)?;
     let mut copy = Connection::open(destination)?;
+    if !durable {
+        copy.execute_batch("PRAGMA synchronous=OFF;")?;
+    }
     std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
     let step = rusqlite::backup::Backup::new(&source, &mut copy)?.step(-1)?;
     anyhow::ensure!(
@@ -501,7 +529,7 @@ pub fn snapshot_host(source: &Path, destination: &Path) -> Result<()> {
                 if let Some(wal) = &first.1 {
                     std::fs::write(directory.join("Cookies-wal"), wal)?;
                 }
-                snapshot(&copy, &candidate)?;
+                snapshot_scratch(&copy, &candidate)?;
                 let database = Connection::open(&candidate)?;
                 let check: String =
                     database.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
@@ -531,12 +559,28 @@ pub fn snapshot_host(source: &Path, destination: &Path) -> Result<()> {
 /// Keep complete rows, including encrypted values and partition metadata.
 /// A schema mismatch preserves the destination rather than guessing a migration.
 pub fn merge(destination: &Path, source: &Path) -> Result<()> {
+    merge_with(destination, source, true)
+}
+
+/// [`merge`] into a session's private copy; see [`apply_deletions_scratch`].
+pub fn merge_scratch(destination: &Path, source: &Path) -> Result<()> {
+    merge_with(destination, source, false)
+}
+
+fn merge_with(destination: &Path, source: &Path, durable: bool) -> Result<()> {
     if !source.is_file() {
-        return prune_expired(&Connection::open(destination)?);
+        let connection = Connection::open(destination)?;
+        if !durable {
+            connection.execute_batch("PRAGMA synchronous=OFF;")?;
+        }
+        return prune_expired(&connection);
     }
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.busy_timeout(Duration::ZERO)?;
     let mut destination = Connection::open(destination)?;
+    if !durable {
+        destination.execute_batch("PRAGMA synchronous=OFF;")?;
+    }
     destination.busy_timeout(Duration::ZERO)?;
     let names = columns(&destination)?;
     anyhow::ensure!(names == columns(&source)?, "cookie schemas differ");

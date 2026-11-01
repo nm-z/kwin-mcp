@@ -5251,7 +5251,7 @@ fn prepare_browser_cookies(
                     service.profile_operation("snapshot host cookies", &database)?;
                     kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
                         service.profile_operation("merge saved cookies", &previous)?;
-                        if let Err(error) = kwin_mcp::browser_cookies::merge(&upper, &previous) {
+                        if let Err(error) = kwin_mcp::browser_cookies::merge_scratch(&upper, &previous) {
                             merge_failed = true;
                             let message = format!("{}: {error:#}", database.display());
                             eprintln!(
@@ -5264,7 +5264,7 @@ fn prepare_browser_cookies(
                     })
                 } else {
                     service.profile_operation("snapshot saved cookies", &previous)?;
-                    kwin_mcp::browser_cookies::snapshot(&previous, &upper)
+                    kwin_mcp::browser_cookies::snapshot_scratch(&previous, &upper)
                 };
                 if let Err(error) = result {
                     // Never expose a live lower-layer WAL after a failed copy.
@@ -5278,7 +5278,7 @@ fn prepare_browser_cookies(
                         eprintln!("session_start: {message}");
                         cookie_errors.push(message);
                         service.profile_operation("snapshot saved cookies", &previous)?;
-                        kwin_mcp::browser_cookies::snapshot(&previous, &upper)?;
+                        kwin_mcp::browser_cookies::snapshot_scratch(&previous, &upper)?;
                     } else {
                         return Err(
                             error.context(format!("snapshot cookies for {}", database.display()))
@@ -5295,7 +5295,7 @@ fn prepare_browser_cookies(
                 }
                 if !merge_failed {
                     service.profile_operation("apply cookie deletions", &previous)?;
-                    kwin_mcp::browser_cookies::apply_deletions(&upper, &previous)?;
+                    kwin_mcp::browser_cookies::apply_deletions_scratch(&upper, &previous)?;
                 }
                 let original = baseline.join(&profile).join(name);
                 std::fs::create_dir_all(
@@ -5304,7 +5304,7 @@ fn prepare_browser_cookies(
                         .ok_or_else(|| anyhow::anyhow!("cookie baseline has no parent"))?,
                 )?;
                 service.profile_operation("snapshot cookie baseline", &original)?;
-                kwin_mcp::browser_cookies::snapshot(&upper, &original)?;
+                kwin_mcp::browser_cookies::snapshot_scratch(&upper, &original)?;
             }
         }
         for overlay in &plan.overlays {
