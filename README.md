@@ -334,9 +334,16 @@ host thread. Each initial database plus WAL must fit the 64 MiB snapshot limit.
 An inconsistent, oversized or otherwise failed explicit snapshot fails startup
 with its preparation error; it does not silently substitute a read-only database.
 
-`session_start.sqlite_access` reports `private_writable_snapshot`,
-`live_read_only`, or `shared_host` for the live databases it discovers. The list
-contains at most 128 entries; `total_databases` reports the full count. If an
+`session_start` lists the live databases it discovers. When every one is
+`live_read_only` the result has one list of paths, `live_ro_dbs` (at most 128
+entries; `live_ro_dbs_total` appears when there are more). When any database has
+another mode (`private_writable_snapshot`, `shared_host`) or a note, the result
+has `sqlite_access` instead, with a `mode` per database and `total_databases`.
+Empty results (`cookie_errors`, `oversized_read_only_files`, `host_write_paths`,
+`runtime_root_fallback`) are left out. A `launch_app` result for a window it found
+carries the window, its title and how it was found (`window_outcome`); `cdp_port`,
+`warning`, `extension_warning` and the window-baseline fields appear only when they
+have something to report. If an
 application reports SQLite error 14 or cannot open its state, check this policy
 and the startup error before concluding that its host database is damaged.
 
