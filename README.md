@@ -613,9 +613,12 @@ submission; this tool never adds a Return key automatically.
 The receipt reports `clipboard_characters`, `shortcut_submitted`,
 `submission_complete`, and `compositor_acknowledged` separately. These establish
 the offered clipboard length and input submission. `application_text` is
-`unverified` and `form_submission` is `not_observed`: this tool does not read back
-the application value or confirm command execution. Check the field, terminal
-output, or a command-produced file before continuing. `retry_safe: false` means
+`verified` only when the focused field was read before and after the paste through
+accessibility and the pasted text appeared (`delivery.method` is `atspi_focused_text`
+or `atspi_rich_text`); otherwise it is `unverified` (terminals, and fields AT-SPI
+cannot read). `form_submission` is always `not_observed`: this tool does not confirm
+command execution. Check the field, terminal output, or a command-produced file
+before continuing. `retry_safe: false` means
 inspect before repeating a paste, since it can duplicate text or commands.
 
 Run the production-stdio regression with
