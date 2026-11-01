@@ -14087,7 +14087,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("wrote {length} characters to the {label} clipboard"),
-            serde_json::json!({"target":params.target,"length":length}),
+            serde_json::json!({"ok": true}),
         )
         .await)
     }
@@ -14201,7 +14201,7 @@ impl KwinMcp {
                 return Ok(structured_result(
                     &peer,
                     message,
-                    serde_json::json!({"status": "already_open", "viewer": viewer,"title":title}),
+                    serde_json::json!({"status": "already_open", "viewer": viewer}),
                 )
                 .await);
             }
@@ -14320,7 +14320,7 @@ impl KwinMcp {
         Ok(structured_result(
             &peer,
             format!("viewer {status}: {}", viewer_summary(&viewer)),
-            serde_json::json!({"status": status, "viewer": viewer,"title":title}),
+            serde_json::json!({"status": status, "viewer": viewer}),
         )
         .await)
     }
@@ -14498,18 +14498,13 @@ impl KwinMcp {
             Some(workdir) => format!("{subject}, workdir {workdir} removed"),
             None => subject,
         };
-        let lifecycle_record = previous_session_lifecycle(&self.session_id).ok().flatten();
-        Ok(structured_result(
-            &peer,
-            message,
-            serde_json::json!({
-                "status": status,
-                "workdir_removed": workdir_removed,
-                "cookie_errors": cookie_errors,
-                "session_lifecycle_record": lifecycle_record,
-            }),
-        )
-        .await)
+        let mut stopped = serde_json::json!({
+            "status": status,
+            "workdir_removed": workdir_removed,
+            "cookie_errors": cookie_errors,
+        });
+        drop_empty_fields(&mut stopped, &["workdir_removed", "cookie_errors"]);
+        Ok(structured_result(&peer, message, stopped).await)
     }
 
     #[rmcp::tool(
@@ -16446,7 +16441,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "import_file",
-        description = "Refresh a file inside an already-running session from a regular host file, without restarting the desktop. HOME is an overlay: session copies, deletions, and application caches can hide later host additions or edits; host updates are not a reliable live sync. host_path is an absolute host file path; session_path defaults to that same path and must name a file in an existing writable session directory. Existing session files (including private edits) are preserved unless overwrite=true. The copy is verified byte for byte before atomic replacement through the session filesystem; it never writes the overlay upper layer directly. Returns imported paths and bytes. Reload/reopen the note in its application afterward; application caches and unsaved buffers are not refreshed by this tool. Read-only mounts cannot be imported into. Outside explicitly shared host_write_paths, HOME imports remain private; importing into a shared directory writes to live host state."
+        description = "Refresh a file inside an already-running session from a regular host file, without restarting the desktop. HOME is an overlay: session copies, deletions, and application caches can hide later host additions or edits; host updates are not a reliable live sync. host_path is an absolute host file path; session_path defaults to that same path and must name a file in an existing writable session directory. Existing session files (including private edits) are preserved unless overwrite=true. The copy is verified byte for byte before atomic replacement through the session filesystem; it never writes the overlay upper layer directly. Returns the bytes copied, and session_path when it is not the one requested. Reload/reopen the note in its application afterward; application caches and unsaved buffers are not refreshed by this tool. Read-only mounts cannot be imported into. Outside explicitly shared host_write_paths, HOME imports remain private; importing into a shared directory writes to live host state."
     )]
     async fn import_file(
         &self,
@@ -16481,14 +16476,16 @@ impl KwinMcp {
             Ok((destination, bytes)) => Ok(structured_result(
                 &peer,
                 format!("imported {} -> {} ({bytes} bytes, verified); reload/reopen the file in its application", params.host_path, destination.display()),
-                serde_json::json!({
-                    "status": "imported",
-                    "host_path": params.host_path,
-                    "session_path": destination,
-                    "bytes": bytes,
-                    "verified": true,
-                    "application_reload_required": true,
-                }),
+                {
+                    // The destination is named only when it is not where the caller asked
+                    // (the session_path, or host_path when none was given).
+                    let requested = params.session_path.as_deref().unwrap_or(&params.host_path);
+                    let mut imported = serde_json::json!({"status": "imported", "bytes": bytes});
+                    if requested != destination.to_string_lossy() {
+                        imported["session_path"] = serde_json::json!(destination);
+                    }
+                    imported
+                },
             ).await),
             Err(reason) => Err(McpError::internal_error(
                 format!("import_file did not replace the session file: {reason}"),
@@ -16586,13 +16583,7 @@ impl KwinMcp {
                     "ready: {} ({size_bytes} bytes stable for {stable_for_ms} ms)",
                     params.session_path
                 ),
-                serde_json::json!({
-                    "status": "ready",
-                    "session_path": params.session_path,
-                    "size_bytes": size_bytes,
-                    "stable_for_ms": stable_for_ms,
-                    "timeout_seconds": timeout_seconds,
-                }),
+                serde_json::json!({"status": "ready", "size_bytes": size_bytes}),
             )
             .await)
         } else {
@@ -16702,13 +16693,18 @@ impl KwinMcp {
                 Ok(structured_result(
                     &peer,
                     text,
-                    serde_json::json!({
-                        "status": "exported",
-                        "session_path": params.session_path,
-                        "host_path": destination.display().to_string(),
-                        "bytes": bytes,
-                        "verified": true,
-                    }),
+                    {
+                        // The host path is named when it is not where the caller asked
+                        // (the host_path, or session_path when none was given): a directory
+                        // the file went into, for one.
+                        let resolved = destination.display().to_string();
+                        let requested = params.host_path.as_deref().unwrap_or(&params.session_path);
+                        let mut exported = serde_json::json!({"status": "exported", "bytes": bytes});
+                        if requested != resolved {
+                            exported["host_path"] = serde_json::json!(resolved);
+                        }
+                        exported
+                    },
                 )
                 .await)
             }
@@ -18793,8 +18789,6 @@ impl SessionRouter {
                         serde_json::json!({
                             "status": "already_cleared",
                             "session_status": status,
-                            "session_lifecycle_record": record,
-                            "cookie_errors": [],
                         }),
                     )
                     .await,
@@ -18925,29 +18919,30 @@ impl SessionRouter {
                 session_registry::Phase::Running => {
                     let guard = service.session.read().await;
                     if let Some(session) = guard.as_ref() {
-                        records.push(serde_json::json!({
-                            "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":session.scope.report(), "input_log":service.input_log.as_ref().map(|log| &log.path),
+                        let mut memory_limits = session.scope.report();
+                        // scope_unit names the unit once.
+                        remove_fields(&mut memory_limits, &["unit"]);
+                        let mut record = serde_json::json!({
+                            "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":memory_limits, "input_log":service.input_log.as_ref().map(|log| &log.path),
                             "workdir": session.host_xdg_dir, "host_shared_dir": session.host_xdg_dir, "width": session.screen_width,
                             "host_write_paths": session.host_write_paths,
                             "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
                             "memory": session.scope.memory_snapshot(session.sandbox_child.id()).map(SessionMemorySnapshot::as_json),
-                        }));
+                        });
+                        drop_empty_fields(&mut record, &["host_write_paths"]);
+                        records.push(record);
                     }
                 }
             }
         }
         Ok(structured_result(
             peer,
-            format!(
-                "{SESSION_OWNERSHIP_NOTICE}\nkwin-mcp process PID {}. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, expired, or start_blocked; a call with a saved ID reports its lifecycle record when available.\n{}",
-                std::process::id(),
-                serde_json::to_string(&records).map_err(KwinError::from)?
-            ),
+            // The ownership notice and what the list covers are in the tool description.
+            serde_json::to_string(&records).map_err(KwinError::from)?,
             serde_json::json!({
                 "sessions": records,
                 "server_pid": std::process::id(),
                 "scope": "current_process",
-                "ownership_notice": SESSION_OWNERSHIP_NOTICE,
             }),
         )
         .await)
@@ -19020,7 +19015,7 @@ impl SessionRouter {
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. {SESSION_OWNERSHIP_NOTICE}"),
+            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, expired, or start_blocked. {SESSION_OWNERSHIP_NOTICE}"),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -20458,7 +20453,13 @@ mod host_wayland_scan_tests {
 
     #[test]
     fn the_live_numbered_socket_wins_over_stale_and_unrelated_names() -> std::io::Result<()> {
-        let runtime = std::env::temp_dir().join(format!("kwin-mcp-wayland-scan-{}", std::process::id()));
+        // A directory of its own, so nothing left by another run can answer.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let runtime = std::env::temp_dir()
+            .join(format!("kwin-mcp-wayland-scan-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(&runtime)?;
         // A bound-then-dropped listener leaves a socket file nothing answers on.
         drop(UnixListener::bind(runtime.join("wayland-0"))?);

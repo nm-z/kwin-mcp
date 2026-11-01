@@ -4589,11 +4589,13 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "export_file",
         json!({"session_path": download}),
     );
+    // The default destination is the session path itself, so it is not repeated.
     assert_eq!(
-        default["result"]["structuredContent"]["host_path"],
-        json!(download.display().to_string()),
+        default["result"]["structuredContent"]["status"],
+        json!("exported"),
         "{default}"
     );
+    assert!(default["result"]["structuredContent"].get("host_path").is_none(), "{default}");
     assert!(download.exists());
 
     let note = call_tool(
@@ -4717,7 +4719,7 @@ fn import_file_refreshes_host_notes_without_restarting_the_session() {
         json!({"session_path":note,"host_path":baseline}),
     );
     assert_eq!(
-        exported["result"]["structuredContent"]["verified"], true,
+        exported["result"]["structuredContent"]["status"], "exported",
         "{exported}"
     );
     assert_eq!(std::fs::read(&baseline).expect("blank baseline"), b"");
@@ -4757,10 +4759,9 @@ fn import_file_refreshes_host_notes_without_restarting_the_session() {
         let imported = call("import_file", json!({"host_path":path,"overwrite":true}));
         let result = &imported["result"]["structuredContent"];
         assert_eq!(result["status"], "imported", "{imported}");
-        assert_eq!(result["session_path"], json!(path), "{imported}");
+        // The destination the caller chose is not repeated.
+        assert!(result.get("session_path").is_none(), "{imported}");
         assert_eq!(result["bytes"], contents.len(), "{imported}");
-        assert_eq!(result["verified"], true, "{imported}");
-        assert_eq!(result["application_reload_required"], true, "{imported}");
         // Read back through a separate MCP operation, not the import receipt.
         let actual = vault.join(format!("actual-{index}.md"));
         let exported = call(
@@ -4768,7 +4769,7 @@ fn import_file_refreshes_host_notes_without_restarting_the_session() {
             json!({"session_path":path,"host_path":actual}),
         );
         assert_eq!(
-            exported["result"]["structuredContent"]["verified"], true,
+            exported["result"]["structuredContent"]["status"], "exported",
             "{exported}"
         );
         assert_eq!(
@@ -4804,7 +4805,7 @@ fn import_file_refreshes_host_notes_without_restarting_the_session() {
         json!({"session_path":format!("/tmp/{}",host_sentinel.file_name().expect("sentinel name").to_string_lossy()),"host_path":linked_copy}),
     );
     assert_eq!(
-        exported["result"]["structuredContent"]["verified"], true,
+        exported["result"]["structuredContent"]["status"], "exported",
         "{exported}"
     );
     assert_eq!(
@@ -8892,12 +8893,8 @@ fn starts_cannot_adopt_listed_sessions_and_each_caller_gets_a_new_desktop() {
     assert!(launched["error"].is_null(), "{launched}");
     let listed = call_tool(&mut client, 5, "session_list", json!({}));
     let contents = &listed["result"]["structuredContent"];
-    assert!(
-        contents["ownership_notice"]
-            .as_str()
-            .expect("ownership notice")
-            .contains("your own session_start calls")
-    );
+    // The notice is in the tool description, not in every list.
+    assert!(contents.get("ownership_notice").is_none(), "{listed}");
     let foreign = contents["sessions"][0]["session_id"]
         .as_str()
         .expect("listed session");
@@ -8965,8 +8962,9 @@ fn starts_cannot_adopt_listed_sessions_and_each_caller_gets_a_new_desktop() {
             .iter()
             .all(|session| session.get("owner").is_none())
     );
+    // The ownership notice is in the tool description, not repeated in every list.
     assert!(
-        listed["result"]["content"]
+        !listed["result"]["content"]
             .to_string()
             .contains("other agents' sessions")
     );
