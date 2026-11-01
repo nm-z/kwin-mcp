@@ -3744,8 +3744,17 @@ fn user_namespace_guidance(stderr: &str, facts: &UserNamespaceFacts) -> Option<S
         .iter()
         .any(|refusal| stderr.contains(refusal))
         .then(|| {
+            // NoNewPrivs alone causes it: pasta runs the sandbox command with only the
+            // few capabilities pasta kept, and under NoNewPrivs exec cannot restore
+            // CAP_SETUID/CAP_SETFCAP, which bwrap needs to map ids. Reproduced with
+            // `setpriv --no-new-privs pasta --config-net -- bwrap --unshare-user ...`.
+            let no_new_privs = if facts.no_new_privs == "1" {
+                ". NoNewPrivs is set, which is enough on its own: it stops the command pasta runs from regaining the capabilities bwrap needs to map ids (`setpriv --no-new-privs pasta --config-net -- bwrap --unshare-user --ro-bind / / true` fails the same way), and a capability added to the sandbox does not change that. The process that launches kwin-mcp must not set NoNewPrivs: start the server as `systemd-run --user --quiet --wait --pipe --collect /path/to/kwin-mcp ...`, which runs it from the user manager instead of the sandbox (verified from inside a NoNewPrivs sandbox)"
+            } else {
+                ""
+            };
             format!(
-                "bwrap could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones. Start kwin-mcp outside that sandbox, or allow nested user namespaces for it, then call session_start again",
+                "bwrap could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones{no_new_privs}. Start kwin-mcp outside that sandbox, or allow nested user namespaces for it, then call session_start again",
                 facts.uid_map,
                 facts.max_user_namespaces,
                 facts.no_new_privs,
@@ -20520,9 +20529,16 @@ mod user_namespace_guidance_tests {
             "Seccomp: 2",
             "kernel.apparmor_restrict_unprivileged_userns: 1",
             "Start kwin-mcp outside that sandbox",
+            "NoNewPrivs is set, which is enough on its own",
+            "systemd-run --user --quiet --wait --pipe --collect",
         ] {
             assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
         }
+        let mut free = confined();
+        free.no_new_privs = "0".to_owned();
+        let without = user_namespace_guidance("bwrap: setting up uid map: Operation not permitted", &free)
+            .expect("guidance without NoNewPrivs");
+        assert!(!without.contains("NoNewPrivs is set"), "{without}");
     }
 
     #[test]
