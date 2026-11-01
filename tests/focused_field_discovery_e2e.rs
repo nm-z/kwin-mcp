@@ -130,7 +130,8 @@ fn find_ui_elements_reaches_a_button_after_thousands_of_nodes() {
     let _ = server.tool("session_stop", json!({"session_id":session}));
     let content = &found["result"]["structuredContent"];
     assert_eq!(content["matches"], 1, "the page's button was missed: {found}");
-    assert_eq!(content["incomplete"], false, "{found}");
+    // A complete search does not carry the flag.
+    assert!(content.get("incomplete").is_none(), "{found}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

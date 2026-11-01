@@ -1148,11 +1148,19 @@ host disk or change a user quota.
 
 ### Attributable element lookup
 
-`find_ui_elements` accepts optional `role` and `visible_only` filters. `role:
+`find_ui_elements` accepts optional `role` and `visible_only` filters, `exact`
+(match the whole name or role), `limit` (1 to 200, default 50) and `compact`. `role:
 "button"` includes native push/toggle buttons but not a label that merely mentions
-a button. Structured `elements` retain backend, role, name, states, application or
-page/frame identity, coordinate space, and the matched KWin window when known.
-The legacy `matches`, `query`, and `results` keys remain. Both accessibility
+a button. Structured `elements` carry backend, role, name, bounds, states and the
+index of the element's `surface` (the application frame or page, listed once in
+`surfaces`). `matches` counts every match found and `more` says how many the limit
+left out. `window_id` appears only for a window other than `active_window_id`, and
+`visible: false`, `enabled: false`, `occluded: true`, `incomplete` and `errors` only
+when they apply. `compact: true` returns role, name, bounds and
+`mouse_coordinates_usable` only. The `query`, `results`, `role`, `visible_only`,
+`server_pid`, `sampled_at_milliseconds` and `continuation` keys and the per-element
+`window`, `coordinate_space` and `raw_atspi_bounds` were removed: on a page with 200
+matches the result went from 377,870 to 14,587 bytes. Both accessibility
 backends can report the same physical control; these are attributed observations,
 not a count of unique physical widgets.
 

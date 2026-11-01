@@ -11743,6 +11743,100 @@ fn find_ui_native_match(
         "center_hit":serde_json::Value::Null,"occlusion_note":"Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay."})
 }
 
+const FIND_UI_DEFAULT_LIMIT: usize = 50;
+
+/// The matches in the form a caller reads: each `surface` object is listed once and
+/// elements point at it, the KWin window is its id, and fields that restate a default
+/// or a constant (nulls, true visibility, the coordinate space, the hit-test note) are
+/// left out. `compact` keeps role, name, bounds and click-usability only.
+fn compact_find_elements(
+    elements: Vec<serde_json::Value>,
+    compact: bool,
+    active_window: Option<&str>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut surfaces: Vec<serde_json::Value> = Vec::new();
+    let mut out = Vec::with_capacity(elements.len());
+    for element in elements {
+        let serde_json::Value::Object(mut fields) = element else {
+            out.push(element);
+            continue;
+        };
+        let surface = fields.remove("surface").filter(|surface| !surface.is_null()).map(|surface| {
+            surfaces.iter().position(|known| *known == surface).unwrap_or_else(|| {
+                surfaces.push(surface);
+                surfaces.len() - 1
+            })
+        });
+        if compact {
+            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "bounds" | "mouse_coordinates_usable" | "backend"));
+        } else {
+            // The window is named only when it is not the active one the result names once.
+            if let Some(window) = fields.remove("window")
+                && let Some(id) = window.get("id").filter(|id| !id.is_null() && id.as_str() != active_window)
+            {
+                fields.insert("window_id".to_owned(), id.clone());
+            }
+            if fields.get("mapped_screen_bounds") == fields.get("bounds") {
+                fields.remove("mapped_screen_bounds");
+            }
+            // States the visible/enabled flags already carry are not repeated.
+            if let Some(serde_json::Value::Array(states)) = fields.get_mut("states") {
+                states.retain(|state| !matches!(state.as_str(), Some("enabled" | "sensitive" | "showing" | "visible")));
+            }
+            for key in ["raw_atspi_bounds", "coordinate_space", "occlusion_note", "provider_visible", "center_hit", "object_path"] {
+                fields.remove(key);
+            }
+            for key in ["visible", "enabled"] {
+                if fields.get(key).is_some_and(|value| *value == serde_json::Value::Bool(true)) {
+                    fields.remove(key);
+                }
+            }
+            if fields.get("window_association").is_some_and(|value| value == "unique_title_and_frame_size") {
+                fields.remove("window_association");
+            }
+            fields.retain(|_, value| !value.is_null());
+        }
+        if let Some(index) = surface {
+            fields.insert("surface".to_owned(), serde_json::json!(index));
+        }
+        out.push(serde_json::Value::Object(fields));
+    }
+    (out, surfaces)
+}
+
+/// One line per element: role, name, bounds, a note for what is not the usual case,
+/// and the surface index. The surfaces are listed once above.
+fn find_elements_text(elements: &[serde_json::Value], surfaces: &[serde_json::Value]) -> String {
+    let mut lines: Vec<String> = surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| format!("surface {index}: {surface}"))
+        .collect();
+    for element in elements {
+        let mut line = format!(
+            "{}\t{}\t{}",
+            element["role"].as_str().unwrap_or_default(),
+            tree_field(element["name"].as_str().unwrap_or_default()),
+            element["bounds"],
+        );
+        if element["mouse_coordinates_usable"] == true {
+            line.push_str("\tclick-usable");
+        }
+        for (key, note) in [("visible", "hidden"), ("enabled", "disabled"), ("occluded", "occluded")] {
+            let flagged = if key == "occluded" { element[key] == true } else { element[key] == false };
+            if flagged {
+                line.push('\t');
+                line.push_str(note);
+            }
+        }
+        if let Some(index) = element["surface"].as_u64() {
+            line.push_str(&format!("\tsurface={index}"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindUiElementsParams {
     query: String,
@@ -11753,6 +11847,14 @@ struct FindUiElementsParams {
     /// Search time budget in seconds, from 1 to 30; defaults to 5. A large page
     /// can need more than the default, and an unfinished search says so.
     timeout_seconds: Option<u32>,
+    /// Most elements to return, 1 to 200; defaults to 50. `matches` counts every
+    /// match found and `more` says how many were left out.
+    limit: Option<usize>,
+    /// Return only role, name, bounds and whether the bounds are click-usable.
+    compact: Option<bool>,
+    /// Match the whole name or role (case-insensitive, whitespace collapsed)
+    /// instead of any part of it.
+    exact: Option<bool>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -15197,7 +15299,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Results identify their backend, application/page/frame, matched KWin window, visibility and coordinate space. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: CDP reports a center hit test, while native occlusion can remain unknown. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -15342,25 +15444,38 @@ impl KwinMcp {
             Ok(Err(error)) => errors.push(format!("AT-SPI search incomplete: {error}")),
             Err(_) => errors.push(format!("AT-SPI search reached its {}-second limit; already collected matches are retained; pass timeout_seconds (up to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}) for a larger page", search_timeout.as_secs())),
         }
-        let lines = elements.iter().map(|element| format!("{}\t{}\t{}\t{}\tvisible={} occluded={} mouse_coordinates_usable={}\tsurface={}",
-            element["role"].as_str().unwrap_or_default(), tree_field(element["name"].as_str().unwrap_or_default()),
-            element["bounds"], element["coordinate_space"].as_str().unwrap_or_default(), element["visible"],
-            element["occluded"], element["mouse_coordinates_usable"], element["surface"])).collect::<Vec<_>>();
-        let results = if lines.is_empty() {
+        if params.exact.unwrap_or(false) {
+            elements.retain(|element| {
+                find_ui_search_text(element["name"].as_str().unwrap_or_default()) == query
+                    || find_ui_search_text(element["role"].as_str().unwrap_or_default()) == query
+            });
+        }
+        let found = elements.len();
+        let limit = params.limit.unwrap_or(FIND_UI_DEFAULT_LIMIT).clamp(1, FIND_UI_MAX_MATCHES);
+        elements.truncate(limit);
+        let (elements, surfaces) =
+            compact_find_elements(elements, params.compact.unwrap_or(false), active_id.as_deref());
+        let mut text = if elements.is_empty() {
             format!("no observed elements matching '{}'", params.query)
         } else {
-            lines.join("\n")
+            find_elements_text(&elements, &surfaces)
         };
-        let sampled_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        Ok(structured_result(&peer, results.clone(), serde_json::json!({
-            "matches":elements.len(),"query":params.query,"role":params.role,"visible_only":visible_only,
-            "results":results,"elements":elements,"active_window_id":active_id,"server_pid":std::process::id(),
-            "sampled_at_milliseconds":sampled_at,"incomplete":!errors.is_empty(),"errors":errors,
-            "continuation":"Re-query after navigation, scroll or window changes. Only mouse_coordinates_usable bounds share mouse_click's active-window pixel frame; use screenshot for unknown or obscured matches."
-        })).await)
+        let mut data = serde_json::json!({"matches": found, "elements": elements});
+        if found > elements.len() {
+            data["more"] = serde_json::json!(found - elements.len());
+            text.push_str(&format!("\n{} more matches; raise limit or narrow the query", found - elements.len()));
+        }
+        if !surfaces.is_empty() {
+            data["surfaces"] = serde_json::json!(surfaces);
+        }
+        if let Some(active_id) = active_id {
+            data["active_window_id"] = serde_json::json!(active_id);
+        }
+        if !errors.is_empty() {
+            data["incomplete"] = serde_json::json!(true);
+            data["errors"] = serde_json::json!(errors);
+        }
+        Ok(structured_result(&peer, text, data).await)
     }
 
     #[rmcp::tool(
@@ -20826,7 +20941,8 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        compact_launch_result, compact_session_result, SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
+        compact_find_elements, compact_launch_result, compact_session_result, find_elements_text,
+        SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
         screenshot_frame_timeout, screenshot_tool_timeout,
     };
@@ -20977,6 +21093,67 @@ mod startup_report_tests {
         // The tool limit always leaves room for a frame wait plus the window queries.
         assert!(SCREENSHOT_TOOL_TIMEOUT_PRESSURED > screenshot_frame_timeout_pressured());
         assert!(SCREENSHOT_TOOL_TIMEOUT > SCREENSHOT_FRAME_TIMEOUT);
+    }
+
+    /// An element as `find_ui_native_match` builds it.
+    fn native_element(name: &str, index: u32) -> serde_json::Value {
+        serde_json::json!({"backend":"atspi","role":"push button","name":name,
+            "states":["enabled","sensitive","showing","visible","focusable"],
+            "bounds":{"x":10.0,"y":20.0 + f64::from(index),"w":80,"h":24},
+            "raw_atspi_bounds":{"x":10,"y":20,"w":80,"h":24},"mapped_screen_bounds":{"x":10.0,"y":20.0 + f64::from(index),"w":80,"h":24},
+            "window":{"active":true,"dialog":false,"h":1080.0,"hidden":false,"id":"{w}","minimized":false,
+                "modal":false,"pid":67,"popup":false,"resourceClass":"google-chrome","resourceName":"google-chrome",
+                "stackingOrder":0,"title":"zyBooks - Google Chrome","transient":false,"transientFor":null,"w":1920.0,"x":0.0,"y":0.0},
+            "coordinate_space":"active_window_pixels","mouse_coordinates_usable":true,
+            "window_association":"unique_title_and_frame_size","visible":true,"provider_visible":true,
+            "enabled":true,"occluded":null,"clickable":null,"center_hit":null,
+            "occlusion_note":"Native center hit test unavailable; visibility and KWin geometry do not exclude an in-app overlay.",
+            "surface":{"application":"google-chrome","frame_title":"zyBooks - Google Chrome",
+                "frame_screen_bounds":[0,0,1920,1080],"bus":":1.7","frame_path":"/org/a11y/atspi/accessible/2"},
+            "object_path":format!("/org/a11y/atspi/accessible/{index}")})
+    }
+
+    #[test]
+    fn found_elements_list_each_surface_once_and_drop_constants() {
+        let elements: Vec<_> = (0..12).map(|index| native_element(&format!("Start {index}"), index)).collect();
+        let before = serde_json::to_string(&elements).map(|text| text.len()).unwrap_or(0);
+        let (compacted, surfaces) = compact_find_elements(elements, false, Some("{other}"));
+        let after = serde_json::to_string(&compacted).map(|text| text.len()).unwrap_or(0)
+            + serde_json::to_string(&surfaces).map(|text| text.len()).unwrap_or(0);
+        assert_eq!(surfaces.len(), 1);
+        assert!(compacted.iter().all(|element| element["surface"] == 0));
+        for element in &compacted {
+            for gone in ["raw_atspi_bounds", "coordinate_space", "occlusion_note", "provider_visible", "center_hit", "window", "object_path", "visible", "enabled", "occluded", "clickable", "mapped_screen_bounds", "window_association"] {
+                assert!(element.get(gone).is_none(), "{gone} in {element}");
+            }
+            assert_eq!(element["window_id"], "{w}");
+            assert_eq!(element["mouse_coordinates_usable"], true);
+        }
+        assert!(after * 3 < before, "{before} bytes became {after}");
+        // Anything out of the usual case stays.
+        let mut hidden = native_element("Hidden", 1);
+        hidden["visible"] = serde_json::json!(false);
+        hidden["occluded"] = serde_json::json!(true);
+        hidden["window_association"] = serde_json::json!("unverified");
+        let (kept, _) = compact_find_elements(vec![hidden], false, Some("{w}"));
+        assert_eq!(kept[0]["visible"], false);
+        assert_eq!(kept[0]["occluded"], true);
+        assert_eq!(kept[0]["window_association"], "unverified");
+        // The active window is not repeated on each element; another window is named.
+        assert!(kept[0].get("window_id").is_none() && kept[0].get("mapped_screen_bounds").is_none());
+        assert_eq!(kept[0]["states"], serde_json::json!(["focusable"]));
+    }
+
+    #[test]
+    fn compact_found_elements_keep_role_name_and_bounds_only() {
+        let (compacted, surfaces) = compact_find_elements(vec![native_element("Start", 0)], true, None);
+        let element = compacted[0].as_object().map(|fields| fields.keys().cloned().collect::<Vec<_>>());
+        let mut keys = element.unwrap_or_default();
+        keys.sort();
+        assert_eq!(keys, ["backend", "bounds", "mouse_coordinates_usable", "name", "role", "surface"]);
+        let text = find_elements_text(&compacted, &surfaces);
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("surface 0: ") && text.contains("Start\t") && text.contains("click-usable") && text.contains("surface=0"), "{text}");
     }
 
     #[test]
