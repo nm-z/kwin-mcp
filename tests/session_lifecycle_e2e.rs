@@ -1710,7 +1710,8 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
         "screenshot",
         json!({"session_id":sid,"inline":true,"region":[150,200,900,700],"include_cursor":false}),
     );
-    assert_eq!(screenshot_meta(&before)["include_cursor"], true);
+    // The cursor is included unless asked otherwise, so only an omitted one is reported.
+    assert!(screenshot_meta(&before).get("include_cursor").is_none());
     assert_eq!(screenshot_meta(&hidden)["include_cursor"], false);
     assert_eq!(
         screenshot_meta(&before)["window"],
@@ -1864,7 +1865,8 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
         meta["window"]["x"].as_i64() > Some(0) && meta["window"]["y"].as_i64() > Some(0),
         "{meta}"
     );
-    assert_eq!(meta["region"], json!([0, 0, win_w, win_h]), "{meta}");
+    // The whole window is the default region and is not repeated.
+    assert!(meta.get("region").is_none(), "{meta}");
     assert_eq!(
         (meta["width"].as_i64(), meta["height"].as_i64()),
         (Some(win_w), Some(win_h)),
@@ -1899,18 +1901,14 @@ fn screenshot_pixels_are_mouse_coordinates_for_dialogs_crops_and_maximized_windo
         "find_ui_elements",
         json!({"query":"Relaunch"}),
     );
-    let listing = found["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let numbers: Vec<i64> = listing
-        .rsplit_once('(')
-        .map(|(_, rest)| rest.trim_end_matches([')', '\n']).replace('x', ","))
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|part| part.trim().parse().ok())
+    let bounds = &found["result"]["structuredContent"]["elements"][0]["bounds"];
+    #[expect(clippy::as_conversions)]
+    let numbers: Vec<i64> = ["x", "y", "w", "h"]
+        .iter()
+        .filter_map(|key| bounds[*key].as_f64())
+        .map(|value| value.round() as i64)
         .collect();
-    assert_eq!(numbers.len(), 4, "button geometry: {listing}");
+    assert_eq!(numbers.len(), 4, "button geometry: {found}");
     let (image_x, image_y) = (
         numbers[0] + numbers[2] / 2 + 40,
         numbers[1] + numbers[3] / 2 + 40,
