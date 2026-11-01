@@ -9003,6 +9003,68 @@ fn compare_transient_capture(
 /// events are flushed, before the app has handled them and repainted, so a
 /// capture shortly after input polls until the screen has been unchanged for
 /// SCREENSHOT_SETTLE_QUIET, bounded by SCREENSHOT_SETTLE_LIMIT after the input.
+/// A hash of the whole screen's pixels, without the cursor: two equal values mean
+/// the view did not change between them. None when the compositor cannot be asked.
+async fn view_fingerprint(conn: &zbus::Connection, kwin_unique: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let proxy = KWinScreenShot2Proxy::builder(conn)
+        .destination(kwin_unique.to_owned())
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    let (.., pixels) = capture_frame(&proxy, false).await.ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pixels.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Whether the view changed from `before`: waits for the screen to stop changing
+/// (up to about a second) and compares it with the earlier fingerprint. None when
+/// either could not be taken.
+async fn view_changed_since(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    before: Option<u64>,
+) -> Option<bool> {
+    let before = before?;
+    let mut latest = None;
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = view_fingerprint(conn, kwin_unique).await?;
+        if latest == Some(now) {
+            break;
+        }
+        latest = Some(now);
+    }
+    latest.map(|now| now != before)
+}
+
+/// A zoom shortcut: ctrl with minus, plus, equal or 0.
+fn is_zoom_combo(modifiers: &[u32], key: &str) -> bool {
+    let main = key.rsplit('+').next().unwrap_or("").trim().to_ascii_lowercase();
+    modifiers.contains(&KEY_LEFTCTRL) && matches!(main.as_str(), "minus" | "plus" | "equal" | "0" | "-" | "=")
+}
+
+/// The vertical scroll position of the browser page behind `window_title`, and the
+/// most it can scroll, through CDP: (scrollY, scrollHeight - innerHeight).
+async fn cdp_scroll_position(browser: &chromiumoxide::Browser, window_title: &str) -> Option<(f64, f64)> {
+    for page in browser.pages().await.ok()? {
+        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+        if title.is_empty() || !window_title.starts_with(&title) {
+            continue;
+        }
+        let value = page
+            .evaluate("JSON.stringify([window.scrollY, Math.max(0, document.documentElement.scrollHeight - window.innerHeight)])")
+            .await
+            .ok()?;
+        let text = value.value()?.as_str()?.to_owned();
+        let [y, max] = serde_json::from_str::<[f64; 2]>(&text).ok()?;
+        return Some((y, max));
+    }
+    None
+}
+
 async fn capture_settled_frame(
     proxy: &KWinScreenShot2Proxy<'_>,
     last_input: Option<std::time::Instant>,
@@ -16144,7 +16206,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_scroll",
-        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels in Chromium-family browsers and 120 is one wheel notch in other apps (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window."
+        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels in Chromium-family browsers and 120 is one wheel notch in other apps (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window. The result has view_changed: false when the screen did not change (the end of the content, or nothing there scrolls); with CDP (a browser launched with its own --user-data-dir) also scroll_y, scroll_max_y and at_end."
     )]
     async fn mouse_scroll(
         &self,
@@ -16162,10 +16224,14 @@ impl KwinMcp {
             &self.host_xdg_dir().await?,
         )
         .await?;
+        let view_conn = self.kwin_conn().await?;
+        let view_unique = self.kwin_unique_name().await?;
+        let before_view = view_fingerprint(&view_conn, &view_unique).await;
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
+        let cdp_browser = sess.cdp_browser.clone();
         let (ax, ay) = (
             f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
             f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
@@ -16217,12 +16283,26 @@ impl KwinMcp {
         }
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(
-            &peer,
-            format!("scrolled {delta} at ({x},{y})"),
-            serde_json::json!({"ok": true}),
-        )
-        .await)
+        // Whether anything moved says whether the scroll took effect or the end was
+        // reached; with CDP the page's own offset says where it is.
+        let changed = view_changed_since(&view_conn, &view_unique, before_view).await;
+        let mut data = serde_json::json!({"ok": true});
+        let mut text = format!("scrolled {delta} at ({x},{y})");
+        if let Some(changed) = changed {
+            data["view_changed"] = serde_json::json!(changed);
+            if !changed {
+                text.push_str(": the view did not change (the end of the content, or the pointer was not over something that scrolls)");
+            }
+        }
+        if let Some(browser) = cdp_browser
+            && let Ok((_, _, active)) = active_window_info(&view_conn, &view_unique, &self.host_xdg_dir().await?).await
+            && let Some((scroll_y, max_y)) = cdp_scroll_position(&browser, &active.title).await
+        {
+            data["scroll_y"] = serde_json::json!(scroll_y.round());
+            data["scroll_max_y"] = serde_json::json!(max_y.round());
+            data["at_end"] = serde_json::json!(scroll_y + 1.0 >= max_y);
+        }
+        Ok(structured_result(&peer, text, data).await)
     }
 
     #[rmcp::tool(
@@ -16732,7 +16812,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Zoom shortcuts (ctrl with minus, plus, equal or 0) report view_changed and application_effect view_changed or view_unchanged (the zoom limit, or the page did not get the key). Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -16743,6 +16823,7 @@ impl KwinMcp {
         self.touch_activity().await;
         let (mods, main) = parse_combo(&params.key)?;
         let is_paste = is_native_paste_combo(&mods, main);
+        let zoom = is_zoom_combo(&mods, &params.key);
         let (conn, kwin_unique, xdg) = self
             .with_session(|s| {
                 Ok((
@@ -16760,6 +16841,7 @@ impl KwinMcp {
             .map(|geometry| geometry.title.clone())
             .unwrap_or_default();
         let page_unfocused = browser_page_unfocused(&conn, &active_title).await;
+        let before_view = if zoom { view_fingerprint(&conn, &kwin_unique).await } else { None };
         let warning = if is_chromium_devtools_shortcut(&active_title, &mods, &params.key) {
             Some(
                 "KWin can acknowledge the shortcut without Chrome opening or closing DevTools. \
@@ -16895,6 +16977,12 @@ impl KwinMcp {
             "application_effect": "unverified",
         });
         drop_empty_fields(&mut data, &["warning"]);
+        // A zoom shortcut is checked by what it does to the screen: unchanged means
+        // the zoom limit was reached or the page did not get the key.
+        if zoom && let Some(changed) = view_changed_since(&conn, &kwin_unique, before_view).await {
+            data["view_changed"] = serde_json::json!(changed);
+            data["application_effect"] = serde_json::json!(if changed { "view_changed" } else { "view_unchanged" });
+        }
         if let Some(delivery) = paste_delivery {
             data["paste"] = serde_json::json!({
                 "clipboard_scope":"session", "shortcut_acknowledged":true,
