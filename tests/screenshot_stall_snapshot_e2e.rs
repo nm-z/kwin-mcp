@@ -76,14 +76,12 @@ fn signal(pid: u32, signal: i32) {
     assert_eq!(unsafe { nix::libc::kill(pid, signal) }, 0, "signal {signal}");
 }
 
-#[test]
-#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
-fn a_screenshot_stall_shows_the_compositor_stopped() {
-    let home = std::env::temp_dir().join(format!("kwin-mcp-shot-stall-{}", std::process::id()));
+/// A running session with Konsole open, and its compositor's pid.
+fn session_with_compositor(home: &std::path::Path) -> (Child, Wire, String, u32) {
     std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
     let mut child: Child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
         .args(["--autoclean", "--no-viewer"])
-        .env("HOME", &home)
+        .env("HOME", home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -99,7 +97,7 @@ fn a_screenshot_stall_shows_the_compositor_stopped() {
         "initialize",
         json!({
             "protocolVersion":"2025-06-18", "capabilities":{},
-            "clientInfo":{"name":"screenshot-stall-snapshot-e2e","version":"1"}
+            "clientInfo":{"name":"stopped-compositor-e2e","version":"1"}
         }),
     );
     assert!(reply["result"].is_object(), "{reply}");
@@ -127,6 +125,14 @@ fn a_screenshot_stall_shows_the_compositor_stopped() {
     )
     .expect("pid fits");
     let compositor = compositor_below(sandbox).expect("kwin_wayland below the sandbox");
+    (child, wire, session, compositor)
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn a_screenshot_stall_shows_the_compositor_stopped() {
+    let home = std::env::temp_dir().join(format!("kwin-mcp-shot-stall-{}", std::process::id()));
+    let (mut child, mut wire, session, compositor) = session_with_compositor(&home);
 
     signal(compositor, nix::libc::SIGSTOP);
     let stalled = wire.tool(5, "screenshot", json!({"session_id":session}));
@@ -136,7 +142,14 @@ fn a_screenshot_stall_shows_the_compositor_stopped() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&home);
 
-    assert_eq!(stalled["error"]["data"]["reason"], "frame_unavailable", "{stalled}");
+    // The window query inside the capture ends the stall first ("KWin did not
+    // answer", about 10 s) unless the capture itself waits out its 20 s frame limit.
+    let message = stalled["error"]["message"].as_str().expect("an error");
+    assert!(
+        stalled["error"]["data"]["reason"] == "frame_unavailable"
+            || message.contains("KWin did not answer"),
+        "{stalled}"
+    );
     let snapshot = stalled["error"]["data"]["sandbox_snapshot"]
         .as_str()
         .expect("the stall carries a sandbox snapshot");
@@ -144,4 +157,33 @@ fn a_screenshot_stall_shows_the_compositor_stopped() {
         snapshot.contains(&format!("kwin_wayland[{compositor}<-")) && snapshot.contains(" T "),
         "the stopped compositor is not shown as stopped: {snapshot}"
     );
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn window_list_with_a_stopped_compositor_ends_with_an_error() {
+    let home = std::env::temp_dir().join(format!("kwin-mcp-list-stall-{}", std::process::id()));
+    let (mut child, mut wire, session, compositor) = session_with_compositor(&home);
+
+    signal(compositor, nix::libc::SIGSTOP);
+    let began = std::time::Instant::now();
+    let stalled = wire.tool(5, "window_list", json!({"session_id":session}));
+    let elapsed = began.elapsed();
+    signal(compositor, nix::libc::SIGCONT);
+    let _ = wire.tool(6, "session_stop", json!({"session_id":session}));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+
+    // Before the calls to KWin were bounded this never returned.
+    assert!(
+        elapsed < std::time::Duration::from_secs(40),
+        "window_list took {elapsed:?} against a stopped compositor"
+    );
+    let message = stalled["error"]["message"].as_str().expect("an error");
+    assert!(message.contains("KWin did not answer"), "{message}");
+    let snapshot = stalled["error"]["data"]["sandbox_snapshot"]
+        .as_str()
+        .expect("the error carries a sandbox snapshot");
+    assert!(snapshot.contains(&format!("kwin_wayland[{compositor}<-")), "{snapshot}");
 }
