@@ -7485,6 +7485,103 @@ async fn structured_result(
     r
 }
 
+/// Which half of a result a client puts in front of the model. Measured with a
+/// server returning text `TEXT-MARKER-123` and structuredContent
+/// `{"marker":"SC-MARKER-456"}`: Claude Code 2.1.316 (`claude-code`) gave the
+/// model only the structuredContent; Codex 0.163.0 (`codex-mcp-client`) gave it
+/// only the text. A client not listed gets both, since either may be dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResultView {
+    StructuredOnly,
+    TextOnly,
+    Both,
+}
+
+impl ResultView {
+    fn of_client(name: &str) -> Self {
+        match name {
+            "claude-code" => Self::StructuredOnly,
+            "codex-mcp-client" => Self::TextOnly,
+            _ => Self::Both,
+        }
+    }
+
+    fn of_peer(peer: &rmcp::Peer<rmcp::RoleServer>) -> Self {
+        peer.peer_info()
+            .map_or(Self::Both, |info| Self::of_client(&info.client_info.name))
+    }
+}
+
+/// Puts `body` where the client shows it and returns the result's text: the body
+/// in the structuredContent under `body_key` for a client that shows only that
+/// (the text is then `summary`), in the text alone for a client that shows only
+/// the text, in both for a client of unknown behavior.
+fn place_body(
+    view: ResultView,
+    body: String,
+    summary: &str,
+    structured: &mut serde_json::Value,
+    body_key: &str,
+) -> String {
+    match view {
+        ResultView::StructuredOnly => {
+            structured[body_key] = serde_json::json!(body);
+            summary.to_owned()
+        }
+        ResultView::TextOnly => {
+            if let Some(object) = structured.as_object_mut() {
+                object.remove(body_key);
+            }
+            body
+        }
+        ResultView::Both => {
+            structured[body_key] = serde_json::json!(body);
+            body
+        }
+    }
+}
+
+/// A result whose bulk is `body`: the accessibility tree, the clipboard text. The
+/// body is sent in the half of the result the client shows the model and left out
+/// of the other (the text then is `summary`), so it is paid for once. A client of
+/// unknown behavior gets the body in both.
+/// An accessibility tree result: the tree once, in the half the client shows.
+async fn tree_result(
+    peer: &rmcp::Peer<rmcp::RoleServer>,
+    tree: String,
+    mut info: serde_json::Value,
+) -> CallToolResult {
+    let summary = format!(
+        "accessibility tree: {} nodes, {} levels{} (in structuredContent.tree)",
+        info["nodes"],
+        info["levels"],
+        if info["more_below"] == true || info["incomplete"] == true { ", more below" } else { "" }
+    );
+    // The body key is dropped for a text-only client and set for the others.
+    info.as_object_mut().map(|object| object.remove("tree"));
+    body_result(peer, ResultView::of_peer(peer), tree, summary, info, "tree").await
+}
+
+async fn body_result(
+    peer: &rmcp::Peer<rmcp::RoleServer>,
+    view: ResultView,
+    body: String,
+    summary: String,
+    mut structured: serde_json::Value,
+    body_key: &str,
+) -> CallToolResult {
+    let _ = peer
+        .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
+            rmcp::model::LoggingLevel::Info,
+            serde_json::json!(summary),
+        ))
+        .await;
+    let text = place_body(view, body, &summary, &mut structured, body_key);
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    result.structured_content = Some(structured);
+    result
+}
+
 fn cleanup_stale_session_files(dir: &std::path::Path) {
     const STALE_FILES: &[&str] = &[
         "bus",
@@ -14294,10 +14391,15 @@ impl KwinMcp {
                     McpError::internal_error("session clipboard text is not UTF-8", None)
                 })?;
                 let length = text.chars().count();
-                (
-                    text.clone(),
-                    serde_json::json!({"target":"session","text":text,"length":length,"protected":false}),
+                return Ok(body_result(
+                    &peer,
+                    ResultView::of_peer(&peer),
+                    text,
+                    format!("session clipboard: {length} characters (in structuredContent.text)"),
+                    serde_json::json!({"length":length}),
+                    "text",
                 )
+                .await);
             }
         };
         Ok(structured_result(&peer, message, data).await)
@@ -15214,7 +15316,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level; the same text is also in structuredContent.tree for clients that show only structured results. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level; the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -15266,7 +15368,7 @@ impl KwinMcp {
                 info["continuation"] = serde_json::json!(format!(
                     "Call accessibility_tree with a root=ID shown in this reply and a smaller max_depth to continue that subtree. Set timeout_seconds from {ACCESSIBILITY_TREE_TIMEOUT_MIN_SECONDS} to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS} to adjust the time budget. If no nodes were read, use find_ui_elements for a named control or screenshot."
                 ));
-                Ok(structured_result(&peer, text, info).await)
+                Ok(tree_result(&peer, text, info).await)
             }
         }
     }
@@ -15392,7 +15494,7 @@ impl KwinMcp {
                 }
                 let (tree, mut info) = tree.render(max_levels);
                 info["source"] = serde_json::json!("cdp");
-                return Ok(structured_result(&peer, tree, info).await);
+                return Ok(tree_result(&peer, tree, info).await);
             }
         }
         // AT-SPI path for native apps
@@ -15529,7 +15631,7 @@ impl KwinMcp {
             }
         }
         let (tree, info) = tree.render(max_levels);
-        Ok(structured_result(&peer, tree, info).await)
+        Ok(tree_result(&peer, tree, info).await)
     }
 
     #[rmcp::tool(
@@ -21480,7 +21582,7 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        FindMatch, WindowSnapshot, clickable_center, folds_into_ancestor, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        FindMatch, ResultView, WindowSnapshot, clickable_center, folds_into_ancestor, place_body, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
@@ -21869,6 +21971,31 @@ mod startup_report_tests {
         for role in ["button", "push button", "link", "entry", "check box", "menu item", "combo box", "page tab", "something new"] {
             assert!(!folds_into_ancestor(role), "{role}");
         }
+    }
+
+    #[test]
+    fn a_big_body_is_sent_once_in_the_half_the_client_shows() {
+        // Measured: Claude Code shows the model only structuredContent, Codex only the text.
+        assert_eq!(ResultView::of_client("claude-code"), ResultView::StructuredOnly);
+        assert_eq!(ResultView::of_client("codex-mcp-client"), ResultView::TextOnly);
+        assert_eq!(ResultView::of_client("some-other-client"), ResultView::Both);
+        let body = "frame\tKonsole\n".repeat(400);
+        let summary = "accessibility tree: 400 nodes";
+        let info = || serde_json::json!({"nodes": 400, "tree": "stale"});
+
+        let mut structured = info();
+        let text = place_body(ResultView::StructuredOnly, body.clone(), summary, &mut structured, "tree");
+        assert_eq!((text.as_str(), structured["tree"].as_str()), (summary, Some(body.as_str())));
+
+        let mut structured = info();
+        let text = place_body(ResultView::TextOnly, body.clone(), summary, &mut structured, "tree");
+        assert_eq!(text, body);
+        assert!(structured.get("tree").is_none(), "{structured}");
+        assert_eq!(structured["nodes"], 400);
+
+        let mut structured = info();
+        let text = place_body(ResultView::Both, body.clone(), summary, &mut structured, "tree");
+        assert_eq!((text.as_str(), structured["tree"].as_str()), (body.as_str(), Some(body.as_str())));
     }
 
     #[test]

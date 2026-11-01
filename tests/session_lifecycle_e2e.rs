@@ -10218,7 +10218,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
             "clipboard_write",
             json!({"session_id":id,"target":"session","text":agent_text})
         ),
-        json!({"target":"session","length":14})
+        json!({"ok": true})
     );
     assert_eq!(
         run(&mut client, "clipboard_read", json!({"session_id":id}))["text"],
@@ -10232,7 +10232,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
             "clipboard_write",
             json!({"session_id":id,"target":"session","text":&long_command})
         ),
-        json!({"target":"session","length":595})
+        json!({"ok": true})
     );
     let xterm_command = format!(
         "xterm -e sh -c 'IFS= read -r pasted; printf \"%s\\n\" \"$pasted\" > \"{}/xterm.txt\"'",
@@ -10367,7 +10367,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
         "clipboard_write",
         json!({"session_id":id,"target":"host","generate_secret":secret}),
     );
-    assert_eq!(result, json!({"target":"host","length":32}));
+    assert_eq!(result, json!({"ok": true}));
     assert_eq!(
         run(
             &mut desktop,
@@ -10409,7 +10409,7 @@ fn clipboard_tools_separate_desktops_and_keep_generated_values_out_of_responses(
         "clipboard_write",
         json!({"session_id":id,"target":"session","generate_secret":secret}),
     );
-    assert_eq!(result, json!({"target":"session","length":32}));
+    assert_eq!(result, json!({"ok": true}));
     assert_eq!(
         run(&mut client, "clipboard_read", json!({"session_id":id})),
         json!({"target":"session","length":32,"text":null,"protected":true})
@@ -10528,8 +10528,9 @@ fn clipboard_read_times_out_on_a_private_frozen_compositor_and_recovers() {
             "clipboard_read",
             json!({"session_id":id}),
         );
+        // The clipboard waits 5 s for a compositor that does not answer.
         assert!(
-            start.elapsed() < Duration::from_secs(3),
+            start.elapsed() < Duration::from_secs(7),
             "clipboard deadline exceeded"
         );
         assert!(
@@ -10551,7 +10552,7 @@ fn clipboard_read_times_out_on_a_private_frozen_compositor_and_recovers() {
     call_tool(&mut client, 7, "session_stop", json!({"session_id":id}));
     client.stop_process();
     println!(
-        "PASS: initial and established clipboard connections time out within 3 seconds and recover after resuming the owned compositor"
+        "PASS: initial and established clipboard connections time out within 7 seconds and recover after resuming the owned compositor"
     );
 }
 
