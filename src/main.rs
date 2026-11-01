@@ -11156,6 +11156,38 @@ fn clickable_center(
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct BrowserNavigateParams {
+    /// Timing multiplier. Default 1.0; larger values send input faster.
+    speed: Option<f64>,
+    /// The address to open: printable ASCII, no spaces. A scheme is optional.
+    url: String,
+}
+
+/// The reason `url` cannot be typed into the address bar, if any.
+fn navigate_url_problem(url: &str) -> Option<&'static str> {
+    if url.is_empty() {
+        Some("the url is empty")
+    } else if url.chars().count() > 2000 {
+        Some("the url is longer than 2000 characters")
+    } else if url.chars().any(|ch| !ch.is_ascii_graphic()) {
+        Some("the url must be printable ASCII without spaces (percent-encode anything else)")
+    } else {
+        None
+    }
+}
+
+/// Whether the page at `landed` is the one that was asked for: same host and path,
+/// ignoring the scheme, a leading `www.`, a trailing slash, the query and the fragment.
+fn same_destination(requested: &str, landed: &str) -> bool {
+    let normalize = |url: &str| {
+        let url = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let url = url.split(['?', '#']).next().unwrap_or(url);
+        url.trim_start_matches("www.").trim_end_matches('/').to_ascii_lowercase()
+    };
+    normalize(requested) == normalize(landed)
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct MouseMoveParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
@@ -15697,6 +15729,149 @@ impl KwinMcp {
     }
 
     #[rmcp::tool(
+        name = "browser_navigate",
+        description = "Open a URL in the focused Chromium-family browser window: focus the address bar (ctrl+l), type the URL, press Delete so Chrome's inline autocomplete cannot extend it to another address from history, then Return. Waits for the window title to change and returns it. When the browser has CDP (launch_app reported cdp_port) the result also has the page's url, and matched=false with a warning if it is not the address asked for. Without CDP the landing page is known only by its title: check it. url is printable ASCII without spaces."
+    )]
+    async fn browser_navigate(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<BrowserNavigateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let pace = InputPace::new(params.speed, None)?;
+        self.touch_activity().await;
+        if let Some(problem) = navigate_url_problem(&params.url) {
+            return Err(McpError::invalid_params(
+                format!("Nothing was typed: {problem}."),
+                Some(serde_json::json!({"reason": "invalid_url", "retry_safe": true})),
+            ));
+        }
+        let keys = params
+            .url
+            .chars()
+            .map(char_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        let guard = self.session.read().await;
+        let sess = guard.as_ref().ok_or_else(|| {
+            McpError::internal_error("no session — call session_start first", None)
+        })?;
+        let refuse = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!("Nothing was typed: {detail}."),
+                Some(serde_json::json!({"reason": reason, "retry_safe": true})),
+            )
+        };
+        let active = active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+            .await
+            .map(|(_, _, geometry)| geometry)
+            .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+        let window = window_snapshots(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+            .await
+            .map_err(|error| refuse("target_unverifiable", error.to_string()))?
+            .into_iter()
+            .find(|window| window.id == active.id && window.active && !window.minimized)
+            .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
+        if !chromium_resource_class(&window.resource_class) {
+            return Err(refuse(
+                "not_a_browser",
+                format!(
+                    "the active window is {:?} ({}), not a Chromium-family browser",
+                    window.title, window.resource_class
+                ),
+            ));
+        }
+        let title_before = window.title.clone();
+        let combo = |name: &str| -> Result<(Vec<u32>, u32), McpError> { parse_combo(name) };
+        let typing_window = TypingWindow {
+            connection: &sess.kwin_conn,
+            kwin_unique: &sess.kwin_unique_name,
+            runtime: &sess.host_xdg_dir,
+            window_id: &active.id,
+            browser_title: None,
+        };
+        // ctrl+l, then the address.
+        {
+            let (mods, main) = combo("ctrl+l")?;
+            let mut sent = SentInput::new(&sess.eis);
+            for m in &mods {
+                sent.key(*m, true, None).map_err(KwinError::from)?;
+            }
+            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+            sent.key(main, true, None).map_err(KwinError::from)?;
+            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
+            sent.key(main, false, None).map_err(KwinError::from)?;
+            for m in mods.iter().rev() {
+                sent.key(*m, false, None).map_err(KwinError::from)?;
+            }
+        }
+        sess.eis.roundtrip().await.map_err(KwinError::from)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        type_with_profile(&sess.eis, &params.url, &keys, pace, None, &typing_window).await?;
+        // The address bar completes the typed text inline; the completion is
+        // selected, so Delete removes it and Return opens what was typed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for name in ["Delete", "Return"] {
+            let (_, main) = combo(name)?;
+            let mut sent = SentInput::new(&sess.eis);
+            sent.key(main, true, None).map_err(KwinError::from)?;
+            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
+            sent.key(main, false, None).map_err(KwinError::from)?;
+            drop(sent);
+            sess.eis.roundtrip().await.map_err(KwinError::from)?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        let cdp_browser = sess.cdp_browser.clone();
+        let (conn, unique, runtime) = (
+            sess.kwin_conn.clone(),
+            sess.kwin_unique_name.clone(),
+            sess.host_xdg_dir.clone(),
+        );
+        drop(guard);
+        self.mark_input().await;
+        // Wait for the title to change; a page that keeps its title (a reload of the
+        // same address) is reported as unchanged after the wait.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut title = title_before.clone();
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Ok((_, _, now)) = active_window_info(&conn, &unique, &runtime).await
+                && now.title != title_before
+            {
+                title = now.title;
+                break;
+            }
+        }
+        let mut data = serde_json::json!({"title": title});
+        let mut text = format!("navigated: {title}");
+        if title == title_before {
+            data["title_changed"] = serde_json::json!(false);
+            text.push_str(" (the title did not change: the page may still be loading, or it is the page that was already open)");
+        }
+        if let Some(browser) = cdp_browser
+            && let Ok(pages) = browser.pages().await
+        {
+            for page in pages {
+                let page_title = page.get_title().await.ok().flatten().unwrap_or_default();
+                if page_title.is_empty() || !title.starts_with(&page_title) {
+                    continue;
+                }
+                if let Some(url) = page.url().await.ok().flatten() {
+                    let matched = same_destination(&params.url, &url);
+                    data["url"] = serde_json::json!(url);
+                    if !matched {
+                        data["matched"] = serde_json::json!(false);
+                        data["warning"] = serde_json::json!(
+                            "The page is not at the address that was typed; the address bar may have completed it from history."
+                        );
+                        text.push_str(&format!(". warning: landed on {url}, not {}", params.url));
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(structured_result(&peer, text, data).await)
+    }
+
+    #[rmcp::tool(
         name = "mouse_click_element",
         description = "Find an element by name/role as find_ui_elements does, at the moment of the click, and click the center of its bounds. Use it where the layout shifts between steps (an answer check that inserts a feedback block) so coordinates from an earlier look would miss. index picks which clickable match (visible, bounds in the active window's pixels) when several match; default 0. exact, role, button, double and triple work as in find_ui_elements and mouse_click. Reports which element was clicked and how many were clickable. Fails without clicking when nothing clickable matches."
     )]
@@ -18219,7 +18394,7 @@ async fn finish_prepared_paste(preparation: PreparedPaste) -> input_bridge::Text
 }
 
 fn input_tool(name: &str) -> bool {
-    name.starts_with("mouse_") || name.starts_with("keyboard_")
+    name.starts_with("mouse_") || name.starts_with("keyboard_") || name == "browser_navigate"
 }
 
 fn ordered_tool(name: &str) -> bool {
@@ -21588,6 +21763,24 @@ mod startup_report_tests {
         let error = clickable_center(&elements, 2).expect_err("only two are clickable");
         assert!(error.contains("2 of 4 matches"), "{error}");
         assert!(clickable_center(&[], 0).is_err());
+    }
+
+    #[test]
+    fn navigate_urls_are_checked_and_compared_by_destination() {
+        use super::{navigate_url_problem, same_destination};
+        assert!(navigate_url_problem("learn.zybooks.com/zybook/X/chapter/3/section/14").is_none());
+        assert!(navigate_url_problem("https://example.test/a?b=c#d").is_none());
+        assert!(navigate_url_problem("").is_some());
+        assert!(navigate_url_problem("two words").is_some());
+        assert!(navigate_url_problem("caf\u{e9}.test").is_some());
+        assert!(navigate_url_problem(&"a".repeat(2001)).is_some());
+        // The case the issue reports: history completed section/11 to section/14.
+        assert!(!same_destination(
+            "learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/1",
+            "https://learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/14"
+        ));
+        assert!(same_destination("example.test/a", "https://www.example.test/a/?x=1#top"));
+        assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
     }
 
     #[test]
