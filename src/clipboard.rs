@@ -17,7 +17,9 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_source_v1::{self as data_source, ExtDataControlSourceV1},
 };
 pub const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(1);
+// The compositor answers a sync round trip in milliseconds; a loaded host (the
+// report that raised this had memory PSI at 9.68%) can take far longer.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 const WL_SEAT_VERSION: u32 = 1;
 const DATA_CONTROL_VERSION: u32 = 1;
 

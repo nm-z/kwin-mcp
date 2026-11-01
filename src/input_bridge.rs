@@ -945,7 +945,22 @@ pub async fn register_devices(
 
 // Application-side receipts for paced keyboard input. EIS acknowledgement
 // confirms compositor processing; AT-SPI independently confirms the field text.
-const TEXT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// A loaded host answers AT-SPI queries slowly (the reports that raised this
+// show memory pressure), and that is slowness, not an unobservable field.
+const TEXT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reading the focused field did not finish in time. The field may be perfectly
+/// readable; the host or session was too slow to say.
+#[derive(Debug)]
+pub struct TextDiscoveryTimedOut(pub std::time::Duration);
+
+impl std::fmt::Display for TextDiscoveryTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "focused text discovery timed out after {:?}", self.0)
+    }
+}
+
+impl std::error::Error for TextDiscoveryTimedOut {}
 const TEXT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // When two browser windows share a title and bounds, AT-SPI cannot reliably
 // identify the active one; do not spend the full mismatch timeout on stale text.
@@ -1479,15 +1494,34 @@ impl TextReceipt {
         pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
+        Self::capture_within(
+            TEXT_DISCOVERY_TIMEOUT,
+            address,
+            title,
+            bounds,
+            pointer,
+            input,
+        )
+        .await
+    }
+
+    async fn capture_within(
+        timeout: std::time::Duration,
+        address: &str,
+        title: &str,
+        bounds: [f64; 4],
+        pointer: Option<[f64; 2]>,
+        input: &str,
+    ) -> anyhow::Result<Self> {
         if title.is_empty() {
             anyhow::bail!("there is no active window");
         }
         tokio::time::timeout(
-            TEXT_DISCOVERY_TIMEOUT,
+            timeout,
             Self::discover(address, title, bounds, pointer, input),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("focused text discovery timed out"))?
+        .map_err(|_| TextDiscoveryTimedOut(timeout))?
     }
 
     async fn discover(
@@ -2116,8 +2150,27 @@ mod null_ref_tests {
         }
     }
 
+    // A registry that answers far slower than any discovery budget.
+    struct SlowRegistry;
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl SlowRegistry {
+        #[zbus(name = "GetChildren")]
+        async fn get_children(
+            &self,
+        ) -> zbus::fdo::Result<Vec<(String, zbus::zvariant::OwnedObjectPath)>> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(Vec::new())
+        }
+    }
+
     fn start_bus() -> anyhow::Result<(Bus, String)> {
-        let dir = std::env::temp_dir().join(format!("kwin-mcp-nullref-{}", std::process::id()));
+        static BUSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kwin-mcp-nullref-{}-{}",
+            std::process::id(),
+            BUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir)?;
         let config = dir.join("bus.conf");
         let mut file = std::fs::File::create(&config)?;
@@ -2142,6 +2195,31 @@ mod null_ref_tests {
             .ok_or_else(|| anyhow::anyhow!("dbus-daemon stdout"))?;
         std::io::BufReader::new(stdout).read_line(&mut address)?;
         Ok((Bus { child, dir }, address.trim().to_owned()))
+    }
+
+    #[tokio::test]
+    async fn a_slow_registry_is_a_timeout_not_an_unobservable_field() -> anyhow::Result<()> {
+        let (_bus, address) = start_bus()?;
+        let _registry = zbus::connection::Builder::address(address.as_str())?
+            .auth_mechanism(zbus::AuthMechanism::Anonymous)
+            .name("org.a11y.atspi.Registry")?
+            .serve_at("/org/a11y/atspi/accessible/root", SlowRegistry)?
+            .build()
+            .await?;
+        let budget = std::time::Duration::from_millis(300);
+        let began = std::time::Instant::now();
+        let Err(error) =
+            TextReceipt::capture_within(budget, &address, "Some Window", [0.0; 4], None, "x").await
+        else {
+            anyhow::bail!("a registry that never answers produced a focused field");
+        };
+        assert!(
+            error.is::<super::TextDiscoveryTimedOut>(),
+            "slowness was not reported as a timeout: {error}"
+        );
+        assert!(error.to_string().contains("timed out after 300ms"), "{error}");
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        Ok(())
     }
 
     #[tokio::test]

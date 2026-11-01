@@ -15189,10 +15189,23 @@ impl KwinMcp {
             && !error.is::<input_bridge::TerminalFocus>()
             && !error.is::<input_bridge::ProtectedFocus>()
         {
+            // Slowness is not an unobservable field: say so, so the caller retries
+            // instead of hunting for a different field.
+            let (message, reason) = if error.is::<input_bridge::TextDiscoveryTimedOut>() {
+                (
+                    "Typing was not started because reading the browser's focused field timed out; the host or session is slow. Nothing was typed, so retrying is safe; if it keeps timing out, use keyboard_paste.",
+                    "text_discovery_timed_out",
+                )
+            } else {
+                (
+                    "Typing was not started because the browser's focused editable target could not be verified. Click the intended field and inspect it before retrying.",
+                    "text_target_unavailable",
+                )
+            };
             return Err(McpError::invalid_params(
-                "Typing was not started because the browser's focused editable target could not be verified. Click the intended field and inspect it before retrying.",
+                message,
                 Some(serde_json::json!({
-                    "reason":"text_target_unavailable", "submitted_characters":0,
+                    "reason":reason, "submitted_characters":0,
                     "attempted_characters":0, "requested_characters":keys.len(),
                     "submission_complete":false, "retry_safe":true,
                     "target_observation":error.to_string(),
