@@ -1,8 +1,9 @@
 #![allow(clippy::expect_used)]
 
-//! `keyboard_type` must find the focused field of a page with far more nodes
-//! than the accessibility walk may visit. Typing follows a click, so the field
-//! under the pointer is found by hit-testing before the page is walked.
+//! Pages with far more accessibility nodes than a walk may visit. `keyboard_type`
+//! must still find the focused field (typing follows a click, so the field under
+//! the pointer is found by hit-testing before the page is walked), and
+//! `find_ui_elements` must still reach a control after thousands of nodes.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -84,6 +85,53 @@ impl Server {
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         self.request("tools/call", json!({"name":name, "arguments":arguments}))
     }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
+fn find_ui_elements_reaches_a_button_after_thousands_of_nodes() {
+    let home = std::env::temp_dir().join(format!("kwin-mcp-find-heavy-{}", std::process::id()));
+    std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
+    let mut server = Server::start(&home);
+    let started = server.tool(
+        "session_start",
+        json!({"browser_profiles":"fresh", "width":1920, "height":1080}),
+    );
+    let session = started["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let workdir = started["result"]["structuredContent"]["host_shared_dir"]
+        .as_str()
+        .expect("workdir")
+        .to_owned();
+    // 4000 paragraphs are about 8000 accessibility nodes before the button, past
+    // the 2000 nodes the search once stopped at. No --user-data-dir, so no CDP:
+    // the search walks AT-SPI.
+    let mut page = String::from("<html><body>");
+    for index in 1..=4000 {
+        page.push_str(&format!("<p>paragraph {index}</p>"));
+    }
+    page.push_str("<button>Page Sign in Button</button></body></html>");
+    std::fs::write(format!("{workdir}/big.html"), page).expect("write page");
+    let launched = server.tool(
+        "launch_app",
+        json!({"session_id":session,
+            "command":format!("google-chrome-stable file://{workdir}/big.html"),
+            "window_timeout_seconds":40}),
+    );
+    assert!(launched["error"].is_null(), "{launched}");
+    std::thread::sleep(std::time::Duration::from_secs(8));
+
+    let found = server.tool(
+        "find_ui_elements",
+        json!({"session_id":session, "query":"Page Sign in Button", "role":"button"}),
+    );
+    let _ = server.tool("session_stop", json!({"session_id":session}));
+    let content = &found["result"]["structuredContent"];
+    assert_eq!(content["matches"], 1, "the page's button was missed: {found}");
+    assert_eq!(content["incomplete"], false, "{found}");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]

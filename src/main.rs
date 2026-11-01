@@ -11194,7 +11194,10 @@ struct AccessibilityTreeParams {
 }
 
 const FIND_UI_MAX_MATCHES: usize = 200;
-const FIND_UI_MAX_NODES: usize = 2000;
+// The five-second ATSPI_TRAVERSAL_TIMEOUT bounds how long a search runs and keeps
+// the matches already found; this only caps runaway trees. It was 2000, which
+// Chrome's own toolbar and a modest page exhaust before the page's tail.
+const FIND_UI_MAX_NODES: usize = 100_000;
 const FIND_UI_MAX_PAGES: usize = 10;
 
 fn find_ui_search_text(text: &str) -> String {
