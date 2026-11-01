@@ -6582,6 +6582,42 @@ fn terminal_record(status: &str, reason: &str) -> serde_json::Value {
 struct StartStage {
     label: String,
     since: std::time::Instant,
+    /// The coarse stage this checkpoint belongs to and when it began: the
+    /// per-process and per-socket checkpoints inside it do not appear in the
+    /// time-per-stage record.
+    coarse: String,
+    coarse_since: std::time::Instant,
+    /// Coarse stages already left in this start, with how long each lasted.
+    finished: Vec<(String, std::time::Duration)>,
+}
+
+/// How long each startup checkpoint lasted, as `stage: 1.2s` pairs. The last
+/// entry is the checkpoint still running, so a stalled start names where the
+/// time went and not only where it stopped.
+fn format_stage_times(finished: &[(String, std::time::Duration)], current: &str, running: std::time::Duration) -> String {
+    finished
+        .iter()
+        .map(|(label, took)| (label.as_str(), *took))
+        .chain(std::iter::once((current, running)))
+        .map(|(label, took)| format!("{label} {:.1}s", took.as_secs_f64()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn stage_times_json(finished: &[(String, std::time::Duration)], current: &str, running: std::time::Duration) -> serde_json::Value {
+    serde_json::Value::Array(
+        finished
+            .iter()
+            .map(|(label, took)| (label.as_str(), *took))
+            .chain(std::iter::once((current, running)))
+            .map(|(label, took)| {
+                serde_json::json!({
+                    "stage": label,
+                    "milliseconds": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                })
+            })
+            .collect(),
+    )
 }
 
 impl KwinMcp {
@@ -6884,6 +6920,9 @@ impl KwinMcp {
             start_stage: Arc::new(std::sync::Mutex::new(StartStage {
                 label: "waiting for the lifecycle gate".to_owned(),
                 since: std::time::Instant::now(),
+                coarse: "waiting for the lifecycle gate".to_owned(),
+                coarse_since: std::time::Instant::now(),
+                finished: Vec::new(),
             })),
             startup_sandbox_pid: Arc::new(std::sync::Mutex::new(None)),
             startup_snapshot: Arc::new(std::sync::Mutex::new(None)),
@@ -6896,17 +6935,38 @@ impl KwinMcp {
     fn set_start_stage(&self, stage: impl Into<String>) {
         let stage = stage.into();
         eprintln!("session_start: stage: {stage}");
+        if let Ok(mut current) = self.start_stage.lock() {
+            let now = std::time::Instant::now();
+            let left = std::mem::replace(&mut current.coarse, stage.clone());
+            let took = now.saturating_duration_since(current.coarse_since);
+            current.coarse_since = now;
+            current.finished.push((left, took));
+        }
         self.record_start_stage(stage);
     }
     /// Records a checkpoint without logging it, for per-process and per-socket
     /// steps that would otherwise flood the log.
     fn record_start_stage(&self, stage: impl Into<String>) {
         if let Ok(mut current) = self.start_stage.lock() {
-            *current = StartStage {
-                label: stage.into(),
-                since: std::time::Instant::now(),
-            };
+            current.label = stage.into();
+            current.since = std::time::Instant::now();
         }
+    }
+    /// Forgets the checkpoints of the previous start.
+    fn begin_start_stage_log(&self) {
+        if let Ok(mut current) = self.start_stage.lock() {
+            current.finished.clear();
+            current.coarse_since = std::time::Instant::now();
+        }
+    }
+    /// Time spent in each checkpoint of this start so far, the running one last.
+    fn start_stage_times(&self) -> Option<(String, serde_json::Value)> {
+        let current = self.start_stage.lock().ok()?;
+        let running = current.coarse_since.elapsed();
+        Some((
+            format_stage_times(&current.finished, &current.coarse, running),
+            stage_times_json(&current.finished, &current.coarse, running),
+        ))
     }
     /// host call blocks, nothing moves the checkpoint, so this names the call.
     fn start_stage_report(&self) -> (String, std::time::Duration) {
@@ -12338,6 +12398,7 @@ impl KwinMcp {
             attempt.finish(Some(&error.message));
             return Err(error);
         }
+        self.begin_start_stage_log();
         self.set_start_stage("preparing the session workdir");
         *self
             .startup_deadline
@@ -12433,6 +12494,12 @@ impl KwinMcp {
                     .lock()
                     .ok()
                     .and_then(|slot| slot.clone());
+                if let Some((text, json)) = self.start_stage_times() {
+                    error.message = format!("{}; time per stage: {text}", error.message).into();
+                    if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
+                        data.insert("stage_times".to_owned(), json);
+                    }
+                }
                 if let Some(snapshot) = snapshot {
                     error.message = format!("{}; last sandbox snapshot: {snapshot}", error.message).into();
                     if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
@@ -13630,6 +13697,7 @@ impl KwinMcp {
             "status": "started",
             "browser_profiles": browser_profiles,
             "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_DEFAULT_TIMEOUT.as_secs()),
+            "stage_times": self.start_stage_times().map(|(_, json)| json),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
             "commit": env!("GIT_HASH"),
@@ -20703,6 +20771,38 @@ mod startup_report_tests {
         let data = error.data.unwrap_or_default();
         assert_eq!(data["reason"], "lifecycle_busy");
         assert_eq!(data["stage"], "reading /proc/42");
+    }
+
+    #[test]
+    fn stage_times_name_every_checkpoint_of_the_start_and_end_with_the_running_one() -> Result<(), String> {
+        let service = server();
+        service.begin_start_stage_log();
+        service.set_start_stage("preparing the session workdir");
+        std::thread::sleep(Duration::from_millis(20));
+        service.set_start_stage("spawning the pasta and bwrap sandbox");
+        std::thread::sleep(Duration::from_millis(20));
+        service.set_start_stage("waiting for the container D-Bus daemon");
+        let (text, json) = service.start_stage_times().ok_or("no stage times")?;
+        assert!(text.contains("preparing the session workdir 0."), "{text}");
+        assert!(text.contains("spawning the pasta and bwrap sandbox 0."), "{text}");
+        assert!(text.ends_with('s'), "{text}");
+        let stages = json.as_array().ok_or("stage times are not a list")?;
+        let last = stages.last().ok_or("empty list")?;
+        assert_eq!(last["stage"], "waiting for the container D-Bus daemon");
+        assert!(
+            stages.iter().any(|stage| stage["stage"] == "preparing the session workdir"
+                && stage["milliseconds"].as_u64().unwrap_or(0) >= 15),
+            "{json}"
+        );
+        // A new start forgets the previous start's checkpoints.
+        service.begin_start_stage_log();
+        service.set_start_stage("preparing the session workdir");
+        let (_, json) = service.start_stage_times().ok_or("no stage times")?;
+        assert!(
+            json.as_array().ok_or("stage times are not a list")?.len() <= 2,
+            "{json}"
+        );
+        Ok(())
     }
 
     #[test]

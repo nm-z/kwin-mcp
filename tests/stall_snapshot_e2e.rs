@@ -88,6 +88,23 @@ fn a_stalled_start_names_the_processes_in_its_sandbox() {
     // The entrypoint's own processes are in the tree, with parent, state and wait channel.
     assert!(snapshot.contains("dbus-daemon["), "{snapshot}");
     assert!(snapshot.contains("<-"), "{snapshot}");
+    // The stall also says how long each earlier stage took, ending with the running one.
+    let stages = response["error"]["data"]["stage_times"]
+        .as_array()
+        .expect("the stall error lists the time per stage");
+    assert!(stages.len() >= 3, "{response}");
+    assert_eq!(
+        stages.last().map(|stage| stage["stage"].clone()),
+        Some(response["error"]["data"]["stage"].clone()),
+        "{response}"
+    );
+    assert!(stages.len() <= 24, "per-process checkpoints leaked into {response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time per stage:")),
+        "{response}"
+    );
     assert!(
         response["error"]["message"]
             .as_str()
