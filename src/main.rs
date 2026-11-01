@@ -321,7 +321,25 @@ mod kwin_script {
     /// Bound on the wait for a script's callback. Scripts answer in milliseconds;
     /// one that never answers must not hold its KWin's script lock indefinitely.
     const SCRIPT_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Bound on each D-Bus call that loads and starts a script, and on the wait for
+    /// the lifecycle lock held by an earlier script. A D-Bus call has no timeout of
+    /// its own, so a stopped or blocked KWin held every query forever.
+    const SCRIPT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+    const SCRIPT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
     pub(crate) const SCRIPT_DIRECTORY: &str = "kwin-scripts";
+
+    /// `call`, ended with a clear error when KWin does not answer in time.
+    async fn answered_in_time<T>(
+        what: &str,
+        call: impl std::future::Future<Output = zbus::Result<T>>,
+    ) -> Result<T, KwinError> {
+        match tokio::time::timeout(SCRIPT_CALL_TIMEOUT, call).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(KwinError::Msg(format!(
+                "KWin did not answer {what} within {SCRIPT_CALL_TIMEOUT:?}; the compositor may be stopped or blocked"
+            ))),
+        }
+    }
 
     static NEXT_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -387,7 +405,13 @@ mod kwin_script {
             .to_string();
         // Held until this script is unloaded, including when a dropped caller
         // leaves the unload to the cleanup task.
-        let lock = script_lock(kwin_unique).lock_owned().await;
+        let lock = tokio::time::timeout(SCRIPT_LOCK_TIMEOUT, script_lock(kwin_unique).lock_owned())
+            .await
+            .map_err(|_| {
+                KwinError::Msg(format!(
+                    "KWin did not answer: an earlier query still held its script lock after {SCRIPT_LOCK_TIMEOUT:?}; the compositor may be stopped or blocked"
+                ))
+            })?;
         let mut cleanup = ScriptCleanup {
             conn: conn.clone(),
             kwin_unique: kwin_unique.to_owned(),
@@ -444,9 +468,11 @@ mod kwin_script {
                 .build()
                 .await?;
             cleanup.load_attempted = true;
-            let (script_id,): (i32,) = scripting
-                .call("loadScript", &(&container_script_path, &cleanup.marker))
-                .await?;
+            let (script_id,): (i32,) = answered_in_time(
+                "loadScript",
+                scripting.call("loadScript", &(&container_script_path, &cleanup.marker)),
+            )
+            .await?;
             if script_id < 0 {
                 return Err(KwinError::Msg(format!(
                     "KWin loadScript failed, id={script_id}"
@@ -459,7 +485,7 @@ mod kwin_script {
                 .cache_properties(zbus::proxy::CacheProperties::No)
                 .build()
                 .await?;
-            script_proxy.call::<_, (), ()>("run", &()).await?;
+            answered_in_time("run", script_proxy.call::<_, (), ()>("run", &())).await?;
             match tokio::time::timeout(SCRIPT_RESULT_TIMEOUT, rx).await {
                 Ok(payload) => {
                     payload.map_err(|_| KwinError::Msg("KWin callback channel closed".to_owned()))
@@ -17400,6 +17426,18 @@ impl tower::Service<SessionCall> for KwinMcp {
                     if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
                         data.insert("sandbox_snapshot".to_owned(), serde_json::json!(snapshot));
                     }
+                }
+            }
+            // Any tool that asks KWin and gets no answer: say what the sandbox is doing.
+            if let Err(error) = &mut result
+                && error.message.contains("KWin did not answer")
+                && !error.message.contains("sandbox process pid=")
+                && let Some(snapshot) = session.running_sandbox_snapshot().await
+            {
+                error.message = format!("{}; {snapshot}", error.message).into();
+                let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(data) = data.as_object_mut() {
+                    data.insert("sandbox_snapshot".to_owned(), serde_json::json!(snapshot));
                 }
             }
             result
