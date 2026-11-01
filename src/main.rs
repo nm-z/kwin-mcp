@@ -9288,7 +9288,59 @@ fn detect_browsers() -> Vec<String> {
         .collect()
 }
 
+/// The first `wayland-N` socket in `runtime` that still accepts a connection.
+fn live_wayland_socket(runtime: &Path) -> Option<std::ffi::OsString> {
+    let mut numbered: Vec<(u32, std::ffi::OsString)> = std::fs::read_dir(runtime)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let number = name.to_str()?.strip_prefix("wayland-")?.parse::<u32>().ok()?;
+            Some((number, name))
+        })
+        .collect();
+    numbered.sort();
+    numbered
+        .into_iter()
+        .map(|(_, name)| name)
+        .find(|name| std::os::unix::net::UnixStream::connect(runtime.join(name)).is_ok())
+}
+
+/// The host desktop's Wayland socket. logind says which session is the user's
+/// active desktop, but it is a hint: a worker in a confined environment cannot
+/// reach it, and a desktop started outside a logind graphical session is not
+/// listed as one. Either way the desktop's socket sits in the runtime directory,
+/// so look there before giving up.
 async fn host_wayland() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
+    use std::os::unix::fs::MetadataExt;
+    let logind_error = match host_wayland_via_logind().await {
+        Ok(found) => return Ok(found),
+        Err(error) => error,
+    };
+    let runtime = match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime),
+        None => PathBuf::from(format!(
+            "/run/user/{}",
+            std::fs::metadata("/proc/self")?.uid()
+        )),
+    };
+    match live_wayland_socket(&runtime) {
+        Some(display) => {
+            eprintln!(
+                "viewer: {logind_error:#}; using {} in {} instead",
+                display.to_string_lossy(),
+                runtime.display()
+            );
+            Ok((runtime, display))
+        }
+        None => Err(logind_error.context(format!(
+            "{} has no live wayland-N socket either",
+            runtime.display()
+        ))),
+    }
+}
+
+async fn host_wayland_via_logind() -> anyhow::Result<(PathBuf, std::ffi::OsString)> {
     use std::os::unix::fs::FileTypeExt;
     let (inherited_display, inherited_runtime) = (
         std::env::var_os("WAYLAND_DISPLAY"),
@@ -19613,6 +19665,28 @@ mod file_content_tests {
                 &mut Cursor::new(contents),
             )?);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_wayland_scan_tests {
+    use super::live_wayland_socket;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn the_live_numbered_socket_wins_over_stale_and_unrelated_names() -> std::io::Result<()> {
+        let runtime = std::env::temp_dir().join(format!("kwin-mcp-wayland-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime)?;
+        // A bound-then-dropped listener leaves a socket file nothing answers on.
+        drop(UnixListener::bind(runtime.join("wayland-0"))?);
+        let _live = UnixListener::bind(runtime.join("wayland-1"))?;
+        std::fs::write(runtime.join("wayland-0.lock"), [])?;
+        std::fs::write(runtime.join("wayland-x"), [])?;
+        let found = live_wayland_socket(&runtime);
+        std::fs::remove_dir_all(&runtime)?;
+        assert_eq!(found.as_deref(), Some(std::ffi::OsStr::new("wayland-1")));
+        assert_eq!(live_wayland_socket(&runtime), None);
         Ok(())
     }
 }
