@@ -15652,7 +15652,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_paste",
-        description = "Paste UTF-8 text into the focused application using the session clipboard and one Shift+Insert shortcut. Use this for fast long-text or terminal input; keyboard_type remains paced ASCII key input. Click or Tab into the target first. Leaves this text in the session clipboard and PRIMARY selection; the host clipboard is separate. Pasted newlines are clipboard content, not separate Return key presses, but the application may interpret them. Use keyboard_key Return when you intend to submit a terminal command. Reports clipboard length, shortcut submission, and compositor acknowledgement separately. Application text is always unverified by this tool, and form submission is not observed. Inspect the application or its output before retrying, because another paste can duplicate text or commands."
+        description = "Paste UTF-8 text into the focused application using the session clipboard and one Shift+Insert shortcut. Use this for fast long-text or terminal input; keyboard_type remains paced ASCII key input. Click or Tab into the target first. Leaves this text in the session clipboard and PRIMARY selection; the host clipboard is separate. Pasted newlines are clipboard content, not separate Return key presses, but the application may interpret them. Use keyboard_key Return when you intend to submit a terminal command. Reports clipboard length, shortcut submission, and compositor acknowledgement separately. The field is read before and after through accessibility: delivery.status is verified only when the pasted text appeared, otherwise unverified (terminals and fields AT-SPI cannot read), and form submission is not observed. Inspect the application or its output before retrying, because another paste can duplicate text or commands."
     )]
     async fn keyboard_paste(
         &self,
@@ -15673,6 +15673,7 @@ impl KwinMcp {
         let socket = sess.host_xdg_dir.join("wayland-0");
         let store = self.clipboards.clone();
         let text = params.text;
+        let pasted = text.clone();
         let length = tokio::task::spawn_blocking(move || {
             store
                 .lock()
@@ -15682,6 +15683,30 @@ impl KwinMcp {
         .await
         .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
         .map_err(KwinError::from)?;
+        // Read the focused field before pasting, as the paste shortcut of keyboard_key
+        // does, so the field can be read again afterwards and a paste that did not
+        // land is told apart from one that did.
+        let preparation = match active_window_info(
+            &sess.kwin_conn,
+            &sess.kwin_unique_name,
+            &sess.host_xdg_dir,
+        )
+        .await
+        {
+            Ok((_, _, geometry)) => {
+                prepare_paste_text(
+                    kwin_mcp::clipboard::ClipboardText::Text(pasted.into_bytes()),
+                    &sess.atspi_bus_address,
+                    &geometry.title,
+                    [geometry.x, geometry.y, geometry.w, geometry.h],
+                )
+                .await
+            }
+            Err(_) => PreparedPaste::Unavailable {
+                method: "paste_target_unobservable",
+                warning: "The active window could not be observed for paste verification. The native shortcut was still submitted.",
+            },
+        };
         let mut shortcut_submitted = false;
         let mut submission_complete = false;
         let sent: anyhow::Result<()> = async {
@@ -15719,10 +15744,7 @@ impl KwinMcp {
                 })),
             ));
         }
-        let delivery = input_bridge::TextDelivery::unavailable(
-            "the paste shortcut does not independently read back the application's value; a compositor acknowledgement does not prove that the application consumed the clipboard or submitted a form"
-                .to_owned(),
-        );
+        let delivery = finish_prepared_paste(preparation).await;
         drop(guard);
         self.mark_input().await;
         let result = structured_result(
@@ -15739,7 +15761,8 @@ impl KwinMcp {
                 "shortcut": KEYBOARD_PASTE_SHORTCUT,
                 "shortcut_submitted": true, "submission_complete": true,
                 "compositor_acknowledged": true, "retry_safe": false,
-                "application_text": "unverified", "form_submission": "not_observed",
+                "application_text": if delivery.status == "verified" { "verified" } else { "unverified" },
+                "form_submission": "not_observed",
                 "delivery": delivery, "elapsed_ms": started.elapsed().as_millis(),
             }),
         )
