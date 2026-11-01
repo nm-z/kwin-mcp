@@ -15175,6 +15175,7 @@ impl KwinMcp {
             &sess.atspi_bus_address,
             &active.title,
             [active.x, active.y, active.w, active.h],
+            Some([active.cx, active.cy]),
             &params.text,
         )
         .await;
@@ -15267,6 +15268,7 @@ impl KwinMcp {
                         &sess.atspi_bus_address,
                         &active.title,
                         [active.x, active.y, active.w, active.h],
+                        None,
                         "",
                     )
                     .await;
@@ -17087,7 +17089,7 @@ async fn prepare_paste_text(
             warning: "The clipboard did not provide supported UTF-8 text for editable-value verification.",
         };
     };
-    match input_bridge::TextReceipt::capture_paste(address, title, bounds, &text).await {
+    match input_bridge::TextReceipt::capture_paste(address, title, bounds, None, &text).await {
         Ok(receipt) => PreparedPaste::Ready(receipt),
         Err(_) => PreparedPaste::Unavailable {
             method: "paste_target_unobservable",

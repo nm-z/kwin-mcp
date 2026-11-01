@@ -1073,6 +1073,75 @@ async fn descendant_text_snapshot(
     })
 }
 
+/// The focused, editable, showing field under `point` inside `container`, found
+/// by hit-testing instead of walking everything below it. Providers differ in
+/// whether a hit test returns the deepest node or a direct child, so it is
+/// repeated until it stops changing.
+async fn focused_editable_at(
+    bus: &zbus::Connection,
+    container: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    point: [f64; 2],
+) -> Option<atspi::ObjectRefOwned> {
+    use atspi::proxy::accessible::ObjectRefExt;
+    use atspi::proxy::proxy_ext::ProxyExt;
+    const MAX_HIT_TESTS: usize = 8;
+    #[expect(clippy::as_conversions, reason = "AT-SPI hit tests take whole pixels")]
+    let (x, y) = (point[0].round() as i32, point[1].round() as i32);
+    let identity = |object: &atspi::ObjectRefOwned| {
+        (
+            object.name().map(ToString::to_string),
+            object.path().to_string(),
+        )
+    };
+    let mut current = container
+        .proxies()
+        .await
+        .ok()?
+        .component()
+        .await
+        .ok()?
+        .get_accessible_at_point(x, y, atspi::CoordType::Screen)
+        .await
+        .ok()?;
+    for _ in 0..MAX_HIT_TESTS {
+        // The proxy borrows `current`, so it lives in this block and only owned
+        // values leave it.
+        let (is_target, next) = {
+            let proxy = current.as_accessible_proxy(bus).await.ok()?;
+            let states = proxy.get_state().await.ok()?;
+            let is_target = states.contains(atspi::State::Focused)
+                && states.contains(atspi::State::Editable)
+                && states.contains(atspi::State::Showing);
+            let next = if is_target {
+                None
+            } else {
+                Some(
+                    proxy
+                        .proxies()
+                        .await
+                        .ok()?
+                        .component()
+                        .await
+                        .ok()?
+                        .get_accessible_at_point(x, y, atspi::CoordType::Screen)
+                        .await
+                        .ok()?,
+                )
+            };
+            (is_target, next)
+        };
+        if is_target {
+            return Some(current);
+        }
+        let next = next?;
+        if identity(&next) == identity(&current) {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
 pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
@@ -1388,22 +1457,26 @@ where
 }
 
 impl TextReceipt {
+    /// `pointer` is the cursor's screen position: typing usually follows a click, so
+    /// the focused field is looked for there before the whole page is walked.
     pub async fn capture(
         address: &str,
         title: &str,
         bounds: [f64; 4],
+        pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
         if input.contains(['\t', '\n']) {
             anyhow::bail!("Tab or Return may change focus or submit the field");
         }
-        Self::capture_paste(address, title, bounds, input).await
+        Self::capture_paste(address, title, bounds, pointer, input).await
     }
 
     pub async fn capture_paste(
         address: &str,
         title: &str,
         bounds: [f64; 4],
+        pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
         if title.is_empty() {
@@ -1411,7 +1484,7 @@ impl TextReceipt {
         }
         tokio::time::timeout(
             TEXT_DISCOVERY_TIMEOUT,
-            Self::discover(address, title, bounds, input),
+            Self::discover(address, title, bounds, pointer, input),
         )
         .await
         .map_err(|_| anyhow::anyhow!("focused text discovery timed out"))?
@@ -1421,6 +1494,7 @@ impl TextReceipt {
         address: &str,
         title: &str,
         bounds: [f64; 4],
+        pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
         use atspi::proxy::accessible::ObjectRefExt;
@@ -1500,8 +1574,20 @@ impl TextReceipt {
                     let Ok(node) = object.as_accessible_proxy(&bus).await else {
                         continue;
                     };
-                    let inside_web_document =
-                        inside_web_document || node.get_role().await? == atspi::Role::DocumentWeb;
+                    let is_web_document = node.get_role().await? == atspi::Role::DocumentWeb;
+                    // A page can hold tens of thousands of nodes, and the walk costs
+                    // several D-Bus calls each. The toolbar has been visited by now
+                    // (so its focus wins a stale page focus); look under the pointer
+                    // for the focused field before descending into the page.
+                    if is_web_document
+                        && !inside_web_document
+                        && let Some(pointer) = pointer
+                        && let Some(candidate) = focused_editable_at(&bus, &node, pointer).await
+                    {
+                        stack.push((candidate, true));
+                        continue;
+                    }
+                    let inside_web_document = inside_web_document || is_web_document;
                     let states = node.get_state().await?;
                     // Konsole's focused terminal does not report Editable. Its
                     // hidden plugin widgets can also report Focused/Showing,
@@ -2067,7 +2153,7 @@ mod null_ref_tests {
             .serve_at("/org/a11y/atspi/accessible/root", NullRegistry)?
             .build()
             .await?;
-        let Err(error) = TextReceipt::capture(&address, "Some Window", [0.0; 4], "x").await
+        let Err(error) = TextReceipt::capture(&address, "Some Window", [0.0; 4], None, "x").await
         else {
             anyhow::bail!("an empty accessibility tree produced a focused field");
         };
