@@ -21,7 +21,7 @@ The optional [KWin MCP skill](skills/kwin-mcp/SKILL.md) helps Codex choose betwe
 | `browser_navigate` | Open a URL in the focused Chromium-family window: ctrl+l, type it, Delete (drops the address bar's inline completion), Return. Returns the new window title, and the page `url` when CDP is connected (`matched: false` plus a warning if it is not the address typed). |
 | `mouse_click_element` | Find an element by name/role at click time (as `find_ui_elements`) and click the center of its bounds; `index` picks among several. For pages whose layout shifts between steps. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
-| `mouse_scroll` | Scroll at window-relative coordinates. |
+| `mouse_scroll` | Scroll at window-relative coordinates. Reports `view_changed` (false at the end of the content), and with CDP `scroll_y`, `scroll_max_y`, `at_end`. |
 | `mouse_drag` | Drag from one window-relative position to another. |
 | `keyboard_type` | Type a string of text. The result names the window that received the keys (`window`: id, title, `resourceClass`, pid, `hidden`), so text sent to a terminal running a full-screen program or to a hidden window can be told from lost input. |
 | `keyboard_paste` | Paste UTF-8 text through the session clipboard with an acknowledged shortcut. |
