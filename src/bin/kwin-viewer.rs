@@ -64,11 +64,11 @@ const AXIS_HORIZONTAL: u32 = 1;
 
 const NUMLOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
-// Bound on a clipboard owner answering one read, and on the compositor
-// applying a selection.
 // How long after a viewer copy chord the session's next selection change is
-// taken as that copy.
-const COPY_TIMEOUT: Duration = Duration::from_secs(1);
+// taken as that copy. A memory-throttled browser can take seconds to answer
+// Ctrl+C; the next clipboard shortcut ends the wait early.
+const COPY_TIMEOUT: Duration = Duration::from_secs(10);
+const COPY_POLL: Duration = Duration::from_millis(100);
 // A viewer paste hands the agent's selection back after the pasting app has
 // been quiet this long, or after PASTE_TIMEOUT if it never reads.
 const PASTE_SETTLE: Duration = Duration::from_millis(200);
@@ -534,27 +534,47 @@ struct ClipboardBridge {
     host: Arc<Clipboard>,
     isolated: Arc<Clipboard>,
     restore: Option<JoinHandle<()>>,
+    // Set by the next chord so a pending copy wait stops instead of blocking it.
+    superseded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClipboardBridge {
     // Runs before the chord's key press reaches the session.
     fn before(&mut self, chord: ClipChord) -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        self.superseded.store(true, Ordering::Relaxed);
         if let Some(restore) = self.restore.take()
             && restore.join().is_err()
         {
             eprintln!("kwin-viewer: clipboard restore thread panicked");
         }
+        self.superseded = Arc::new(AtomicBool::new(false));
         let agent = self.isolated.read()?;
         let isolated = Arc::clone(&self.isolated);
         let restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send> = match chord {
             ClipChord::Copy => {
                 let host = Arc::clone(&self.host);
                 let before = isolated.generation()?;
+                let superseded = Arc::clone(&self.superseded);
+                let pressed = Instant::now();
                 Box::new(move || {
-                    if isolated.wait_for_change(before, COPY_TIMEOUT)? {
-                        host.write(isolated.read()?)?;
-                        isolated.write(agent)?;
+                    while !isolated.wait_for_change(before, COPY_POLL)? {
+                        if superseded.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        if pressed.elapsed() >= COPY_TIMEOUT {
+                            eprintln!(
+                                "kwin-viewer: copy shortcut: the session clipboard did not change within {COPY_TIMEOUT:?}; the host clipboard is unchanged"
+                            );
+                            return Ok(());
+                        }
                     }
+                    host.write(isolated.read()?)?;
+                    isolated.write(agent)?;
+                    eprintln!(
+                        "kwin-viewer: copy shortcut: sent the session selection to the host clipboard after {} ms",
+                        pressed.elapsed().as_millis()
+                    );
                     Ok(())
                 })
             }
@@ -795,6 +815,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
             &shutdown,
         )?),
         restore: None,
+        superseded: Arc::default(),
     };
 
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
