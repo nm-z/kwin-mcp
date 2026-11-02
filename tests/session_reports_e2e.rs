@@ -18,6 +18,7 @@
 //!   ui_name_whitespace (#633) an accessible name with a non-breaking space matches a normal-space query
 //!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
 //!   viewer_copy (#840) text copied with Ctrl+C in a viewer reaches the viewer host's clipboard
+//!   reaped_viewer_reload (#842) input works after a reload that follows the viewer's exit
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -66,6 +67,10 @@ impl Server {
     }
 
     fn start_with_env(flags: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::start_from(&server_program(), flags, env)
+    }
+
+    fn start_from(program: &Path, flags: &[&str], env: &[(&str, &str)]) -> Self {
         let root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/tmp"));
@@ -74,8 +79,6 @@ impl Server {
             std::fs::create_dir_all(home.join(directory)).expect("create private HOME");
         }
         let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
-        let program = std::env::var("KWIN_MCP_E2E_SERVER")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned());
         let mut command = Command::new(program);
         command
             .args(flags)
@@ -978,5 +981,102 @@ fn viewer_copy() {
     assert!(
         copied.is_some(),
         "text copied in the viewer did not reach the viewer host's clipboard; viewer log:\n{log}"
+    );
+}
+
+fn server_program() -> PathBuf {
+    std::env::var_os("KWIN_MCP_E2E_SERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp")))
+}
+
+#[test]
+#[ignore = "needs a real KDE session and bubblewrap"]
+fn reaped_viewer_reload() {
+    require_e2e();
+    // The outer session hosts the viewer window, so no viewer opens on the
+    // desktop running the test.
+    let mut outer = Server::start(&["--autoclean"]);
+    let outer_started = outer.start_session(json!({"width":1600, "height":1000}));
+    let outer_wayland = format!(
+        "{}/wayland-0",
+        outer_started["host_shared_dir"]
+            .as_str()
+            .expect("outer host_shared_dir")
+    );
+    // A private copy of the server, so touching it reloads only this server.
+    let source = server_program();
+    let bin = std::env::temp_dir().join(format!("ksr-reload-{}", nonce()));
+    std::fs::create_dir_all(&bin).expect("create private bin");
+    let program = bin.join("kwin-mcp");
+    std::fs::copy(&source, &program).expect("copy kwin-mcp");
+    std::fs::copy(
+        source.with_file_name("kwin-viewer"),
+        bin.join("kwin-viewer"),
+    )
+    .expect("copy kwin-viewer");
+    let program_text = program.display().to_string();
+    let mut inner = Server::start_from(
+        &program,
+        &["--autoclean"],
+        &[
+            ("WAYLAND_DISPLAY", &outer_wayland),
+            ("KWIN_MCP_BINARY", &program_text),
+        ],
+    );
+    let inner_started = inner.start_session(json!({"width":1280, "height":720}));
+    let workdir = inner_started["host_shared_dir"]
+        .as_str()
+        .expect("inner host_shared_dir")
+        .to_owned();
+    // A window for the click to land in.
+    inner.data(
+        "launch_app",
+        json!({"command":"konsole", "window_timeout_seconds":30}),
+    );
+    let opened = inner.data("viewer_open", json!({}));
+    let viewer = wait_until(20, "the viewer process", || {
+        let found = Command::new("pgrep")
+            .args(["-f", &format!("kwin-viewer {workdir} ")])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&found.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
+    // The viewer exits on its own (window closed); the server's reaper
+    // collects it while still holding its handle.
+    let killed = Command::new("kill")
+        .arg(viewer.to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "kill viewer {viewer}: {opened}");
+    wait_until(20, "the server to reap the viewer", || {
+        (!Path::new(&format!("/proc/{viewer}")).exists()).then_some(())
+    });
+    // A new binary at the watched path re-executes the server in place.
+    // A running executable cannot be opened for writing; its owner can still
+    // set its times through a read-only handle.
+    std::fs::File::open(&program)
+        .and_then(|file| file.set_modified(SystemTime::now()))
+        .expect("touch the server binary");
+    let server = inner.child.id();
+    wait_until(60, "the server to re-execute", || {
+        std::fs::read(format!("/proc/{server}/environ"))
+            .ok()?
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"KWIN_MCP_RESUME_FD="))
+            .then_some(())
+    });
+    inner.windows();
+    let clicked = inner.call("mouse_click", json!({"x":10, "y":10}));
+    let _ = std::fs::remove_dir_all(&bin);
+    assert!(
+        clicked["error"].is_null() && clicked["result"]["isError"] != json!(true),
+        "input after a reload that followed the viewer's exit failed: {}",
+        failure_text(&clicked)
     );
 }
