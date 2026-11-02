@@ -2909,8 +2909,20 @@ impl InputLog {
         use std::os::unix::fs::OpenOptionsExt;
         let resume = saved_path.is_some();
         let mut path = saved_path.unwrap_or_else(|| input_log_path(session_id));
+        // Name the path: a HOME that belongs to another user (sudo keeps
+        // root's) otherwise fails as a bare "Permission denied" (#838).
+        let context = |what: &str, at: &Path, error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{what} {} for the session input log (HOME or XDG_STATE_HOME decides where): {error}",
+                    at.display()
+                ),
+            )
+        };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| context("create directory", parent, error))?;
         }
         let mut options = std::fs::OpenOptions::new();
         options
@@ -2922,9 +2934,11 @@ impl InputLog {
             Err(error) if !resume && error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let (_, wall) = input_clock()?;
                 path.set_file_name(format!("{session_id}-{wall}.jsonl"));
-                options.open(&path)?
+                options
+                    .open(&path)
+                    .map_err(|error| context("create", &path, error))?
             }
-            result => result?,
+            result => result.map_err(|error| context("open", &path, error))?,
         };
         Ok(Arc::new(Self {
             path,
@@ -23349,6 +23363,34 @@ mod browser_alias_tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(String::from_utf8_lossy(&aliased.stdout).trim(), "stub-ran");
         assert_eq!(missing.status.code(), Some(127));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod input_log_path_tests {
+    use super::{InputHistory, InputLog};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_denied_input_log_directory_names_its_path() -> std::io::Result<()> {
+        let locked = std::env::temp_dir().join(format!("kwin-mcp-locked-{}", std::process::id()));
+        std::fs::create_dir_all(&locked)?;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))?;
+        let target = locked.join("state/kwin-mcp/input/s1-1.jsonl");
+        let result = InputLog::open("s1-1", InputHistory::default(), Some(target));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::remove_dir_all(&locked)?;
+        let Err(error) = result else {
+            // Root ignores directory permissions; nothing to check there.
+            return Ok(());
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&locked.join("state").display().to_string())
+                && message.contains("input log"),
+            "{message}"
+        );
         Ok(())
     }
 }
