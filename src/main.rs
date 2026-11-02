@@ -15827,13 +15827,31 @@ impl KwinMcp {
             for app_obj in root.get_children().await.map_err(KwinError::from)? {
                 let Ok(app) = app_obj.as_accessible_proxy(&bus).await else { continue; };
                 let app_name = app.name().await.unwrap_or_default();
+                let mut frames = Vec::new();
                 for frame_obj in app.get_children().await.unwrap_or_default() {
                     let Ok(frame) = frame_obj.as_accessible_proxy(&bus).await else { continue; };
                     let Ok(frame_node) = atspi_node(&frame).await else { continue; };
                     let associated = find_ui_frame_window(&windows, &frame_node.name, frame_node.bounds);
+                    let provider = (frame.inner().destination().to_string(), frame.inner().path().to_string());
+                    drop(frame);
+                    frames.push((frame_obj, provider, frame_node, associated));
+                }
+                // A Chrome menu or extension popup is an untitled frame of the same
+                // application with no KWin window of its own (#836). It reports screen
+                // coordinates like the frame of the active window it opened from.
+                let parent = frames.iter().find_map(|(_, _, node, window)| {
+                    window
+                        .filter(|window| window.active && find_ui_frame_aligned(window, node.bounds))
+                        .map(|window| (window, node.bounds))
+                });
+                for (frame_obj, (bus_name, frame_path), frame_node, associated) in frames {
+                    let popup = associated.is_none() && frame_node.name.is_empty() && parent.is_some();
+                    let (associated, origin) = match parent {
+                        Some((window, bounds)) if popup => (Some(window), bounds),
+                        _ => (associated, frame_node.bounds),
+                    };
                     let surface = serde_json::json!({"application":app_name,"frame_title":frame_node.name,
-                        "frame_screen_bounds":frame_node.bounds,"bus":frame.inner().destination().to_string(),
-                        "frame_path":frame.inner().path().to_string()});
+                        "frame_screen_bounds":frame_node.bounds,"bus":bus_name,"frame_path":frame_path});
                     // Each entry carries the index of the nearest matched ancestor, so a
                     // match inside a matched element is counted there, not listed again.
                     let mut stack = vec![(frame_obj, None::<usize>)];
@@ -15854,7 +15872,22 @@ impl KwinMcp {
                                 let count = elements[ancestor]["children_matched"].as_u64().unwrap_or(0);
                                 elements[ancestor]["children_matched"] = serde_json::json!(count + 1);
                             } else {
-                                let mut matched = find_ui_native_match(&node, associated, &windows, frame_node.bounds);
+                                // Popup nodes omit the Visible state; inside the shown popup
+                                // frame, they are on screen.
+                                let mut node = node;
+                                let (x, y, w, h) = node.bounds;
+                                let (fx, fy, fw, fh) = frame_node.bounds;
+                                if popup
+                                    && x + w / 2 >= fx && y + h / 2 >= fy
+                                    && x + w / 2 < fx + fw && y + h / 2 < fy + fh
+                                    && !node.states.iter().any(|state| state == "visible")
+                                {
+                                    node.states.push("visible".to_owned());
+                                }
+                                let mut matched = find_ui_native_match(&node, associated, &windows, origin);
+                                if popup {
+                                    matched["window_association"] = serde_json::json!("popup_of_active_window");
+                                }
                                 if !visible_only || matched["visible"] == true {
                                     matched["surface"] = surface.clone();
                                     matched["object_path"] = serde_json::json!(acc.inner().path().to_string());

@@ -19,6 +19,7 @@
 //!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
 //!   viewer_copy (#840) text copied with Ctrl+C in a viewer reaches the viewer host's clipboard
 //!   reaped_viewer_reload (#842) input works after a reload that follows the viewer's exit
+//!   extension_popup (#836) a Chrome extension popup is in window_list and its button is clickable by bounds
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -1077,6 +1078,106 @@ fn reaped_viewer_reload() {
     assert!(
         clicked["error"].is_null() && clicked["result"]["isError"] != json!(true),
         "input after a reload that followed the viewer's exit failed: {}",
+        failure_text(&clicked)
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn extension_popup() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let started = server.start_session(json!({"width":1280, "height":800}));
+    let shared = PathBuf::from(
+        started["host_shared_dir"]
+            .as_str()
+            .expect("host_shared_dir"),
+    );
+    let extension = shared.join("ext836");
+    std::fs::create_dir_all(&extension).expect("create extension");
+    std::fs::write(
+        extension.join("manifest.json"),
+        r#"{"manifest_version":3,"name":"Popup836","version":"1","action":{"default_popup":"popup.html"}}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        extension.join("popup.html"),
+        r#"<!doctype html><body style="width:260px;height:180px;margin:0"><button style="width:240px;height:60px;margin:10px">Mark clicked</button></body>"#,
+    )
+    .expect("write popup");
+    server.data(
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --user-data-dir=$HOME/chrome-ext-{} about:blank", nonce()),
+               "window_timeout_seconds":40}),
+    );
+    server.data("browser_navigate", json!({"url":"chrome://extensions"}));
+    server.data(
+        "mouse_click_element",
+        json!({"query":"Developer mode", "role":"toggle button"}),
+    );
+    server.data(
+        "mouse_click_element",
+        json!({"query":"Load unpacked", "role":"button"}),
+    );
+    wait_until(20, "Chrome's folder chooser", || {
+        server.windows()["windows"]
+            .as_array()?
+            .iter()
+            .any(|window| window["title"] == json!("Select the extension directory."))
+            .then_some(())
+    });
+    server.data("keyboard_key", json!({"key":"ctrl+l"}));
+    server.data(
+        "keyboard_type",
+        json!({"text":format!("{}/", extension.display()), "speed":3}),
+    );
+    // The chooser's top-right Open accepts the folder (README, Chrome Load unpacked).
+    server.data("mouse_click", json!({"x":1240, "y":26}));
+    std::thread::sleep(Duration::from_secs(2));
+    // Toolbar Extensions button, then the Popup836 row of its menu. The
+    // menu is a popup surface too; the window sits at (0, 0), so its screen
+    // bounds are also window pixels for opening it.
+    server.data(
+        "mouse_click_element",
+        json!({"query":"Extensions", "role":"button", "exact":true}),
+    );
+    let row = wait_until(10, "the Popup836 menu row", || {
+        let found = server.data(
+            "find_ui_elements",
+            json!({"query":"Popup836", "role":"button", "exact":true}),
+        );
+        found["elements"].as_array()?.first().cloned()
+    });
+    let center = |bounds: &Value, axis: &str, size: &str| {
+        let start = bounds[axis].as_f64().expect("bound");
+        let length = bounds[size].as_f64().expect("bound");
+        format!("{:.0}", start + length / 2.0)
+            .parse::<i64>()
+            .expect("integer pixel")
+    };
+    server.data(
+        "mouse_click",
+        json!({"x":center(&row["bounds"], "x", "w"), "y":center(&row["bounds"], "y", "h")}),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let windows = server.windows();
+    let found = server.data("find_ui_elements", json!({"query":"Mark clicked"}));
+    let button = found["elements"]
+        .as_array()
+        .and_then(|elements| elements.first())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        button["mouse_coordinates_usable"] == json!(true),
+        "the popup's button has no clickable bounds: {found}\nwindows: {windows}"
+    );
+    let clicked = server.call(
+        "mouse_click_element",
+        json!({"query":"Mark clicked", "role":"button"}),
+    );
+    assert!(
+        clicked["error"].is_null() && clicked["result"]["isError"] != json!(true),
+        "mouse_click_element could not click the popup's button: {}",
         failure_text(&clicked)
     );
 }
