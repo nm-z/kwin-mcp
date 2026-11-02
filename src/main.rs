@@ -2021,6 +2021,8 @@ fn screenshot_tool_timeout(pressured: bool) -> Duration {
 // Percent of compared dialog pixels that may differ between the composited
 // screen and the window capture before a screenshot is rejected.
 const TRANSIENT_MISMATCH_PERCENT: u64 = 1;
+// Per-channel difference two captures of the same pixels may show.
+const TRANSIENT_CHANNEL_TOLERANCE: u8 = 2;
 // How long screenshot recaptures a dialog missing from the composited screen.
 const TRANSIENT_CAPTURE_WAIT: Duration = Duration::from_secs(2);
 // A click that closes one window leaves KWin without an active window until
@@ -8970,7 +8972,13 @@ fn compare_transient_capture(
                 continue;
             }
             compared += 1;
-            if a[..3] != b[..3] {
+            // The two capture paths can round a blended pixel one or two units
+            // apart (#847); a different window's pixels differ by far more.
+            if a[..3]
+                .iter()
+                .zip(&b[..3])
+                .any(|(screen, window)| screen.abs_diff(*window) > TRANSIENT_CHANNEL_TOLERANCE)
+            {
                 mismatches += 1;
                 if samples.len() < 4 {
                     samples.push(serde_json::json!({"x": x, "y": y, "screen": [a[0], a[1], a[2], a[3]], "window": [b[0], b[1], b[2], b[3]]}));
@@ -23407,5 +23415,45 @@ mod input_log_path_tests {
             "{message}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transient_capture_tests {
+    use super::compare_transient_capture;
+
+    fn frame(fill: impl Fn(u32, u32) -> [u8; 4]) -> super::Frame {
+        let (w, h) = (200_u32, 200_u32);
+        let mut bytes = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                bytes.extend_from_slice(&fill(x, y));
+            }
+        }
+        (w, h, w * 4, bytes)
+    }
+
+    #[test]
+    fn a_one_unit_rendering_difference_is_the_same_dialog() {
+        // A hovered row composites one unit off from the window's own capture (#847).
+        let reference = frame(|_, _| [170, 128, 48, 255]);
+        let composite = frame(|_, y| {
+            if (50..110).contains(&y) {
+                [169, 127, 48, 255]
+            } else {
+                [170, 128, 48, 255]
+            }
+        });
+        let compared = compare_transient_capture(&composite, &reference, (0, 0), (200, 200), &[]);
+        assert!(compared.is_ok(), "{compared:?}");
+        // Other content under the dialog's identity still fails.
+        let parent = frame(|_, y| {
+            if (50..110).contains(&y) {
+                [30, 30, 30, 255]
+            } else {
+                [170, 128, 48, 255]
+            }
+        });
+        assert!(compare_transient_capture(&parent, &reference, (0, 0), (200, 200), &[]).is_err());
     }
 }
