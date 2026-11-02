@@ -381,8 +381,9 @@ KWin and D-Bus processes, even if another descendant keeps stdin open. The
 watcher and session scope identity survive hot reload. Normal stdin EOF,
 `session_stop`, and startup cancellation use the same scope cleanup path.
 
-Each new sandbox runs in a systemd user scope with `MemoryHigh=3G`,
-`MemoryMax=4G`, and `MemorySwapMax=1G`. Startup fails if the user manager
+Each new sandbox runs in a systemd user scope with `MemoryHigh=6G`,
+`MemoryMax=8G`, and `MemorySwapMax=2G`, enough for Chrome on a real profile
+with about 15 tabs (#839); smaller caps throttled every call there. Startup fails if the user manager
 cannot create a scope. The limits cover the sandbox and its applications;
 the host viewer and MCP server remain outside that scope.
 

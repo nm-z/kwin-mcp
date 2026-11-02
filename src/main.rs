@@ -18056,9 +18056,9 @@ fn parse_cli_args() -> Result<DisplayConfig, String> {
 }
 
 const GIB_BYTES: u64 = 1 << 30;
-const DEFAULT_MEMORY_HIGH: u64 = 3 * GIB_BYTES;
-const DEFAULT_MEMORY_MAX: u64 = 4 * GIB_BYTES;
-const DEFAULT_MEMORY_SWAP_MAX: u64 = GIB_BYTES;
+const DEFAULT_MEMORY_HIGH: u64 = 6 * GIB_BYTES;
+const DEFAULT_MEMORY_MAX: u64 = 8 * GIB_BYTES;
+const DEFAULT_MEMORY_SWAP_MAX: u64 = 2 * GIB_BYTES;
 
 fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<DisplayConfig, String> {
     let mut cfg = DisplayConfig {
@@ -21204,24 +21204,26 @@ mod memory_limit_tests {
     #[test]
     fn default_session_retains_hard_limits_when_throttling_is_disabled() -> Result<(), String> {
         let default = parse_cli_args_from(std::iter::empty())?;
-        assert_eq!(default.memory_high, Some(3 * GIB_BYTES));
-        assert_eq!(default.memory_max, 4 * GIB_BYTES);
-        assert_eq!(default.memory_swap_max, GIB_BYTES);
+        // Chrome on a real profile with about 15 tabs needs more than 4 GiB (#839).
+        assert_eq!(default.memory_high, Some(6 * GIB_BYTES));
+        assert_eq!(default.memory_max, 8 * GIB_BYTES);
+        assert_eq!(default.memory_swap_max, 2 * GIB_BYTES);
         let disabled = parse_cli_args_from(
             ["--memory-high", "0", "--memory-swap-max", "0"]
                 .map(str::to_owned)
                 .into_iter(),
         )?;
         assert_eq!(disabled.memory_high, None);
-        assert_eq!(disabled.memory_max, 4 * GIB_BYTES);
+        assert_eq!(disabled.memory_max, 8 * GIB_BYTES);
         assert_eq!(disabled.memory_swap_max, 0);
         Ok(())
     }
 
     #[test]
     fn larger_gateway_requires_an_explicit_hard_limit() -> Result<(), String> {
+        // A threshold above the default hard limit needs an explicit one.
         assert!(
-            parse_cli_args_from(["--memory-high", "8"].map(str::to_owned).into_iter()).is_err()
+            parse_cli_args_from(["--memory-high", "9"].map(str::to_owned).into_iter()).is_err()
         );
         let gateway = parse_cli_args_from(
             [
