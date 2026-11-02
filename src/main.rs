@@ -7030,7 +7030,12 @@ impl KwinMcp {
                 }
                 Ok(())
             }
+            // ECHILD: a child survives re-exec, so this pid was already reaped.
             Some(Ok(Some(_))) => {
+                session.viewer_child.take();
+                Ok(())
+            }
+            Some(Err(error)) if error.raw_os_error() == Some(nix::libc::ECHILD) => {
                 session.viewer_child.take();
                 Ok(())
             }
@@ -20675,7 +20680,7 @@ impl SessionRouter {
                     .iter()
                     .map(SessionProcess::id)
                     .collect(),
-                viewer: session.viewer_child.as_ref().map(SessionProcess::id),
+                viewer: session.viewer_child.as_ref().filter(|viewer| viewer.status.is_none()).map(SessionProcess::id),
                 kwin_unique: session.kwin_unique_name.clone(),
                 service_bus: session.service_bus_address.clone(),
                 atspi_bus: session.atspi_bus_address.clone(),
