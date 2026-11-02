@@ -19,7 +19,8 @@
 //!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
 //!   viewer_copy (#840) text copied with Ctrl+C in a viewer reaches the viewer host's clipboard
 //!   reaped_viewer_reload (#842) input works after a reload that follows the viewer's exit
-//!   extension_popup (#836) a Chrome extension popup is in window_list and its button is clickable by bounds
+//!   result_once (#808) a result is not sent again as a log notification
+//!   extension_popup (#836) a Chrome extension popup's button has clickable bounds
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -56,6 +57,8 @@ struct Server {
     home: PathBuf,
     next_id: u64,
     session: Option<String>,
+    /// `notifications/message` log notifications the server sent.
+    log_notices: usize,
 }
 
 impl Server {
@@ -129,6 +132,7 @@ impl Server {
             home,
             next_id: 0,
             session: None,
+            log_notices: 0,
         };
         let initialized = server.rpc(
             "initialize",
@@ -160,6 +164,9 @@ impl Server {
                 .responses
                 .recv_timeout(remaining)
                 .unwrap_or_else(|error| panic!("{method} #{id}: {error}"));
+            if response["method"] == json!("notifications/message") {
+                self.log_notices += 1;
+            }
             if response["id"] == json!(id) {
                 return response;
             }
@@ -1179,5 +1186,19 @@ fn extension_popup() {
         clicked["error"].is_null() && clicked["result"]["isError"] != json!(true),
         "mouse_click_element could not click the popup's button: {}",
         failure_text(&clicked)
+    );
+}
+
+#[test]
+#[ignore = "needs a real KDE session and bubblewrap"]
+fn result_once() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({}));
+    server.windows();
+    server.stop_session();
+    assert_eq!(
+        server.log_notices, 0,
+        "results were sent again as notifications/message log notifications"
     );
 }
