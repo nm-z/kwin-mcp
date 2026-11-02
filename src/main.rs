@@ -7488,17 +7488,13 @@ fn cursor_sprite() -> Option<&'static CursorSprite> {
 }
 
 async fn structured_result(
-    peer: &rmcp::Peer<rmcp::RoleServer>,
+    _peer: &rmcp::Peer<rmcp::RoleServer>,
     text: impl Into<String>,
     structured: serde_json::Value,
 ) -> CallToolResult {
+    // The result itself is what the caller reads; it is not re-sent as a log
+    // notification (#808).
     let s: String = text.into();
-    let _ = peer
-        .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
-            rmcp::model::LoggingLevel::Info,
-            serde_json::json!(s),
-        ))
-        .await;
     let mut r = CallToolResult::success(vec![Content::text(s)]);
     r.structured_content = Some(structured);
     r
@@ -7578,23 +7574,16 @@ async fn tree_result(
     );
     // The body key is dropped for a text-only client and set for the others.
     info.as_object_mut().map(|object| object.remove("tree"));
-    body_result(peer, ResultView::of_peer(peer), tree, summary, info, "tree").await
+    body_result(ResultView::of_peer(peer), tree, summary, info, "tree").await
 }
 
 async fn body_result(
-    peer: &rmcp::Peer<rmcp::RoleServer>,
     view: ResultView,
     body: String,
     summary: String,
     mut structured: serde_json::Value,
     body_key: &str,
 ) -> CallToolResult {
-    let _ = peer
-        .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
-            rmcp::model::LoggingLevel::Info,
-            serde_json::json!(summary),
-        ))
-        .await;
     let text = place_body(view, body, &summary, &mut structured, body_key);
     let mut result = CallToolResult::success(vec![Content::text(text)]);
     result.structured_content = Some(structured);
@@ -14473,7 +14462,6 @@ impl KwinMcp {
                 })?;
                 let length = text.chars().count();
                 return Ok(body_result(
-                    &peer,
                     ResultView::of_peer(&peer),
                     text,
                     format!("session clipboard: {length} characters (in structuredContent.text)"),
@@ -15376,12 +15364,6 @@ impl KwinMcp {
                 raw.meta = Some(meta);
             }
             let payload_text = serde_json::to_string(&payload).unwrap_or_else(|_| text.clone());
-            let _ = peer
-                .notify_logging_message(rmcp::model::LoggingMessageNotificationParam::new(
-                    rmcp::model::LoggingLevel::Info,
-                    serde_json::json!(text),
-                ))
-                .await;
             let mut result = CallToolResult::success(vec![
                 Content::text(text),
                 Content::text(payload_text),
