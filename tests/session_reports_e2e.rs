@@ -17,6 +17,7 @@
 //!   chooser_typing (#624) typing the location in Chrome's file chooser is not refused
 //!   ui_name_whitespace (#633) an accessible name with a non-breaking space matches a normal-space query
 //!   at_spi_launcher (#644) session_start finds the AT-SPI launcher outside PATH
+//!   viewer_copy (#840) text copied with Ctrl+C in a viewer reaches the viewer host's clipboard
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -61,6 +62,10 @@ impl Server {
     }
 
     fn start_with_path(flags: &[&str], path: Option<&str>) -> Self {
+        Self::start_with_env(flags, path.map(|path| ("PATH", path)).as_slice())
+    }
+
+    fn start_with_env(flags: &[&str], env: &[(&str, &str)]) -> Self {
         let root = std::env::var_os("KWIN_MCP_TEST_TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/tmp"));
@@ -91,8 +96,8 @@ impl Server {
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
             .env_remove("XAUTHORITY");
-        if let Some(path) = path {
-            command.env("PATH", path);
+        for (name, value) in env {
+            command.env(name, value);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -880,4 +885,98 @@ fn at_spi_launcher_outside_path() {
         "AT-SPI bus launcher was not found: {sandbox_log}"
     );
     let _ = server.stop_session();
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn viewer_copy() {
+    require_e2e();
+    // The outer session is the viewer's host desktop, so its clipboard is the
+    // one a viewer copy must reach.
+    let mut outer = Server::start(&["--autoclean"]);
+    let outer_started = outer.start_session(json!({"width":1600, "height":1000}));
+    let outer_wayland = format!(
+        "{}/wayland-0",
+        outer_started["host_shared_dir"]
+            .as_str()
+            .expect("outer host_shared_dir")
+    );
+    let mut inner =
+        Server::start_with_env(&["--autoclean"], &[("WAYLAND_DISPLAY", &outer_wayland)]);
+    let inner_started = inner.start_session(json!({"width":1280, "height":720}));
+    let marker = format!("viewer-copy-{}", nonce());
+    inner.data(
+        "launch_app",
+        json!({"command":format!("google-chrome-stable --user-data-dir=$HOME/chrome-{marker} 'data:text/html,<p style=font-size:40px>{marker}</p>'"),
+               "window_timeout_seconds":40}),
+    );
+    let opened = inner.data("viewer_open", json!({}));
+    assert!(
+        matches!(
+            opened["viewer"]["state"].as_str(),
+            Some("ready" | "starting")
+        ),
+        "viewer_open: {opened}"
+    );
+    let viewer_log = PathBuf::from(
+        inner_started["host_shared_dir"]
+            .as_str()
+            .expect("inner host_shared_dir"),
+    )
+    .join("viewer.log");
+    let mut windows = Value::Null;
+    let viewer = (0..60)
+        .find_map(|_| {
+            std::thread::sleep(Duration::from_millis(500));
+            windows = outer.windows();
+            windows["windows"]
+                .as_array()?
+                .iter()
+                .find(|window| {
+                    ["resourceClass", "title"].iter().any(|field| {
+                        window[*field]
+                            .as_str()
+                            .is_some_and(|text| text.contains("kwin-viewer"))
+                    })
+                })
+                .and_then(|window| window["id"].as_str().map(str::to_owned))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no viewer window in the outer session: {windows}\nviewer log:\n{}",
+                std::fs::read_to_string(&viewer_log).unwrap_or_default()
+            )
+        });
+    outer.data("window_activate", json!({"window_id":viewer}));
+    // The user's sequence: select the page text in the viewer, then Ctrl+C.
+    outer.data("mouse_click", json!({"x":400, "y":300}));
+    outer.data("keyboard_key", json!({"key":"ctrl+a"}));
+    // A loaded browser answers Ctrl+C late (#840): hold Chrome for two seconds
+    // so its copy lands well after the key reached it.
+    let chrome = |signal: &str| {
+        let status = Command::new("pkill")
+            .args([signal, "-f", &format!("chrome-{marker}")])
+            .status()
+            .expect("run pkill");
+        assert!(status.success(), "pkill {signal} found no Chrome process");
+    };
+    std::thread::sleep(Duration::from_secs(1));
+    chrome("-STOP");
+    outer.data("keyboard_key", json!({"key":"ctrl+c"}));
+    std::thread::sleep(Duration::from_secs(2));
+    chrome("-CONT");
+    let copied = (0..20).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(500));
+        let read = outer.call("clipboard_read", json!({}));
+        let text = read["result"]["structuredContent"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        text.contains(&marker).then_some(text)
+    });
+    let log = std::fs::read_to_string(&viewer_log).unwrap_or_default();
+    assert!(
+        copied.is_some(),
+        "text copied in the viewer did not reach the viewer host's clipboard; viewer log:\n{log}"
+    );
 }
