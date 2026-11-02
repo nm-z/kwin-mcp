@@ -21146,7 +21146,7 @@ mod file_content_tests {
 #[cfg(test)]
 mod host_wayland_scan_tests {
     use super::live_wayland_socket;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixDatagram, UnixListener};
 
     #[test]
     fn the_live_numbered_socket_wins_over_stale_and_unrelated_names() -> std::io::Result<()> {
@@ -21158,8 +21158,11 @@ mod host_wayland_scan_tests {
             .join(format!("kwin-mcp-wayland-scan-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(&runtime)?;
-        // A bound-then-dropped listener leaves a socket file nothing answers on.
-        drop(UnixListener::bind(runtime.join("wayland-0"))?);
+        // A socket file nothing answers a stream connect on, like a dead
+        // compositor's. It must never listen: a dropped listener stays open in
+        // any child another test has forked and not yet exec'd, and then
+        // answers (#845). Held open here to show that alone does not make it live.
+        let _stale = UnixDatagram::bind(runtime.join("wayland-0"))?;
         let _live = UnixListener::bind(runtime.join("wayland-1"))?;
         std::fs::write(runtime.join("wayland-0.lock"), [])?;
         std::fs::write(runtime.join("wayland-x"), [])?;
