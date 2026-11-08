@@ -1710,7 +1710,7 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
         "screenshot",
         json!({"session_id":sid,"inline":true,"region":[150,200,900,700],"include_cursor":false}),
     );
-    // The cursor is included unless asked otherwise, so only an omitted one is reported.
+    // Without save_as, the cursor is included unless asked otherwise.
     assert!(screenshot_meta(&before).get("include_cursor").is_none());
     assert_eq!(screenshot_meta(&hidden)["include_cursor"], false);
     assert_eq!(
@@ -1762,6 +1762,85 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
             .all(|rgba| rgba == background),
         "cursor-free static body contains unexpected pixels"
     );
+    // #854: a kept image must be clean by default, with both explicit
+    // overrides still honored. Compare actual PNG bytes, not just metadata.
+    // Cover full-window files, inline region crops, and cursor-centered crops.
+    for (shape, options) in [
+        ("region", json!({"inline":true,"region":[150,200,900,700]})),
+        ("full", json!({})),
+        ("cursor", json!({"inline":true,"cursor":true})),
+    ] {
+        let mut captures = Vec::new();
+        for (setting, include_cursor) in
+            [("off", Some(false)), ("on", Some(true)), ("default", None)]
+        {
+            let saved = client.home.join(format!("saved-{shape}-{setting}.png"));
+            let mut arguments = options.clone();
+            arguments["session_id"] = json!(sid);
+            arguments["save_as"] = json!(saved);
+            if let Some(include_cursor) = include_cursor {
+                arguments["include_cursor"] = json!(include_cursor);
+            }
+            id += 1;
+            let capture = call_tool(&mut client, id, "screenshot", arguments);
+            assert!(capture["error"].is_null(), "{capture}");
+            let metadata = if options["inline"] == true {
+                screenshot_meta(&capture)
+            } else {
+                capture["result"]["structuredContent"].clone()
+            };
+            let bytes = std::fs::read(&saved).expect("saved screenshot PNG");
+            assert_eq!(metadata["saved_as"], json!(saved));
+            assert_eq!(
+                bytes,
+                std::fs::read(metadata["path"].as_str().expect("workdir PNG path"))
+                    .expect("workdir PNG"),
+                "{shape}/{setting}: saved and workdir PNGs differ"
+            );
+            if options["inline"] == true {
+                use base64::Engine;
+                assert_eq!(
+                    bytes,
+                    base64::engine::general_purpose::STANDARD
+                        .decode(inline_png(&capture))
+                        .expect("inline saved screenshot"),
+                    "{shape}/{setting}: saved and inline PNGs differ"
+                );
+            }
+            if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
+                std::fs::create_dir_all(&proof).expect("create saved cursor evidence");
+                std::fs::write(proof.join(format!("saved-{shape}-{setting}.png")), &bytes)
+                    .expect("write saved cursor evidence");
+                std::fs::write(
+                    proof.join(format!("saved-{shape}-{setting}.json")),
+                    serde_json::to_vec_pretty(&metadata).expect("encode saved metadata"),
+                )
+                .expect("write saved metadata");
+            }
+            captures.push((bytes, metadata));
+        }
+        assert_ne!(
+            captures[0].0, captures[1].0,
+            "{shape}: explicit true drew no pointer"
+        );
+        assert!(
+            captures[0].0 == captures[2].0,
+            "{shape}: save_as default baked the pointer into the saved PNG"
+        );
+        assert_eq!(captures[0].1["include_cursor"], false);
+        assert!(captures[1].1.get("include_cursor").is_none());
+        assert_eq!(captures[2].1["include_cursor"], false);
+        if shape == "region" {
+            use base64::Engine;
+            assert_eq!(
+                captures[0].0,
+                base64::engine::general_purpose::STANDARD
+                    .decode(inline_png(&hidden))
+                    .expect("clean reference crop"),
+                "saved crop does not match the independently checked clean background"
+            );
+        }
+    }
     id += 1;
     call_tool(
         &mut client,
