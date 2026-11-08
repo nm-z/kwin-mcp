@@ -1,0 +1,291 @@
+[
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 5,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/beta"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 8,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/beta",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 27,
+          "text": "http://127.0.0.1:35905/beta"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 10,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/prefix-long"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 13,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/prefix-long",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 34,
+          "text": "http://127.0.0.1:35905/prefix-long"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 15,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/prefix"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 18,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/prefix",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 29,
+          "text": "http://127.0.0.1:35905/prefix"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 20,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/prefix?value=One"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 23,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/prefix?value=One",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 39,
+          "text": "http://127.0.0.1:35905/prefix?value=One"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 25,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/prefix?value=Two"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 28,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/prefix?value=Two",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 39,
+          "text": "http://127.0.0.1:35905/prefix?value=Two"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 30,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/delayed"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 33,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/delayed",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 30,
+          "text": "http://127.0.0.1:35905/delayed"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 35,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open). warning: landed on http://127.0.0.1:35905/delayed, not http://127.0.0.1:35905/download",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "matched": false,
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:35905/delayed",
+          "warning": "The page is not at the address that was typed; the address bar may have completed it from history."
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 38,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:35905/delayed",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 30,
+          "text": "http://127.0.0.1:35905/delayed"
+        }
+      }
+    }
+  }
+]

@@ -1,0 +1,492 @@
+[
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 5,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/beta",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/beta"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 8,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/beta",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 27,
+          "text": "http://127.0.0.1:38615/beta"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 10,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/prefix-long",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/prefix-long"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 13,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/prefix-long",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 34,
+          "text": "http://127.0.0.1:38615/prefix-long"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 15,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/prefix",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/prefix"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 18,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/prefix",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 29,
+          "text": "http://127.0.0.1:38615/prefix"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 20,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/prefix?value=One",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/prefix?value=One"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 23,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/prefix?value=One",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 39,
+          "text": "http://127.0.0.1:38615/prefix?value=One"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 25,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/prefix?value=Two",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/prefix?value=Two"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 28,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/prefix?value=Two",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 39,
+          "text": "http://127.0.0.1:38615/prefix?value=Two"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 30,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open)",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/delayed",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/delayed"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 33,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/delayed",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 30,
+          "text": "http://127.0.0.1:38615/delayed"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 35,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "Navigation submitted; destination not reached within eight seconds: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open). Inspect the current page before reading it or retrying.",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "matched": false,
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/download",
+          "retry_safe": false,
+          "status": "not_reached",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/delayed",
+          "warning": "The requested destination was not verified. Inspect the current page before reading it or retrying; navigation may still be pending or may have redirected."
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 38,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/delayed",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 30,
+          "text": "http://127.0.0.1:38615/delayed"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 40,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "Navigation submitted; destination not reached within eight seconds: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open). Inspect the current page before reading it or retrying.",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "matched": false,
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/redirect",
+          "retry_safe": false,
+          "status": "not_reached",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/elsewhere",
+          "warning": "The requested destination was not verified. Inspect the current page before reading it or retrying; navigation may still be pending or may have redirected."
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 43,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/elsewhere",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 32,
+          "text": "http://127.0.0.1:38615/elsewhere"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 45,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "Navigation submitted; destination not reached within eight seconds: navigation-fixture - Google Chrome (the title did not change: the page may still be loading, or it is the page that was already open). Inspect the current page before reading it or retrying.",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "matched": false,
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/query?value=New",
+          "retry_safe": false,
+          "status": "not_reached",
+          "title": "navigation-fixture - Google Chrome",
+          "title_changed": false,
+          "url": "http://127.0.0.1:38615/query?value=old",
+          "warning": "The requested destination was not verified. Inspect the current page before reading it or retrying; navigation may still be pending or may have redirected."
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 48,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/query?value=old",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 38,
+          "text": "http://127.0.0.1:38615/query?value=old"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "error": {
+        "code": -32602,
+        "data": {
+          "reason": "invalid_url",
+          "retry_safe": true
+        },
+        "message": "Nothing was typed: the url must be printable ASCII without spaces (percent-encode anything else)."
+      },
+      "id": 50,
+      "jsonrpc": "2.0"
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 53,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/query?value=old",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 38,
+          "text": "http://127.0.0.1:38615/query?value=old"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 56,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: navigation-fixture - Google Chrome",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "navigation_submitted": true,
+          "requested_url": "http://127.0.0.1:38615/after-new-tab",
+          "retry_safe": false,
+          "status": "verified",
+          "title": "navigation-fixture - Google Chrome",
+          "url": "http://127.0.0.1:38615/after-new-tab"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 59,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "http://127.0.0.1:38615/after-new-tab",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 36,
+          "text": "http://127.0.0.1:38615/after-new-tab"
+        }
+      }
+    }
+  }
+]

@@ -2415,6 +2415,8 @@ const TYPED_KEY_HOLD_MAX: Duration = Duration::from_millis(250);
 const TYPING_BUDGET: Duration = Duration::from_secs(45);
 const TYPING_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
 const KEYBOARD_PASTE_SHORTCUT: &str = "shift+Insert";
+const NAVIGATION_WAIT: Duration = Duration::from_secs(8);
+const NAVIGATION_POLL: Duration = Duration::from_millis(250);
 const TYPED_KEY_INTERVAL_FLOOR: Duration = Duration::from_millis(10);
 
 #[derive(Deserialize)]
@@ -11352,14 +11354,89 @@ fn navigate_url_problem(url: &str) -> Option<&'static str> {
 }
 
 /// Whether the page at `landed` is the one that was asked for: same host and path,
-/// ignoring the scheme, a leading `www.`, a trailing slash, the query and the fragment.
+/// ignoring the scheme, a leading `www.` and a trailing path slash. Paths,
+/// queries and fragments remain case-sensitive: a history entry is not a match.
 fn same_destination(requested: &str, landed: &str) -> bool {
     let normalize = |url: &str| {
         let url = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let url = url.split(['?', '#']).next().unwrap_or(url);
-        url.trim_start_matches("www.").trim_end_matches('/').to_ascii_lowercase()
+        let end = url.find(['/', '?', '#']).unwrap_or(url.len());
+        let host = url[..end].to_ascii_lowercase();
+        let rest = &url[end..];
+        let suffix = rest.find(['?', '#']).unwrap_or(rest.len());
+        format!(
+            "{}{}{}",
+            host.trim_start_matches("www."),
+            rest[..suffix].trim_end_matches('/'),
+            &rest[suffix..]
+        )
     };
     normalize(requested) == normalize(landed)
+}
+
+async fn navigation_key(eis: &Eis, name: &str, pace: InputPace) -> Result<(), McpError> {
+    let (modifiers, key) = parse_combo(name)?;
+    let mut sent = SentInput::new(eis);
+    for modifier in &modifiers {
+        sent.key(*modifier, true, None).map_err(KwinError::from)?;
+    }
+    tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+    sent.key(key, true, None).map_err(KwinError::from)?;
+    tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
+    sent.key(key, false, None).map_err(KwinError::from)?;
+    for modifier in modifiers.iter().rev() {
+        sent.key(*modifier, false, None).map_err(KwinError::from)?;
+    }
+    drop(sent);
+    eis.roundtrip().await.map_err(KwinError::from)?;
+    Ok(())
+}
+
+/// Read the committed entry without evaluating in a possibly navigating renderer.
+async fn navigation_entry(page: &chromiumoxide::Page) -> Option<(String, String)> {
+    use chromiumoxide::cdp::browser_protocol::page::GetNavigationHistoryParams;
+    let history = tokio::time::timeout(
+        NAVIGATION_POLL,
+        page.execute(GetNavigationHistoryParams::default()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let entry = history
+        .result
+        .entries
+        .get(usize::try_from(history.result.current_index).ok()?)?;
+    Some((entry.url.clone(), entry.title.clone()))
+}
+
+/// Bind once, before navigation, instead of searching by the changing title later.
+async fn navigation_page(
+    browser: &chromiumoxide::Browser,
+    title: &str,
+    address: &str,
+) -> Option<chromiumoxide::Page> {
+    let pages = tokio::time::timeout(NAVIGATION_POLL, browser.pages())
+        .await
+        .ok()?
+        .ok()?;
+    let mut matched = None;
+    for page in pages {
+        if let Some((url, page_title)) = navigation_entry(&page).await
+            && !page_title.is_empty()
+            && title.starts_with(&page_title)
+            && (same_destination(address, &url)
+                || address.is_empty()
+                    && matches!(
+                        url.as_str(),
+                        "chrome://newtab/" | "chrome://new-tab-page/" | "about:blank"
+                    ))
+        {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(page);
+        }
+    }
+    matched
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -15993,7 +16070,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "browser_navigate",
-        description = "Open a URL in the focused Chromium-family browser window: focus the address bar (ctrl+l), type the URL, press Delete so Chrome's inline autocomplete cannot extend it to another address from history, then Return. Waits for the window title to change and returns it. When the browser has CDP (launch_app reported cdp_port) the result also has the page's url, and matched=false with a warning if it is not the address asked for. Without CDP the landing page is known only by its title: check it. url is printable ASCII without spaces."
+        description = "Open a URL in the focused Chromium-family browser window. Verifies address-bar focus and selection after ctrl+l (retries with alt+d), types the URL, removes inline history completion with Delete, and verifies the complete address before Return. With an identifiable CDP tab, waits up to eight seconds for its committed URL; an unchanged or different destination is a tool error with matched=false, even if the title changed. Redirects to another destination also require inspection. Without an identifiable CDP tab, returns an unverified tool error; inspect the page. url is printable ASCII without spaces."
     )]
     async fn browser_navigate(
         &self,
@@ -16023,10 +16100,18 @@ impl KwinMcp {
                 Some(serde_json::json!({"reason": reason, "retry_safe": true})),
             )
         };
-        let active = active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
-            .await
-            .map(|(_, _, geometry)| geometry)
-            .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+        let held = sess.eis.held_modifiers();
+        if !held.is_empty() {
+            return Err(refuse(
+                "modifier_held",
+                format!("release the held modifiers first: {}", held.join("+")),
+            ));
+        }
+        let active =
+            active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+                .await
+                .map(|(_, _, geometry)| geometry)
+                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
         let window = window_snapshots(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
             .await
             .map_err(|error| refuse("target_unverifiable", error.to_string()))?
@@ -16043,46 +16128,77 @@ impl KwinMcp {
             ));
         }
         let title_before = window.title.clone();
-        let combo = |name: &str| -> Result<(Vec<u32>, u32), McpError> { parse_combo(name) };
         let typing_window = TypingWindow {
             connection: &sess.kwin_conn,
             kwin_unique: &sess.kwin_unique_name,
             runtime: &sess.host_xdg_dir,
             window_id: &active.id,
-            browser_title: None,
+            browser_title: Some(&title_before),
         };
-        // ctrl+l, then the address.
-        {
-            let (mods, main) = combo("ctrl+l")?;
-            let mut sent = SentInput::new(&sess.eis);
-            for m in &mods {
-                sent.key(*m, true, None).map_err(KwinError::from)?;
-            }
-            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
-            sent.key(main, true, None).map_err(KwinError::from)?;
-            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
-            sent.key(main, false, None).map_err(KwinError::from)?;
-            for m in mods.iter().rev() {
-                sent.key(*m, false, None).map_err(KwinError::from)?;
+        let mut receipt = None;
+        let mut focus_error = String::new();
+        for shortcut in ["ctrl+l", "alt+d"] {
+            navigation_key(&sess.eis, shortcut, pace).await?;
+            tokio::time::sleep(NAVIGATION_POLL).await;
+            check_typing_window(&typing_window)
+                .await
+                .map_err(|error| refuse(error.reason(), error.to_string()))?;
+            match input_bridge::TextReceipt::capture_address(
+                &sess.atspi_bus_address,
+                &title_before,
+                [active.x, active.y, active.w, active.h],
+                &params.url,
+            )
+            .await
+            {
+                Ok(target) => {
+                    receipt = Some(target);
+                    break;
+                }
+                Err(error) => focus_error = error.to_string(),
             }
         }
-        sess.eis.roundtrip().await.map_err(KwinError::from)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        type_with_profile(&sess.eis, &params.url, &keys, pace, None, &typing_window).await?;
+        let receipt = receipt.ok_or_else(|| refuse("address_bar_unavailable", focus_error))?;
+        let page = match &sess.cdp_browser {
+            Some(browser) => {
+                navigation_page(
+                    browser,
+                    &title_before,
+                    receipt.prior_text().unwrap_or_default(),
+                )
+                .await
+            }
+            None => None,
+        };
+        type_with_profile(
+            &sess.eis,
+            &params.url,
+            &keys,
+            pace,
+            Some(&receipt),
+            &typing_window,
+        )
+        .await?;
         // The address bar completes the typed text inline; the completion is
         // selected, so Delete removes it and Return opens what was typed.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        for name in ["Delete", "Return"] {
-            let (_, main) = combo(name)?;
-            let mut sent = SentInput::new(&sess.eis);
-            sent.key(main, true, None).map_err(KwinError::from)?;
-            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
-            sent.key(main, false, None).map_err(KwinError::from)?;
-            drop(sent);
-            sess.eis.roundtrip().await.map_err(KwinError::from)?;
-            tokio::time::sleep(Duration::from_millis(120)).await;
+        navigation_key(&sess.eis, "Delete", pace).await?;
+        let delivery = receipt.confirm().await;
+        if delivery.status != "verified" || delivery.observed_text.as_deref() != Some(&params.url) {
+            return Err(McpError::internal_error(
+                "The complete requested address could not be verified. Return was not pressed; inspect the address bar before retrying.",
+                Some(
+                    serde_json::json!({"reason":"address_not_verified", "navigation_submitted":false, "retry_safe":false, "delivery":delivery}),
+                ),
+            ));
         }
-        let cdp_browser = sess.cdp_browser.clone();
+        check_typing_window(&typing_window).await.map_err(|error| {
+            McpError::internal_error(
+                error.to_string(),
+                Some(serde_json::json!({"reason":error.reason(), "navigation_submitted":false, "retry_safe":false})),
+            )
+        })?;
+        navigation_key(&sess.eis, "Return", pace).await?;
         let (conn, unique, runtime) = (
             sess.kwin_conn.clone(),
             sess.kwin_unique_name.clone(),
@@ -16090,48 +16206,63 @@ impl KwinMcp {
         );
         drop(guard);
         self.mark_input().await;
-        // Wait for the title to change; a page that keeps its title (a reload of the
-        // same address) is reported as unchanged after the wait.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + NAVIGATION_WAIT;
         let mut title = title_before.clone();
+        let mut landed = None;
+        let mut matched = false;
         while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            if let Ok((_, _, now)) = active_window_info(&conn, &unique, &runtime).await
-                && now.title != title_before
-            {
+            tokio::time::sleep(NAVIGATION_POLL).await;
+            if let Ok((_, _, now)) = active_window_info(&conn, &unique, &runtime).await {
+                if now.id != active.id {
+                    break;
+                }
                 title = now.title;
+            }
+            if let Some(page) = &page {
+                if let Some((url, _)) = navigation_entry(page).await {
+                    matched = same_destination(&params.url, &url);
+                    landed = Some(url);
+                    if matched {
+                        break;
+                    }
+                }
+            } else if title != title_before {
                 break;
             }
         }
-        let mut data = serde_json::json!({"title": title});
-        let mut text = format!("navigated: {title}");
+        let mut data = serde_json::json!({"title": title, "requested_url":params.url, "navigation_submitted":true, "retry_safe":false,
+            "status":if matched { "verified" } else if page.is_some() { "not_reached" } else { "unverified" }});
+        let mut text = if matched {
+            format!("navigated: {title}")
+        } else {
+            format!(
+                "Navigation submitted; destination {}: {title}",
+                if page.is_some() {
+                    "not reached within eight seconds"
+                } else {
+                    "unverified"
+                }
+            )
+        };
         if title == title_before {
             data["title_changed"] = serde_json::json!(false);
             text.push_str(" (the title did not change: the page may still be loading, or it is the page that was already open)");
         }
-        if let Some(browser) = cdp_browser
-            && let Ok(pages) = browser.pages().await
-        {
-            for page in pages {
-                let page_title = page.get_title().await.ok().flatten().unwrap_or_default();
-                if page_title.is_empty() || !title.starts_with(&page_title) {
-                    continue;
-                }
-                if let Some(url) = page.url().await.ok().flatten() {
-                    let matched = same_destination(&params.url, &url);
-                    data["url"] = serde_json::json!(url);
-                    if !matched {
-                        data["matched"] = serde_json::json!(false);
-                        data["warning"] = serde_json::json!(
-                            "The page is not at the address that was typed; the address bar may have completed it from history."
-                        );
-                        text.push_str(&format!(". warning: landed on {url}, not {}", params.url));
-                    }
-                    break;
-                }
+        if let Some(url) = landed {
+            data["url"] = serde_json::json!(url);
+        }
+        if !matched {
+            data["warning"] = serde_json::json!(
+                "The requested destination was not verified. Inspect the current page before reading it or retrying; navigation may still be pending or may have redirected."
+            );
+            text.push_str(". Inspect the current page before reading it or retrying.");
+            if page.is_some() {
+                data["matched"] = serde_json::json!(false);
             }
         }
-        Ok(structured_result(&peer, text, data).await)
+        let mut result = structured_result(&peer, text, data).await;
+        result.is_error = Some(!matched);
+        Ok(result)
     }
 
     #[rmcp::tool(
@@ -22074,7 +22205,10 @@ mod startup_report_tests {
             "learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/1",
             "https://learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/14"
         ));
-        assert!(same_destination("example.test/a", "https://www.example.test/a/?x=1#top"));
+        assert!(same_destination("example.test/a?x=1#top", "https://www.example.test/a/?x=1#top"));
+        assert!(!same_destination("example.test/a?x=New", "https://example.test/a?x=old"));
+        assert!(!same_destination("example.test/Part", "https://example.test/part"));
+        assert!(!same_destination("example.test/a#new", "https://example.test/a#old"));
         assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
     }
 

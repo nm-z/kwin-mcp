@@ -1172,6 +1172,7 @@ pub struct TextReceipt {
     blank_line_replacement: Option<String>,
     placeholder_replacement: Option<String>,
     browser_toolbar: bool,
+    inside_web_document: bool,
     initial_descendant_snapshot: Option<DescendantTextSnapshot>,
     initial_descendant_snapshot_error: Option<String>,
 }
@@ -1417,6 +1418,29 @@ impl std::fmt::Display for TextFocusError {
 impl std::error::Error for TextFocusError {}
 
 impl TextReceipt {
+    /// A selected Chromium omnibox, not a stale focused editor in the page.
+    pub async fn capture_address(
+        address: &str,
+        title: &str,
+        bounds: [f64; 4],
+        input: &str,
+    ) -> anyhow::Result<Self> {
+        use atspi::proxy::accessible::ObjectRefExt;
+        let receipt = Self::capture(address, title, bounds, None, input).await?;
+        let node = receipt.object.as_accessible_proxy(&receipt.bus).await?;
+        let attributes = node.get_attributes().await?;
+        // Chromium exposes the widget class independently of its translated
+        // accessible name. A page's autocomplete input must not qualify.
+        if receipt.inside_web_document
+            || receipt.ambiguous_frame
+            || attributes.get("class").map(String::as_str) != Some("OmniboxViewViews")
+            || receipt.expected != receipt.input
+        {
+            anyhow::bail!("the address bar is not uniquely focused with its entire value selected");
+        }
+        Ok(receipt)
+    }
+
     pub(crate) async fn check_focus(&self) -> Result<(), TextFocusError> {
         let query = async {
             let name = self
@@ -1774,6 +1798,7 @@ impl TextReceipt {
                             blank_line_replacement,
                             placeholder_replacement,
                             browser_toolbar: prefer_chrome_toolbar_focus && !inside_web_document,
+                            inside_web_document,
                             initial_descendant_snapshot,
                             initial_descendant_snapshot_error,
                         });

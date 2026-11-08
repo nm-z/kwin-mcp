@@ -1,0 +1,84 @@
+[
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 4,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: flat twinax ribbon cable 30awg per meter - Buy flat twinax ribbon cable 30awg per meter with free shipping on AliExpress - Google Chrome",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "title": "flat twinax ribbon cable 30awg per meter - Buy flat twinax ribbon cable 30awg per meter with free shipping on AliExpress - Google Chrome",
+          "url": "https://www.aliexpress.com/w/wholesale-flat-twinax-ribbon-cable-30awg-per-meter.html"
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 7,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "https://www.aliexpress.com/w/wholesale-flat-twinax-ribbon-cable-30awg-per-meter.html",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 84,
+          "text": "https://www.aliexpress.com/w/wholesale-flat-twinax-ribbon-cable-30awg-per-meter.html"
+        }
+      }
+    }
+  },
+  {
+    "tool": "browser_navigate",
+    "reply": {
+      "id": 10,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "navigated: Coaxial Cables (RF) | Cables, Wires | DigiKey - Google Chrome. warning: landed on https://www.digikey.com/en/products/filter/coaxial-cables-rf/475?s=N4IgTCBcDaICoHcCWA7AsgQwB4gLoF8g, not https://www.digikey.com/en/products/result?keywords=TwinMax",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "matched": false,
+          "title": "Coaxial Cables (RF) | Cables, Wires | DigiKey - Google Chrome",
+          "url": "https://www.digikey.com/en/products/filter/coaxial-cables-rf/475?s=N4IgTCBcDaICoHcCWA7AsgQwB4gLoF8g",
+          "warning": "The page is not at the address that was typed; the address bar may have completed it from history."
+        }
+      }
+    }
+  },
+  {
+    "tool": "clipboard_read",
+    "reply": {
+      "id": 13,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "https://www.digikey.com/en/products/filter/coaxial-cables-rf/475?s=N4IgTCBcDaICoHcCWA7AsgQwB4gLoF8g",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "length": 99,
+          "text": "https://www.digikey.com/en/products/filter/coaxial-cables-rf/475?s=N4IgTCBcDaICoHcCWA7AsgQwB4gLoF8g"
+        }
+      }
+    }
+  }
+]

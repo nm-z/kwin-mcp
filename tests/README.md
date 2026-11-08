@@ -1,5 +1,27 @@
 # Real-system test storage
 
+## Browser navigation
+
+```bash
+cargo test --test browser_navigate_e2e -- --ignored --exact \
+  navigate_opens_the_typed_address_and_reports_where_it_landed --nocapture
+```
+
+This production-stdio regression starts its own fresh KWin/Chrome session and
+local Rust HTTP fixture. It checks an existing tab across origins, history
+prefixes, query changes, delayed pages with unchanged titles, and a New Tab.
+A download leaving the old page visible and redirects (including a query-only
+redirect) must return tool errors. Native Ctrl+L/Ctrl+C plus `clipboard_read`
+independently checks each actual address; the fixture also records requests.
+An autofocused page editor exercises stale page focus while targeting the
+omnibox. Invalid input must leave the address unchanged.
+
+Run on a KDE/KWin host outside a sandbox that sets NoNewPrivs. The test honors
+`KWIN_MCP_E2E_SERVER` for a copied production binary and cleans up its private
+HOME and desktop even on assertion failure. See
+[`docs/verification/issue853`](../docs/verification/issue853/README.md) for
+baseline/fixed receipts and host assumptions.
+
 `ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
 native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks
 multiline UTF-8 field receipts and independently receives the complete values
