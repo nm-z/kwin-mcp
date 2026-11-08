@@ -22205,10 +22205,22 @@ mod startup_report_tests {
             "learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/1",
             "https://learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/14"
         ));
-        assert!(same_destination("example.test/a?x=1#top", "https://www.example.test/a/?x=1#top"));
-        assert!(!same_destination("example.test/a?x=New", "https://example.test/a?x=old"));
-        assert!(!same_destination("example.test/Part", "https://example.test/part"));
-        assert!(!same_destination("example.test/a#new", "https://example.test/a#old"));
+        assert!(same_destination(
+            "example.test/a?x=1#top",
+            "https://www.example.test/a/?x=1#top"
+        ));
+        assert!(!same_destination(
+            "example.test/a?x=New",
+            "https://example.test/a?x=old"
+        ));
+        assert!(!same_destination(
+            "example.test/Part",
+            "https://example.test/part"
+        ));
+        assert!(!same_destination(
+            "example.test/a#new",
+            "https://example.test/a#old"
+        ));
         assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
     }
 

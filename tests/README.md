@@ -22,6 +22,8 @@ HOME and desktop even on assertion failure. See
 [`docs/verification/issue853`](../docs/verification/issue853/README.md) for
 baseline/fixed receipts and host assumptions.
 
+## Text input and fixture storage
+
 `ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
 native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks
 multiline UTF-8 field receipts and independently receives the complete values
