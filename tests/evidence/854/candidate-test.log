@@ -1,0 +1,7 @@
+
+running 1 test
+cursor-free dominant colors: [([37, 66, 96, 255], 375000)]
+cursor overlay removed: 836 pixels; cursor-free pixels unchanged after pointer move
+test screenshot_can_omit_both_cursor_layers_without_moving_the_pointer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 10.42s

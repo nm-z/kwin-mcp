@@ -11273,8 +11273,9 @@ struct ScreenshotParams {
     /// where a click would land. Mutually exclusive with `region`.
     #[serde(default)]
     cursor: bool,
-    /// Whether to draw the pointer in the image. Defaults to true. Set false
-    /// for pixel comparisons or clean captures without moving the pointer.
+    /// Whether to draw the pointer in the image. Defaults to false with
+    /// `save_as`, true otherwise. Set false for pixel comparisons or clean
+    /// captures without moving the pointer.
     /// Independent of `cursor`, which selects a crop around its position.
     #[serde(default)]
     include_cursor: Option<bool>,
@@ -11291,6 +11292,8 @@ struct ScreenshotParams {
     structured_metadata: bool,
     /// Absolute host path to also save this PNG to, so the next screenshot
     /// does not replace it. The file must not exist; its directory must.
+    /// Omits the pointer by default; set `include_cursor: true` to keep it.
+    /// The workdir PNG and inline image use the same cursor setting.
     #[serde(default)]
     save_as: Option<String>,
 }
@@ -16144,7 +16147,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops. It defaults to false with save_as, true otherwise. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path and omits the pointer by default; pass include_cursor=true to keep it. The saved copy, workdir PNG, and inline image share the same cursor setting. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -16222,7 +16225,7 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let include_cursor = params.include_cursor.unwrap_or(true);
+        let include_cursor = params.include_cursor.unwrap_or(params.save_as.is_none());
         let (mut width, mut height, mut stride, mut pixels, settle) =
             capture_settled_frame(&proxy, self.last_input().await, include_cursor).await?;
         // CaptureScreen returns the composited display, which can change focus
@@ -16476,7 +16479,7 @@ impl KwinMcp {
             },
         });
         // Defaults and what the caller can derive are left out: a target that did
-        // not match is an error, the cursor is included unless asked otherwise, and
+        // not match is an error, only an omitted cursor is reported, and
         // the region is the whole window unless a region or cursor crop was asked for.
         if include_cursor {
             remove_fields(&mut payload, &["include_cursor"]);

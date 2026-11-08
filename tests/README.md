@@ -93,6 +93,20 @@ that the host system bus still denies name ownership. Set
 `KWIN_MCP_TEST_ARTIFACT_DIR` to save RPC evidence and the screenshot. The same
 test fails against the pre-fix server supplied with `KWIN_MCP_E2E_SERVER`.
 
+## Saved screenshots and the pointer (#854)
+
+```bash
+KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
+  screenshot_can_omit_both_cursor_layers_without_moving_the_pointer -- --ignored --exact --nocapture
+```
+
+The production stdio test opens a static Chrome page and independently checks
+that a clean crop contains only its background color. It compares saved PNG
+bytes for omitted, false, and true `include_cursor` settings across full-window,
+region, and cursor crops, and checks agreement with workdir and inline images.
+Ordinary captures still show the pointer by default. Set
+`KWIN_MCP_E2E_PROOF_DIR` to keep images and metadata, and `KWIN_MCP_E2E_SERVER`
+to exercise a pre-fix binary with the same test (it must fail on the saved crop).
 # DevTools placeholder receipt
 
 Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`
