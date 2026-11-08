@@ -7418,14 +7418,11 @@ impl KwinMcp {
         if self.session.read().await.is_some() {
             return error;
         }
-        // Process guards have stopped startup children, but the owned disk
-        // twin still exists here. Keep bounded diagnostics in the response
-        // before autoclean removes the only copy of their stderr.
-        let error = if self.workdir.owned().is_some() {
-            preserve_startup_sandbox_diagnostics(error, &self.path)
-        } else {
-            error
-        };
+        // Process guards have stopped startup children, but their disk twin
+        // still exists here. Report bounded stderr even when --autoclean is
+        // off: workdir ownership controls deletion, not startup diagnostics.
+        // With autoclean, preserve it before removing the only copy.
+        let error = preserve_startup_sandbox_diagnostics(error, &self.path);
         let removal = self.workdir.remove();
         // The deferred cleanup of a blocked start ends that handle, and its
         // record names what this removal left.
