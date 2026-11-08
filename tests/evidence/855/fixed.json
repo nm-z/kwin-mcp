@@ -1,0 +1,31 @@
+{
+  "launch": {
+    "is_error": false,
+    "message": "launched: plasma-systemmonitor window: {db81d629-ead6-4257-b227-3419f425f304}",
+    "outcome": "new",
+    "exit_status": null,
+    "stderr_tail": null
+  },
+  "qt_failure": {
+    "is_error": true,
+    "exit_status": 134,
+    "qt_plugin_stderr": [
+      "qt.qpa.plugin: Could not find the Qt platform plugin \"kwin-mcp-missing-platform\" in \"\""
+    ]
+  },
+  "windows": [
+    {
+      "active": true,
+      "h": 720.0,
+      "id": "{db81d629-ead6-4257-b227-3419f425f304}",
+      "pid": 76,
+      "resourceClass": "org.kde.plasma-systemmonitor",
+      "resourceName": "plasma-systemmonitor",
+      "stackingOrder": 0,
+      "title": "Overview — System Monitor",
+      "w": 1280.0,
+      "x": 0.0,
+      "y": 0.0
+    }
+  ]
+}

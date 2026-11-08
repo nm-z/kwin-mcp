@@ -1174,7 +1174,7 @@ fn compound_chrome_gets_browser_switches_and_accessibility_tree() {
             "DBUS_SESSION_BUS_ADDRESS=unix:path={}/service_bus_socket",
             workdir.display()
         )) && launch_env.contains("AT_SPI_BUS_ADDRESS="),
-        "Chrome launch shell did not inherit the filtered buses: {launch_env}"
+        "Chrome launch shell did not inherit the session buses: {launch_env}"
     );
 
     let tree_deadline = Instant::now() + Duration::from_secs(20);
@@ -11852,5 +11852,115 @@ fn starting_another_session_preserves_existing_file_exports() {
     eprintln!(
         "PASS: two distinct live handles, three byte-exact PNG exports, earlier handle survives later stop, stopped handle rejected, both workdirs removed"
     );
+    client.stop_process();
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, input devices, and plasma-systemmonitor"]
+fn systemmonitor_registers_on_the_private_app_bus_and_qt_failures_reach_stderr() {
+    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
+    let mut client = RpcClient::start();
+    initialize(&mut client);
+    let started = call_tool(
+        &mut client,
+        2,
+        "session_start",
+        json!({"browser_profiles":"fresh","width":1280,"height":720}),
+    );
+    let session = session_handle(&started);
+    let workdir = workdir(&started);
+
+    // A real Qt failure must explain itself even on builds that normally log
+    // to journald, whose socket is unavailable inside the sandbox.
+    let failed = call_tool(
+        &mut client,
+        3,
+        "launch_app",
+        json!({"session_id":session,
+            "command":"ulimit -c 0; QT_QPA_PLATFORM=kwin-mcp-missing-platform plasma-systemmonitor"}),
+    );
+    let launched = call_tool(
+        &mut client,
+        4,
+        "launch_app",
+        json!({"session_id":session,"command":"plasma-systemmonitor"}),
+    );
+    let listed = call_tool(&mut client, 5, "window_list", json!({"session_id":session}));
+    let proof = json!({"qt_failure":failed,"launch":launched,"windows":listed});
+    if let Some(directory) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") {
+        std::fs::write(
+            PathBuf::from(directory).join("systemmonitor-rpc.json"),
+            serde_json::to_vec_pretty(&proof).expect("serialize RPC evidence"),
+        )
+        .expect("save RPC evidence");
+    }
+    eprintln!("System Monitor real-path proof: {proof}");
+    let launch = attach_test_data(&launched);
+    assert_eq!(launch["window_outcome"], "new", "{launched}");
+    assert!(
+        attach_test_data(&listed)["windows"]
+            .as_array()
+            .expect("KWin windows")
+            .iter()
+            .any(|window| window["id"] == launch["window"]
+                && window["resourceClass"] == "org.kde.plasma-systemmonitor"),
+        "KWin did not independently observe System Monitor: {listed}"
+    );
+    save_session_image(&mut client, 6, &session, "systemmonitor.png");
+
+    // This is the bus launch_app supplies, not the compositor or host bus.
+    let address = format!("unix:path={}", workdir.join("service_bus_socket").display());
+    let apps = zbus::blocking::connection::Builder::address(address.as_str())
+        .expect("private app bus address")
+        .build()
+        .expect("connect to private app bus");
+    let bus = zbus::blocking::fdo::DBusProxy::new(&apps).expect("app bus proxy");
+    assert!(
+        bus.name_has_owner("org.kde.plasma-systemmonitor".try_into().expect("app name"))
+            .expect("query app ownership"),
+        "System Monitor did not register its service"
+    );
+    // Registration must work for arbitrary applications, not just this KDE app.
+    let name = "com.example.KwinMcpIssue855";
+    apps.request_name(name)
+        .expect("register another app service");
+    let host = zbus::blocking::Connection::session().expect("host bus");
+    let host_bus = zbus::blocking::fdo::DBusProxy::new(&host).expect("host bus proxy");
+    assert_ne!(
+        bus.get_id().expect("app bus ID"),
+        host_bus.get_id().expect("host bus ID")
+    );
+    assert!(
+        !host_bus
+            .name_has_owner(name.try_into().expect("fixture name"))
+            .expect("query host ownership"),
+        "session app registered on the host bus"
+    );
+    // The same bus still serves the session's wallet, including a disabled one
+    // when the test host has no unlocked wallet to snapshot.
+    let _: bool = session_wallet(&apps, "isEnabled", &());
+    let system_address = format!("unix:path={}", workdir.join("system_bus_socket").display());
+    let system = zbus::blocking::connection::Builder::address(system_address.as_str())
+        .expect("filtered system bus address")
+        .build()
+        .expect("connect to filtered system bus");
+    assert!(
+        system.request_name(name).is_err(),
+        "the host system bus allowed session name ownership"
+    );
+    assert!(failed["result"]["isError"] == true, "{failed}");
+    assert!(
+        failed["result"]["structuredContent"]["stderr_tail"]
+            .as_array()
+            .expect("Qt stderr lines")
+            .iter()
+            .any(|line| {
+                let line = line.as_str().unwrap_or_default();
+                line.starts_with("qt.qpa.plugin: Could not find the Qt platform plugin")
+                    && line.contains("kwin-mcp-missing-platform")
+            }),
+        "the Qt failure lost its diagnostic: {failed}"
+    );
+    drop((bus, apps, host_bus, host, system));
     client.stop_process();
 }
