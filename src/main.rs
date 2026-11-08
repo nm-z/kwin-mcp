@@ -3983,13 +3983,13 @@ fn validate_session_socket_path(socket: &Path) -> anyhow::Result<()> {
 async fn spawn_dbus_proxy(
     address: &str,
     socket: &Path,
-    rules: &[&str],
+    options: &[&str],
 ) -> anyhow::Result<std::process::Child> {
     use std::os::unix::fs::FileTypeExt;
     let _ = std::fs::remove_file(socket);
     let mut command = std::process::Command::new("xdg-dbus-proxy");
     terminate_with_parent(&mut command);
-    command.arg(address).arg(socket).arg("--filter").args(rules);
+    command.arg(address).arg(socket).args(options);
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
     let mut child = spawn_session_child(command, false).await?;
@@ -14050,6 +14050,7 @@ impl KwinMcp {
             export XDG_RUNTIME_DIR={xdg_dir_str}\n\
             export WAYLAND_DISPLAY=wayland-0\n\
             export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n\
+            export QT_FORCE_STDERR_LOGGING=1\n\
             export QT_SCALE_FACTOR={KDE_SCALE_FACTOR}\n\
             export GDK_SCALE={KDE_SCALE_FACTOR}\n\
             export FREETYPE_PROPERTIES=truetype:interpreter-version=35\n\
@@ -14102,6 +14103,7 @@ impl KwinMcp {
             "unix:path=/run/dbus/system_bus_socket",
             &system_proxy_socket,
             &[
+                "--filter",
                 "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.Get@/*",
                 "--call=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.GetAll@/*",
                 "--broadcast=org.freedesktop.NetworkManager=org.freedesktop.DBus.Properties.PropertiesChanged@/*",
@@ -14197,50 +14199,18 @@ impl KwinMcp {
         match spawn_dbus_proxy(
             &wallet_bus_address,
             &service_proxy_socket,
-            &[
-                // Upstream is the session-local wallet service on a private bus
-                // (wallet_mediator); these rules keep the session to KWallet
-                // calls on that bus.
-                "--see=org.kde.kwalletd6",
-                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Introspectable.Introspect@/*",
-                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.GetMachineId@/*",
-                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Peer.Ping@/*",
-                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Properties.Get@/*",
-                "--call=org.kde.kwalletd6=org.freedesktop.DBus.Properties.GetAll@/*",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.isEnabled@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.networkWallet@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.localWallet@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.wallets@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.isOpen@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.open@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.openAsync@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.openPath@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.openPathAsync@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.folderList@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.hasFolder@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.entryList@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.entriesList@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.hasEntry@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.entryType@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.readEntry@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.readMap@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.readPassword@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.mapList@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.passwordList@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.users@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.close@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.createFolder@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.removeFolder@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.writePassword@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.writeEntry@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.writeMap@/modules/kwalletd6",
-                "--call=org.kde.kwalletd6=org.kde.KWallet.removeEntry@/modules/kwalletd6",
-                "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletAsyncOpened@/modules/kwalletd6",
-                "--broadcast=org.kde.kwalletd6=org.kde.KWallet.walletOpened@/modules/kwalletd6",
-            ],
-        ).await {
+            // This upstream is created for this session and contains only its
+            // in-memory wallet and applications, never host desktop services.
+            // Apps need normal bus ownership and peer calls (KDBusService exits
+            // before mapping a window when RequestName is denied).
+            &[],
+        )
+        .await
+        {
             Ok(child) => startup.add_proxy(child),
-            Err(error) => return cleanup_err(format!("session D-Bus proxy: {error:#}"), &mut startup),
+            Err(error) => {
+                return cleanup_err(format!("session D-Bus proxy: {error:#}"), &mut startup);
+            }
         }
         let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
         let proxy_sock_str = system_proxy_socket.display().to_string();

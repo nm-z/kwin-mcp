@@ -76,6 +76,23 @@ To show the regression against an older binary, set `KWIN_MCP_E2E_SERVER` to its
 absolute path. Before the fix, the default case fails because its response omits
 the stderr, while the autoclean case passes.
 
+## System Monitor startup and Qt diagnostics
+
+```bash
+KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
+  systemmonitor_registers_on_the_private_app_bus_and_qt_failures_reach_stderr \
+  -- --ignored --exact --nocapture
+```
+
+Requires `plasma-systemmonitor` and the normal KDE session dependencies. The
+production stdio test launches System Monitor with fresh browser profiles,
+checks its window through KWin and a screenshot, checks private app service
+ownership and wallet access, and requires a Qt platform failure to report its
+reason on stderr. It also checks that the app bus differs from the host bus and
+that the host system bus still denies name ownership. Set
+`KWIN_MCP_TEST_ARTIFACT_DIR` to save RPC evidence and the screenshot. The same
+test fails against the pre-fix server supplied with `KWIN_MCP_E2E_SERVER`.
+
 # DevTools placeholder receipt
 
 Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`

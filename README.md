@@ -550,6 +550,12 @@ overlays, host sockets and processes, or browser profiles.
 
 ### Two-phase D-Bus startup
 
+Launched applications share a private app bus with the session-local KWallet.
+They can register service names and communicate with other session apps; this
+bus has no connection to host desktop services. The host system-bus proxy keeps
+its NetworkManager filter. Qt applications log to stderr so launch failures can
+report their diagnostics even without a journal socket in the sandbox.
+
 The private KWallet bus records `dbus-daemon` diagnostics in the session
 workdir's `kwallet-bus.stderr`. If the daemon exits before readiness or its
 socket does not appear within three seconds, `session_start` includes a bounded
@@ -1017,7 +1023,7 @@ Requires: `bubblewrap` (bwrap), `passt` (pasta), and KWin running as a Wayland c
 
 ## Screenshot dimensions
 
-Apps in the session see a D-Bus session bus that carries only KWallet, not KWin, so KDE's Spectacle (which needs `org.kde.KWin.ScreenShot2` there) exits with "KWin compositor not available". Use the `screenshot` tool, which captures the session's virtual output through the server's own KWin connection.
+Apps in the session see a private D-Bus session bus that carries their services and the session-local KWallet, not KWin, so KDE's Spectacle (which needs `org.kde.KWin.ScreenShot2` there) exits with "KWin compositor not available". Use the `screenshot` tool, which captures the session's virtual output through the server's own KWin connection.
 
 File screenshot responses expose capture metadata in `structuredContent`: the
 PNG path, dimensions, window, region, and optional settling information. Inline
