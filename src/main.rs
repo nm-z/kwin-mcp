@@ -2037,8 +2037,10 @@ const NO_ACTIVE_WINDOW: &str = "KWin script error: No active window";
 const A11Y_TREE_MAX_CHARS: usize = 30_000;
 // Longest node name accessibility_tree shows whole. One longer name (a chat page keeps a
 // 120,000-character message as a single node) would outweigh the budget by itself, and the tree
-// would stop at the levels above the page that holds it. A longer name is shown cut to this many
-// characters with a count of the rest; find_ui_elements returns a name whole.
+// would stop at the levels above the page that holds it. A longer name is shown cut to its first
+// and last half of this many characters with a count of the characters between (a caller that
+// looks for the end of a message in the page, as a chat shim does, still finds it);
+// find_ui_elements returns a name whole.
 const A11Y_NAME_MAX_CHARS: usize = 8_000;
 
 // Let KWin publish an activated window before reading its geometry.
@@ -10922,17 +10924,20 @@ fn tree_field(value: &str) -> String {
 }
 
 /// A node name as accessibility_tree shows it: whole up to A11Y_NAME_MAX_CHARS characters, else
-/// its first A11Y_NAME_MAX_CHARS characters and a count of the rest.
+/// its first and last A11Y_NAME_MAX_CHARS / 2 characters and a count of the characters between.
 fn tree_name(value: &str) -> String {
     let chars = value.chars().count();
     if chars <= A11Y_NAME_MAX_CHARS {
         return tree_field(value);
     }
-    let head: String = value.chars().take(A11Y_NAME_MAX_CHARS).collect();
+    let half = A11Y_NAME_MAX_CHARS / 2;
+    let head: String = value.chars().take(half).collect();
+    let tail: String = value.chars().skip(chars - half).collect();
     format!(
-        "{}…[{} more characters; find_ui_elements returns the whole name]",
+        "{}…[{} more characters; find_ui_elements returns the whole name]…{}",
         tree_field(&head),
-        chars - A11Y_NAME_MAX_CHARS
+        chars - 2 * half,
+        tree_field(&tail)
     )
 }
 
@@ -15407,7 +15412,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters is cut there and ends in '…[N more characters ...]'; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
