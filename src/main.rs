@@ -4387,6 +4387,10 @@ fn compact_launch_result(payload: &mut serde_json::Value) {
     );
 }
 
+/// Reported by `session_start` on a host with no DRM device: KWin's virtual
+/// backend then composites with QPainter, where screen capture is cancelled.
+const NO_DRI_WARNING: &str = "this host has no /dev/dri, so KWin composites without OpenGL: screenshot and the viewer do not work. Load a DRM device (sudo modprobe vgem gives a software one) and start a new session.";
+
 /// The `session_start` result without its empty fields, and the SQLite access
 /// report in its short form.
 fn compact_session_result(payload: &mut serde_json::Value, sqlite_access: &SqliteAccessReport) {
@@ -14535,6 +14539,9 @@ impl KwinMcp {
             },
         });
         compact_session_result(&mut started, &sqlite_access);
+        if let (false, Some(object)) = (Path::new("/dev/dri").is_dir(), started.as_object_mut()) {
+            object.insert("graphics_warning".to_owned(), NO_DRI_WARNING.into());
+        }
         Ok(structured_result(&peer, msg, started).await)
     }
 
