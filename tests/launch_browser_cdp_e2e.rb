@@ -66,8 +66,7 @@ begin
   input.flush
   session_id = call.call('session_start', {
     width: 1000,
-    height: 700,
-    browser_profiles: 'fresh'
+    height: 700
   }).fetch('session_id')
   launched = call.call('launch_app', {
     command: 'google-chrome-stable --no-first-run --no-default-browser-check --user-data-dir="$HOME/.kwin-mcp-cdp-e2e" --remote-debugging-address=127.0.0.1 --remote-debugging-port=1 about:blank'

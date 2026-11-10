@@ -60,7 +60,7 @@ Dir.mktmpdir('kmscript-',FixturePaths.root) do |root|
     begin
       rpc.call('initialize',protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'script-cleanup-proof',version:'1'})
       input.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized'));input.flush
-      started=rpc.call('tools/call',name:'session_start',arguments:{width:800,height:600,browser_profiles:'fresh'}).fetch('structuredContent')
+      started=rpc.call('tools/call',name:'session_start',arguments:{width:800,height:600}).fetch('structuredContent')
       session=started.fetch('session_id');workdir=started.fetch('workdir')
       list=rpc.call('tools/call',name:'session_list',arguments:{}).fetch('structuredContent').fetch('sessions')
       sandbox=list.find { |entry| entry['session_id']==session }.fetch('sandbox_pid')

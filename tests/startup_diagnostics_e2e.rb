@@ -73,7 +73,7 @@ Dir.mktmpdir('kw450-', FixturePaths.root) do |root|
         raise initialized.inspect if initialized['error']
         input.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized')); input.flush
         began = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        response = request(input,output,2,'tools/call',name:'session_start',arguments:{width:800,height:600,browser_profiles:'fresh',startup_timeout_seconds:(mode == 'stopped' ? 60 : 20)})
+        response = request(input,output,2,'tools/call',name:'session_start',arguments:{width:800,height:600,startup_timeout_seconds:(mode == 'stopped' ? 60 : 20)})
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC)-began
         File.write(File.join(evidence,"#{mode}.json"),JSON.pretty_generate(response))
         if mode == 'normal'

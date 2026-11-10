@@ -38,7 +38,7 @@ capture=lambda do |name|
  image=tool.call(owner,'screenshot',{inline:false});FileUtils.cp(image.fetch('path'),evidence+'/'+name+'.png')
 end
 begin
- started=tool.call(owner,'session_start',{width:1000,height:700,browser_profiles:'fresh'})
+ started=tool.call(owner,'session_start',{width:1000,height:700})
  session=started.fetch('session_id');work=started.fetch('workdir')
  title="UI418-native-#{Process.pid}"
  tool.call(owner,'launch_app',{command:['kdialog','--title',title,'--yesno','Stop is explanatory text, not the button.','--yes-label','Stop','--no-label','Cancel'].shelljoin})

@@ -60,7 +60,7 @@ begin
   initialized = receive.call(send_rpc.call('initialize', {protocolVersion: '2025-06-18', capabilities: {}, clientInfo: {name: 'screenshot-target-identity-e2e', version: '1'}}))
   raise initialized.inspect if initialized['error']
   input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
-  started = tool.call('session_start', {browser_profiles: 'fresh', width: 1000, height: 700})
+  started = tool.call('session_start', {width: 1000, height: 700})
   session = started.fetch('session_id')
   tool.call('launch_app', {command: "kdialog --title Capture-A --msgbox 'WINDOW A: original capture target'"})
   a = tool.call('window_list').fetch('windows').find { |window| window['title'].include?('Capture-A') }

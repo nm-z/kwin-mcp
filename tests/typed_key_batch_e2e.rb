@@ -63,7 +63,7 @@ begin
   initialized = receive.call(send_rpc.call('initialize', {protocolVersion: '2025-06-18', capabilities: {}, clientInfo: {name: 'typed-key-batch-e2e', version: '1'}}))
   raise initialized.inspect if initialized['error']
   input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
-  started = tool.call('session_start', {browser_profiles: 'fresh', width: 1000, height: 700})
+  started = tool.call('session_start', {width: 1000, height: 700})
   session = started.fetch('session_id')
   audit = started.fetch('input_log')
   tool.call('launch_app', {command: "kdialog --title 'Punctuation delivery 472' --inputbox 'The field must contain exactly one copy of each typed character.'"})

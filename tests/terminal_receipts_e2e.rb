@@ -39,7 +39,7 @@ class TerminalReceiptProbe
     @id = 0
     success(rpc('initialize',protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'terminal-receipts-e2e',version:'1'}))
     @input.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized')); @input.flush
-    started = raw_call('session_start',browser_profiles:'fresh',startup_timeout_seconds:60)
+    started = raw_call('session_start',startup_timeout_seconds:60)
     @session_id = started.dig('error','data','session_id')
     @session_id = success(started).fetch('structuredContent').fetch('session_id')
   rescue StandardError

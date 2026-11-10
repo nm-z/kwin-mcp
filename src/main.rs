@@ -5200,12 +5200,8 @@ fn bind_live_sqlite(
     databases: &[PathBuf],
     writable_paths: &[PathBuf],
     service: &KwinMcp,
-    browser_profiles: BrowserProfiles,
 ) -> anyhow::Result<()> {
-    let discarded = match browser_profiles {
-        BrowserProfiles::Inherit => discarded_session_databases(target, service)?,
-        BrowserProfiles::Fresh => Vec::new(),
-    };
+    let discarded = discarded_session_databases(target, service)?;
     for database in databases.iter().filter(|database| {
         !discarded.contains(database) && !browser_cookie_database(target, database)
     }) {
@@ -5754,7 +5750,6 @@ fn validate_host_write_paths(
 /// session_start choices that shape the host view.
 #[derive(Clone, Copy)]
 struct HostViewOptions {
-    browser_profiles: BrowserProfiles,
     /// Bytes the disk-backed HOME overlay needs free before startup.
     disk_min_free: u64,
 }
@@ -5768,10 +5763,7 @@ fn prepare_host_view(
     service: &KwinMcp,
     options: HostViewOptions,
 ) -> anyhow::Result<HostView> {
-    let HostViewOptions {
-        browser_profiles,
-        disk_min_free,
-    } = options;
+    let HostViewOptions { disk_min_free } = options;
     service.host_step("validating host_write_paths")?;
     let host_write_paths =
         validate_host_write_paths(target, host_runtime, writable_paths, host_write_paths)?;
@@ -5839,19 +5831,12 @@ fn prepare_host_view(
         .expose_sockets(target, host_runtime, host_xdg_dir, &inventory, service)
         .map_err(|e| anyhow::anyhow!("expose host sockets: {e:#}"))?;
     service.host_step("preparing live SQLite access modes")?;
-    if matches!(browser_profiles, BrowserProfiles::Fresh) {
-        // Mask the profile roots before alias mounts are constructed, too.
-        overlay_plan
-            .empty_dirs
-            .extend(BROWSER_CONFIG_DIRS.iter().map(|config| target.join(config)));
-    }
     bind_live_sqlite(
         &mut overlay_plan,
         target,
         &inventory.live_databases,
         writable_paths,
         service,
-        browser_profiles,
     )?;
 
     eprintln!(
@@ -5864,24 +5849,18 @@ fn prepare_host_view(
         overlay_plan.overlays.len(),
         overlay_plan.read_only_binds.len()
     );
-    let (cookie_roots, cookie_errors) = match browser_profiles {
-        BrowserProfiles::Inherit => {
-            service.set_start_stage("preparing browser profiles");
-            let discarded = discarded_session_databases(target, service)?;
-            empty_session_databases(&overlay_plan, &discarded, service)?;
-            let cookies = prepare_browser_cookies(
-                &mut overlay_plan,
-                target,
-                &disk.join("cookie-baselines"),
-                service,
-            )?;
-            let marked = mark_browser_exits_clean(&overlay_plan, target, service)?;
-            hide_browser_sessions(&mut overlay_plan, target, service)?;
-            eprintln!("session_start: marked {marked} browser profile(s) clean");
-            cookies
-        }
-        BrowserProfiles::Fresh => (Vec::new(), Vec::new()),
-    };
+    service.set_start_stage("preparing browser profiles");
+    let discarded = discarded_session_databases(target, service)?;
+    empty_session_databases(&overlay_plan, &discarded, service)?;
+    let (cookie_roots, cookie_errors) = prepare_browser_cookies(
+        &mut overlay_plan,
+        target,
+        &disk.join("cookie-baselines"),
+        service,
+    )?;
+    let marked = mark_browser_exits_clean(&overlay_plan, target, service)?;
+    hide_browser_sessions(&mut overlay_plan, target, service)?;
+    eprintln!("session_start: marked {marked} browser profile(s) clean");
     let browser_cache = target.join(BROWSER_CACHE_DIR);
     if browser_cache.is_dir() {
         overlay_plan.empty_dirs.push(browser_cache);
@@ -12291,14 +12270,6 @@ struct FindUiElementsParams {
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum BrowserProfiles {
-    #[default]
-    Inherit,
-    Fresh,
-}
-
-#[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
 enum WindowMode {
     /// Every new window maximizes when it maps (default).
     #[default]
@@ -12311,11 +12282,6 @@ enum WindowMode {
 struct SessionStartParams {
     /// Startup wall-clock limit in seconds (1..300). Default 20; includes host preparation.
     startup_timeout_seconds: Option<u64>,
-    /// inherit (default) prepares saved Chromium profiles and cookies. fresh
-    /// starts those browser config directories empty, skipping profile copying
-    /// and cookie persistence; useful for terminal-only work.
-    #[serde(default)]
-    browser_profiles: BrowserProfiles,
     /// maximized (default) maximizes every new window when it maps. native
     /// leaves windows at the size their app requests, so a relaunched app
     /// reopens at its own size. Both modes disable window decorations.
@@ -13030,7 +12996,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). browser_profiles=fresh skips inherited Chromium profiles and cookie persistence; inherit is default. window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
@@ -13196,7 +13162,6 @@ impl KwinMcp {
         host_work: HostWork,
     ) -> Result<CallToolResult, McpError> {
         let memory = params.memory_config(self.display)?;
-        let browser_profiles = params.browser_profiles;
         let window_mode = params.window_mode;
         eprintln!(
             "kwin-mcp v{}.{} ({}) session_start",
@@ -13383,10 +13348,7 @@ impl KwinMcp {
                 &writable_paths,
                 &host_write_paths,
                 &view_service,
-                HostViewOptions {
-                    browser_profiles,
-                    disk_min_free,
-                },
+                HostViewOptions { disk_min_free },
             ));
         });
         if let Ok(mut slot) = host_work.lock() {
@@ -14366,7 +14328,6 @@ impl KwinMcp {
         });
         let mut started = serde_json::json!({
             "status": "started",
-            "browser_profiles": browser_profiles,
             "startup_timeout_seconds": params.startup_timeout_seconds.unwrap_or(SESSION_START_DEFAULT_TIMEOUT.as_secs()),
             "memory_limits": scope.report(),
             "version": format!("v{}.{}", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
@@ -17414,7 +17375,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 30s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Exit failures quote the last 20 stderr lines and a matching sandbox.log line. command_resolution reports the leading command word's PATH executable, builtin, or absence. KWin reads are bounded; timeouts keep the session and report the stalled stage. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process; on timeout a late window is reported or a fresh window_snapshot attached. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. Waits 30s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process; on timeout a late window is reported or a fresh window_snapshot attached. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -19387,11 +19348,100 @@ struct SessionRouter {
     display: DisplayConfig,
     routes: Arc<ToolRoutes>,
     limit: tower::limit::GlobalConcurrencyLimitLayer,
+    /// The host's Chrome profiles, read once when the server starts.
+    chrome_profiles: Arc<Vec<String>>,
+}
+
+/// `"DIR" ("Name", last used Nov 9, 2026, 2:52 PM)` for each profile in Chrome's
+/// Local State, most recently used first.
+fn chrome_profile_entries(state: &serde_json::Value) -> Vec<String> {
+    let Some(cache) = state["profile"]["info_cache"].as_object() else {
+        return Vec::new();
+    };
+    let mut profiles = cache
+        .iter()
+        .map(|(directory, info)| {
+            // Whole seconds, without a float-to-integer cast.
+            let used = info["active_time"]
+                .as_number()
+                .and_then(|time| time.to_string().split('.').next()?.parse::<i64>().ok());
+            (directory, info["name"].as_str().unwrap_or_default(), used)
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by_key(|(_, _, used)| std::cmp::Reverse(*used));
+    profiles
+        .into_iter()
+        .map(|(directory, name, used)| {
+            let used = used
+                .and_then(local_time_12h)
+                .map(|time| format!(", last used {time}"))
+                .unwrap_or_default();
+            format!("\"{directory}\" (\"{name}\"{used})")
+        })
+        .collect()
+}
+
+/// Unix seconds as local time, e.g. `Nov 9, 2026, 2:52 PM`.
+fn local_time_12h(seconds: i64) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let time: nix::libc::time_t = seconds;
+    // SAFETY: localtime_r reads `time` and writes only into `tm`.
+    let mut tm = unsafe { std::mem::zeroed::<nix::libc::tm>() };
+    if unsafe { nix::libc::localtime_r(&time, &mut tm) }.is_null() {
+        return None;
+    }
+    let month = MONTHS.get(usize::try_from(tm.tm_mon).ok()?)?;
+    let hour = match tm.tm_hour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    let half = if tm.tm_hour < 12 { "AM" } else { "PM" };
+    Some(format!(
+        "{month} {}, {}, {hour}:{:02} {half}",
+        tm.tm_mday,
+        tm.tm_year + 1900,
+        tm.tm_min
+    ))
+}
+
+/// The host's Chrome profiles from `google-chrome/Local State`, empty when
+/// Chrome has none.
+fn host_chrome_profiles() -> Vec<String> {
+    let Some(config) = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(config.join("google-chrome/Local State"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .map(|state| chrome_profile_entries(&state))
+        .unwrap_or_default()
+}
+
+/// `description` plus as many Chrome profiles as fit the client's 2048-character
+/// description limit.
+fn with_chrome_profiles(description: String, profiles: &[String]) -> String {
+    const PREFIX: &str = " Chrome profiles here, most recently used first; pick one with --profile-directory=\"DIR\": ";
+    let mut text = description.clone();
+    for count in (1..=profiles.len()).rev() {
+        let candidate = format!("{description}{PREFIX}{}.", profiles[..count].join("; "));
+        if candidate.chars().count() <= 2048 {
+            text = candidate;
+            break;
+        }
+    }
+    text
 }
 
 impl SessionRouter {
     fn new(display: DisplayConfig) -> Self {
         Self {
+            chrome_profiles: Arc::new(host_chrome_profiles()),
             attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
@@ -19711,10 +19761,14 @@ impl SessionRouter {
                 properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist. Requests for a live session owned by another same-user kwin-mcp process are forwarded to its owner."}));
             }
             let description = tool.description.take().unwrap_or_default();
-            tool.description = Some(
-                format!("{description} Pass a session_id from your own session_start or an explicitly authorized session_attach; a live session you created through another local same-user process is forwarded to its owner.")
-                    .into(),
+            let description = format!(
+                "{description} Pass a session_id from your own session_start or an explicitly authorized session_attach; a live session you created through another local same-user process is forwarded to its owner."
             );
+            tool.description = Some(if tool.name == "launch_app" {
+                with_chrome_profiles(description, &self.chrome_profiles).into()
+            } else {
+                description.into()
+            });
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
@@ -23466,5 +23520,50 @@ mod transient_capture_tests {
             }
         });
         assert!(compare_transient_capture(&parent, &reference, (0, 0), (200, 200), &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod chrome_profile_tests {
+    use super::{chrome_profile_entries, with_chrome_profiles};
+
+    #[test]
+    fn profiles_are_listed_by_last_use_with_directory_and_name() {
+        let state = serde_json::json!({"profile":{"info_cache":{
+            "Default":{"name":"Your Chrome","active_time":1794271924.627086},
+            "Profile 2":{"name":"Person 1","active_time":1794271990.5},
+            "Profile 3":{"name":"Never"}
+        }}});
+        let entries = chrome_profile_entries(&state);
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries[0].starts_with("\"Profile 2\" (\"Person 1\", last used "),
+            "{entries:?}"
+        );
+        assert!(
+            entries[1].starts_with("\"Default\" (\"Your Chrome\", last used "),
+            "{entries:?}"
+        );
+        assert!(
+            entries[0].ends_with(" AM)") || entries[0].ends_with(" PM)"),
+            "{entries:?}"
+        );
+        assert_eq!(entries[2], "\"Profile 3\" (\"Never\")");
+        assert!(chrome_profile_entries(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn the_profile_list_never_pushes_a_description_past_2048_characters() {
+        let profiles = (0..200)
+            .map(|index| format!("\"Profile {index}\" (\"Person {index}\")"))
+            .collect::<Vec<_>>();
+        let described = with_chrome_profiles("x".repeat(1900), &profiles);
+        assert!(described.chars().count() <= 2048);
+        assert!(described.contains("\"Profile 0\""));
+        assert_eq!(
+            with_chrome_profiles("x".repeat(2040), &profiles),
+            "x".repeat(2040)
+        );
+        assert_eq!(with_chrome_profiles("d".to_owned(), &[]), "d");
     }
 }

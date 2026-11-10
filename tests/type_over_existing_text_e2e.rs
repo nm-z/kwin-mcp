@@ -70,7 +70,7 @@ fn typing_into_a_filled_field_reports_before_and_after_and_replace_overwrites() 
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     let started = wire.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

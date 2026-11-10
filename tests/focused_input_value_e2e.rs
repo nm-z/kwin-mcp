@@ -70,7 +70,7 @@ fn inputs_show_their_value_and_a_refused_type_names_the_focus() {
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     let started = wire.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

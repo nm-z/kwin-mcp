@@ -82,7 +82,7 @@ fn an_inherit_start_over_many_browser_profiles_returns_a_small_result() {
         2,
         "tools/call",
         json!({"name":"session_start",
-            "arguments":{"browser_profiles":"inherit", "startup_timeout_seconds":120}}),
+            "arguments":{"startup_timeout_seconds":120}}),
     );
     let reply: Value = serde_json::from_str(&raw).expect("a JSON reply");
     let session = reply["result"]["structuredContent"]["session_id"]

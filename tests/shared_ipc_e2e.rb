@@ -56,7 +56,7 @@ Dir.mktmpdir('kmipc-', '/var/tmp') do |root|
           rpc('initialize', protocolVersion: '2025-06-18', capabilities: {}, clientInfo: {name: 'shared-ipc-e2e', version: '1'})
           input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
           input.flush
-          started = call('session_start', width: 800, height: 600, browser_profiles: 'fresh')
+          started = call('session_start', width: 800, height: 600)
           @session = started.fetch('session_id')
           shared = started.fetch('workdir')
           entry = call('session_list').fetch('sessions').find { |item| item['session_id'] == @session }

@@ -28,7 +28,7 @@ end
 begin
  rpc.call('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'issue500-failure-context',version:'1'}})
  i.puts(JSON.generate(jsonrpc:'2.0',method:'notifications/initialized'));i.flush
- started=call.call('session_start',{width:800,height:600,browser_profiles:'fresh'})
+ started=call.call('session_start',{width:800,height:600})
  session=started.fetch('session_id');work=started.fetch('workdir')
  raise 'workdir is not owned by test user' unless File.stat(work).uid==Process.uid
  permissions=File.stat(work).mode & 0777

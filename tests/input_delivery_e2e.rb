@@ -52,7 +52,7 @@ class InputDeliveryProbe
         clientInfo: { name: 'input-delivery-e2e', version: '1' })
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
-    start = call('session_start', width: width, height: height, browser_profiles: 'fresh', startup_timeout_seconds: 60)
+    start = call('session_start', width: width, height: height, startup_timeout_seconds: 60)
     assert_success(start)
     @started = true
     @workdir = start.dig('result','structuredContent','workdir')

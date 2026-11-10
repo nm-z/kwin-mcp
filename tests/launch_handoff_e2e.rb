@@ -71,7 +71,7 @@ class LaunchHandoffProbe
                                  clientInfo: {name: 'launch-handoff', version: '1'})
     raise response.inspect if response['error']
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); @input.flush
-    started = data('session_start', width: 1280, height: 800, browser_profiles: 'fresh',
+    started = data('session_start', width: 1280, height: 800,
                                     startup_timeout_seconds: 60)
     @session = started.fetch('session_id')
     @shared = started.fetch('host_shared_dir')

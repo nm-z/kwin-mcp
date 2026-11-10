@@ -58,7 +58,7 @@ class ActivationIdProbe
         clientInfo: {name: 'window-activation-ids', version: '1'})
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); @input.flush
     started = data('session_start', width: 1000, height: 700,
-                   browser_profiles: 'fresh', window_mode: 'native', startup_timeout_seconds: 60)
+                   window_mode: 'native', startup_timeout_seconds: 60)
     @session = started.fetch('session_id')
   end
 

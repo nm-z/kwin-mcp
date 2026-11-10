@@ -46,7 +46,7 @@ Dir.mktmpdir('k580-', ENV.fetch('KWIN_MCP_TEST_TMPDIR', '/var/tmp')) do |home|
   begin
     rpc.call('initialize', {protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {name: 'qt-line-edit-receipt', version: '1'}})
     input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
-    session = data.call('session_start', {width: 1280, height: 800, browser_profiles: 'fresh'}).fetch('session_id')
+    session = data.call('session_start', {width: 1280, height: 800}).fetch('session_id')
     data.call('launch_app', {command: "okular #{home}/doc.pdf", window_timeout_seconds: 30})
     sleep 2
     # The page-number field is the role "text" node right of the previous-page button.

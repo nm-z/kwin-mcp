@@ -74,27 +74,6 @@ class StartupProbe
 end
 
 probe = nil
-begin
-  probe = StartupProbe.new(server, evidence, 'fresh')
-  profile = File.join(probe.home, '.config/google-chrome/Default')
-  FileUtils.mkdir_p(profile)
-  fifo = File.join(profile, 'Preferences')
-  File.mkfifo(fifo)
-  File.write(File.join(profile, 'host-only'), 'synthetic host marker')
-  result = probe.data(probe.start(browser_profiles:'fresh'))
-  raise result.inspect unless result['browser_profiles']=='fresh' && result['startup_timeout_seconds']==20
-  workdir = result.fetch('workdir')
-  probe.data(probe.call('launch_app', command:'test ! -e "$HOME/.config/google-chrome/Default/host-only" && test ! -e "$HOME/.config/google-chrome/Default/Preferences" && printf fresh > "$XDG_RUNTIME_DIR/profile-proof" && konsole --separate --nofork -e bash --noprofile --norc'))
-  raise 'fresh profile mask failed' unless File.read(File.join(workdir,'profile-proof'))=='fresh'
-  raise 'host profile changed' unless File.read(File.join(profile,'host-only'))=='synthetic host marker' && File.pipe?(fifo)
-  probe.stop
-  raise 'fresh mode persisted cookies' if File.exist?(File.join(probe.home,'.local/state/kwin-mcp/browser-cookies'))
-  puts 'PASS fresh: terminal launched despite blocked host Preferences; host profile masked and unchanged; no cookie persistence'
-ensure
-  probe&.close
-end
-
-probe = nil
 fifo = nil
 begin
   probe = StartupProbe.new(server, evidence, 'blocked')
@@ -123,10 +102,10 @@ begin
     response = probe.start(startup_timeout_seconds:seconds)
     raise response.inspect unless response.dig('error','code') == -32602
   end
-  response = probe.start(browser_profiles:'fresh', startup_timeout_seconds:2)
+  response = probe.start(startup_timeout_seconds:2)
   raise response.inspect unless response.dig('error','data','reason')=='hard_timeout'
   probe.stop
-  result = probe.data(probe.start(browser_profiles:'fresh', startup_timeout_seconds:10))
+  result = probe.data(probe.start(startup_timeout_seconds:10))
   raise result.inspect unless result['startup_timeout_seconds']==10
   probe.data(probe.call('window_list'))
   probe.stop

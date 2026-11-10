@@ -69,7 +69,7 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     let started = wire.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

@@ -74,7 +74,7 @@ fn a_stalled_start_names_the_processes_in_its_sandbox() {
         2,
         "tools/call",
         json!({"name":"session_start",
-            "arguments":{"browser_profiles":"fresh", "startup_timeout_seconds":5}}),
+            "arguments":{"startup_timeout_seconds":5}}),
     );
     let _ = child.kill();
     let _ = child.wait();

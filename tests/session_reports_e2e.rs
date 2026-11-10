@@ -191,7 +191,7 @@ impl Server {
     }
 
     fn start_session(&mut self, extra: Value) -> Value {
-        let mut arguments = json!({"width":1280, "height":800, "browser_profiles":"fresh",
+        let mut arguments = json!({"width":1280, "height":800,
                                    "startup_timeout_seconds":60});
         if let (Some(arguments), Some(extra)) = (arguments.as_object_mut(), extra.as_object()) {
             arguments.extend(extra.clone());
@@ -278,7 +278,7 @@ fn disk_floor() {
     let mut server = Server::start(&["--autoclean"]);
     let refused = server.call(
         "session_start",
-        json!({"width":1280, "height":800, "browser_profiles":"fresh",
+        json!({"width":1280, "height":800,
                "startup_timeout_seconds":60, "disk_min_free_mib":100_000_000_u64}),
     );
     assert!(
@@ -875,7 +875,7 @@ fn at_spi_launcher_outside_path() {
     let started = server.data(
         "session_start",
         json!({"width":1280, "height":720, "window_mode":"native",
-               "browser_profiles":"fresh", "startup_timeout_seconds":30}),
+               "startup_timeout_seconds":30}),
     );
     server.session = Some(
         started["session_id"]

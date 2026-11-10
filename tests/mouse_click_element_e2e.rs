@@ -77,7 +77,7 @@ fn a_click_by_name_lands_after_the_layout_moved() {
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     let started = wire.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

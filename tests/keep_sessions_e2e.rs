@@ -107,7 +107,7 @@ fn a_second_server_reaches_a_session_whose_client_closed() {
 
     let started = first.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

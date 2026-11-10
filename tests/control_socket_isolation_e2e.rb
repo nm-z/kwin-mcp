@@ -63,7 +63,7 @@ Dir.mktmpdir('k597-', ENV.fetch('KWIN_MCP_TEST_TMPDIR', '/var/tmp')) do |home|
     rpc.call('initialize', {protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {name: 'control-socket', version: '1'}})
     input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
     5.times do |attempt|
-      started = call.('session_start', {browser_profiles: 'fresh', width: 800, height: 600})
+      started = call.('session_start', {width: 800, height: 600})
       raise "start #{attempt + 1} failed during socket churn: #{started['error'] || started}" if started['error'] || started.dig('result', 'isError')
       sessions << started.dig('result', 'structuredContent', 'session_id')
     end

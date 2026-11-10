@@ -62,10 +62,10 @@ Dir.mktmpdir('kmvup-',FixturePaths.root) do |root|
   begin
     Timeout.timeout(5) { sleep 0.02 until File.socket?(bus) }
     outer=ViewerUpgradeClient.new(server,File.join(root,'outer'),proof,'outer',"unix:path=#{bus}")
-    desktop=outer.ok(outer.call('session_start',width:1000,height:800,browser_profiles:'fresh'))
+    desktop=outer.ok(outer.call('session_start',width:1000,height:800))
     home=File.join(root,'inner')
     inner=ViewerUpgradeClient.new(server,home,proof,'inner',"unix:path=#{bus}",File.join(desktop.fetch('workdir'),'wayland-0'))
-    started=inner.ok(inner.call('session_start',width:640,height:480,browser_profiles:'fresh'))
+    started=inner.ok(inner.call('session_start',width:640,height:480))
     id=started.fetch('session_id');workdir=started.fetch('workdir')
     inner.ok(inner.call('launch_app',session_id:id,command:'kdialog --title viewer-upgrade-field --inputbox Input > "$HOME/field.txt"'))
     viewer=inner.ok(inner.call('viewer_open',session_id:id,reason:'Inspect the owned input field')).fetch('viewer')

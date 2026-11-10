@@ -67,7 +67,7 @@ fn read_as(client: &str) -> (Value, Value) {
         }),
     );
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool("session_start", json!({"browser_profiles":"fresh"}));
+    let started = wire.tool("session_start", json!({}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")

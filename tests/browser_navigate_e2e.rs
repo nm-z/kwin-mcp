@@ -69,7 +69,7 @@ fn navigate_opens_the_typed_address_and_reports_where_it_landed() {
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
     let started = wire.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

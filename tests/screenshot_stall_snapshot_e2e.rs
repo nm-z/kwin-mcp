@@ -105,7 +105,7 @@ fn session_with_compositor(home: &std::path::Path) -> (Child, Wire, String, u32)
     let started = wire.tool(
         2,
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1280, "height":720}),
+        json!({"width":1280, "height":720}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

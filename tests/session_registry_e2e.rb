@@ -71,13 +71,13 @@ Dir.mktmpdir('kw-registry-', '/tmp') do |root|
           input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
           input.flush
 
-          first = structured(call(input, output, 2, 'session_start', browser_profiles: 'fresh', startup_timeout_seconds: 60)).fetch('session_id')
+          first = structured(call(input, output, 2, 'session_start', startup_timeout_seconds: 60)).fetch('session_id')
           # Both sessions write the same private /tmp pathname. Unlike
           # /etc/hostname, these bytes distinguish the owner serving an export.
           session_file = '/tmp/kw410-session-token'
           succeeded(call(input, output, 20, 'launch_app', session_id: first,
                          command: "printf '%s\\n' #{Shellwords.escape(first)} > #{session_file}; exec kdialog --title 'First session' --msgbox 'Earlier session stays usable'"))
-          second = structured(call(input, output, 3, 'session_start', browser_profiles: 'fresh', startup_timeout_seconds: 60)).fetch('session_id')
+          second = structured(call(input, output, 3, 'session_start', startup_timeout_seconds: 60)).fetch('session_id')
           raise 'session ids collide' if first == second
           succeeded(call(input, output, 21, 'launch_app', session_id: second,
                          command: "printf '%s\\n' #{Shellwords.escape(second)} > #{session_file}; exec kdialog --title 'Second session' --msgbox 'Later session has different export bytes'"))

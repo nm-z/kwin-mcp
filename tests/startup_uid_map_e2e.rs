@@ -85,7 +85,7 @@ fn a_refused_uid_map_is_reported_with_guidance() {
     send(json!({
         "jsonrpc":"2.0", "id":2, "method":"tools/call",
         "params":{"name":"session_start",
-            "arguments":{"browser_profiles":"fresh", "startup_timeout_seconds":30}}
+            "arguments":{"startup_timeout_seconds":30}}
     }));
     let response = reply(2);
     let _ = child.kill();

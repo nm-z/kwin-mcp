@@ -44,7 +44,7 @@ Dir.mktmpdir('k596-', ENV.fetch('KWIN_MCP_TEST_TMPDIR', '/var/tmp')) do |home|
     rpc.call('initialize', {protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {name: 'kwin-exit', version: '1'}})
     input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
     started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    response = rpc.call('tools/call', {name: 'session_start', arguments: {browser_profiles: 'fresh', width: 800, height: 600}})
+    response = rpc.call('tools/call', {name: 'session_start', arguments: {width: 800, height: 600}})
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
     message = response.dig('error', 'message').to_s
     File.write(File.join(evidence, 'result.json'), JSON.pretty_generate(response: response, elapsed: elapsed))

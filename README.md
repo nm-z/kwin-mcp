@@ -1082,21 +1082,19 @@ native regression verifies all 75 characters in an unrestricted search field
 and deliberately limits another to 72: that mismatch removes the final `:1d`,
 showing why the count alone cannot identify the missing characters.
 
-### Startup budgets and fresh browser profiles
+### Startup budgets and browser profiles
 
 `session_start` accepts `startup_timeout_seconds` from 1 to 300 (default 60).
 The budget includes waiting for the lifecycle gate and preparing host profiles;
 it does not disable bounded startup or cleanup. Increase it explicitly when a
 large profile set needs more preparation time.
 
-For a terminal-only task or a browser that should start without inherited
-Chromium profiles, use `browser_profiles: "fresh"`. The recognized Chromium
-configuration directories start empty in that session, profile/cookie copying
-is skipped, and cookies from those fresh profiles are not persisted between
-sessions. Host files are unchanged. The default `"inherit"` preserves the
-existing profile and cookie-continuity behavior. The response reports both the
-profile mode and startup budget. This option does not bypass general HOME
-mount/process discovery or unblock unrelated hung filesystems.
+Every session inherits the host's Chromium profiles and their cookies. When the
+server starts, it reads Chrome's `Local State` and lists each profile's
+directory, name and last use in the `launch_app` description, most recently
+used first, so an agent can pick one with `--profile-directory="DIR"` without
+looking. The list is read once per server process, not per session, and is cut
+to fit the 2048-character description limit.
 
 Browser preparation timeouts identify the current operation and pathname,
 without printing file contents. Preparation checks its deadline between
@@ -1113,8 +1111,8 @@ D-Bus failures, noisy diagnostics, normal KWin startup, and cleanup.
 
 Run `ruby tests/startup_profiles_e2e.rb SERVER EVIDENCE` for the real-stdio
 regression. It uses synthetic private profiles, a controlled blocked Preferences
-read, terminal launch, and a delayed real sandbox to verify profile isolation,
-operation diagnostics, deferred cleanup, and configurable timeout bounds.
+read, and a delayed real sandbox to verify operation diagnostics, deferred
+cleanup, and configurable timeout bounds.
 
 ## Release packaging and deployment
 

@@ -95,7 +95,7 @@ fn find_ui_elements_reaches_a_button_after_thousands_of_nodes() {
     let mut server = Server::start(&home);
     let started = server.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1920, "height":1080}),
+        json!({"width":1920, "height":1080}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
@@ -144,7 +144,7 @@ fn typing_after_a_click_finds_the_field_on_a_page_with_thousands_of_nodes() {
 
     let started = server.tool(
         "session_start",
-        json!({"browser_profiles":"fresh", "width":1920, "height":1080}),
+        json!({"width":1920, "height":1080}),
     );
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()

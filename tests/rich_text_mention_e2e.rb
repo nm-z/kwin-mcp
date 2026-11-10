@@ -62,7 +62,7 @@ Dir.mktmpdir('k575-', ENV.fetch('KWIN_MCP_TEST_TMPDIR', '/var/tmp')) do |home|
   begin
     rpc.call('initialize', {protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {name: 'rich-text-mention', version: '1'}})
     input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized')); input.flush
-    session = data.call('session_start', {width: 1280, height: 800, browser_profiles: 'fresh'}).fetch('session_id')
+    session = data.call('session_start', {width: 1280, height: 800}).fetch('session_id')
     data.call('launch_app', {command: "google-chrome-stable --no-first-run --no-default-browser-check #{Shellwords.escape("file://#{page}")}", window_timeout_seconds: 30})
     sleep 3
     typed = data.call('keyboard_type', {text: TYPED})

@@ -7157,7 +7157,7 @@ fn check_live_idle_expiry(block_cleanup: bool) {
         &mut client,
         2,
         "session_start",
-        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+        json!({"width":800,"height":600}),
     );
     let id = session_handle(&started);
     let runtime = workdir(&started);
@@ -7257,7 +7257,7 @@ fn cleanup_retry_updates_the_record_to_removed() {
         &mut client,
         2,
         "session_start",
-        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+        json!({"width":800,"height":600}),
     );
     let id = session_handle(&started);
     let runtime = workdir(&started);
@@ -7585,7 +7585,7 @@ fn screenshot_timeout_is_retryable_and_preserves_the_desktop() {
         &mut client,
         2,
         "session_start",
-        json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+        json!({"width":800,"height":600}),
     );
     let session_id = session_handle(&started);
     let launched = call_tool(
@@ -11422,7 +11422,7 @@ fn session_private_sqlite_reopens_with_new_sidecars() -> Result<(), Box<dyn std:
         2,
         "session_start",
         json!({
-            "browser_profiles": "fresh", "writable_paths": [codex_directory],
+            "writable_paths": [codex_directory],
         }),
     );
     private_sqlite_tool_ok(&started)?;
@@ -11551,7 +11551,7 @@ fn session_attach_reuses_foreign_desktop_without_owning_lifecycle() {
         2,
         "session_start",
         json!({
-            "browser_profiles":"fresh", "width":1280, "height":800,
+            "width":1280, "height":800,
         }),
     );
     let session_id = session_handle(&started);
@@ -11699,7 +11699,7 @@ fn starting_another_session_preserves_existing_file_exports() {
             &mut client,
             request,
             "session_start",
-            json!({"width":800,"height":600,"browser_profiles":"fresh"}),
+            json!({"width":800,"height":600}),
         );
         let id = session_handle(&started);
         let launched = call_tool(

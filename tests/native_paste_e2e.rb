@@ -78,7 +78,7 @@ begin
           raise initialized.inspect if initialized['error']
           input.puts(JSON.generate({jsonrpc: '2.0', method: 'notifications/initialized'})); input.flush
 
-          started = content.call(call.call('session_start', {browser_profiles: 'fresh', width: 1280, height: 800}))
+          started = content.call(call.call('session_start', {width: 1280, height: 800}))
           session_id = started.fetch('session_id')
           args = {session_id: session_id}
           File.write(File.join(evidence, 'started.json'), JSON.pretty_generate(started))

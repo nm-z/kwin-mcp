@@ -37,7 +37,7 @@ class KeyboardPasteProbe
     @input.puts(JSON.generate(jsonrpc: '2.0', method: 'notifications/initialized'))
     @input.flush
     @tools = rpc('tools/list', {}).fetch('result').fetch('tools').map { |tool| tool.fetch('name') }
-    started = data(call('session_start', width: 1232, height: 924, browser_profiles: 'fresh',
+    started = data(call('session_start', width: 1232, height: 924,
                                       startup_timeout_seconds: 120))
     @session_id = started.fetch('session_id')
   rescue StandardError
