@@ -79,7 +79,7 @@ impl Window {
             draw_fn,
             on_submission,
             None,
-            || {},
+            || false,
             |_, _| false,
         )
     }
@@ -87,6 +87,14 @@ impl Window {
     /// Calls `on_idle` on the responsive event loop even when rendering is
     /// suspended. Window events reach `on_event` immediately; returning true
     /// consumes the event instead of also buffering it for the draw callback.
+    ///
+    /// Redraws follow the compositor's frame callbacks, and a compositor that
+    /// is not showing the window (it is minimized or hidden, or the outputs
+    /// are powered off) sends none, so no redraw is requested however long
+    /// that lasts. When `on_idle` returns true, one frame is drawn and
+    /// presented at once without waiting for a frame callback. The swapchain
+    /// should then use a present mode that does not wait for one either
+    /// (`v_sync(false)`), or that draw can block.
     pub fn run_with_submission_idle_and_event_callbacks<F, P, I, E>(
         self,
         draw_fn: F,
@@ -98,7 +106,7 @@ impl Window {
     where
         F: FnMut(FrameContext),
         P: FnMut(),
-        I: FnMut(),
+        I: FnMut() -> bool,
         E: FnMut(&winit::window::Window, &WindowEvent) -> bool,
     {
         struct Application<F, P, I, E> {
@@ -236,7 +244,7 @@ impl Window {
         where
             F: FnMut(FrameContext),
             P: FnMut(),
-            I: FnMut(),
+            I: FnMut() -> bool,
             E: FnMut(&winit::window::Window, &WindowEvent) -> bool,
         {
             fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -247,8 +255,26 @@ impl Window {
                             .active_window
                             .as_ref()
                             .is_some_and(|window| window.configured);
-                        if can_report_idle {
-                            (self.on_idle)();
+                        let draw_now = can_report_idle && (self.on_idle)();
+                        if let Some(active_window) =
+                            self.active_window.as_mut().filter(|_| draw_now)
+                        {
+                            // No frame callback is on its way, or `on_idle`
+                            // would not have asked: draw without one.
+                            match active_window.draw(
+                                &self.device,
+                                &mut self.draw_fn,
+                                &mut self.on_submission,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => event_loop.exit(),
+                                Err(err) => {
+                                    eprintln!(
+                                        "screen-13-window: draw without a frame callback failed: {err}"
+                                    );
+                                    event_loop.exit();
+                                }
+                            }
                         }
                         self.next_idle = now + interval;
                     }

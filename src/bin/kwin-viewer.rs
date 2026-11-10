@@ -80,6 +80,23 @@ const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 // A drag delivers a Resized per pointer step; the aspect correction waits until
 // the size has held this long, so it never fights the compositor mid-drag.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+// A compositor that is not showing the window (it is minimized or hidden, or
+// the outputs are powered off) sends no frame callbacks, so nothing asks the
+// window to redraw. A frame that has waited this long for a redraw is drawn
+// and presented without one, so the window's content is current whenever it
+// is looked at: by a person once it shows again, by a screenshot or a window
+// thumbnail before that. A shown window redraws on every frame callback, far
+// sooner than this.
+const UNSHOWN_DRAW_AFTER: Duration = Duration::from_millis(100);
+// How often the window looks for such a frame.
+const UNSHOWN_DRAW_POLL: Duration = Duration::from_millis(50);
+
+// Whether to draw without the compositor asking: the window has shown its
+// first frame, something waits to be drawn, and no draw has run for
+// UNSHOWN_DRAW_AFTER.
+fn draws_unshown(ready: bool, waiting: bool, since_last_draw: Duration) -> bool {
+    ready && waiting && since_last_draw >= UNSHOWN_DRAW_AFTER
+}
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 const VIEWER_STATUS_HEARTBEAT: Duration = Duration::from_secs(1);
 const INITIAL_VIEWER_WIDTH: f64 = 1920.0;
@@ -968,6 +985,11 @@ fn window_loop(
     let surface = Arc::new(Mutex::new(None::<vk::SurfaceFormatKHR>));
     let window = WindowBuilder::default()
         .window(|wa| wa.with_title(&initial_title).with_inner_size(initial_size))
+        // Mailbox presentation: a present never waits for the compositor to
+        // show the previous one, which it does not do while the window is
+        // not shown. Redraws of a shown window still follow the compositor's
+        // frame callbacks, one per refresh.
+        .v_sync(false)
         .desired_surface_format({
             let surface = Arc::clone(&surface);
             move |formats| {
@@ -1017,9 +1039,14 @@ fn window_loop(
     };
     // Capture time of the picture staged by the current draw, until its
     // submission is counted.
-    let staged_capture = Cell::new(None::<u64>);
+    // With it, whether that draw was one the compositor did not ask for.
+    let staged_capture = Cell::new(None::<(u64, bool)>);
     // The swapchain format the stream's counters already name.
     let noted_surface = Cell::new(None::<vk::SurfaceFormatKHR>);
+    // When the window last drew, and whether the draw now running is one the
+    // idle callback asked for because the compositor asks for none.
+    let last_draw = Cell::new(Instant::now());
+    let unshown_draw = Cell::new(false);
     let mut draw_frame = |mut frame: FrameContext<'_>| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
@@ -1027,6 +1054,8 @@ fn window_loop(
             frame.exit();
             return;
         }
+        last_draw.set(Instant::now());
+        let unshown = unshown_draw.take();
         report_size(frame.window.inner_size());
 
         if !first_host_redraw {
@@ -1117,7 +1146,7 @@ fn window_loop(
                         let image_node = frame.render_graph.bind_node(image);
                         frame.render_graph.copy_buffer_to_image(staging_node, image_node);
                         session_frame_queued = true;
-                        staged_capture.set(Some(f.captured_micros));
+                        staged_capture.set(Some((f.captured_micros, unshown)));
                     }
                     Err(e) => eprintln!("kwin-viewer: staging buffer failed: {e:?}"),
                 }
@@ -1163,10 +1192,10 @@ fn window_loop(
     window.run_with_submission_idle_and_event_callbacks(
         &mut draw_frame,
         || {
-            if let Some(captured) = staged_capture.take()
+            if let Some((captured, unshown)) = staged_capture.take()
                 && let Some(stream) = stream
             {
-                stream.presented(captured);
+                stream.presented(captured, unshown);
             }
             if !ready_reported.get() && first_frame_queued.get() {
                 ready_reported.set(true);
@@ -1192,7 +1221,7 @@ fn window_loop(
                 last_status_heartbeat.set(Instant::now());
             }
         },
-        Some(VIEWER_STATUS_HEARTBEAT),
+        Some(UNSHOWN_DRAW_POLL),
         || {
             if ready_reported.get()
                 && !window_closed.get()
@@ -1203,6 +1232,18 @@ fn window_loop(
                 }
                 last_status_heartbeat.set(Instant::now());
             }
+            // The compositor asks for no redraw while it does not show the
+            // window. A frame that has waited this long is drawn without one.
+            // The same draw is where the window leaves when the session or
+            // the stream has ended.
+            let waiting = mailbox.0.lock().is_ok_and(|frame| frame.is_some());
+            let draw = draws_unshown(
+                first_frame_queued.get(),
+                waiting || shutdown.requested(),
+                last_draw.get().elapsed(),
+            );
+            unshown_draw.set(draw);
+            draw
         },
         |window, event| {
             // Input and focus-loss releases must run even when a minimized surface
@@ -2247,6 +2288,7 @@ struct StreamCounters {
     frames: u64,
     bytes: u64,
     presented: u64,
+    presented_unshown: u64,
     parameter_sets: u64,
     // Changes between raw and DSC, and raw pictures that repeated a still
     // DSC picture exactly. A settle picture is not a change of mode.
@@ -2271,6 +2313,9 @@ struct RecentCounters {
     // Pictures a newer one replaced before they were decoded.
     skipped: u64,
     presented: u64,
+    // Of those, the ones drawn without the compositor asking, because it was
+    // not showing the window.
+    presented_unshown: u64,
     decode_micros: u64,
     sender_micros: u64,
     // Capture on the session's host to submission for presentation here, on
@@ -2314,11 +2359,13 @@ impl StreamStats {
         counters.recent.sender_micros += u64::from(header.sender_micros);
     }
 
-    fn presented(&self, captured_micros: u64) {
+    fn presented(&self, captured_micros: u64, unshown: bool) {
         let latency = unix_micros().saturating_sub(captured_micros);
         let mut counters = self.counters();
         counters.presented += 1;
+        counters.presented_unshown += u64::from(unshown);
         counters.recent.presented += 1;
+        counters.recent.presented_unshown += u64::from(unshown);
         counters.recent.latency_micros += latency;
         counters.recent.latency_max_micros = counters.recent.latency_max_micros.max(latency);
     }
@@ -2406,12 +2453,13 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
         let decode = milliseconds(recent.decode_micros, recent.frames);
         if active {
             eprintln!(
-                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented, {} skipped for a newer one; {} frames and {} parameter sets in total; {} mode switches, {} settles",
+                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented ({} of them while the window was not shown), {} skipped for a newer one; {} frames and {} parameter sets in total; {} mode switches, {} settles",
                 counters.width,
                 counters.height,
                 bits_per_pixel(counters.bpp_x16),
                 counters.frame_bytes,
                 recent.presented,
+                recent.presented_unshown,
                 recent.skipped,
                 counters.frames,
                 counters.parameter_sets,
@@ -2431,13 +2479,15 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
         let surface = stats.surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let body = serde_json::json!({
             "frames": counters.frames, "bytes": counters.bytes, "presented": counters.presented,
+            "presented_unshown": counters.presented_unshown,
             "parameter_sets": counters.parameter_sets,
             "mode_switches": counters.mode_switches, "settles": counters.settles,
             "width": counters.width, "height": counters.height, "mode": mode, "stream_mode": stream_mode,
             "bits_per_pixel": bits_per_pixel(counters.bpp_x16), "frame_bytes": counters.frame_bytes,
             "swapchain": surface,
             "last_second": {
-                "frames": recent.frames, "presented": recent.presented, "skipped": recent.skipped,
+                "frames": recent.frames, "presented": recent.presented,
+                "presented_unshown": recent.presented_unshown, "skipped": recent.skipped,
                 "frames_per_second": frames_per_second, "megabits_per_second": megabits_per_second,
                 "latency_ms": latency, "latency_max_ms": latency_max,
                 "sender_ms": sender, "decode_ms": decode,
@@ -3427,6 +3477,33 @@ mod wire_tests {
 
     fn picture(payload: Payload, settle: bool) -> Header {
         Header { payload, settle, width: 4, height: 2, bpp_x16: 96, sequence: 0, captured_micros: 0, sender_micros: 0 }
+    }
+
+    #[test]
+    fn a_frame_no_redraw_comes_for_is_drawn_after_a_tenth_of_a_second() {
+        let long = UNSHOWN_DRAW_AFTER;
+        let short = long - Duration::from_millis(1);
+        assert!(draws_unshown(true, true, long));
+        // A shown window redraws on a frame callback well before that.
+        assert!(!draws_unshown(true, true, short));
+        // Nothing waits to be drawn.
+        assert!(!draws_unshown(true, false, long));
+        // The first frame comes with the window's first redraw.
+        assert!(!draws_unshown(false, true, long));
+        assert!(UNSHOWN_DRAW_POLL <= UNSHOWN_DRAW_AFTER);
+    }
+
+    #[test]
+    fn presents_the_compositor_did_not_ask_for_are_counted_apart() {
+        let stats = StreamStats::default();
+        stats.presented(unix_micros(), false);
+        stats.presented(unix_micros(), true);
+        stats.presented(unix_micros(), true);
+        let counters = stats.take();
+        assert_eq!((counters.presented, counters.presented_unshown), (3, 2));
+        assert_eq!((counters.recent.presented, counters.recent.presented_unshown), (3, 2));
+        let next = stats.take();
+        assert_eq!((next.presented_unshown, next.recent.presented_unshown), (2, 0));
     }
 
     #[test]

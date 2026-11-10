@@ -96,7 +96,7 @@ intentionally has no PNG.
 
 ```bash
 cargo test --release --test remote_viewer_e2e -- --ignored --test-threads 1 \
-  a_remote_session raw_frames every_way
+  a_remote_session raw_frames every_way a_window_the_compositor
 cargo test --release --test remote_viewer_e2e -- --ignored two_viewers --nocapture
 cargo test --release --test remote_viewer_e2e -- --ignored measure_the_stream --nocapture
 ```
@@ -145,3 +145,35 @@ remote sessions.
   chosen mode, bytes per frame, frames per second, capture-to-present latency,
   processor use of sender and viewer, and what the still frame became.
   `KWIN_MCP_TEST_BINARY` names another kwin-mcp build to measure.
+- `a_window_the_compositor_does_not_show_still_presents_the_frames_it_receives`:
+  the viewer window is minimized while text scrolls. It gets no frame
+  callbacks then, and must go on presenting what arrives (`presented` in its
+  counters keeps up with `frames`, counted as `presented_unshown`), return to
+  the compositor's redraws when it is shown again, and close when its stream
+  ends while it is minimized.
+- `the_local_viewer_keeps_showing_a_changing_session`: the local viewer, which
+  shares the window code, shows different pictures over time.
+
+Every test that streams also checks that the window presents: frames that
+arrive while `presented` stands still fail it.
+
+What the isolated desktop cannot show is the tester's own: real outputs with
+their scale and HDR mode, and the states in which that compositor repaints
+nothing (outputs powered off, a locked screen). One test opens its window
+there, for six seconds per session size:
+
+```bash
+KWIN_MCP_STREAM_HEIGHTS=1080,1350 KWIN_MCP_STREAM_EVIDENCE=/some/directory \
+  cargo test --release --test remote_viewer_e2e -- --ignored the_viewer_presents --nocapture
+```
+
+`the_viewer_presents_the_frames_it_receives_on_the_testers_own_desktop` fails
+when a second with frames has almost no presents, and with
+`KWIN_MCP_STREAM_EVIDENCE` it copies the viewer's log and takes two screenshots
+of the window (kdotool makes it the active window, spectacle captures it),
+which must differ. `KWIN_MCP_REAL_DESKTOP_MOVE=X,Y` moves the window first, to
+choose the output. Run it once with the screens on and once with them off
+(`kscreen-doctor --dpms off`): the log says which presents the compositor did
+not ask for. A 1920x1080 session on an output at scale 1.25 gives a window of
+2400x1350 device pixels, larger than the session; a 2400x1350 session there is
+shown one to one.
