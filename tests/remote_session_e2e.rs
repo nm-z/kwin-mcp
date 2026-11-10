@@ -264,13 +264,7 @@ fn a_session_runs_on_the_listener_and_ends_with_its_owner() {
         .is_some_and(|content| content.iter().any(|part| part["type"] == "image"));
     assert!(image, "the remote screenshot carries no image: {shot}");
 
-    let viewer = server.tool(
-        "viewer_open",
-        json!({"session_id":session, "reason":"test"}),
-    );
-    assert_eq!(viewer["result"]["isError"], true, "{viewer}");
-    assert!(viewer.to_string().contains("#915"), "{viewer}");
-
+    // The viewer of a remote session is covered by remote_viewer_e2e.rs.
     let stopped = server.tool("session_stop", json!({"session_id":session}));
     assert!(stopped["error"].is_null(), "{stopped}");
     assert!(
