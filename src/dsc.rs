@@ -10,7 +10,25 @@
 //! Every encoded picture of one configuration has the same length:
 //! `chunk_size * slice_height` bytes per slice, slices of one row interleaved
 //! line by line (chunk by chunk), as the DSC transport sends them.
+//!
+//! Speed comes from four places, none of which changes a byte of output:
+//!
+//! - Slices are coded on a pool of worker threads that lives as long as any
+//!   [`Encoder`] or [`Decoder`] of the process (`Pool`), and every codec
+//!   object keeps its per-thread buffers between pictures.
+//! - Line buffers hold whole pixels, so the three components of a group are
+//!   predicted and quantized side by side in 16-bit lanes (`Lanes`); the
+//!   colour history search and the colour conversion are `Kernels` with SSE2
+//!   and AVX2 implementations next to the portable one.
+//! - The slice loops are compiled once per instruction set (`Level`) and the
+//!   copy for the running CPU is chosen at run time.
+//! - Work that follows the picture data (bit writing, the block-prediction
+//!   search, clamping) is written without branches.
 
+use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 
 const NUM_BUF_RANGES: usize = 15;
@@ -27,7 +45,9 @@ const MAX_SE_SIZE: i32 = 36;
 const RC_MODEL_SIZE: i64 = 8192;
 const OFFSET_FRACTIONAL_BITS: u32 = 11;
 const OVERFLOW_AVOID_THRESHOLD: i64 = -172;
-const BP_EDGE_COUNT: u32 = 3;
+/// Block prediction needs an edge among the last this many pixels; with the
+/// three-pixel groups that is an edge inside the group itself.
+const BP_EDGE_COUNT: usize = 3;
 const BP_EDGE_STRENGTH: i16 = 32;
 const FLATNESS_DET_THRESH: i32 = 2;
 const SOMEWHAT_FLAT_QP_THRESH: i32 = 7;
@@ -329,13 +349,26 @@ pub struct Pps {
     pub second_line_offset_adj: u16,
 }
 
-fn qlevel(component: usize, qp: i32) -> i32 {
-    let index = usize::try_from(qp.clamp(0, MAX_QP)).unwrap_or(0);
-    if component == 0 {
-        QLEVEL_LUMA[index]
-    } else {
-        QLEVEL_CHROMA[index]
+/// Quantization shift of Y, Co and Cg for every quantization parameter.
+const QLEVELS: [[i32; 3]; 16] = {
+    let mut levels = [[0; 3]; 16];
+    let mut qp = 0;
+    while qp < 16 {
+        levels[qp] = [QLEVEL_LUMA[qp], QLEVEL_CHROMA[qp], QLEVEL_CHROMA[qp]];
+        qp += 1;
     }
+    levels
+};
+
+/// Quantization shift of Y, Co and Cg at `qp`.
+#[inline(always)]
+fn qp_levels(qp: i32) -> [i32; 3] {
+    QLEVELS[usize::try_from(qp.clamp(0, MAX_QP)).unwrap_or(0) % QLEVELS.len()]
+}
+
+#[inline(always)]
+fn qlevel(component: usize, qp: i32) -> i32 {
+    qp_levels(qp)[component.min(2)]
 }
 
 fn ceil_div(numerator: i64, denominator: i64) -> i64 {
@@ -694,9 +727,8 @@ impl Pps {
             writer.put(i32::from(self.nsl_bpg_offset), 16);
             writer.put(i32::from(self.second_line_offset_adj), 16);
         }
-        writer.flush();
         let mut bytes = [0u8; PPS_SIZE];
-        for (target, source) in bytes.iter_mut().zip(writer.bytes.iter()) {
+        for (target, source) in bytes.iter_mut().zip(writer.written().iter()) {
             *target = *source;
         }
         bytes
@@ -848,98 +880,1235 @@ impl PpsReader<'_> {
     }
 }
 
-/// MSB-first bit accumulator (one per substream, and for the PPS).
+/// MSB-first bit accumulator (one per substream, and for the PPS). Every
+/// write stores the bits that are not yet part of a whole byte, left-aligned
+/// and padded with zero bits, as eight bytes at the write position: no
+/// branch depends on the data, and the written bytes are complete at any
+/// time.
 #[derive(Default)]
 struct BitWriter {
+    /// The bytes written so far, then scratch space.
     bytes: Vec<u8>,
+    /// Whole bytes written.
+    position: usize,
     accumulator: u64,
+    /// Low bits of the accumulator after the last whole byte (fewer than 8
+    /// between writes).
     pending: u32,
 }
 
 impl BitWriter {
-    fn clear(&mut self) {
-        self.bytes.clear();
+    /// Start over, with room for `capacity` bytes before the buffer grows.
+    fn clear(&mut self, capacity: usize) {
+        if self.bytes.len() < capacity + 8 {
+            self.bytes.resize(capacity + 8, 0);
+        }
+        self.position = 0;
         self.accumulator = 0;
         self.pending = 0;
     }
 
-    /// Append the low `bits` bits of `value` (two's complement for negatives).
+    /// Append the low `bits` bits of `value` (two's complement for negatives);
+    /// a width outside 1..=32 writes nothing.
+    #[inline(always)]
     fn put(&mut self, value: i32, bits: i32) {
-        let Ok(bits) = u32::try_from(bits) else {
-            return;
-        };
-        if bits == 0 || bits > 32 {
-            return;
-        }
-        let raw = u64::from(u32::from_le_bytes(value.to_le_bytes()));
-        self.accumulator = (self.accumulator << bits) | (raw & ((1u64 << bits) - 1));
-        self.pending += bits;
-        while self.pending >= 8 {
-            self.pending -= 8;
-            self.bytes
-                .push((self.accumulator >> self.pending).to_le_bytes()[0]);
+        if let Ok(bits @ 1..=32) = u32::try_from(bits) {
+            self.put_raw(u64::from(u32::from_le_bytes(value.to_le_bytes())), bits);
         }
     }
 
-    /// Pad the last partial byte with zero bits.
-    fn flush(&mut self) {
-        if self.pending > 0 {
-            let byte = (self.accumulator << (8 - self.pending)).to_le_bytes()[0];
-            self.bytes.push(byte);
-            self.pending = 0;
+    /// Append the low `bits` (at most 56) bits of `raw`.
+    #[inline(always)]
+    fn put_raw(&mut self, raw: u64, bits: u32) {
+        if bits == 0 || bits > 56 {
+            return;
         }
+        self.accumulator = (self.accumulator << bits) | (raw & ((1u64 << bits) - 1));
+        // Fewer than 8 bits were pending, so at most 63 are now.
+        self.pending += bits;
+        let aligned = (self.accumulator << (64 - self.pending)).to_be_bytes();
+        match self.bytes.get_mut(self.position..self.position + 8) {
+            Some(target) => target.copy_from_slice(&aligned),
+            None => self.grow(aligned),
+        }
+        self.position += usize::try_from(self.pending / 8).unwrap_or(0);
+        self.pending %= 8;
+    }
+
+    #[cold]
+    fn grow(&mut self, aligned: [u8; 8]) {
+        self.bytes.resize(self.position * 2 + 64, 0);
+        if let Some(target) = self.bytes.get_mut(self.position..self.position + 8) {
+            target.copy_from_slice(&aligned);
+        }
+    }
+
+    /// The bytes written so far, the last partial byte padded with zero bits.
+    fn written(&self) -> &[u8] {
+        let length = self.position + usize::from(self.pending > 0);
+        self.bytes.get(..length).unwrap_or(&[])
     }
 }
 
+/// `value` limited to `low..=high` the way the C model does it: `high` wins
+/// when the limits cross. The limits follow the picture data, so this is
+/// written without branches.
+#[inline(always)]
 fn clamp_c(value: i32, low: i32, high: i32) -> i32 {
-    if value > high {
-        high
-    } else if value < low {
-        low
-    } else {
-        value
-    }
+    let limited = value.max(low);
+    let over = -i32::from(value > high);
+    (high & over) | (limited & !over)
 }
 
 /// Number of significant bits (the C model's `ceil_log2`).
+#[inline(always)]
 fn bit_length(value: i32) -> i32 {
     i32::try_from(32 - value.leading_zeros()).unwrap_or(0)
 }
 
 /// Bits needed to code a quantized residual in two's complement.
+#[inline(always)]
 fn residual_size(value: i32) -> i32 {
-    if value == 0 {
-        0
-    } else if value > 0 {
-        bit_length(value) + 1
-    } else {
-        bit_length(!value) + 1
-    }
+    // `value ^ (value >> 31)` is `value` when positive, `!value` otherwise;
+    // every value but zero needs a sign bit on top.
+    bit_length(value ^ (value >> 31)) + i32::from(value != 0)
 }
 
+/// Divide by `1 << qlevel`, rounding half toward zero, keeping the sign.
+#[inline(always)]
 fn quantize(error: i32, qlevel: i32) -> i32 {
-    let offset = if qlevel == 0 {
-        0
-    } else {
-        (1 << (qlevel - 1)) - 1
-    };
-    if error > 0 {
-        (error + offset) >> qlevel
-    } else {
-        -((offset - error) >> qlevel)
-    }
+    let offset = ((1 << qlevel) >> 1) - i32::from(qlevel > 0);
+    let sign = error >> 31;
+    let magnitude = (error ^ sign) - sign;
+    (((magnitude + offset) >> qlevel) ^ sign) - sign
 }
 
+#[inline(always)]
 fn sample(value: i32) -> i16 {
     i16::try_from(value).unwrap_or(0)
 }
 
+#[inline(always)]
 fn index(value: i32) -> usize {
     usize::try_from(value).unwrap_or(0)
 }
 
+#[inline(always)]
 fn mid_value(component: usize) -> i32 {
     1 << (DEPTH[component] - 1)
+}
+
+/// The low `count` bits set.
+#[inline(always)]
+fn low_bits(count: usize) -> u32 {
+    if count >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << count) - 1
+    }
+}
+
+struct Zeros<const N: usize>;
+
+impl<const N: usize> Zeros<N> {
+    const SAMPLES: [i16; N] = [0; N];
+}
+
+/// The `N` samples of `line` from `at` on. A window outside the line reads as
+/// zeros; the line buffers are sized so that this does not happen, and the
+/// hot loops stay free of panics either way.
+#[inline(always)]
+fn window<const N: usize>(line: &[i16], at: usize) -> &[i16; N] {
+    line.get(at..)
+        .and_then(|rest| rest.first_chunk::<N>())
+        .unwrap_or(&Zeros::<N>::SAMPLES)
+}
+
+/// One pixel of a line buffer: its Y, Co and Cg samples and a spare lane that
+/// stays zero. Keeping the components of a pixel together lets one load fetch
+/// all three for the lane arithmetic of [`Lanes`].
+type Pixel = [i16; 4];
+
+struct ZeroPixels<const N: usize>;
+
+impl<const N: usize> ZeroPixels<N> {
+    const PIXELS: [Pixel; N] = [[0; 4]; N];
+}
+
+/// The `N` pixels of `line` from `at` on; zeros outside the line, as
+/// [`window`] does it.
+#[inline(always)]
+fn pixels<const N: usize>(line: &[Pixel], at: usize) -> &[Pixel; N] {
+    line.get(at..)
+        .and_then(|rest| rest.first_chunk::<N>())
+        .unwrap_or(&ZeroPixels::<N>::PIXELS)
+}
+
+/// The indexed colour history, one row per component (Y, Co, Cg). Samples are
+/// within 0..=511.
+type IchTable = [[i16; ICH_SIZE]; 3];
+
+/// Sixteen candidate pixels for a history search, one row per component:
+/// half of the history, or the previous line around the group (whose first
+/// seven samples are history entries 25..=31 from the second line on).
+type IchRows<'a> = [&'a [i16; ICH_ROW]; 3];
+const ICH_ROW: usize = ICH_SIZE / 2;
+
+/// Search key of a history entry: the weighted difference above the entry
+/// number, so that the lowest key is the first entry with the lowest
+/// difference. No entry has the key `ICH_NO_KEY`.
+const ICH_KEY_SHIFT: u32 = 5;
+const ICH_NO_KEY: u32 = 0xFFFF;
+
+/// The two halves of the history as search rows.
+#[inline(always)]
+fn ich_halves(ich: &IchTable) -> [IchRows<'_>; 2] {
+    [
+        [window(&ich[0], 0), window(&ich[1], 0), window(&ich[2], 0)],
+        [
+            window(&ich[0], ICH_ROW),
+            window(&ich[1], ICH_ROW),
+            window(&ich[2], ICH_ROW),
+        ],
+    ]
+}
+
+/// The first history entry whose bit in `valid` is set and that is within
+/// `tolerance` of `pixel`. The second half is only searched when the first
+/// has no such entry.
+#[inline(always)]
+fn ich_table_first<K: Kernels>(
+    kernels: K,
+    ich: &IchTable,
+    pixel: [i16; 3],
+    tolerance: [i16; 3],
+    valid: u32,
+) -> Option<usize> {
+    let [low, high] = ich_halves(ich);
+    kernels.ich_first(low, pixel, tolerance, valid).or_else(|| {
+        kernels
+            .ich_first(high, pixel, tolerance, valid >> ICH_ROW)
+            .map(|entry| entry + ICH_ROW)
+    })
+}
+
+/// Weighted absolute difference the history search minimizes.
+#[inline(always)]
+fn ich_weighted_sad(entry: [i32; 3], pixel: [i16; 3]) -> i32 {
+    2 * (entry[0] - i32::from(pixel[0])).abs()
+        + (entry[1] - i32::from(pixel[1])).abs()
+        + (entry[2] - i32::from(pixel[2])).abs()
+}
+
+/// Insert `pixel` at the front of the history, moving the entries before
+/// `location` back by one (the entry at `location` is replaced).
+#[inline(always)]
+fn ich_insert(ich: &mut IchTable, location: usize, pixel: [i16; 3]) {
+    for (history, value) in ich.iter_mut().zip(pixel) {
+        if location == 0 {
+            history[0] = value;
+            continue;
+        }
+        let old = *history;
+        let mut moved = [value; ICH_SIZE];
+        moved[1..].copy_from_slice(&old[..ICH_SIZE - 1]);
+        for (slot, ((target, moved), old)) in history
+            .iter_mut()
+            .zip(moved.iter())
+            .zip(old.iter())
+            .enumerate()
+        {
+            // A mask instead of a choice, so that this is vector code.
+            let take = -i16::from(slot <= location);
+            *target = (*moved & take) | (*old & !take);
+        }
+    }
+}
+
+/// Insert three pixels one after the other without looking for duplicates:
+/// the first `valid` entries (at most `reserved - 3`) move back by three.
+#[inline(always)]
+fn ich_insert_group(ich: &mut IchTable, valid: usize, reserved: usize, pixels: &[Pixel; 3]) {
+    let filled = (valid + 3).min(reserved);
+    for (component, history) in ich.iter_mut().enumerate() {
+        let old = *history;
+        let mut moved = [0i16; ICH_SIZE];
+        moved[0] = pixels[2][component];
+        moved[1] = pixels[1][component];
+        moved[2] = pixels[0][component];
+        moved[3..].copy_from_slice(&old[..ICH_SIZE - 3]);
+        for (slot, ((target, moved), old)) in history
+            .iter_mut()
+            .zip(moved.iter())
+            .zip(old.iter())
+            .enumerate()
+        {
+            let take = -i16::from(slot < filled);
+            *target = (*moved & take) | (*old & !take);
+        }
+    }
+}
+
+#[inline(always)]
+fn rgb_to_ycocg(red: u8, green: u8, blue: u8) -> Pixel {
+    let (r, g, b) = (i16::from(red), i16::from(green), i16::from(blue));
+    let co = r - b;
+    let t = b + (co >> 1);
+    let cg = g - t;
+    let y = t + (cg >> 1);
+    [y, co + 256, cg + 256, 0]
+}
+
+#[inline(always)]
+fn ycocg_to_rgb(pixel: Pixel) -> [u8; 3] {
+    let [y, co, cg, _] = pixel.map(i32::from);
+    let (co, cg) = (co - 256, cg - 256);
+    let t = y - (cg >> 1);
+    let g = cg + t;
+    let b = t - (co >> 1);
+    let r = co + b;
+    let byte = |value: i32| value.clamp(0, 255).to_le_bytes()[0];
+    [byte(r), byte(g), byte(b)]
+}
+
+/// Four 16-bit lanes: the Y, Co and Cg samples of one pixel, or one value per
+/// component (lane 3 is spare). The three components of a group are coded
+/// with the same steps, so they are computed side by side. All arithmetic
+/// wraps: every implementation gives the same lanes for every input.
+trait Lanes: Copy {
+    fn new(lanes: [i16; 4]) -> Self;
+    fn splat(value: i16) -> Self;
+    fn get(self) -> [i16; 4];
+    fn add(self, other: Self) -> Self;
+    fn sub(self, other: Self) -> Self;
+    /// The low 16 bits of the products.
+    fn mul(self, other: Self) -> Self;
+    fn min(self, other: Self) -> Self;
+    fn max(self, other: Self) -> Self;
+    fn xor(self, other: Self) -> Self;
+    /// Arithmetic shift right of every lane by `count` (at most 15).
+    fn shr(self, count: u32) -> Self;
+    /// Lane 0 (luma) of `self` with lanes 1..=3 of `chroma`.
+    fn luma_or(self, chroma: Self) -> Self;
+
+    /// `self` limited to `low..=high`; `low` must not exceed `high`.
+    #[inline(always)]
+    fn clamp(self, low: Self, high: Self) -> Self {
+        self.min(high).max(low)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        self.max(Self::splat(0).sub(self))
+    }
+}
+
+/// [`Lanes`] in portable code, the reference for the other implementations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PortableLanes([i16; 4]);
+
+impl PortableLanes {
+    #[inline(always)]
+    fn zip(self, other: Self, operation: impl Fn(i16, i16) -> i16) -> Self {
+        Self(std::array::from_fn(|lane| {
+            operation(self.0[lane], other.0[lane])
+        }))
+    }
+}
+
+impl Lanes for PortableLanes {
+    #[inline(always)]
+    fn new(lanes: [i16; 4]) -> Self {
+        Self(lanes)
+    }
+
+    #[inline(always)]
+    fn splat(value: i16) -> Self {
+        Self([value; 4])
+    }
+
+    #[inline(always)]
+    fn get(self) -> [i16; 4] {
+        self.0
+    }
+
+    #[inline(always)]
+    fn add(self, other: Self) -> Self {
+        self.zip(other, i16::wrapping_add)
+    }
+
+    #[inline(always)]
+    fn sub(self, other: Self) -> Self {
+        self.zip(other, i16::wrapping_sub)
+    }
+
+    #[inline(always)]
+    fn mul(self, other: Self) -> Self {
+        self.zip(other, i16::wrapping_mul)
+    }
+
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        self.zip(other, Ord::min)
+    }
+
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        self.zip(other, Ord::max)
+    }
+
+    #[inline(always)]
+    fn xor(self, other: Self) -> Self {
+        self.zip(other, |a, b| a ^ b)
+    }
+
+    #[inline(always)]
+    fn shr(self, count: u32) -> Self {
+        Self(self.0.map(|lane| lane >> count.min(15)))
+    }
+
+    #[inline(always)]
+    fn luma_or(self, chroma: Self) -> Self {
+        Self([self.0[0], chroma.0[1], chroma.0[2], chroma.0[3]])
+    }
+}
+
+/// Per-component constants of one quantization parameter, as lanes.
+#[derive(Clone, Copy)]
+struct QuantLanes<V> {
+    /// Quantization shift of luma and of both chroma components.
+    shift: [u32; 2],
+    /// `1 << shift`.
+    scale: V,
+    /// Rounding offset of the quantizer.
+    offset: V,
+    /// Most that MAP prediction lets the filter change a previous-line sample.
+    half: V,
+    neg_half: V,
+}
+
+impl<V: Lanes> QuantLanes<V> {
+    fn new(qp: i32) -> Self {
+        let levels = [qlevel(0, qp), qlevel(1, qp), qlevel(2, qp), qlevel(2, qp)];
+        let half = levels.map(|level| sample((1 << level) / 2));
+        Self {
+            shift: [
+                u32::try_from(levels[0]).unwrap_or(0),
+                u32::try_from(levels[1]).unwrap_or(0),
+            ],
+            scale: V::new(levels.map(|level| sample(1 << level))),
+            offset: V::new(levels.map(|level| sample(((1 << level) >> 1) - i32::from(level > 0)))),
+            half: V::new(half),
+            neg_half: V::new(half.map(|value| -value)),
+        }
+    }
+
+    /// The constants of every quantization parameter, indexed by it.
+    fn table() -> [Self; 16] {
+        std::array::from_fn(|qp| Self::new(i32::try_from(qp).unwrap_or(0)))
+    }
+
+    /// [`quantize`] of every lane with its component's shift.
+    #[inline(always)]
+    fn quantize(&self, error: V) -> V {
+        let sign = error.shr(15);
+        let rounded = error.xor(sign).sub(sign).add(self.offset);
+        let shifted = rounded
+            .shr(self.shift[0])
+            .luma_or(rounded.shr(self.shift[1]));
+        shifted.xor(sign).sub(sign)
+    }
+}
+
+/// Largest sample value per component, as lanes (the spare lane stays zero).
+#[inline(always)]
+fn max_values<V: Lanes>() -> V {
+    V::new([
+        sample((1 << DEPTH[0]) - 1),
+        sample((1 << DEPTH[1]) - 1),
+        sample((1 << DEPTH[2]) - 1),
+        0,
+    ])
+}
+
+/// Everything needed to predict the three pixels of a group, one lane per
+/// component.
+#[derive(Clone, Copy)]
+enum Pred<V> {
+    /// The left pixel and the blended previous-line pixels c, b, d, e.
+    Map {
+        a: V,
+        c: V,
+        b: V,
+        d: V,
+        e: V,
+    },
+    Left {
+        a: V,
+    },
+    Block([V; 3]),
+}
+
+/// Predict and reconstruct the three pixels of a group, all components at
+/// once. `residual` gives the quantized residuals of a position from its
+/// prediction (the encoder quantizes, the decoder returns what it read);
+/// later predictions depend on earlier residuals. Returns the residuals and
+/// the reconstructed pixels.
+#[inline(always)]
+fn code_units<V: Lanes>(
+    pred: Pred<V>,
+    scale: V,
+    mut residual: impl FnMut(usize, V) -> V,
+) -> ([V; 3], [V; 3]) {
+    let zero = V::splat(0);
+    let max_value = max_values::<V>();
+    let rebuild =
+        |prediction: V, quantized: V| prediction.add(quantized.mul(scale)).clamp(zero, max_value);
+    let predictions;
+    let residuals;
+    match pred {
+        Pred::Map { a, c, b, d, e } => {
+            let slope = a.sub(c);
+            let (low, high) = (a.min(b), a.max(b));
+            let p0 = slope.add(b).clamp(low, high);
+            let q0 = residual(0, p0);
+            let (low, high) = (low.min(d), high.max(d));
+            let p1 = slope.add(d).add(q0.mul(scale)).clamp(low, high);
+            let q1 = residual(1, p1);
+            let (low, high) = (low.min(e), high.max(e));
+            let p2 = slope.add(e).add(q0.add(q1).mul(scale)).clamp(low, high);
+            let q2 = residual(2, p2);
+            predictions = [p0, p1, p2];
+            residuals = [q0, q1, q2];
+        }
+        Pred::Left { a } => {
+            let q0 = residual(0, a);
+            let p1 = a.add(q0.mul(scale)).clamp(zero, max_value);
+            let q1 = residual(1, p1);
+            let p2 = a.add(q0.add(q1).mul(scale)).clamp(zero, max_value);
+            let q2 = residual(2, p2);
+            predictions = [a, p1, p2];
+            residuals = [q0, q1, q2];
+        }
+        Pred::Block(block) => {
+            predictions = block;
+            residuals = [
+                residual(0, block[0]),
+                residual(1, block[1]),
+                residual(2, block[2]),
+            ];
+        }
+    }
+    let rebuilt = [
+        rebuild(predictions[0], residuals[0]),
+        rebuild(predictions[1], residuals[1]),
+        rebuild(predictions[2], residuals[2]),
+    ];
+    (residuals, rebuilt)
+}
+
+/// The data-parallel inner loops of the codec. Every implementation gives the
+/// same results as [`Scalar`]; the slice coders are generic over this trait,
+/// so each implementation gets its own copy of the whole slice loop.
+trait Kernels: Copy {
+    /// Lane arithmetic for the three components of a pixel.
+    type Lanes: Lanes;
+
+    /// The first candidate `n` (of 16) of `rows` whose bit in `valid` is set
+    /// and that is within `tolerance` of `pixel` in every component.
+    fn ich_first(
+        self,
+        rows: IchRows<'_>,
+        pixel: [i16; 3],
+        tolerance: [i16; 3],
+        valid: u32,
+    ) -> Option<usize>;
+
+    /// The lowest search key `sad << ICH_KEY_SHIFT | (first + n)` among the
+    /// candidates `n` of `rows` whose bit in `valid` is set, where `sad` is
+    /// the weighted absolute difference from `pixel`; `ICH_NO_KEY` when
+    /// `valid` has none of the low 16 bits set. `first + 15` is at most 31
+    /// and samples are within 0..=511, so keys fit 16 bits.
+    fn ich_best(self, rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32;
+
+    /// Convert leading 4-byte pixels of `row` to Y, Co and Cg samples and
+    /// return how many pixels were converted; the caller converts the rest.
+    fn to_ycocg(self, row: &[u8], red_first: bool, line: &mut [Pixel]) -> usize;
+
+    /// Convert leading Y, Co and Cg samples to 4-byte pixels in `row` and
+    /// return how many pixels were written; the caller converts the rest.
+    fn to_rgb(self, line: &[Pixel], red_first: bool, row: &mut [u8]) -> usize;
+}
+
+/// Portable implementation of [`Kernels`], the reference for the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scalar;
+
+impl Kernels for Scalar {
+    type Lanes = PortableLanes;
+
+    #[inline(always)]
+    fn ich_first(
+        self,
+        rows: IchRows<'_>,
+        pixel: [i16; 3],
+        tolerance: [i16; 3],
+        valid: u32,
+    ) -> Option<usize> {
+        // Only the valid candidates are visited, lowest first.
+        let mut remaining = valid & low_bits(ICH_ROW);
+        while remaining != 0 {
+            let entry = usize::try_from(remaining.trailing_zeros()).unwrap_or(0) % ICH_ROW;
+            if (rows[0][entry] - pixel[0]).abs() <= tolerance[0]
+                && (rows[1][entry] - pixel[1]).abs() <= tolerance[1]
+                && (rows[2][entry] - pixel[2]).abs() <= tolerance[2]
+            {
+                return Some(entry);
+            }
+            remaining &= remaining - 1;
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn ich_best(self, rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+        let mut lowest = ICH_NO_KEY;
+        let mut remaining = valid & low_bits(ICH_ROW);
+        while remaining != 0 {
+            let entry = usize::try_from(remaining.trailing_zeros()).unwrap_or(0) % ICH_ROW;
+            let candidate = [rows[0][entry], rows[1][entry], rows[2][entry]].map(i32::from);
+            let sad = u32::try_from(ich_weighted_sad(candidate, pixel)).unwrap_or(0);
+            let number = u32::try_from(first + entry).unwrap_or(0);
+            lowest = lowest.min((sad << ICH_KEY_SHIFT) | number);
+            remaining &= remaining - 1;
+        }
+        lowest
+    }
+
+    #[inline(always)]
+    fn to_ycocg(self, _row: &[u8], _red_first: bool, _line: &mut [Pixel]) -> usize {
+        0
+    }
+
+    #[inline(always)]
+    fn to_rgb(self, _line: &[Pixel], _red_first: bool, _row: &mut [u8]) -> usize {
+        0
+    }
+}
+
+/// Convert one row of 4-byte pixels to Y, Co and Cg samples; the shorter of
+/// the two slices sets the pixel count.
+#[inline(always)]
+fn row_to_ycocg<K: Kernels>(kernels: K, row: &[u8], red_first: bool, line: &mut [Pixel]) {
+    let done = kernels.to_ycocg(row, red_first, line);
+    let (red, blue) = if red_first { (0, 2) } else { (2, 0) };
+    let sources = row.chunks_exact(4).skip(done);
+    for (target, source) in line.iter_mut().skip(done).zip(sources) {
+        *target = rgb_to_ycocg(source[red], source[1], source[blue]);
+    }
+}
+
+/// Convert Y, Co and Cg samples to one row of 4-byte pixels (padding byte
+/// 255); the shorter of the two slices sets the pixel count.
+#[inline(always)]
+fn row_to_rgb<K: Kernels>(kernels: K, line: &[Pixel], red_first: bool, row: &mut [u8]) {
+    let done = kernels.to_rgb(line, red_first, row);
+    let (red, blue) = if red_first { (0, 2) } else { (2, 0) };
+    let targets = row.chunks_exact_mut(4).skip(done);
+    for (target, source) in targets.zip(line.iter().skip(done)) {
+        let [r, g, b] = ycocg_to_rgb(*source);
+        target[red] = r;
+        target[1] = g;
+        target[blue] = b;
+        target[3] = 255;
+    }
+}
+
+/// SSE2 and AVX2 implementations of [`Kernels`].
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::{IchRows, Kernels, Lanes, Pixel};
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi16,
+        _mm_cmpgt_epi16, _mm_cvtsi32_si128, _mm_extract_epi16, _mm_loadl_epi64, _mm_loadu_si128,
+        _mm_max_epi16, _mm_min_epi16, _mm_min_epu16, _mm_minpos_epu16, _mm_movemask_epi8,
+        _mm_mullo_epi16, _mm_or_si128, _mm_packs_epi16, _mm_packs_epi32, _mm_packus_epi16,
+        _mm_set1_epi16, _mm_set1_epi32, _mm_setr_epi16, _mm_setzero_si128, _mm_slli_epi16,
+        _mm_sra_epi16, _mm_srai_epi16, _mm_srli_epi32, _mm_srli_si128, _mm_storel_epi64,
+        _mm_storeu_si128, _mm_sub_epi16, _mm_unpackhi_epi16, _mm_unpackhi_epi32,
+        _mm_unpackhi_epi64, _mm_unpacklo_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi32,
+        _mm_unpacklo_epi64, _mm_xor_si128, _mm256_abs_epi16, _mm256_add_epi16, _mm256_and_si256,
+        _mm256_andnot_si256, _mm256_castsi256_si128, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_or_si256, _mm256_set1_epi16,
+        _mm256_setr_epi16, _mm256_setzero_si256, _mm256_slli_epi16, _mm256_sub_epi16,
+    };
+
+    /// SSE2 kernels. SSE2 is part of the x86-64 baseline; the assertion below
+    /// rejects a build that turns it off.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Sse2;
+
+    const _: () = assert!(cfg!(target_feature = "sse2"));
+
+    /// The SSE2 kernels inside slice loops compiled for SSE4.2-era CPUs. A
+    /// value exists only after [`Sse42::detect`] saw the features on the
+    /// running CPU, so holding one proves they are present.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Sse42(());
+
+    impl Sse42 {
+        /// The features the SSE4.2 copies of the slice loops are compiled for.
+        pub(super) fn detect() -> Option<Self> {
+            let present = std::arch::is_x86_feature_detected!("sse4.2")
+                && std::arch::is_x86_feature_detected!("ssse3")
+                && std::arch::is_x86_feature_detected!("popcnt");
+            present.then_some(Self(()))
+        }
+    }
+
+    /// AVX2 kernels. A value exists only after [`Avx2::detect`] saw the
+    /// features on the running CPU, so holding one proves they are present.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Avx2(());
+
+    impl Avx2 {
+        /// The features the AVX2 copies of the slice loops are compiled for.
+        pub(super) fn detect() -> Option<Self> {
+            let present = std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("bmi1")
+                && std::arch::is_x86_feature_detected!("bmi2")
+                && std::arch::is_x86_feature_detected!("lzcnt")
+                && std::arch::is_x86_feature_detected!("popcnt");
+            present.then_some(Self(()))
+        }
+    }
+
+    /// [`Lanes`] in the low half of an SSE2 register.
+    #[derive(Clone, Copy)]
+    pub(super) struct WideLanes(__m128i);
+
+    // SAFETY (every block in this impl): the functions called need SSE2,
+    // which is enabled for the whole build (asserted above); the loads and
+    // stores go through references to exactly the eight bytes they touch and
+    // have no alignment requirement.
+    impl Lanes for WideLanes {
+        #[inline(always)]
+        fn new(lanes: [i16; 4]) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_loadl_epi64(std::ptr::from_ref(&lanes).cast()) })
+        }
+
+        #[inline(always)]
+        fn splat(value: i16) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_set1_epi16(value) })
+        }
+
+        #[inline(always)]
+        fn get(self) -> [i16; 4] {
+            let mut lanes = [0i16; 4];
+            // SAFETY: see the impl.
+            unsafe { _mm_storel_epi64(std::ptr::from_mut(&mut lanes).cast(), self.0) };
+            lanes
+        }
+
+        #[inline(always)]
+        fn add(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_add_epi16(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn sub(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_sub_epi16(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn mul(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_mullo_epi16(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn min(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_min_epi16(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn max(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_max_epi16(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn xor(self, other: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_xor_si128(self.0, other.0) })
+        }
+
+        #[inline(always)]
+        fn shr(self, count: u32) -> Self {
+            let count = i32::try_from(count.min(15)).unwrap_or(15);
+            // SAFETY: see the impl.
+            Self(unsafe { _mm_sra_epi16(self.0, _mm_cvtsi32_si128(count)) })
+        }
+
+        #[inline(always)]
+        fn luma_or(self, chroma: Self) -> Self {
+            // SAFETY: see the impl.
+            Self(unsafe {
+                let luma = _mm_setr_epi16(-1, 0, 0, 0, 0, 0, 0, 0);
+                _mm_or_si128(
+                    _mm_and_si128(luma, self.0),
+                    _mm_andnot_si128(luma, chroma.0),
+                )
+            })
+        }
+    }
+
+    /// The lowest set bit of a 16-candidate hit mask.
+    fn first_hit(hits: u32) -> Option<usize> {
+        (hits != 0).then(|| usize::try_from(hits.trailing_zeros()).unwrap_or(0))
+    }
+
+    fn mask_bits(mask: i32) -> u32 {
+        u32::from_le_bytes(mask.to_le_bytes())
+    }
+
+    /// Bits `shift..shift + 16` of `valid` as a 16-bit lane.
+    fn valid_lanes(valid: u32, shift: usize) -> i16 {
+        let [low, high, _, _] = (valid >> shift).to_le_bytes();
+        i16::from_le_bytes([low, high])
+    }
+
+    fn lane(value: usize) -> i16 {
+        i16::try_from(value).unwrap_or(0)
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn load(values: &[i16; 8]) -> __m128i {
+        // SAFETY: `values` is a valid reference to 16 bytes and the load has
+        // no alignment requirement.
+        unsafe { _mm_loadu_si128(std::ptr::from_ref(values).cast()) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn load_pixels(values: &[Pixel; 2]) -> __m128i {
+        // SAFETY: `values` is a valid reference to 16 bytes and the load has
+        // no alignment requirement.
+        unsafe { _mm_loadu_si128(std::ptr::from_ref(values).cast()) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn store_pixels(target: &mut [Pixel; 2], value: __m128i) {
+        // SAFETY: `target` is a valid, exclusive reference to 16 bytes and
+        // the store has no alignment requirement.
+        unsafe { _mm_storeu_si128(std::ptr::from_mut(target).cast(), value) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn load_bytes(values: &[u8; 16]) -> __m128i {
+        // SAFETY: `values` is a valid reference to 16 bytes and the load has
+        // no alignment requirement.
+        unsafe { _mm_loadu_si128(std::ptr::from_ref(values).cast()) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn store_bytes(target: &mut [u8; 16], value: __m128i) {
+        // SAFETY: `target` is a valid, exclusive reference to 16 bytes and
+        // the store has no alignment requirement.
+        unsafe { _mm_storeu_si128(std::ptr::from_mut(target).cast(), value) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn magnitude(value: __m128i) -> __m128i {
+        _mm_max_epi16(value, _mm_sub_epi16(_mm_setzero_si128(), value))
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn ich_hits_sse2(rows: IchRows<'_>, pixel: [i16; 3], tolerance: [i16; 3]) -> u32 {
+        let mut over = [_mm_setzero_si128(); 2];
+        for component in 0..3 {
+            let target = _mm_set1_epi16(pixel[component]);
+            let limit = _mm_set1_epi16(tolerance[component]);
+            let (blocks, _) = rows[component].as_chunks::<8>();
+            for (over, block) in over.iter_mut().zip(blocks) {
+                let distance = magnitude(_mm_sub_epi16(load(block), target));
+                *over = _mm_or_si128(*over, _mm_cmpgt_epi16(distance, limit));
+            }
+        }
+        !mask_bits(_mm_movemask_epi8(_mm_packs_epi16(over[0], over[1]))) & 0xFFFF
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn ich_best_sse2(rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+        // Each lane holds the key of its candidate, 0xFFFF when the candidate
+        // is not valid. SSE2 only has a signed 16-bit minimum, hence the
+        // sign-bit flip around it.
+        let flip = _mm_set1_epi16(i16::MIN);
+        let ones = _mm_set1_epi16(-1);
+        let selectors = _mm_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128);
+        let numbers = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7);
+        let mut lowest = _mm_set1_epi16(i16::MAX);
+        for block in 0..2 {
+            let mut sad = _mm_setzero_si128();
+            for component in 0..3 {
+                let (blocks, _) = rows[component].as_chunks::<8>();
+                let target = _mm_set1_epi16(pixel[component]);
+                let distance = magnitude(_mm_sub_epi16(load(&blocks[block]), target));
+                let weighted = if component == 0 {
+                    _mm_slli_epi16::<1>(distance)
+                } else {
+                    distance
+                };
+                sad = _mm_add_epi16(sad, weighted);
+            }
+            let number = _mm_add_epi16(numbers, _mm_set1_epi16(lane(first + block * 8)));
+            let key = _mm_or_si128(_mm_slli_epi16::<5>(sad), number);
+            let lanes = _mm_set1_epi16(valid_lanes(valid, block * 8));
+            let usable = _mm_cmpeq_epi16(_mm_and_si128(lanes, selectors), selectors);
+            let key = _mm_or_si128(key, _mm_andnot_si128(usable, ones));
+            lowest = _mm_min_epi16(lowest, _mm_xor_si128(key, flip));
+        }
+        let lowest = _mm_min_epi16(lowest, _mm_srli_si128::<8>(lowest));
+        let lowest = _mm_min_epi16(lowest, _mm_srli_si128::<4>(lowest));
+        let lowest = _mm_min_epi16(lowest, _mm_srli_si128::<2>(lowest));
+        mask_bits(_mm_extract_epi16::<0>(_mm_xor_si128(lowest, flip))) & 0xFFFF
+    }
+
+    /// Eight pixels at a time.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn to_ycocg_sse2(row: &[u8], red_first: bool, line: &mut [Pixel]) -> usize {
+        let (sources, _) = row.as_chunks::<32>();
+        let (targets, _) = line.as_chunks_mut::<8>();
+        let byte = _mm_set1_epi32(0xFF);
+        let bias = _mm_set1_epi16(256);
+        let zero = _mm_setzero_si128();
+        let mut done = 0;
+        for (source, target) in sources.iter().zip(targets.iter_mut()) {
+            let (halves, _) = source.as_chunks::<16>();
+            let low = load_bytes(&halves[0]);
+            let high = load_bytes(&halves[1]);
+            let first = _mm_packs_epi32(_mm_and_si128(low, byte), _mm_and_si128(high, byte));
+            let g = _mm_packs_epi32(
+                _mm_and_si128(_mm_srli_epi32::<8>(low), byte),
+                _mm_and_si128(_mm_srli_epi32::<8>(high), byte),
+            );
+            let third = _mm_packs_epi32(
+                _mm_and_si128(_mm_srli_epi32::<16>(low), byte),
+                _mm_and_si128(_mm_srli_epi32::<16>(high), byte),
+            );
+            let (r, b) = if red_first {
+                (first, third)
+            } else {
+                (third, first)
+            };
+            let co = _mm_sub_epi16(r, b);
+            let t = _mm_add_epi16(b, _mm_srai_epi16::<1>(co));
+            let cg = _mm_sub_epi16(g, t);
+            let y = _mm_add_epi16(t, _mm_srai_epi16::<1>(cg));
+            let co = _mm_add_epi16(co, bias);
+            let cg = _mm_add_epi16(cg, bias);
+            // Interleave the three planes (and zeros) into pixels.
+            let front_low = _mm_unpacklo_epi16(y, co);
+            let front_high = _mm_unpackhi_epi16(y, co);
+            let back_low = _mm_unpacklo_epi16(cg, zero);
+            let back_high = _mm_unpackhi_epi16(cg, zero);
+            let (pairs, _) = target.as_chunks_mut::<2>();
+            if let [first, second, third, fourth] = pairs {
+                store_pixels(first, _mm_unpacklo_epi32(front_low, back_low));
+                store_pixels(second, _mm_unpackhi_epi32(front_low, back_low));
+                store_pixels(third, _mm_unpacklo_epi32(front_high, back_high));
+                store_pixels(fourth, _mm_unpackhi_epi32(front_high, back_high));
+            }
+            done += 8;
+        }
+        done
+    }
+
+    /// The Y, Co and Cg planes of four pixels: Y in the low half of the
+    /// first register, Co in its high half, Cg in the low half of the second.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn planes_of_four(first: &[Pixel; 2], second: &[Pixel; 2]) -> (__m128i, __m128i) {
+        let first = load_pixels(first);
+        let second = load_pixels(second);
+        let even = _mm_unpacklo_epi16(first, second);
+        let odd = _mm_unpackhi_epi16(first, second);
+        (_mm_unpacklo_epi16(even, odd), _mm_unpackhi_epi16(even, odd))
+    }
+
+    /// Eight pixels at a time.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn to_rgb_sse2(line: &[Pixel], red_first: bool, row: &mut [u8]) -> usize {
+        let (sources, _) = line.as_chunks::<8>();
+        let (targets, _) = row.as_chunks_mut::<32>();
+        let bias = _mm_set1_epi16(256);
+        let opaque = _mm_set1_epi16(-1);
+        let mut done = 0;
+        for (source, target) in sources.iter().zip(targets.iter_mut()) {
+            let (pairs, _) = source.as_chunks::<2>();
+            let [first, second, third, fourth] = pairs else {
+                break;
+            };
+            let (front_low, back_low) = planes_of_four(first, second);
+            let (front_high, back_high) = planes_of_four(third, fourth);
+            let y = _mm_unpacklo_epi64(front_low, front_high);
+            let co = _mm_sub_epi16(_mm_unpackhi_epi64(front_low, front_high), bias);
+            let cg = _mm_sub_epi16(_mm_unpacklo_epi64(back_low, back_high), bias);
+            let t = _mm_sub_epi16(y, _mm_srai_epi16::<1>(cg));
+            let g = _mm_add_epi16(cg, t);
+            let b = _mm_sub_epi16(t, _mm_srai_epi16::<1>(co));
+            let r = _mm_add_epi16(co, b);
+            let (first, third) = if red_first { (r, b) } else { (b, r) };
+            // Saturating packs clamp to 0..=255.
+            let first = _mm_packus_epi16(first, first);
+            let g = _mm_packus_epi16(g, g);
+            let third = _mm_packus_epi16(third, third);
+            let front = _mm_unpacklo_epi8(first, g);
+            let back = _mm_unpacklo_epi8(third, opaque);
+            let (halves, _) = target.as_chunks_mut::<16>();
+            if let [low, high] = halves {
+                store_bytes(low, _mm_unpacklo_epi16(front, back));
+                store_bytes(high, _mm_unpackhi_epi16(front, back));
+            }
+            done += 8;
+        }
+        done
+    }
+
+    impl Kernels for Sse2 {
+        type Lanes = WideLanes;
+
+        #[inline(always)]
+        fn ich_first(
+            self,
+            rows: IchRows<'_>,
+            pixel: [i16; 3],
+            tolerance: [i16; 3],
+            valid: u32,
+        ) -> Option<usize> {
+            // SAFETY: SSE2 is enabled for the whole build (asserted above).
+            first_hit(unsafe { ich_hits_sse2(rows, pixel, tolerance) } & valid)
+        }
+
+        #[inline(always)]
+        fn ich_best(self, rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+            // SAFETY: SSE2 is enabled for the whole build (asserted above).
+            unsafe { ich_best_sse2(rows, pixel, valid, first) }
+        }
+
+        #[inline(always)]
+        fn to_ycocg(self, row: &[u8], red_first: bool, line: &mut [Pixel]) -> usize {
+            // SAFETY: SSE2 is enabled for the whole build (asserted above).
+            unsafe { to_ycocg_sse2(row, red_first, line) }
+        }
+
+        #[inline(always)]
+        fn to_rgb(self, line: &[Pixel], red_first: bool, row: &mut [u8]) -> usize {
+            // SAFETY: SSE2 is enabled for the whole build (asserted above).
+            unsafe { to_rgb_sse2(line, red_first, row) }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn load_wide(values: &[i16; 16]) -> __m256i {
+        // SAFETY: `values` is a valid reference to 32 bytes and the load has
+        // no alignment requirement.
+        unsafe { _mm256_loadu_si256(std::ptr::from_ref(values).cast()) }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn ich_hits_avx2(rows: IchRows<'_>, pixel: [i16; 3], tolerance: [i16; 3]) -> u32 {
+        let mut over = _mm256_setzero_si256();
+        for component in 0..3 {
+            let target = _mm256_set1_epi16(pixel[component]);
+            let limit = _mm256_set1_epi16(tolerance[component]);
+            let distance = _mm256_abs_epi16(_mm256_sub_epi16(load_wide(rows[component]), target));
+            over = _mm256_or_si256(over, _mm256_cmpgt_epi16(distance, limit));
+        }
+        let packed = _mm_packs_epi16(
+            _mm256_castsi256_si128(over),
+            _mm256_extracti128_si256::<1>(over),
+        );
+        !mask_bits(_mm_movemask_epi8(packed)) & 0xFFFF
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn ich_best_avx2(rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+        // Each lane holds the key of its candidate, 0xFFFF when the candidate
+        // is not valid.
+        let ones = _mm256_set1_epi16(-1);
+        let selectors = _mm256_setr_epi16(
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            i16::MIN,
+        );
+        let numbers = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let mut sad = _mm256_setzero_si256();
+        for component in 0..3 {
+            let target = _mm256_set1_epi16(pixel[component]);
+            let distance = _mm256_abs_epi16(_mm256_sub_epi16(load_wide(rows[component]), target));
+            let weighted = if component == 0 {
+                _mm256_slli_epi16::<1>(distance)
+            } else {
+                distance
+            };
+            sad = _mm256_add_epi16(sad, weighted);
+        }
+        let number = _mm256_add_epi16(numbers, _mm256_set1_epi16(lane(first)));
+        let key = _mm256_or_si256(_mm256_slli_epi16::<5>(sad), number);
+        let lanes = _mm256_set1_epi16(valid_lanes(valid, 0));
+        let usable = _mm256_cmpeq_epi16(_mm256_and_si256(lanes, selectors), selectors);
+        let key = _mm256_or_si256(key, _mm256_andnot_si256(usable, ones));
+        let folded = _mm_min_epu16(
+            _mm256_castsi256_si128(key),
+            _mm256_extracti128_si256::<1>(key),
+        );
+        mask_bits(_mm_extract_epi16::<0>(_mm_minpos_epu16(folded))) & 0xFFFF
+    }
+
+    /// The kernels are the SSE2 ones; what differs is the slice loop around
+    /// them, which the compiler may write with SSSE3 and SSE4 instructions.
+    impl Kernels for Sse42 {
+        type Lanes = WideLanes;
+
+        #[inline(always)]
+        fn ich_first(
+            self,
+            rows: IchRows<'_>,
+            pixel: [i16; 3],
+            tolerance: [i16; 3],
+            valid: u32,
+        ) -> Option<usize> {
+            Sse2.ich_first(rows, pixel, tolerance, valid)
+        }
+
+        #[inline(always)]
+        fn ich_best(self, rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+            Sse2.ich_best(rows, pixel, valid, first)
+        }
+
+        #[inline(always)]
+        fn to_ycocg(self, row: &[u8], red_first: bool, line: &mut [Pixel]) -> usize {
+            Sse2.to_ycocg(row, red_first, line)
+        }
+
+        #[inline(always)]
+        fn to_rgb(self, line: &[Pixel], red_first: bool, row: &mut [u8]) -> usize {
+            Sse2.to_rgb(line, red_first, row)
+        }
+    }
+
+    /// The history searches use AVX2 (sixteen candidates per register). The
+    /// lane arithmetic and the colour conversion are the SSE2 code: inside
+    /// the slice loops compiled for AVX2 it is encoded with VEX prefixes, and
+    /// wider registers would not make them noticeably faster.
+    impl Kernels for Avx2 {
+        type Lanes = WideLanes;
+
+        #[inline(always)]
+        fn ich_first(
+            self,
+            rows: IchRows<'_>,
+            pixel: [i16; 3],
+            tolerance: [i16; 3],
+            valid: u32,
+        ) -> Option<usize> {
+            // SAFETY: an `Avx2` value proves the CPU has AVX2 (see `detect`).
+            first_hit(unsafe { ich_hits_avx2(rows, pixel, tolerance) } & valid)
+        }
+
+        #[inline(always)]
+        fn ich_best(self, rows: IchRows<'_>, pixel: [i16; 3], valid: u32, first: usize) -> u32 {
+            // SAFETY: an `Avx2` value proves the CPU has AVX2 (see `detect`).
+            unsafe { ich_best_avx2(rows, pixel, valid, first) }
+        }
+
+        #[inline(always)]
+        fn to_ycocg(self, row: &[u8], red_first: bool, line: &mut [Pixel]) -> usize {
+            Sse2.to_ycocg(row, red_first, line)
+        }
+
+        #[inline(always)]
+        fn to_rgb(self, line: &[Pixel], red_first: bool, row: &mut [u8]) -> usize {
+            Sse2.to_rgb(line, red_first, row)
+        }
+    }
+}
+
+/// Which copy of the slice loops runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
+    /// Portable code only.
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Sse2,
+    /// SSE2 kernels in slice loops compiled for SSE4.2, SSSE3 and POPCNT.
+    #[cfg(target_arch = "x86_64")]
+    Sse42(x86::Sse42),
+    /// AVX2 kernels, and the slice loops compiled for AVX2, BMI and LZCNT.
+    #[cfg(target_arch = "x86_64")]
+    Avx2(x86::Avx2),
+}
+
+impl Level {
+    /// The fastest level the running CPU supports. `KWIN_DSC_SIMD` set to
+    /// `scalar`, `sse2` or `sse4.2` selects a lower one (every level gives
+    /// the same bytes); other values, and levels the CPU lacks, are ignored.
+    fn detect() -> Self {
+        let wanted = std::env::var("KWIN_DSC_SIMD").unwrap_or_default();
+        Self::choose(&wanted)
+    }
+
+    fn choose(wanted: &str) -> Self {
+        if wanted == "scalar" {
+            return Self::Scalar;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if wanted == "sse2" {
+                return Self::Sse2;
+            }
+            match (x86::Avx2::detect(), x86::Sse42::detect()) {
+                (Some(token), _) if wanted != "sse4.2" => Self::Avx2(token),
+                (_, Some(token)) => Self::Sse42(token),
+                (_, None) => Self::Sse2,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self::Scalar
+        }
+    }
 }
 
 /// Validated, widened view of a picture parameter set.
@@ -1092,6 +2261,7 @@ impl Params {
         self.slice_w + PAD_LEFT + PAD_RIGHT
     }
 
+    #[inline(always)]
     fn flatness_info_sent(&self, qp: i32) -> bool {
         qp >= self.flatness_min_qp && qp <= self.flatness_max_qp
     }
@@ -1104,62 +2274,34 @@ enum PredMode {
     Block,
 }
 
-/// Everything needed to predict the three samples of one unit.
-struct PredCtx {
-    mode: PredMode,
-    left: i32,
-    /// Blended previous-line samples c, b, d, e.
-    blend: [i32; 4],
-    block: [i32; 3],
-    max_value: i32,
-    quant_divisor: i32,
-}
-
-impl PredCtx {
-    fn predict(&self, position: usize, residuals: &[i32; 3]) -> i32 {
-        let a = self.left;
-        let [c, b, d, e] = self.blend;
-        match self.mode {
-            PredMode::Map => match position {
-                0 => clamp_c(a + b - c, a.min(b), a.max(b)),
-                1 => clamp_c(
-                    a + d - c + residuals[0] * self.quant_divisor,
-                    a.min(b).min(d),
-                    a.max(b).max(d),
-                ),
-                _ => clamp_c(
-                    a + e - c + (residuals[0] + residuals[1]) * self.quant_divisor,
-                    a.min(b).min(d.min(e)),
-                    a.max(b).max(d.max(e)),
-                ),
-            },
-            PredMode::Left => match position {
-                0 => a,
-                1 => clamp_c(a + residuals[0] * self.quant_divisor, 0, self.max_value),
-                _ => clamp_c(
-                    a + (residuals[0] + residuals[1]) * self.quant_divisor,
-                    0,
-                    self.max_value,
-                ),
-            },
-            PredMode::Block => self.block[position.min(2)],
-        }
-    }
-}
-
 /// Block-prediction candidates that take part in the search: candidate 0 (the
 /// left neighbour) is the reference, 2..=9 are vectors -3..=-10.
 const BP_CANDIDATES: [usize; 9] = [0, 2, 3, 4, 5, 6, 7, 8, 9];
+/// Block vector length of each search slot (0 for the reference), indexed by
+/// the low `BP_KEY_SHIFT` bits of a search key.
+const BP_VECTORS: [u8; 16] = [0, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 0, 0, 0, 0];
+const BP_KEY_SHIFT: u32 = 4;
 
 /// Slice state shared by the encoder and the decoder.
 struct Core {
-    cur: [Vec<i16>; 3],
-    prev: [Vec<i16>; 3],
+    /// The line being reconstructed and the line above it as the line buffer
+    /// keeps it, both with `PAD_LEFT` and `PAD_RIGHT` pixels around them.
+    cur: Vec<Pixel>,
+    prev: Vec<Pixel>,
+    /// Per sample of the previous line: the 1-2-1 filtered value minus the
+    /// sample, which MAP prediction clamps and adds back.
+    blend: Vec<Pixel>,
+    /// The previous line again, one plane per component, for the searches
+    /// that compare many pixels of one component.
+    planes: [Vec<i16>; 3],
     /// Per group of the previous line: 0 for MAP, else the block vector length.
     pred: Vec<u8>,
-    bp_acc: Vec<u16>,
-    bp_group: [Vec<u16>; 9],
-    ich: [[i16; ICH_SIZE]; 3],
+    /// Block-prediction search scratch, one entry per pixel of the line.
+    bp_acc: Vec<i16>,
+    bp_sum: Vec<i16>,
+    bp_min: Vec<i16>,
+    bp_edge: Vec<i16>,
+    ich: IchTable,
     ich_valid: usize,
     st_qp: i32,
     prev_qp: i32,
@@ -1197,16 +2339,30 @@ struct Core {
     buffer_overflow: bool,
 }
 
+/// The pixel every line buffer holds at the start of a slice.
+fn mid_pixel() -> Pixel {
+    [
+        sample(mid_value(0)),
+        sample(mid_value(1)),
+        sample(mid_value(2)),
+        0,
+    ]
+}
+
 impl Core {
     fn new(params: &Params) -> Self {
         let line = params.line_len();
         let groups = params.slice_w.div_ceil(3);
         let mut core = Self {
-            cur: [vec![0; line], vec![0; line], vec![0; line]],
-            prev: [vec![0; line], vec![0; line], vec![0; line]],
+            cur: vec![[0; 4]; line],
+            prev: vec![[0; 4]; line],
+            blend: vec![[0; 4]; line],
+            planes: [vec![0; line], vec![0; line], vec![0; line]],
             pred: vec![0; groups],
-            bp_acc: vec![0; groups * 3],
-            bp_group: std::array::from_fn(|_| vec![0; groups]),
+            bp_acc: vec![0; line],
+            bp_sum: vec![0; line],
+            bp_min: vec![0; line],
+            bp_edge: vec![0; line],
             ich: [[0; ICH_SIZE]; 3],
             ich_valid: 0,
             st_qp: 0,
@@ -1248,15 +2404,23 @@ impl Core {
         core
     }
 
+    /// Whether the buffers have the sizes `params` needs.
+    fn fits(&self, params: &Params) -> bool {
+        self.cur.len() == params.line_len()
+    }
+
     /// Start-of-slice state.
     fn reset(&mut self, params: &Params) {
-        for component in 0..3 {
-            let mid = sample(mid_value(component));
-            self.cur[component].fill(mid);
-            self.prev[component].fill(mid);
-            self.ich[component] = [mid; ICH_SIZE];
+        let mid = mid_pixel();
+        self.cur.fill(mid);
+        self.prev.fill(mid);
+        self.blend.fill([0; 4]);
+        for ((plane, history), value) in self.planes.iter_mut().zip(self.ich.iter_mut()).zip(mid) {
+            plane.fill(value);
+            *history = [value; ICH_SIZE];
         }
         self.pred.fill(0);
+        self.bp_sum.fill(0);
         self.ich_valid = 0;
         self.st_qp = 0;
         self.prev_qp = 0;
@@ -1295,7 +2459,14 @@ impl Core {
     }
 
     /// Feed the previous group's reconstructed pixels into the colour history.
-    fn ich_group_start(&mut self, params: &Params, group_start: usize, previous_group_ich: bool) {
+    #[inline(always)]
+    fn ich_group_start<K: Kernels>(
+        &mut self,
+        kernels: K,
+        params: &Params,
+        group_start: usize,
+        previous_group_ich: bool,
+    ) {
         if group_start == 0 && (self.v_pos == 0 || params.multi_slice) {
             self.ich_valid = 0;
         }
@@ -1307,30 +2478,34 @@ impl Core {
         } else {
             ICH_RESERVED
         };
-        for offset in 0..3 {
-            let x = group_start - 3 + offset + PAD_LEFT;
-            let pixel = [self.cur[0][x], self.cur[1][x], self.cur[2][x]];
+        let group: &[Pixel; 3] = pixels(&self.cur, group_start - 3 + PAD_LEFT);
+        if !previous_group_ich {
+            // No duplicate search: the three pixels go to the front at once.
             let valid = self.ich_valid.min(reserved);
+            ich_insert_group(&mut self.ich, valid, reserved, group);
+            if valid < reserved {
+                self.ich_valid = (valid + 3).min(reserved);
+            }
+            return;
+        }
+        for pixel in group {
+            let pixel = [pixel[0], pixel[1], pixel[2]];
+            let valid = self.ich_valid.min(reserved);
+            let newest = [self.ich[0][0], self.ich[1][0], self.ich[2][0]];
+            if valid > 0 && newest == pixel {
+                // The pixel is the newest entry already: nothing moves.
+                continue;
+            }
             let mut location = if valid < reserved {
                 valid
             } else {
                 reserved - 1
             };
-            if previous_group_ich {
-                for entry in 0..valid {
-                    if self.ich[0][entry] == pixel[0]
-                        && self.ich[1][entry] == pixel[1]
-                        && self.ich[2][entry] == pixel[2]
-                    {
-                        location = entry;
-                        break;
-                    }
-                }
+            let same = ich_table_first(kernels, &self.ich, pixel, [0; 3], low_bits(valid));
+            if let Some(same) = same {
+                location = same;
             }
-            for (history, value) in self.ich.iter_mut().zip(pixel) {
-                history.copy_within(0..location, 1);
-                history[0] = value;
-            }
+            ich_insert(&mut self.ich, location, pixel);
             if location == valid {
                 self.ich_valid = valid + 1;
             }
@@ -1338,6 +2513,7 @@ impl Core {
     }
 
     /// Column (with padding) of history entry 25 for the group at `group_start`.
+    #[inline(always)]
     fn ich_above_base(params: &Params, group_start: usize) -> usize {
         let low = ICH_ABOVE / 2;
         let high = params.slice_w - 1 - ICH_ABOVE / 2;
@@ -1346,15 +2522,13 @@ impl Core {
         centre - ICH_ABOVE / 2 + PAD_LEFT
     }
 
+    #[inline(always)]
     fn ich_pixel(&self, params: &Params, entry: usize, group_start: usize) -> [i32; 3] {
         let entry = entry % ICH_SIZE;
         if self.v_pos > 0 && entry >= ICH_RESERVED {
             let x = Self::ich_above_base(params, group_start) + entry - ICH_RESERVED;
-            [
-                i32::from(self.prev[0][x]),
-                i32::from(self.prev[1][x]),
-                i32::from(self.prev[2][x]),
-            ]
+            let [y, co, cg, _] = pixels::<1>(&self.prev, x)[0].map(i32::from);
+            [y, co, cg]
         } else {
             [
                 i32::from(self.ich[0][entry]),
@@ -1365,6 +2539,7 @@ impl Core {
     }
 
     /// Predictor of the group and, for block prediction, the vector length.
+    #[inline(always)]
     fn pred_mode(&self, group_start: usize) -> (PredMode, usize) {
         if self.v_pos == 0 {
             return (PredMode::Left, 0);
@@ -1375,58 +2550,50 @@ impl Core {
         }
     }
 
-    fn pred_ctx(
+    /// Predictor inputs of the group at `group_start`, all components.
+    #[inline(always)]
+    fn predictor<V: Lanes>(
         &self,
         mode: (PredMode, usize),
-        component: usize,
         group_start: usize,
-        qlevel: i32,
-    ) -> PredCtx {
+        quant: &QuantLanes<V>,
+    ) -> Pred<V> {
         let base = group_start + PAD_LEFT;
-        let cur = &self.cur[component];
-        let left = i32::from(cur[base - 1]);
-        let quant_divisor = 1 << qlevel;
-        let mut ctx = PredCtx {
-            mode: mode.0,
-            left,
-            blend: [0; 4],
-            block: [0; 3],
-            max_value: (1 << DEPTH[component]) - 1,
-            quant_divisor,
-        };
+        let a = V::new(pixels::<1>(&self.cur, base - 1)[0]);
         match mode.0 {
             PredMode::Map => {
-                let prev = &self.prev[component];
-                let at = |x: usize| i32::from(prev[x]);
-                let half = quant_divisor / 2;
-                let blend = |x: usize| {
-                    let filtered = (at(x - 1) + 2 * at(x) + at(x + 1) + 2) >> 2;
-                    at(x) + clamp_c(filtered - at(x), -half, half)
+                let previous: &[Pixel; 4] = pixels(&self.prev, base - 1);
+                let filter: &[Pixel; 4] = pixels(&self.blend, base - 1);
+                let blend = |slot: usize| {
+                    V::new(previous[slot])
+                        .add(V::new(filter[slot]).clamp(quant.neg_half, quant.half))
                 };
-                ctx.blend = [
-                    blend(base - 1),
-                    blend(base),
-                    blend(base + 1),
-                    blend(base + 2),
-                ];
-                if group_start == 0 {
-                    ctx.blend[0] = left;
+                Pred::Map {
+                    a,
+                    c: if group_start == 0 { a } else { blend(0) },
+                    b: blend(1),
+                    d: blend(2),
+                    e: blend(3),
                 }
             }
-            PredMode::Left => {}
+            PredMode::Left => Pred::Left { a },
             PredMode::Block => {
-                for (offset, value) in ctx.block.iter_mut().enumerate() {
-                    *value = i32::from(cur[(base + offset).saturating_sub(mode.1)]);
-                }
+                let reference = |offset: usize| {
+                    V::new(pixels::<1>(&self.cur, (base + offset).saturating_sub(mode.1))[0])
+                };
+                Pred::Block([reference(0), reference(1), reference(2)])
             }
         }
-        ctx
     }
 
+    #[inline(always)]
     fn midpoint_pred(&self, component: usize, qlevel: i32) -> i32 {
-        mid_value(component) + self.left_recon[component] % (1 << qlevel)
+        // Reconstructed samples are never negative, so the mask is the
+        // remainder of the division by `1 << qlevel`.
+        mid_value(component) + (self.left_recon[component] & ((1 << qlevel) - 1))
     }
 
+    #[inline(always)]
     fn adjusted_predicted_size(&self, component: usize) -> i32 {
         let new = qlevel(component, self.primary_qp);
         let old = qlevel(component, self.prev_primary_qp);
@@ -1439,6 +2606,7 @@ impl Core {
 
     /// QP change at a flat group (after the encoder's flatness decision or the
     /// decoder's flatness syntax), for the last pixel `last_h` of the group.
+    #[inline(always)]
     fn flatness_qp_adjust(&mut self, params: &Params, last_h: usize) {
         if params.v2 && last_h >= params.slice_w - 1 {
             self.orig_is_flat = true;
@@ -1459,12 +2627,32 @@ impl Core {
         }
     }
 
-    /// Store the group's last reconstructed pixel and run the rate control.
-    fn finish_group(&mut self, params: &Params, group_start: usize, pixels: usize) {
-        let x = (group_start + 2).min(params.slice_w - 1) + PAD_LEFT;
-        for component in 0..3 {
-            self.left_recon[component] = i32::from(self.cur[component][x]);
+    /// Store the group's reconstructed pixels (the first `pixels` of
+    /// `group`) and run the rate control.
+    #[inline(always)]
+    fn finish_group(
+        &mut self,
+        params: &Params,
+        group_start: usize,
+        pixels: usize,
+        group: &[Pixel; 3],
+    ) {
+        let pixels = pixels.clamp(1, 3);
+        let base = group_start + PAD_LEFT;
+        // Fixed-size stores: a copy of variable length would be a call.
+        if let Some(target) = self.cur.get_mut(base..base + 3)
+            && pixels == 3
+        {
+            target[0] = group[0];
+            target[1] = group[1];
+            target[2] = group[2];
+        } else if let Some(target) = self.cur.get_mut(base..base + pixels) {
+            for (target, pixel) in target.iter_mut().zip(group) {
+                *target = *pixel;
+            }
         }
+        let [y, co, cg, _] = group[pixels - 1].map(i32::from);
+        self.left_recon = [y, co, cg];
         let (scale, bpg_offset) = self.calc_fullness_offset(params);
         self.group_count += 1;
         self.rate_control(
@@ -1475,6 +2663,7 @@ impl Core {
         );
     }
 
+    #[inline(always)]
     fn calc_fullness_offset(&mut self, params: &Params) -> (i64, i64) {
         if self.group_count == 0 {
             self.current_scale = params.initial_scale;
@@ -1536,6 +2725,7 @@ impl Core {
     }
 
     /// Remove one pixel time of bits from the rate buffer model.
+    #[inline(always)]
     fn remove_bits(&mut self, params: &Params) {
         self.bpg_frac_accum += params.bpp & 15;
         let bits = (params.bpp >> 4) + (self.bpg_frac_accum >> 4);
@@ -1552,15 +2742,30 @@ impl Core {
         }
     }
 
+    #[inline(always)]
     fn rate_control(&mut self, params: &Params, scale: i64, bpg_offset: i64, group_size: i32) {
         let prev_qp = self.st_qp;
         let prev2_qp = self.prev_qp;
         let rc_size_group_prev = self.rc_size_group;
-        let midpoints = self.midpoint.iter().filter(|selected| **selected).count();
-        for _ in 0..group_size {
-            self.pixel_count += 1;
-            if self.pixel_count >= params.xmit_delay {
-                self.remove_bits(params);
+        let pixel_times = usize::try_from(group_size).unwrap_or(0);
+        if self.pixel_count + 1 >= params.xmit_delay
+            && self.chunk_pixel_times + pixel_times < params.slice_w
+        {
+            // Every pixel time of the group removes bits and none ends a
+            // chunk, so the per-pixel steps of `remove_bits` add up to this.
+            let fraction = self.bpg_frac_accum + group_size * (params.bpp & 15);
+            let bits = group_size * (params.bpp >> 4) + (fraction >> 4);
+            self.buffer_fullness -= i64::from(bits);
+            self.num_bits_chunk += bits;
+            self.bpg_frac_accum = fraction & 15;
+            self.chunk_pixel_times += pixel_times;
+            self.pixel_count += group_size;
+        } else {
+            for _ in 0..group_size {
+                self.pixel_count += 1;
+                if self.pixel_count >= params.xmit_delay {
+                    self.remove_bits(params);
+                }
             }
         }
         let rc_size_group: i32 = self.rc_size_unit.iter().sum();
@@ -1594,7 +2799,7 @@ impl Core {
             + self.predicted_size[1].max(self.predicted_size[2]);
         let bit_save_thresh = DEPTH[0] + DEPTH[1] - 2;
         if params.v2 && self.v_pos > 0 && self.first_flat == -1 {
-            if !self.ich_selected && midpoints >= 3 {
+            if !self.ich_selected && self.midpoint == [true; 3] {
                 self.mpp_state += 1;
                 if self.mpp_state >= 2 {
                     self.bit_save_mode = 2;
@@ -1678,25 +2883,58 @@ impl Core {
     }
 
     /// End of a slice line: move the line into the (depth-limited) line
-    /// buffer and search block-prediction vectors for the next line.
+    /// buffer, prepare the MAP filter and search block-prediction vectors for
+    /// the next line.
+    #[inline(always)]
     fn end_line(&mut self, params: &Params) {
         let width = params.slice_w;
-        for component in 0..3 {
-            let shift = params.linebuf_shift[component];
-            let round = if shift > 0 { 1 << (shift - 1) } else { 0 };
-            let prev = &mut self.prev[component];
-            let cur = &self.cur[component];
-            for (target, source) in prev[PAD_LEFT..PAD_LEFT + width]
-                .iter_mut()
-                .zip(cur[PAD_LEFT..PAD_LEFT + width].iter())
-            {
-                let stored = ((i32::from(*source) + round) >> shift).min(params.linebuf_max);
-                *target = sample(stored << shift);
+        let (Some(target), Some(source)) = (
+            self.prev.get_mut(PAD_LEFT..PAD_LEFT + width),
+            self.cur.get(PAD_LEFT..PAD_LEFT + width),
+        ) else {
+            return;
+        };
+        let largest = (1 << DEPTH[1].max(DEPTH[2]).max(DEPTH[0])) - 1;
+        if params.linebuf_shift == [0; 3] && params.linebuf_max >= largest {
+            // The line buffer keeps every bit of the samples.
+            target.copy_from_slice(source);
+        } else {
+            for (target, source) in target.iter_mut().zip(source.iter()) {
+                for component in 0..3 {
+                    let shift = params.linebuf_shift[component];
+                    let round = if shift > 0 { 1 << (shift - 1) } else { 0 };
+                    let stored =
+                        ((i32::from(source[component]) + round) >> shift).min(params.linebuf_max);
+                    target[component] = sample(stored << shift);
+                }
             }
-            let first = prev[PAD_LEFT];
-            let last = prev[PAD_LEFT + width - 1];
-            prev[..PAD_LEFT].fill(first);
-            prev[PAD_LEFT + width..].fill(last);
+        }
+        let first = target.first().copied().unwrap_or_default();
+        let last = target.last().copied().unwrap_or_default();
+        self.prev[..PAD_LEFT].fill(first);
+        self.prev[PAD_LEFT + width..].fill(last);
+        // Pixels PAD_LEFT - 1 ..= PAD_LEFT + width + 2 are the ones MAP
+        // prediction blends; the filter is the same for every lane.
+        let count = (width + 4) * 4;
+        let from = (PAD_LEFT - 1) * 4;
+        let samples = self.prev.as_flattened();
+        if let (Some(filter), Some(left), Some(centre), Some(right)) = (
+            self.blend.as_flattened_mut().get_mut(from..from + count),
+            samples.get(from - 4..from - 4 + count),
+            samples.get(from..from + count),
+            samples.get(from + 4..from + 4 + count),
+        ) {
+            let neighbours = left.iter().zip(centre.iter()).zip(right.iter());
+            for (filter, ((left, centre), right)) in filter.iter_mut().zip(neighbours) {
+                *filter = ((*left + 2 * *centre + *right + 2) >> 2) - *centre;
+            }
+        }
+        let [luma, orange, green] = &mut self.planes;
+        let planes = luma.iter_mut().zip(orange.iter_mut()).zip(green.iter_mut());
+        for (pixel, ((y, co), cg)) in self.prev.iter().zip(planes) {
+            *y = pixel[0];
+            *co = pixel[1];
+            *cg = pixel[2];
         }
         if params.bp_enable {
             self.block_pred_search(params);
@@ -1705,86 +2943,128 @@ impl Core {
         self.ich_valid = self.ich_valid.min(ICH_RESERVED);
     }
 
+    /// Choose, per group of the next line, MAP prediction or a block vector
+    /// from the line just stored. A group is block-predicted only when it
+    /// holds an edge and it and the two groups before it have a vector that
+    /// beats the left neighbour, so only the span of groups from four before
+    /// the first edge to the last edge is searched.
+    #[inline(always)]
     fn block_pred_search(&mut self, params: &Params) {
         let groups = params.slice_w / 3;
         let pixels = groups * 3;
+        let (Some(pred), Some(edge)) =
+            (self.pred.get_mut(..groups), self.bp_edge.get_mut(..pixels))
+        else {
+            return;
+        };
         if groups == 0 {
             return;
         }
+        edge.fill(0);
+        for component in 0..3 {
+            let Some(current) = self.planes[component].get(PAD_LEFT..PAD_LEFT + pixels) else {
+                return;
+            };
+            let mid = sample(mid_value(component));
+            edge[0] |= i16::from((current[0] - mid).abs() > BP_EDGE_STRENGTH);
+            let pairs = current[1..].iter().zip(current.iter());
+            for (edge, (value, left)) in edge[1..].iter_mut().zip(pairs) {
+                *edge |= i16::from((*value - *left).abs() > BP_EDGE_STRENGTH);
+            }
+        }
+        pred.fill(0);
+        let has_edge = |flags: &[i16]| flags.iter().any(|flag| *flag != 0);
+        let mut edge_groups = edge.chunks_exact(BP_EDGE_COUNT);
+        let Some(first_edge) = edge_groups.position(has_edge) else {
+            return;
+        };
+        // `rposition` counts from the front of what `position` left over.
+        let last_edge = edge_groups
+            .rposition(has_edge)
+            .map_or(first_edge, |after| first_edge + 1 + after);
+        // Vectors are compared for the groups from `start` on; their sums
+        // reach two groups further back.
+        let start = first_edge.saturating_sub(2);
+        let low = first_edge.saturating_sub(4) * 3;
+        let high = (last_edge + 1) * 3;
+        let from = start * 3;
         for (slot, candidate) in BP_CANDIDATES.iter().enumerate() {
-            let acc = &mut self.bp_acc[..pixels];
+            let Some(acc) = self.bp_acc.get_mut(low..high) else {
+                return;
+            };
             acc.fill(0);
-            for component in 0..3 {
-                let line = &self.prev[component];
+            // Pixels up to `candidate` have no reference in the line and are
+            // compared with the mid value.
+            let head = (candidate + 1).clamp(low, high);
+            for (component, line) in self.planes.iter().enumerate() {
                 let shift = DEPTH[component] - 7;
                 let mid = sample(mid_value(component));
-                let head = (candidate + 1).min(pixels);
-                for (sum, value) in acc[..head].iter_mut().zip(line[PAD_LEFT..].iter()) {
-                    *sum += ((*value - mid).unsigned_abs() >> shift).min(63);
+                if let Some(current) = line.get(PAD_LEFT + low..PAD_LEFT + head) {
+                    for (sum, value) in acc.iter_mut().zip(current.iter()) {
+                        *sum += ((*value - mid).abs() >> shift).min(63);
+                    }
                 }
-                if pixels > head {
-                    let current = &line[PAD_LEFT + head..PAD_LEFT + pixels];
-                    let start = PAD_LEFT + head - 1 - candidate;
-                    let reference = &line[start..start + pixels - head];
-                    for ((sum, value), predictor) in acc[head..]
-                        .iter_mut()
-                        .zip(current.iter())
-                        .zip(reference.iter())
-                    {
-                        *sum += ((*value - *predictor).unsigned_abs() >> shift).min(63);
+                if high > head
+                    && let (Some(sums), Some(current), Some(reference)) = (
+                        acc.get_mut(head - low..),
+                        line.get(PAD_LEFT + head..PAD_LEFT + high),
+                        line.get(PAD_LEFT + head - 1 - candidate..PAD_LEFT + high - 1 - candidate),
+                    )
+                {
+                    let pairs = current.iter().zip(reference.iter());
+                    for (sum, (value, predictor)) in sums.iter_mut().zip(pairs) {
+                        *sum += ((*value - *predictor).abs() >> shift).min(63);
                     }
                 }
             }
-            for (group, sum) in self.bp_group[slot][..groups].iter_mut().enumerate() {
-                *sum = (acc[group * 3] + acc[group * 3 + 1] + acc[group * 3 + 2]).min(511);
+            // `bp_sum[x + 6]` is the capped error of the three pixels from
+            // `x` on; the six entries before pixel 0 stay zero.
+            if let (Some(sums), Some(second), Some(third)) = (
+                self.bp_sum.get_mut(low + 6..high + 4),
+                acc.get(1..),
+                acc.get(2..),
+            ) {
+                let triples = acc.iter().zip(second.iter()).zip(third.iter());
+                for (sum, ((a, b), c)) in sums.iter_mut().zip(triples) {
+                    *sum = (*a + *b + *c).min(511);
+                }
+            }
+            // The error of a group and the two groups before it, for a group
+            // starting at any pixel `x` (only multiples of three are used).
+            // The lowest key `error << BP_KEY_SHIFT | slot` is the first
+            // candidate with the lowest error; a plain minimum, which the
+            // compiler turns into vector code, keeps it.
+            let (Some(lowest), Some(two_back), Some(one_back), Some(own)) = (
+                self.bp_min.get_mut(from..high - 2),
+                self.bp_sum.get(from..),
+                self.bp_sum.get(from + 3..),
+                self.bp_sum.get(from + 6..),
+            ) else {
+                return;
+            };
+            let number = i16::try_from(slot).unwrap_or(0);
+            let errors = two_back.iter().zip(one_back.iter()).zip(own.iter());
+            if slot == 0 {
+                for (lowest, ((a, b), c)) in lowest.iter_mut().zip(errors) {
+                    *lowest = ((*a + *b + *c) >> 3) << BP_KEY_SHIFT;
+                }
+            } else {
+                for (lowest, ((a, b), c)) in lowest.iter_mut().zip(errors) {
+                    let key = (((*a + *b + *c) >> 3) << BP_KEY_SHIFT) | number;
+                    *lowest = (*lowest).min(key);
+                }
             }
         }
         let mut bp_count = 0u32;
-        let mut last_edge_count = 10u32;
-        for group in 0..groups {
-            for h in group * 3..group * 3 + 3 {
-                let mut edge = false;
-                for component in 0..3 {
-                    let line = &self.prev[component];
-                    let left = if h > 0 {
-                        line[PAD_LEFT + h - 1]
-                    } else {
-                        sample(mid_value(component))
-                    };
-                    if (line[PAD_LEFT + h] - left).abs() > BP_EDGE_STRENGTH {
-                        edge = true;
-                    }
-                }
-                last_edge_count = if edge { 0 } else { last_edge_count + 1 };
-            }
-            let sad = |slot: usize| {
-                let sums = &self.bp_group[slot];
-                let mut total = sums[group];
-                if group >= 1 {
-                    total += sums[group - 1];
-                }
-                if group >= 2 {
-                    total += sums[group - 2];
-                }
-                total >> 3
-            };
-            let mut min_err = sad(0);
-            let mut best = 0u8;
-            for (slot, candidate) in BP_CANDIDATES.iter().enumerate().skip(1) {
-                let err = sad(slot);
-                if min_err > err {
-                    min_err = err;
-                    best = u8::try_from(candidate + 1).unwrap_or(0);
-                }
-            }
-            if group * 3 + 2 >= 9 {
-                bp_count = if best != 0 { bp_count + 1 } else { 0 };
-            }
-            self.pred[group] = if bp_count >= 3 && last_edge_count < BP_EDGE_COUNT {
-                best
-            } else {
-                0
-            };
+        for (group, vector) in pred.iter_mut().enumerate().take(last_edge + 1).skip(start) {
+            let x = group * 3;
+            let key = self.bp_min.get(x).copied().unwrap_or(0);
+            let best = BP_VECTORS[usize::try_from(key).unwrap_or(0) % BP_VECTORS.len()];
+            let counted = if best != 0 { bp_count + 1 } else { 0 };
+            bp_count = if group >= 3 { counted } else { bp_count };
+            let flags: &[i16; BP_EDGE_COUNT] = window(edge, x);
+            let has_edge = (flags[0] | flags[1] | flags[2]) != 0;
+            *vector = if bp_count >= 3 && has_edge { best } else { 0 };
         }
     }
 }
@@ -1847,25 +3127,6 @@ impl FrameStats {
     }
 }
 
-fn rgb_to_ycocg(red: u8, green: u8, blue: u8) -> [i16; 3] {
-    let (r, g, b) = (i16::from(red), i16::from(green), i16::from(blue));
-    let co = r - b;
-    let t = b + (co >> 1);
-    let cg = g - t;
-    let y = t + (cg >> 1);
-    [y, co + 256, cg + 256]
-}
-
-fn ycocg_to_rgb(y: i16, co: i16, cg: i16) -> [u8; 3] {
-    let (y, co, cg) = (i32::from(y), i32::from(co) - 256, i32::from(cg) - 256);
-    let t = y - (cg >> 1);
-    let g = cg + t;
-    let b = t - (co >> 1);
-    let r = co + b;
-    let byte = |value: i32| value.clamp(0, 255).to_le_bytes()[0];
-    [byte(r), byte(g), byte(b)]
-}
-
 /// One slice's share of the output picture: its chunk of every slice line.
 struct EncodeJob<'a> {
     xstart: usize,
@@ -1873,44 +3134,85 @@ struct EncodeJob<'a> {
     chunks: Vec<&'a mut [u8]>,
 }
 
+/// Low `size` bits of three residuals, first residual in the highest bits.
+#[inline(always)]
+fn pack_residuals(values: [i32; 3], size: u32) -> u32 {
+    let mask = (1u32 << size) - 1;
+    let raw = values.map(|value| u32::from_le_bytes(value.to_le_bytes()) & mask);
+    (raw[0] << (2 * size)) | (raw[1] << size) | raw[2]
+}
+
+/// Everything one thread needs to encode slices; kept between pictures.
 struct SliceEncoder {
     core: Core,
-    orig: [Vec<i16>; 3],
+    orig: Vec<Pixel>,
+    /// Per pixel position `h` of the line and per component, the spread
+    /// (highest minus lowest) of the original samples the flatness test
+    /// looks at: of samples `h..h + 4` and of samples `h + 1..h + 7`.
+    near_spread: Vec<Pixel>,
+    far_spread: Vec<Pixel>,
+    scan_low: Vec<Pixel>,
+    scan_high: Vec<Pixel>,
     substreams: [BitWriter; 3],
-    se_sizes: Vec<[u8; 3]>,
+    /// Per group: the bits it wrote to each substream, eight bits each.
+    se_sizes: Vec<u32>,
     prev_flatness_type: i32,
     muxed: Vec<u8>,
 }
 
 impl SliceEncoder {
     fn new(params: &Params) -> Self {
-        let line = params.line_len();
+        let line = || vec![[0; 4]; params.line_len()];
         Self {
             core: Core::new(params),
-            orig: [vec![0; line], vec![0; line], vec![0; line]],
+            orig: line(),
+            near_spread: line(),
+            far_spread: line(),
+            scan_low: line(),
+            scan_high: line(),
             substreams: [
                 BitWriter::default(),
                 BitWriter::default(),
                 BitWriter::default(),
             ],
-            se_sizes: Vec::with_capacity(params.slice_w.div_ceil(3) * params.slice_h),
+            se_sizes: Vec::new(),
             prev_flatness_type: 0,
-            muxed: vec![0; params.slice_bytes()],
+            muxed: Vec::new(),
         }
     }
 
-    fn populate_orig(
+    /// Start-of-slice state; buffers keep their allocations between slices
+    /// and are only rebuilt when the slice geometry changed.
+    fn start(&mut self, params: &Params) {
+        if !self.core.fits(params) {
+            *self = Self::new(params);
+        }
+        self.core.reset(params);
+        let groups = params.slice_w.div_ceil(3) * params.slice_h;
+        for writer in &mut self.substreams {
+            writer.clear(params.slice_bytes());
+        }
+        self.se_sizes.clear();
+        self.se_sizes.reserve(groups);
+        self.prev_flatness_type = 0;
+        self.muxed.resize(params.slice_bytes(), 0);
+    }
+
+    #[inline(always)]
+    fn populate_orig<K: Kernels>(
         &mut self,
+        kernels: K,
         params: &Params,
         frame: &Frame<'_>,
         xstart: usize,
         y: usize,
     ) -> Result<(), DscError> {
         let width = params.slice_w + PAD_RIGHT;
+        let Some(line) = self.orig.get_mut(PAD_LEFT..PAD_LEFT + width) else {
+            return Ok(());
+        };
         if y >= params.pic_h {
-            for component in 0..3 {
-                self.orig[component][PAD_LEFT..PAD_LEFT + width].fill(sample(mid_value(component)));
-            }
+            line.fill(mid_pixel());
             return Ok(());
         }
         let end = params.pic_w.min(xstart + params.slice_w);
@@ -1919,62 +3221,82 @@ impl SliceEncoder {
             .data
             .get(row_start + xstart * 4..row_start + end * 4)
             .ok_or(DscError::FrameTooSmall)?;
-        let (red, blue) = match frame.format {
-            PixelFormat::Bgrx => (2, 0),
-            PixelFormat::Rgbx => (0, 2),
-        };
-        let [luma, orange, green] = &mut self.orig;
-        let targets = luma[PAD_LEFT..]
-            .iter_mut()
-            .zip(orange[PAD_LEFT..].iter_mut())
-            .zip(green[PAD_LEFT..].iter_mut());
-        for (((y_out, co_out), cg_out), pixel) in targets.zip(row.chunks_exact(4)) {
-            let [y_value, co, cg] = rgb_to_ycocg(pixel[red], pixel[1], pixel[blue]);
-            *y_out = y_value;
-            *co_out = co;
-            *cg_out = cg;
-        }
-        let real = end - xstart;
-        for line in &mut self.orig {
-            let last = line[PAD_LEFT + real - 1];
-            line[PAD_LEFT + real..PAD_LEFT + width].fill(last);
-        }
+        let real = (end - xstart).clamp(1, width);
+        let (picture, padding) = line.split_at_mut(real);
+        row_to_ycocg(kernels, row, frame.format == PixelFormat::Rgbx, picture);
+        padding.fill(picture[real - 1]);
         Ok(())
+    }
+
+    /// Fill `near_spread` and `far_spread` for the line in `orig`. The steps
+    /// are the same for every lane, so the loops run over the samples.
+    #[inline(always)]
+    fn scan_flatness(&mut self, params: &Params) {
+        let width = params.slice_w * 4;
+        // Lowest and highest of four pixels from every position on; the
+        // six-pixel window is two of those, two pixels apart.
+        let count = width + 3 * 4;
+        let from = PAD_LEFT * 4;
+        let samples = self.orig.as_flattened();
+        let (Some(low), Some(high)) = (
+            self.scan_low.as_flattened_mut().get_mut(..count),
+            self.scan_high.as_flattened_mut().get_mut(..count),
+        ) else {
+            return;
+        };
+        let (Some(first), Some(second), Some(third), Some(fourth)) = (
+            samples.get(from..from + count),
+            samples.get(from + 4..from + 4 + count),
+            samples.get(from + 8..from + 8 + count),
+            samples.get(from + 12..from + 12 + count),
+        ) else {
+            return;
+        };
+        let windows = first
+            .iter()
+            .zip(second.iter())
+            .zip(third.iter())
+            .zip(fourth.iter());
+        for ((low, high), (((a, b), c), d)) in low.iter_mut().zip(high.iter_mut()).zip(windows) {
+            *low = (*a).min(*b).min((*c).min(*d));
+            *high = (*a).max(*b).max((*c).max(*d));
+        }
+        let (Some(near), Some(far)) = (
+            self.near_spread.as_flattened_mut().get_mut(..width),
+            self.far_spread.as_flattened_mut().get_mut(..width),
+        ) else {
+            return;
+        };
+        for ((near, low), high) in near.iter_mut().zip(low.iter()).zip(high.iter()) {
+            *near = *high - *low;
+        }
+        let lows = low[4..].iter().zip(low[12..].iter());
+        let highs = high[4..].iter().zip(high[12..].iter());
+        for (far, ((low_a, low_b), (high_a, high_b))) in far.iter_mut().zip(lows.zip(highs)) {
+            *far = (*high_a).max(*high_b) - (*low_a).min(*low_b);
+        }
     }
 
     /// Flatness class of the original pixels after position `h`: 0 not flat,
     /// 1 somewhat flat, 2 very flat.
+    #[inline(always)]
     fn orig_flatness(&self, params: &Params, h: usize) -> i32 {
         if h + 1 >= params.slice_w {
             return 0;
         }
         let qp = (self.core.primary_qp - SOMEWHAT_FLAT_QP_DELTA).max(0);
-        for (first, last) in [(0usize, 4usize), (1, 7)] {
-            if first == 1 && h + 2 >= params.slice_w {
+        let luma_limit = FLATNESS_DET_THRESH.max(1 << qlevel(0, qp));
+        let chroma_limit = FLATNESS_DET_THRESH.max(1 << qlevel(1, qp));
+        for (window, spreads) in [&self.near_spread, &self.far_spread].iter().enumerate() {
+            if window == 1 && h + 2 >= params.slice_w {
                 return 0;
             }
-            let mut somewhat_flat = true;
-            let mut very_flat = true;
-            for component in 0..3 {
-                let window = &self.orig[component][PAD_LEFT + h + first..PAD_LEFT + h + last];
-                let mut low = i16::MAX;
-                let mut high = i16::MIN;
-                for value in window {
-                    low = low.min(*value);
-                    high = high.max(*value);
-                }
-                let spread = i32::from(high - low);
-                if spread > FLATNESS_DET_THRESH.max(1 << qlevel(component, qp)) {
-                    somewhat_flat = false;
-                }
-                if spread > FLATNESS_DET_THRESH {
-                    very_flat = false;
-                }
-            }
-            if very_flat {
+            let [luma, orange, green, _] = pixels::<1>(spreads, h)[0].map(i32::from);
+            let chroma = orange.max(green);
+            if luma <= FLATNESS_DET_THRESH && chroma <= FLATNESS_DET_THRESH {
                 return 2;
             }
-            if somewhat_flat {
+            if luma <= luma_limit && chroma <= chroma_limit {
                 return 1;
             }
         }
@@ -1983,23 +3305,77 @@ impl SliceEncoder {
 
     fn encode_slice(
         &mut self,
+        level: Level,
+        params: &Params,
+        frame: &Frame<'_>,
+        job: &mut EncodeJob<'_>,
+    ) -> Result<FrameStats, DscError> {
+        match level {
+            Level::Scalar => self.encode_slice_with(Scalar, params, frame, job),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse2 => self.encode_slice_with(x86::Sse2, params, frame, job),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse42(token) => {
+                // SAFETY: the token proves that the CPU has every feature
+                // `encode_slice_sse42` is compiled for (`x86::Sse42::detect`).
+                unsafe { self.encode_slice_sse42(token, params, frame, job) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx2(token) => {
+                // SAFETY: the token proves that the CPU has every feature
+                // `encode_slice_avx2` is compiled for (`x86::Avx2::detect`).
+                unsafe { self.encode_slice_avx2(token, params, frame, job) }
+            }
+        }
+    }
+
+    /// The slice loop compiled for SSE4.2-era CPUs (no AVX2): the automatic
+    /// vector code and the lowering of the SSE2 kernels get absolute values,
+    /// unsigned minima and blends as single instructions.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse4.2,ssse3,popcnt")]
+    fn encode_slice_sse42(
+        &mut self,
+        token: x86::Sse42,
+        params: &Params,
+        frame: &Frame<'_>,
+        job: &mut EncodeJob<'_>,
+    ) -> Result<FrameStats, DscError> {
+        self.encode_slice_with(token, params, frame, job)
+    }
+
+    /// The slice loop compiled for AVX2-era CPUs: shorter shifts and bit
+    /// counts, wider automatic vectors, and the AVX2 kernels inlined.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    fn encode_slice_avx2(
+        &mut self,
+        token: x86::Avx2,
+        params: &Params,
+        frame: &Frame<'_>,
+        job: &mut EncodeJob<'_>,
+    ) -> Result<FrameStats, DscError> {
+        self.encode_slice_with(token, params, frame, job)
+    }
+
+    #[inline(always)]
+    fn encode_slice_with<K: Kernels>(
+        &mut self,
+        kernels: K,
         params: &Params,
         frame: &Frame<'_>,
         job: &mut EncodeJob<'_>,
     ) -> Result<FrameStats, DscError> {
         let mut stats = FrameStats::default();
-        self.core.reset(params);
-        for writer in &mut self.substreams {
-            writer.clear();
-        }
-        self.se_sizes.clear();
-        self.prev_flatness_type = 0;
+        let quant = QuantLanes::<K::Lanes>::table();
+        self.start(params);
         for line in 0..params.slice_h {
-            self.populate_orig(params, frame, job.xstart, job.ystart + line)?;
+            self.populate_orig(kernels, params, frame, job.xstart, job.ystart + line)?;
+            self.scan_flatness(params);
             let mut group_start = 0;
             while group_start < params.slice_w {
                 let pixels = (params.slice_w - group_start).min(3);
-                self.encode_group(params, group_start, pixels, &mut stats)?;
+                self.encode_group(kernels, params, &quant, group_start, pixels, &mut stats)?;
                 group_start += 3;
             }
             self.core.end_line(params);
@@ -2021,9 +3397,12 @@ impl SliceEncoder {
         Ok(stats)
     }
 
-    fn encode_group(
+    #[inline(always)]
+    fn encode_group<K: Kernels>(
         &mut self,
+        kernels: K,
         params: &Params,
+        quant: &[QuantLanes<K::Lanes>; 16],
         group_start: usize,
         pixels: usize,
         stats: &mut FrameStats,
@@ -2031,46 +3410,98 @@ impl SliceEncoder {
         self.core.primary_qp = self.core.prev_qp;
         let qp = self.core.primary_qp;
         let prev_ich = self.core.ich_selected;
-        self.core.ich_group_start(params, group_start, prev_ich);
+        self.core
+            .ich_group_start(kernels, params, group_start, prev_ich);
         let mode = self.core.pred_mode(group_start);
+        let pixels = pixels.clamp(1, 3);
         let last_h = group_start + pixels - 1;
+        let qlevels = qp_levels(qp);
+        let quant = &quant[index(qp) % 16];
+        let originals: &[Pixel; 3] = self::pixels(&self.orig, group_start + PAD_LEFT);
 
-        // Predictive coding of every unit, both with the regular predictor
-        // and with midpoint prediction.
+        // Underflow prevention: force midpoint prediction when the rate
+        // buffer is about to run dry.
+        let max_bits_per_group = (3 * params.bpp + 15) >> 4;
+        let chunk_bits = i32::try_from(params.chunk_bytes * 8).unwrap_or(i32::MAX);
+        let fractional =
+            (i64::from(params.bpp) * i64::try_from(params.slice_w).unwrap_or(0)) & 15 != 0;
+        let chunk_end = self.core.num_bits_chunk + max_bits_per_group + 8;
+        let low_water = i64::from(max_bits_per_group - 3);
+        let force_mpp = if (fractional && chunk_end == chunk_bits) || chunk_end > chunk_bits {
+            self.core.buffer_fullness - 8 < low_water
+        } else {
+            self.core.pixel_count >= params.xmit_delay && self.core.buffer_fullness < low_water
+        };
+
+        // Predictive coding with the regular predictor, the three components
+        // side by side in lanes.
+        let actual = originals.map(<K::Lanes as Lanes>::new);
+        let pred = self.core.predictor(mode, group_start, quant);
+        let (quantized, rebuilt) = code_units(pred, quant.scale, |position, prediction| {
+            quant.quantize(actual[position].sub(prediction))
+        });
+        let errors = [
+            actual[0].sub(rebuilt[0]).abs().get(),
+            actual[1].sub(rebuilt[1]).abs().get(),
+            actual[2].sub(rebuilt[2]).abs().get(),
+        ];
+        let quantized = quantized.map(Lanes::get);
+        let rebuilt = rebuilt.map(Lanes::get);
+
+        // Per component: residual sizes, and midpoint prediction where that
+        // is what will be sent. Positions past the slice edge code a zero
+        // residual and have no error.
+        let live = [true, pixels > 1, pixels > 2];
+        let pick = |position: usize, value: i32| if live[position] { value } else { 0 };
         let mut residuals = [[0i32; 3]; 3];
-        let mut mid_residuals = [[0i32; 3]; 3];
-        let mut recon = [[0i32; 3]; 3];
-        let mut mid_recon = [[0i32; 3]; 3];
+        let mut recon = [[0i16; 3]; 3];
         let mut max_error = [0i32; 3];
-        let mut max_mid_error = [0i32; 3];
-        let mut qlevels = [0i32; 3];
+        let mut required = [[0i32; 3]; 3];
+        let mut max_size = [0i32; 3];
+        let mut midpoint = [false; 3];
         for unit in 0..3 {
-            let level = qlevel(unit, qp);
-            qlevels[unit] = level;
-            let ctx = self.core.pred_ctx(mode, unit, group_start, level);
-            let max_residual = DEPTH[unit] - level;
-            let mid_pred = self.core.midpoint_pred(unit, level);
-            for position in 0..pixels {
-                let actual = i32::from(self.orig[unit][PAD_LEFT + group_start + position]);
-                let pred = ctx.predict(position, &residuals[unit]);
-                let quantized = quantize(actual - pred, level);
-                residuals[unit][position] = quantized;
-                let mut mid_quantized = quantize(actual - mid_pred, level);
-                while residual_size(mid_quantized) > max_residual {
-                    mid_quantized += if mid_quantized > 0 { -1 } else { 1 };
-                }
-                mid_residuals[unit][position] = mid_quantized;
-                let value = clamp_c(pred + quantized * ctx.quant_divisor, 0, ctx.max_value);
-                recon[unit][position] = value;
-                max_error[unit] = max_error[unit].max((actual - value).abs());
-                let mid = clamp_c(
-                    mid_pred + mid_quantized * ctx.quant_divisor,
-                    0,
-                    ctx.max_value,
-                );
-                mid_recon[unit][position] = mid;
-                max_mid_error[unit] = max_mid_error[unit].max((actual - mid).abs());
+            let level = qlevels[unit];
+            let [mut q0, mut q1, mut q2] = [
+                i32::from(quantized[0][unit]),
+                pick(1, i32::from(quantized[1][unit])),
+                pick(2, i32::from(quantized[2][unit])),
+            ];
+            let [mut r0, mut r1, mut r2] = [rebuilt[0][unit], rebuilt[1][unit], rebuilt[2][unit]];
+            let mut error = i32::from(errors[0][unit])
+                .max(pick(1, i32::from(errors[1][unit])))
+                .max(pick(2, i32::from(errors[2][unit])));
+            let mut sizes = [residual_size(q0), residual_size(q1), residual_size(q2)];
+            let mut size = sizes[0].max(sizes[1]).max(sizes[2]);
+            let limit = DEPTH[unit] - level;
+            let use_midpoint = force_mpp || size >= limit;
+            if use_midpoint {
+                // Midpoint prediction; residuals are limited to `limit` bits.
+                let max_value = (1 << DEPTH[unit]) - 1;
+                let mid_pred = self.core.midpoint_pred(unit, level);
+                let bound = 1 << (limit - 1).max(0);
+                let code = |position: usize| {
+                    let wanted = i32::from(originals[position][unit]);
+                    let residual = clamp_c(quantize(wanted - mid_pred, level), -bound, bound - 1);
+                    let value = clamp_c(mid_pred + (residual << level), 0, max_value);
+                    (
+                        pick(position, residual),
+                        sample(value),
+                        pick(position, (wanted - value).abs()),
+                    )
+                };
+                let (first, second, third) = (code(0), code(1), code(2));
+                [q0, q1, q2] = [first.0, second.0, third.0];
+                [r0, r1, r2] = [first.1, second.1, third.1];
+                error = first.2.max(second.2).max(third.2);
+                size = limit;
+                sizes = [limit; 3];
             }
+            residuals[unit] = [q0, q1, q2];
+            recon[unit] = [r0, r1, r2];
+            max_error[unit] = error;
+            required[unit] = sizes;
+            max_size[unit] = size;
+            midpoint[unit] = use_midpoint;
         }
 
         // Flatness decision for the next supergroup and QP adjustment.
@@ -2098,100 +3529,124 @@ impl SliceEncoder {
             self.core.first_flat >= 0 && group_in_supergroup == self.core.first_flat;
         self.core.flatness_qp_adjust(params, last_h);
 
-        // Underflow prevention: force midpoint prediction when the rate
-        // buffer is about to run dry.
-        let max_bits_per_group = (3 * params.bpp + 15) >> 4;
-        let chunk_bits = i32::try_from(params.chunk_bytes * 8).unwrap_or(i32::MAX);
-        let fractional =
-            (i64::from(params.bpp) * i64::try_from(params.slice_w).unwrap_or(0)) & 15 != 0;
-        let chunk_end = self.core.num_bits_chunk + max_bits_per_group + 8;
-        let low_water = i64::from(max_bits_per_group - 3);
-        let force_mpp = if (fractional && chunk_end == chunk_bits) || chunk_end > chunk_bits {
-            self.core.buffer_fullness - 8 < low_water
+        // Cost of the predictive coding, which the colour history has to beat.
+        let adjusted = [
+            self.core.adjusted_predicted_size(0),
+            self.core.adjusted_predicted_size(1),
+            self.core.adjusted_predicted_size(2),
+        ];
+        let escape_size = DEPTH[0] + 1 - qlevels[0];
+        let mut ich_bits = if prev_ich {
+            1
         } else {
-            self.core.pixel_count >= params.xmit_delay && self.core.buffer_fullness < low_water
+            escape_size - adjusted[0]
         };
+        ich_bits += ICH_BITS * 3;
+        let mut log_err_p = 0;
+        let mut p_bits = 0;
+        for unit in 0..3 {
+            log_err_p += bit_length(max_error[unit]);
+            if !params.v2 && unit == 0 {
+                log_err_p *= 2;
+            }
+            let limit = DEPTH[unit] - qlevels[unit];
+            p_bits += if max_size[unit] < adjusted[unit] {
+                1 + 3 * adjusted[unit]
+            } else if max_size[unit] == limit && unit != 0 {
+                max_size[unit] - adjusted[unit] + 3 * max_size[unit]
+            } else {
+                1 + max_size[unit] - adjusted[unit] + 3 * max_size[unit]
+            };
+        }
+        if max_size[0] < DEPTH[0] - qlevels[0] && prev_ich {
+            p_bits += 1;
+        }
+        let p_cost = p_bits + ICH_LAMBDA * log_err_p;
 
-        // Indexed colour history search.
-        let mut ich_possible = !force_mpp && !(group_start == 0 && self.core.v_pos == 0);
+        // Indexed colour history search. Its cost is at least `ich_bits`, so
+        // a group that predicts for less is not searched at all.
+        let mut ich_possible =
+            !force_mpp && !(group_start == 0 && self.core.v_pos == 0) && ich_bits < p_cost;
         let mut ich_lookup = [0usize; 3];
-        let mut ich_pixels = [[0i32; 3]; 3];
+        let mut ich_recon = [[0i16; 3]; 3];
         let mut max_ich_error = [0i32; 3];
         if ich_possible {
-            let mut entries = self.core.ich;
-            let mut valid = if self.core.ich_valid >= ICH_SIZE {
-                u32::MAX
+            let core = &self.core;
+            // On the first line all 32 entries are history. From the second
+            // line on the history has 25 entries and entries 25..=31 are the
+            // seven pixels above the group, searched where they are in the
+            // previous line.
+            let above_base = Core::ich_above_base(params, group_start);
+            let above: IchRows<'_> = [
+                window(&core.planes[0], above_base),
+                window(&core.planes[1], above_base),
+                window(&core.planes[2], above_base),
+            ];
+            let (history, above_valid) = if core.v_pos > 0 {
+                (
+                    low_bits(core.ich_valid.min(ICH_RESERVED)),
+                    low_bits(ICH_ABOVE),
+                )
             } else {
-                (1u32 << self.core.ich_valid) - 1
+                (low_bits(core.ich_valid), 0)
             };
-            if self.core.v_pos > 0 {
-                valid = (valid & ((1 << ICH_RESERVED) - 1)) | !((1u32 << ICH_RESERVED) - 1);
-                let base = Core::ich_above_base(params, group_start);
-                for component in 0..3 {
-                    entries[component][ICH_RESERVED..]
-                        .copy_from_slice(&self.core.prev[component][base..base + ICH_ABOVE]);
-                }
-            }
+            let [low, high] = ich_halves(&core.ich);
             let modified_qp = (qp + 2).min(MAX_QP);
-            let max_qerr: [i32; 3] =
-                std::array::from_fn(|component| (1 << qlevel(component, modified_qp)) / 2);
+            let tolerance: [i16; 3] =
+                std::array::from_fn(|unit| sample((1 << qlevel(unit, modified_qp)) / 2));
             for position in 0..pixels {
-                let x = PAD_LEFT + group_start + position;
-                let orig = [
-                    i32::from(self.orig[0][x]),
-                    i32::from(self.orig[1][x]),
-                    i32::from(self.orig[2][x]),
-                ];
-                let diffs = |entry: usize| {
-                    [
-                        (i32::from(entries[0][entry]) - orig[0]).abs(),
-                        (i32::from(entries[1][entry]) - orig[1]).abs(),
-                        (i32::from(entries[2][entry]) - orig[2]).abs(),
-                    ]
-                };
-                let mut hit = None;
-                for entry in 0..ICH_SIZE {
-                    if (valid >> entry) & 1 == 0 {
-                        continue;
-                    }
-                    let d = diffs(entry);
-                    if d[0] <= max_qerr[0] && d[1] <= max_qerr[1] && d[2] <= max_qerr[2] {
-                        hit = Some((entry, 2 * d[0] + d[1] + d[2]));
-                        break;
-                    }
-                }
-                let Some((hit_entry, hit_sad)) = hit else {
+                let [y, co, cg, _] = originals[position];
+                let pixel = [y, co, cg];
+                // The first entry within the tolerance, in entry order:
+                // history, then the pixels above.
+                let hit =
+                    ich_table_first(kernels, &core.ich, pixel, tolerance, history).or_else(|| {
+                        kernels
+                            .ich_first(above, pixel, tolerance, above_valid)
+                            .map(|entry| entry + ICH_RESERVED)
+                    });
+                let Some(mut best) = hit else {
                     ich_possible = false;
                     break;
                 };
-                // The first entry with the lowest weighted SAD; an exact hit
-                // is that entry already.
-                let mut best = hit_entry;
-                if hit_sad != 0 {
-                    let mut lowest = i32::MAX;
-                    for entry in 0..ICH_SIZE {
-                        if (valid >> entry) & 1 == 0 {
-                            continue;
-                        }
-                        let d = diffs(entry);
-                        let sad = 2 * d[0] + d[1] + d[2];
-                        if lowest > sad {
-                            lowest = sad;
-                            best = entry;
-                        }
+                // The entry to use is the first with the lowest weighted
+                // difference; an exact first hit is that entry already.
+                let mut entry = core.ich_pixel(params, best, group_start);
+                if ich_weighted_sad(entry, pixel) != 0 {
+                    let mut key = kernels
+                        .ich_best(low, pixel, history, 0)
+                        .min(kernels.ich_best(high, pixel, history >> ICH_ROW, ICH_ROW));
+                    if above_valid != 0 {
+                        key = key.min(kernels.ich_best(above, pixel, above_valid, ICH_RESERVED));
                     }
+                    best = usize::try_from(key).unwrap_or(0) % ICH_SIZE;
+                    entry = core.ich_pixel(params, best, group_start);
                 }
                 ich_lookup[position] = best;
-                let d = diffs(best);
-                for component in 0..3 {
-                    ich_pixels[position][component] = i32::from(entries[component][best]);
-                    max_ich_error[component] = max_ich_error[component].max(d[component]);
+                for unit in 0..3 {
+                    ich_recon[unit][position] = sample(entry[unit]);
+                    max_ich_error[unit] =
+                        max_ich_error[unit].max((entry[unit] - i32::from(pixel[unit])).abs());
                 }
             }
             let last_lookup = ich_lookup[pixels - 1];
             for lookup in ich_lookup.iter_mut().skip(pixels) {
                 *lookup = last_lookup;
             }
+        }
+        let mut use_ich = false;
+        if ich_possible {
+            let mut log_err_ich = 0;
+            for (unit, error) in max_ich_error.iter().enumerate() {
+                log_err_ich += bit_length(*error);
+                if !params.v2 && unit == 0 {
+                    log_err_ich *= 2;
+                }
+            }
+            let ich_cost = ich_bits + ICH_LAMBDA * log_err_ich;
+            use_ich = ich_cost < p_cost
+                && (log_err_ich <= log_err_p
+                    || (params.v2 && self.orig_flatness(params, group_start + 2) != 2));
         }
 
         // Entropy coding.
@@ -2209,64 +3664,6 @@ impl SliceEncoder {
             }
             self.substreams[0].put(self.core.first_flat, 2);
             bits[0] += 2;
-        }
-        let mut adjusted = [0i32; 3];
-        let mut max_size = [0i32; 3];
-        let mut required = [[0i32; 3]; 3];
-        let mut midpoint = [false; 3];
-        for unit in 0..3 {
-            adjusted[unit] = self.core.adjusted_predicted_size(unit);
-            for position in 0..3 {
-                required[unit][position] = residual_size(residuals[unit][position]);
-                max_size[unit] = max_size[unit].max(required[unit][position]);
-            }
-            let limit = DEPTH[unit] - qlevels[unit];
-            if force_mpp || max_size[unit] >= limit {
-                max_size[unit] = limit;
-                required[unit] = [limit; 3];
-                midpoint[unit] = true;
-            }
-        }
-        let escape_size = DEPTH[0] + 1 - qlevels[0];
-        let mut use_ich = false;
-        if ich_possible {
-            let mut ich_bits = if prev_ich {
-                1
-            } else {
-                escape_size - adjusted[0]
-            };
-            ich_bits += ICH_BITS * 3;
-            let mut log_err_p = 0;
-            let mut log_err_ich = 0;
-            let mut p_bits = 0;
-            for unit in 0..3 {
-                let error = if midpoint[unit] {
-                    max_mid_error[unit]
-                } else {
-                    max_error[unit]
-                };
-                log_err_p += bit_length(error);
-                log_err_ich += bit_length(max_ich_error[unit]);
-                if !params.v2 && unit == 0 {
-                    log_err_p *= 2;
-                    log_err_ich *= 2;
-                }
-                let limit = DEPTH[unit] - qlevels[unit];
-                p_bits += if max_size[unit] < adjusted[unit] {
-                    1 + 3 * adjusted[unit]
-                } else if max_size[unit] == limit && unit != 0 {
-                    max_size[unit] - adjusted[unit] + 3 * max_size[unit]
-                } else {
-                    1 + max_size[unit] - adjusted[unit] + 3 * max_size[unit]
-                };
-            }
-            if max_size[0] < DEPTH[0] - qlevels[0] && prev_ich {
-                p_bits += 1;
-            }
-            let p_cost = p_bits + ICH_LAMBDA * log_err_p;
-            let ich_cost = ich_bits + ICH_LAMBDA * log_err_ich;
-            let need_lower_error = !params.v2 || self.orig_flatness(params, group_start + 2) == 2;
-            use_ich = ich_cost < p_cost && (!need_lower_error || log_err_ich <= log_err_p);
         }
         let core = &mut self.core;
         if use_ich {
@@ -2295,22 +3692,26 @@ impl SliceEncoder {
                     prefix += 1;
                 }
                 let max_prefix = DEPTH[unit] - qlevels[unit] + luma - adjusted[unit];
-                if prefix == max_prefix {
-                    self.substreams[unit].put(0, max_prefix);
-                    bits[unit] += max_prefix;
-                } else {
-                    self.substreams[unit].put(1, prefix + 1);
-                    bits[unit] += prefix + 1;
+                let writer = &mut self.substreams[unit];
+                // `prefix` zero bits, then a one bit unless the prefix has
+                // its greatest length.
+                let terminated = i32::from(prefix != max_prefix);
+                let prefix_bits = prefix + terminated;
+                match (u32::try_from(prefix_bits), u32::try_from(size)) {
+                    // The prefix and the three residuals in one write.
+                    (Ok(head @ 0..=16), Ok(width @ 0..=10)) => {
+                        let packed = (u64::from(terminated != 0) << (3 * width))
+                            | u64::from(pack_residuals(residuals[unit], width));
+                        writer.put_raw(packed, head + 3 * width);
+                    }
+                    (Ok(_) | Err(_), Ok(_) | Err(_)) => {
+                        writer.put(terminated, prefix_bits);
+                        for value in residuals[unit] {
+                            writer.put(value, size);
+                        }
+                    }
                 }
-                let values = if midpoint[unit] {
-                    &mid_residuals[unit]
-                } else {
-                    &residuals[unit]
-                };
-                for value in values {
-                    self.substreams[unit].put(*value, size);
-                }
-                bits[unit] += 3 * size;
+                bits[unit] += prefix_bits + 3 * size;
                 core.rc_size_unit[unit] = max_size[unit] * 3 + 1;
                 core.predicted_size[unit] =
                     (2 + required[unit][0] + required[unit][1] + 2 * required[unit][2]) >> 2;
@@ -2322,8 +3723,9 @@ impl SliceEncoder {
             }
         }
         core.ich_selected = use_ich;
+        let size_byte = |size: i32| u32::try_from(size).map_or(255, |size| size.min(255));
         self.se_sizes
-            .push(bits.map(|size| u8::try_from(size).unwrap_or(u8::MAX)));
+            .push(size_byte(bits[0]) | (size_byte(bits[1]) << 8) | (size_byte(bits[2]) << 16));
         let coded = bits[0] + bits[1] + bits[2];
         core.buffer_fullness += i64::from(coded);
         core.coded_group_size = coded;
@@ -2333,20 +3735,16 @@ impl SliceEncoder {
         stats.stuffed_groups += u64::from(force_mpp);
 
         // Final reconstruction of the group.
-        for position in 0..pixels {
-            let x = PAD_LEFT + group_start + position;
-            for unit in 0..3 {
-                let value = if use_ich {
-                    ich_pixels[position][unit]
-                } else if midpoint[unit] {
-                    mid_recon[unit][position]
-                } else {
-                    recon[unit][position]
-                };
-                core.cur[unit][x] = sample(value);
-            }
-        }
-        core.finish_group(params, group_start, pixels);
+        let chosen = if use_ich { &ich_recon } else { &recon };
+        let group: [Pixel; 3] = std::array::from_fn(|position| {
+            [
+                chosen[0][position],
+                chosen[1][position],
+                chosen[2][position],
+                0,
+            ]
+        });
+        core.finish_group(params, group_start, pixels, &group);
         if core.model_overflow {
             return Err(DscError::RateControl("the rate-control model overflowed"));
         }
@@ -2362,9 +3760,6 @@ impl SliceEncoder {
     /// Substream multiplexing: emit 48-bit mux words in the order a decoder's
     /// three funnel shifters will request them.
     fn multiplex(&mut self) -> Result<(), DscError> {
-        for writer in &mut self.substreams {
-            writer.flush();
-        }
         let mut fullness = [0i32; 3];
         let mut read = [0usize; 3];
         let mut position = 0usize;
@@ -2377,15 +3772,21 @@ impl SliceEncoder {
                         .ok_or(DscError::RateControl(
                             "the slice does not fit its constant-rate budget",
                         ))?;
-                    let bytes = &self.substreams[stream].bytes;
-                    for (offset, byte) in target.iter_mut().enumerate() {
-                        *byte = bytes.get(read[stream] + offset).copied().unwrap_or(0);
+                    let bytes = self.substreams[stream].written();
+                    let start = read[stream];
+                    if let Some(source) = bytes.get(start..start + MUX_WORD_BYTES) {
+                        target.copy_from_slice(source);
+                    } else {
+                        // The last word of a substream is padded with zeros.
+                        for (offset, byte) in target.iter_mut().enumerate() {
+                            *byte = bytes.get(start + offset).copied().unwrap_or(0);
+                        }
                     }
                     read[stream] += MUX_WORD_BYTES;
                     position += MUX_WORD_BYTES;
                     fullness[stream] += MUX_WORD_BITS;
                 }
-                fullness[stream] -= i32::from(sizes[stream]);
+                fullness[stream] -= i32::from(sizes.to_le_bytes()[stream]);
             }
         }
         self.muxed[position..].fill(0);
@@ -2395,6 +3796,7 @@ impl SliceEncoder {
 
 /// The decoder's substream demultiplexer: three funnel shifters fed with
 /// 48-bit mux words.
+#[derive(Clone)]
 struct Demux<'a> {
     data: &'a [u8],
     position: usize,
@@ -2404,21 +3806,40 @@ struct Demux<'a> {
 }
 
 impl Demux<'_> {
+    #[inline(always)]
     fn refill(&mut self) {
         for stream in 0..3 {
             if self.fullness[stream] < MAX_SE_SIZE {
-                let mut word = 0u128;
-                for offset in 0..MUX_WORD_BYTES {
-                    let byte = self.data.get(self.position + offset).copied().unwrap_or(0);
-                    word = (word << 8) | u128::from(byte);
-                }
+                let whole = self
+                    .data
+                    .get(self.position..)
+                    .and_then(|rest| rest.first_chunk::<MUX_WORD_BYTES>());
+                let word = if let Some([a, b, c, d, e, f]) = whole {
+                    u64::from_be_bytes([0, 0, *a, *b, *c, *d, *e, *f])
+                } else {
+                    // Past the end of the slice the words read as zeros.
+                    let mut word = 0u64;
+                    for offset in 0..MUX_WORD_BYTES {
+                        let byte = self.data.get(self.position + offset).copied().unwrap_or(0);
+                        word = (word << 8) | u64::from(byte);
+                    }
+                    word
+                };
                 self.position += MUX_WORD_BYTES;
-                self.shifter[stream] = (self.shifter[stream] << MUX_WORD_BITS) | word;
+                self.shifter[stream] = (self.shifter[stream] << MUX_WORD_BITS) | u128::from(word);
                 self.fullness[stream] += MUX_WORD_BITS;
             }
         }
     }
 
+    /// The low 64 bits of the funnel shifter above its lowest `below` bits.
+    #[inline(always)]
+    fn peek(&self, stream: usize, below: i32) -> u64 {
+        let shifted = self.shifter[stream] >> below.clamp(0, 127);
+        u64::try_from(shifted & u128::from(u64::MAX)).unwrap_or(0)
+    }
+
+    #[inline(always)]
     fn get(&mut self, stream: usize, bits: i32) -> i32 {
         if bits <= 0 {
             return 0;
@@ -2433,6 +3854,7 @@ impl Demux<'_> {
         i32::try_from(value).unwrap_or(0)
     }
 
+    #[inline(always)]
     fn get_signed(&mut self, stream: usize, bits: i32) -> i32 {
         let value = self.get(stream, bits);
         if bits > 0 && value >> (bits - 1) != 0 {
@@ -2441,14 +3863,74 @@ impl Demux<'_> {
             value
         }
     }
+
+    /// Three `bits`-wide signed values, as three [`Demux::get_signed`] calls
+    /// read them.
+    #[inline(always)]
+    fn get_signed3(&mut self, stream: usize, bits: i32) -> [i32; 3] {
+        if bits <= 0 {
+            return [0; 3];
+        }
+        if bits > 10 || self.fullness[stream] < 3 * bits {
+            return [
+                self.get_signed(stream, bits),
+                self.get_signed(stream, bits),
+                self.get_signed(stream, bits),
+            ];
+        }
+        self.consumed += 3 * bits;
+        self.fullness[stream] -= 3 * bits;
+        let all = self.peek(stream, self.fullness[stream]);
+        let mask = (1u64 << bits) - 1;
+        let sign = 1i32 << (bits - 1);
+        let value = |shift: i32| {
+            let raw = i32::try_from((all >> shift) & mask).unwrap_or(0);
+            (raw ^ sign) - sign
+        };
+        [value(2 * bits), value(bits), value(0)]
+    }
+
+    /// The unary size prefix: the number of zero bits before a one bit, at
+    /// most `max_prefix` (then no one bit follows). Reads what bit-by-bit
+    /// [`Demux::get`] calls would read.
+    #[inline(always)]
+    fn prefix(&mut self, stream: usize, max_prefix: i32) -> i32 {
+        if max_prefix <= 0 {
+            return 0;
+        }
+        if max_prefix > 32 {
+            let mut prefix = 0;
+            while prefix < max_prefix && self.get(stream, 1) == 0 {
+                prefix += 1;
+            }
+            return prefix;
+        }
+        let available = self.fullness[stream].max(0);
+        let looked = max_prefix.min(available);
+        let bits = self.peek(stream, available - looked) & ((1u64 << looked) - 1);
+        if bits == 0 {
+            // No one bit in reach: an exhausted shifter reads as zeros.
+            self.consumed += max_prefix;
+            self.fullness[stream] = available - looked;
+            return max_prefix;
+        }
+        let length = i32::try_from(u64::BITS - bits.leading_zeros()).unwrap_or(0);
+        let zeros = looked - length;
+        self.consumed += zeros + 1;
+        self.fullness[stream] = available - zeros - 1;
+        zeros
+    }
 }
 
-/// One slice's share of the decoded picture: its segment of every row.
+/// One slice's share of the decoded picture: the bitstream of its slice row,
+/// its position in that row and its segment of every picture row.
 struct DecodeJob<'a> {
-    chunks: Vec<&'a [u8]>,
+    band: &'a [u8],
+    slice: usize,
     rows: Vec<&'a mut [u8]>,
 }
 
+/// Everything one thread needs to decode slices; kept between pictures.
 struct SliceDecoder {
     core: Core,
     data: Vec<u8>,
@@ -2462,12 +3944,83 @@ impl SliceDecoder {
         }
     }
 
-    fn decode_slice(&mut self, params: &Params, job: &mut DecodeJob<'_>, format: PixelFormat) {
+    fn decode_slice(
+        &mut self,
+        level: Level,
+        params: &Params,
+        job: &mut DecodeJob<'_>,
+        format: PixelFormat,
+    ) {
+        match level {
+            Level::Scalar => self.decode_slice_with(Scalar, params, job, format),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse2 => self.decode_slice_with(x86::Sse2, params, job, format),
+            #[cfg(target_arch = "x86_64")]
+            Level::Sse42(token) => {
+                // SAFETY: the token proves that the CPU has every feature
+                // `decode_slice_sse42` is compiled for (`x86::Sse42::detect`).
+                unsafe { self.decode_slice_sse42(token, params, job, format) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx2(token) => {
+                // SAFETY: the token proves that the CPU has every feature
+                // `decode_slice_avx2` is compiled for (`x86::Avx2::detect`).
+                unsafe { self.decode_slice_avx2(token, params, job, format) }
+            }
+        }
+    }
+
+    /// The slice loop compiled for SSE4.2-era CPUs, see
+    /// [`SliceEncoder::encode_slice_sse42`].
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse4.2,ssse3,popcnt")]
+    fn decode_slice_sse42(
+        &mut self,
+        token: x86::Sse42,
+        params: &Params,
+        job: &mut DecodeJob<'_>,
+        format: PixelFormat,
+    ) {
+        self.decode_slice_with(token, params, job, format);
+    }
+
+    /// The slice loop compiled for AVX2-era CPUs, see
+    /// [`SliceEncoder::encode_slice_avx2`].
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    fn decode_slice_avx2(
+        &mut self,
+        token: x86::Avx2,
+        params: &Params,
+        job: &mut DecodeJob<'_>,
+        format: PixelFormat,
+    ) {
+        self.decode_slice_with(token, params, job, format);
+    }
+
+    #[inline(always)]
+    fn decode_slice_with<K: Kernels>(
+        &mut self,
+        kernels: K,
+        params: &Params,
+        job: &mut DecodeJob<'_>,
+        format: PixelFormat,
+    ) {
+        if !self.core.fits(params) {
+            *self = Self::new(params);
+        }
+        // The slice's chunks are interleaved with those of its row.
         self.data.clear();
-        for chunk in &job.chunks {
+        let chunks = job
+            .band
+            .chunks(params.chunk_bytes.max(1))
+            .skip(job.slice)
+            .step_by(params.slices_per_line.max(1));
+        for chunk in chunks {
             self.data.extend_from_slice(chunk);
         }
         self.core.reset(params);
+        let quant = QuantLanes::<K::Lanes>::table();
         let mut demux = Demux {
             data: &self.data,
             position: 0,
@@ -2475,46 +4028,47 @@ impl SliceDecoder {
             fullness: [0; 3],
             consumed: 0,
         };
-        let (red, blue) = match format {
-            PixelFormat::Bgrx => (2, 0),
-            PixelFormat::Rgbx => (0, 2),
-        };
+        let red_first = format == PixelFormat::Rgbx;
         for line in 0..params.slice_h {
             let mut group_start = 0;
             while group_start < params.slice_w {
-                let pixels = (params.slice_w - group_start).min(3);
-                Self::decode_group(&mut self.core, params, &mut demux, group_start, pixels);
+                let count = (params.slice_w - group_start).min(3);
+                Self::decode_group(
+                    &mut self.core,
+                    kernels,
+                    params,
+                    &quant,
+                    &mut demux,
+                    group_start,
+                    count,
+                );
                 group_start += 3;
             }
             if let Some(row) = job.rows.get_mut(line) {
-                let core = &self.core;
-                let samples = core.cur[0][PAD_LEFT..]
-                    .iter()
-                    .zip(core.cur[1][PAD_LEFT..].iter())
-                    .zip(core.cur[2][PAD_LEFT..].iter());
-                for (pixel, ((y, co), cg)) in row.chunks_exact_mut(4).zip(samples) {
-                    let [r, g, b] = ycocg_to_rgb(*y, *co, *cg);
-                    pixel[red] = r;
-                    pixel[1] = g;
-                    pixel[blue] = b;
-                    pixel[3] = 255;
+                let count = (row.len() / 4).min(params.slice_w);
+                if let Some(decoded) = self.core.cur.get(PAD_LEFT..PAD_LEFT + count) {
+                    row_to_rgb(kernels, decoded, red_first, row);
                 }
             }
             self.core.end_line(params);
         }
     }
 
-    fn decode_group(
+    #[inline(always)]
+    fn decode_group<K: Kernels>(
         core: &mut Core,
+        kernels: K,
         params: &Params,
+        quant: &[QuantLanes<K::Lanes>; 16],
         demux: &mut Demux<'_>,
         group_start: usize,
-        pixels: usize,
+        count: usize,
     ) {
         core.primary_qp = core.prev_qp;
         let qp = core.primary_qp;
         let prev_ich = core.ich_selected;
-        core.ich_group_start(params, group_start, prev_ich);
+        core.ich_group_start(kernels, params, group_start, prev_ich);
+        let count = count.clamp(1, 3);
 
         // Entropy decoding.
         demux.refill();
@@ -2553,10 +4107,7 @@ impl SliceDecoder {
             }
             let limit = DEPTH[unit] - level;
             let max_prefix = limit + i32::from(unit == 0) - adjusted;
-            let mut prefix = 0;
-            while prefix < max_prefix && demux.get(unit, 1) == 0 {
-                prefix += 1;
-            }
+            let prefix = demux.prefix(unit, max_prefix);
             let size = if unit == 0 && prev_ich {
                 adjusted + prefix - 1
             } else {
@@ -2574,13 +4125,9 @@ impl SliceDecoder {
             let size = size.clamp(0, limit);
             let midpoint = size == limit;
             core.midpoint[unit] = midpoint;
-            let mut required = [0i32; 3];
-            let mut max_size = 0;
-            for position in 0..3 {
-                residuals[unit][position] = demux.get_signed(unit, size);
-                required[position] = residual_size(residuals[unit][position]);
-                max_size = max_size.max(required[position]);
-            }
+            residuals[unit] = demux.get_signed3(unit, size);
+            let mut required = residuals[unit].map(residual_size);
+            let mut max_size = required[0].max(required[1]).max(required[2]);
             if midpoint {
                 max_size = size;
                 required = [size; 3];
@@ -2594,107 +4141,405 @@ impl SliceDecoder {
         core.orig_is_flat = group_in_supergroup == core.first_flat;
 
         // Reconstruction.
+        let mut group = [[0i16; 4]; 3];
         if core.ich_selected {
-            for (position, lookup) in ich_lookup.iter().enumerate().take(pixels) {
-                let pixel = core.ich_pixel(params, *lookup, group_start);
-                for unit in 0..3 {
-                    core.cur[unit][PAD_LEFT + group_start + position] = sample(pixel[unit]);
-                }
+            for (pixel, lookup) in group.iter_mut().zip(ich_lookup).take(count) {
+                let [y, co, cg] = core.ich_pixel(params, lookup, group_start);
+                *pixel = [sample(y), sample(co), sample(cg), 0];
             }
         } else {
+            // The three components side by side in lanes; a component with
+            // midpoint prediction is then redone on its own.
+            let quant = &quant[index(qp) % 16];
             let mode = core.pred_mode(group_start);
+            let pred = core.predictor::<K::Lanes>(mode, group_start, quant);
+            let read: [K::Lanes; 3] = std::array::from_fn(|position| {
+                Lanes::new([
+                    sample(residuals[0][position]),
+                    sample(residuals[1][position]),
+                    sample(residuals[2][position]),
+                    0,
+                ])
+            });
+            let (_, rebuilt) = code_units(pred, quant.scale, |position, _| read[position % 3]);
+            group = rebuilt.map(Lanes::get);
             for unit in 0..3 {
-                let level = qlevel(unit, qp);
-                let ctx = core.pred_ctx(mode, unit, group_start, level);
-                let mid_pred = core.midpoint_pred(unit, level);
-                for position in 0..pixels {
-                    let pred = if core.midpoint[unit] {
-                        mid_pred
-                    } else {
-                        ctx.predict(position, &residuals[unit])
-                    };
-                    let value = clamp_c(
-                        pred + residuals[unit][position] * ctx.quant_divisor,
-                        0,
-                        ctx.max_value,
-                    );
-                    core.cur[unit][PAD_LEFT + group_start + position] = sample(value);
+                if core.midpoint[unit] {
+                    let level = qlevel(unit, qp);
+                    let max_value = (1 << DEPTH[unit]) - 1;
+                    let mid_pred = core.midpoint_pred(unit, level);
+                    for (pixel, residual) in group.iter_mut().zip(residuals[unit]) {
+                        pixel[unit] = sample(clamp_c(mid_pred + (residual << level), 0, max_value));
+                    }
                 }
             }
         }
-        core.flatness_qp_adjust(params, group_start + pixels - 1);
-        core.finish_group(params, group_start, pixels);
+        core.flatness_qp_adjust(params, group_start + count - 1);
+        core.finish_group(params, group_start, count, &group);
     }
 }
 
+/// Whether a buffer of `len` bytes holds the picture in rows `stride` apart.
 fn check_frame(params: &Params, len: usize, stride: usize) -> Result<(), DscError> {
     let row = params.pic_w * 4;
-    if stride < row || len < (params.pic_h - 1) * stride + row {
-        return Err(DscError::FrameTooSmall);
+    let needed = params
+        .pic_h
+        .saturating_sub(1)
+        .checked_mul(stride)
+        .and_then(|rows| rows.checked_add(row));
+    match needed {
+        Some(needed) if stride >= row && len >= needed => Ok(()),
+        Some(_) | None => Err(DscError::FrameTooSmall),
     }
-    Ok(())
 }
 
-/// Run `work` over `jobs` on up to `threads` scoped threads, one worker state
-/// per thread, and merge the results.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A borrowed `Fn() + Sync` closure with its type and lifetime erased, so
+/// that pool threads, which outlive any one call, can run it.
+#[derive(Clone, Copy)]
+struct TaskRef {
+    data: *const (),
+    call: unsafe fn(*const ()),
+}
+
+// SAFETY: `data` points to a closure that is `Sync` (`TaskRef::new`), so
+// calling it through a shared reference from another thread is sound while
+// the closure is alive; `Pool::run` keeps it alive (see there).
+unsafe impl Send for TaskRef {}
+
+impl TaskRef {
+    fn new<F: Fn() + Sync>(task: &F) -> Self {
+        /// # Safety
+        /// `data` must point to a live `F`.
+        unsafe fn call<F: Fn() + Sync>(data: *const ()) {
+            // SAFETY: the caller guarantees that `data` points to a live `F`.
+            let task = unsafe { &*data.cast::<F>() };
+            task();
+        }
+        Self {
+            data: std::ptr::from_ref(task).cast(),
+            call: call::<F>,
+        }
+    }
+}
+
+/// One `Pool::run` call that pool threads may still join.
+struct Batch {
+    id: u64,
+    task: TaskRef,
+    /// Pool threads that may still join.
+    wanted: usize,
+    /// Pool threads inside the task right now.
+    active: usize,
+    panicked: bool,
+}
+
+#[derive(Default)]
+struct PoolState {
+    batches: Vec<Batch>,
+    next_id: u64,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct PoolShared {
+    state: Mutex<PoolState>,
+    /// Signalled when a batch arrives or the pool shuts down.
+    work: Condvar,
+    /// Signalled when a pool thread leaves a task.
+    done: Condvar,
+}
+
+/// Persistent worker threads for the slices of a picture. Threads start the
+/// first time they are needed and sleep between pictures; dropping the pool
+/// stops and joins them.
+struct Pool {
+    shared: Arc<PoolShared>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Most threads the pool will ever start.
+    limit: usize,
+}
+
+impl Pool {
+    fn new(limit: usize) -> Self {
+        Self {
+            shared: Arc::new(PoolShared::default()),
+            workers: Mutex::new(Vec::new()),
+            limit,
+        }
+    }
+
+    /// The pool every encoder and decoder of the process shares: one thread
+    /// per available core, counting the calling thread. It lives as long as
+    /// any of its users.
+    fn shared() -> Arc<Self> {
+        static SHARED: Mutex<Weak<Pool>> = Mutex::new(Weak::new());
+        let mut slot = lock(&SHARED);
+        if let Some(pool) = slot.upgrade() {
+            return pool;
+        }
+        let cores = thread::available_parallelism().map_or(1, usize::from);
+        let pool = Arc::new(Self::new(cores.saturating_sub(1)));
+        *slot = Arc::downgrade(&pool);
+        pool
+    }
+
+    /// Make sure `count` threads exist (fewer if the system refuses to start
+    /// one) and return how many do.
+    fn grow(&self, count: usize) -> usize {
+        let mut workers = lock(&self.workers);
+        while workers.len() < count.min(self.limit) {
+            let shared = Arc::clone(&self.shared);
+            let spawned = thread::Builder::new()
+                .name("dsc-slice".to_owned())
+                .spawn(move || Self::work(&shared));
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(_) => break,
+            }
+        }
+        workers.len()
+    }
+
+    /// Body of a pool thread: join batches until the pool shuts down.
+    fn work(shared: &PoolShared) {
+        let mut state = lock(&shared.state);
+        loop {
+            if state.shutdown {
+                return;
+            }
+            let mut claimed = None;
+            for batch in &mut state.batches {
+                if batch.wanted > 0 {
+                    batch.wanted -= 1;
+                    batch.active += 1;
+                    claimed = Some((batch.id, batch.task));
+                    break;
+                }
+            }
+            let Some((id, task)) = claimed else {
+                state = shared
+                    .work
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            drop(state);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: this thread is counted in the batch's `active`, and
+                // `Pool::run` does not return or unwind (`BatchGuard`) before
+                // `active` is zero again, so the closure `task` points to is
+                // alive for the whole call.
+                unsafe { (task.call)(task.data) }
+            }));
+            state = lock(&shared.state);
+            for batch in &mut state.batches {
+                if batch.id == id {
+                    batch.active -= 1;
+                    batch.panicked |= outcome.is_err();
+                }
+            }
+            shared.done.notify_all();
+        }
+    }
+
+    /// Run `task` on the calling thread and on up to `helpers` pool threads
+    /// at once, and return when all of them have left it. `task` is expected
+    /// to take jobs from a shared queue until none are left. An error means a
+    /// pool thread panicked inside `task`.
+    fn run<F: Fn() + Sync>(&self, helpers: usize, task: &F) -> Result<(), DscError> {
+        let helpers = helpers.min(self.grow(helpers));
+        if helpers == 0 {
+            task();
+            return Ok(());
+        }
+        // The guard exists before the batch is visible to pool threads, so
+        // however this function is left, it first waits for them.
+        let guard = {
+            let mut state = lock(&self.shared.state);
+            state.next_id += 1;
+            let guard = BatchGuard {
+                shared: &self.shared,
+                id: state.next_id,
+            };
+            state.batches.push(Batch {
+                id: guard.id,
+                task: TaskRef::new(task),
+                wanted: helpers,
+                active: 0,
+                panicked: false,
+            });
+            guard
+        };
+        self.shared.work.notify_all();
+        task();
+        if guard.close() {
+            return Err(DscError::Worker);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        lock(&self.shared.state).shutdown = true;
+        self.shared.work.notify_all();
+        for handle in lock(&self.workers).drain(..) {
+            // A pool thread only ends by returning from `Pool::work`.
+            drop(handle.join());
+        }
+    }
+}
+
+/// Withdraws a batch from the pool and waits for the pool threads inside it.
+struct BatchGuard<'a> {
+    shared: &'a PoolShared,
+    id: u64,
+}
+
+impl BatchGuard<'_> {
+    /// Stop pool threads from joining the batch, wait until those inside
+    /// have left, and report whether one of them panicked. Later calls
+    /// report `false`.
+    fn close(&self) -> bool {
+        let mut state = lock(&self.shared.state);
+        loop {
+            let Some(at) = state.batches.iter().position(|batch| batch.id == self.id) else {
+                return false;
+            };
+            state.batches[at].wanted = 0;
+            if state.batches[at].active == 0 {
+                return state.batches.swap_remove(at).panicked;
+            }
+            state = self
+                .shared
+                .done
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Per-thread coder states that are idle between pictures.
+struct Spares<W>(Mutex<Vec<W>>);
+
+impl<W> Spares<W> {
+    fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn take(&self) -> Option<W> {
+        lock(&self.0).pop()
+    }
+
+    fn give(&self, worker: W) {
+        lock(&self.0).push(worker);
+    }
+}
+
+/// Run `work` over `jobs` on the calling thread and up to `threads - 1` pool
+/// threads, each with a coder state from `spares` (or a new one), and merge
+/// the results. Threads take the next job when they finish one, so slices
+/// that are quick to code do not leave a thread idle. With one thread the
+/// jobs run in order on the calling thread.
 fn run_jobs<J, W, R>(
-    jobs: Vec<J>,
+    pool: &Pool,
+    spares: &Spares<W>,
     threads: usize,
+    jobs: Vec<J>,
     make_worker: impl Fn() -> W + Sync,
     work: impl Fn(&mut W, &mut J) -> Result<R, DscError> + Sync,
     mut merge: impl FnMut(R),
 ) -> Result<(), DscError>
 where
     J: Send,
+    W: Send,
     R: Send,
 {
-    let threads = threads.clamp(1, jobs.len().max(1));
-    if threads == 1 {
-        let mut worker = make_worker();
-        for mut job in jobs {
-            merge(work(&mut worker, &mut job)?);
-        }
-        return Ok(());
-    }
-    let mut buckets: Vec<Vec<J>> = (0..threads).map(|_| Vec::new()).collect();
-    for (number, job) in jobs.into_iter().enumerate() {
-        buckets[number % threads].push(job);
-    }
-    let results = thread::scope(|scope| {
-        let handles: Vec<_> = buckets
-            .into_iter()
-            .map(|bucket| {
-                let make_worker = &make_worker;
-                let work = &work;
-                scope.spawn(move || {
-                    let mut worker = make_worker();
-                    let mut results = Vec::with_capacity(bucket.len());
-                    for mut job in bucket {
-                        results.push(work(&mut worker, &mut job)?);
+    let count = jobs.len();
+    let helpers = threads.clamp(1, count.max(1)) - 1;
+    let queue = Mutex::new(jobs.into_iter().enumerate());
+    let results: Mutex<Vec<R>> = Mutex::new(Vec::with_capacity(count));
+    // The failed job with the lowest number, as a single thread reports it.
+    let failure: Mutex<Option<(usize, DscError)>> = Mutex::new(None);
+    let failed = AtomicBool::new(false);
+    let task = || {
+        // A thread that arrives after the last job was taken needs no state.
+        let mut worker: Option<W> = None;
+        while !failed.load(Ordering::Relaxed) {
+            let next = lock(&queue).next();
+            let Some((number, mut job)) = next else {
+                break;
+            };
+            let state = worker.get_or_insert_with(|| spares.take().unwrap_or_else(&make_worker));
+            match work(state, &mut job) {
+                Ok(result) => lock(&results).push(result),
+                Err(error) => {
+                    failed.store(true, Ordering::Relaxed);
+                    let mut failure = lock(&failure);
+                    if failure.as_ref().is_none_or(|(first, _)| number < *first) {
+                        *failure = Some((number, error));
                     }
-                    Ok::<_, DscError>(results)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().map_err(|_| DscError::Worker))
-            .collect::<Vec<_>>()
-    });
-    for result in results {
-        for item in result?? {
-            merge(item);
+                }
+            }
         }
+        if let Some(worker) = worker {
+            spares.give(worker);
+        }
+    };
+    pool.run(helpers, &task)?;
+    if let Some((_, error)) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(error);
+    }
+    for result in results.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        merge(result);
     }
     Ok(())
 }
 
-/// Fixed-rate DSC encoder for one picture size.
-#[derive(Clone, Debug)]
+/// Fixed-rate DSC encoder for one picture size. It keeps its working buffers
+/// between pictures, and all encoders and decoders of a process share one
+/// pool of worker threads that stops when the last of them is dropped.
 pub struct Encoder {
     config: Config,
     pps: Pps,
     params: Params,
+    level: Level,
+    pool: Arc<Pool>,
+    spares: Spares<SliceEncoder>,
+}
+
+impl Clone for Encoder {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            pps: self.pps.clone(),
+            params: self.params.clone(),
+            level: self.level,
+            pool: Arc::clone(&self.pool),
+            spares: Spares::new(),
+        }
+    }
+}
+
+impl fmt::Debug for Encoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Encoder")
+            .field("config", &self.config)
+            .field("pps", &self.pps)
+            .field("level", &self.level)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Encoder {
@@ -2705,6 +4550,9 @@ impl Encoder {
             config,
             pps,
             params,
+            level: Level::detect(),
+            pool: Pool::shared(),
+            spares: Spares::new(),
         })
     }
 
@@ -2729,7 +4577,11 @@ impl Encoder {
             bits_per_pixel_x16,
             ..self.config.clone()
         };
-        *self = Self::new(config)?;
+        let pps = Pps::from_config(&config)?;
+        let params = Params::from_pps(&pps)?;
+        self.config = config;
+        self.pps = pps;
+        self.params = params;
         Ok(())
     }
 
@@ -2739,8 +4591,9 @@ impl Encoder {
         self.encode_parallel(frame, out, 1)
     }
 
-    /// Encode one picture with its slices spread over up to `threads` threads.
-    /// The output is identical to [`Encoder::encode`].
+    /// Encode one picture with its slices spread over the calling thread and
+    /// up to `threads - 1` threads of the shared pool (never more threads
+    /// than cores). The output is identical to [`Encoder::encode`].
     pub fn encode_parallel(
         &self,
         frame: &Frame<'_>,
@@ -2749,7 +4602,8 @@ impl Encoder {
     ) -> Result<FrameStats, DscError> {
         let params = &self.params;
         check_frame(params, frame.data.len(), frame.stride)?;
-        out.clear();
+        // Every byte is written below, so a buffer of the right length is
+        // reused as it is.
         out.resize(self.frame_len(), 0);
         let row_bytes = params.slice_bytes() * params.slices_per_line;
         let mut jobs = Vec::with_capacity(params.slices_per_line * params.slice_rows);
@@ -2766,29 +4620,63 @@ impl Encoder {
             }
             jobs.extend(slices);
         }
+        let level = self.level;
         let mut stats = FrameStats::default();
         run_jobs(
-            jobs,
+            &self.pool,
+            &self.spares,
             threads,
+            jobs,
             || SliceEncoder::new(params),
-            |worker, job| worker.encode_slice(params, frame, job),
+            |worker, job| worker.encode_slice(level, params, frame, job),
             |slice_stats| stats.add(&slice_stats),
         )?;
         Ok(stats)
     }
 }
 
-/// DSC decoder for one picture parameter set.
-#[derive(Clone, Debug)]
+/// DSC decoder for one picture parameter set. Like [`Encoder`] it keeps its
+/// working buffers between pictures and uses the shared pool of threads.
 pub struct Decoder {
     pps: Pps,
     params: Params,
+    level: Level,
+    pool: Arc<Pool>,
+    spares: Spares<SliceDecoder>,
+}
+
+impl Clone for Decoder {
+    fn clone(&self) -> Self {
+        Self {
+            pps: self.pps.clone(),
+            params: self.params.clone(),
+            level: self.level,
+            pool: Arc::clone(&self.pool),
+            spares: Spares::new(),
+        }
+    }
+}
+
+impl fmt::Debug for Decoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Decoder")
+            .field("pps", &self.pps)
+            .field("level", &self.level)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Decoder {
     pub fn new(pps: Pps) -> Result<Self, DscError> {
         let params = Params::from_pps(&pps)?;
-        Ok(Self { pps, params })
+        Ok(Self {
+            pps,
+            params,
+            level: Level::detect(),
+            pool: Pool::shared(),
+            spares: Spares::new(),
+        })
     }
 
     pub fn pps(&self) -> &Pps {
@@ -2811,7 +4699,9 @@ impl Decoder {
         self.decode_parallel(bitstream, out, stride, format, 1)
     }
 
-    /// Decode one picture with its slices spread over up to `threads` threads.
+    /// Decode one picture with its slices spread over the calling thread and
+    /// up to `threads - 1` threads of the shared pool (never more threads
+    /// than cores).
     pub fn decode_parallel(
         &self,
         bitstream: &[u8],
@@ -2830,17 +4720,15 @@ impl Decoder {
         }
         let row_bytes = params.slice_bytes() * params.slices_per_line;
         let mut jobs = Vec::with_capacity(params.slices_per_line * params.slice_rows);
-        let bands = out.chunks_mut(stride * params.slice_h);
+        let bands = out.chunks_mut(stride.saturating_mul(params.slice_h));
         for (band, data) in bands.zip(bitstream.chunks(row_bytes)) {
             let mut slices: Vec<DecodeJob<'_>> = (0..params.slices_per_line)
-                .map(|_| DecodeJob {
-                    chunks: Vec::with_capacity(params.slice_h),
+                .map(|slice| DecodeJob {
+                    band: data,
+                    slice,
                     rows: Vec::with_capacity(params.slice_h),
                 })
                 .collect();
-            for (number, chunk) in data.chunks(params.chunk_bytes).enumerate() {
-                slices[number % params.slices_per_line].chunks.push(chunk);
-            }
             for row in band.chunks_mut(stride) {
                 let Some(visible) = row.get_mut(..params.pic_w * 4) else {
                     continue;
@@ -2851,12 +4739,15 @@ impl Decoder {
             }
             jobs.extend(slices);
         }
+        let level = self.level;
         run_jobs(
-            jobs,
+            &self.pool,
+            &self.spares,
             threads,
+            jobs,
             || SliceDecoder::new(params),
             |worker, job| {
-                worker.decode_slice(params, job, format);
+                worker.decode_slice(level, params, job, format);
                 Ok(())
             },
             |()| {},
@@ -2867,10 +4758,13 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BPP_X16, Decoder, DscError, Encoder, Frame, FrameStats, MAX_BPP_X16,
-        MIN_BPP_X16, PPS_SIZE, PixelFormat, Pps,
+        BitWriter, Config, DEFAULT_BPP_X16, Decoder, Demux, DscError, Encoder, Frame, FrameStats,
+        Kernels, Lanes, Level, MAX_BPP_X16, MIN_BPP_X16, PPS_SIZE, Pixel, PixelFormat, Pool,
+        PortableLanes, Pps, QuantLanes, Scalar, lock, qlevel, quantize, row_to_rgb, row_to_ycocg,
     };
     use std::error::Error;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -3858,52 +5752,800 @@ mod tests {
         Ok(())
     }
 
-    /// Prints encode and decode time per 1920x1080 picture: `cargo test
-    /// --release --lib dsc_timing -- --ignored --nocapture`.
+    /// Every code level this CPU can run, by the name `KWIN_DSC_SIMD` uses.
+    fn levels() -> Vec<(&'static str, Level)> {
+        #[cfg(target_arch = "x86_64")]
+        let simd = {
+            let mut levels = vec![("sse2", Level::Sse2)];
+            if let Some(token) = super::x86::Sse42::detect() {
+                levels.push(("sse4.2", Level::Sse42(token)));
+            }
+            if let Some(token) = super::x86::Avx2::detect() {
+                levels.push(("avx2", Level::Avx2(token)));
+            }
+            levels
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd = Vec::new();
+        std::iter::once(("scalar", Level::Scalar))
+            .chain(simd)
+            .collect()
+    }
+
+    fn load_average() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .map_or_else(|_| "unknown".to_owned(), |text| text.trim().to_owned())
+    }
+
+    /// Prints encode and decode time per 1920x1080 and 1280x720 picture, on
+    /// one thread and on the pool, for every code level of this CPU: `cargo
+    /// test --release --lib dsc_timing -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run in release mode"]
     fn dsc_timing() -> TestResult {
         let threads = std::thread::available_parallelism().map_or(4, usize::from);
-        let encoder = Encoder::new(Config::new(1920, 1080)?)?;
-        let decoder = Decoder::new(encoder.pps().clone())?;
-        println!("1920x1080, 8 bpp, 40 slices of 480x108, {threads} threads for the parallel runs");
-        for pattern in PATTERNS {
-            let image = picture(pattern, 1920, 1080);
-            let frame = Frame {
-                data: &image,
-                stride: 1920 * 4,
-                format: PixelFormat::Bgrx,
-            };
-            let mut bitstream = Vec::new();
-            let mut decoded = vec![0u8; image.len()];
-            let time = |runs: u32, work: &mut dyn FnMut() -> Result<(), DscError>| {
-                let mut best = f64::INFINITY;
-                for _ in 0..runs {
-                    let start = Instant::now();
-                    work()?;
-                    best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "8 bpp, best of several runs, {threads} threads for the pooled runs, load average {}",
+            load_average()
+        );
+        let time = |runs: u32, work: &mut dyn FnMut() -> Result<(), DscError>| {
+            let mut best = f64::INFINITY;
+            for _ in 0..runs {
+                let start = Instant::now();
+                work()?;
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            Ok::<f64, DscError>(best)
+        };
+        for (name, level) in levels() {
+            for (width, height) in [(1920u32, 1080u32), (1280, 720)] {
+                let mut encoder = Encoder::new(Config::new(width, height)?)?;
+                encoder.level = level;
+                let mut decoder = Decoder::new(encoder.pps().clone())?;
+                decoder.level = level;
+                let pps = encoder.pps();
+                println!(
+                    "{name} {width}x{height}: {} slices of {}x{}",
+                    pps.slices_per_line() * pps.slice_rows(),
+                    pps.slice_width,
+                    pps.slice_height
+                );
+                let stride = size(width) * 4;
+                for pattern in PATTERNS {
+                    let image = picture(pattern, size(width), size(height));
+                    let frame = Frame {
+                        data: &image,
+                        stride,
+                        format: PixelFormat::Bgrx,
+                    };
+                    let mut bitstream = Vec::new();
+                    let mut decoded = vec![0u8; image.len()];
+                    let encode_single = time(5, &mut || {
+                        encoder.encode(&frame, &mut bitstream).map(|_| ())
+                    })?;
+                    let encode_pooled = time(15, &mut || {
+                        encoder
+                            .encode_parallel(&frame, &mut bitstream, threads)
+                            .map(|_| ())
+                    })?;
+                    let stream = bitstream.clone();
+                    let decode_single = time(5, &mut || {
+                        decoder.decode(&stream, &mut decoded, stride, PixelFormat::Bgrx)
+                    })?;
+                    let decode_pooled = time(15, &mut || {
+                        decoder.decode_parallel(
+                            &stream,
+                            &mut decoded,
+                            stride,
+                            PixelFormat::Bgrx,
+                            threads,
+                        )
+                    })?;
+                    println!(
+                        "  {pattern:?}: encode {encode_single:.1} ms single, {encode_pooled:.1} ms pooled; decode {decode_single:.1} ms single, {decode_pooled:.1} ms pooled"
+                    );
                 }
-                Ok::<f64, DscError>(best)
-            };
-            let encode_single = time(5, &mut || {
-                encoder.encode(&frame, &mut bitstream).map(|_| ())
-            })?;
-            let encode_parallel = time(10, &mut || {
-                encoder
-                    .encode_parallel(&frame, &mut bitstream, threads)
-                    .map(|_| ())
-            })?;
-            let stream = bitstream.clone();
-            let decode_single = time(5, &mut || {
-                decoder.decode(&stream, &mut decoded, 1920 * 4, PixelFormat::Bgrx)
-            })?;
-            let decode_parallel = time(10, &mut || {
-                decoder.decode_parallel(&stream, &mut decoded, 1920 * 4, PixelFormat::Bgrx, threads)
-            })?;
-            println!(
-                "{pattern:?}: encode {encode_single:.1} ms single, {encode_parallel:.1} ms parallel; decode {decode_single:.1} ms single, {decode_parallel:.1} ms parallel"
+            }
+        }
+        println!("load average at the end {}", load_average());
+        Ok(())
+    }
+
+    #[test]
+    fn level_choice_follows_the_request() {
+        assert_eq!(Level::choose("scalar"), Level::Scalar);
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(Level::choose("sse2"), Level::Sse2);
+            let middle = Level::choose("sse4.2");
+            assert_eq!(
+                matches!(middle, Level::Sse42(_)),
+                super::x86::Sse42::detect().is_some()
+            );
+            let best = Level::choose("");
+            match super::x86::Avx2::detect() {
+                Some(token) => assert_eq!(best, Level::Avx2(token)),
+                None => assert_eq!(best, middle),
+            }
+            assert_eq!(Level::choose("something else"), best);
+        }
+    }
+
+    fn random_lanes(rng: &mut Rng) -> [i16; 4] {
+        std::array::from_fn(|_| {
+            let value = i16::from_le_bytes([rng.byte(), rng.byte()]);
+            // Mostly values of the size the codec works with, sometimes any.
+            if rng.below(4) == 0 {
+                value
+            } else {
+                value % 1024
+            }
+        })
+    }
+
+    /// The result of every lane operation for one set of operands.
+    fn lane_results<V: Lanes>(operands: [[i16; 4]; 3], count: u32) -> [[i16; 4]; 13] {
+        let [a, b, c] = operands.map(V::new);
+        let (low, high) = (b.min(c), b.max(c));
+        [
+            a.get(),
+            a.add(b).get(),
+            a.sub(b).get(),
+            a.mul(b).get(),
+            a.min(b).get(),
+            a.max(b).get(),
+            a.xor(b).get(),
+            a.shr(count).get(),
+            a.luma_or(b).get(),
+            a.clamp(low, high).get(),
+            a.abs().get(),
+            V::splat(operands[0][0]).get(),
+            QuantLanes::<V>::new(i32::try_from(count).unwrap_or(0))
+                .quantize(a)
+                .get(),
+        ]
+    }
+
+    /// The lane arithmetic the group coder is written in: the portable
+    /// implementation against plain integer code, and the SSE2 one against
+    /// the portable one, lane for lane.
+    #[test]
+    fn lane_arithmetic_matches_scalar_code() {
+        let mut rng = Rng(21);
+        for _ in 0..50_000 {
+            let operands = [
+                random_lanes(&mut rng),
+                random_lanes(&mut rng),
+                random_lanes(&mut rng),
+            ];
+            let count = u32::try_from(rng.below(16)).unwrap_or(0);
+            let portable = lane_results::<PortableLanes>(operands, count);
+            let [a, b, _] = operands;
+            for lane in 0..4 {
+                assert_eq!(portable[1][lane], a[lane].wrapping_add(b[lane]));
+                assert_eq!(portable[3][lane], a[lane].wrapping_mul(b[lane]));
+                assert_eq!(portable[7][lane], a[lane] >> count);
+            }
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                portable,
+                lane_results::<super::x86::WideLanes>(operands, count),
+                "{operands:?} {count}"
             );
         }
+        // The lane quantizer is `quantize` with each component's shift.
+        for qp in 0..16 {
+            for error in -1100i16..=1100 {
+                let lanes = QuantLanes::<PortableLanes>::new(qp)
+                    .quantize(PortableLanes::new([error; 4]))
+                    .get();
+                for (component, lane) in lanes.iter().enumerate().take(3) {
+                    let expected = quantize(i32::from(error), qlevel(component, qp));
+                    assert_eq!(i32::from(*lane), expected, "{qp} {error}");
+                }
+            }
+        }
+    }
+
+    fn random_colour(rng: &mut Rng) -> [i16; 3] {
+        let sample = |rng: &mut Rng, bound: usize| i16::try_from(rng.below(bound)).unwrap_or(0);
+        [sample(rng, 256), sample(rng, 512), sample(rng, 512)]
+    }
+
+    /// The history searches and the colour conversion of `kernels` against
+    /// the portable implementation.
+    fn check_kernels<K: Kernels>(kernels: K, rng: &mut Rng) {
+        for _ in 0..20_000 {
+            // A few colours repeat, so that exact hits and ties are common.
+            let palette = [random_colour(rng), random_colour(rng), random_colour(rng)];
+            let mut rows = [[0i16; 16]; 3];
+            for entry in 0..16 {
+                let colour = if rng.below(3) == 0 {
+                    random_colour(rng)
+                } else {
+                    palette[rng.below(3)]
+                };
+                for (row, value) in rows.iter_mut().zip(colour) {
+                    row[entry] = value;
+                }
+            }
+            let mut pixel = palette[rng.below(3)];
+            if rng.below(2) == 0 {
+                for value in &mut pixel {
+                    *value = (*value + i16::try_from(rng.below(9)).unwrap_or(0) - 4).clamp(0, 255);
+                }
+            }
+            let tolerance = [0usize; 3].map(|_| {
+                let wide = rng.below(3) == 0;
+                i16::try_from(rng.below(if wide { 130 } else { 4 })).unwrap_or(0)
+            });
+            let (first, usable) = [(0usize, u32::MAX), (16, u32::MAX), (25, 0x7F)][rng.below(3)];
+            let valid = match rng.below(4) {
+                0 => 0,
+                1 => usable,
+                _ => u32::try_from(rng.next() >> 32).unwrap_or(0) & usable,
+            };
+            let candidates = [&rows[0], &rows[1], &rows[2]];
+            assert_eq!(
+                kernels.ich_first(candidates, pixel, tolerance, valid),
+                Scalar.ich_first(candidates, pixel, tolerance, valid),
+                "{rows:?} {pixel:?} {tolerance:?} {valid:#x}"
+            );
+            assert_eq!(
+                kernels.ich_first(candidates, pixel, tolerance, u32::MAX),
+                Scalar.ich_first(candidates, pixel, tolerance, u32::MAX),
+                "{rows:?} {pixel:?} {tolerance:?}"
+            );
+            assert_eq!(
+                kernels.ich_best(candidates, pixel, valid, first),
+                Scalar.ich_best(candidates, pixel, valid, first),
+                "{rows:?} {pixel:?} {valid:#x} {first}"
+            );
+        }
+        for length in 0..70usize {
+            for red_first in [false, true] {
+                let row: Vec<u8> = (0..length * 4).map(|_| rng.byte()).collect();
+                let mut line = vec![[7i16; 4]; length];
+                let mut expected = vec![[9i16; 4]; length];
+                row_to_ycocg(kernels, &row, red_first, &mut line);
+                row_to_ycocg(Scalar, &row, red_first, &mut expected);
+                assert_eq!(line, expected, "{length} pixels to YCoCg");
+                // Converting back gives the row again, padding byte 255.
+                let mut back = vec![1u8; length * 4];
+                row_to_rgb(kernels, &line, red_first, &mut back);
+                for (pixel, original) in back.chunks_exact(4).zip(row.chunks_exact(4)) {
+                    assert_eq!(pixel, [original[0], original[1], original[2], 255]);
+                }
+                // Any reconstructed samples, also ones no picture produces.
+                let line: Vec<Pixel> = (0..length)
+                    .map(|_| {
+                        let [y, co, cg] = random_colour(rng);
+                        [y, co, cg, 0]
+                    })
+                    .collect();
+                let mut pixels = vec![3u8; length * 4];
+                let mut expected = vec![5u8; length * 4];
+                row_to_rgb(kernels, &line, red_first, &mut pixels);
+                row_to_rgb(Scalar, &line, red_first, &mut expected);
+                assert_eq!(pixels, expected, "{length} pixels to RGB");
+            }
+        }
+    }
+
+    /// The SSE2 and AVX2 kernels (the `unsafe` code of the codec) against the
+    /// scalar kernels on random input.
+    #[test]
+    fn simd_kernels_match_scalar_kernels() {
+        let mut rng = Rng(22);
+        check_kernels(Scalar, &mut rng);
+        #[cfg(target_arch = "x86_64")]
+        {
+            check_kernels(super::x86::Sse2, &mut rng);
+            if let Some(token) = super::x86::Sse42::detect() {
+                check_kernels(token, &mut rng);
+            }
+            if let Some(token) = super::x86::Avx2::detect() {
+                check_kernels(token, &mut rng);
+            }
+        }
+    }
+
+    /// Whole pictures through the scalar, SSE2 and AVX2 copies of the slice
+    /// loops: the same bitstream, statistics and decoded picture, also from
+    /// a corrupt bitstream.
+    #[test]
+    fn every_level_gives_the_same_bytes() -> TestResult {
+        let all = levels();
+        // Width, height, rate, DSC minor version, block prediction, line
+        // buffer depth, RGBx input.
+        let cases = [
+            (640u32, 360u32, 128u16, 2u8, true, 9u8, false),
+            (641, 479, 96, 2, true, 9, false),
+            (333, 217, 192, 1, true, 8, true),
+            (320, 120, 137, 2, false, 9, false),
+            (101, 67, 128, 2, true, 16, true),
+            (1366, 768, 160, 1, true, 9, false),
+        ];
+        for (width, height, bits_per_pixel_x16, version_minor, block_pred_enable, depth, rgbx) in
+            cases
+        {
+            let config = Config {
+                bits_per_pixel_x16,
+                version_minor,
+                block_pred_enable,
+                linebuf_depth: depth,
+                ..Config::new(width, height)?
+            };
+            let (format, stride) = if rgbx {
+                (PixelFormat::Rgbx, size(width) * 4 + 8)
+            } else {
+                (PixelFormat::Bgrx, size(width) * 4)
+            };
+            for pattern in PATTERNS {
+                let image = picture(pattern, size(width), size(height));
+                let mut data = vec![0x42u8; stride * size(height)];
+                let rows = data.chunks_exact_mut(stride);
+                for (row, source) in rows.zip(image.chunks_exact(size(width) * 4)) {
+                    row[..source.len()].copy_from_slice(source);
+                }
+                let frame = Frame {
+                    data: &data,
+                    stride,
+                    format,
+                };
+                let mut reference = None;
+                for (name, level) in &all {
+                    let mut encoder = Encoder::new(config.clone())?;
+                    encoder.level = *level;
+                    let mut bitstream = Vec::new();
+                    let stats = encoder.encode(&frame, &mut bitstream)?;
+                    let mut pooled = Vec::new();
+                    assert_eq!(encoder.encode_parallel(&frame, &mut pooled, 3)?, stats);
+                    assert_eq!(bitstream, pooled, "{name} pooled");
+                    let mut decoder = Decoder::new(encoder.pps().clone())?;
+                    decoder.level = *level;
+                    let mut decoded = vec![0u8; data.len()];
+                    decoder.decode_parallel(&bitstream, &mut decoded, stride, format, 3)?;
+                    let mut corrupt = bitstream.clone();
+                    let mut rng = Rng(u64::from(width) * 7919 + u64::from(bits_per_pixel_x16));
+                    for _ in 0..64 {
+                        let at = rng.below(corrupt.len());
+                        corrupt[at] ^= rng.byte();
+                    }
+                    let mut garbled = vec![0u8; data.len()];
+                    decoder.decode(&corrupt, &mut garbled, stride, format)?;
+                    let result = (bitstream, stats, decoded, garbled);
+                    match &reference {
+                        None => reference = Some(result),
+                        Some(expected) => {
+                            assert!(
+                                *expected == result,
+                                "{name} differs from scalar: {width}x{height} {pattern:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The pool runs a closure that borrows from the caller's stack on its
+    /// threads, survives a panicking closure, and its threads end when it is
+    /// dropped.
+    #[test]
+    fn pool_runs_borrowed_work_and_shuts_down() {
+        let pool = Pool::new(3);
+        let shared = Arc::clone(&pool.shared);
+        assert_eq!(
+            Arc::strong_count(&shared),
+            2,
+            "no thread before the first use"
+        );
+        let numbers: Vec<u64> = (1..=10_000).collect();
+        for _ in 0..50 {
+            let next = AtomicUsize::new(0);
+            let sum = AtomicU64::new(0);
+            let task = || {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(number) = numbers.get(at) else {
+                        break;
+                    };
+                    sum.fetch_add(*number, Ordering::Relaxed);
+                }
+            };
+            assert_eq!(pool.run(3, &task), Ok(()));
+            assert_eq!(sum.load(Ordering::Relaxed), 50_005_000);
+        }
+        let started = lock(&pool.workers).len();
+        assert_eq!(started, 3, "three helper threads were asked for");
+        assert_eq!(Arc::strong_count(&shared), 2 + started);
+        assert_eq!(pool.run(0, &|| {}), Ok(()), "no helper wanted");
+
+        // A helper thread panics inside the closure: the call reports it
+        // once every thread has left the closure, and the pool keeps working.
+        let helper_ran = AtomicBool::new(false);
+        let task = || {
+            if std::thread::current().name() == Some("dsc-slice") {
+                helper_ran.store(true, Ordering::SeqCst);
+                std::panic::resume_unwind(Box::new("test panic"));
+            }
+            let start = Instant::now();
+            while !helper_ran.load(Ordering::SeqCst) && start.elapsed().as_secs() < 20 {
+                std::thread::yield_now();
+            }
+        };
+        assert_eq!(pool.run(3, &task), Err(DscError::Worker));
+        assert!(helper_ran.load(Ordering::SeqCst));
+        let calls = AtomicUsize::new(0);
+        let task = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        };
+        assert_eq!(pool.run(3, &task), Ok(()));
+        assert!((1..=4).contains(&calls.load(Ordering::SeqCst)));
+        assert_eq!(lock(&pool.shared.state).batches.len(), 0);
+
+        drop(pool);
+        assert_eq!(Arc::strong_count(&shared), 1, "every thread has ended");
+    }
+
+    /// A panic of the calling thread inside the closure still waits for the
+    /// helper threads before the borrowed closure goes away.
+    #[test]
+    fn pool_waits_for_helpers_when_the_caller_panics() {
+        let pool = Pool::new(2);
+        let inside = AtomicUsize::new(0);
+        let left = AtomicUsize::new(0);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let task = || {
+                if std::thread::current().name() == Some("dsc-slice") {
+                    inside.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    left.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    let start = Instant::now();
+                    while inside.load(Ordering::SeqCst) == 0 && start.elapsed().as_secs() < 20 {
+                        std::thread::yield_now();
+                    }
+                    std::panic::resume_unwind(Box::new("test panic"));
+                }
+            };
+            pool.run(2, &task)
+        }));
+        assert!(outcome.is_err(), "the caller's panic continues");
+        let inside = inside.load(Ordering::SeqCst);
+        assert!(inside >= 1);
+        assert_eq!(
+            left.load(Ordering::SeqCst),
+            inside,
+            "helpers were waited for"
+        );
+        assert_eq!(lock(&pool.shared.state).batches.len(), 0);
+        assert_eq!(pool.run(2, &|| {}), Ok(()));
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    /// One encoder and one decoder for many pictures: the kept state and the
+    /// shared pool do not leak from one picture, rate or thread into another.
+    #[test]
+    fn codec_objects_are_reused_across_pictures_rates_and_threads() -> TestResult {
+        assert_send_sync::<Encoder>();
+        assert_send_sync::<Decoder>();
+        let (width, height) = (640usize, 360usize);
+        let stride = width * 4;
+        let images: Vec<Vec<u8>> = PATTERNS
+            .iter()
+            .map(|pattern| picture(*pattern, width, height))
+            .collect();
+        let mut encoder = Encoder::new(Config::new(640, 360)?)?;
+        for bits_per_pixel_x16 in [DEFAULT_BPP_X16, MIN_BPP_X16, 171, MAX_BPP_X16, 104] {
+            encoder.set_bits_per_pixel_x16(bits_per_pixel_x16)?;
+            let decoder = Decoder::new(encoder.pps().clone())?;
+            for (number, image) in images.iter().enumerate() {
+                let frame = Frame {
+                    data: image,
+                    stride,
+                    format: PixelFormat::Bgrx,
+                };
+                // A new encoder on one thread is the reference.
+                let fresh = Encoder::new(encoder.config().clone())?;
+                let mut expected = Vec::new();
+                let expected_stats = fresh.encode(&frame, &mut expected)?;
+                let mut bitstream = vec![0xAAu8; number * 1000];
+                let threads = 1 + number % 5;
+                let stats = encoder.encode_parallel(&frame, &mut bitstream, threads)?;
+                assert_eq!(stats, expected_stats);
+                assert_eq!(
+                    bitstream, expected,
+                    "picture {number} at {bits_per_pixel_x16}"
+                );
+                let mut expected_picture = vec![0u8; image.len()];
+                Decoder::new(fresh.pps().clone())?.decode(
+                    &expected,
+                    &mut expected_picture,
+                    stride,
+                    PixelFormat::Bgrx,
+                )?;
+                let mut decoded = vec![0x55u8; image.len()];
+                decoder.decode_parallel(&bitstream, &mut decoded, stride, PixelFormat::Bgrx, 4)?;
+                assert_eq!(decoded, expected_picture);
+                let copy = decoder.clone();
+                decoded.fill(0);
+                copy.decode(&bitstream, &mut decoded, stride, PixelFormat::Bgrx)?;
+                assert_eq!(decoded, expected_picture);
+            }
+        }
+        assert!(
+            !lock(&encoder.spares.0).is_empty(),
+            "the encoder keeps its slice state between pictures"
+        );
+        assert!(Arc::ptr_eq(&encoder.pool, &encoder.clone().pool));
+
+        // Several threads use one encoder and one decoder at the same time.
+        encoder.set_bits_per_pixel_x16(DEFAULT_BPP_X16)?;
+        let decoder = Decoder::new(encoder.pps().clone())?;
+        let frame = Frame {
+            data: &images[4],
+            stride,
+            format: PixelFormat::Bgrx,
+        };
+        let mut expected = Vec::new();
+        encoder.encode(&frame, &mut expected)?;
+        let mut expected_picture = vec![0u8; images[4].len()];
+        decoder.decode(&expected, &mut expected_picture, stride, PixelFormat::Bgrx)?;
+        let outcomes: Vec<Result<bool, DscError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|thread| {
+                    let (encoder, decoder) = (&encoder, &decoder);
+                    let (expected, expected_picture) = (&expected, &expected_picture);
+                    scope.spawn(move || {
+                        let mut same = true;
+                        for round in 0..6 {
+                            let mut bitstream = Vec::new();
+                            encoder.encode_parallel(
+                                &frame,
+                                &mut bitstream,
+                                1 + (thread + round) % 4,
+                            )?;
+                            same &= bitstream == *expected;
+                            let mut decoded = vec![0u8; expected_picture.len()];
+                            decoder.decode_parallel(
+                                &bitstream,
+                                &mut decoded,
+                                stride,
+                                PixelFormat::Bgrx,
+                                1 + round % 3,
+                            )?;
+                            same &= decoded == *expected_picture;
+                        }
+                        Ok(same)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or(Err(DscError::Worker)))
+                .collect()
+        });
+        assert!(
+            outcomes.iter().all(|outcome| *outcome == Ok(true)),
+            "{outcomes:?}"
+        );
+        Ok(())
+    }
+
+    /// Small, narrow and odd pictures and slices: every call returns (a
+    /// result or an error) and every code level agrees.
+    #[test]
+    fn small_and_odd_sizes_never_panic() -> TestResult {
+        let all = levels();
+        let mut rng = Rng(31);
+        let mut configs = Vec::new();
+        for width in (1u32..=48).chain([63, 64, 65, 100, 127, 255, 333]) {
+            for height in (1u32..=12).chain([16, 24, 31, 32, 48, 64, 100, 108, 109, 217]) {
+                if let Ok(config) = Config::new(width, height) {
+                    configs.push(config);
+                }
+            }
+        }
+        // Slices that do not divide the picture, one-line slices, slices of
+        // the smallest width.
+        for (width, height, slice_width, slice_height) in [
+            (50u32, 20u32, 7u32, 3u32),
+            (50, 20, 13, 20),
+            (33, 9, 33, 1),
+            (640, 100, 7, 100),
+            (97, 53, 31, 17),
+            (200, 30, 199, 29),
+            (64, 64, 8, 64),
+        ] {
+            for bits_per_pixel_x16 in [MIN_BPP_X16, 133, MAX_BPP_X16] {
+                configs.push(Config {
+                    width,
+                    height,
+                    slice_width,
+                    slice_height,
+                    bits_per_pixel_x16,
+                    block_pred_enable: true,
+                    version_minor: 2,
+                    linebuf_depth: 9,
+                });
+            }
+        }
+        let (mut coded, mut refused) = (0, 0);
+        for config in configs {
+            let (width, height) = (size(config.width), size(config.height));
+            let noisy = rng.below(2) == 0;
+            let image: Vec<u8> = (0..width * height * 4)
+                .map(|at| {
+                    if noisy {
+                        rng.byte()
+                    } else {
+                        byte(at / 4 % 7 * 40)
+                    }
+                })
+                .collect();
+            let frame = Frame {
+                data: &image,
+                stride: width * 4,
+                format: PixelFormat::Bgrx,
+            };
+            let mut reference = None;
+            for (name, level) in &all {
+                let mut encoder = match Encoder::new(config.clone()) {
+                    Ok(encoder) => encoder,
+                    Err(DscError::Config(_)) => {
+                        refused += 1;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                encoder.level = *level;
+                let mut bitstream = Vec::new();
+                let outcome = encoder.encode_parallel(&frame, &mut bitstream, 3);
+                let mut decoder = Decoder::new(Pps::from_bytes(&encoder.pps().to_bytes())?)?;
+                decoder.level = *level;
+                if outcome.is_err() {
+                    // A slice this small can overflow its rate buffer; the
+                    // decoder still has to cope with whatever arrives.
+                    bitstream = (0..encoder.frame_len()).map(|_| rng.byte()).collect();
+                }
+                let mut decoded = vec![0u8; image.len()];
+                decoder.decode_parallel(
+                    &bitstream,
+                    &mut decoded,
+                    width * 4,
+                    PixelFormat::Bgrx,
+                    3,
+                )?;
+                // Random bytes differ per level; only real pictures compare.
+                let result = if outcome.is_ok() {
+                    coded += 1;
+                    (outcome, bitstream, decoded.clone())
+                } else {
+                    (outcome, Vec::new(), Vec::new())
+                };
+                match &reference {
+                    None => reference = Some(result),
+                    Some(expected) => assert!(*expected == result, "{name} {config:?}"),
+                }
+                // Buffers of the wrong size are errors, not panics.
+                let mut short = vec![0u8; image.len() - 1];
+                let stream = vec![0u8; encoder.frame_len()];
+                assert_eq!(
+                    decoder.decode(&stream, &mut short, width * 4, PixelFormat::Bgrx),
+                    Err(DscError::FrameTooSmall)
+                );
+                assert_eq!(
+                    decoder.decode(&stream, &mut decoded, width * 4 - 1, PixelFormat::Bgrx),
+                    Err(DscError::FrameTooSmall)
+                );
+                let cut = Frame {
+                    data: &image[1..],
+                    ..frame
+                };
+                assert_eq!(
+                    encoder.encode(&cut, &mut Vec::new()),
+                    Err(DscError::FrameTooSmall)
+                );
+            }
+        }
+        println!("{coded} pictures coded, {refused} configurations refused");
+        assert!(coded >= 100 * all.len(), "{coded}");
+        Ok(())
+    }
+
+    #[test]
+    fn bit_writer_matches_bit_by_bit_output() {
+        let mut rng = Rng(41);
+        for round in 0..300 {
+            let mut writer = BitWriter::default();
+            if round % 2 == 0 {
+                writer.clear(rng.below(64));
+            }
+            let mut bits = Vec::new();
+            for _ in 0..rng.below(400) {
+                // A width of 0 or above the limit (56 bits for raw words,
+                // 32 for signed values) writes nothing.
+                let value = rng.next();
+                let (width, limit) = if rng.below(2) == 0 {
+                    let width = u32::try_from(rng.below(58)).unwrap_or(0);
+                    writer.put_raw(value, width);
+                    (width, 56)
+                } else {
+                    let width = u32::try_from(rng.below(34)).unwrap_or(0);
+                    let [a, b, c, d, ..] = value.to_le_bytes();
+                    let signed = i32::from_le_bytes([a, b, c, d]);
+                    writer.put(signed, i32::try_from(width).unwrap_or(0));
+                    writer.put(signed, -3);
+                    (width, 32)
+                };
+                if (1..=limit).contains(&width) {
+                    bits.extend((0..width).rev().map(|bit| (value >> bit) & 1 == 1));
+                }
+            }
+            let mut expected = vec![0u8; bits.len().div_ceil(8)];
+            for (number, bit) in bits.iter().enumerate() {
+                if *bit {
+                    expected[number / 8] |= 0x80 >> (number % 8);
+                }
+            }
+            assert_eq!(writer.written(), expected);
+        }
+    }
+
+    /// The decoder's prefix and three-residual reads against the single-bit
+    /// reads they replace, also when the funnel shifter runs dry.
+    #[test]
+    fn demux_fast_paths_read_what_single_reads_read() {
+        let mut rng = Rng(51);
+        for _ in 0..2000 {
+            let sparse = rng.below(2) == 0;
+            let data: Vec<u8> = (0..rng.below(48))
+                .map(|_| {
+                    if sparse && rng.below(3) != 0 {
+                        0
+                    } else {
+                        rng.byte()
+                    }
+                })
+                .collect();
+            let mut fast = Demux {
+                data: &data,
+                position: 0,
+                shifter: [0; 3],
+                fullness: [0; 3],
+                consumed: 0,
+            };
+            for _ in 0..40 {
+                if rng.below(3) == 0 {
+                    fast.refill();
+                }
+                let stream = rng.below(3);
+                let mut slow = fast.clone();
+                if rng.below(2) == 0 {
+                    let max_prefix = i32::try_from(rng.below(15)).unwrap_or(0) - 1;
+                    let mut expected = 0;
+                    while expected < max_prefix && slow.get(stream, 1) == 0 {
+                        expected += 1;
+                    }
+                    assert_eq!(fast.prefix(stream, max_prefix), expected);
+                } else {
+                    let bits = i32::try_from(rng.below(13)).unwrap_or(0) - 1;
+                    let expected = [
+                        slow.get_signed(stream, bits),
+                        slow.get_signed(stream, bits),
+                        slow.get_signed(stream, bits),
+                    ];
+                    assert_eq!(fast.get_signed3(stream, bits), expected);
+                }
+                assert_eq!(
+                    (fast.fullness, fast.consumed, fast.position),
+                    (slow.fullness, slow.consumed, slow.position)
+                );
+            }
+        }
     }
 }
