@@ -13833,6 +13833,11 @@ impl KwinMcp {
         cmd.args(["--dev", "/dev"]);
         let trimmed_dri = usable_dri_nodes(nvidia_gbm_installed());
         match &trimmed_dri {
+            // A compute-only host (NVIDIA without nvidia-drm) has no /dev/dri;
+            // KWin then renders in software.
+            None if !Path::new("/dev/dri").is_dir() => {
+                eprintln!("session_start: host has no /dev/dri; the session renders in software");
+            }
             None => {
                 cmd.args(["--dev-bind", "/dev/dri", "/dev/dri"]);
             }
