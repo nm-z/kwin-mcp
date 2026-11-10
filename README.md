@@ -143,6 +143,8 @@ install -d -m 700 ~/.config/kwin-mcp
 kwin-mcp --listen 192.168.1.20 --autoclean --ttl 120
 ```
 
+To keep the listener running across reboots, install [`systemd/kwin-mcp-listen.service`](systemd/kwin-mcp-listen.service) as a user unit, put the address in `~/.config/kwin-mcp/listen.env` as `KWIN_MCP_LISTEN=192.168.1.20`, then run `systemctl --user enable --now kwin-mcp-listen` and, on a machine nobody logs in to, `loginctl enable-linger`. The unit holds no session alive: each session still ends with its owner's connection or its `--ttl`.
+
 `--listen ADDRESS[:PORT]` takes the IP address to bind (default port 47913) and serves kwin-mcp peers instead of an MCP client on stdio; the other options (`--ttl`, `--autoclean`, `--width`, memory limits) apply to the sessions it starts. `--keep-sessions` is rejected with it. `--link-mbps N` sets the link speed its viewer frames are budgeted against (see **Viewer** below).
 
 Then pass `host` to `session_start` on the local server: a hostname or IP address with an optional `:port`, for example `{"host": "sentry"}` or `{"host": "192.168.1.20:47913"}`. The local server connects to that listener (one connection per host, reused by later starts), and the listener starts the desktop as its own child process exactly as a local `session_start` does. The returned `session_id` is the listener's; every later call with it is routed over the socket and its result returned unchanged. `session_list` gives each session a `host`: this machine's hostname for local sessions, the `name:port` passed to `session_start` for remote ones.
