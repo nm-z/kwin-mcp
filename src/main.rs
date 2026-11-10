@@ -18951,6 +18951,9 @@ const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const LISTEN_ACCEPT_RETRY: Duration = Duration::from_millis(200);
 const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a re-execution waits for requests to other machines to return
+/// before it goes on without their connections.
+const REMOTE_HOLD_WAIT: Duration = Duration::from_secs(30);
 
 fn session_owner_pid(id: &str) -> Option<u32> {
     id.strip_prefix('s')
@@ -19630,11 +19633,17 @@ struct SessionRouter {
     frame_sockets: Arc<FrameSockets>,
 }
 
-type RemoteHost = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>;
+/// The connection to one listener: the MCP client on its control socket, and
+/// what hands that socket to the image this server re-executes into.
+struct RemoteHost {
+    service: rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+    wire: remote::Handover,
+}
 
 /// Sessions on other machines. A listener stops a peer's sessions when the
 /// peer's connection ends, so each host's connection lives as long as this
-/// server's client does and is closed with it.
+/// server's client does and is closed with it. A re-execution keeps the
+/// connections (see [`RemoteSessions::hold`]); nothing else does.
 #[derive(Default)]
 struct RemoteSessions {
     /// One connection per listener, keyed by `name:port`.
@@ -19644,6 +19653,55 @@ struct RemoteSessions {
     /// session_id → the viewer window on this machine. Held across a whole
     /// viewer_open or viewer_close, so they run one at a time.
     viewers: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteViewer>>,
+    /// Read by every request to a listener until its response is in and
+    /// recorded; written by a re-execution, which so waits for them all and
+    /// lets none start. Taken after `viewers` and `hosts`, never before.
+    calls: tokio::sync::RwLock<()>,
+}
+
+/// One kept connection in the reload state.
+#[derive(Serialize, Deserialize)]
+struct RemoteHostRestore {
+    host: String,
+    /// The control socket's descriptor, inherited across the exec.
+    fd: i32,
+    /// What the listener answered to `initialize`.
+    info: Option<rmcp::model::ServerInfo>,
+}
+
+/// The reload state of the sessions on other machines.
+#[derive(Default, Serialize, Deserialize)]
+struct RemoteRestore {
+    #[serde(default)]
+    hosts: Vec<RemoteHostRestore>,
+    /// session_id → the listener that owns it.
+    #[serde(default)]
+    sessions: std::collections::BTreeMap<String, String>,
+    /// session_id → the process of its open viewer window.
+    #[serde(default)]
+    viewers: std::collections::BTreeMap<String, u32>,
+}
+
+/// Everything about the sessions on other machines stands still while this
+/// lives: no request to a listener is under way or can start, and the kept
+/// control sockets move no bytes. An exec ends that by replacing the process;
+/// dropping this (the exec failed) lets everything run again.
+struct RemoteHold<'a> {
+    wires: Vec<remote::Handover>,
+    /// The descriptors the next image inherits, named in the reload state.
+    /// They are closed on exec until the exec itself (see `reexecute`).
+    _sockets: Vec<std::os::fd::OwnedFd>,
+    _calls: tokio::sync::RwLockWriteGuard<'a, ()>,
+    _hosts: tokio::sync::MutexGuard<'a, std::collections::BTreeMap<String, RemoteHost>>,
+    _viewers: tokio::sync::MutexGuard<'a, std::collections::BTreeMap<String, RemoteViewer>>,
+}
+
+impl Drop for RemoteHold<'_> {
+    fn drop(&mut self) {
+        for wire in &self.wires {
+            wire.release();
+        }
+    }
 }
 
 /// The viewer of a session on another machine: a `kwin-viewer --stream`
@@ -19703,8 +19761,18 @@ impl RemoteSessions {
             .lock()
             .await
             .get(host)
-            .filter(|service| !service.is_closed())
-            .map(|service| service.peer().clone())
+            .filter(|link| !link.service.is_closed())
+            .map(|link| link.service.peer().clone())
+    }
+    /// A request to a listener. A re-execution waits for it to return.
+    async fn call(
+        &self,
+        peer: &rmcp::Peer<rmcp::RoleClient>,
+        host: &str,
+        request: rmcp::model::CallToolRequestParams,
+    ) -> Result<CallToolResult, McpError> {
+        let _calling = self.calls.read().await;
+        remote_call(peer, host, request).await
     }
     /// The connection to `host`, opened now unless one is open. The listener
     /// sees `client`, so it shapes results for the client that reads them.
@@ -19714,8 +19782,8 @@ impl RemoteSessions {
         client: Option<rmcp::model::ClientInfo>,
     ) -> Result<rmcp::Peer<rmcp::RoleClient>, McpError> {
         let mut hosts = self.hosts.lock().await;
-        if let Some(service) = hosts.get(host).filter(|service| !service.is_closed()) {
-            return Ok(service.peer().clone());
+        if let Some(link) = hosts.get(host).filter(|link| !link.service.is_closed()) {
+            return Ok(link.service.peer().clone());
         }
         let unreachable = |error: String| {
             remote_error(
@@ -19725,13 +19793,159 @@ impl RemoteSessions {
             )
         };
         let secret = remote::read_secret().map_err(unreachable)?;
-        let transport = remote::connect(host, &secret).await.map_err(unreachable)?;
+        let (transport, wire) = remote::connect(host, &secret).await.map_err(unreachable)?;
         let service = rmcp::service::serve_client(client.unwrap_or_default(), transport)
             .await
             .map_err(|error| unreachable(format!("MCP handshake failed: {error}")))?;
         let peer = service.peer().clone();
-        hosts.insert(host.to_owned(), service);
+        hosts.insert(host.to_owned(), RemoteHost { service, wire });
         Ok(peer)
+    }
+    /// Before this server re-executes itself into `executable`: brings every
+    /// connection that owns a session to rest between two messages and
+    /// returns what the next image needs to continue on the same sockets.
+    /// The listeners see no disconnect, so they keep the sessions, and a
+    /// viewer window, a child of this process with a frame socket of its own,
+    /// runs on. A connection that cannot be kept closes with this image, as
+    /// every connection did before, and its listener stops its sessions; the
+    /// state then still names them, so they are reported as lost.
+    async fn hold(&self, executable: &Path) -> (RemoteRestore, Option<RemoteHold<'_>>) {
+        let lost = |reason: String| {
+            let sessions = self.sessions().clone();
+            if !sessions.is_empty() {
+                eprintln!(
+                    "reload: {reason}; the connections to other machines close with this process image and the {} sessions there stop",
+                    sessions.len()
+                );
+            }
+            let state = RemoteRestore {
+                sessions,
+                ..Default::default()
+            };
+            (state, None)
+        };
+        let locked = tokio::time::timeout(REMOTE_HOLD_WAIT, async {
+            let viewers = self.viewers.lock().await;
+            let hosts = self.hosts.lock().await;
+            let calls = self.calls.write().await;
+            (viewers, hosts, calls)
+        })
+        .await;
+        let Ok((mut viewers, hosts, calls)) = locked else {
+            return lost(format!(
+                "a request to another machine is still under way after {} seconds",
+                REMOTE_HOLD_WAIT.as_secs()
+            ));
+        };
+        // No request can change it any more.
+        let sessions = self.sessions().clone();
+        if !sessions.is_empty() {
+            let executable = executable.to_owned();
+            let adopts = tokio::task::spawn_blocking(move || remote::adopts_control(&executable))
+                .await
+                .unwrap_or(false);
+            if !adopts {
+                return lost(
+                    "the new binary does not continue on inherited control sockets".to_owned(),
+                );
+            }
+        }
+        let mut wires = Vec::new();
+        let mut sockets = Vec::new();
+        let mut kept = Vec::new();
+        for (host, link) in hosts.iter() {
+            use std::os::fd::AsRawFd;
+            let owned = sessions.values().filter(|owner| *owner == host).count();
+            if owned == 0 || link.service.is_closed() {
+                continue;
+            }
+            // No request is under way, so the socket is at rest unless the
+            // listener sent something on its own.
+            if !link.wire.hold().await {
+                eprintln!(
+                    "reload: the connection to {host} is in the middle of a message and closes with this process image; {host} stops its {owned} sessions"
+                );
+                continue;
+            }
+            wires.push(link.wire.clone());
+            match link.wire.socket() {
+                Ok(socket) => {
+                    kept.push(RemoteHostRestore {
+                        host: host.clone(),
+                        fd: socket.as_raw_fd(),
+                        info: link.service.peer().peer_info().cloned(),
+                    });
+                    sockets.push(socket);
+                }
+                Err(error) => eprintln!(
+                    "reload: the connection to {host} cannot be inherited ({error}) and closes with this process image; {host} stops its {owned} sessions"
+                ),
+            }
+        }
+        let open_viewers = viewers
+            .iter_mut()
+            .filter(|(id, _)| sessions.contains_key(*id))
+            .filter_map(|(id, viewer)| {
+                let child = viewer.child.as_mut()?;
+                matches!(child.try_wait(), Ok(None)).then(|| (id.clone(), child.id()))
+            })
+            .collect();
+        let state = RemoteRestore {
+            hosts: kept,
+            sessions,
+            viewers: open_viewers,
+        };
+        let hold = RemoteHold {
+            wires,
+            _sockets: sockets,
+            _calls: calls,
+            _hosts: hosts,
+            _viewers: viewers,
+        };
+        (state, Some(hold))
+    }
+    /// In the image a server re-executed into: continues on the inherited
+    /// control sockets. A session whose connection did not come along is
+    /// reported as `connection_lost`, as after any dropped connection.
+    async fn restore(&self, state: RemoteRestore, client: Option<rmcp::model::ClientInfo>) {
+        let mut hosts = self.hosts.lock().await;
+        for saved in state.hosts {
+            let owned = state
+                .sessions
+                .values()
+                .filter(|owner| **owner == saved.host)
+                .count();
+            let adopted = match adopt_descriptor(saved.fd) {
+                Ok(socket) => remote::adopt_control(socket).await,
+                Err(error) => Err(error.to_string()),
+            };
+            match adopted {
+                Ok((transport, wire)) => {
+                    // The listener was initialized by the previous image.
+                    let service = rmcp::service::serve_directly(
+                        client.clone().unwrap_or_default(),
+                        transport,
+                        saved.info,
+                    );
+                    eprintln!(
+                        "reload: kept the connection to {} and its {owned} sessions",
+                        saved.host
+                    );
+                    hosts.insert(saved.host, RemoteHost { service, wire });
+                }
+                Err(error) => eprintln!(
+                    "reload: lost the connection to {} and its {owned} sessions: {error}",
+                    saved.host
+                ),
+            }
+        }
+        *self.sessions() = state.sessions;
+        let mut viewers = self.viewers.lock().await;
+        for (id, pid) in state.viewers {
+            let mut viewer = RemoteViewer::new(&id);
+            viewer.child = Some(SessionProcess { pid, status: None });
+            viewers.insert(id, viewer);
+        }
     }
     /// Closes the viewer of a session that has ended.
     async fn discard_viewer(&self, id: &str) {
@@ -19747,9 +19961,10 @@ impl RemoteSessions {
             viewer.discard().await;
         }
         let hosts = std::mem::take(&mut *self.hosts.lock().await);
-        for (host, service) in hosts {
+        for (host, link) in hosts {
             eprintln!("remote: closing the connection to {host}; its sessions stop with it");
-            let _ = tokio::time::timeout(SESSION_CONTROL_CLOSE_TIMEOUT, service.cancel()).await;
+            let _ =
+                tokio::time::timeout(SESSION_CONTROL_CLOSE_TIMEOUT, link.service.cancel()).await;
         }
     }
 }
@@ -19936,6 +20151,9 @@ impl SessionRouter {
             arguments.remove("host");
         }
         let listener = self.remote.connect(&host, peer.peer_info().cloned()).await?;
+        // Held until the new session's host is recorded: a re-execution in
+        // between would not know the session.
+        let _calling = self.remote.calls.read().await;
         let result = remote_call(&listener, &host, request).await;
         // A failed start can leave a handle too; its error names the ID.
         let id = match &result {
@@ -20009,16 +20227,22 @@ impl SessionRouter {
                 .close_remote_viewer(request, id, host, &listener, peer)
                 .await;
         }
+        // Held until a stopped session is forgotten, so a re-execution never
+        // carries one along.
+        let calling = self.remote.calls.read().await;
         let result = remote_call(&listener, host, request).await;
-        if stop
+        let stopped = stop
             && result.as_ref().is_ok_and(|done| {
                 done.structured_content
                     .as_ref()
                     .and_then(|data| data["status"].as_str())
                     != Some("cleanup_pending")
-            })
-        {
+            });
+        if stopped {
             self.remote.sessions().remove(id);
+        }
+        drop(calling);
+        if stopped {
             self.remote.discard_viewer(id).await;
         }
         result
@@ -20043,7 +20267,7 @@ impl SessionRouter {
         if let Some(child) = viewer.child.as_mut() {
             let shown = viewer_report(&viewer.dir, Some(child), None);
             if shown["state"] == "ready" {
-                let sending = remote_call(listener, host, request.clone())
+                let sending = self.remote.call(listener, host, request.clone())
                     .await
                     .ok()
                     .and_then(|result| result.structured_content)
@@ -20069,7 +20293,7 @@ impl SessionRouter {
             .insert("frame_ticket".to_owned(), serde_json::json!(ticket));
         // Returns once the frame sender there saw this window present a frame,
         // or with the reason it could not.
-        let sender = remote_call(listener, host, request).await;
+        let sender = self.remote.call(listener, host, request).await;
         let refused = match &sender {
             Err(error) => Some(error.message.to_string()),
             Ok(result) => match result.structured_content.as_ref().map(|data| &data["viewer"]) {
@@ -20118,7 +20342,7 @@ impl SessionRouter {
                     serde_json::json!({"name": "viewer_close", "arguments": {"session_id": id}}),
                 )
             {
-                let _ = remote_call(listener, host, close).await;
+                let _ = self.remote.call(listener, host, close).await;
             }
             return Ok(remote_viewer_result(peer, "unavailable", shown, host).await);
         }
@@ -20144,7 +20368,7 @@ impl SessionRouter {
         } else {
             "already_closed"
         };
-        let _ = remote_call(listener, host, request).await;
+        let _ = self.remote.call(listener, host, request).await;
         let shown = viewer_report(&viewer.dir, None, None);
         Ok(remote_viewer_result(peer, status, shown, host).await)
     }
@@ -20160,7 +20384,7 @@ impl SessionRouter {
             .ok();
             let listed = match (self.remote.connected(host).await, request) {
                 (Some(listener), Some(request)) => {
-                    remote_call(&listener, host, request).await.ok()
+                    self.remote.call(&listener, host, request).await.ok()
                 }
                 _ => None,
             };
@@ -21281,6 +21505,8 @@ struct ServerRestore {
     sessions: Vec<SessionRestore>,
     cleanup: Vec<(String, PathBuf, Option<i32>)>,
     input: Vec<u8>,
+    #[serde(default)]
+    remote: RemoteRestore,
 }
 
 fn retain_descriptor(
@@ -21326,6 +21552,19 @@ fn restore_state() -> anyhow::Result<Option<ServerRestore>> {
         state.pid == std::process::id(),
         "reload state belongs to another server PID"
     );
+    // The inherited control sockets of sessions on other machines are closed
+    // on exec again before this image starts its first process: a child that
+    // held one would keep those sessions alive after this server died.
+    for host in &state.remote.hosts {
+        if host.fd > 2 {
+            // SAFETY: the previous image left this descriptor open for this one.
+            let socket = unsafe { std::os::fd::BorrowedFd::borrow_raw(host.fd) };
+            let _ = nix::fcntl::fcntl(
+                socket,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            );
+        }
+    }
     Ok(Some(state))
 }
 impl SessionRouter {
@@ -21484,6 +21723,7 @@ impl SessionRouter {
             self.entries()?.len(),
             std::process::id()
         );
+        self.remote.restore(state.remote, state.client).await;
         Ok(state.input)
     }
     async fn reexecute(
@@ -21579,6 +21819,10 @@ impl SessionRouter {
                 lease_fd: service.workdir.saved_lease(&mut retained)?,
             });
         }
+        // Last, so the connections to other machines stand still only for the
+        // exec itself.
+        let (remote, _remote_hold) = self.remote.hold(executable).await;
+        let remote_sockets: Vec<i32> = remote.hosts.iter().map(|host| host.fd).collect();
         let input = wire
             .state
             .lock()
@@ -21601,6 +21845,7 @@ impl SessionRouter {
             sessions: saved,
             cleanup,
             input,
+            remote,
         };
         // Wallet and clipboard data stay in an anonymous descriptor, never in a workdir,
         // environment variable, log, or command line.
@@ -21614,10 +21859,36 @@ impl SessionRouter {
             std::process::id(),
             state.sessions.len()
         );
+        if !state.remote.sessions.is_empty() {
+            eprintln!(
+                "reload: keeping {} connections to other machines for {} sessions there",
+                state.remote.hosts.len(),
+                state.remote.sessions.len()
+            );
+        }
         let mut command = std::process::Command::new(executable);
         command
             .args(std::env::args_os().skip(1))
             .env(RESUME_DESCRIPTOR, file.as_raw_fd().to_string());
+        // The kept control sockets become inheritable in the exec call itself,
+        // on the thread that starts every session process, so no child of
+        // this server ever holds one: a child that did would keep the
+        // connection, and with it the sessions, open after the server died.
+        // SAFETY: the callback runs in this process, before execve, and only
+        // changes flags of descriptors that `_remote_hold` keeps open.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(move || {
+                for socket in &remote_sockets {
+                    nix::fcntl::fcntl(
+                        std::os::fd::BorrowedFd::borrow_raw(*socket),
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                    )
+                    .map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            });
+        }
         let error = exec_on_main(command).await?;
         wire.thaw();
         Err(error.into())
