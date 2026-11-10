@@ -18963,8 +18963,6 @@ impl Drop for SessionControlSocket {
 struct SessionAttachArgs {
     session_id: String,
     owner_pid: u32,
-    user_authorized: bool,
-    application: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19536,19 +19534,6 @@ impl SessionRouter {
                         format!("Invalid session_attach arguments: {error}"),
                     )
                 })?;
-        if !args.user_authorized {
-            return Err(session_attach_error(
-                "explicit_authorization_required",
-                "session_attach requires explicit user authorization for the selected existing session.",
-            ));
-        }
-        let application = args.application.trim();
-        if application.is_empty() || application.chars().count() > 512 {
-            return Err(session_attach_error(
-                "invalid_authorization_context",
-                "application must describe the authorized application or desktop in 1–512 characters.",
-            ));
-        }
         if session_owner_pid(&args.session_id) != Some(args.owner_pid) {
             return Err(session_attach_error(
                 "session_owner_mismatch",
@@ -19602,7 +19587,7 @@ impl SessionRouter {
             "owner_pid":attached.owner.pid, "owner_uid":attached.owner.uid,
             "owner_start_ticks":attached.owner.start_ticks,
             "sandbox_pid":attached.sandbox_pid, "workdir":attached.workdir,
-            "scope_unit":attached.scope_unit, "requested_application":application,
+            "scope_unit":attached.scope_unit,
             "attaching_router_pid":std::process::id(),
             "attachment_owns_lifecycle":false, "new_desktop_created":false,
             "ownership_notice":"The original owner retains lifecycle ownership. Dropping this attachment does not stop the existing session.",
@@ -19741,16 +19726,14 @@ impl SessionRouter {
         ));
         tools.push(rmcp::model::Tool::new(
             "session_attach",
-            "Attach to a specific already-running kwin-mcp desktop explicitly authorized by the user. Reuses its exact session_id without creating a desktop or transferring lifecycle ownership. owner_pid must match the handle. Set user_authorized only after the user authorizes this existing session; discovery is not authorization. application describes that authorization. Do not stop the attached session unless the user requests it.",
+            "Attach to a specific already-running kwin-mcp desktop explicitly authorized by the user. Reuses its exact session_id without creating a desktop or transferring lifecycle ownership. owner_pid must match the handle. Discovering a session is not authorization. Do not stop the attached session unless the user requests it.",
             Arc::new(serde_json::from_value(serde_json::json!({
                 "type":"object",
                 "properties":{
                     "session_id":{"type":"string","minLength":1},
-                    "owner_pid":{"type":"integer","minimum":1,"maximum":4294967295_u64},
-                    "user_authorized":{"type":"boolean","const":true},
-                    "application":{"type":"string","minLength":1,"maxLength":512}
+                    "owner_pid":{"type":"integer","minimum":1,"maximum":4294967295_u64}
                 },
-                "required":["session_id","owner_pid","user_authorized","application"],
+                "required":["session_id","owner_pid"],
                 "additionalProperties":false
             })).unwrap_or_default()),
         ));

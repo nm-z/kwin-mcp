@@ -287,8 +287,7 @@ files that must survive that restart.
 `session_start` always creates a new isolated desktop. To reach an application
 already open in another live same-user kwin-mcp session, first obtain the user's
 authorization for that specific session, then call `session_attach` with its
-exact `session_id`, the `owner_pid` encoded in that handle,
-`user_authorized: true`, and an `application` description of the authorization.
+exact `session_id` and the `owner_pid` encoded in that handle.
 Discovering another session does not authorize operating it.
 
 Attachment verifies the owner's Unix UID, process start time, authenticated

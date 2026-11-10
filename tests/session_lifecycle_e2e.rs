@@ -11582,17 +11582,7 @@ fn session_attach_reuses_foreign_desktop_without_owning_lifecycle() {
     let original_ids = attach_test_windows(&windows);
     assert!(!original_ids.is_empty());
     assert!(windows.to_string().to_lowercase().contains("konsole"));
-    let attach_args = json!({
-        "session_id":session_id, "owner_pid":owner_pid, "user_authorized":true,
-        "application":"owned Konsole attachment regression",
-    });
-    let mut denied_args = attach_args.clone();
-    denied_args["user_authorized"] = json!(false);
-    let denied = call_tool(&mut attacher, 2, "session_attach", denied_args);
-    assert_eq!(
-        denied["error"]["data"]["reason"],
-        "explicit_authorization_required"
-    );
+    let attach_args = json!({"session_id":session_id, "owner_pid":owner_pid});
     let mut wrong_pid = attach_args.clone();
     wrong_pid["owner_pid"] = json!(owner_pid + 1);
     let denied = call_tool(&mut attacher, 3, "session_attach", wrong_pid);
