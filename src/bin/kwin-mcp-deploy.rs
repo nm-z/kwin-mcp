@@ -175,11 +175,11 @@ fn package(artifacts: &Path, destination: &Path, identity: &str) -> Result<()> {
     }
     fs::write(
         destination.join("systemd/kwin-mcp-gateway.service"),
-        include_str!("../../packaging/systemd/kwin-mcp-gateway.service"),
+        include_str!("../../systemd/kwin-mcp-gateway.service"),
     )?;
     fs::write(
         destination.join("systemd/kwin-mcp-tunnel.service"),
-        include_str!("../../packaging/systemd/kwin-mcp-tunnel.service"),
+        include_str!("../../systemd/kwin-mcp-tunnel.service"),
     )?;
     fs::write(
         destination.join("DEPLOYMENT.md"),
