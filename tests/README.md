@@ -91,3 +91,21 @@ The checked-in `evidence/396` images show the baseline race returning parent
 pixels under the chooser's identity, and the candidate's verified chooser and
 subsequent parent capture. The candidate rejects the race, so that response
 intentionally has no PNG.
+
+# Remote viewer stream
+
+```bash
+cargo test --release --test remote_viewer_e2e -- --ignored
+```
+
+This starts three production servers from one private HOME that holds a shared
+secret: a listener on a loopback port with `--link-mbps 400`, the server that
+starts a 1280x720 session on it, and a third server whose isolated desktop
+receives the viewer window, so nothing opens on the tester's own desktop. It
+reads the viewer's `viewer-stream.json` counters to check that frames arrive at
+the window's size (raw at 640x360, DSC below 8 bpp at 1280x720 under that
+budget), that an idle screen sends none, that agent typing sends some, that
+keys typed into the window create a file in the session, that `screenshot`
+still returns 1280x720, and that the frame sender stops when the window closes,
+on `viewer_close`, and when the calling server is killed. Build in release:
+the software DSC codec is too slow unoptimized for the viewer's start timeout.

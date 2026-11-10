@@ -1,0 +1,70 @@
+kwin-viewer: stream: viewer 127.0.0.1:50470 over lo, --link-mbps 1000; budget 900 Mb/s
+kwin-viewer: connected to pipewire node 46
+kwin-viewer: pw stream Unconnected -> Connecting
+kwin-viewer: pw stream Connecting -> Paused
+kwin-viewer: negotiated VideoFormat::BGRx 1920x1080 @ 0/1
+kwin-viewer: pw stream Paused -> Streaming
+kwin-viewer: first PipeWire frame received: 1920x1080, chunk=8294400, stride=7680, mapped=8294400
+kwin-viewer: stream: sending dsc 1920x1080 at 8.00 bpp, 2073624 bytes per frame (995 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 8.00 -> 7.19 bpp (frame took 32.6 ms, complexity 0/1000, 995 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1920x1080 at 7.19 bpp, 1866264 bytes per frame (896 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 4.0 frames/s, 61.1 Mb/s; per frame scale 0.0 ms, encode 39.3 ms, send 0.4 ms, slowest 58.6 ms; 2 parameter sets, 0 unchanged captures skipped, 3 captures replaced by a newer one
+kwin-viewer: stream: sent 1.6 frames/s, 24.2 Mb/s; per frame scale 0.0 ms, encode 28.2 ms, send 0.4 ms, slowest 28.7 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sending dsc 1280x720 at 8.00 bpp, 921624 bytes per frame (442 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 1.0 frames/s, 7.3 Mb/s; per frame scale 2.4 ms, encode 13.4 ms, send 0.2 ms, slowest 16.1 ms; 1 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 8.9 frames/s, 65.5 Mb/s; per frame scale 2.9 ms, encode 15.4 ms, send 0.2 ms, slowest 23.1 ms; 0 parameter sets, 1 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: rate 8.00 -> 7.06 bpp (frame took 18.6 ms, complexity 4/1000, 442 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 7.06 bpp, 815064 bytes per frame (391 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 26.6 frames/s, 191.6 Mb/s; per frame scale 2.6 ms, encode 15.4 ms, send 0.2 ms, slowest 24.1 ms; 1 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: rate 7.06 -> 6.12 bpp (frame took 20.4 ms, complexity 7/1000, 391 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 6.12 bpp, 705624 bytes per frame (339 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 6.12 -> 6.00 bpp (frame took 18.4 ms, complexity 13/1000, 339 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 6.00 bpp, 691224 bytes per frame (332 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 23.2 frames/s, 132.1 Mb/s; per frame scale 2.5 ms, encode 16.5 ms, send 0.2 ms, slowest 22.4 ms; 2 parameter sets, 1 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.6 frames/s, 130.6 Mb/s; per frame scale 2.0 ms, encode 15.3 ms, send 0.2 ms, slowest 23.7 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.6 frames/s, 130.4 Mb/s; per frame scale 2.2 ms, encode 15.5 ms, send 0.2 ms, slowest 22.6 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.2 frames/s, 128.5 Mb/s; per frame scale 2.0 ms, encode 14.7 ms, send 0.2 ms, slowest 20.4 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.6 frames/s, 130.6 Mb/s; per frame scale 1.9 ms, encode 15.2 ms, send 0.2 ms, slowest 22.5 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 21.0 frames/s, 116.0 Mb/s; per frame scale 2.3 ms, encode 15.8 ms, send 0.2 ms, slowest 25.5 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.2 frames/s, 128.4 Mb/s; per frame scale 2.3 ms, encode 16.6 ms, send 0.2 ms, slowest 25.4 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 23.5 frames/s, 130.2 Mb/s; per frame scale 1.9 ms, encode 15.0 ms, send 0.2 ms, slowest 21.0 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sending dsc 1920x1080 at 8.00 bpp, 2073624 bytes per frame (995 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 8.00 -> 7.19 bpp (frame took 38.8 ms, complexity 2/1000, 995 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1920x1080 at 7.19 bpp, 1866264 bytes per frame (896 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 7.19 -> 6.25 bpp (frame took 43.4 ms, complexity 4/1000, 894 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1920x1080 at 6.25 bpp, 1620024 bytes per frame (778 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 22.7 frames/s, 232.2 Mb/s; per frame scale 0.9 ms, encode 30.9 ms, send 0.3 ms, slowest 53.5 ms; 3 parameter sets, 0 unchanged captures skipped, 2 captures replaced by a newer one
+kwin-viewer: stream: rate 6.25 -> 6.00 bpp (frame took 39.3 ms, complexity 10/1000, 778 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1920x1080 at 6.00 bpp, 1555224 bytes per frame (747 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 22.6 frames/s, 283.4 Mb/s; per frame scale 0.0 ms, encode 41.1 ms, send 0.3 ms, slowest 52.8 ms; 1 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 22.5 frames/s, 280.0 Mb/s; per frame scale 0.0 ms, encode 42.6 ms, send 0.3 ms, slowest 52.8 ms; 0 parameter sets, 0 unchanged captures skipped, 1 captures replaced by a newer one
+kwin-viewer: stream: sent 21.0 frames/s, 261.2 Mb/s; per frame scale 0.0 ms, encode 45.1 ms, send 0.4 ms, slowest 53.6 ms; 0 parameter sets, 0 unchanged captures skipped, 2 captures replaced by a newer one
+kwin-viewer: stream: sent 21.1 frames/s, 262.3 Mb/s; per frame scale 0.0 ms, encode 46.2 ms, send 0.4 ms, slowest 56.3 ms; 0 parameter sets, 0 unchanged captures skipped, 2 captures replaced by a newer one
+kwin-viewer: stream: sent 14.6 frames/s, 182.1 Mb/s; per frame scale 0.0 ms, encode 41.8 ms, send 0.3 ms, slowest 48.2 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 21.6 frames/s, 268.6 Mb/s; per frame scale 0.0 ms, encode 44.6 ms, send 0.4 ms, slowest 55.6 ms; 0 parameter sets, 0 unchanged captures skipped, 3 captures replaced by a newer one
+kwin-viewer: stream: sent 22.4 frames/s, 278.6 Mb/s; per frame scale 0.0 ms, encode 44.3 ms, send 0.3 ms, slowest 49.3 ms; 0 parameter sets, 0 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 21.9 frames/s, 272.3 Mb/s; per frame scale 0.0 ms, encode 43.8 ms, send 0.4 ms, slowest 52.7 ms; 0 parameter sets, 0 unchanged captures skipped, 1 captures replaced by a newer one
+kwin-viewer: stream: sent 12.6 frames/s, 156.7 Mb/s; per frame scale 0.0 ms, encode 46.1 ms, send 0.3 ms, slowest 56.0 ms; 0 parameter sets, 0 unchanged captures skipped, 1 captures replaced by a newer one
+kwin-viewer: stream: sent 0.0 frames/s, 0.0 Mb/s; per frame scale 0.0 ms, encode 0.0 ms, send 0.0 ms, slowest 0.0 ms; 0 parameter sets, 1 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 16.7 frames/s, 208.0 Mb/s; per frame scale 0.0 ms, encode 39.8 ms, send 0.3 ms, slowest 46.4 ms; 0 parameter sets, 0 unchanged captures skipped, 20 captures replaced by a newer one
+kwin-viewer: stream: sent 23.6 frames/s, 293.9 Mb/s; per frame scale 0.0 ms, encode 41.8 ms, send 0.4 ms, slowest 51.6 ms; 0 parameter sets, 0 unchanged captures skipped, 37 captures replaced by a newer one
+kwin-viewer: stream: sent 25.3 frames/s, 315.0 Mb/s; per frame scale 0.0 ms, encode 38.4 ms, send 0.3 ms, slowest 44.4 ms; 0 parameter sets, 1 unchanged captures skipped, 32 captures replaced by a newer one
+kwin-viewer: stream: sent 24.4 frames/s, 303.3 Mb/s; per frame scale 0.0 ms, encode 40.5 ms, send 0.3 ms, slowest 49.3 ms; 0 parameter sets, 0 unchanged captures skipped, 35 captures replaced by a newer one
+kwin-viewer: stream: sent 25.4 frames/s, 316.5 Mb/s; per frame scale 0.0 ms, encode 38.9 ms, send 0.3 ms, slowest 46.2 ms; 0 parameter sets, 0 unchanged captures skipped, 35 captures replaced by a newer one
+kwin-viewer: stream: sent 23.5 frames/s, 292.8 Mb/s; per frame scale 0.0 ms, encode 42.0 ms, send 0.3 ms, slowest 51.2 ms; 0 parameter sets, 0 unchanged captures skipped, 32 captures replaced by a newer one
+kwin-viewer: stream: sent 24.3 frames/s, 302.9 Mb/s; per frame scale 0.0 ms, encode 40.6 ms, send 0.3 ms, slowest 48.0 ms; 0 parameter sets, 0 unchanged captures skipped, 37 captures replaced by a newer one
+kwin-viewer: stream: sending dsc 1280x720 at 8.00 bpp, 921624 bytes per frame (442 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 8.00 -> 7.06 bpp (frame took 21.0 ms, complexity 1/1000, 442 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 7.06 bpp, 815064 bytes per frame (391 Mb/s at 60 Hz)
+kwin-viewer: stream: rate 7.06 -> 6.12 bpp (frame took 23.5 ms, complexity 3/1000, 391 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 6.12 bpp, 705624 bytes per frame (339 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 32.6 frames/s, 265.0 Mb/s; per frame scale 3.5 ms, encode 24.1 ms, send 0.2 ms, slowest 54.9 ms; 3 parameter sets, 7 unchanged captures skipped, 22 captures replaced by a newer one
+kwin-viewer: stream: rate 6.12 -> 6.00 bpp (frame took 17.9 ms, complexity 12/1000, 339 Mb/s at 60 Hz against a budget of 900 Mb/s)
+kwin-viewer: stream: sending dsc 1280x720 at 6.00 bpp, 691224 bytes per frame (332 Mb/s at 60 Hz)
+kwin-viewer: stream: sent 39.4 frames/s, 219.9 Mb/s; per frame scale 3.8 ms, encode 16.9 ms, send 0.2 ms, slowest 27.9 ms; 1 parameter sets, 16 unchanged captures skipped, 3 captures replaced by a newer one
+kwin-viewer: stream: sent 38.5 frames/s, 213.1 Mb/s; per frame scale 2.9 ms, encode 15.3 ms, send 0.2 ms, slowest 24.1 ms; 0 parameter sets, 21 unchanged captures skipped, 0 captures replaced by a newer one
+kwin-viewer: stream: sent 39.6 frames/s, 218.8 Mb/s; per frame scale 5.0 ms, encode 19.5 ms, send 0.2 ms, slowest 52.8 ms; 0 parameter sets, 3 unchanged captures skipped, 18 captures replaced by a newer one
+kwin-viewer: stream: sent 43.5 frames/s, 240.6 Mb/s; per frame scale 4.1 ms, encode 17.5 ms, send 0.2 ms, slowest 32.2 ms; 0 parameter sets, 5 unchanged captures skipped, 12 captures replaced by a newer one
+kwin-viewer: stream: sent 42.8 frames/s, 236.5 Mb/s; per frame scale 4.4 ms, encode 18.2 ms, send 0.2 ms, slowest 28.2 ms; 0 parameter sets, 3 unchanged captures skipped, 15 captures replaced by a newer one
+kwin-viewer: stream: sent 43.9 frames/s, 242.5 Mb/s; per frame scale 4.6 ms, encode 17.3 ms, send 0.2 ms, slowest 25.7 ms; 0 parameter sets, 2 unchanged captures skipped, 14 captures replaced by a newer one
+kwin-viewer: stream: sent 43.0 frames/s, 237.5 Mb/s; per frame scale 4.1 ms, encode 17.0 ms, send 0.2 ms, slowest 26.6 ms; 0 parameter sets, 10 unchanged captures skipped, 7 captures replaced by a newer one

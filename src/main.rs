@@ -301,8 +301,8 @@ mod fuse_bridge {
 }
 mod host_environment;
 mod input_bridge;
-mod remote;
 mod session_registry;
+use kwin_mcp::remote;
 mod kwin_script {
     use std::collections::HashMap;
     use std::io::Write;
@@ -6509,6 +6509,9 @@ struct DisplayConfig {
     /// Serve other machines' kwin-mcp servers over WebSocket at this address
     /// instead of an MCP client on stdio.
     listen: Option<std::net::SocketAddr>,
+    /// Speed in Mb/s of the link to remote viewers, in place of the speed the
+    /// routing interface reports; a listener passes it to its frame senders.
+    link_mbps: Option<u64>,
     /// cgroup MemoryHigh for each session's sandbox in bytes; None disables throttling.
     memory_high: Option<u64>,
     memory_max: u64,
@@ -6724,6 +6727,86 @@ struct KwinMcp {
     /// before the gate is released.
     pending_cleanup: Arc<std::sync::Mutex<Option<PathBuf>>>,
     display: DisplayConfig,
+    /// Set for a session a `--listen` peer started: its viewer window is on
+    /// the peer's machine, and viewer_open takes the peer's frame socket here.
+    frame_sockets: Option<Arc<FrameSockets>>,
+}
+
+/// How long a viewer's frame socket and the viewer_open call that names its
+/// ticket wait for each other.
+const FRAME_SOCKET_WAIT: Duration = Duration::from_secs(5);
+
+enum FrameSlot {
+    /// viewer_open is waiting for the socket.
+    Wanted(tokio::sync::oneshot::Sender<std::net::TcpStream>),
+    /// The socket arrived before its viewer_open call.
+    Arrived(std::net::TcpStream),
+}
+
+/// Frame sockets a `--listen` server accepted, until the viewer_open call
+/// holding the same ticket on a control socket takes them. The ticket binds a
+/// frame socket to one session of the control connection that sent it.
+#[derive(Default)]
+struct FrameSockets {
+    slots: std::sync::Mutex<std::collections::BTreeMap<String, FrameSlot>>,
+}
+
+impl FrameSockets {
+    fn slots(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, FrameSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A peer opened the frame socket for `ticket`. Without a viewer_open call
+    /// to take it, the socket is closed after [`FRAME_SOCKET_WAIT`].
+    fn deliver(self: &Arc<Self>, ticket: String, socket: std::net::TcpStream) {
+        let mut slots = self.slots();
+        if let Some(FrameSlot::Wanted(waiter)) = slots.remove(&ticket) {
+            // A waiter that has given up drops the socket, which closes it.
+            let _ = waiter.send(socket);
+            return;
+        }
+        slots.insert(ticket.clone(), FrameSlot::Arrived(socket));
+        drop(slots);
+        let sockets = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(FRAME_SOCKET_WAIT).await;
+            let mut slots = sockets.slots();
+            if matches!(slots.get(&ticket), Some(FrameSlot::Arrived(_))) {
+                slots.remove(&ticket);
+            }
+        });
+    }
+
+    /// The frame socket for `ticket`, waiting up to [`FRAME_SOCKET_WAIT`] for
+    /// the caller's viewer to open it.
+    async fn claim(&self, ticket: &str) -> Result<std::net::TcpStream, String> {
+        struct Forget<'a>(&'a FrameSockets, &'a str);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.slots().remove(self.1);
+            }
+        }
+        let arriving = {
+            let mut slots = self.slots();
+            if let Some(FrameSlot::Arrived(socket)) = slots.remove(ticket) {
+                return Ok(socket);
+            }
+            let (waiter, arriving) = tokio::sync::oneshot::channel();
+            slots.insert(ticket.to_owned(), FrameSlot::Wanted(waiter));
+            arriving
+        };
+        // Also when this call is cancelled.
+        let _forget = Forget(self, ticket);
+        match tokio::time::timeout(FRAME_SOCKET_WAIT, arriving).await {
+            Ok(Ok(socket)) => Ok(socket),
+            Ok(Err(_)) | Err(_) => Err(format!(
+                "the calling machine's viewer opened no frame socket within {} seconds",
+                FRAME_SOCKET_WAIT.as_secs()
+            )),
+        }
+    }
 }
 
 /// Bound on each session lock the reaper waits for, so one stuck handle cannot
@@ -7096,6 +7179,7 @@ impl KwinMcp {
             startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             pending_cleanup: Arc::new(std::sync::Mutex::new(None)),
             display,
+            frame_sockets: None,
         }
     }
     /// Logs a startup checkpoint that runs once per start.
@@ -10109,6 +10193,79 @@ async fn spawn_viewer(
     }
 }
 
+/// Start the frame sender beside a session whose viewer window is on another
+/// machine: `kwin-viewer --stream-serve` with that viewer's frame socket as its
+/// stdin. It reports through the same status file and log as a local viewer,
+/// and ends when the socket closes or the session stops.
+async fn spawn_frame_sender(
+    host_xdg_dir: &Path,
+    width: u32,
+    height: u32,
+    socket: std::net::TcpStream,
+    link_mbps: Option<u64>,
+) -> Result<SessionProcess, String> {
+    let log_path = host_xdg_dir.join("viewer.log");
+    let _ = std::fs::remove_file(host_xdg_dir.join(VIEWER_STATUS_FILE));
+    let _ = std::fs::remove_file(host_xdg_dir.join("viewer-pipewire.json"));
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|error| format!("create {}: {error}", log_path.display()))?;
+    let bin = resolve_viewer_binary()
+        .ok_or_else(|| "kwin-viewer binary not found next to kwin-mcp".to_owned())?;
+    let mut command = std::process::Command::new(&bin);
+    command
+        .arg("--stream-serve")
+        .arg(host_xdg_dir)
+        .arg(width.to_string())
+        .arg(height.to_string());
+    if let Some(mbps) = link_mbps {
+        command.arg("--link-mbps").arg(mbps.to_string());
+    }
+    command
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(socket)))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file));
+    terminate_with_parent(&mut command);
+    let child = spawn_session_child(command, false)
+        .await
+        .map_err(|error| format!("frame sender spawn failed: {error}"))?;
+    eprintln!("viewer_open: spawned frame sender pid={}", child.id());
+    Ok(child.into())
+}
+
+/// Start the viewer window on this machine for a session on `host`: it opens
+/// the frame socket named by `ticket` to that machine's listener and reports
+/// through the status file and log in `dir`.
+async fn spawn_remote_viewer(dir: &Path, host: &str, ticket: &str) -> Result<SessionProcess, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let log_path = dir.join("viewer.log");
+    let _ = std::fs::remove_file(dir.join(VIEWER_STATUS_FILE));
+    let _ = std::fs::remove_file(dir.join(kwin_mcp::viewer_stream::COUNTERS_FILE));
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|error| format!("create {}: {error}", log_path.display()))?;
+    let bin = resolve_viewer_binary()
+        .ok_or_else(|| "kwin-viewer binary not found next to kwin-mcp".to_owned())?;
+    let (runtime, display) = host_wayland()
+        .await
+        .map_err(|error| format!("this machine has no desktop to show the viewer on: {error:#}"))?;
+    let mut command = std::process::Command::new(&bin);
+    command
+        .arg("--stream")
+        .arg(host)
+        .arg(dir)
+        .env(remote::TICKET_ENV, ticket)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("WAYLAND_DISPLAY", display)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file));
+    terminate_with_parent(&mut command);
+    let child = spawn_session_child(command, false)
+        .await
+        .map_err(|error| format!("viewer spawn failed: {error}"))?;
+    eprintln!("viewer_open: spawned viewer pid={} for a session on {host}", child.id());
+    Ok(child.into())
+}
+
 /// The viewer outcome: ready (the first session frame was submitted by the
 /// host renderer), starting, unavailable with a reason, or closed.
 fn viewer_report(
@@ -11274,6 +11431,11 @@ impl ClipboardStore {
 struct ViewerOpenParams {
     /// A short instruction for the user. Displayed only in the viewer title.
     reason: Option<String>,
+    /// Sent by the kwin-mcp server that started this session on a `--listen`
+    /// server: the ticket of the frame socket its viewer opens.
+    #[schemars(skip)]
+    #[serde(default)]
+    frame_ticket: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -14490,7 +14652,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open or reuse the live viewer for this isolated session on the server's desktop. Use it when the user asks to watch or must see or act on a password, OTP, Duo, CAPTCHA, choice or result. First navigate to the relevant form and show the entry; pass reason with a short instruction for the window title. Never assume the viewer is open or stop the session for a handoff. Keep the page open and poll screenshots; continue when the step completes. If Duo expires, leave the resend option visible and tell the user. The viewer may stay open; the user can close it. Viewer input is forwarded immediately and cancels remaining in-flight agent events with retry_safe=false: inspect before retrying. New agent input receives a retry-safe error for one second after viewer input; resume after a quiet second. Returns ready after the host renderer submits its first PipeWire frame, or unavailable with the startup failure and last PipeWire state. On a headless host, the reason gives a kwin-viewer --remote HOST DIR command to show this session elsewhere without restarting it. Works with --no-viewer. In the local viewer Ctrl+C/Ctrl+X copies to the server host clipboard and Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares local viewer paste; target=session prepares agent input. clipboard_read reads session text only and withholds generated secrets."
+        description = "Open or reuse the live viewer for this isolated session on the server's desktop. Use it when the user asks to watch or must see or act on a password, OTP, Duo, CAPTCHA, choice or result. First navigate to the relevant form and show the entry; pass reason with a short instruction for the window title. Never assume the viewer is open or stop the session for a handoff. Keep the page open and poll screenshots; continue when the step completes. If Duo expires, leave the resend option visible and tell the user. The viewer may stay open; the user can close it. Viewer input is forwarded immediately and cancels remaining in-flight agent events with retry_safe=false: inspect before retrying. New agent input receives a retry-safe error for one second after viewer input; resume after a quiet second. Returns ready after the host renderer submits its first PipeWire frame, or unavailable with the startup failure and last PipeWire state. On a headless host, the reason gives a kwin-viewer --remote HOST DIR command to show this session elsewhere without restarting it. For a session started with host, the window still opens on this server's desktop: that machine sends the frames, scaled to the window, over a second WebSocket, and viewer input returns on it. Works with --no-viewer. In the local viewer Ctrl+C/Ctrl+X copies to the server host clipboard and Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares local viewer paste; target=session prepares agent input. clipboard_read reads session text only and withholds generated secrets."
     )]
     async fn viewer_open(
         &self,
@@ -14517,6 +14679,20 @@ impl KwinMcp {
         } else {
             format!("kwin-viewer {}: {reason}", self.session_id)
         };
+        // A listener peer's window is on the peer's machine: this side runs the
+        // frame sender, once per frame socket the peer's viewer opens.
+        let frames = match (self.frame_sockets.as_ref(), params.frame_ticket) {
+            (Some(sockets), Some(ticket)) => Some((Arc::clone(sockets), ticket)),
+            (Some(_), None) => None,
+            (None, Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "frame_ticket is accepted only for a session a --listen server started for another machine",
+                    None,
+                ));
+            }
+            (None, None) => None,
+        };
+        let remote_window = self.frame_sockets.is_some();
         let (host_xdg_dir, width, height, existing, stale) = {
             let mut guard = self.session.write().await;
             let sess = guard.as_mut().ok_or_else(|| {
@@ -14537,7 +14713,9 @@ impl KwinMcp {
             } else {
                 None
             };
-            if let Some(viewer) = viewer.as_ref()
+            // A new frame socket replaces whatever served the previous one.
+            if frames.is_none()
+                && let Some(viewer) = viewer.as_ref()
                 && viewer["state"] == "ready"
             {
                 let message = format!("viewer already open: {}", viewer_summary(viewer));
@@ -14549,9 +14727,24 @@ impl KwinMcp {
                 )
                 .await);
             }
-            let reuse = viewer
-                .as_ref()
-                .is_some_and(|viewer| viewer["state"] == "starting");
+            if remote_window && frames.is_none() {
+                let viewer = serde_json::json!({
+                    "state": "unavailable",
+                    "reason": "no frame socket is open for this session; the server that started it opens one when its viewer_open is called",
+                    "log": sess.host_xdg_dir.join("viewer.log"),
+                });
+                drop(guard);
+                return Ok(structured_result(
+                    &peer,
+                    format!("viewer unavailable: {}", viewer_summary(&viewer)),
+                    serde_json::json!({"status": "unavailable", "viewer": viewer}),
+                )
+                .await);
+            }
+            let reuse = frames.is_none()
+                && viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer["state"] == "starting");
             let (existing, stale) = if running {
                 let child = sess.viewer_child.take();
                 if reuse { (child, None) } else { (None, child) }
@@ -14572,9 +14765,16 @@ impl KwinMcp {
                 .map_err(|error| KwinError::Msg(format!("viewer cleanup task failed: {error}")))?;
         }
         let reused = existing.is_some();
-        let spawned = match existing {
-            Some(child) => Ok(child),
-            None => spawn_viewer(&host_xdg_dir, width, height).await,
+        let spawned = match (existing, frames) {
+            (Some(child), _) => Ok(child),
+            (None, Some((sockets, ticket))) => match sockets.claim(&ticket).await {
+                Ok(socket) => {
+                    spawn_frame_sender(&host_xdg_dir, width, height, socket, self.display.link_mbps)
+                        .await
+                }
+                Err(reason) => Err(reason),
+            },
+            (None, None) => spawn_viewer(&host_xdg_dir, width, height).await,
         };
         let mut guard = self.session.write().await;
         let Some(sess) = guard
@@ -18086,6 +18286,9 @@ Options:\n\
                          stdio (default port: {}); peers must present the shared secret in\n\
                          ~/.config/kwin-mcp/remote-secret (mode 0600). A peer's sessions\n\
                          stop when its connection drops\n\
+  --link-mbps N          With --listen: speed in Mb/s of the link to remote viewers, in\n\
+                         place of the routing interface's own (loopback: unlimited). Frames\n\
+                         go out raw when 60 a second fit 90% of it, else as DSC\n\
   --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
   --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
   --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
@@ -18117,6 +18320,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
         ttl: None,
         keep_sessions: None,
         listen: None,
+        link_mbps: None,
         memory_high: Some(DEFAULT_MEMORY_HIGH),
         memory_max: DEFAULT_MEMORY_MAX,
         memory_swap_max: DEFAULT_MEMORY_SWAP_MAX,
@@ -18139,6 +18343,18 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
                     .ok_or_else(|| "--listen requires ADDRESS[:PORT]".to_owned())?;
                 cfg.listen = Some(remote::parse_listen(&value)?);
             }
+            "--link-mbps" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--link-mbps requires a speed in Mb/s".to_owned())?;
+                cfg.link_mbps = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|mbps| *mbps > 0)
+                        .ok_or_else(|| format!("--link-mbps '{value}' is not a positive whole number of Mb/s"))?,
+                );
+            }
             "--memory-high" => {
                 cfg.memory_high = match parse_memory_arg(&mut args, "--memory-high")? {
                     0 => None,
@@ -18159,6 +18375,12 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
     if cfg.listen.is_some() && cfg.keep_sessions.is_some() {
         return Err(
             "--listen cannot be combined with --keep-sessions: a listener's sessions end with the peer that started them"
+                .to_owned(),
+        );
+    }
+    if cfg.link_mbps.is_some() && cfg.listen.is_none() {
+        return Err(
+            "--link-mbps applies to --listen: the listener sends a remote viewer's frames"
                 .to_owned(),
         );
     }
@@ -19395,6 +19617,9 @@ struct SessionRouter {
     /// only the sessions it started: no attach, and no forwarding to another
     /// process or machine.
     listener_peer: bool,
+    /// Frame sockets this `--listen` server accepted and no viewer_open call
+    /// has taken yet; shared by the routers of all its peers.
+    frame_sockets: Arc<FrameSockets>,
 }
 
 type RemoteHost = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>;
@@ -19408,6 +19633,44 @@ struct RemoteSessions {
     hosts: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteHost>>,
     /// session_id → the listener that owns it.
     sessions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// session_id → the viewer window on this machine. Held across a whole
+    /// viewer_open or viewer_close, so they run one at a time.
+    viewers: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteViewer>>,
+}
+
+/// The viewer of a session on another machine: a `kwin-viewer --stream`
+/// process on this machine and the directory with its status file and log.
+struct RemoteViewer {
+    child: Option<SessionProcess>,
+    dir: PathBuf,
+}
+
+impl RemoteViewer {
+    fn new(session_id: &str) -> Self {
+        // The dead-owner sweep removes the directory if this server is killed.
+        let name = format!("kwin-mcp-{}-viewer-{session_id}", std::process::id());
+        Self {
+            child: None,
+            dir: session_runtime_root(&name).join(name),
+        }
+    }
+
+    /// Closes the window, which closes its frame socket and so ends the
+    /// capture on the session's machine.
+    async fn close(&mut self) -> bool {
+        let Some(child) = self.child.take() else {
+            return false;
+        };
+        let _ = tokio::task::spawn_blocking(move || terminate_child(child, false, "remote viewer"))
+            .await;
+        true
+    }
+
+    /// Closes the window and removes its directory; the session is gone.
+    async fn discard(mut self) {
+        self.close().await;
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn remote_error(reason: &'static str, host: &str, message: String) -> McpError {
@@ -19462,8 +19725,19 @@ impl RemoteSessions {
         hosts.insert(host.to_owned(), service);
         Ok(peer)
     }
+    /// Closes the viewer of a session that has ended.
+    async fn discard_viewer(&self, id: &str) {
+        let viewer = self.viewers.lock().await.remove(id);
+        if let Some(viewer) = viewer {
+            viewer.discard().await;
+        }
+    }
     /// Ends every connection, which makes each listener stop this server's sessions.
     async fn close(&self) {
+        let viewers = std::mem::take(&mut *self.viewers.lock().await);
+        for viewer in viewers.into_values() {
+            viewer.discard().await;
+        }
         let hosts = std::mem::take(&mut *self.hosts.lock().await);
         for (host, service) in hosts {
             eprintln!("remote: closing the connection to {host}; its sessions stop with it");
@@ -19488,6 +19762,26 @@ async fn remote_call(
             ),
         )),
     }
+}
+
+/// A viewer_open or viewer_close result for a session on `host`, in the form
+/// the local tools return, plus the host.
+async fn remote_viewer_result(
+    peer: &rmcp::Peer<rmcp::RoleServer>,
+    status: &str,
+    viewer: serde_json::Value,
+    host: &str,
+) -> CallToolResult {
+    let text = match status {
+        "closed" | "already_closed" => format!("viewer {status}"),
+        _ => format!("viewer {status}: {}", viewer_summary(&viewer)),
+    };
+    structured_result(
+        peer,
+        text,
+        serde_json::json!({"status": status, "viewer": viewer, "host": host}),
+    )
+    .await
 }
 
 fn local_host_name() -> String {
@@ -19588,6 +19882,7 @@ impl SessionRouter {
             chrome_profiles: Arc::new(host_chrome_profiles()),
             remote: Arc::default(),
             listener_peer: false,
+            frame_sockets: Arc::default(),
             attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
@@ -19671,26 +19966,12 @@ impl SessionRouter {
         host: &str,
         peer: &rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if request.name == "viewer_open" {
-            let mut result = structured_result(
-                peer,
-                format!(
-                    "viewer_open is not yet supported for remote sessions (#915); session {id} runs on {host}. Use screenshot to observe it."
-                ),
-                serde_json::json!({
-                    "status": "unsupported", "reason": "remote_viewer_unsupported",
-                    "session_id": id, "host": host,
-                }),
-            )
-            .await;
-            result.is_error = Some(true);
-            return Ok(result);
-        }
         let stop = request.name == "session_stop";
         let Some(listener) = self.remote.connected(host).await else {
             // The listener stopped the session when the connection ended.
             if stop {
                 self.remote.sessions().remove(id);
+                self.remote.discard_viewer(id).await;
                 return Ok(structured_result(
                     peer,
                     format!(
@@ -19710,6 +19991,16 @@ impl SessionRouter {
                 ),
             ));
         };
+        if request.name == "viewer_open" {
+            return self
+                .open_remote_viewer(request, id, host, &listener, peer)
+                .await;
+        }
+        if request.name == "viewer_close" {
+            return self
+                .close_remote_viewer(request, id, host, &listener, peer)
+                .await;
+        }
         let result = remote_call(&listener, host, request).await;
         if stop
             && result.as_ref().is_ok_and(|done| {
@@ -19720,8 +20011,134 @@ impl SessionRouter {
             })
         {
             self.remote.sessions().remove(id);
+            self.remote.discard_viewer(id).await;
         }
         result
+    }
+    /// viewer_open for a session on another machine. The window opens on this
+    /// machine; it opens a frame socket of its own to the session's listener,
+    /// and the ticket sent with this call on the control socket tells the
+    /// listener which session's frames belong on it.
+    async fn open_remote_viewer(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        id: &str,
+        host: &str,
+        listener: &rmcp::Peer<rmcp::RoleClient>,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut viewers = self.remote.viewers.lock().await;
+        let viewer = viewers
+            .entry(id.to_owned())
+            .or_insert_with(|| RemoteViewer::new(id));
+        // An open window stays, and the session's machine takes the new title.
+        if let Some(child) = viewer.child.as_mut() {
+            let shown = viewer_report(&viewer.dir, Some(child), None);
+            if shown["state"] == "ready" {
+                let sending = remote_call(listener, host, request.clone())
+                    .await
+                    .ok()
+                    .and_then(|result| result.structured_content)
+                    .is_some_and(|data| data["status"] == "already_open");
+                if sending {
+                    return Ok(remote_viewer_result(peer, "already_open", shown, host).await);
+                }
+            }
+            viewer.close().await;
+        }
+        let ticket = remote::new_ticket();
+        let mut child = match spawn_remote_viewer(&viewer.dir, host, &ticket).await {
+            Ok(child) => child,
+            Err(reason) => {
+                eprintln!("remote viewer unavailable: {reason}");
+                let shown = viewer_report(&viewer.dir, None, Some(&reason));
+                return Ok(remote_viewer_result(peer, "unavailable", shown, host).await);
+            }
+        };
+        request
+            .arguments
+            .get_or_insert_with(Default::default)
+            .insert("frame_ticket".to_owned(), serde_json::json!(ticket));
+        // Returns once the frame sender there saw this window present a frame,
+        // or with the reason it could not.
+        let sender = remote_call(listener, host, request).await;
+        let refused = match &sender {
+            Err(error) => Some(error.message.to_string()),
+            Ok(result) => match result.structured_content.as_ref().map(|data| &data["viewer"]) {
+                Some(sender) if sender["state"] == "ready" => None,
+                Some(sender) => Some(
+                    sender["reason"]
+                        .as_str()
+                        .unwrap_or("its frame sender did not become ready")
+                        .to_owned(),
+                ),
+                None => Some("it returned no viewer state".to_owned()),
+            },
+        };
+        let sender_started = refused.is_none();
+        let log = viewer.dir.join("viewer.log");
+        let mut shown = viewer_report(&viewer.dir, Some(&mut child), None);
+        // A window that already exited names its own reason.
+        if shown["state"] != "unavailable" {
+            shown = match refused {
+                None => wait_for_viewer(&viewer.dir, &mut child).await,
+                Some(reason) => serde_json::json!({
+                    "state": "unavailable",
+                    "reason": format!("{host} sent no frames: {reason}"),
+                    "log": log,
+                }),
+            };
+        }
+        if shown["state"] == "starting" {
+            shown = serde_json::json!({
+                "state": "unavailable",
+                "reason": format!(
+                    "viewer did not submit a frame within {} seconds",
+                    VIEWER_READY_WAIT.as_secs()
+                ),
+                "log": log,
+            });
+        }
+        if shown["state"] == "unavailable" {
+            let _ = tokio::task::spawn_blocking(move || {
+                terminate_child(child, false, "failed remote viewer")
+            })
+            .await;
+            // The sender ends with its socket; this reaps it at once.
+            if sender_started
+                && let Ok(close) = serde_json::from_value::<rmcp::model::CallToolRequestParams>(
+                    serde_json::json!({"name": "viewer_close", "arguments": {"session_id": id}}),
+                )
+            {
+                let _ = remote_call(listener, host, close).await;
+            }
+            return Ok(remote_viewer_result(peer, "unavailable", shown, host).await);
+        }
+        viewer.child = Some(child);
+        Ok(remote_viewer_result(peer, "opened", shown, host).await)
+    }
+    /// viewer_close for a session on another machine: closes the window here,
+    /// which closes its frame socket, and has the listener reap the sender.
+    async fn close_remote_viewer(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        id: &str,
+        host: &str,
+        listener: &rmcp::Peer<rmcp::RoleClient>,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut viewers = self.remote.viewers.lock().await;
+        let viewer = viewers
+            .entry(id.to_owned())
+            .or_insert_with(|| RemoteViewer::new(id));
+        let status = if viewer.close().await {
+            "closed"
+        } else {
+            "already_closed"
+        };
+        let _ = remote_call(listener, host, request).await;
+        let shown = viewer_report(&viewer.dir, None, None);
+        Ok(remote_viewer_result(peer, status, shown, host).await)
     }
     /// session_list records for sessions on other machines, each with its host.
     async fn remote_records(&self) -> Vec<serde_json::Value> {
@@ -19809,6 +20226,9 @@ impl SessionRouter {
             let mut session = KwinMcp::new(self.display);
             session.session_id = id.clone();
             session.clipboards = self.clipboards.clone();
+            if self.listener_peer {
+                session.frame_sockets = Some(Arc::clone(&self.frame_sockets));
+            }
             session.input_log =
                 Some(InputLog::open(&id, InputHistory::default(), None).map_err(KwinError::from)?);
             let name = format!("kwin-mcp-{}-{number}", std::process::id());
@@ -21356,7 +21776,14 @@ async fn serve_listener_peer(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let transport = match remote::accept(stream, &secret).await {
-        Ok(transport) => transport,
+        Ok(remote::Accepted::Control(sink, stream)) => (sink, stream),
+        // A viewer's frame socket: the viewer_open call that carries the same
+        // ticket on a control socket hands it to that session's frame sender.
+        Ok(remote::Accepted::Frames { ticket, socket }) => {
+            eprintln!("listen: {address} opened a frame socket");
+            router.frame_sockets.deliver(ticket, socket);
+            return;
+        }
         Err(error) => {
             eprintln!("listen: refused {address}: {error}");
             return;
@@ -21943,6 +22370,7 @@ mod instructions_tests {
                 ttl: None,
                 keep_sessions: None,
                 listen: None,
+                link_mbps: None,
                 memory_high: None,
                 memory_max: 0,
                 memory_swap_max: 0,
@@ -22261,6 +22689,7 @@ mod startup_report_tests {
             ttl: None,
             keep_sessions: None,
             listen: None,
+            link_mbps: None,
             memory_high: None,
             memory_max: 0,
             memory_swap_max: 0,

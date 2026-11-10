@@ -15,7 +15,10 @@
 //! window. Mouse/keyboard events on the window are forwarded back into the
 //! container via org_kde_kwin_fake_input.
 
+use async_tungstenite::tungstenite::Message;
 use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
+use kwin_mcp::viewer_stream::{Header, Notice, Payload};
+use kwin_mcp::{dsc, remote, viewer_stream};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
@@ -134,9 +137,30 @@ fn write_status(session: &std::path::Path, state: &str, detail: &str) {
 struct Frame {
     width: u32,
     height: u32,
-    // Tightly packed RGBA8 (stride == 4 * width). Video format conversion
-    // happens in the pipewire callback so the render path stays trivial.
-    rgba: Vec<u8>,
+    // Tightly packed 4-byte pixels (stride == 4 * width) in the layout the
+    // consumer asked for: RGBA8 for a window, BGRx for the stream sender.
+    // Video format conversion happens in the pipewire callback so the render
+    // path stays trivial.
+    pixels: Vec<u8>,
+    // When PipeWire delivered the picture, in microseconds since the Unix
+    // epoch on the clock of the machine that captured it.
+    captured_micros: u64,
+    // Counts the pictures of one source: PipeWire deliveries, or the sequence
+    // number a stream sender gave.
+    serial: u64,
+}
+
+// Pixel layout the PipeWire callback hands out.
+#[derive(Clone, Copy)]
+enum CaptureLayout {
+    Rgba,
+    Bgrx,
+}
+
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
 }
 
 // Latest-frame mailbox. PipeWire's process callback writes; the window's
@@ -602,7 +626,7 @@ impl ClipboardBridge {
     }
 }
 
-const USAGE: &str = "usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --remote HOST /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --serve /tmp/kwin-mcp-<pid> [width height]";
+const USAGE: &str = "usage: kwin-viewer /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --remote HOST /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --serve /tmp/kwin-mcp-<pid> [width height]\n       kwin-viewer --stream HOST:PORT STATUS_DIR          (started by kwin-mcp viewer_open)\n       kwin-viewer --stream-serve /tmp/kwin-mcp-<pid> width height [--link-mbps N]   (started by kwin-mcp --listen)";
 
 fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1).peekable();
@@ -610,6 +634,14 @@ fn main() -> anyhow::Result<()> {
         Some("--serve") => {
             argv.next();
             serve(argv)
+        }
+        Some("--stream-serve") => {
+            argv.next();
+            stream_serve(argv)
+        }
+        Some("--stream") => {
+            argv.next();
+            run_stream(argv)
         }
         Some("--remote") => {
             argv.next();
@@ -660,6 +692,7 @@ impl SessionLink {
         virt: (u32, u32),
         shutdown: &Shutdown,
         mailbox: &FrameMailbox,
+        layout: CaptureLayout,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             session_path.join("wayland-0").exists(),
@@ -721,7 +754,7 @@ impl SessionLink {
             std::thread::Builder::new()
                 .name("pipewire".to_owned())
                 .spawn(move || {
-                    if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx) {
+                    if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx, layout) {
                         eprintln!("kwin-viewer: pipewire loop exited: {e}");
                     }
                     // Losing the video feed ends the viewer the same way a dead
@@ -819,7 +852,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     };
 
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
+    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox, CaptureLayout::Rgba)?;
     numlock.apply(&link.fake_input, &link.conn)?;
 
     let mut input_state = InputState {
@@ -837,11 +870,13 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
 
     let run_result = window_loop(
         ViewerTitle::Local(&session_path),
+        Some(&session_path),
         &mailbox,
         &shutdown,
         virt,
         &mut input_state,
         Some((&numlock, &link.fake_input, &link.conn)),
+        None,
     );
 
     // Ordered teardown, reached on every exit including a window error, which
@@ -856,8 +891,9 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
 }
 
 // The viewer window: shows the latest frame from the mailbox and forwards the
-// window's input through `input_state`. `status_dir` is where the local viewer
-// reports readiness; a remote viewer has none.
+// window's input through `input_state`. `status_dir` is where a viewer that
+// kwin-mcp started reports readiness; `--remote` has none. `stream` collects
+// what a `--stream` viewer presented.
 enum ViewerTitle<'a> {
     Local(&'a std::path::Path),
     Remote(&'a Mutex<String>, &'a str),
@@ -874,15 +910,17 @@ impl ViewerTitle<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn window_loop(
     title: ViewerTitle<'_>,
+    status_dir: Option<&std::path::Path>,
     mailbox: &FrameMailbox,
     shutdown: &Shutdown,
     virt: (u32, u32),
     input_state: &mut InputState,
     numlock: Option<(&NumLockSync, &OrgKdeKwinFakeInput, &Connection)>,
+    stream: Option<&StreamStats>,
 ) -> anyhow::Result<()> {
-    let status_dir = match &title {ViewerTitle::Local(path) => Some(*path), ViewerTitle::Remote(_,_) => None};
     let initial_title = title.text();
     let initial_scale = (INITIAL_VIEWER_WIDTH / f64::from(virt.0))
         .min(INITIAL_VIEWER_HEIGHT / f64::from(virt.1))
@@ -915,8 +953,26 @@ fn window_loop(
 
     let remote_output = match &input_state.out {
         InputOut::Local { .. } => None,
-        InputOut::Remote(pipe) => Some(Arc::clone(pipe)),
+        InputOut::Remote(sink) => Some(sink.clone()),
     };
+    // A stream sender scales to the drawable size, so it is told at the first
+    // draw and whenever it changes.
+    let reported_size = Cell::new(None::<(u32, u32)>);
+    let report_size = |size: PhysicalSize<u32>| {
+        let Some(OpSink::Socket(_)) = remote_output.as_ref() else { return };
+        let size = (size.width, size.height);
+        if size.0 == 0 || size.1 == 0 || reported_size.get() == Some(size) {
+            return;
+        }
+        reported_size.set(Some(size));
+        eprintln!("kwin-viewer: stream: drawable size {}x{} reported to the sender", size.0, size.1);
+        if let Some(sink) = remote_output.as_ref() {
+            sink.send(Op::Size(size.0, size.1));
+        }
+    };
+    // Capture time of the picture staged by the current draw, until its
+    // submission is counted.
+    let staged_capture = Cell::new(None::<u64>);
     let mut draw_frame = |mut frame: FrameContext<'_>| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
@@ -924,6 +980,7 @@ fn window_loop(
             frame.exit();
             return;
         }
+        report_size(frame.window.inner_size());
 
         if !first_host_redraw {
             first_host_redraw = true;
@@ -1006,13 +1063,14 @@ fn window_loop(
                 match Buffer::create_from_slice(
                     &device,
                     vk::BufferUsageFlags::TRANSFER_SRC,
-                    &f.rgba,
+                    &f.pixels,
                 ) {
                     Ok(staging) => {
                         let staging_node = frame.render_graph.bind_node(staging);
                         let image_node = frame.render_graph.bind_node(image);
                         frame.render_graph.copy_buffer_to_image(staging_node, image_node);
                         session_frame_queued = true;
+                        staged_capture.set(Some(f.captured_micros));
                     }
                     Err(e) => eprintln!("kwin-viewer: staging buffer failed: {e:?}"),
                 }
@@ -1041,6 +1099,11 @@ fn window_loop(
     window.run_with_submission_idle_and_event_callbacks(
         &mut draw_frame,
         || {
+            if let Some(captured) = staged_capture.take()
+                && let Some(stream) = stream
+            {
+                stream.presented(captured);
+            }
             if !ready_reported.get() && first_frame_queued.get() {
                 ready_reported.set(true);
                 eprintln!("kwin-viewer: first frame submitted for presentation");
@@ -1052,8 +1115,8 @@ fn window_loop(
                     );
                 }
                 last_status_heartbeat.set(Instant::now());
-                if let Some(pipe) = remote_output.as_ref() {
-                    send_remote_op(pipe, Op::Presented);
+                if let Some(sink) = remote_output.as_ref() {
+                    sink.send(Op::Presented);
                 }
             } else if ready_reported.get()
                 && !window_closed.get()
@@ -1089,6 +1152,7 @@ fn window_loop(
             }
             if let WindowEvent::Resized(size) = event {
                 resized.set(Some((*size, Instant::now())));
+                report_size(*size);
             }
             let size = window.inner_size();
             forward_input(event, (size.width, size.height), virt, input_state, numlock);
@@ -1186,7 +1250,7 @@ fn write_frame(out: &mut impl Write, frame: &Frame) -> anyhow::Result<()> {
         encoder.set_compression(png::Compression::Fast);
         encoder.set_filter(png::FilterType::Sub);
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&frame.rgba)?;
+        writer.write_image_data(&frame.pixels)?;
     }
     out.write_all(&[WIRE_FRAME])?;
     out.write_all(&u32::try_from(png_bytes.len())?.to_le_bytes())?;
@@ -1232,7 +1296,9 @@ fn read_frame(
         return Ok(Some(Frame {
             width: info.width,
             height: info.height,
-            rgba,
+            pixels: rgba,
+            captured_micros: unix_micros(),
+            serial: 0,
         }));
     }
 }
@@ -1247,7 +1313,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     pipewire::init();
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox)?;
+    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox, CaptureLayout::Rgba)?;
     let input = InputOut::Local {
         fake_input: link.fake_input.clone(),
         conn: link.conn.clone(),
@@ -1411,7 +1477,7 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     };
 
     let mut input_state = InputState {
-        out: InputOut::Remote(Arc::new(Mutex::new(stdin))),
+        out: InputOut::Remote(OpSink::Pipe(Arc::new(Mutex::new(stdin)))),
         last_pos: None,
         held_buttons: 0,
         active_touch: None,
@@ -1420,10 +1486,12 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     };
     let result = window_loop(
         ViewerTitle::Remote(&title, &host),
+        None,
         &mailbox,
         &shutdown,
         virt,
         &mut input_state,
+        None,
         None,
     );
     shutdown.request();
@@ -1437,6 +1505,889 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     result
 }
 
+// ── Remote viewer stream ────────────────────────────────────────────────────
+// `--stream-serve` beside the session and `--stream` on the machine with the
+// screen, joined by one WebSocket. kwin_mcp::viewer_stream documents what the
+// socket carries and the rule that picks each picture's encoding.
+
+const STREAM_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+// While the screen is unchanged the sender wakes this often for the window
+// title and its own deadlines.
+const STREAM_IDLE_POLL: Duration = Duration::from_millis(250);
+// The sender speaks first, once the listener has handed it the socket.
+const STREAM_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+type FrameSink = futures::stream::SplitSink<remote::FrameSocket, Message>;
+
+// One worker drives the socket; pictures are coded on the calling thread and
+// the scoped threads it starts.
+fn stream_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("frame-socket")
+        .enable_all()
+        .build()?)
+}
+
+fn codec_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+fn megabits(bits: u64) -> f64 {
+    bits as f64 / 1e6
+}
+
+fn bits_per_pixel(bpp_x16: u16) -> f64 {
+    f64::from(bpp_x16) / 16.0
+}
+
+fn milliseconds(micros: u64, count: u64) -> f64 {
+    micros as f64 / 1e3 / count.max(1) as f64
+}
+
+// What the viewer told the sender.
+struct ViewerLink {
+    // Drawable size in physical pixels; None until the first report.
+    size: Mutex<Option<(u32, u32)>>,
+    presented: AtomicBool,
+}
+
+impl ViewerLink {
+    fn size(&self) -> Option<(u32, u32)> {
+        *self.size.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Stored under the mailbox lock, which the sender holds from its check of
+    // the size until it waits, so the wake-up cannot fall between the two.
+    fn resize(&self, mailbox: &FrameMailbox, size: (u32, u32)) {
+        let (latest, ready) = &**mailbox;
+        let guard = latest.lock();
+        *self.size.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size);
+        drop(guard);
+        ready.notify_all();
+    }
+}
+
+struct DscStream {
+    size: (u32, u32),
+    encoder: dsc::Encoder,
+    rate: viewer_stream::RateControl,
+    // Whether the viewer has the current picture parameter set.
+    pps_sent: bool,
+}
+
+// What went out since the last log line.
+#[derive(Default)]
+struct SendWindow {
+    frames: u64,
+    bytes: u64,
+    pps: u64,
+    // Captures identical to the picture already sent.
+    unchanged: u64,
+    // Captures replaced by a newer one before the sender was free.
+    dropped: u64,
+    scale: Duration,
+    encode: Duration,
+    send: Duration,
+    slowest: Duration,
+}
+
+// The scaler for the sizes of the last picture.
+struct SizedScaler {
+    source: (u32, u32),
+    target: (u32, u32),
+    scaler: viewer_stream::Scaler,
+}
+
+struct PictureSender {
+    // Bits per second; None is unlimited.
+    budget: Option<u64>,
+    threads: usize,
+    sequence: u32,
+    scaler: Option<SizedScaler>,
+    scaled: Vec<u8>,
+    dsc: Option<DscStream>,
+    // A size the DSC encoder has no slice layout for goes out raw.
+    dsc_unsupported: Option<(u32, u32)>,
+    encoded: Vec<u8>,
+    // Encoding, size and rate of the last picture, to log each change once.
+    mode: Option<(Payload, (u32, u32), u16)>,
+    window: SendWindow,
+    window_started: Instant,
+    last_serial: u64,
+}
+
+impl PictureSender {
+    fn new(budget: Option<u64>) -> Self {
+        Self {
+            budget,
+            threads: codec_threads(),
+            sequence: 0,
+            scaler: None,
+            scaled: Vec::new(),
+            dsc: None,
+            dsc_unsupported: None,
+            encoded: Vec::new(),
+            mode: None,
+            window: SendWindow::default(),
+            window_started: Instant::now(),
+            last_serial: 0,
+        }
+    }
+
+    // Counts the captures the mailbox replaced before this one was taken.
+    fn captured(&mut self, frame: &Frame) {
+        self.window.dropped += frame.serial.saturating_sub(self.last_serial + 1);
+        self.last_serial = frame.serial;
+    }
+
+    // Scales `frame` to the viewer's drawable size and sends it raw or as DSC,
+    // whichever the budget allows, then applies the rate rule.
+    fn send(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        sink: &mut FrameSink,
+        frame: &Frame,
+        drawable: (u32, u32),
+        captured_micros: u64,
+    ) -> anyhow::Result<()> {
+        use futures::SinkExt;
+        let started = Instant::now();
+        let source = (frame.width, frame.height);
+        let target = viewer_stream::fit_size(source, drawable);
+        let source_stride = frame.width as usize * 4;
+        let (pixels, stride): (&[u8], usize) = if target == source {
+            (&frame.pixels, source_stride)
+        } else {
+            let sized = match self.scaler.take() {
+                Some(sized) if (sized.source, sized.target) == (source, target) => sized,
+                _ => SizedScaler { source, target, scaler: viewer_stream::Scaler::new(source, target)? },
+            };
+            let sized = self.scaler.insert(sized);
+            sized.scaler.scale(&frame.pixels, source_stride, &mut self.scaled, self.threads)?;
+            (&self.scaled, target.0 as usize * 4)
+        };
+        let scaled = Instant::now();
+
+        let mut raw = viewer_stream::raw_fits(target.0, target.1, self.budget)
+            || self.dsc_unsupported == Some(target);
+        if !raw && self.dsc.as_ref().is_none_or(|dsc| dsc.size != target) {
+            match dsc::Config::new(target.0, target.1).and_then(dsc::Encoder::new) {
+                Ok(encoder) => {
+                    self.dsc = Some(DscStream {
+                        size: target,
+                        encoder,
+                        rate: viewer_stream::RateControl::default(),
+                        pps_sent: false,
+                    });
+                }
+                Err(error) => {
+                    eprintln!(
+                        "kwin-viewer: stream: no DSC layout for {}x{} ({error}); sending raw over the budget",
+                        target.0, target.1
+                    );
+                    self.dsc_unsupported = Some(target);
+                    raw = true;
+                }
+            }
+        }
+        let mut header = Header {
+            payload: Payload::Raw,
+            width: u16::try_from(target.0)?,
+            height: u16::try_from(target.1)?,
+            bpp_x16: viewer_stream::RAW_BPP_X16,
+            sequence: self.sequence,
+            captured_micros,
+            sender_micros: 0,
+        };
+        let mut message;
+        let mut complexity = None;
+        match self.dsc.as_mut().filter(|_| !raw) {
+            None => {
+                message = Vec::with_capacity(viewer_stream::HEADER_BYTES + header.raw_len());
+                message.extend_from_slice(&[0; viewer_stream::HEADER_BYTES]);
+                viewer_stream::pack_rgb(pixels, stride, target, &mut message, self.threads)?;
+            }
+            Some(dsc) => {
+                header.payload = Payload::Dsc;
+                header.bpp_x16 = dsc.encoder.config().bits_per_pixel_x16;
+                if !dsc.pps_sent {
+                    let mut pps = Header { payload: Payload::Pps, ..header }.encode().to_vec();
+                    pps.extend_from_slice(&dsc.encoder.pps().to_bytes());
+                    runtime.block_on(sink.send(Message::Binary(pps.into())))?;
+                    dsc.pps_sent = true;
+                    self.window.pps += 1;
+                }
+                let picture = dsc::Frame { data: pixels, stride, format: dsc::PixelFormat::Bgrx };
+                let stats = dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
+                complexity = Some(stats.complexity_permille());
+                message = Vec::with_capacity(viewer_stream::HEADER_BYTES + self.encoded.len());
+                message.extend_from_slice(&[0; viewer_stream::HEADER_BYTES]);
+                message.extend_from_slice(&self.encoded);
+            }
+        }
+        let encoded = Instant::now();
+        header.sender_micros =
+            u32::try_from(unix_micros().saturating_sub(captured_micros)).unwrap_or(u32::MAX);
+        message[..viewer_stream::HEADER_BYTES].copy_from_slice(&header.encode());
+        let bytes = message.len();
+        runtime.block_on(sink.send(Message::Binary(message.into())))?;
+        let sent = Instant::now();
+        self.sequence = self.sequence.wrapping_add(1);
+
+        let mode = (header.payload, target, header.bpp_x16);
+        if self.mode != Some(mode) {
+            self.mode = Some(mode);
+            eprintln!(
+                "kwin-viewer: stream: sending {} {}x{} at {:.2} bpp, {bytes} bytes per frame ({:.0} Mb/s at {} Hz)",
+                if raw { "raw" } else { "dsc" },
+                target.0,
+                target.1,
+                bits_per_pixel(header.bpp_x16),
+                megabits(bytes as u64 * 8 * viewer_stream::FRAME_RATE),
+                viewer_stream::FRAME_RATE,
+            );
+        }
+        let time = sent - started;
+        if let (Some(complexity), Some(dsc)) = (complexity, self.dsc.as_mut()) {
+            let before = dsc.rate.bpp_x16();
+            let pixels = u64::from(target.0) * u64::from(target.1);
+            if dsc.rate.after_frame(pixels, time, complexity, self.budget) {
+                let after = dsc.rate.bpp_x16();
+                // On an error the encoder keeps its rate, which the header reports.
+                match dsc.encoder.set_bits_per_pixel_x16(after) {
+                    Ok(()) => {
+                        dsc.pps_sent = false;
+                        eprintln!(
+                            "kwin-viewer: stream: rate {:.2} -> {:.2} bpp (frame took {:.1} ms, complexity {complexity}/1000, {:.0} Mb/s at {} Hz against a budget of {})",
+                            bits_per_pixel(before),
+                            bits_per_pixel(after),
+                            time.as_secs_f64() * 1e3,
+                            megabits(viewer_stream::stream_bits_per_second(pixels, before)),
+                            viewer_stream::FRAME_RATE,
+                            budget_text(self.budget),
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "kwin-viewer: stream: rate stays at {:.2} bpp: {error}",
+                        bits_per_pixel(before)
+                    ),
+                }
+            }
+        }
+        self.window.frames += 1;
+        self.window.bytes += bytes as u64;
+        self.window.scale += scaled - started;
+        self.window.encode += encoded - scaled;
+        self.window.send += sent - encoded;
+        self.window.slowest = self.window.slowest.max(time);
+        Ok(())
+    }
+
+    // One log line per second in which something was captured.
+    fn report(&mut self) {
+        let elapsed = self.window_started.elapsed();
+        if elapsed < STREAM_REPORT_INTERVAL {
+            return;
+        }
+        let window = std::mem::take(&mut self.window);
+        self.window_started = Instant::now();
+        if window.frames == 0 && window.unchanged == 0 && window.dropped == 0 {
+            return;
+        }
+        let per_frame = |total: Duration| total.as_secs_f64() * 1e3 / window.frames.max(1) as f64;
+        eprintln!(
+            "kwin-viewer: stream: sent {:.1} frames/s, {:.1} Mb/s; per frame scale {:.1} ms, encode {:.1} ms, send {:.1} ms, slowest {:.1} ms; {} parameter sets, {} unchanged captures skipped, {} captures replaced by a newer one",
+            window.frames as f64 / elapsed.as_secs_f64(),
+            megabits(window.bytes * 8) / elapsed.as_secs_f64(),
+            per_frame(window.scale),
+            per_frame(window.encode),
+            per_frame(window.send),
+            window.slowest.as_secs_f64() * 1e3,
+            window.pps,
+            window.unchanged,
+            window.dropped,
+        );
+    }
+}
+
+fn budget_text(budget: Option<u64>) -> String {
+    budget.map_or_else(|| "unlimited".to_owned(), |bits| format!("{:.0} Mb/s", megabits(bits)))
+}
+
+fn send_notice(
+    runtime: &tokio::runtime::Runtime,
+    sink: &mut FrameSink,
+    notice: &Notice,
+) -> anyhow::Result<()> {
+    use futures::SinkExt;
+    let text = serde_json::to_string(notice)?;
+    runtime.block_on(sink.send(Message::text(text)))?;
+    Ok(())
+}
+
+// Run by `kwin-mcp --listen` beside the session, with the viewer's frame
+// socket as stdin: no window. Sends each changed picture of the session,
+// scaled to the viewer's size, and applies the input records that come back.
+fn stream_serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let session_path = PathBuf::from(&session_dir);
+    write_status(&session_path, "starting", "remote viewer stream");
+    let result = stream_sender(&session_path, argv);
+    match &result {
+        Ok(()) => write_status(&session_path, "closed", "remote viewer disconnected"),
+        Err(error) => write_status(&session_path, "failed", &format!("{error:#}")),
+    }
+    result
+}
+
+fn stream_sender(
+    session_path: &std::path::Path,
+    mut argv: impl Iterator<Item = String>,
+) -> anyhow::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use std::os::fd::AsFd;
+    let virt = parse_size(&mut argv)?;
+    let link_mbps = match argv.next().as_deref() {
+        None => None,
+        Some("--link-mbps") => {
+            let value = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+            Some(value.parse::<u64>().map_err(|error| anyhow::anyhow!("--link-mbps '{value}': {error}"))?)
+        }
+        Some(other) => anyhow::bail!("unknown argument '{other}'\n{USAGE}"),
+    };
+    let socket = std::net::TcpStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let budget = viewer_stream::link_budget(socket.local_addr()?.ip(), link_mbps);
+    eprintln!(
+        "kwin-viewer: stream: viewer {} over {}; budget {}",
+        socket.peer_addr()?,
+        budget.link,
+        budget_text(budget.bits_per_second)
+    );
+
+    pipewire::init();
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    let link = SessionLink::connect(session_path, virt, &shutdown, &mailbox, CaptureLayout::Bgrx)?;
+    let input = InputOut::Local {
+        fake_input: link.fake_input.clone(),
+        conn: link.conn.clone(),
+        activity: open_input_activity(session_path)?,
+    };
+    let runtime = stream_runtime()?;
+    let socket = runtime.block_on(remote::adopt_frames(socket)).map_err(anyhow::Error::msg)?;
+    let (mut sink, mut stream) = StreamExt::split(socket);
+
+    let viewer = Arc::new(ViewerLink { size: Mutex::new(None), presented: AtomicBool::new(false) });
+    runtime.spawn({
+        let (viewer, mailbox, shutdown) = (Arc::clone(&viewer), Arc::clone(&mailbox), shutdown.clone());
+        let session_path = session_path.to_owned();
+        async move {
+            while let Some(Ok(message)) = stream.next().await {
+                let record = match message {
+                    Message::Binary(record) => record,
+                    Message::Close(_) => break,
+                    Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                };
+                let Ok(Some(op)) = Op::decode(&mut &record[..]) else {
+                    eprintln!("kwin-viewer: stream: invalid input record of {} bytes", record.len());
+                    break;
+                };
+                match op {
+                    Op::Presented => {
+                        viewer.presented.store(true, Ordering::Release);
+                        write_status(
+                            &session_path,
+                            "ready",
+                            "remote viewer submitted its first frame for presentation",
+                        );
+                    }
+                    Op::Size(width, height) => viewer.resize(&mailbox, (width, height)),
+                    Op::Motion(..) | Op::Button(..) | Op::Axis(..) | Op::Key(..) => input.send(op),
+                }
+            }
+            // The frame socket ended: the capture ends with it.
+            shutdown.request();
+            mailbox.1.notify_all();
+        }
+    });
+
+    let mut sent_title = session_title(session_path);
+    send_notice(
+        &runtime,
+        &mut sink,
+        &Notice::Hello {
+            width: virt.0,
+            height: virt.1,
+            title: sent_title.clone(),
+            budget_bits_per_second: budget.bits_per_second,
+            link: budget.link.clone(),
+        },
+    )?;
+    let mut sender = PictureSender::new(budget.bits_per_second);
+    let started = Instant::now();
+    let mut heartbeat = Instant::now();
+    // The newest capture, whether it still has to go out, and the size the
+    // last picture went out at.
+    let mut latest: Option<Frame> = None;
+    let mut pending = false;
+    let mut sent_size = None;
+    let result = loop {
+        if shutdown.requested() {
+            break Ok(());
+        }
+        let presented = viewer.presented.load(Ordering::Acquire);
+        if !presented && started.elapsed() >= FIRST_FRAME_TIMEOUT {
+            break Err(anyhow::anyhow!(
+                "remote {}",
+                frame_timeout_reason(Some(session_path))
+            ));
+        }
+        if presented && heartbeat.elapsed() >= VIEWER_STATUS_HEARTBEAT {
+            write_status(session_path, "ready", "remote viewer is showing the session");
+            heartbeat = Instant::now();
+        }
+        let title = session_title(session_path);
+        if title != sent_title {
+            if let Err(error) = send_notice(&runtime, &mut sink, &Notice::Title { title: title.clone() }) {
+                eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
+                break Ok(());
+            }
+            sent_title = title;
+        }
+        // Wait for the screen to change, unless the picture in hand has to go
+        // out again because the viewer changed size.
+        let fresh = {
+            let (slot, ready) = &*mailbox;
+            let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resized = latest.is_some() && viewer.size().is_some_and(|size| Some(size) != sent_size);
+            if slot.is_none() && !resized && !shutdown.requested() {
+                slot = ready
+                    .wait_timeout(slot, STREAM_IDLE_POLL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            slot.take()
+        };
+        let mut captured_micros = None;
+        if let Some(frame) = fresh {
+            sender.captured(&frame);
+            // PipeWire delivers on damage; a delivery with the same pixels is
+            // still not a change and is never sent.
+            let unchanged = latest.as_ref().is_some_and(|shown| {
+                (shown.width, shown.height) == (frame.width, frame.height) && shown.pixels == frame.pixels
+            });
+            if unchanged {
+                sender.window.unchanged += 1;
+            } else {
+                pending = true;
+                captured_micros = Some(frame.captured_micros);
+                latest = Some(frame);
+            }
+        }
+        sender.report();
+        let Some(size) = viewer.size() else { continue };
+        pending |= Some(size) != sent_size;
+        let Some(frame) = latest.as_ref().filter(|_| pending) else { continue };
+        // A picture sent again for a new size is timed from now.
+        let captured_micros = captured_micros.unwrap_or_else(unix_micros);
+        if let Err(error) = sender.send(&runtime, &mut sink, frame, size, captured_micros) {
+            if error.is::<async_tungstenite::tungstenite::Error>() {
+                eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
+                break Ok(());
+            }
+            break Err(error);
+        }
+        pending = false;
+        sent_size = Some(size);
+    };
+    shutdown.request();
+    let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink.close()).await });
+    link.close();
+    result
+}
+
+// What a `--stream` viewer received and presented.
+#[derive(Default)]
+struct StreamStats {
+    counters: Mutex<StreamCounters>,
+}
+
+#[derive(Default, Clone)]
+struct StreamCounters {
+    // Since the viewer started.
+    frames: u64,
+    bytes: u64,
+    presented: u64,
+    parameter_sets: u64,
+    // The last picture.
+    width: u16,
+    height: u16,
+    raw: bool,
+    bpp_x16: u16,
+    frame_bytes: u64,
+    // Since the last report.
+    recent: RecentCounters,
+}
+
+#[derive(Default, Clone)]
+struct RecentCounters {
+    frames: u64,
+    bytes: u64,
+    // Pictures a newer one replaced before they were decoded.
+    skipped: u64,
+    presented: u64,
+    decode_micros: u64,
+    sender_micros: u64,
+    // Capture on the session's host to submission for presentation here, on
+    // the two machines' wall clocks.
+    latency_micros: u64,
+    latency_max_micros: u64,
+}
+
+impl StreamStats {
+    fn counters(&self) -> std::sync::MutexGuard<'_, StreamCounters> {
+        self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // A picture was decoded. Its bytes were counted when it arrived.
+    fn received(&self, header: &Header, bytes: usize, decode: Duration) {
+        let mut counters = self.counters();
+        counters.frames += 1;
+        counters.width = header.width;
+        counters.height = header.height;
+        counters.raw = header.payload == Payload::Raw;
+        counters.bpp_x16 = header.bpp_x16;
+        counters.frame_bytes = bytes as u64;
+        counters.recent.frames += 1;
+        counters.recent.decode_micros += decode.as_micros() as u64;
+        counters.recent.sender_micros += u64::from(header.sender_micros);
+    }
+
+    fn presented(&self, captured_micros: u64) {
+        let latency = unix_micros().saturating_sub(captured_micros);
+        let mut counters = self.counters();
+        counters.presented += 1;
+        counters.recent.presented += 1;
+        counters.recent.latency_micros += latency;
+        counters.recent.latency_max_micros = counters.recent.latency_max_micros.max(latency);
+    }
+
+    // The counters, with `recent` starting again.
+    fn take(&self) -> StreamCounters {
+        let mut counters = self.counters();
+        let taken = counters.clone();
+        counters.recent = RecentCounters::default();
+        taken
+    }
+}
+
+// Once a second: a log line while pictures arrive and one when they stop, and
+// the counters file whenever a line is written.
+fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &Shutdown) {
+    let mut active = false;
+    let mut last = Instant::now();
+    while !shutdown.requested() {
+        std::thread::sleep(DISPATCH_POLL_INTERVAL.min(STREAM_REPORT_INTERVAL));
+        let elapsed = last.elapsed();
+        if elapsed < STREAM_REPORT_INTERVAL {
+            continue;
+        }
+        last = Instant::now();
+        let counters = stats.take();
+        let recent = &counters.recent;
+        if recent.frames == 0 && recent.presented == 0 && !active {
+            continue;
+        }
+        active = recent.frames > 0 || recent.presented > 0;
+        let mode = if counters.raw { "raw" } else { "dsc" };
+        let megabits_per_second = megabits(recent.bytes * 8) / elapsed.as_secs_f64();
+        let frames_per_second = recent.frames as f64 / elapsed.as_secs_f64();
+        let latency = milliseconds(recent.latency_micros, recent.presented);
+        let latency_max = milliseconds(recent.latency_max_micros, 1);
+        let sender = milliseconds(recent.sender_micros, recent.frames);
+        let decode = milliseconds(recent.decode_micros, recent.frames);
+        if active {
+            eprintln!(
+                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented, {} skipped for a newer one; {} frames and {} parameter sets in total",
+                counters.width,
+                counters.height,
+                bits_per_pixel(counters.bpp_x16),
+                counters.frame_bytes,
+                recent.presented,
+                recent.skipped,
+                counters.frames,
+                counters.parameter_sets,
+            );
+        } else {
+            eprintln!(
+                "kwin-viewer: stream: idle, 0 frames in the last second; {} frames and {} bytes in total",
+                counters.frames, counters.bytes
+            );
+        }
+        let body = serde_json::json!({
+            "frames": counters.frames, "bytes": counters.bytes, "presented": counters.presented,
+            "parameter_sets": counters.parameter_sets,
+            "width": counters.width, "height": counters.height, "mode": mode,
+            "bits_per_pixel": bits_per_pixel(counters.bpp_x16), "frame_bytes": counters.frame_bytes,
+            "last_second": {
+                "frames": recent.frames, "presented": recent.presented, "skipped": recent.skipped,
+                "frames_per_second": frames_per_second, "megabits_per_second": megabits_per_second,
+                "latency_ms": latency, "latency_max_ms": latency_max,
+                "sender_ms": sender, "decode_ms": decode,
+            },
+        });
+        let temporary = status_dir.join(format!("{}.tmp", viewer_stream::COUNTERS_FILE));
+        if std::fs::write(&temporary, body.to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, status_dir.join(viewer_stream::COUNTERS_FILE));
+        }
+    }
+}
+
+// The newest picture message that is not decoded yet, with the decoder for
+// the parameter set that was current when it arrived.
+type Undecoded = Arc<(Mutex<Option<(async_tungstenite::tungstenite::Bytes, Option<Arc<dsc::Decoder>>)>>, Condvar)>;
+
+// One picture message from the sender, decoded for the window.
+fn receive_picture(
+    message: &[u8],
+    decoder: Option<&dsc::Decoder>,
+    mailbox: &FrameMailbox,
+    stats: &StreamStats,
+    threads: usize,
+) -> anyhow::Result<()> {
+    let arrived = Instant::now();
+    let (header, payload) = Header::decode(message)
+        .ok_or_else(|| anyhow::anyhow!("unknown frame message of {} bytes", message.len()))?;
+    let (width, height) = (usize::from(header.width), usize::from(header.height));
+    let mut rgba = Vec::new();
+    match header.payload {
+        Payload::Pps => anyhow::bail!("a picture parameter set where a picture belongs"),
+        Payload::Raw => {
+            anyhow::ensure!(
+                payload.len() == header.raw_len(),
+                "raw {width}x{height} frame has {} bytes",
+                payload.len()
+            );
+            viewer_stream::unpack_rgb(payload, width, &mut rgba, threads);
+        }
+        Payload::Dsc => {
+            let decoder = decoder
+                .filter(|decoder| {
+                    (decoder.pps().pic_width, decoder.pps().pic_height) == (header.width, header.height)
+                })
+                .ok_or_else(|| anyhow::anyhow!("DSC {width}x{height} frame without its parameter set"))?;
+            rgba.resize(width * height * 4, 0);
+            decoder.decode_parallel(payload, &mut rgba, width * 4, dsc::PixelFormat::Rgbx, threads)?;
+        }
+    }
+    stats.received(&header, message.len(), arrived.elapsed());
+    store_frame(
+        mailbox,
+        Frame {
+            width: u32::from(header.width),
+            height: u32::from(header.height),
+            pixels: rgba,
+            captured_micros: header.captured_micros,
+            serial: u64::from(header.sequence),
+        },
+    );
+    Ok(())
+}
+
+// Started by kwin-mcp `viewer_open` for a session on another machine: the
+// window on this machine, the session's pictures from that machine's listener.
+fn run_stream(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let authority = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let status_dir = PathBuf::from(argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?);
+    write_status(&status_dir, "starting", "connecting to the session's host");
+    let result = stream_viewer(&authority, &status_dir);
+    match &result {
+        Ok(()) => write_status(&status_dir, "closed", "viewer exited: window closed or stream ended"),
+        Err(error) => write_status(&status_dir, "failed", &format!("{error:#}")),
+    }
+    result
+}
+
+fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    ensure_host_display()?;
+    let ticket = std::env::var(remote::TICKET_ENV).map_err(|_| {
+        anyhow::anyhow!("{} is not set; kwin-mcp viewer_open starts this viewer", remote::TICKET_ENV)
+    })?;
+    let secret = remote::read_secret().map_err(anyhow::Error::msg)?;
+    let runtime = stream_runtime()?;
+    let socket = runtime
+        .block_on(remote::connect_frames(authority, &secret, &ticket))
+        .map_err(|error| anyhow::anyhow!("frame socket to {authority}: {error}"))?;
+    let (mut sink, mut stream) = StreamExt::split(socket);
+    let hello = runtime.block_on(async { tokio::time::timeout(STREAM_HELLO_TIMEOUT, stream.next()).await });
+    let (virt, first_title) = match hello {
+        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<Notice>(text.as_str())? {
+            Notice::Hello { width, height, title, budget_bits_per_second, link } => {
+                eprintln!(
+                    "kwin-viewer: stream: session {width}x{height} on {authority}; sender link {link}, budget {}",
+                    budget_text(budget_bits_per_second)
+                );
+                ((width, height), title)
+            }
+            Notice::Title { .. } => anyhow::bail!("{authority} did not begin the frame socket with hello"),
+        },
+        Ok(Some(Ok(_))) => anyhow::bail!("{authority} did not begin the frame socket with hello"),
+        Ok(Some(Err(error))) => anyhow::bail!("frame socket to {authority}: {error}"),
+        Ok(None) => anyhow::bail!(
+            "{authority} closed the frame socket before sending anything: the session's capture did not start"
+        ),
+        Err(_) => anyhow::bail!("{authority} sent nothing on the frame socket within {STREAM_HELLO_TIMEOUT:?}"),
+    };
+    anyhow::ensure!(virt.0 > 0 && virt.1 > 0, "session dimensions must be positive");
+
+    let title = Arc::new(Mutex::new(first_title));
+    let shutdown = Shutdown::default();
+    let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    let stats = Arc::new(StreamStats::default());
+
+    // Input records go out as they are queued, whatever the frame thread does.
+    let (ops, mut queued) = tokio::sync::mpsc::unbounded_channel::<Op>();
+    let (closed, sink_closed) = tokio::sync::oneshot::channel::<()>();
+    runtime.spawn(async move {
+        while let Some(op) = queued.recv().await {
+            if sink.send(Message::Binary(op.encode().to_vec().into())).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+        let _ = closed.send(());
+    });
+    // One thread takes messages off the socket as they arrive and keeps only
+    // the newest picture; another decodes it. A viewer that decodes slower
+    // than pictures arrive therefore skips to the newest instead of falling
+    // behind, and the sender's send time measures the link, not this machine.
+    let undecoded: Undecoded = Arc::new((Mutex::new(None), Condvar::new()));
+    {
+        let (undecoded, mailbox, stats, shutdown) =
+            (Arc::clone(&undecoded), Arc::clone(&mailbox), Arc::clone(&stats), shutdown.clone());
+        std::thread::Builder::new().name("stream-decode".to_owned()).spawn(move || {
+            let threads = codec_threads();
+            let (newest, arrived) = &*undecoded;
+            loop {
+                let picture = {
+                    let mut newest = newest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while newest.is_none() && !shutdown.requested() {
+                        newest = arrived
+                            .wait_timeout(newest, DISPATCH_POLL_INTERVAL)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    newest.take()
+                };
+                let Some((message, decoder)) = picture else { break };
+                if let Err(error) = receive_picture(&message, decoder.as_deref(), &mailbox, &stats, threads) {
+                    eprintln!("kwin-viewer: stream: {error:#}");
+                    shutdown.request();
+                    break;
+                }
+            }
+        })?;
+    }
+    {
+        let (title, stats, shutdown) = (Arc::clone(&title), Arc::clone(&stats), shutdown.clone());
+        let handle = runtime.handle().clone();
+        std::thread::Builder::new().name("stream-frames".to_owned()).spawn(move || {
+            let mut decoder: Option<Arc<dsc::Decoder>> = None;
+            loop {
+                match handle.block_on(stream.next()) {
+                    Some(Ok(Message::Binary(message))) => {
+                        let parameter_set = match Header::decode(&message) {
+                            Some((header, payload)) if header.payload == Payload::Pps => Some(payload),
+                            Some(_) => None,
+                            None => {
+                                eprintln!("kwin-viewer: stream: unknown frame message of {} bytes", message.len());
+                                break;
+                            }
+                        };
+                        if let Some(parameter_set) = parameter_set {
+                            match dsc::Pps::from_bytes(parameter_set).and_then(dsc::Decoder::new) {
+                                Ok(next) => decoder = Some(Arc::new(next)),
+                                Err(error) => {
+                                    eprintln!("kwin-viewer: stream: picture parameter set: {error}");
+                                    break;
+                                }
+                            }
+                            stats.counters().parameter_sets += 1;
+                            continue;
+                        }
+                        {
+                            let mut counters = stats.counters();
+                            counters.bytes += message.len() as u64;
+                            counters.recent.bytes += message.len() as u64;
+                        }
+                        let (newest, arrived) = &*undecoded;
+                        let replaced = newest
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .replace((message, decoder.clone()));
+                        if replaced.is_some() {
+                            stats.counters().recent.skipped += 1;
+                        }
+                        arrived.notify_one();
+                    }
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(text.as_str()) {
+                        Ok(Notice::Title { title: next }) => {
+                            *title.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                        }
+                        Ok(Notice::Hello { .. }) => {}
+                        Err(error) => eprintln!("kwin-viewer: stream: unreadable notice: {error}"),
+                    },
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => {
+                        eprintln!("kwin-viewer: stream: the session's host closed the frame socket");
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("kwin-viewer: stream: frame socket: {error}");
+                        break;
+                    }
+                }
+            }
+            shutdown.request();
+        })?;
+    }
+    {
+        let (stats, shutdown, status_dir) = (Arc::clone(&stats), shutdown.clone(), status_dir.to_owned());
+        std::thread::Builder::new()
+            .name("stream-report".to_owned())
+            .spawn(move || report_stream(&stats, &status_dir, &shutdown))?;
+    }
+
+    let mut input_state = InputState {
+        out: InputOut::Remote(OpSink::Socket(ops)),
+        last_pos: None,
+        held_buttons: 0,
+        active_touch: None,
+        held_keys: HashSet::new(),
+        clipboard: None,
+    };
+    let result = window_loop(
+        ViewerTitle::Remote(&title, authority),
+        Some(status_dir),
+        &mailbox,
+        &shutdown,
+        virt,
+        &mut input_state,
+        None,
+        Some(&stats),
+    );
+    shutdown.request();
+    // Dropping the queue closes the socket, which ends the capture on the
+    // session's host. The frame thread may still be parked on the socket; it
+    // ends with the process.
+    drop(input_state);
+    let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink_closed).await });
+    result
+}
+
 #[derive(Clone, Copy)]
 enum Op {
     Motion(f64, f64),
@@ -1445,6 +2396,8 @@ enum Op {
     Key(u32, u32),
     // The remote viewer has queued its first rendered frame for presentation.
     Presented,
+    // A stream viewer's drawable size in physical pixels.
+    Size(u32, u32),
 }
 
 impl Op {
@@ -1457,6 +2410,7 @@ impl Op {
             Op::Axis(axis, value) => (3, u64::from(axis), value.to_bits()),
             Op::Key(code, state) => (4, u64::from(code), u64::from(state)),
             Op::Presented => (5,0,0),
+            Op::Size(width, height) => (6, u64::from(width), u64::from(height)),
         };
         let mut record = [0u8; 17];
         record[0] = tag;
@@ -1486,6 +2440,7 @@ impl Op {
             3 => narrow(a).map(|axis| Op::Axis(axis, f64::from_bits(b))),
             4 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Key(code, state)),
             5 if a==0 && b==0 => Some(Op::Presented),
+            6 => narrow(a).zip(narrow(b)).map(|(width, height)| Op::Size(width, height)),
             _ => None,
         })
     }
@@ -1498,6 +2453,7 @@ impl Op {
             Op::Axis(..) => "scroll wheel",
             Op::Key(..) => "key",
             Op::Presented => "presented frame",
+            Op::Size(..) => "viewer size",
         }
     }
 
@@ -1507,20 +2463,42 @@ impl Op {
             Op::Button(code, state) => fake_input.button(code, state),
             Op::Axis(axis, value) => fake_input.axis(axis, value),
             Op::Key(code, state) => fake_input.keyboard_key(code, state),
-            Op::Presented => {}
+            Op::Presented | Op::Size(..) => {}
         }
     }
 }
 
-// Where forwarded input goes: directly to the local compositor, or to the ssh
-// pipe for a `--serve` process that forwards it to its local compositor.
+// The way to the process beside the session: the ssh pipe of `--serve`, or the
+// frame socket of `--stream-serve` (a task writes each record as one binary
+// WebSocket message).
+#[derive(Clone)]
+enum OpSink {
+    Pipe(Arc<Mutex<std::process::ChildStdin>>),
+    Socket(tokio::sync::mpsc::UnboundedSender<Op>),
+}
+
+impl OpSink {
+    fn send(&self, op: Op) {
+        match self {
+            OpSink::Pipe(pipe) => send_remote_op(pipe, op),
+            OpSink::Socket(queue) => {
+                if queue.send(op).is_err() {
+                    eprintln!("kwin-viewer: frame socket closed");
+                }
+            }
+        }
+    }
+}
+
+// Where forwarded input goes: directly to the local compositor, or to the
+// process beside a remote session that forwards it to its local compositor.
 enum InputOut {
     Local {
         fake_input: OrgKdeKwinFakeInput,
         conn: Connection,
         activity: std::fs::File,
     },
-    Remote(Arc<Mutex<std::process::ChildStdin>>),
+    Remote(OpSink),
 }
 
 impl InputOut {
@@ -1531,7 +2509,7 @@ impl InputOut {
                 conn,
                 activity,
             } => {
-                if !matches!(op, Op::Presented) {
+                if !matches!(op, Op::Presented | Op::Size(..)) {
                     // The marker's time is the last input; its content names the
                     // kind, so a pause the user did not cause can be traced.
                     let kind = op.kind();
@@ -1550,7 +2528,7 @@ impl InputOut {
                 op.emit(fake_input);
                 let _ = conn.flush();
             }
-            InputOut::Remote(pipe) => send_remote_op(pipe, op),
+            InputOut::Remote(sink) => sink.send(op),
         }
     }
 }
@@ -1818,6 +2796,7 @@ fn run_pipewire(
     mailbox: FrameMailbox,
     virt: (u32, u32),
     quit: pipewire::channel::Receiver<()>,
+    layout: CaptureLayout,
 ) -> anyhow::Result<()> {
     use pipewire as pw;
     use pw::spa;
@@ -1843,11 +2822,15 @@ fn run_pipewire(
         format: spa::param::video::VideoInfoRaw,
         mailbox: FrameMailbox,
         first_frame_received: bool,
+        layout: CaptureLayout,
+        serial: u64,
     }
     let data = UserData {
         format: spa::param::video::VideoInfoRaw::default(),
         mailbox,
         first_frame_received: false,
+        layout,
+        serial: 0,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -1904,8 +2887,16 @@ fn run_pipewire(
             if w == 0 || h == 0 { return }
             let src_fmt = ud.format.format();
 
-            let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
-            convert_to_rgba(raw, &mut rgba, w as usize, h as usize, stride, src_fmt);
+            let captured_micros = unix_micros();
+            let pixels = match ud.layout {
+                CaptureLayout::Rgba => {
+                    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+                    convert_to_rgba(raw, &mut rgba, w as usize, h as usize, stride, src_fmt);
+                    rgba
+                }
+                CaptureLayout::Bgrx => copy_as_bgrx(raw, w as usize, h as usize, stride, src_fmt),
+            };
+            ud.serial += 1;
 
             if !ud.first_frame_received {
                 eprintln!(
@@ -1918,7 +2909,7 @@ fn run_pipewire(
                 );
                 ud.first_frame_received = true;
             }
-            store_frame(&ud.mailbox, Frame { width: w, height: h, rgba });
+            store_frame(&ud.mailbox, Frame { width: w, height: h, pixels, captured_micros, serial: ud.serial });
         })
         .register()?;
 
@@ -1976,6 +2967,31 @@ fn build_format_pod(virt: (u32, u32)) -> anyhow::Result<Vec<u8>> {
     .0
     .into_inner();
     Ok(bytes)
+}
+
+// The captured rows without their stride padding, as BGRx: the layout KWin
+// delivers and the DSC encoder and the raw packer read.
+fn copy_as_bgrx(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    fmt: pipewire::spa::param::video::VideoFormat,
+) -> Vec<u8> {
+    use pipewire::spa::param::video::VideoFormat as F;
+    let row = w * 4;
+    let mut out = Vec::with_capacity(row * h);
+    for y in 0..h {
+        let Some(line) = src.get(y * stride..y * stride + row) else { break };
+        out.extend_from_slice(line);
+    }
+    out.resize(row * h, 0);
+    if matches!(fmt, F::RGBA | F::RGBx) {
+        for pixel in out.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    out
 }
 
 fn convert_to_rgba(
@@ -2055,7 +3071,7 @@ mod wire_tests {
 
     #[test]
     fn input_records_round_trip() -> std::io::Result<()> {
-        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0), Op::Presented];
+        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0), Op::Presented, Op::Size(1280, 720)];
         let bytes: Vec<u8> = ops.iter().flat_map(|op| op.encode()).collect();
         let mut input = Cursor::new(bytes);
         for op in ops {
@@ -2091,7 +3107,7 @@ mod wire_tests {
     #[test]
     fn frames_keep_their_pixels_across_the_wire() -> anyhow::Result<()> {
         let rgba: Vec<u8> = (0..4 * 6 * 3).map(|i| u8::try_from(i * 7 % 256).unwrap_or(0)).collect();
-        let frame = Frame { width: 6, height: 3, rgba: rgba.clone() };
+        let frame = Frame { width: 6, height: 3, pixels: rgba.clone(), captured_micros: 0, serial: 0 };
         let mut wire = Vec::new();
         write_title(&mut wire,"kwin-viewer s1: First instruction")?;
         write_frame(&mut wire, &frame)?;
@@ -2103,7 +3119,7 @@ mod wire_tests {
             let got = read_frame(&mut input,Some(&title))?.ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
             assert_eq!(*title.lock().unwrap(),expected);
             assert_eq!((got.width, got.height), (6, 3));
-            assert_eq!(got.rgba, rgba);
+            assert_eq!(got.pixels, rgba);
         }
         assert!(read_frame(&mut input,None)?.is_none());
         Ok(())
