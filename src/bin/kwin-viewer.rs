@@ -17,7 +17,7 @@
 
 use async_tungstenite::tungstenite::Message;
 use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
-use kwin_mcp::viewer_stream::{Header, Notice, Payload};
+use kwin_mcp::viewer_stream::{Header, Mode, ModeControl, Notice, Payload};
 use kwin_mcp::{dsc, remote, viewer_stream};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
@@ -150,11 +150,12 @@ struct Frame {
     serial: u64,
 }
 
-// Pixel layout the PipeWire callback hands out.
-#[derive(Clone, Copy)]
+// Pixel layout the PipeWire callback hands out. The stream sender's captures
+// take their buffers from the pool it returns them to.
+#[derive(Clone)]
 enum CaptureLayout {
     Rgba,
-    Bgrx,
+    Bgrx(BufferPool),
 }
 
 fn unix_micros() -> u64 {
@@ -169,12 +170,14 @@ fn unix_micros() -> u64 {
 // producer never blocks if the consumer is slow.
 type FrameMailbox = Arc<(Mutex<Option<Frame>>, Condvar)>;
 
-fn store_frame(mailbox: &FrameMailbox, frame: Frame) {
+// Puts `frame` in the mailbox and returns the one it replaced, which nobody
+// took.
+fn store_frame(mailbox: &FrameMailbox, frame: Frame) -> Option<Frame> {
     let (latest, ready) = &**mailbox;
-    if let Ok(mut latest) = latest.lock() {
-        *latest = Some(frame);
-        ready.notify_one();
-    }
+    let mut latest = latest.lock().ok()?;
+    let replaced = latest.replace(frame);
+    ready.notify_one();
+    replaced
 }
 
 fn take_frame(mailbox: &FrameMailbox) -> Option<Frame> {
@@ -910,6 +913,39 @@ impl ViewerTitle<'_> {
     }
 }
 
+// The session's pixels are 8-bit sRGB-encoded values, uploaded to an
+// R8G8B8A8_UNORM image. A UNORM swapchain takes them from a blit unchanged
+// (only the channel order follows the format), where an _SRGB swapchain
+// format would run them through the transfer curve. The sRGB non-linear
+// colour space tells the compositor they are sRGB-encoded, which is what the
+// session rendered. The first such format the surface offers is used, then
+// the first UNORM one, then the surface's first.
+fn exact_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    let rank = |format: &vk::SurfaceFormatKHR| {
+        let unorm = matches!(format.format, vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM);
+        match (unorm, format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
+        }
+    };
+    let chosen = formats.iter().min_by_key(|format| rank(format)).copied().unwrap_or_default();
+    eprintln!(
+        "kwin-viewer: swapchain {}{}",
+        surface_text(chosen),
+        if rank(&chosen) == 0 {
+            ": session pixels are presented unchanged"
+        } else {
+            ": NOT an 8-bit UNORM sRGB surface, colours may be converted"
+        }
+    );
+    chosen
+}
+
+fn surface_text(surface: vk::SurfaceFormatKHR) -> String {
+    format!("{:?} {:?}", surface.format, surface.color_space)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn window_loop(
     title: ViewerTitle<'_>,
@@ -929,8 +965,17 @@ fn window_loop(
         f64::from(virt.0) * initial_scale,
         f64::from(virt.1) * initial_scale,
     );
+    let surface = Arc::new(Mutex::new(None::<vk::SurfaceFormatKHR>));
     let window = WindowBuilder::default()
         .window(|wa| wa.with_title(&initial_title).with_inner_size(initial_size))
+        .desired_surface_format({
+            let surface = Arc::clone(&surface);
+            move |formats| {
+                let chosen = exact_surface_format(formats);
+                *surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chosen);
+                chosen
+            }
+        })
         .build()?;
     let device = Arc::clone(&window.device);
 
@@ -959,7 +1004,7 @@ fn window_loop(
     // draw and whenever it changes.
     let reported_size = Cell::new(None::<(u32, u32)>);
     let report_size = |size: PhysicalSize<u32>| {
-        let Some(OpSink::Socket(_)) = remote_output.as_ref() else { return };
+        let Some(OpSink::Socket(..)) = remote_output.as_ref() else { return };
         let size = (size.width, size.height);
         if size.0 == 0 || size.1 == 0 || reported_size.get() == Some(size) {
             return;
@@ -973,6 +1018,8 @@ fn window_loop(
     // Capture time of the picture staged by the current draw, until its
     // submission is counted.
     let staged_capture = Cell::new(None::<u64>);
+    // The swapchain format the stream's counters already name.
+    let noted_surface = Cell::new(None::<vk::SurfaceFormatKHR>);
     let mut draw_frame = |mut frame: FrameContext<'_>| {
         // Leave as soon as anything the viewer depends on has ended, so the
         // window never sits on a dead session and main can join the threads.
@@ -1075,13 +1122,30 @@ fn window_loop(
                     Err(e) => eprintln!("kwin-viewer: staging buffer failed: {e:?}"),
                 }
             }
+            if let Some(stream) = stream {
+                stream.shown(f);
+            }
+        }
+        let chosen = *surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if chosen != noted_surface.get() {
+            noted_surface.set(chosen);
+            if let (Some(stream), Some(chosen)) = (stream, chosen) {
+                stream.surface(&surface_text(chosen));
+            }
         }
 
         if let Some(image) = src_image.as_ref() {
             let image_node = frame.render_graph.bind_node(image);
+            // A picture of the window's own size is copied texel for texel;
+            // any other size is interpolated.
+            let filter = if src_dims == (frame.width, frame.height) {
+                vk::Filter::NEAREST
+            } else {
+                vk::Filter::LINEAR
+            };
             frame
                 .render_graph
-                .blit_image(image_node, frame.swapchain_image, vk::Filter::LINEAR);
+                .blit_image(image_node, frame.swapchain_image, filter);
             if session_frame_queued {
                 first_frame_queued.set(true);
             }
@@ -1517,11 +1581,19 @@ const STREAM_IDLE_POLL: Duration = Duration::from_millis(250);
 // The sender speaks first, once the listener has handed it the socket.
 const STREAM_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+// While a message waits for a slow or stalled viewer, the sender looks this
+// often whether the stream has ended.
+const STREAM_SEND_POLL: Duration = Duration::from_millis(100);
+// Capture buffers kept for the next captures instead of being freed.
+const CAPTURE_POOL_BUFFERS: usize = 3;
+// Input records a viewer may have waiting for the session's host. A host that
+// stopped reading them ends the stream instead of growing the queue.
+const STREAM_INPUT_QUEUE: usize = 4096;
 
 type FrameSink = futures::stream::SplitSink<remote::FrameSocket, Message>;
 
 // One worker drives the socket; pictures are coded on the calling thread and
-// the scoped threads it starts.
+// the stream's picture workers.
 fn stream_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -1544,6 +1616,27 @@ fn bits_per_pixel(bpp_x16: u16) -> f64 {
 
 fn milliseconds(micros: u64, count: u64) -> f64 {
     micros as f64 / 1e3 / count.max(1) as f64
+}
+
+fn mode_text(mode: Mode) -> String {
+    match mode {
+        Mode::Raw => "raw".to_owned(),
+        Mode::Dsc { bpp_x16 } => format!("dsc at {:.2} bpp", bits_per_pixel(bpp_x16)),
+    }
+}
+
+// Pixel buffers of captures that are no longer needed, for the captures to come.
+type BufferPool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+fn recycle(pool: &BufferPool, buffer: Vec<u8>) {
+    let mut pool = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pool.len() < CAPTURE_POOL_BUFFERS {
+        pool.push(buffer);
+    }
+}
+
+fn recycled(pool: &BufferPool) -> Vec<u8> {
+    pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop().unwrap_or_default()
 }
 
 // What the viewer told the sender.
@@ -1572,7 +1665,6 @@ impl ViewerLink {
 struct DscStream {
     size: (u32, u32),
     encoder: dsc::Encoder,
-    rate: viewer_stream::RateControl,
     // Whether the viewer has the current picture parameter set.
     pps_sent: bool,
 }
@@ -1581,6 +1673,8 @@ struct DscStream {
 #[derive(Default)]
 struct SendWindow {
     frames: u64,
+    raw: u64,
+    settles: u64,
     bytes: u64,
     pps: u64,
     // Captures identical to the picture already sent.
@@ -1588,8 +1682,10 @@ struct SendWindow {
     // Captures replaced by a newer one before the sender was free.
     dropped: u64,
     scale: Duration,
-    encode: Duration,
-    send: Duration,
+    // Packing a raw picture or encoding a DSC one.
+    prepare: Duration,
+    // From handing a picture to the socket until its last byte left.
+    wire: Duration,
     slowest: Duration,
 }
 
@@ -1600,10 +1696,56 @@ struct SizedScaler {
     scaler: viewer_stream::Scaler,
 }
 
+// The stream ended while a message waited for the viewer.
+#[derive(Debug, thiserror::Error)]
+#[error("the stream ended while a message waited for the viewer")]
+struct StreamEnded;
+
+// Sends `message` and returns once its last byte has left for the viewer, or
+// with an error when the socket or the stream ended first. A viewer that
+// takes nothing holds the sender here: nothing queues behind the message.
+fn deliver(
+    runtime: &tokio::runtime::Runtime,
+    sink: &mut FrameSink,
+    probe: &std::net::TcpStream,
+    shutdown: &Shutdown,
+    message: Message,
+) -> anyhow::Result<()> {
+    use futures::SinkExt;
+    runtime.block_on(async {
+        let mut send = std::pin::pin!(sink.send(message));
+        loop {
+            tokio::select! {
+                sent = &mut send => break sent.map_err(anyhow::Error::from),
+                () = tokio::time::sleep(STREAM_SEND_POLL) => {
+                    if shutdown.requested() {
+                        break Err(StreamEnded.into());
+                    }
+                }
+            }
+        }
+    })?;
+    // The library has written the message to the socket; the kernel still
+    // holds what the link or the viewer has not taken.
+    while viewer_stream::unsent_bytes(probe).is_ok_and(|unsent| unsent > 0) {
+        if shutdown.requested() {
+            return Err(StreamEnded.into());
+        }
+        std::thread::sleep(viewer_stream::LINK_SAMPLE_TIME);
+    }
+    Ok(())
+}
+
 struct PictureSender {
     // Bits per second; None is unlimited.
     budget: Option<u64>,
+    control: ModeControl,
+    settle: viewer_stream::Settle,
+    workers: viewer_stream::Workers,
     threads: usize,
+    // The frame socket again, to ask the kernel what it has not sent.
+    probe: std::net::TcpStream,
+    shutdown: Shutdown,
     sequence: u32,
     scaler: Option<SizedScaler>,
     scaled: Vec<u8>,
@@ -1611,25 +1753,35 @@ struct PictureSender {
     // A size the DSC encoder has no slice layout for goes out raw.
     dsc_unsupported: Option<(u32, u32)>,
     encoded: Vec<u8>,
-    // Encoding, size and rate of the last picture, to log each change once.
-    mode: Option<(Payload, (u32, u32), u16)>,
+    // The last picture's message, kept for the next one of the same length.
+    message: Vec<u8>,
+    // Mode and size of the last picture, to log each change once.
+    mode: Option<(Mode, (u32, u32))>,
+    settles: u64,
     window: SendWindow,
     window_started: Instant,
     last_serial: u64,
 }
 
 impl PictureSender {
-    fn new(budget: Option<u64>) -> Self {
+    fn new(budget: Option<u64>, probe: std::net::TcpStream, shutdown: Shutdown) -> Self {
         Self {
             budget,
+            control: ModeControl::new(budget),
+            settle: viewer_stream::Settle::default(),
+            workers: viewer_stream::Workers::all_cores(),
             threads: codec_threads(),
+            probe,
+            shutdown,
             sequence: 0,
             scaler: None,
             scaled: Vec::new(),
             dsc: None,
             dsc_unsupported: None,
             encoded: Vec::new(),
+            message: Vec::new(),
             mode: None,
+            settles: 0,
             window: SendWindow::default(),
             window_started: Instant::now(),
             last_serial: 0,
@@ -1642,8 +1794,39 @@ impl PictureSender {
         self.last_serial = frame.serial;
     }
 
-    // Scales `frame` to the viewer's drawable size and sends it raw or as DSC,
-    // whichever the budget allows, then applies the rate rule.
+    // How long until the picture last sent is due again as exact pixels.
+    fn settle_due_in(&self) -> Option<Duration> {
+        self.settle.due_in(Instant::now())
+    }
+
+    // Whether the DSC encoder for `target` exists; a size it cannot cut into
+    // slices is remembered and goes out raw.
+    fn encoder_for(&mut self, target: (u32, u32)) -> bool {
+        if self.dsc_unsupported == Some(target) {
+            return false;
+        }
+        if self.dsc.as_ref().is_some_and(|dsc| dsc.size == target) {
+            return true;
+        }
+        match dsc::Config::new(target.0, target.1).and_then(dsc::Encoder::new) {
+            Ok(encoder) => {
+                self.dsc = Some(DscStream { size: target, encoder, pps_sent: false });
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "kwin-viewer: stream: no DSC layout for {}x{} ({error}); sending raw",
+                    target.0, target.1
+                );
+                self.dsc_unsupported = Some(target);
+                false
+            }
+        }
+    }
+
+    // Scales `frame` to the viewer's drawable size and sends it in the mode
+    // the rule gives (viewer_stream::ModeControl), or raw and marked when
+    // `settle` repeats a still DSC picture exactly.
     fn send(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -1651,49 +1834,55 @@ impl PictureSender {
         frame: &Frame,
         drawable: (u32, u32),
         captured_micros: u64,
+        settle: bool,
     ) -> anyhow::Result<()> {
-        use futures::SinkExt;
         let started = Instant::now();
         let source = (frame.width, frame.height);
         let target = viewer_stream::fit_size(source, drawable);
         let source_stride = frame.width as usize * 4;
-        let (pixels, stride): (&[u8], usize) = if target == source {
-            (&frame.pixels, source_stride)
-        } else {
+        let resized = target != source;
+        if resized {
             let sized = match self.scaler.take() {
                 Some(sized) if (sized.source, sized.target) == (source, target) => sized,
                 _ => SizedScaler { source, target, scaler: viewer_stream::Scaler::new(source, target)? },
             };
             let sized = self.scaler.insert(sized);
-            sized.scaler.scale(&frame.pixels, source_stride, &mut self.scaled, self.threads)?;
-            (&self.scaled, target.0 as usize * 4)
-        };
+            if self.scaled.len() != sized.scaler.scaled_len() {
+                self.scaled.resize(sized.scaler.scaled_len(), 0);
+            }
+            sized.scaler.scale(&mut self.workers, &frame.pixels, source_stride, &mut self.scaled)?;
+        }
         let scaled = Instant::now();
 
-        let mut raw = viewer_stream::raw_fits(target.0, target.1, self.budget)
-            || self.dsc_unsupported == Some(target);
-        if !raw && self.dsc.as_ref().is_none_or(|dsc| dsc.size != target) {
-            match dsc::Config::new(target.0, target.1).and_then(dsc::Encoder::new) {
-                Ok(encoder) => {
-                    self.dsc = Some(DscStream {
-                        size: target,
-                        encoder,
-                        rate: viewer_stream::RateControl::default(),
-                        pps_sent: false,
-                    });
-                }
-                Err(error) => {
-                    eprintln!(
-                        "kwin-viewer: stream: no DSC layout for {}x{} ({error}); sending raw over the budget",
-                        target.0, target.1
-                    );
-                    self.dsc_unsupported = Some(target);
-                    raw = true;
-                }
-            }
+        let pixel_count = u64::from(target.0) * u64::from(target.1);
+        // The encoder is made only for a size the rule may send as DSC.
+        let dsc_ready = !settle && self.control.may_choose_dsc(pixel_count) && self.encoder_for(target);
+        let (pixels, stride): (&[u8], usize) =
+            if resized { (&self.scaled, target.0 as usize * 4) } else { (&frame.pixels, source_stride) };
+        if dsc_ready
+            && self.control.wants_encode_time(pixel_count)
+            && let Some(dsc) = self.dsc.as_ref()
+        {
+            // The rule needs an encode time no picture has given it yet.
+            let trial = Instant::now();
+            let picture = dsc::Frame { data: pixels, stride, format: dsc::PixelFormat::Bgrx };
+            dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
+            let took = trial.elapsed();
+            self.control.encode_measured(pixel_count, took);
+            eprintln!(
+                "kwin-viewer: stream: measured the encoder: {:.1} ms for {}x{}",
+                took.as_secs_f64() * 1e3,
+                target.0,
+                target.1
+            );
         }
+        let before = self.control.switches();
+        let mode = if settle { Mode::Raw } else { self.control.mode(pixel_count, dsc_ready) };
+        let estimate = self.control.estimate(pixel_count);
+        let prepare_started = Instant::now();
         let mut header = Header {
             payload: Payload::Raw,
+            settle,
             width: u16::try_from(target.0)?,
             height: u16::try_from(target.1)?,
             bpp_x16: viewer_stream::RAW_BPP_X16,
@@ -1701,86 +1890,98 @@ impl PictureSender {
             captured_micros,
             sender_micros: 0,
         };
-        let mut message;
-        let mut complexity = None;
-        match self.dsc.as_mut().filter(|_| !raw) {
-            None => {
-                message = Vec::with_capacity(viewer_stream::HEADER_BYTES + header.raw_len());
-                message.extend_from_slice(&[0; viewer_stream::HEADER_BYTES]);
-                viewer_stream::pack_rgb(pixels, stride, target, &mut message, self.threads)?;
-            }
-            Some(dsc) => {
+        match (mode, self.dsc.as_mut()) {
+            (Mode::Dsc { bpp_x16 }, Some(dsc)) => {
+                if dsc.encoder.config().bits_per_pixel_x16 != bpp_x16 {
+                    // On an error the encoder keeps its rate, which the header reports.
+                    match dsc.encoder.set_bits_per_pixel_x16(bpp_x16) {
+                        Ok(()) => dsc.pps_sent = false,
+                        Err(error) => eprintln!(
+                            "kwin-viewer: stream: rate stays at {:.2} bpp: {error}",
+                            bits_per_pixel(dsc.encoder.config().bits_per_pixel_x16)
+                        ),
+                    }
+                }
                 header.payload = Payload::Dsc;
                 header.bpp_x16 = dsc.encoder.config().bits_per_pixel_x16;
                 if !dsc.pps_sent {
                     let mut pps = Header { payload: Payload::Pps, ..header }.encode().to_vec();
                     pps.extend_from_slice(&dsc.encoder.pps().to_bytes());
-                    runtime.block_on(sink.send(Message::Binary(pps.into())))?;
+                    deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(pps.into()))?;
                     dsc.pps_sent = true;
                     self.window.pps += 1;
                 }
                 let picture = dsc::Frame { data: pixels, stride, format: dsc::PixelFormat::Bgrx };
-                let stats = dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
-                complexity = Some(stats.complexity_permille());
-                message = Vec::with_capacity(viewer_stream::HEADER_BYTES + self.encoded.len());
-                message.extend_from_slice(&[0; viewer_stream::HEADER_BYTES]);
-                message.extend_from_slice(&self.encoded);
+                dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
+                self.message.resize(viewer_stream::HEADER_BYTES + self.encoded.len(), 0);
+                self.message[viewer_stream::HEADER_BYTES..].copy_from_slice(&self.encoded);
+            }
+            (Mode::Raw | Mode::Dsc { .. }, _) => {
+                let length = viewer_stream::HEADER_BYTES + viewer_stream::packed_len(target);
+                if self.message.len() != length {
+                    self.message.resize(length, 0);
+                }
+                viewer_stream::pack_rgb(
+                    &mut self.workers,
+                    pixels,
+                    stride,
+                    target,
+                    &mut self.message[viewer_stream::HEADER_BYTES..],
+                )?;
             }
         }
-        let encoded = Instant::now();
+        let sent_mode = match header.payload {
+            Payload::Dsc => Mode::Dsc { bpp_x16: header.bpp_x16 },
+            Payload::Raw | Payload::Pps => Mode::Raw,
+        };
+        let prepared = Instant::now();
         header.sender_micros =
             u32::try_from(unix_micros().saturating_sub(captured_micros)).unwrap_or(u32::MAX);
-        message[..viewer_stream::HEADER_BYTES].copy_from_slice(&header.encode());
-        let bytes = message.len();
-        runtime.block_on(sink.send(Message::Binary(message.into())))?;
+        self.message[..viewer_stream::HEADER_BYTES].copy_from_slice(&header.encode());
+        let bytes = self.message.len();
+        // The message goes to the socket without a copy and comes back for
+        // the next picture once the socket has let go of it.
+        let message = async_tungstenite::tungstenite::Bytes::from(std::mem::take(&mut self.message));
+        let delivered =
+            deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(message.clone()));
+        self.message = Vec::from(message);
+        delivered?;
         let sent = Instant::now();
         self.sequence = self.sequence.wrapping_add(1);
+        self.settle.sent(!sent_mode.is_raw(), sent);
+        self.control.sent(&viewer_stream::Sent {
+            mode: sent_mode,
+            pixels: pixel_count,
+            prepare: prepared - prepare_started,
+            bytes,
+            wire: sent - prepared,
+        });
 
-        let mode = (header.payload, target, header.bpp_x16);
-        if self.mode != Some(mode) {
-            self.mode = Some(mode);
+        if !settle && self.mode != Some((sent_mode, target)) {
+            self.mode = Some((sent_mode, target));
             eprintln!(
-                "kwin-viewer: stream: sending {} {}x{} at {:.2} bpp, {bytes} bytes per frame ({:.0} Mb/s at {} Hz)",
-                if raw { "raw" } else { "dsc" },
+                "kwin-viewer: stream: sending {} {}x{}, {bytes} bytes per frame; expected raw {:.1} ms, dsc {:.1} ms at {:.2} bpp, link {}{}",
+                mode_text(sent_mode),
                 target.0,
                 target.1,
-                bits_per_pixel(header.bpp_x16),
-                megabits(bytes as u64 * 8 * viewer_stream::FRAME_RATE),
-                viewer_stream::FRAME_RATE,
+                estimate.raw.as_secs_f64() * 1e3,
+                estimate.dsc.as_secs_f64() * 1e3,
+                bits_per_pixel(estimate.dsc_bpp_x16),
+                budget_text(estimate.link_bits_per_second),
+                if self.control.switches() > before { "; mode switched" } else { "" },
             );
         }
         let time = sent - started;
-        if let (Some(complexity), Some(dsc)) = (complexity, self.dsc.as_mut()) {
-            let before = dsc.rate.bpp_x16();
-            let pixels = u64::from(target.0) * u64::from(target.1);
-            if dsc.rate.after_frame(pixels, time, complexity, self.budget) {
-                let after = dsc.rate.bpp_x16();
-                // On an error the encoder keeps its rate, which the header reports.
-                match dsc.encoder.set_bits_per_pixel_x16(after) {
-                    Ok(()) => {
-                        dsc.pps_sent = false;
-                        eprintln!(
-                            "kwin-viewer: stream: rate {:.2} -> {:.2} bpp (frame took {:.1} ms, complexity {complexity}/1000, {:.0} Mb/s at {} Hz against a budget of {})",
-                            bits_per_pixel(before),
-                            bits_per_pixel(after),
-                            time.as_secs_f64() * 1e3,
-                            megabits(viewer_stream::stream_bits_per_second(pixels, before)),
-                            viewer_stream::FRAME_RATE,
-                            budget_text(self.budget),
-                        );
-                    }
-                    Err(error) => eprintln!(
-                        "kwin-viewer: stream: rate stays at {:.2} bpp: {error}",
-                        bits_per_pixel(before)
-                    ),
-                }
-            }
-        }
         self.window.frames += 1;
+        self.window.raw += u64::from(sent_mode.is_raw());
+        if settle {
+            self.settles += 1;
+            self.window.settles += 1;
+        }
         self.window.bytes += bytes as u64;
         self.window.scale += scaled - started;
-        self.window.encode += encoded - scaled;
-        self.window.send += sent - encoded;
+        self.window.prepare += prepared - prepare_started;
+        self.window.wire += sent - prepared;
         self.window.slowest = self.window.slowest.max(time);
         Ok(())
     }
@@ -1798,16 +1999,22 @@ impl PictureSender {
         }
         let per_frame = |total: Duration| total.as_secs_f64() * 1e3 / window.frames.max(1) as f64;
         eprintln!(
-            "kwin-viewer: stream: sent {:.1} frames/s, {:.1} Mb/s; per frame scale {:.1} ms, encode {:.1} ms, send {:.1} ms, slowest {:.1} ms; {} parameter sets, {} unchanged captures skipped, {} captures replaced by a newer one",
+            "kwin-viewer: stream: sent {:.1} frames/s ({} raw, {} dsc, {} of the raw to settle), {:.1} Mb/s of {}; per frame scale {:.1} ms, pack or encode {:.1} ms, wire {:.1} ms, slowest {:.1} ms; {} parameter sets, {} unchanged captures skipped, {} captures replaced by a newer one; {} mode switches and {} settles in total",
             window.frames as f64 / elapsed.as_secs_f64(),
+            window.raw,
+            window.frames - window.raw,
+            window.settles,
             megabits(window.bytes * 8) / elapsed.as_secs_f64(),
+            budget_text(self.budget),
             per_frame(window.scale),
-            per_frame(window.encode),
-            per_frame(window.send),
+            per_frame(window.prepare),
+            per_frame(window.wire),
             window.slowest.as_secs_f64() * 1e3,
             window.pps,
             window.unchanged,
             window.dropped,
+            self.control.switches(),
+            self.settles,
         );
     }
 }
@@ -1858,9 +2065,16 @@ fn stream_sender(
         Some(other) => anyhow::bail!("unknown argument '{other}'\n{USAGE}"),
     };
     let socket = std::net::TcpStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let probe = socket.try_clone()?;
     let budget = viewer_stream::link_budget(socket.local_addr()?.ip(), link_mbps);
+    // The kernel keeps the stream inside its budget.
+    let paced = match budget.bits_per_second.map(|bits| viewer_stream::pace(&socket, bits)) {
+        None => "not paced".to_owned(),
+        Some(Ok(())) => "paced to the budget".to_owned(),
+        Some(Err(error)) => format!("not paced ({error})"),
+    };
     eprintln!(
-        "kwin-viewer: stream: viewer {} over {}; budget {}",
+        "kwin-viewer: stream: viewer {} over {}; budget {}, {paced}",
         socket.peer_addr()?,
         budget.link,
         budget_text(budget.bits_per_second)
@@ -1869,7 +2083,9 @@ fn stream_sender(
     pipewire::init();
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let link = SessionLink::connect(session_path, virt, &shutdown, &mailbox, CaptureLayout::Bgrx)?;
+    let pool: BufferPool = Arc::default();
+    let link =
+        SessionLink::connect(session_path, virt, &shutdown, &mailbox, CaptureLayout::Bgrx(Arc::clone(&pool)))?;
     let input = InputOut::Local {
         fake_input: link.fake_input.clone(),
         conn: link.conn.clone(),
@@ -1925,7 +2141,7 @@ fn stream_sender(
             link: budget.link.clone(),
         },
     )?;
-    let mut sender = PictureSender::new(budget.bits_per_second);
+    let mut sender = PictureSender::new(budget.bits_per_second, probe, shutdown.clone());
     let started = Instant::now();
     let mut heartbeat = Instant::now();
     // The newest capture, whether it still has to go out, and the size the
@@ -1957,16 +2173,15 @@ fn stream_sender(
             sent_title = title;
         }
         // Wait for the screen to change, unless the picture in hand has to go
-        // out again because the viewer changed size.
+        // out again: the viewer changed size, or a still DSC picture is due
+        // as exact pixels.
         let fresh = {
             let (slot, ready) = &*mailbox;
             let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let resized = latest.is_some() && viewer.size().is_some_and(|size| Some(size) != sent_size);
-            if slot.is_none() && !resized && !shutdown.requested() {
-                slot = ready
-                    .wait_timeout(slot, STREAM_IDLE_POLL)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .0;
+            let wait = sender.settle_due_in().map_or(STREAM_IDLE_POLL, |due| due.min(STREAM_IDLE_POLL));
+            if slot.is_none() && !resized && !wait.is_zero() && !shutdown.requested() {
+                slot = ready.wait_timeout(slot, wait).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
             slot.take()
         };
@@ -1978,22 +2193,28 @@ fn stream_sender(
             let unchanged = latest.as_ref().is_some_and(|shown| {
                 (shown.width, shown.height) == (frame.width, frame.height) && shown.pixels == frame.pixels
             });
-            if unchanged {
+            let spare = if unchanged {
                 sender.window.unchanged += 1;
+                Some(frame)
             } else {
                 pending = true;
                 captured_micros = Some(frame.captured_micros);
-                latest = Some(frame);
+                latest.replace(frame)
+            };
+            if let Some(spare) = spare {
+                recycle(&pool, spare.pixels);
             }
         }
         sender.report();
         let Some(size) = viewer.size() else { continue };
         pending |= Some(size) != sent_size;
-        let Some(frame) = latest.as_ref().filter(|_| pending) else { continue };
-        // A picture sent again for a new size is timed from now.
+        // A still picture that went out as DSC goes out once more, exactly.
+        let settle = !pending && sender.settle_due_in().is_some_and(|due| due.is_zero());
+        let Some(frame) = latest.as_ref().filter(|_| pending || settle) else { continue };
+        // A picture sent again is timed from now.
         let captured_micros = captured_micros.unwrap_or_else(unix_micros);
-        if let Err(error) = sender.send(&runtime, &mut sink, frame, size, captured_micros) {
-            if error.is::<async_tungstenite::tungstenite::Error>() {
+        if let Err(error) = sender.send(&runtime, &mut sink, frame, size, captured_micros, settle) {
+            if error.is::<async_tungstenite::tungstenite::Error>() || error.is::<StreamEnded>() {
                 eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
                 break Ok(());
             }
@@ -2012,6 +2233,12 @@ fn stream_sender(
 #[derive(Default)]
 struct StreamStats {
     counters: Mutex<StreamCounters>,
+    // The picture the window presented last, kept for the dump file, and the
+    // buffers of the ones before it, kept for the pictures to come.
+    shown: Mutex<Option<Frame>>,
+    pool: BufferPool,
+    // The swapchain's format and colour space, once the window has drawn.
+    surface: Mutex<String>,
 }
 
 #[derive(Default, Clone)]
@@ -2021,6 +2248,12 @@ struct StreamCounters {
     bytes: u64,
     presented: u64,
     parameter_sets: u64,
+    // Changes between raw and DSC, and raw pictures that repeated a still
+    // DSC picture exactly. A settle picture is not a change of mode.
+    mode_switches: u64,
+    settles: u64,
+    // Whether the stream's pictures are raw, a settle picture aside.
+    stream_raw: Option<bool>,
     // The last picture.
     width: u16,
     height: u16,
@@ -2051,6 +2284,22 @@ impl StreamStats {
         self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    // A picture message came off the socket.
+    fn arrived(&self, header: &Header, bytes: usize) {
+        let mut counters = self.counters();
+        counters.bytes += bytes as u64;
+        counters.recent.bytes += bytes as u64;
+        if header.settle {
+            counters.settles += 1;
+            return;
+        }
+        let raw = header.payload == Payload::Raw;
+        if counters.stream_raw.is_some_and(|before| before != raw) {
+            counters.mode_switches += 1;
+        }
+        counters.stream_raw = Some(raw);
+    }
+
     // A picture was decoded. Its bytes were counted when it arrived.
     fn received(&self, header: &Header, bytes: usize, decode: Duration) {
         let mut counters = self.counters();
@@ -2074,6 +2323,18 @@ impl StreamStats {
         counters.recent.latency_max_micros = counters.recent.latency_max_micros.max(latency);
     }
 
+    // The window uploaded `frame`: it is the picture on screen now.
+    fn shown(&self, frame: Frame) {
+        let before = self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(frame);
+        if let Some(before) = before {
+            recycle(&self.pool, before.pixels);
+        }
+    }
+
+    fn surface(&self, format: &str) {
+        format.clone_into(&mut self.surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+
     // The counters, with `recent` starting again.
     fn take(&self) -> StreamCounters {
         let mut counters = self.counters();
@@ -2081,11 +2342,36 @@ impl StreamStats {
         counters.recent = RecentCounters::default();
         taken
     }
+
+    // Writes the picture on screen to `path` as a PNG, once per picture.
+    fn dump(&self, path: &std::path::Path, dumped: &mut Option<u64>) {
+        let shown = self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(frame) = shown.as_ref().filter(|frame| *dumped != Some(frame.serial)) else { return };
+        let temporary = path.with_extension("tmp");
+        let written = (|| -> anyhow::Result<()> {
+            let mut encoder =
+                png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&temporary)?), frame.width, frame.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&frame.pixels)?;
+            writer.finish()?;
+            std::fs::rename(&temporary, path)?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => *dumped = Some(frame.serial),
+            Err(error) => eprintln!("kwin-viewer: stream: dump to {}: {error:#}", path.display()),
+        }
+    }
 }
 
 // Once a second: a log line while pictures arrive and one when they stop, and
 // the counters file whenever a line is written.
 fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &Shutdown) {
+    let dump = std::env::var_os(viewer_stream::DUMP_ENV).map(PathBuf::from);
+    let mut dumped = None;
     let mut active = false;
     let mut last = Instant::now();
     while !shutdown.requested() {
@@ -2097,11 +2383,21 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
         last = Instant::now();
         let counters = stats.take();
         let recent = &counters.recent;
+        if recent.frames == 0
+            && recent.presented == 0
+            && let Some(path) = dump.as_deref()
+        {
+            stats.dump(path, &mut dumped);
+        }
         if recent.frames == 0 && recent.presented == 0 && !active {
             continue;
         }
         active = recent.frames > 0 || recent.presented > 0;
         let mode = if counters.raw { "raw" } else { "dsc" };
+        let stream_mode = match counters.stream_raw {
+            Some(false) => "dsc",
+            Some(true) | None => "raw",
+        };
         let megabits_per_second = megabits(recent.bytes * 8) / elapsed.as_secs_f64();
         let frames_per_second = recent.frames as f64 / elapsed.as_secs_f64();
         let latency = milliseconds(recent.latency_micros, recent.presented);
@@ -2110,7 +2406,7 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
         let decode = milliseconds(recent.decode_micros, recent.frames);
         if active {
             eprintln!(
-                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented, {} skipped for a newer one; {} frames and {} parameter sets in total",
+                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented, {} skipped for a newer one; {} frames and {} parameter sets in total; {} mode switches, {} settles",
                 counters.width,
                 counters.height,
                 bits_per_pixel(counters.bpp_x16),
@@ -2119,18 +2415,27 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
                 recent.skipped,
                 counters.frames,
                 counters.parameter_sets,
+                counters.mode_switches,
+                counters.settles,
             );
         } else {
             eprintln!(
-                "kwin-viewer: stream: idle, 0 frames in the last second; {} frames and {} bytes in total",
-                counters.frames, counters.bytes
+                "kwin-viewer: stream: idle, 0 frames in the last second; {} frames and {} bytes in total; {} mode switches, {} settles; the last picture is {}",
+                counters.frames,
+                counters.bytes,
+                counters.mode_switches,
+                counters.settles,
+                if counters.raw { "exact" } else { "dsc" },
             );
         }
+        let surface = stats.surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let body = serde_json::json!({
             "frames": counters.frames, "bytes": counters.bytes, "presented": counters.presented,
             "parameter_sets": counters.parameter_sets,
-            "width": counters.width, "height": counters.height, "mode": mode,
+            "mode_switches": counters.mode_switches, "settles": counters.settles,
+            "width": counters.width, "height": counters.height, "mode": mode, "stream_mode": stream_mode,
             "bits_per_pixel": bits_per_pixel(counters.bpp_x16), "frame_bytes": counters.frame_bytes,
+            "swapchain": surface,
             "last_second": {
                 "frames": recent.frames, "presented": recent.presented, "skipped": recent.skipped,
                 "frames_per_second": frames_per_second, "megabits_per_second": megabits_per_second,
@@ -2155,13 +2460,16 @@ fn receive_picture(
     decoder: Option<&dsc::Decoder>,
     mailbox: &FrameMailbox,
     stats: &StreamStats,
-    threads: usize,
+    workers: &mut viewer_stream::Workers,
 ) -> anyhow::Result<()> {
     let arrived = Instant::now();
     let (header, payload) = Header::decode(message)
         .ok_or_else(|| anyhow::anyhow!("unknown frame message of {} bytes", message.len()))?;
     let (width, height) = (usize::from(header.width), usize::from(header.height));
-    let mut rgba = Vec::new();
+    let mut rgba = recycled(&stats.pool);
+    if rgba.len() != width * height * 4 {
+        rgba.resize(width * height * 4, 0);
+    }
     match header.payload {
         Payload::Pps => anyhow::bail!("a picture parameter set where a picture belongs"),
         Payload::Raw => {
@@ -2170,7 +2478,7 @@ fn receive_picture(
                 "raw {width}x{height} frame has {} bytes",
                 payload.len()
             );
-            viewer_stream::unpack_rgb(payload, width, &mut rgba, threads);
+            viewer_stream::unpack_rgb(workers, payload, width, &mut rgba)?;
         }
         Payload::Dsc => {
             let decoder = decoder
@@ -2178,12 +2486,11 @@ fn receive_picture(
                     (decoder.pps().pic_width, decoder.pps().pic_height) == (header.width, header.height)
                 })
                 .ok_or_else(|| anyhow::anyhow!("DSC {width}x{height} frame without its parameter set"))?;
-            rgba.resize(width * height * 4, 0);
-            decoder.decode_parallel(payload, &mut rgba, width * 4, dsc::PixelFormat::Rgbx, threads)?;
+            decoder.decode_parallel(payload, &mut rgba, width * 4, dsc::PixelFormat::Rgbx, workers.threads())?;
         }
     }
     stats.received(&header, message.len(), arrived.elapsed());
-    store_frame(
+    let replaced = store_frame(
         mailbox,
         Frame {
             width: u32::from(header.width),
@@ -2193,6 +2500,9 @@ fn receive_picture(
             serial: u64::from(header.sequence),
         },
     );
+    if let Some(replaced) = replaced {
+        recycle(&stats.pool, replaced.pixels);
+    }
     Ok(())
 }
 
@@ -2249,7 +2559,7 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     let stats = Arc::new(StreamStats::default());
 
     // Input records go out as they are queued, whatever the frame thread does.
-    let (ops, mut queued) = tokio::sync::mpsc::unbounded_channel::<Op>();
+    let (ops, mut queued) = tokio::sync::mpsc::channel::<Op>(STREAM_INPUT_QUEUE);
     let (closed, sink_closed) = tokio::sync::oneshot::channel::<()>();
     runtime.spawn(async move {
         while let Some(op) = queued.recv().await {
@@ -2269,7 +2579,7 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         let (undecoded, mailbox, stats, shutdown) =
             (Arc::clone(&undecoded), Arc::clone(&mailbox), Arc::clone(&stats), shutdown.clone());
         std::thread::Builder::new().name("stream-decode".to_owned()).spawn(move || {
-            let threads = codec_threads();
+            let mut workers = viewer_stream::Workers::all_cores();
             let (newest, arrived) = &*undecoded;
             loop {
                 let picture = {
@@ -2283,7 +2593,7 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                     newest.take()
                 };
                 let Some((message, decoder)) = picture else { break };
-                if let Err(error) = receive_picture(&message, decoder.as_deref(), &mailbox, &stats, threads) {
+                if let Err(error) = receive_picture(&message, decoder.as_deref(), &mailbox, &stats, &mut workers) {
                     eprintln!("kwin-viewer: stream: {error:#}");
                     shutdown.request();
                     break;
@@ -2299,16 +2609,12 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
             loop {
                 match handle.block_on(stream.next()) {
                     Some(Ok(Message::Binary(message))) => {
-                        let parameter_set = match Header::decode(&message) {
-                            Some((header, payload)) if header.payload == Payload::Pps => Some(payload),
-                            Some(_) => None,
-                            None => {
-                                eprintln!("kwin-viewer: stream: unknown frame message of {} bytes", message.len());
-                                break;
-                            }
+                        let Some((header, payload)) = Header::decode(&message) else {
+                            eprintln!("kwin-viewer: stream: unknown frame message of {} bytes", message.len());
+                            break;
                         };
-                        if let Some(parameter_set) = parameter_set {
-                            match dsc::Pps::from_bytes(parameter_set).and_then(dsc::Decoder::new) {
+                        if header.payload == Payload::Pps {
+                            match dsc::Pps::from_bytes(payload).and_then(dsc::Decoder::new) {
                                 Ok(next) => decoder = Some(Arc::new(next)),
                                 Err(error) => {
                                     eprintln!("kwin-viewer: stream: picture parameter set: {error}");
@@ -2318,11 +2624,7 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                             stats.counters().parameter_sets += 1;
                             continue;
                         }
-                        {
-                            let mut counters = stats.counters();
-                            counters.bytes += message.len() as u64;
-                            counters.recent.bytes += message.len() as u64;
-                        }
+                        stats.arrived(&header, message.len());
                         let (newest, arrived) = &*undecoded;
                         let replaced = newest
                             .lock()
@@ -2362,7 +2664,7 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     }
 
     let mut input_state = InputState {
-        out: InputOut::Remote(OpSink::Socket(ops)),
+        out: InputOut::Remote(OpSink::Socket(ops, shutdown.clone())),
         last_pos: None,
         held_buttons: 0,
         active_touch: None,
@@ -2474,18 +2776,28 @@ impl Op {
 #[derive(Clone)]
 enum OpSink {
     Pipe(Arc<Mutex<std::process::ChildStdin>>),
-    Socket(tokio::sync::mpsc::UnboundedSender<Op>),
+    Socket(tokio::sync::mpsc::Sender<Op>, Shutdown),
 }
 
 impl OpSink {
     fn send(&self, op: Op) {
+        use tokio::sync::mpsc::error::TrySendError;
         match self {
             OpSink::Pipe(pipe) => send_remote_op(pipe, op),
-            OpSink::Socket(queue) => {
-                if queue.send(op).is_err() {
-                    eprintln!("kwin-viewer: frame socket closed");
+            OpSink::Socket(queue, shutdown) => match queue.try_send(op) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => eprintln!("kwin-viewer: frame socket closed"),
+                // A dropped record could leave a key held in the session, so
+                // the stream ends instead.
+                Err(TrySendError::Full(_)) => {
+                    if !shutdown.requested() {
+                        eprintln!(
+                            "kwin-viewer: stream: the session's host took none of {STREAM_INPUT_QUEUE} input records; closing"
+                        );
+                    }
+                    shutdown.request();
                 }
-            }
+            },
         }
     }
 }
@@ -2888,13 +3200,15 @@ fn run_pipewire(
             let src_fmt = ud.format.format();
 
             let captured_micros = unix_micros();
-            let pixels = match ud.layout {
+            let pixels = match &ud.layout {
                 CaptureLayout::Rgba => {
                     let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
                     convert_to_rgba(raw, &mut rgba, w as usize, h as usize, stride, src_fmt);
                     rgba
                 }
-                CaptureLayout::Bgrx => copy_as_bgrx(raw, w as usize, h as usize, stride, src_fmt),
+                CaptureLayout::Bgrx(pool) => {
+                    copy_as_bgrx(raw, w as usize, h as usize, stride, src_fmt, recycled(pool))
+                }
             };
             ud.serial += 1;
 
@@ -2909,7 +3223,11 @@ fn run_pipewire(
                 );
                 ud.first_frame_received = true;
             }
-            store_frame(&ud.mailbox, Frame { width: w, height: h, pixels, captured_micros, serial: ud.serial });
+            let replaced =
+                store_frame(&ud.mailbox, Frame { width: w, height: h, pixels, captured_micros, serial: ud.serial });
+            if let (Some(replaced), CaptureLayout::Bgrx(pool)) = (replaced, &ud.layout) {
+                recycle(pool, replaced.pixels);
+            }
         })
         .register()?;
 
@@ -2970,17 +3288,20 @@ fn build_format_pod(virt: (u32, u32)) -> anyhow::Result<Vec<u8>> {
 }
 
 // The captured rows without their stride padding, as BGRx: the layout KWin
-// delivers and the DSC encoder and the raw packer read.
+// delivers and the DSC encoder and the raw packer read. `out` is a buffer to
+// fill; one that held a picture of this size is not allocated again.
 fn copy_as_bgrx(
     src: &[u8],
     w: usize,
     h: usize,
     stride: usize,
     fmt: pipewire::spa::param::video::VideoFormat,
+    mut out: Vec<u8>,
 ) -> Vec<u8> {
     use pipewire::spa::param::video::VideoFormat as F;
     let row = w * 4;
-    let mut out = Vec::with_capacity(row * h);
+    out.clear();
+    out.reserve_exact(row * h);
     for y in 0..h {
         let Some(line) = src.get(y * stride..y * stride + row) else { break };
         out.extend_from_slice(line);
@@ -3104,6 +3425,74 @@ mod wire_tests {
         Ok(())
     }
 
+    fn picture(payload: Payload, settle: bool) -> Header {
+        Header { payload, settle, width: 4, height: 2, bpp_x16: 96, sequence: 0, captured_micros: 0, sender_micros: 0 }
+    }
+
+    #[test]
+    fn a_settle_frame_is_counted_and_is_not_a_mode_switch() {
+        let stats = StreamStats::default();
+        // DSC, the still frame once more exactly, DSC again: one settle, and
+        // the stream's mode never changed.
+        stats.arrived(&picture(Payload::Dsc, false), 100);
+        stats.arrived(&picture(Payload::Raw, true), 300);
+        stats.arrived(&picture(Payload::Dsc, false), 100);
+        {
+            let counters = stats.counters();
+            assert_eq!((counters.mode_switches, counters.settles, counters.stream_raw), (0, 1, Some(false)));
+            assert_eq!((counters.bytes, counters.recent.bytes), (500, 500));
+        }
+        // The stream turns raw and back to DSC: two switches.
+        stats.arrived(&picture(Payload::Raw, false), 300);
+        stats.arrived(&picture(Payload::Raw, false), 300);
+        assert_eq!(stats.counters().stream_raw, Some(true));
+        stats.arrived(&picture(Payload::Dsc, false), 100);
+        stats.arrived(&picture(Payload::Raw, true), 300);
+        let counters = stats.counters();
+        assert_eq!((counters.mode_switches, counters.settles, counters.stream_raw), (2, 2, Some(false)));
+    }
+
+    #[test]
+    fn a_capture_takes_the_buffer_of_one_that_is_done_with() {
+        use pipewire::spa::param::video::VideoFormat;
+        let pool: BufferPool = Arc::default();
+        let (width, height, stride) = (3usize, 2usize, 3 * 4 + 4);
+        let source: Vec<u8> = (0..stride * height).map(|index| index as u8).collect();
+        let rows: Vec<u8> = source.chunks_exact(stride).flat_map(|row| row[..width * 4].to_vec()).collect();
+        let first = copy_as_bgrx(&source, width, height, stride, VideoFormat::BGRx, recycled(&pool));
+        assert_eq!(first, rows);
+        let address = first.as_ptr();
+        recycle(&pool, first);
+        // The next capture of the same size fills the same allocation.
+        let second = copy_as_bgrx(&source, width, height, stride, VideoFormat::RGBx, recycled(&pool));
+        assert_eq!(second.as_ptr(), address);
+        let swapped: Vec<u8> = rows.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]]).collect();
+        assert_eq!(second, swapped);
+        // The pool keeps a few buffers, not every one it is handed.
+        for _ in 0..3 * CAPTURE_POOL_BUFFERS {
+            recycle(&pool, vec![0; 16]);
+        }
+        assert_eq!(pool.lock().unwrap().len(), CAPTURE_POOL_BUFFERS);
+    }
+
+    #[test]
+    fn the_swapchain_is_unorm_in_the_srgb_colour_space_when_the_surface_offers_it() {
+        let offer = |format, color_space| vk::SurfaceFormatKHR { format, color_space };
+        let srgb = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let offered = [
+            offer(vk::Format::B8G8R8A8_SRGB, srgb),
+            offer(vk::Format::A2B10G10R10_UNORM_PACK32, srgb),
+            offer(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT),
+            offer(vk::Format::R8G8B8A8_UNORM, srgb),
+            offer(vk::Format::B8G8R8A8_UNORM, srgb),
+        ];
+        // The first UNORM sRGB format, before an _SRGB format that would
+        // apply the transfer curve to the session's values.
+        assert_eq!(exact_surface_format(&offered), offered[3]);
+        // Without one: any 8-bit UNORM format, then whatever comes first.
+        assert_eq!(exact_surface_format(&offered[..3]), offered[2]);
+        assert_eq!(exact_surface_format(&offered[..2]), offered[0]);
+    }
     #[test]
     fn frames_keep_their_pixels_across_the_wire() -> anyhow::Result<()> {
         let rgba: Vec<u8> = (0..4 * 6 * 3).map(|i| u8::try_from(i * 7 % 256).unwrap_or(0)).collect();

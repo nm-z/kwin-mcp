@@ -8,66 +8,122 @@
 //! Sender to viewer:
 //! * text: one JSON [`Notice`] (`hello` once, then `title` on each change);
 //! * binary: a [`Header`] followed by its payload. `Raw` is `width * height`
-//!   pixels of 3 bytes (red, green, blue). `Dsc` is one VESA DSC picture for
-//!   the picture parameter set last sent. `Pps` is that 128-byte set, sent
-//!   before the first DSC picture and again whenever size or rate changes.
+//!   pixels of 3 bytes (red, green, blue): the session's own values, exact.
+//!   `Dsc` is one VESA DSC picture for the picture parameter set last sent.
+//!   `Pps` is that 128-byte set, sent before the first DSC picture and again
+//!   whenever size or rate changes.
 //!
 //! Viewer to sender: binary 17-byte input records (the viewer's `Op`), which
 //! include the drawable size and the first-presentation notice.
 //!
 //! A picture is sent only when the session's screen changed, scaled down to
-//! the viewer's drawable size (never up), so every picture of one viewer size
-//! and mode has the same length.
+//! the viewer's drawable size (never up). One picture is on its way at a time:
+//! the next one is the newest capture once the last byte of the previous one
+//! has left for the viewer, so nothing queues behind a slow or stalled viewer.
 //!
-//! Mode: with `budget` = the link's speed times [`LINK_USABLE_PERCENT`], a
-//! picture goes out raw when `width * height * 24 * 60 <= budget`, otherwise
-//! as DSC starting at 8 bits per pixel.
+//! # Mode: exact pixels unless DSC is sooner ([`ModeControl`])
 //!
-//! Rate rule ([`RateControl`]), applied after each DSC picture with that
-//! picture's time (scaling, encoding and sending) and its complexity `c`
-//! (`FrameStats::complexity_permille`, 0 = coded without quantization):
-//! 1. slow: each of the last [`CONSISTENT_FRAMES`] pictures took longer than
-//!    one 60 Hz period;
-//! 2. over budget: `width * height * bpp * 60 > budget`;
-//! 3. on slow or over budget, lower the rate by `1/4 + 3/4 * (1000 - c) / 1000`
-//!    bits per pixel (a simple picture gives up the most), to no less than 6,
-//!    and when only the budget asks, to no less than the budget allows;
-//! 4. otherwise, when each of the last [`CONSISTENT_FRAMES`] pictures took less
-//!    than half a period, raise it by `c / 1000` bits per pixel (a picture
-//!    already coded exactly gains nothing), to no more than 12 or the budget;
-//! 5. a change starts both counts again, and the new picture parameter set
-//!    goes out before the next picture.
+//! Measured, per frame socket:
+//! * `link`: bits per second the socket carried, from each picture of at
+//!   least [`LINK_SAMPLE_BYTES`] and the time until its last byte left. It
+//!   starts at the link budget (the interface's speed times
+//!   [`LINK_USABLE_PERCENT`], which the socket is also paced to) and then
+//!   follows the measurements, a quarter of the difference per picture.
+//! * `pack` and `encode`: time to pack a raw picture and to encode a DSC one,
+//!   per pixel, smoothed the same way. While raw is not usable and no DSC
+//!   picture gives it, the sender encodes one picture just to measure
+//!   `encode`: before the first decision that needs it, and again after
+//!   every [`ENCODE_REMEASURE_FRAMES`] raw pictures.
+//!
+//! For a picture of `pixels` pixels:
+//! * `raw_time = pack + pixels * 24 / link`;
+//! * `rate` = the highest whole DSC rate from 6 to 12 bits per pixel whose
+//!   picture crosses the link within [`USABLE_FRAME_TIME`]: it follows the
+//!   link alone, never the encode time;
+//! * `dsc_time = encode + pixels * rate / link`.
+//!
+//! Rule:
+//! 1. Raw while `raw_time <= USABLE_FRAME_TIME`: the link carries exact
+//!    pixels at a usable rate.
+//! 2. From raw to DSC when raw is not usable and DSC is at least a quarter
+//!    sooner: `dsc_time <= raw_time * DSC_SOONER_PERCENT / 100`.
+//! 3. From DSC back to raw when `raw_time <= USABLE_FRAME_TIME *
+//!    RAW_RETURN_PERCENT / 100` or DSC is no longer sooner
+//!    (`dsc_time >= raw_time`).
+//! 4. A change of mode needs the rule to ask for it on
+//!    [`SWITCH_AFTER_FRAMES`] pictures in a row; the first picture of a new
+//!    size decides at once by 1 and 2.
+//! 5. In DSC the rate rises when the link carries a higher one with
+//!    [`RATE_RAISE_PERCENT`] of its speed, and falls when it no longer
+//!    carries the current one, each on [`SWITCH_AFTER_FRAMES`] pictures in a
+//!    row.
+//!
+//! # Settle to exact ([`Settle`])
+//!
+//! When the last picture went out as DSC and the screen stays unchanged for
+//! [`SETTLE_AFTER`], the same picture goes out once more raw, marked
+//! [`Header::settle`]: a still screen is always shown with exact pixels.
 
 use crate::dsc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-/// Pictures per second the budget and the rate rule are measured against.
-pub const FRAME_RATE: u64 = 60;
-/// One period of [`FRAME_RATE`].
-pub const FRAME_PERIOD: Duration = Duration::from_nanos(1_000_000_000 / FRAME_RATE);
 /// Bits per pixel of a raw picture, in 1/16 bit as the DSC rates are.
 pub const RAW_BPP_X16: u16 = 24 * 16;
 /// Share of the link speed the stream may fill.
 pub const LINK_USABLE_PERCENT: u64 = 90;
 /// Speed assumed for an interface that reports none (Wi-Fi, virtual links).
 pub const UNKNOWN_LINK_MBPS: u64 = 1000;
-/// How many pictures in a row make a timing "consistent" for the rate rule.
-pub const CONSISTENT_FRAMES: u32 = 8;
+/// A picture arrives at a usable rate when packing or encoding it and sending
+/// it takes no longer than this: ten pictures a second.
+pub const USABLE_FRAME_TIME: Duration = Duration::from_millis(100);
+/// DSC replaces raw only when it takes at most this share of raw's time.
+pub const DSC_SOONER_PERCENT: u64 = 75;
+/// Raw replaces DSC once it takes at most this share of [`USABLE_FRAME_TIME`].
+pub const RAW_RETURN_PERCENT: u64 = 90;
+/// The DSC rate rises when this share of the link carries the higher rate.
+pub const RATE_RAISE_PERCENT: u64 = 95;
+/// Pictures in a row that must ask for another mode or rate before it changes.
+pub const SWITCH_AFTER_FRAMES: u32 = 4;
+/// While raw is not usable, the encoder is timed again after this many raw
+/// pictures, so one slow measurement does not keep DSC away for good.
+pub const ENCODE_REMEASURE_FRAMES: u32 = 32;
+/// How long the screen stays unchanged after a DSC picture before the same
+/// picture goes out exactly.
+pub const SETTLE_AFTER: Duration = Duration::from_millis(150);
+/// Smallest picture message whose sending time measures the link.
+pub const LINK_SAMPLE_BYTES: usize = 64 << 10;
+/// Shortest sending time a link measurement divides by: the sender looks for
+/// the last byte's departure this often.
+pub const LINK_SAMPLE_TIME: Duration = Duration::from_micros(250);
 /// File beside the viewer's log where `kwin-viewer --stream` keeps its
-/// counters: frames, bytes, size, mode, rate, and the last second's rates and
-/// capture-to-present latency.
+/// counters: frames, bytes, size, mode, rate, mode switches, settles, and the
+/// last second's rates and capture-to-present latency.
 pub const COUNTERS_FILE: &str = "viewer-stream.json";
+/// Names a file for `kwin-viewer --stream`: whenever a second passes without
+/// a picture, it writes the picture it last presented there as a PNG.
+pub const DUMP_ENV: &str = "KWIN_VIEWER_STREAM_DUMP";
 /// Weights of one output sample of the scaler sum to this.
 const WEIGHT_ONE: u16 = 256;
 const BYTES_PER_PIXEL: usize = 4;
 const RAW_BYTES_PER_PIXEL: usize = 3;
+/// Measurements move a smoothed value by one part in this many.
+const SMOOTHING: u64 = 4;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+/// `SIOCOUTQNSD` of linux/sockios.h: bytes of a socket's send queue that
+/// have not been sent yet.
+const SIOCOUTQNSD: nix::libc::Ioctl = 0x894B;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StreamError {
     #[error("frame buffer is smaller than its dimensions")]
     FrameTooSmall,
+    #[error("output buffer does not have the picture's size")]
+    OutputSize,
     #[error("dimensions {0}x{1} cannot be scaled to {2}x{3}")]
     Dimensions(u32, u32, u32, u32),
+    #[error("a picture worker panicked")]
+    WorkerPanicked,
 }
 
 /// A text message from the sender.
@@ -99,13 +155,18 @@ pub enum Payload {
 
 /// Length in bytes of an encoded [`Header`].
 pub const HEADER_BYTES: usize = 24;
+/// Bit of the header's flag byte that marks a settle picture.
+const FLAG_SETTLE: u8 = 1;
 
 /// The fixed head of every binary message from the sender, little-endian:
-/// kind (1 raw, 2 DSC, 3 PPS), a zero byte, width, height and rate (u16
-/// each), sequence (u32), capture time (u64) and sender time (u32).
+/// kind (1 raw, 2 DSC, 3 PPS), flags (bit 0: settle), width, height and rate
+/// (u16 each), sequence (u32), capture time (u64) and sender time (u32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub payload: Payload,
+    /// A raw picture that repeats the DSC picture before it exactly, sent
+    /// because the screen stayed unchanged. It is not a change of mode.
+    pub settle: bool,
     pub width: u16,
     pub height: u16,
     /// Bits per pixel times 16: [`RAW_BPP_X16`] or the DSC rate.
@@ -127,6 +188,7 @@ impl Header {
             Payload::Dsc => 2,
             Payload::Pps => 3,
         };
+        bytes[1] = if self.settle { FLAG_SETTLE } else { 0 };
         bytes[2..4].copy_from_slice(&self.width.to_le_bytes());
         bytes[4..6].copy_from_slice(&self.height.to_le_bytes());
         bytes[6..8].copy_from_slice(&self.bpp_x16.to_le_bytes());
@@ -149,6 +211,7 @@ impl Header {
         let u16_at = |at: usize| Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?));
         let header = Self {
             payload: kind,
+            settle: head[1] & FLAG_SETTLE != 0,
             width: u16_at(2)?,
             height: u16_at(4)?,
             bpp_x16: u16_at(6)?,
@@ -175,20 +238,6 @@ pub fn fit_size(session: (u32, u32), drawable: (u32, u32)) -> (u32, u32) {
         drawable.0.clamp(1, session.0.max(1)),
         drawable.1.clamp(1, session.1.max(1)),
     )
-}
-
-/// Bits per second of a stream of `pixels`-pixel pictures at [`FRAME_RATE`].
-pub fn stream_bits_per_second(pixels: u64, bpp_x16: u16) -> u64 {
-    pixels
-        .saturating_mul(u64::from(bpp_x16))
-        .saturating_mul(FRAME_RATE)
-        / 16
-}
-
-/// Whether raw pictures of this size fit the budget at [`FRAME_RATE`].
-pub fn raw_fits(width: u32, height: u32, budget: Option<u64>) -> bool {
-    let pixels = u64::from(width) * u64::from(height);
-    budget.is_none_or(|budget| stream_bits_per_second(pixels, RAW_BPP_X16) <= budget)
 }
 
 /// The bit budget of a frame socket.
@@ -280,100 +329,560 @@ pub fn link_budget(local: std::net::IpAddr, override_mbps: Option<u64>) -> LinkB
     budget_of(override_mbps, interface.as_ref())
 }
 
-/// DSC rate for the pictures of one viewer size. See the module text for the rule.
+/// Has the kernel send `socket`'s bytes no faster than `bits_per_second`
+/// (`SO_MAX_PACING_RATE`), so the stream stays inside its budget on the real
+/// link and `--link-mbps` behaves like a link of that speed on any other.
+pub fn pace(socket: &impl std::os::fd::AsFd, bits_per_second: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let bytes_per_second: u64 = (bits_per_second / 8).max(1);
+    let length = nix::libc::socklen_t::try_from(size_of::<u64>()).map_err(std::io::Error::other)?;
+    // SAFETY: the kernel reads `length` bytes from `bytes_per_second`, which
+    // lives until the call returns.
+    let result = unsafe {
+        nix::libc::setsockopt(
+            socket.as_fd().as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_MAX_PACING_RATE,
+            (&raw const bytes_per_second).cast(),
+            length,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Bytes written to the TCP `socket` that the kernel has not sent yet. Zero
+/// means the last byte has left for the peer.
+pub fn unsent_bytes(socket: &impl std::os::fd::AsFd) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let mut unsent: nix::libc::c_int = 0;
+    // SAFETY: SIOCOUTQNSD writes one int through the pointer, which is valid
+    // for the call.
+    let result =
+        unsafe { nix::libc::ioctl(socket.as_fd().as_raw_fd(), SIOCOUTQNSD, &raw mut unsent) };
+    if result == 0 {
+        Ok(usize::try_from(unsent).unwrap_or(0))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// How a picture goes out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Exact pixels.
+    Raw,
+    /// VESA DSC at this many 1/16 bits per pixel.
+    Dsc { bpp_x16: u16 },
+}
+
+impl Mode {
+    pub fn is_raw(self) -> bool {
+        self == Self::Raw
+    }
+}
+
+/// What one sent picture cost.
+#[derive(Clone, Copy, Debug)]
+pub struct Sent {
+    pub mode: Mode,
+    pub pixels: u64,
+    /// Packing (raw) or encoding (DSC); scaling is not part of it.
+    pub prepare: Duration,
+    /// Length of the picture's message.
+    pub bytes: usize,
+    /// From handing the message to the socket until its last byte left.
+    pub wire: Duration,
+}
+
+/// What the rule expects of the next picture of some size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Estimate {
+    /// None: unlimited and not measured yet.
+    pub link_bits_per_second: Option<u64>,
+    pub raw: Duration,
+    pub dsc: Duration,
+    /// The rate `dsc` is for.
+    pub dsc_bpp_x16: u16,
+}
+
+fn smoothed(current: Option<u64>, sample: u64) -> u64 {
+    match current {
+        None => sample,
+        Some(current) if sample >= current => current + (sample - current) / SMOOTHING,
+        Some(current) => current - (current - sample) / SMOOTHING,
+    }
+}
+
+fn narrow(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn nanos(duration: Duration) -> u64 {
+    narrow(duration.as_nanos())
+}
+
+/// The mode of each picture on one frame socket. See the module text for the
+/// rule.
 #[derive(Clone, Debug)]
-pub struct RateControl {
-    bpp_x16: u16,
-    slow: u32,
-    fast: u32,
+pub struct ModeControl {
+    budget: Option<u64>,
+    /// Bits per second; the budget until a picture measured it.
+    link: Option<u64>,
+    link_measured: bool,
+    /// Picoseconds per pixel.
+    pack: Option<u64>,
+    encode: Option<u64>,
+    /// The size the mode was chosen for.
+    pixels: Option<u64>,
+    mode: Mode,
+    /// Pictures in a row for which the rule asked for the other mode.
+    against_mode: u32,
+    /// Pictures in a row for which the rule asked for another rate.
+    against_rate: u32,
+    switches: u64,
+    /// Raw pictures since the encoder was last timed.
+    raw_since_encode: u32,
 }
 
-impl Default for RateControl {
-    fn default() -> Self {
+impl ModeControl {
+    /// `budget` is the link budget in bits per second; None is unlimited.
+    pub fn new(budget: Option<u64>) -> Self {
         Self {
-            bpp_x16: dsc::DEFAULT_BPP_X16,
-            slow: 0,
-            fast: 0,
+            budget,
+            link: budget,
+            link_measured: false,
+            pack: None,
+            encode: None,
+            pixels: None,
+            mode: Mode::Raw,
+            against_mode: 0,
+            against_rate: 0,
+            switches: 0,
+            raw_since_encode: 0,
+        }
+    }
+
+    /// Times the mode changed between raw and DSC.
+    pub fn switches(&self) -> u64 {
+        self.switches
+    }
+
+    fn wire(&self, bits: u64) -> Duration {
+        self.link.map_or(Duration::ZERO, |link| {
+            Duration::from_nanos(narrow(
+                u128::from(bits) * NANOS_PER_SECOND / u128::from(link.max(1)),
+            ))
+        })
+    }
+
+    fn per_picture(picos_per_pixel: Option<u64>, pixels: u64) -> Duration {
+        Duration::from_nanos(picos_per_pixel.unwrap_or(0).saturating_mul(pixels) / 1000)
+    }
+
+    /// The highest whole rate whose picture crosses `percent` of the link
+    /// within [`USABLE_FRAME_TIME`], within the codec's range.
+    fn carried_rate(&self, pixels: u64, percent: u64) -> u16 {
+        let Some(link) = self.link else {
+            return dsc::MAX_BPP_X16;
+        };
+        let bits = u128::from(link) * u128::from(percent) / 100 * USABLE_FRAME_TIME.as_nanos()
+            / NANOS_PER_SECOND;
+        let whole = narrow(bits / u128::from(pixels.max(1)));
+        u16::try_from(whole.saturating_mul(16))
+            .unwrap_or(dsc::MAX_BPP_X16)
+            .clamp(dsc::MIN_BPP_X16, dsc::MAX_BPP_X16)
+    }
+
+    fn estimate_at(&self, pixels: u64, dsc_bpp_x16: u16) -> Estimate {
+        let raw_bits = pixels.saturating_mul(u64::from(RAW_BPP_X16)) / 16;
+        let dsc_bits = pixels.saturating_mul(u64::from(dsc_bpp_x16)) / 16;
+        Estimate {
+            link_bits_per_second: self.link,
+            raw: Self::per_picture(self.pack, pixels) + self.wire(raw_bits),
+            dsc: Self::per_picture(self.encode, pixels) + self.wire(dsc_bits),
+            dsc_bpp_x16,
+        }
+    }
+
+    /// What a picture of `pixels` pixels is expected to take: DSC at the
+    /// current rate while that is the mode for this size, otherwise at the
+    /// rate the link carries.
+    pub fn estimate(&self, pixels: u64) -> Estimate {
+        let rate = match self.mode {
+            Mode::Dsc { bpp_x16 } if self.pixels == Some(pixels) => bpp_x16,
+            Mode::Dsc { .. } | Mode::Raw => self.carried_rate(pixels, 100),
+        };
+        self.estimate_at(pixels, rate)
+    }
+
+    /// Whether the rule asks for DSC, given the mode it is in.
+    fn wants_dsc(estimate: &Estimate, lossy: bool) -> bool {
+        let (raw, dsc, usable) = (
+            estimate.raw.as_nanos(),
+            estimate.dsc.as_nanos(),
+            USABLE_FRAME_TIME.as_nanos(),
+        );
+        if lossy {
+            raw * 100 > usable * u128::from(RAW_RETURN_PERCENT) && dsc < raw
+        } else {
+            raw > usable && dsc * 100 <= raw * u128::from(DSC_SOONER_PERCENT)
+        }
+    }
+
+    /// Whether the rule can give DSC for the next picture of `pixels`
+    /// pixels: DSC is the mode for this size, or raw is too slow for the rule
+    /// to keep or return to it at once. Otherwise the sender needs no encoder.
+    pub fn may_choose_dsc(&self, pixels: u64) -> bool {
+        let lossy = !self.mode.is_raw() && self.pixels == Some(pixels);
+        lossy
+            || self.estimate(pixels).raw.as_nanos() * 100
+                > USABLE_FRAME_TIME.as_nanos() * u128::from(RAW_RETURN_PERCENT)
+    }
+
+    /// Whether the next decision for `pixels` pixels needs an encode time
+    /// the sender has to measure: raw is not usable, and no picture has been
+    /// encoded yet or none for [`ENCODE_REMEASURE_FRAMES`] raw pictures. The
+    /// sender then encodes one picture and reports it with
+    /// [`Self::encode_measured`].
+    pub fn wants_encode_time(&self, pixels: u64) -> bool {
+        (self.encode.is_none() || self.raw_since_encode >= ENCODE_REMEASURE_FRAMES)
+            && self.estimate(pixels).raw > USABLE_FRAME_TIME
+    }
+
+    /// An encode of `pixels` pixels took `time`.
+    pub fn encode_measured(&mut self, pixels: u64, time: Duration) {
+        let sample = narrow(time.as_nanos() * 1000 / u128::from(pixels.max(1)));
+        self.encode = Some(smoothed(self.encode, sample));
+        self.raw_since_encode = 0;
+    }
+
+    fn switch_to(&mut self, mode: Mode) {
+        if mode.is_raw() != self.mode.is_raw() {
+            self.switches += 1;
+        }
+        self.mode = mode;
+        self.against_mode = 0;
+        self.against_rate = 0;
+    }
+
+    /// The mode for the next picture of `pixels` pixels. `dsc_available` is
+    /// false for a size the codec has no slice layout for, which goes out
+    /// raw.
+    pub fn mode(&mut self, pixels: u64, dsc_available: bool) -> Mode {
+        let first = self.pixels.is_none();
+        let resized = self.pixels != Some(pixels);
+        self.pixels = Some(pixels);
+        if !dsc_available {
+            if !first {
+                self.switch_to(Mode::Raw);
+            }
+            return self.mode;
+        }
+        if resized {
+            let carried = self.carried_rate(pixels, 100);
+            let chosen = if Self::wants_dsc(&self.estimate_at(pixels, carried), false) {
+                Mode::Dsc { bpp_x16: carried }
+            } else {
+                Mode::Raw
+            };
+            if first {
+                self.mode = chosen;
+            } else {
+                self.switch_to(chosen);
+            }
+            return self.mode;
+        }
+        let lossy = !self.mode.is_raw();
+        if Self::wants_dsc(&self.estimate(pixels), lossy) == lossy {
+            self.against_mode = 0;
+        } else {
+            self.against_mode += 1;
+            if self.against_mode >= SWITCH_AFTER_FRAMES {
+                self.switch_to(if lossy {
+                    Mode::Raw
+                } else {
+                    Mode::Dsc {
+                        bpp_x16: self.carried_rate(pixels, 100),
+                    }
+                });
+                return self.mode;
+            }
+        }
+        if let Mode::Dsc { bpp_x16 } = self.mode {
+            let raised = self.carried_rate(pixels, RATE_RAISE_PERCENT);
+            let carried = self.carried_rate(pixels, 100);
+            let wanted = if raised > bpp_x16 {
+                raised
+            } else {
+                carried.min(bpp_x16)
+            };
+            if wanted == bpp_x16 {
+                self.against_rate = 0;
+            } else {
+                self.against_rate += 1;
+                if self.against_rate >= SWITCH_AFTER_FRAMES {
+                    self.against_rate = 0;
+                    self.mode = Mode::Dsc { bpp_x16: wanted };
+                }
+            }
+        }
+        self.mode
+    }
+
+    /// Accounts for one sent picture: its pack or encode time and, when the
+    /// message was large enough to measure it, the link's speed.
+    pub fn sent(&mut self, sent: &Sent) {
+        let sample = narrow(sent.prepare.as_nanos() * 1000 / u128::from(sent.pixels.max(1)));
+        match sent.mode {
+            Mode::Raw => {
+                self.pack = Some(smoothed(self.pack, sample));
+                self.raw_since_encode = self.raw_since_encode.saturating_add(1);
+            }
+            Mode::Dsc { .. } => {
+                self.encode = Some(smoothed(self.encode, sample));
+                self.raw_since_encode = 0;
+            }
+        }
+        if sent.bytes < LINK_SAMPLE_BYTES {
+            return;
+        }
+        let bits = u128::try_from(sent.bytes).unwrap_or(u128::MAX) * 8;
+        let wire = u128::from(nanos(sent.wire.max(LINK_SAMPLE_TIME)));
+        let mut speed = narrow(bits * NANOS_PER_SECOND / wire);
+        if let Some(budget) = self.budget {
+            speed = speed.min(budget);
+        }
+        // The first measurement replaces the nominal speed.
+        let known = self.link.filter(|_| self.link_measured);
+        self.link = Some(smoothed(known, speed).max(1));
+        self.link_measured = true;
+    }
+}
+
+/// When a still picture that went out as DSC goes out again exactly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Settle {
+    /// When the last picture went out, if it was DSC.
+    lossy_since: Option<Instant>,
+}
+
+impl Settle {
+    /// A picture went out at `now`; `lossy` when it was DSC.
+    pub fn sent(&mut self, lossy: bool, now: Instant) {
+        self.lossy_since = lossy.then_some(now);
+    }
+
+    /// How long from `now` until the exact picture is due, as long as the
+    /// screen stays unchanged: zero when it is due, None when the viewer
+    /// already has exact pixels.
+    pub fn due_in(&self, now: Instant) -> Option<Duration> {
+        self.lossy_since
+            .map(|since| (since + SETTLE_AFTER).saturating_duration_since(now))
+    }
+}
+
+/// One batch of borrowed work for the threads of [`Workers`].
+#[derive(Clone, Copy)]
+struct Batch {
+    work: &'static (dyn Fn(usize) + Sync),
+    count: usize,
+}
+
+#[derive(Default)]
+struct WorkState {
+    batch: Option<Batch>,
+    /// The next index of the batch that nobody has taken.
+    next: usize,
+    /// Indices taken and not finished.
+    running: usize,
+    panicked: bool,
+    closing: bool,
+}
+
+#[derive(Default)]
+struct WorkShared {
+    state: Mutex<WorkState>,
+    /// A batch was published, or the pool is closing.
+    published: Condvar,
+    /// The last running index of a batch finished.
+    finished: Condvar,
+}
+
+impl WorkShared {
+    fn state(&self) -> MutexGuard<'_, WorkState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn take(state: &mut WorkState) -> Option<(Batch, usize)> {
+        let batch = state.batch.filter(|batch| state.next < batch.count)?;
+        let index = state.next;
+        state.next += 1;
+        state.running += 1;
+        Some((batch, index))
+    }
+
+    fn run_one(&self, batch: Batch, index: usize) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (batch.work)(index)));
+        let mut state = self.state();
+        state.running -= 1;
+        state.panicked |= outcome.is_err();
+        if state.running == 0 {
+            self.finished.notify_all();
+        }
+    }
+
+    fn serve(&self) {
+        let mut state = self.state();
+        while !state.closing {
+            match Self::take(&mut state) {
+                Some((batch, index)) => {
+                    drop(state);
+                    self.run_one(batch, index);
+                    state = self.state();
+                }
+                None => {
+                    state = self
+                        .published
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
         }
     }
 }
 
-impl RateControl {
-    /// Rate for the next picture, in 1/16 bit per pixel.
-    pub fn bpp_x16(&self) -> u16 {
-        self.bpp_x16
+/// Threads that live as long as a stream and share out each picture's work,
+/// so no thread is created per picture.
+pub struct Workers {
+    shared: Arc<WorkShared>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Workers {
+    /// `threads` threads in all, counting the caller of [`Self::run`].
+    pub fn new(threads: usize) -> Self {
+        let shared = Arc::new(WorkShared::default());
+        let threads = (1..threads)
+            .filter_map(|_| {
+                let shared = Arc::clone(&shared);
+                std::thread::Builder::new()
+                    .name("picture-worker".to_owned())
+                    .spawn(move || shared.serve())
+                    .ok()
+            })
+            .collect();
+        Self { shared, threads }
     }
 
-    /// Accounts for one sent DSC picture of `pixels` pixels that took `time`
-    /// to scale, encode and send. Returns whether the rate changed.
-    pub fn after_frame(
-        &mut self,
-        pixels: u64,
-        time: Duration,
-        complexity_permille: u32,
-        budget: Option<u64>,
-    ) -> bool {
-        let complexity = u16::try_from(complexity_permille.min(1000)).unwrap_or(1000);
-        self.slow = if time > FRAME_PERIOD {
-            self.slow + 1
-        } else {
-            0
-        };
-        self.fast = if time * 2 < FRAME_PERIOD {
-            self.fast + 1
-        } else {
-            0
-        };
-        // The highest rate the budget carries at FRAME_RATE.
-        let ceiling = budget.map_or(dsc::MAX_BPP_X16, |budget| {
-            let rate = budget.saturating_mul(16) / pixels.max(1).saturating_mul(FRAME_RATE);
-            u16::try_from(rate)
-                .unwrap_or(dsc::MAX_BPP_X16)
-                .clamp(dsc::MIN_BPP_X16, dsc::MAX_BPP_X16)
-        });
-        let over_budget =
-            budget.is_some_and(|budget| stream_bits_per_second(pixels, self.bpp_x16) > budget);
-        let slow = self.slow >= CONSISTENT_FRAMES;
-        let next = if slow || over_budget {
-            let step = 4 + 12 * (1000 - complexity) / 1000;
-            let lowered = self.bpp_x16.saturating_sub(step).max(dsc::MIN_BPP_X16);
-            if slow { lowered } else { lowered.max(ceiling) }
-        } else if self.fast >= CONSISTENT_FRAMES {
-            (self.bpp_x16 + 16 * complexity / 1000).min(ceiling)
-        } else {
-            self.bpp_x16
-        };
-        if next == self.bpp_x16 {
-            return false;
+    /// One thread per core this process may use.
+    pub fn all_cores() -> Self {
+        Self::new(std::thread::available_parallelism().map_or(1, usize::from))
+    }
+
+    /// Threads that share a batch, counting the caller.
+    pub fn threads(&self) -> usize {
+        self.threads.len() + 1
+    }
+
+    /// Calls `work(index)` once for every index below `count`, on this
+    /// thread and the pool's, and returns when all calls have returned.
+    pub fn run(&mut self, count: usize, work: &(dyn Fn(usize) + Sync)) -> Result<(), StreamError> {
+        if count <= 1 || self.threads.is_empty() {
+            (0..count).for_each(work);
+            return Ok(());
         }
-        self.bpp_x16 = next;
-        self.slow = 0;
-        self.fast = 0;
-        true
+        // SAFETY: the reference outlives its borrow only inside `state.batch`
+        // and the copies `take` hands out. Every copy is counted in
+        // `state.running` under the lock, this call returns only after
+        // `running` is back to zero with no index left to take, and it clears
+        // `batch` before it returns. A panic in `work` is caught in
+        // `run_one`, on this thread too, so nothing unwinds past the wait.
+        let work = unsafe {
+            std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(work)
+        };
+        {
+            let mut state = self.shared.state();
+            state.batch = Some(Batch { work, count });
+            state.next = 0;
+            state.panicked = false;
+        }
+        self.shared.published.notify_all();
+        loop {
+            let taken = WorkShared::take(&mut self.shared.state());
+            let Some((batch, index)) = taken else { break };
+            self.shared.run_one(batch, index);
+        }
+        let mut state = self.shared.state();
+        while state.running > 0 {
+            state = self
+                .shared
+                .finished
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.batch = None;
+        if state.panicked {
+            return Err(StreamError::WorkerPanicked);
+        }
+        Ok(())
     }
 }
 
-/// Runs `work(first_row, rows)` over `out` cut into bands of whole rows, on up
-/// to `threads` threads.
-fn in_bands(
+impl Drop for Workers {
+    fn drop(&mut self) {
+        self.shared.state().closing = true;
+        self.shared.published.notify_all();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Most bands one picture is cut into.
+const MAX_BANDS: usize = 64;
+
+/// Runs `work(first_row, rows, state)` over `out` cut into bands of whole
+/// rows, one band per element of `states`, on the workers.
+fn in_bands<S: Send>(
+    workers: &mut Workers,
     out: &mut [u8],
     row_bytes: usize,
-    threads: usize,
-    work: impl Fn(usize, &mut [u8]) + Sync,
-) {
+    states: &mut [S],
+    work: impl Fn(usize, &mut [u8], &mut S) + Sync,
+) -> Result<(), StreamError> {
+    type Band<'a, S> = Mutex<Option<(usize, &'a mut [u8], &'a mut S)>>;
     let rows = out.len() / row_bytes.max(1);
-    let threads = threads.clamp(1, rows.max(1));
-    if threads == 1 {
-        work(0, out);
-        return;
+    let bands = states
+        .len()
+        .min(workers.threads())
+        .min(MAX_BANDS)
+        .clamp(1, rows.max(1));
+    let band_rows = rows.div_ceil(bands).max(1);
+    let slots: [Band<'_, S>; MAX_BANDS] = std::array::from_fn(|_| Mutex::new(None));
+    let mut count = 0;
+    for (index, ((band, state), slot)) in out
+        .chunks_mut(band_rows * row_bytes.max(1))
+        .zip(states.iter_mut())
+        .zip(&slots)
+        .enumerate()
+    {
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((index * band_rows, band, state));
+        count = index + 1;
     }
-    let band_rows = rows.div_ceil(threads);
-    std::thread::scope(|scope| {
-        for (band, chunk) in out.chunks_mut(band_rows * row_bytes).enumerate() {
-            let work = &work;
-            scope.spawn(move || work(band * band_rows, chunk));
+    workers.run(count, &|index| {
+        let taken = slots
+            .get(index)
+            .and_then(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).take());
+        if let Some((first_row, band, state)) = taken {
+            work(first_row, band, state);
         }
-    });
+    })
 }
 
 fn low_byte(value: u32) -> u8 {
@@ -434,12 +943,22 @@ impl Axis {
     }
 }
 
+/// One band's working rows of the scaler, kept between pictures.
+#[derive(Default)]
+struct ScaleRows {
+    /// One source-width row: the source rows an output row covers, summed.
+    sums: Vec<u16>,
+    /// Their mean.
+    mean: Vec<u8>,
+}
+
 /// Area (box) downscale of 4-byte pixels from one fixed size to another.
 pub struct Scaler {
     source: (usize, usize),
     target: (usize, usize),
     columns: Axis,
     rows: Axis,
+    bands: Vec<ScaleRows>,
 }
 
 impl Scaler {
@@ -460,83 +979,110 @@ impl Scaler {
             target,
             columns: Axis::new(source.0, target.0),
             rows: Axis::new(source.1, target.1),
+            bands: Vec::new(),
         })
     }
 
-    /// Scales `source` (rows `stride` bytes apart) into `out`, which becomes
-    /// tightly packed rows of the target size. The fourth byte of each pixel
-    /// is averaged like the others.
+    /// Bytes of a scaled picture: tightly packed rows of the target size.
+    pub fn scaled_len(&self) -> usize {
+        self.target.0 * self.target.1 * BYTES_PER_PIXEL
+    }
+
+    /// Scales `source` (rows `stride` bytes apart) into `out`, which must be
+    /// [`Self::scaled_len`] bytes. The fourth byte of each pixel is averaged
+    /// like the others. Nothing is allocated after the first picture.
     pub fn scale(
-        &self,
+        &mut self,
+        workers: &mut Workers,
         source: &[u8],
         stride: usize,
-        out: &mut Vec<u8>,
-        threads: usize,
+        out: &mut [u8],
     ) -> Result<(), StreamError> {
         let source_row = self.source.0 * BYTES_PER_PIXEL;
         if stride < source_row || source.len() < (self.source.1 - 1) * stride + source_row {
             return Err(StreamError::FrameTooSmall);
         }
+        if out.len() != self.scaled_len() {
+            return Err(StreamError::OutputSize);
+        }
         let target_row = self.target.0 * BYTES_PER_PIXEL;
-        out.clear();
-        out.resize(target_row * self.target.1, 0);
-        in_bands(out, target_row, threads, |first_row, band| {
-            // One source-width row: the rows this output row covers, averaged.
-            let mut sums = vec![0u16; source_row];
-            let mut mean = vec![0u8; source_row];
-            for (row, out_row) in band.chunks_exact_mut(target_row).enumerate() {
-                let Some(tap) = self.rows.taps.get(first_row + row) else {
-                    return;
-                };
-                sums.fill(0);
-                let weights = self.rows.weights.get(tap.weights.clone()).unwrap_or(&[]);
-                for (offset, weight) in weights.iter().enumerate() {
-                    let start = (tap.first + offset) * stride;
-                    let Some(line) = source.get(start..start + source_row) else {
+        let Self {
+            columns,
+            rows,
+            bands,
+            ..
+        } = self;
+        if bands.len() != workers.threads() {
+            bands.resize_with(workers.threads(), ScaleRows::default);
+        }
+        in_bands(
+            workers,
+            out,
+            target_row,
+            bands,
+            |first_row, band, scratch| {
+                scratch.sums.resize(source_row, 0);
+                scratch.mean.resize(source_row, 0);
+                let (sums, mean) = (&mut scratch.sums, &mut scratch.mean);
+                for (row, out_row) in band.chunks_exact_mut(target_row).enumerate() {
+                    let Some(tap) = rows.taps.get(first_row + row) else {
                         return;
                     };
-                    for (sum, sample) in sums.iter_mut().zip(line) {
-                        *sum += weight * u16::from(*sample);
-                    }
-                }
-                for (byte, sum) in mean.iter_mut().zip(&sums) {
-                    *byte = (sum + WEIGHT_ONE / 2).to_le_bytes()[1];
-                }
-                for (pixel, tap) in out_row
-                    .chunks_exact_mut(BYTES_PER_PIXEL)
-                    .zip(&self.columns.taps)
-                {
-                    let weights = self.columns.weights.get(tap.weights.clone()).unwrap_or(&[]);
-                    let start = tap.first * BYTES_PER_PIXEL;
-                    let samples = mean
-                        .get(start..start + weights.len() * BYTES_PER_PIXEL)
-                        .unwrap_or(&[]);
-                    let mut sum = [u32::from(WEIGHT_ONE / 2); BYTES_PER_PIXEL];
-                    for (weight, sample) in
-                        weights.iter().zip(samples.chunks_exact(BYTES_PER_PIXEL))
-                    {
-                        for (sum, channel) in sum.iter_mut().zip(sample) {
-                            *sum += u32::from(*weight) * u32::from(*channel);
+                    sums.fill(0);
+                    let weights = rows.weights.get(tap.weights.clone()).unwrap_or(&[]);
+                    for (offset, weight) in weights.iter().enumerate() {
+                        let start = (tap.first + offset) * stride;
+                        let Some(line) = source.get(start..start + source_row) else {
+                            return;
+                        };
+                        for (sum, sample) in sums.iter_mut().zip(line) {
+                            *sum += weight * u16::from(*sample);
                         }
                     }
-                    for (byte, sum) in pixel.iter_mut().zip(sum) {
-                        *byte = low_byte(sum >> 8);
+                    for (byte, sum) in mean.iter_mut().zip(sums.iter()) {
+                        *byte = (sum + WEIGHT_ONE / 2).to_le_bytes()[1];
+                    }
+                    for (pixel, tap) in out_row.chunks_exact_mut(BYTES_PER_PIXEL).zip(&columns.taps)
+                    {
+                        let weights = columns.weights.get(tap.weights.clone()).unwrap_or(&[]);
+                        let start = tap.first * BYTES_PER_PIXEL;
+                        let samples = mean
+                            .get(start..start + weights.len() * BYTES_PER_PIXEL)
+                            .unwrap_or(&[]);
+                        let mut sum = [u32::from(WEIGHT_ONE / 2); BYTES_PER_PIXEL];
+                        for (weight, sample) in
+                            weights.iter().zip(samples.chunks_exact(BYTES_PER_PIXEL))
+                        {
+                            for (sum, channel) in sum.iter_mut().zip(sample) {
+                                *sum += u32::from(*weight) * u32::from(*channel);
+                            }
+                        }
+                        for (byte, sum) in pixel.iter_mut().zip(sum) {
+                            *byte = low_byte(sum >> 8);
+                        }
                     }
                 }
-            }
-        });
-        Ok(())
+            },
+        )
     }
 }
 
-/// Appends the picture's pixels to `out` as 3 bytes each (red, green, blue),
-/// dropping the padding byte of `BGRx` rows `stride` bytes apart.
+/// Bytes of a raw payload of this size.
+pub fn packed_len(size: (u32, u32)) -> usize {
+    usize::try_from(u64::from(size.0) * u64::from(size.1))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(RAW_BYTES_PER_PIXEL)
+}
+
+/// Writes the picture's pixels to `out` as 3 bytes each (red, green, blue),
+/// dropping the padding byte of `BGRx` rows `stride` bytes apart. `out` must
+/// be [`packed_len`] bytes.
 pub fn pack_rgb(
+    workers: &mut Workers,
     source: &[u8],
     stride: usize,
     size: (u32, u32),
-    out: &mut Vec<u8>,
-    threads: usize,
+    out: &mut [u8],
 ) -> Result<(), StreamError> {
     let (width, height) = (
         usize::try_from(size.0).map_err(|_| StreamError::FrameTooSmall)?,
@@ -551,357 +1097,67 @@ pub fn pack_rgb(
         return Err(StreamError::FrameTooSmall);
     }
     let packed_row = width * RAW_BYTES_PER_PIXEL;
-    let start = out.len();
-    out.resize(start + packed_row * height, 0);
-    let Some(packed) = out.get_mut(start..) else {
-        return Err(StreamError::FrameTooSmall);
-    };
-    in_bands(packed, packed_row, threads, |first_row, band| {
-        for (row, packed) in band.chunks_exact_mut(packed_row).enumerate() {
-            let at = (first_row + row) * stride;
-            let Some(line) = source.get(at..at + source_row) else {
-                return;
-            };
-            for (rgb, bgrx) in packed
-                .chunks_exact_mut(RAW_BYTES_PER_PIXEL)
-                .zip(line.chunks_exact(BYTES_PER_PIXEL))
-            {
-                rgb[0] = bgrx[2];
-                rgb[1] = bgrx[1];
-                rgb[2] = bgrx[0];
+    if out.len() != packed_row * height {
+        return Err(StreamError::OutputSize);
+    }
+    let mut bands = [(); MAX_BANDS];
+    in_bands(
+        workers,
+        out,
+        packed_row,
+        &mut bands,
+        |first_row, band, ()| {
+            for (row, packed) in band.chunks_exact_mut(packed_row).enumerate() {
+                let at = (first_row + row) * stride;
+                let Some(line) = source.get(at..at + source_row) else {
+                    return;
+                };
+                for (rgb, bgrx) in packed
+                    .chunks_exact_mut(RAW_BYTES_PER_PIXEL)
+                    .zip(line.chunks_exact(BYTES_PER_PIXEL))
+                {
+                    rgb[0] = bgrx[2];
+                    rgb[1] = bgrx[1];
+                    rgb[2] = bgrx[0];
+                }
             }
-        }
-    });
-    Ok(())
+        },
+    )
 }
 
-/// Expands a raw payload (3 bytes per pixel) to `RGBA` with full alpha.
-pub fn unpack_rgb(rgb: &[u8], width: usize, out: &mut Vec<u8>, threads: usize) {
-    let pixels = rgb.len() / RAW_BYTES_PER_PIXEL;
-    out.clear();
-    out.resize(pixels * BYTES_PER_PIXEL, 255);
-    let row = width.max(1) * BYTES_PER_PIXEL;
-    in_bands(out, row, threads, |first_row, band| {
-        let at = first_row * width.max(1) * RAW_BYTES_PER_PIXEL;
-        let Some(source) = rgb.get(at..) else { return };
-        for (rgba, rgb) in band
-            .chunks_exact_mut(BYTES_PER_PIXEL)
-            .zip(source.chunks_exact(RAW_BYTES_PER_PIXEL))
-        {
-            rgba[0] = rgb[0];
-            rgba[1] = rgb[1];
-            rgba[2] = rgb[2];
-        }
-    });
+/// Expands a raw payload (3 bytes per pixel, `width` pixels a row) into `out`
+/// as `RGBA` with full alpha. `out` must hold 4 bytes for each pixel.
+pub fn unpack_rgb(
+    workers: &mut Workers,
+    rgb: &[u8],
+    width: usize,
+    out: &mut [u8],
+) -> Result<(), StreamError> {
+    let width = width.max(1);
+    if rgb.len() / RAW_BYTES_PER_PIXEL * BYTES_PER_PIXEL != out.len() {
+        return Err(StreamError::OutputSize);
+    }
+    let mut bands = [(); MAX_BANDS];
+    in_bands(
+        workers,
+        out,
+        width * BYTES_PER_PIXEL,
+        &mut bands,
+        |first_row, band, ()| {
+            let at = first_row * width * RAW_BYTES_PER_PIXEL;
+            let Some(source) = rgb.get(at..) else { return };
+            for (rgba, rgb) in band
+                .chunks_exact_mut(BYTES_PER_PIXEL)
+                .zip(source.chunks_exact(RAW_BYTES_PER_PIXEL))
+            {
+                rgba[0] = rgb[0];
+                rgba[1] = rgb[1];
+                rgba[2] = rgb[2];
+                rgba[3] = 255;
+            }
+        },
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        CONSISTENT_FRAMES, FRAME_PERIOD, HEADER_BYTES, Header, Interface, LINK_USABLE_PERCENT,
-        Notice, Payload, RAW_BPP_X16, RateControl, Scaler, StreamError, UNKNOWN_LINK_MBPS,
-        budget_of, fit_size, pack_rgb, raw_fits, stream_bits_per_second, unpack_rgb,
-    };
-    use crate::dsc;
-    use std::time::Duration;
-
-    #[test]
-    fn a_header_survives_the_wire_and_foreign_bytes_do_not_parse() {
-        let header = Header {
-            payload: Payload::Dsc,
-            width: 1280,
-            height: 720,
-            bpp_x16: 128,
-            sequence: 7,
-            captured_micros: 1_762_732_800_123_456,
-            sender_micros: 31_000,
-        };
-        let mut message = header.encode().to_vec();
-        message.extend_from_slice(&[9, 8, 7]);
-        assert_eq!(Header::decode(&message), Some((header, &[9u8, 8, 7][..])));
-        assert_eq!(Header::decode(&message[..HEADER_BYTES - 1]), None);
-        message[0] = 0;
-        assert_eq!(Header::decode(&message), None);
-        let empty = Header { width: 0, ..header };
-        assert_eq!(Header::decode(&empty.encode()), None);
-        let raw = Header {
-            payload: Payload::Raw,
-            bpp_x16: RAW_BPP_X16,
-            ..header
-        };
-        assert_eq!(raw.raw_len(), 1280 * 720 * 3);
-    }
-
-    #[test]
-    fn notices_are_tagged_json() -> Result<(), serde_json::Error> {
-        let hello = Notice::Hello {
-            width: 1920,
-            height: 1080,
-            title: "kwin-viewer s1".to_owned(),
-            budget_bits_per_second: None,
-            link: "lo, loopback, unlimited".to_owned(),
-        };
-        let text = serde_json::to_string(&hello)?;
-        assert!(text.contains("\"type\":\"hello\""), "{text}");
-        assert_eq!(serde_json::from_str::<Notice>(&text)?, hello);
-        let title: Notice =
-            serde_json::from_str("{\"type\":\"title\",\"title\":\"Enter the code\"}")?;
-        assert_eq!(
-            title,
-            Notice::Title {
-                title: "Enter the code".to_owned()
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn pictures_are_never_larger_than_the_session() {
-        assert_eq!(fit_size((1920, 1080), (1280, 720)), (1280, 720));
-        assert_eq!(fit_size((1920, 1080), (3840, 2160)), (1920, 1080));
-        assert_eq!(fit_size((1920, 1080), (2560, 700)), (1920, 700));
-        assert_eq!(fit_size((1920, 1080), (0, 0)), (1, 1));
-    }
-
-    #[test]
-    fn raw_goes_out_only_when_sixty_pictures_a_second_fit() {
-        // The issue's table: 2.99 Gb/s, 1.33 Gb/s and 0.75 Gb/s raw.
-        assert_eq!(
-            stream_bits_per_second(1920 * 1080, RAW_BPP_X16),
-            2_985_984_000
-        );
-        assert_eq!(
-            stream_bits_per_second(1280 * 720, dsc::DEFAULT_BPP_X16),
-            442_368_000
-        );
-        let gigabit = Some(1000 * 1_000_000 / 100 * LINK_USABLE_PERCENT);
-        assert!(!raw_fits(1920, 1080, gigabit));
-        assert!(!raw_fits(1280, 720, gigabit));
-        assert!(raw_fits(960, 540, gigabit));
-        assert!(raw_fits(1920, 1080, None));
-        assert!(raw_fits(1920, 1080, Some(2_985_984_000)));
-        assert!(!raw_fits(1920, 1080, Some(2_985_983_999)));
-    }
-
-    #[test]
-    fn the_budget_is_the_link_speed_unless_loopback_or_overridden() {
-        let wired = Interface {
-            name: "enp10s0".to_owned(),
-            loopback: false,
-            speed: Some("1000\n".to_owned()),
-        };
-        assert_eq!(
-            budget_of(None, Some(&wired)).bits_per_second,
-            Some(900_000_000)
-        );
-        let loopback = Interface {
-            name: "lo".to_owned(),
-            loopback: true,
-            speed: None,
-        };
-        assert_eq!(budget_of(None, Some(&loopback)).bits_per_second, None);
-        assert_eq!(
-            budget_of(Some(100), Some(&loopback)).bits_per_second,
-            Some(90_000_000)
-        );
-        // Wi-Fi and down links report nothing or -1.
-        let assumed = Some(UNKNOWN_LINK_MBPS * 900_000);
-        for speed in [None, Some("-1\n".to_owned()), Some(String::new())] {
-            let wireless = Interface {
-                name: "wlan0".to_owned(),
-                loopback: false,
-                speed,
-            };
-            assert_eq!(budget_of(None, Some(&wireless)).bits_per_second, assumed);
-        }
-        assert_eq!(budget_of(None, None).bits_per_second, assumed);
-        assert!(
-            budget_of(Some(250), Some(&wired))
-                .link
-                .contains("--link-mbps 250")
-        );
-    }
-
-    const PIXELS_720P: u64 = 1280 * 720;
-
-    #[test]
-    fn a_rate_over_the_budget_falls_to_what_the_budget_carries() {
-        // 400 Mb/s link: 360 Mb/s usable carries 6.5 bpp at 1280x720.
-        let budget = Some(360_000_000);
-        let mut rate = RateControl::default();
-        assert_eq!(rate.bpp_x16(), dsc::DEFAULT_BPP_X16);
-        let quick = Duration::from_millis(1);
-        assert!(rate.after_frame(PIXELS_720P, quick, 0, budget));
-        assert_eq!(rate.bpp_x16(), 112, "a simple picture gives up a whole bit");
-        assert!(rate.after_frame(PIXELS_720P, quick, 0, budget));
-        assert_eq!(rate.bpp_x16(), 104, "no lower than the budget asks");
-        for _ in 0..3 * CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, quick, 1000, budget));
-        }
-        assert_eq!(
-            rate.bpp_x16(),
-            104,
-            "headroom never lifts it over the budget"
-        );
-    }
-
-    #[test]
-    fn consistently_slow_pictures_lower_the_rate_and_a_complex_one_gives_up_less() {
-        let slow = FRAME_PERIOD + Duration::from_millis(1);
-        let mut rate = RateControl::default();
-        for _ in 1..CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, slow, 1000, None));
-        }
-        assert!(rate.after_frame(PIXELS_720P, slow, 1000, None));
-        assert_eq!(
-            rate.bpp_x16(),
-            124,
-            "a complex picture gives up a quarter bit"
-        );
-        // One picture on time starts the count again.
-        for _ in 1..CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, slow, 0, None));
-        }
-        assert!(!rate.after_frame(PIXELS_720P, FRAME_PERIOD, 0, None));
-        for _ in 1..CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, slow, 0, None));
-        }
-        assert!(rate.after_frame(PIXELS_720P, slow, 0, None));
-        assert_eq!(rate.bpp_x16(), 108);
-        for _ in 0..20 * CONSISTENT_FRAMES {
-            rate.after_frame(PIXELS_720P, slow, 0, None);
-        }
-        assert_eq!(rate.bpp_x16(), dsc::MIN_BPP_X16);
-    }
-
-    #[test]
-    fn headroom_raises_the_rate_for_pictures_that_were_quantized() {
-        let quick = FRAME_PERIOD / 4;
-        let mut rate = RateControl::default();
-        for _ in 0..3 * CONSISTENT_FRAMES {
-            assert!(
-                !rate.after_frame(PIXELS_720P, quick, 0, None),
-                "exact pictures gain nothing"
-            );
-        }
-        for _ in 1..CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, FRAME_PERIOD / 4 * 3, 500, None));
-        }
-        for _ in 1..CONSISTENT_FRAMES {
-            assert!(!rate.after_frame(PIXELS_720P, quick, 500, None));
-        }
-        assert!(rate.after_frame(PIXELS_720P, quick, 500, None));
-        assert_eq!(rate.bpp_x16(), 136);
-        for _ in 0..20 * CONSISTENT_FRAMES {
-            rate.after_frame(PIXELS_720P, quick, 1000, None);
-        }
-        assert_eq!(rate.bpp_x16(), dsc::MAX_BPP_X16);
-    }
-
-    fn solid(width: usize, height: usize, stride: usize, pixel: [u8; 4]) -> Vec<u8> {
-        let mut data = vec![0xEEu8; stride * height];
-        for row in data.chunks_exact_mut(stride) {
-            for target in row[..width * 4].chunks_exact_mut(4) {
-                target.copy_from_slice(&pixel);
-            }
-        }
-        data
-    }
-
-    #[test]
-    fn scaling_averages_the_area_each_output_pixel_covers() -> Result<(), StreamError> {
-        // 4x2 to 2x1: each output pixel is the mean of a 2x2 block.
-        let source: Vec<u8> = [
-            [0u8, 0, 0, 0],
-            [100, 40, 8, 0],
-            [200, 200, 200, 0],
-            [200, 200, 200, 0],
-            [0, 0, 0, 0],
-            [100, 40, 8, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-        ]
-        .concat();
-        let mut out = Vec::new();
-        Scaler::new((4, 2), (2, 1))?.scale(&source, 16, &mut out, 1)?;
-        assert_eq!(out, [50, 20, 4, 0, 100, 100, 100, 0]);
-        // 3 to 2 columns: weights 2/3 and 1/3.
-        let source: Vec<u8> = [[0u8, 0, 0, 0], [90, 90, 90, 0], [30, 30, 30, 0]].concat();
-        Scaler::new((3, 1), (2, 1))?.scale(&source, 12, &mut out, 1)?;
-        assert_eq!(out, [30, 30, 30, 0, 50, 50, 50, 0]);
-        Ok(())
-    }
-
-    #[test]
-    fn scaling_keeps_flat_colour_exact_and_ignores_row_padding_and_threads()
-    -> Result<(), StreamError> {
-        let pixel = [17, 130, 255, 255];
-        let source = solid(1920, 1080, 1920 * 4 + 64, pixel);
-        for target in [(1280, 720), (1277, 713), (1920, 540), (1, 1), (1920, 1080)] {
-            let scaler = Scaler::new((1920, 1080), target)?;
-            let (mut one, mut many) = (Vec::new(), Vec::new());
-            scaler.scale(&source, 1920 * 4 + 64, &mut one, 1)?;
-            scaler.scale(&source, 1920 * 4 + 64, &mut many, 7)?;
-            assert_eq!(
-                one.len(),
-                usize::try_from(target.0 * target.1 * 4).unwrap_or(0)
-            );
-            assert!(
-                one.chunks_exact(4).all(|scaled| scaled == pixel),
-                "{target:?}"
-            );
-            assert_eq!(one, many, "{target:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn scaling_a_gradient_matches_single_threaded_output_and_never_upscales()
-    -> Result<(), StreamError> {
-        let (width, height) = (640usize, 360usize);
-        let mut source = vec![0u8; width * height * 4];
-        for (index, byte) in source.iter_mut().enumerate() {
-            *byte = u8::try_from((index * 31 + index / 7) % 251).unwrap_or(0);
-        }
-        let scaler = Scaler::new((640, 360), (417, 233))?;
-        let (mut one, mut many) = (Vec::new(), Vec::new());
-        scaler.scale(&source, width * 4, &mut one, 1)?;
-        scaler.scale(&source, width * 4, &mut many, 5)?;
-        assert_eq!(one, many);
-        assert!(Scaler::new((640, 360), (641, 360)).is_err());
-        assert!(Scaler::new((640, 360), (0, 10)).is_err());
-        assert_eq!(
-            scaler.scale(&source[..source.len() - 1], width * 4, &mut one, 1),
-            Err(StreamError::FrameTooSmall)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn raw_pixels_drop_the_padding_byte_and_come_back_as_rgba() -> Result<(), StreamError> {
-        let (width, height, stride) = (5usize, 3usize, 5 * 4 + 8);
-        let mut source = vec![0xEEu8; stride * height];
-        let mut expected = Vec::new();
-        for (row, line) in source.chunks_exact_mut(stride).enumerate() {
-            for (column, pixel) in line[..width * 4].chunks_exact_mut(4).enumerate() {
-                let value = u8::try_from(row * 16 + column).unwrap_or(0);
-                pixel.copy_from_slice(&[value, value + 100, value + 200, 0]);
-                expected.extend_from_slice(&[value + 200, value + 100, value, 255]);
-            }
-        }
-        for threads in [1, 4] {
-            let mut wire = vec![1, 2];
-            pack_rgb(&source, stride, (5, 3), &mut wire, threads)?;
-            assert_eq!(wire.len(), 2 + width * height * 3);
-            let mut rgba = Vec::new();
-            unpack_rgb(&wire[2..], width, &mut rgba, threads);
-            assert_eq!(rgba, expected);
-        }
-        let mut wire = Vec::new();
-        assert_eq!(
-            pack_rgb(&source[..10], stride, (5, 3), &mut wire, 1),
-            Err(StreamError::FrameTooSmall)
-        );
-        Ok(())
-    }
-}
+mod tests;

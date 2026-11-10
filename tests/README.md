@@ -95,17 +95,53 @@ intentionally has no PNG.
 # Remote viewer stream
 
 ```bash
-cargo test --release --test remote_viewer_e2e -- --ignored
+cargo test --release --test remote_viewer_e2e -- --ignored --test-threads 1 \
+  a_remote_session raw_frames every_way
+cargo test --release --test remote_viewer_e2e -- --ignored two_viewers --nocapture
+cargo test --release --test remote_viewer_e2e -- --ignored measure_the_stream --nocapture
 ```
 
-This starts three production servers from one private HOME that holds a shared
-secret: a listener on a loopback port with `--link-mbps 400`, the server that
-starts a 1280x720 session on it, and a third server whose isolated desktop
-receives the viewer window, so nothing opens on the tester's own desktop. It
-reads the viewer's `viewer-stream.json` counters to check that frames arrive at
-the window's size (raw at 640x360, DSC below 8 bpp at 1280x720 under that
-budget), that an idle screen sends none, that agent typing sends some, that
-keys typed into the window create a file in the session, that `screenshot`
-still returns 1280x720, and that the frame sender stops when the window closes,
-on `viewer_close`, and when the calling server is killed. Build in release:
-the software DSC codec is too slow unoptimized for the viewer's start timeout.
+Each test starts production servers from one private HOME that holds a shared
+secret: a listener on a loopback port, the server that starts sessions on it,
+and a third server whose isolated desktop receives the viewer windows, so
+nothing opens on the tester's own desktop. `--link-mbps` on the listener makes
+the loopback socket behave like a link of that speed. The tests read each
+viewer's `viewer-stream.json` counters and logs. Build in release: the
+software DSC codec is too slow unoptimized for the viewer's start timeout. Do
+not edit `src/` or rebuild while they run: a server started from `target/`
+rebuilds and re-executes itself when its sources change, which drops its
+remote sessions.
+
+- `a_remote_session_streams_changed_frames_to_a_viewer_on_the_callers_machine`
+  (20 Mb/s link): a 1280x720 window gets DSC at the 6 bpp the link carries and,
+  once the screen is still, the same frame as exact pixels; a 320x180 window
+  gets raw frames; an idle screen sends none; agent typing sends some; keys
+  typed into the window create a file in the session; `screenshot` still
+  returns 1280x720; the sender stops when the viewer is killed, on
+  `viewer_close`, and when the calling server is killed.
+- `raw_frames_show_the_sessions_exact_pixels_and_a_still_dsc_frame_becomes_exact`:
+  Gwenview shows a picture with every value of each channel in a 1280x720
+  session, and the viewer window has the same size. The session's own
+  `screenshot`, the frame the viewer received (written through
+  `KWIN_VIEWER_STREAM_DUMP`) and a screenshot of the viewer's window on its
+  desktop are compared pixel for pixel, over an unlimited link (raw) and over
+  a 20 Mb/s link (DSC, then the settled exact frame). A 64x64 corner where the
+  pointer is parked is left out, because the stream draws the pointer and a
+  screenshot with `include_cursor=false` does not.
+- `every_way_a_stream_ends_leaves_nothing_running`: the sender killed, the
+  viewer killed, the window closed, `viewer_close`, `session_stop`, and the
+  listener killed each end both processes; a viewer stopped for six seconds
+  holds its sender back without growing it and then resumes.
+- `two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches`
+  (soak, four minutes; `KWIN_MCP_SOAK_SECONDS` changes that): two sessions and
+  two viewers over a 40 Mb/s link, text scrolling in both, a resize every 15
+  seconds that changes the mode, one stalled viewer. It asserts frames in
+  every 5 second interval, no frame-socket or picture error in any log, mode
+  switches and settles counted, no growth of sender or viewer memory between
+  the halves of the run, and no viewer or sender process afterwards.
+- `measure_the_stream_under_scrolling_text` prints, for each session height in
+  `KWIN_MCP_STREAM_HEIGHTS` (default `1080,720`) and link speed in
+  `KWIN_MCP_STREAM_LINKS` (default `1000,500,200,100`; `0` is unlimited), the
+  chosen mode, bytes per frame, frames per second, capture-to-present latency,
+  processor use of sender and viewer, and what the still frame became.
+  `KWIN_MCP_TEST_BINARY` names another kwin-mcp build to measure.
