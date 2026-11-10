@@ -509,8 +509,20 @@ fn a_remote_session_streams_changed_frames_to_a_viewer_on_the_callers_machine() 
         "the listener exited with its peer"
     );
 
+    // Leave nothing behind: the listener finishes removing the session, the
+    // desk session stops in order, and the killed server's viewer directory
+    // (which a later server's sweep would remove) goes with the test's HOME.
+    wait_for(
+        "the listener to remove the session's files",
+        Duration::from_secs(30),
+        || (!workdir.exists()).then_some(()),
+    );
+    desk.tool("session_stop", json!({"session_id":desk_session}));
     drop(server);
     drop(listener);
     drop(desk);
-    let _ = std::fs::remove_dir_all(home);
+    if let Some(directory) = viewer.counters.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
 }
