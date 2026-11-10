@@ -666,6 +666,7 @@ fn a_remote_session_streams_changed_frames_to_a_viewer_on_the_callers_machine() 
         idle,
         "frames arrived although the screen was idle"
     );
+    let presented_idle = viewer.count("presented");
 
     // The agent's typing changes the screen, so frames follow.
     server.tool(
@@ -675,6 +676,12 @@ fn a_remote_session_streams_changed_frames_to_a_viewer_on_the_callers_machine() 
     wait_for("frames after typing", Duration::from_secs(10), || {
         (viewer.frames() > idle).then_some(())
     });
+    // And the window presents them.
+    wait_for(
+        "the frames after typing to be presented",
+        Duration::from_secs(10),
+        || (viewer.count("presented") > presented_idle).then_some(()),
+    );
     server.tool(
         "keyboard_key",
         json!({"session_id":session, "key":"ctrl+c"}),
@@ -969,8 +976,8 @@ fn every_way_a_stream_ends_leaves_nothing_running() {
         let opened = server.tool("viewer_open", json!({"session_id":session}));
         let viewer = Viewer::opened(&opened, "opened", &host);
         let sender = sender_pid(&workdir);
-        wait_for("frames", Duration::from_secs(10), || {
-            (viewer.frames() > 0).then_some(())
+        wait_for("frames, presented", Duration::from_secs(10), || {
+            (viewer.frames() > 0 && viewer.count("presented") > 0).then_some(())
         });
         desk.activate(&session);
         (viewer, sender)
@@ -1168,6 +1175,13 @@ fn measure_the_stream_under_scrolling_text() {
                     .fold(0.0, f64::max)
             };
             let moving = samples.last().expect("samples").clone();
+            assert!(
+                mean("presented") * 2.0 >= mean("frames"),
+                "the window presented {:.1} of {:.1} frames a second\n{}",
+                mean("presented"),
+                mean("frames"),
+                viewer.log_text()
+            );
             let sender_log =
                 std::fs::read_to_string(workdir.join("viewer.log")).unwrap_or_default();
             let sender_line = sender_log
@@ -1237,8 +1251,9 @@ struct Soaked {
     /// The window's size now.
     size: (u32, u32),
     resizes: u64,
-    /// Frames the viewer had received at the last look.
+    /// Frames the viewer had received and presented at the last look.
     frames: u64,
+    presented: u64,
     /// Resident memory at each look, in KiB.
     sender_memory: Vec<u64>,
     viewer_memory: Vec<u64>,
@@ -1294,6 +1309,7 @@ fn two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches(
                 size: LARGE,
                 resizes: 0,
                 frames: 0,
+                presented: 0,
                 sender_memory: Vec::new(),
                 viewer_memory: Vec::new(),
             }
@@ -1319,6 +1335,14 @@ fn two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches(
                 started.elapsed()
             );
             stream.frames = frames;
+            // And its window presented some of them.
+            let presented = stream.viewer.count("presented");
+            assert!(
+                presented > stream.presented,
+                "stream {index} presented no frame in {LOOK_EVERY:?} after {:?}",
+                started.elapsed()
+            );
+            stream.presented = presented;
             assert!(
                 alive(stream.sender) && alive(stream.viewer.pid),
                 "stream {index} ended"
@@ -1470,5 +1494,332 @@ fn two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches(
             let _ = std::fs::remove_dir_all(directory);
         }
     }
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// Waits for a second in which the viewer received at least five frames and
+/// returns that second's counters. Whatever it received, it must have
+/// presented: a window that takes frames off the socket and draws none of
+/// them shows a stale picture.
+fn presenting(viewer: &Viewer, what: &str) -> Value {
+    let before = viewer.counters();
+    let counters = wait_for("a second with frames", Duration::from_secs(15), || {
+        viewer.counters().filter(|counters| {
+            Some(counters) != before.as_ref()
+                && counters["last_second"]["frames"]
+                    .as_u64()
+                    .is_some_and(|frames| frames >= 5)
+        })
+    });
+    assert!(
+        counters["last_second"]["presented"]
+            .as_u64()
+            .is_some_and(|presented| presented >= 3),
+        "{what}: frames arrive and the window presents none: {counters}\n{}",
+        viewer.log_text()
+    );
+    counters
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn a_window_the_compositor_does_not_show_still_presents_the_frames_it_receives() {
+    let home = home_with_secret("unshown", "shared-secret-0123456789");
+    let mut desk = Desk::start(&home, 1600, 1000);
+    let listener = Listener::start(&home, &[]);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home, "server", Some(&desk.display()), None);
+    let (session, workdir) = server.start_session(json!({"host":host, "width":1280, "height":720}));
+    server.tool(
+        "launch_app",
+        json!({"session_id":session, "command":scrolling_text(3600, 1), "window_timeout_seconds":40}),
+    );
+    let opened = server.tool("viewer_open", json!({"session_id":session}));
+    let viewer = Viewer::opened(&opened, "opened", &host);
+    let sender = sender_pid(&workdir);
+    desk.activate(&session);
+
+    // Shown: the compositor asks for every redraw.
+    let shown = presenting(&viewer, "shown");
+    assert_eq!(
+        shown["last_second"]["presented_unshown"]
+            .as_u64()
+            .unwrap_or(0),
+        0,
+        "the shown window drew without frame callbacks: {shown}"
+    );
+
+    // Minimized, the window gets no frame callbacks, so nothing asks it to
+    // redraw. It keeps presenting what arrives, so a screenshot, a window
+    // thumbnail or the person who brings it back sees the current picture.
+    let title = format!("kwin-viewer {session}");
+    let minimized = |desk: &mut Desk| {
+        let windows = desk.tool("window_list", json!({}));
+        record(&windows, "windows", |window| {
+            window["title"]
+                .as_str()
+                .is_some_and(|shown| shown.starts_with(&title))
+        })
+        .map(|window| window["minimized"] == true)
+    };
+    desk.tool("keyboard_key", json!({"key":"super+pagedown"}));
+    wait_for(
+        "the window to be minimized",
+        Duration::from_secs(10),
+        || (minimized(&mut desk) == Some(true)).then_some(()),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let hidden = presenting(&viewer, "minimized");
+    assert!(
+        hidden["last_second"]["presented_unshown"]
+            .as_u64()
+            .is_some_and(|unshown| unshown >= 3),
+        "the minimized window drew on frame callbacks: {hidden}"
+    );
+    let again = presenting(&viewer, "still minimized");
+    assert!(again["presented"].as_u64() > hidden["presented"].as_u64());
+
+    // Shown again, it is back to the compositor's redraws.
+    desk.activate(&session);
+    wait_for(
+        "the window to be shown again",
+        Duration::from_secs(10),
+        || (minimized(&mut desk) == Some(false)).then_some(()),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let back = presenting(&viewer, "shown again");
+    assert_eq!(back["last_second"]["presented_unshown"], 0, "{back}");
+    assert!(
+        stream_errors(&viewer.log_text()).is_empty(),
+        "{}",
+        viewer.log_text()
+    );
+
+    // A stream that ends while the window is minimized still closes it,
+    // although no redraw comes in which it could notice.
+    desk.tool("keyboard_key", json!({"key":"super+pagedown"}));
+    wait_for(
+        "the window to be minimized",
+        Duration::from_secs(10),
+        || (minimized(&mut desk) == Some(true)).then_some(()),
+    );
+    signal(sender, "KILL");
+    stopped(
+        "the minimized window to close when its stream ends",
+        viewer.pid,
+    );
+    server.tool("session_stop", json!({"session_id":session}));
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+    desk.stop();
+    drop(server);
+    drop(listener);
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn the_local_viewer_keeps_showing_a_changing_session() {
+    // The local viewer shares the window code with the remote one: the same
+    // swapchain and the same draws without a frame callback.
+    let home = home_with_secret("local", "shared-secret-0123456789");
+    let mut desk = Desk::start(&home, 1600, 1000);
+    let mut server = Server::start(&home, "server", Some(&desk.display()), None);
+    let (session, _workdir) = server.start_session(json!({"width":1280, "height":720}));
+    server.tool(
+        "launch_app",
+        json!({"session_id":session, "command":scrolling_text(3600, 1), "window_timeout_seconds":40}),
+    );
+    let opened = server.tool("viewer_open", json!({"session_id":session}));
+    assert_eq!(opened["viewer"]["state"], "ready", "{opened}");
+    let viewer = opened["viewer"]["pid"].as_u64().expect("viewer pid");
+    desk.activate(&session);
+    // Two screenshots of the window while the text scrolls differ.
+    let shot = |desk: &mut Desk| {
+        let shown = desk.tool("screenshot", json!({"include_cursor":false}));
+        let path = PathBuf::from(shown["path"].as_str().expect("screenshot path"));
+        read_png(&path)
+    };
+    let first = shot(&mut desk);
+    assert_eq!((first.0, first.1), (1280, 720));
+    wait_for(
+        "the viewer window to show another picture",
+        Duration::from_secs(10),
+        || (shot(&mut desk).2 != first.2).then_some(()),
+    );
+    let closed = server.tool("viewer_close", json!({"session_id":session}));
+    assert_eq!(closed["status"], "closed", "{closed}");
+    stopped("the viewer to exit after viewer_close", viewer);
+    server.tool("session_stop", json!({"session_id":session}));
+    desk.stop();
+    drop(server);
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// A PNG's decoded bytes, whatever its pixel layout.
+fn decoded_png(path: &Path) -> Vec<u8> {
+    let decoder = png::Decoder::new(std::fs::File::open(path).expect("open PNG"));
+    let mut reader = decoder.read_info().expect("PNG header");
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).expect("PNG pixels");
+    buffer.truncate(info.buffer_size());
+    buffer
+}
+
+/// Runs a desktop tool and returns what it printed, or None when it failed.
+fn desktop_tool(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(arguments).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[test]
+#[ignore = "opens a viewer window on the tester's own desktop for some seconds; requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn the_viewer_presents_the_frames_it_receives_on_the_testers_own_desktop() {
+    // The other tests open their windows in an isolated KWin desktop: one
+    // virtual SDR output at scale 1 that is always on. Only the desktop the
+    // tester sits at has real outputs with their scale and HDR mode, and the
+    // states in which its compositor repaints nothing and so asks no window
+    // to redraw: outputs powered off, a locked screen, another virtual
+    // desktop. This test opens the window there, in whatever state that
+    // desktop is in, and checks that the window presents what arrives. The
+    // log lines it copies say which presents the compositor did not ask for
+    // ("N of them while the window was not shown").
+    //
+    // A session of 1920x1080 on an output at scale 1.25 gets a window of
+    // 2400x1350 device pixels, larger than the session; a session of
+    // 2400x1350 gets the same window at one device pixel per session pixel.
+    //
+    // KWIN_MCP_STREAM_HEIGHTS: session heights (16:9).
+    // KWIN_MCP_REAL_DESKTOP_SECONDS: how long each window stays open.
+    // KWIN_MCP_STREAM_EVIDENCE: a directory that receives the window's log
+    // and two screenshots of it (kdotool and spectacle), which must differ.
+    let heights = numbers_from("KWIN_MCP_STREAM_HEIGHTS", &[1080]);
+    let seconds = numbers_from("KWIN_MCP_REAL_DESKTOP_SECONDS", &[6])[0];
+    let evidence = std::env::var_os("KWIN_MCP_STREAM_EVIDENCE").map(PathBuf::from);
+    let home = home_with_secret("real", "shared-secret-0123456789");
+    for height in heights {
+        let width = height * 16 / 9;
+        let listener = Listener::start(&home, &["--link-mbps", "1000"]);
+        let host = listener.address.clone();
+        let mut server = Server::start(&home, "server", None, None);
+        let (session, _workdir) =
+            server.start_session(json!({"host":host, "width":width, "height":height}));
+        server.tool(
+            "launch_app",
+            json!({
+                "session_id":session,
+                "command":scrolling_text(3600, 1),
+                "window_timeout_seconds":40,
+            }),
+        );
+        let opened = server.tool(
+            "viewer_open",
+            json!({"session_id":session, "reason":"present check"}),
+        );
+        let viewer = Viewer::opened(&opened, "opened", &host);
+        // KWIN_MCP_REAL_DESKTOP_MOVE=X,Y moves the window there (kdotool), to
+        // put it on a particular output.
+        let place = numbers_from("KWIN_MCP_REAL_DESKTOP_MOVE", &[]);
+        if let [x, y] = place[..] {
+            let title = format!("kwin-viewer {session}");
+            let window = wait_for(
+                "kdotool to see the viewer window",
+                Duration::from_secs(5),
+                || {
+                    desktop_tool("kdotool", &["search", "--name", &title])
+                        .and_then(|found| found.lines().next().map(str::to_owned))
+                },
+            );
+            desktop_tool(
+                "kdotool",
+                &["windowmove", &window, &x.to_string(), &y.to_string()],
+            )
+            .expect("kdotool windowmove");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        // Every second the viewer reports, it presented frames.
+        let mut seen = 0;
+        let mut last = viewer.counters();
+        let until = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(200));
+            let Some(counters) = viewer
+                .counters()
+                .filter(|counters| Some(counters) != last.as_ref())
+            else {
+                continue;
+            };
+            eprintln!("{width}x{height}: {counters}");
+            if counters["last_second"]["frames"]
+                .as_u64()
+                .is_some_and(|frames| frames >= 5)
+            {
+                assert!(
+                    counters["last_second"]["presented"]
+                        .as_u64()
+                        .is_some_and(|presented| presented >= 3),
+                    "frames arrive and the window presents none: {counters}\n{}",
+                    viewer.log_text()
+                );
+                seen += 1;
+            }
+            last = Some(counters);
+        }
+        assert!(seen >= 2, "the viewer reported {seen} seconds with frames");
+        if let Some(evidence) = evidence.as_deref() {
+            // Only the viewer's own window is captured: it is made the active
+            // window, and the screenshot is taken if it then is.
+            let title = format!("kwin-viewer {session}");
+            let window = desktop_tool("kdotool", &["search", "--name", &title])
+                .and_then(|found| found.lines().next().map(str::to_owned));
+            if let Some(window) = window {
+                desktop_tool("kdotool", &["windowactivate", &window]);
+                std::thread::sleep(Duration::from_millis(700));
+                let active = desktop_tool("kdotool", &["getactivewindow", "getwindowname"]);
+                if active.is_some_and(|name| name.starts_with(&title)) {
+                    // Two screenshots while the text scrolls: the window's
+                    // picture has to change between them.
+                    let pictures = ["a", "b"].map(|shot| {
+                        let picture =
+                            evidence.join(format!("real-desktop-{width}x{height}-{shot}.png"));
+                        let _ = std::fs::remove_file(&picture);
+                        desktop_tool(
+                            "spectacle",
+                            &[
+                                "--background",
+                                "--activewindow",
+                                "--nonotify",
+                                "--output",
+                                &picture.to_string_lossy(),
+                            ],
+                        );
+                        std::thread::sleep(Duration::from_millis(1200));
+                        picture
+                    });
+                    if pictures.iter().all(|picture| picture.exists()) {
+                        assert_ne!(
+                            decoded_png(&pictures[0]),
+                            decoded_png(&pictures[1]),
+                            "the window showed the same picture 1.2 s apart while text scrolled"
+                        );
+                    }
+                }
+            }
+            std::fs::copy(
+                &viewer.log,
+                evidence.join(format!("real-desktop-{width}x{height}.log")),
+            )
+            .expect("copy the viewer log");
+        }
+        let closed = server.tool("viewer_close", json!({"session_id":session}));
+        assert_eq!(closed["status"], "closed", "{closed}");
+        stopped("the viewer to exit after viewer_close", viewer.pid);
+        server.tool("session_stop", json!({"session_id":session}));
+        drop(server);
+        drop(listener);
+    }
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
     std::fs::remove_dir_all(home).expect("remove the test HOME");
 }
