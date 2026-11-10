@@ -43,10 +43,17 @@ fn home_with_secret(label: &str, secret: &str) -> PathBuf {
     home
 }
 
-fn kwin_mcp(home: &Path) -> Command {
-    let binary = std::env::var_os("KWIN_MCP_TEST_BINARY")
+fn server_binary() -> PathBuf {
+    std::env::var_os("KWIN_MCP_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kwin-mcp")))
+}
+
+fn kwin_mcp(home: &Path) -> Command {
+    kwin_mcp_at(&server_binary(), home)
+}
+
+fn kwin_mcp_at(binary: &Path, home: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .env("HOME", home)
@@ -118,7 +125,35 @@ impl Server {
     /// Wayland socket; with `dump`, its stream viewers write the picture they
     /// last presented there whenever a second passes without a frame.
     fn start(home: &Path, label: &str, display: Option<&Path>, dump: Option<&Path>) -> Self {
-        let mut command = kwin_mcp(home);
+        Self::start_command(kwin_mcp(home), home, label, display, dump)
+    }
+
+    /// A stdio server that runs a private copy of the binary and re-executes
+    /// itself when that copy changes. Returns the copy's path too.
+    fn start_copy(home: &Path, label: &str, display: Option<&Path>) -> (Self, PathBuf) {
+        let source = server_binary();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).expect("create the private bin directory");
+        let program = bin.join("kwin-mcp");
+        std::fs::copy(&source, &program).expect("copy kwin-mcp");
+        std::fs::copy(
+            source.with_file_name("kwin-viewer"),
+            bin.join("kwin-viewer"),
+        )
+        .expect("copy kwin-viewer");
+        let mut command = kwin_mcp_at(&program, home);
+        command.env("KWIN_MCP_BINARY", &program);
+        let server = Self::start_command(command, home, label, display, None);
+        (server, program)
+    }
+
+    fn start_command(
+        mut command: Command,
+        home: &Path,
+        label: &str,
+        display: Option<&Path>,
+        dump: Option<&Path>,
+    ) -> Self {
         if let Some(display) = display {
             command.env("WAYLAND_DISPLAY", display);
         }
@@ -1083,6 +1118,361 @@ fn every_way_a_stream_ends_leaves_nothing_running() {
         },
     );
     drop(sweeper);
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// The process that would reap `pid`.
+fn parent(pid: u64) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?.1.split(' ').nth(1)?.parse().ok()
+}
+
+/// How many lines of the log at `path` contain `text`.
+fn logged(path: &Path, text: &str) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(text))
+        .count()
+}
+
+/// The sockets among a process's descriptors that a program it executes
+/// would inherit, as `fd -> socket:[inode]`.
+fn inheritable_sockets(pid: u64) -> Vec<String> {
+    const CLOSE_ON_EXEC: u32 = 0o2000000;
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read the descriptor table")
+        .flatten()
+    {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.display().to_string();
+        let number = entry.file_name().to_string_lossy().into_owned();
+        let flags = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{number}"))
+            .ok()
+            .and_then(|info| {
+                let flags = info.lines().find_map(|line| line.strip_prefix("flags:"))?;
+                u32::from_str_radix(flags.trim(), 8).ok()
+            });
+        if target.starts_with("socket:") && flags.is_some_and(|flags| flags & CLOSE_ON_EXEC == 0) {
+            open.push(format!("{number} -> {target}"));
+        }
+    }
+    open
+}
+
+/// Copies the PNG a `screenshot` result names into the directory
+/// `KWIN_MCP_TEST_EVIDENCE` names, when it is set.
+fn keep_evidence(screenshot: &Value, name: &str) {
+    let Some(directory) = std::env::var_os("KWIN_MCP_TEST_EVIDENCE").map(PathBuf::from) else {
+        return;
+    };
+    let path = screenshot["path"].as_str().expect("screenshot path");
+    std::fs::create_dir_all(&directory).expect("create the evidence directory");
+    std::fs::copy(path, directory.join(name)).expect("keep a screenshot");
+}
+
+/// Gives the server's binary a new modification time, which a running server
+/// takes for a new build, and waits until the server has re-executed itself
+/// and continued on its connection to `host`. `reloads` counts them.
+fn reexecute(program: &Path, server_log: &Path, host: &str, reloads: usize) {
+    // A running executable cannot be opened for writing; its owner can still
+    // set its times through a read-only handle.
+    std::fs::File::open(program)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .expect("touch the server binary");
+    let kept = format!("reload: kept the connection to {host} and its 1 sessions");
+    wait_for(
+        "the server to re-execute and keep its connection",
+        Duration::from_secs(60),
+        || {
+            let lost = logged(server_log, "reload: lost the connection");
+            assert_eq!(lost, 0, "the re-executed server lost its connection");
+            (logged(server_log, &kept) == reloads).then_some(())
+        },
+    );
+}
+
+/// A server that re-executes itself (every install does this to all running
+/// servers) keeps the sessions it started on other machines, and their open
+/// viewer windows: the control socket's TCP connection goes to the new
+/// process image, so the listener sees no disconnect. A server that dies
+/// still loses them at once.
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn a_remote_session_and_its_viewer_survive_the_callers_reexecution() {
+    let home = home_with_secret("reload", "shared-secret-0123456789");
+    let mut desk = Desk::start(&home, 1600, 1000);
+    let mut listener = Listener::start(&home, &[]);
+    let host = listener.address.clone();
+    let port = host.rsplit(':').next().expect("listener port");
+    let listener_log = home.join(format!("listener-{port}.log"));
+    let server_log = home.join("server.log");
+    let (mut server, program) = Server::start_copy(&home, "server", Some(&desk.display()));
+    let server_pid = u64::from(server.child.id());
+
+    let (session, workdir) = server.start_session(json!({"host":host, "width":1280, "height":720}));
+    let sandbox = server.sandbox(&session);
+    server.tool(
+        "launch_app",
+        json!({"session_id":session, "command":"konsole", "window_timeout_seconds":40}),
+    );
+    let opened = server.tool("viewer_open", json!({"session_id":session}));
+    let viewer = Viewer::opened(&opened, "opened", &host);
+    let sender = sender_pid(&workdir);
+    wait_for("frames, presented", Duration::from_secs(10), || {
+        (viewer.frames() > 0 && viewer.count("presented") > 0).then_some(())
+    });
+    desk.activate(&session);
+    let windows_before = server.tool("window_list", json!({"session_id":session}));
+    let konsole = record(&windows_before, "windows", |window| {
+        window["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("Konsole"))
+    })
+    .unwrap_or_else(|| panic!("no Konsole window: {windows_before}"));
+
+    // Twice: the second re-execution hands over a connection the first one
+    // inherited.
+    for reloads in 1..=2 {
+        reexecute(&program, &server_log, &host, reloads);
+        assert_eq!(
+            logged(&listener_log, "disconnected"),
+            0,
+            "the listener saw its peer disconnect"
+        );
+        assert_eq!(u64::from(server.child.id()), server_pid);
+        assert!(alive(sandbox), "the session ended with the re-execution");
+        assert!(
+            alive(sender),
+            "the frame sender ended with the re-execution"
+        );
+        assert!(alive(viewer.pid), "the viewer closed with the re-execution");
+        assert_eq!(
+            parent(viewer.pid),
+            Some(server_pid),
+            "the viewer is no longer the server's child"
+        );
+
+        // The same session ID still reaches the session, with its host.
+        let listed = server.tool("session_list", json!({}));
+        let entry = record(&listed, "sessions", |listed| {
+            listed["session_id"] == session
+        })
+        .unwrap_or_else(|| panic!("the session is not listed after the reload: {listed}"));
+        assert_eq!(entry["host"], host, "{entry}");
+        assert_eq!(entry["sandbox_pid"], sandbox, "{entry}");
+        let windows = server.tool("window_list", json!({"session_id":session}));
+        assert!(
+            record(&windows, "windows", |window| window["id"] == konsole["id"]).is_some(),
+            "{windows}"
+        );
+        let shot = server.tool("screenshot", json!({"session_id":session}));
+        assert_eq!(
+            (shot["width"].as_u64(), shot["height"].as_u64()),
+            (Some(1280), Some(720)),
+            "{shot}"
+        );
+
+        // The window still receives and presents what changes in the session.
+        let (frames, presented) = (viewer.idle()["frames"].as_u64(), viewer.count("presented"));
+        let frames = frames.expect("frames");
+        server.tool(
+            "keyboard_type",
+            json!({"session_id":session, "text":format!("echo reload {reloads}")}),
+        );
+        server.tool(
+            "keyboard_key",
+            json!({"session_id":session, "key":"Return"}),
+        );
+        wait_for(
+            "frames after the re-execution",
+            Duration::from_secs(10),
+            || (viewer.frames() > frames && viewer.count("presented") > presented).then_some(()),
+        );
+        // And the server still knows it as this session's viewer.
+        let again = server.tool("viewer_open", json!({"session_id":session}));
+        assert_eq!(
+            Viewer::opened(&again, "already_open", &host).pid,
+            viewer.pid
+        );
+        // The inherited control socket is closed on exec again: a child that
+        // held it would keep the session alive after the server died.
+        assert_eq!(
+            inheritable_sockets(server_pid),
+            Vec::<String>::new(),
+            "sockets the re-executed server would pass to its children"
+        );
+        viewer.idle();
+        let window = desk.tool("screenshot", json!({}));
+        keep_evidence(&window, &format!("reload-{reloads}-viewer-window.png"));
+        let shot = server.tool("screenshot", json!({"session_id":session}));
+        keep_evidence(&shot, &format!("reload-{reloads}-session.png"));
+    }
+    let log = viewer.log_text();
+    assert!(stream_errors(&log).is_empty(), "{log}");
+
+    // session_stop still stops the session, its capture and its window.
+    let stopped_session = server.tool("session_stop", json!({"session_id":session}));
+    assert_eq!(stopped_session["status"], "stopped", "{stopped_session}");
+    stopped("the viewer to exit with its session", viewer.pid);
+    stopped("the sender to stop with its session", sender);
+    wait_for("the session to end", Duration::from_secs(30), || {
+        (!alive(sandbox)).then_some(())
+    });
+    let listed = server.tool("session_list", json!({}));
+    assert!(
+        record(&listed, "sessions", |listed| listed["session_id"]
+            == session)
+        .is_none(),
+        "{listed}"
+    );
+    assert_eq!(logged(&listener_log, "disconnected"), 0);
+
+    // A server that dies announces nothing and hands nothing over: the
+    // listener sees the connection end and stops the session at once, also
+    // for a server that has re-executed itself before.
+    let (session, workdir) = server.start_session(json!({"host":host, "width":1280, "height":720}));
+    let sandbox = server.sandbox(&session);
+    server.tool(
+        "launch_app",
+        json!({"session_id":session, "command":"konsole", "window_timeout_seconds":40}),
+    );
+    let opened = server.tool("viewer_open", json!({"session_id":session}));
+    let viewer = Viewer::opened(&opened, "opened", &host);
+    let sender = sender_pid(&workdir);
+    server.child.kill().expect("kill the calling server");
+    server.child.wait().expect("reap the calling server");
+    wait_for(
+        "the listener to notice its peer is gone",
+        Duration::from_secs(5),
+        || {
+            (logged(
+                &listener_log,
+                "disconnected; stopping the sessions it started",
+            ) == 1)
+                .then_some(())
+        },
+    );
+    wait_for(
+        "the listener to stop the capture and the session",
+        Duration::from_secs(30),
+        || (!alive(sender) && !alive(sandbox)).then_some(()),
+    );
+    stopped("the window to close with its server", viewer.pid);
+    assert!(
+        listener.child.try_wait().expect("poll listener").is_none(),
+        "the listener exited with its peer"
+    );
+
+    wait_for(
+        "the listener to remove the session's files",
+        Duration::from_secs(30),
+        || (!workdir.exists()).then_some(()),
+    );
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+    desk.stop();
+    drop(server);
+    drop(listener);
+    // The killed server's viewer directory, which a later server's sweep
+    // would remove.
+    if let Some(directory) = viewer.counters.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    if let Some(directory) = std::env::var_os("KWIN_MCP_TEST_EVIDENCE").map(PathBuf::from) {
+        for log in [&server_log, &listener_log] {
+            let name = log.file_name().expect("log name");
+            std::fs::copy(log, directory.join(name)).expect("keep a log");
+        }
+    }
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// A server only hands its control sockets to a binary that continues on
+/// them. One that does not (an older build installed over this one) would
+/// hold them open without knowing it and pass them to its children, and the
+/// listener would keep sessions nobody can reach. Before such a re-execution
+/// the connection closes, and the listener stops the session at once.
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, and input devices"]
+fn a_reexecution_into_a_binary_without_the_handover_closes_the_connection() {
+    let home = home_with_secret("downgrade", "shared-secret-0123456789");
+    let listener = Listener::start(&home, &[]);
+    let host = listener.address.clone();
+    let port = host.rsplit(':').next().expect("listener port");
+    let listener_log = home.join(format!("listener-{port}.log"));
+    let server_log = home.join("server.log");
+    let (mut server, program) = Server::start_copy(&home, "server", None);
+    let (session, workdir) = server.start_session(json!({"host":host, "width":1280, "height":720}));
+    let sandbox = server.sandbox(&session);
+
+    // The same build without the text that marks the handover: to the running
+    // server, a binary that would not continue on its sockets.
+    let mark = kwin_mcp::remote::ADOPTS_CONTROL_MARK.as_bytes();
+    let mut image = std::fs::read(&program).expect("read the server binary");
+    let at = image
+        .windows(mark.len())
+        .position(|window| window == mark)
+        .expect("the server binary carries the handover mark");
+    image[at] ^= 0x20;
+    let replacement = program.with_extension("new");
+    std::fs::write(&replacement, image).expect("write the replacement binary");
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))
+        .expect("make the replacement executable");
+    std::fs::rename(&replacement, &program).expect("install the replacement binary");
+
+    wait_for("the server to re-execute", Duration::from_secs(60), || {
+        (logged(&server_log, "reload: reattached 0 sessions") == 1).then_some(())
+    });
+    assert_eq!(
+        logged(
+            &server_log,
+            "the new binary does not continue on inherited control sockets"
+        ),
+        1,
+        "{}",
+        std::fs::read_to_string(&server_log).unwrap_or_default()
+    );
+    assert_eq!(logged(&server_log, "reload: kept the connection"), 0);
+    wait_for(
+        "the listener to notice its peer is gone",
+        Duration::from_secs(5),
+        || {
+            (logged(
+                &listener_log,
+                "disconnected; stopping the sessions it started",
+            ) == 1)
+                .then_some(())
+        },
+    );
+    wait_for("the session to end", Duration::from_secs(30), || {
+        (!alive(sandbox)).then_some(())
+    });
+    assert_eq!(
+        inheritable_sockets(u64::from(server.child.id())),
+        Vec::<String>::new()
+    );
+
+    // The server still knows the handle and says what became of it.
+    let listed = server.tool("session_list", json!({}));
+    let entry = record(&listed, "sessions", |listed| {
+        listed["session_id"] == session
+    })
+    .unwrap_or_else(|| panic!("the lost session is not listed: {listed}"));
+    assert_eq!(entry["status"], "connection_lost", "{entry}");
+    assert_eq!(entry["host"], host, "{entry}");
+    let cleared = server.tool("session_stop", json!({"session_id":session}));
+    assert_eq!(cleared["status"], "already_cleared", "{cleared}");
+
+    wait_for(
+        "the listener to remove the session's files",
+        Duration::from_secs(30),
+        || (!workdir.exists()).then_some(()),
+    );
+    drop(server);
+    drop(listener);
     std::fs::remove_dir_all(home).expect("remove the test HOME");
 }
 

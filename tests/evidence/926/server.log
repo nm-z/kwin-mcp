@@ -1,0 +1,16 @@
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable, google-chrome
+viewer_open: spawned viewer pid=3336388 for a session on 127.0.0.1:44919
+reload: re-executing PID 3336169 with 0 live sessions
+reload: keeping 1 connections to other machines for 1 sessions there
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable, google-chrome
+reload: reattached 0 sessions in PID 3336169
+reload: kept the connection to 127.0.0.1:44919 and its 1 sessions
+reload: re-executing PID 3336169 with 0 live sessions
+reload: keeping 1 connections to other machines for 1 sessions there
+kwin-mcp: display default 3840x2160; viewer on demand
+kwin-mcp: detected browsers: google-chrome-stable, google-chrome
+reload: reattached 0 sessions in PID 3336169
+reload: kept the connection to 127.0.0.1:44919 and its 1 sessions
+viewer_open: spawned viewer pid=3338179 for a session on 127.0.0.1:44919

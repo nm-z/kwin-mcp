@@ -1,0 +1,164 @@
+listen: accepting kwin-mcp peers on ws://127.0.0.1:44919
+kwin-mcp: detected browsers: google-chrome-stable, google-chrome
+listen: refused 127.0.0.1:43758: the handshake failed: WebSocket protocol error: Handshake not finished
+listen: 127.0.0.1:43760 connected
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.9 (b1e4de7) session_start
+session_start: virtual display 1280x720
+session_start: host_xdg_dir ready path=/tmp/kwin-mcp-3336145-1
+session_start: stage: scanning host mounts, sockets, and processes
+session_start: stage: validating host_write_paths
+session_start: stage: reading the host mount table (/proc/self/mountinfo)
+session_start: mount inventory=42 overlay-exclusions=0
+session_start: stage: clearing the previous disk overlay /var/tmp/kwin-mcp-remote-reload-3335961/.cache/kwin-mcp/kwin-mcp-3336145-1
+session_start: stage: reading host processes (/proc/<pid>)
+session_start: stage: preparing HOME overlays under /var/tmp/kwin-mcp-remote-reload-3335961
+session_start: stage: reading host unix sockets (/proc/net/unix)
+session_start: stage: preparing live SQLite access modes
+session_start: overlay plan=whole overlays=1 read-only-mounts=0
+session_start: stage: preparing browser profiles
+session_start: marked 0 browser profile(s) clean
+session_start: stage: reading desktop settings
+session_start: uinput mouse=/dev/input/event258 keyboard=/dev/input/event259
+session_start: stage: starting host D-Bus proxies
+session_start: stage: starting the KWallet mediator
+session_start: KWallet: session-local copy of host wallet 'kdewallet': 39 entries
+session_start: MemoryHigh=6442450944 MemoryMax=8589934592 MemorySwapMax=2147483648 bytes
+session_start: FUSE bridge enabled (fusermount, fusermount3)
+session_start: sandbox stderr: /var/tmp/kwin-mcp-remote-reload-3335961/.cache/kwin-mcp/kwin-mcp-3336145-1/sandbox.log
+session_start: stage: spawning the pasta and bwrap sandbox
+session_start: pasta spawned pid=3336216
+session_start: stage: waiting for the container D-Bus daemon
+session_start: dbus-ready
+session_start: creating proxy_conn
+session_start: proxy_conn owns org.kde.KWin
+session_start: input devices registered on proxy_conn
+session_start: bridge-ready signaled, KWin starting
+session_start: stage: waiting for KWin's Wayland socket
+session_start: wayland-0 ready
+session_start: discovering KWin unique name
+session_start: KWin unique name = :1.2
+session_start: stage: connecting to KWin EIS input
+session_start: EIS fd received, negotiating
+session_start: EIS ready
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310824897936279_0 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310825100393580_1 registered=true
+listen: 127.0.0.1:43772 opened a frame socket
+viewer_open: spawned frame sender pid=3336390
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310826215414843_2 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310830221745612_3 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310830224331545_4 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310830225480119_5 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310830243257302_6 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831150684673_7 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831152232705_8 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831175943070_9 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831178292978_10 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831278976328_11 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831378185228_12 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831478474230_13 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831578690311_14 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831679017303_15 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831778376327_16 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831878689239_17 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310831978916560_18 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832078377175_19 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832178730140_20 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832279091664_21 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832378368486_22 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832478549707_23 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832578760168_24 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832678471629_25 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832778317163_26 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832878862991_27 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310832978217444_28 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310833078610240_29 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310833178954235_30 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310833191652925_31 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310833269010269_32 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310835176154452_33 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310835177717594_34 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310835190242861_35 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838201229503_36 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838203650433_37 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838204996060_38 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838222065660_39 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838229627646_40 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838230962133_41 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838253517876_42 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838255975756_43 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838355853065_44 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838455155553_45 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838555370249_46 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838655367930_47 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838755520265_48 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838855785452_49 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310838956040699_50 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839055379007_51 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839155626995_52 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839255858542_53 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839356073749_54 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839455457739_55 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839555600684_56 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839655397263_57 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839723522901_58 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310839800632603_59 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310841155747986_60 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310841157363189_61 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310841369456996_62 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310841375553631_63 registered=true
+teardown: KWin close requested for 0/0 Chromium window(s)
+teardown: no CDP browser handle for graceful close
+teardown: graceful browser shutdown candidates=0 mains=0 graceful_close_attempted=false
+session lifecycle: session_id=s3336145-1 state=session_stopped reason=session_stop
+session_start: stage: preparing the session workdir
+kwin-mcp v0.1.2.9 (b1e4de7) session_start
+session_start: virtual display 1280x720
+session_start: host_xdg_dir ready path=/tmp/kwin-mcp-3336145-2
+session_start: stage: scanning host mounts, sockets, and processes
+session_start: stage: validating host_write_paths
+session_start: stage: reading the host mount table (/proc/self/mountinfo)
+session_start: mount inventory=42 overlay-exclusions=0
+session_start: stage: clearing the previous disk overlay /var/tmp/kwin-mcp-remote-reload-3335961/.cache/kwin-mcp/kwin-mcp-3336145-2
+session_start: stage: reading host processes (/proc/<pid>)
+session_start: stage: preparing HOME overlays under /var/tmp/kwin-mcp-remote-reload-3335961
+session_start: stage: reading host unix sockets (/proc/net/unix)
+session_start: stage: preparing live SQLite access modes
+session_start: overlay plan=whole overlays=1 read-only-mounts=0
+session_start: stage: preparing browser profiles
+session_start: marked 0 browser profile(s) clean
+session_start: stage: reading desktop settings
+session_start: uinput mouse=/dev/input/event258 keyboard=/dev/input/event259
+session_start: stage: starting host D-Bus proxies
+session_start: stage: starting the KWallet mediator
+session_start: KWallet: session-local copy of host wallet 'kdewallet': 39 entries
+session_start: MemoryHigh=6442450944 MemoryMax=8589934592 MemorySwapMax=2147483648 bytes
+session_start: FUSE bridge enabled (fusermount, fusermount3)
+session_start: sandbox stderr: /var/tmp/kwin-mcp-remote-reload-3335961/.cache/kwin-mcp/kwin-mcp-3336145-2/sandbox.log
+session_start: stage: spawning the pasta and bwrap sandbox
+session_start: pasta spawned pid=3338004
+session_start: stage: waiting for the container D-Bus daemon
+session_start: dbus-ready
+session_start: creating proxy_conn
+session_start: proxy_conn owns org.kde.KWin
+session_start: input devices registered on proxy_conn
+session_start: bridge-ready signaled, KWin starting
+session_start: stage: waiting for KWin's Wayland socket
+session_start: wayland-0 ready
+session_start: discovering KWin unique name
+session_start: KWin unique name = :1.2
+session_start: stage: connecting to KWin EIS input
+session_start: EIS fd received, negotiating
+session_start: EIS ready
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310842342085406_64 registered=true
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310842544631098_65 registered=true
+listen: 127.0.0.1:55768 opened a frame socket
+viewer_open: spawned frame sender pid=3338181
+listen: 127.0.0.1:43760 disconnected; stopping the sessions it started
+shutdown: autoclean owns /tmp/kwin-mcp-3336145-2
+run_kwin_script: our_name=:1.1 path=/KWinMCP/3336145_1794310842601813093_66 registered=true
+teardown: KWin close requested for 0/0 Chromium window(s)
+teardown: no CDP browser handle for graceful close
+teardown: graceful browser shutdown candidates=0 mains=0 graceful_close_attempted=false
+shutdown: autoclean removed /tmp/kwin-mcp-3336145-2
+session lifecycle: session_id=s3336145-2 state=shutdown_cleanup_finished reason=server_shutdown

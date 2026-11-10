@@ -96,7 +96,7 @@ intentionally has no PNG.
 
 ```bash
 cargo test --release --test remote_viewer_e2e -- --ignored --test-threads 1 \
-  a_remote_session raw_frames every_way a_window_the_compositor
+  a_remote_session a_reexecution raw_frames every_way a_window_the_compositor
 cargo test --release --test remote_viewer_e2e -- --ignored two_viewers --nocapture
 cargo test --release --test remote_viewer_e2e -- --ignored measure_the_stream --nocapture
 ```
@@ -109,8 +109,9 @@ the loopback socket behave like a link of that speed. The tests read each
 viewer's `viewer-stream.json` counters and logs. Build in release: the
 software DSC codec is too slow unoptimized for the viewer's start timeout. Do
 not edit `src/` or rebuild while they run: a server started from `target/`
-rebuilds and re-executes itself when its sources change, which drops its
-remote sessions.
+rebuilds and re-executes itself when its sources change, in the middle of a
+test's measurements, and the listener, which does not re-execute, would keep
+running the old build.
 
 - `a_remote_session_streams_changed_frames_to_a_viewer_on_the_callers_machine`
   (20 Mb/s link): a 1280x720 window gets DSC at the 6 bpp the link carries and,
@@ -128,6 +129,27 @@ remote sessions.
   a 20 Mb/s link (DSC, then the settled exact frame). A 64x64 corner where the
   pointer is parked is left out, because the stream draws the pointer and a
   screenshot with `include_cursor=false` does not.
+- `a_remote_session_and_its_viewer_survive_the_callers_reexecution` (#926): the
+  calling server runs a private copy of the binary, and a new modification
+  time on it makes the server re-execute itself, twice. Each time the listener
+  logs no disconnect, the sandbox, the frame sender and the viewer keep their
+  PIDs, the viewer is still the server's child, `session_list` shows the
+  session with its host, `window_list` and `screenshot` answer on the same
+  ID, typed text reaches the window as new presented frames, and
+  `viewer_open` reports `already_open`, and no socket of the server is
+  inheritable by its children. `session_stop` then ends all of it, and
+  killing the server with a second session open makes the listener log the
+  disconnect within 5 seconds and stop that session.
+  `KWIN_MCP_TEST_EVIDENCE=DIR` keeps the window's and the session's
+  screenshots after each re-execution and both logs; `evidence/926` holds one
+  run's.
+- `a_reexecution_into_a_binary_without_the_handover_closes_the_connection`:
+  the server's binary is replaced by the same build with one byte of
+  `remote::ADOPTS_CONTROL_MARK` changed, which the running server takes for a
+  build that would not continue on its sockets. It re-executes without them:
+  the listener logs the disconnect within 5 seconds and stops the session,
+  `session_list` shows it as `connection_lost` with its host, and
+  `session_stop` clears it.
 - `every_way_a_stream_ends_leaves_nothing_running`: the sender killed, the
   viewer killed, the window closed, `viewer_close`, `session_stop`, and the
   listener killed each end both processes; a viewer stopped for six seconds
