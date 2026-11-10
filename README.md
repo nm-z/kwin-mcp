@@ -586,6 +586,22 @@ cargo build --release
 cargo clippy         # strict: unwrap/expect/todo/dead_code all denied
 ```
 
+## DSC codec
+
+`src/dsc.rs` (`kwin_mcp::dsc`) is a software VESA Display Stream Compression (DSC 1.1 / 1.2a) encoder and decoder for 8-bit RGB 4:4:4 frames, for the remote viewer stream (#915). Nothing uses it yet. It takes `BGRx` or `RGBx` rows with a stride and writes a constant-size bitstream: every frame of one size and rate is exactly `chunk_size * slice_height * slices` bytes (1920x1080 at 8 bpp is 2,073,600 bytes), with the slices of a row interleaved line by line as DSC transports send them. `Pps` is the standard 128-byte picture parameter set the decoder needs.
+
+```rust
+let mut encoder = Encoder::new(Config::new(1920, 1080)?)?;   // 8 bpp, 4 slices wide, 108 lines high
+let stats = encoder.encode_parallel(&Frame { data, stride, format: PixelFormat::Bgrx }, &mut out, threads)?;
+let decoder = Decoder::new(Pps::from_bytes(&encoder.pps().to_bytes())?)?;
+decoder.decode_parallel(&out, &mut pixels, stride, PixelFormat::Bgrx, threads)?;
+encoder.set_bits_per_pixel_x16(104)?;                        // 6.5 bpp from the next frame on; send the new PPS
+```
+
+The rate is set in 1/16 bpp steps from 6 to 12 bpp. `FrameStats` reports per frame the mean quantization parameter (`complexity_permille`), the share of groups reproduced exactly at almost no cost (`flatness_permille`) and the share padded to hold the constant rate (`stuffing_permille`). Slices are independent, so `encode_parallel` and `decode_parallel` spread them over scoped threads and give the same bytes as the single-threaded calls.
+
+The tests compare bitstreams with the VESA C reference model (v1.67, `DSC_model_20211213`). `cargo test --lib dsc_dump_vectors -- --ignored` with `KWIN_DSC_DUMP_DIR` and `KWIN_DSC_RC_DIR` (the model's directory of `rc_*.cfg` files) writes the inputs, this codec's output and model configurations to rerun that comparison; `cargo test --release --lib dsc_timing -- --ignored --nocapture` prints encode and decode times. Only 8 bpc RGB 4:4:4 at a constant rate is implemented: no 10 bpc and above, YCbCr, 4:2:2, 4:2:0 or VBR.
+
 ## Chrome Load unpacked
 
 Chrome's **Load unpacked** dialog selects a directory. Use this procedure instead
