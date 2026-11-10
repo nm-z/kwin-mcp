@@ -11246,9 +11246,6 @@ struct ScreenshotParams {
     save_as: Option<String>,
 }
 
-const GENERATED_SECRET_MIME: &str = kwin_mcp::clipboard::GENERATED_SECRET_MIME;
-const CLIPBOARD_TEXT_MIME: &str = "text/plain;charset=utf-8";
-
 #[derive(Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ClipboardTarget {
@@ -11292,8 +11289,8 @@ struct GenerateSecretParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ClipboardWriteParams {
     /// Both targets require a live isolated session. Session is its private
-    /// clipboard; host is the server desktop clipboard used by local viewer
-    /// copy/paste, not a remote viewer client's clipboard.
+    /// clipboard; host is the clipboard of this server's desktop, used by
+    /// viewer copy/paste, also for a session started with host.
     target: ClipboardTarget,
     /// Plain UTF-8 text. Specify exactly one of text and generate_secret.
     text: Option<String>,
@@ -11337,6 +11334,67 @@ fn generate_secret(params: GenerateSecretParams) -> Result<String, McpError> {
         bytes.swap(end, other);
     }
     Ok(bytes.into_iter().map(char::from).collect())
+}
+
+/// The text a clipboard_write call writes, and whether it is a secret made
+/// here. A secret is made by the server that writes it to a clipboard on its
+/// own machine, so its value is in no request, no result and no log.
+fn clipboard_write_text(
+    text: Option<String>,
+    generate: Option<GenerateSecretParams>,
+) -> Result<(String, bool), McpError> {
+    match (text, generate) {
+        (Some(text), None) => Ok((text, false)),
+        (None, Some(generate)) => Ok((generate_secret(generate)?, true)),
+        _ => Err(McpError::invalid_params(
+            "specify exactly one of text or generate_secret",
+            None,
+        )),
+    }
+}
+
+/// The Wayland socket of the desktop on this machine: the clipboard of the
+/// user who sits here and of the viewer windows this server opens.
+async fn host_clipboard_socket() -> Result<PathBuf, McpError> {
+    let (runtime, display) = host_wayland().await.map_err(KwinError::from)?;
+    Ok(if Path::new(&display).is_absolute() {
+        PathBuf::from(display)
+    } else {
+        runtime.join(display)
+    })
+}
+
+/// Makes `text` the selection of the compositor at `socket` and returns its
+/// length in characters.
+async fn write_clipboard(
+    store: Arc<std::sync::Mutex<ClipboardStore>>,
+    socket: PathBuf,
+    label: &'static str,
+    text: String,
+    secret: bool,
+    primary: bool,
+) -> Result<usize, McpError> {
+    let length = tokio::task::spawn_blocking(move || {
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
+            .write(socket, label, text, secret, primary)
+    })
+    .await
+    .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
+    .map_err(KwinError::from)?;
+    Ok(length)
+}
+
+/// Whether a clipboard_write call names the host clipboard.
+fn writes_host_clipboard(request: &rmcp::model::CallToolRequestParams) -> bool {
+    request.name == "clipboard_write"
+        && request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("target"))
+            .and_then(serde_json::Value::as_str)
+            == Some(ClipboardTarget::Host.label())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -11384,15 +11442,8 @@ impl ClipboardStore {
         primary: bool,
     ) -> anyhow::Result<usize> {
         let length = text.chars().count();
-        let mut contents = vec![(CLIPBOARD_TEXT_MIME.to_owned(), text.as_bytes().to_vec())];
-        if secret {
-            contents.push((
-                GENERATED_SECRET_MIME.to_owned(),
-                length.to_string().into_bytes(),
-            ));
-        }
+        let contents = kwin_mcp::clipboard::text_contents(&text, secret);
         let entry = self.entry(&socket, label)?;
-        let contents = Arc::new(contents);
         entry.clipboard.write(Arc::clone(&contents))?;
         if primary {
             entry.clipboard.write_primary(contents)?;
@@ -13153,7 +13204,7 @@ impl rmcp::ServerHandler for KwinMcp {
                 Prefer find_ui_elements for named controls, accessibility_tree for structure, screenshots otherwise. Use window_list and window_activate for hidden windows. \
                 Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. The viewer may stay open; the user can close it. \
                 At browser logins, select saved-credential autofill without reading or typing its value; otherwise show the entry and open the viewer. \
-                Clipboards are separate: local viewer Ctrl+C/Ctrl+X copies to the server host; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
+                Clipboards are separate: viewer Ctrl+C/Ctrl+X copies to this server's desktop; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute session path, alt+o; for folders click its top-right button, not alt+o. Enter in the location bar cancels. \
                 Mouse/screenshot coordinates are 1:1 pixels from the active window's top-left. For crop region=[x1,y1,x2,y2], image (px,py) maps to mouse (px+x1,py+y1). \
                 {size_line} Windows auto-maximize unless window_mode=native. Results report memory_warning when the session is throttled.",
@@ -14547,7 +14598,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "clipboard_write",
-        description = "Write UTF-8 text with a live isolated KWin MCP session, even for target=host. This server controls its own isolated desktop, not the user's active desktop session. target=session writes that session's CLIPBOARD and PRIMARY for agent input, including X11 Shift+Insert. target=host writes the server host's Wayland clipboard used by the local viewer: viewer Ctrl+V/Shift+Insert pastes from it, and Ctrl+C/Ctrl+X copies to it. Host does not select a remote viewer client's clipboard or an arbitrary user desktop. For a request to change the user's active desktop clipboard outside this session/viewer workflow, use the appropriate separate desktop mechanism. Specify target and exactly one of text or generate_secret. generate_secret uses operating-system randomness, length 1..4096, and includes every selected character class (lowercase, uppercase, digits, symbols). The result returns only target and character length; clipboard_read withholds generated values."
+        description = "Write UTF-8 text with a live isolated KWin MCP session, even for target=host. This server controls its own isolated desktop, not the user's active desktop session. target=session writes that session's CLIPBOARD and PRIMARY for agent input, including X11 Shift+Insert. target=host writes the Wayland clipboard of this server's desktop, where viewer_open opens the window: viewer Ctrl+V/Shift+Insert pastes from it, and Ctrl+C/Ctrl+X copies to it. For a session started with host it is still this server's desktop clipboard, never the session machine's: the call is not forwarded, and the text crosses the LAN, unencrypted, only when the user pastes it in the viewer. Host does not select a kwin-viewer --remote window's clipboard or an arbitrary user desktop. For a request to change the user's active desktop clipboard outside this session/viewer workflow, use the appropriate separate desktop mechanism. Specify target and exactly one of text or generate_secret. generate_secret uses operating-system randomness on the machine whose clipboard is written, length 1..4096, and includes every selected character class (lowercase, uppercase, digits, symbols). The result returns only target and character length, never the value; clipboard_read withholds generated values."
     )]
     async fn clipboard_write(
         &self,
@@ -14555,43 +14606,19 @@ impl KwinMcp {
         Parameters(params): Parameters<ClipboardWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        let (text, secret) = match (params.text, params.generate_secret) {
-            (Some(text), None) => (text, false),
-            (None, Some(generate)) => (generate_secret(generate)?, true),
-            _ => {
-                return Err(McpError::invalid_params(
-                    "specify exactly one of text or generate_secret",
-                    None,
-                ));
-            }
-        };
+        let label = params.target.label();
+        let primary = matches!(params.target, ClipboardTarget::Session);
+        let (text, secret) = clipboard_write_text(params.text, params.generate_secret)?;
         let guard = self.session.read().await;
         let session = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session; call session_start first", None)
         })?;
         let socket = match params.target {
             ClipboardTarget::Session => session.host_xdg_dir.join("wayland-0"),
-            ClipboardTarget::Host => {
-                let (runtime, display) = host_wayland().await.map_err(KwinError::from)?;
-                if Path::new(&display).is_absolute() {
-                    PathBuf::from(display)
-                } else {
-                    runtime.join(display)
-                }
-            }
+            ClipboardTarget::Host => host_clipboard_socket().await?,
         };
         let store = self.clipboards.clone();
-        let label = params.target.label();
-        let primary = matches!(params.target, ClipboardTarget::Session);
-        let length = tokio::task::spawn_blocking(move || {
-            store
-                .lock()
-                .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
-                .write(socket, label, text, secret, primary)
-        })
-        .await
-        .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
-        .map_err(KwinError::from)?;
+        let length = write_clipboard(store, socket, label, text, secret, primary).await?;
         drop(guard);
         Ok(structured_result(
             &peer,
@@ -14603,7 +14630,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "clipboard_read",
-        description = "Read UTF-8 text from the selected live isolated KWin MCP session's clipboard. Requires a live session, just like clipboard_write with either target. This is the isolated desktop's selection, not the server host's or remote viewer client's clipboard. Local viewer Ctrl+V/Shift+Insert reads the server host clipboard instead. This tool does not read the user's active desktop clipboard; use an appropriate separate desktop mechanism for that request. A generated secret returns only length and protected=true, with text=null.",
+        description = "Read UTF-8 text from the selected live isolated KWin MCP session's clipboard. Requires a live session, just like clipboard_write with either target. This is the isolated desktop's selection, also for a session started with host, not the clipboard of this server's desktop or of a viewer's machine. Viewer Ctrl+V/Shift+Insert reads the clipboard of this server's desktop instead. This tool does not read the user's active desktop clipboard; use an appropriate separate desktop mechanism for that request. A generated secret returns only length and protected=true, with text=null.",
         annotations(read_only_hint = true)
     )]
     async fn clipboard_read(
@@ -14659,7 +14686,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_open",
-        description = "Open or reuse the live viewer for this isolated session on the server's desktop. Use it when the user asks to watch or must see or act on a password, OTP, Duo, CAPTCHA, choice or result. First navigate to the relevant form and show the entry; pass reason with a short instruction for the window title. Never assume the viewer is open or stop the session for a handoff. Keep the page open and poll screenshots; continue when the step completes. If Duo expires, leave the resend option visible and tell the user. The viewer may stay open; the user can close it. Viewer input is forwarded immediately and cancels remaining in-flight agent events with retry_safe=false: inspect before retrying. New agent input receives a retry-safe error for one second after viewer input; resume after a quiet second. Returns ready after the host renderer submits its first PipeWire frame, or unavailable with the startup failure and last PipeWire state. On a headless host, the reason gives a kwin-viewer --remote HOST DIR command to show this session elsewhere without restarting it. For a session started with host, the window still opens on this server's desktop: that machine sends the frames, scaled to the window, over a second WebSocket, and viewer input returns on it. Works with --no-viewer. In the local viewer Ctrl+C/Ctrl+X copies to the server host clipboard and Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares local viewer paste; target=session prepares agent input. clipboard_read reads session text only and withholds generated secrets."
+        description = "Open or reuse the live viewer for this isolated session on the server's desktop. Use it when the user asks to watch or must see or act on a password, OTP, Duo, CAPTCHA, choice or result. First navigate to the relevant form and show the entry; pass reason with a short instruction for the window title. Never assume the viewer is open or stop the session for a handoff. Keep the page open and poll screenshots; continue when the step completes. If Duo expires, leave the resend option visible and tell the user. The viewer may stay open; the user can close it. Viewer input is forwarded immediately and cancels remaining in-flight agent events with retry_safe=false: inspect before retrying. New agent input receives a retry-safe error for one second after viewer input; resume after a quiet second. Returns ready after the host renderer submits its first PipeWire frame, or unavailable with the startup failure and last PipeWire state. On a headless host, the reason gives a kwin-viewer --remote HOST DIR command to show this session elsewhere without restarting it. For a session started with host, the window still opens on this server's desktop: that machine sends the frames, scaled to the window, over a second WebSocket, and viewer input returns on it. Works with --no-viewer. In the viewer Ctrl+C/Ctrl+X copies to this server's desktop clipboard and Ctrl+V/Shift+Insert pastes from it, also for a session started with host (UTF-8 text up to 1 MiB, unencrypted on the LAN). clipboard_write target=host prepares viewer paste; target=session prepares agent input. clipboard_read reads session text only and withholds generated secrets."
     )]
     async fn viewer_open(
         &self,
@@ -20227,6 +20254,9 @@ impl SessionRouter {
                 .close_remote_viewer(request, id, host, &listener, peer)
                 .await;
         }
+        if writes_host_clipboard(&request) {
+            return self.write_callers_clipboard(request, host, peer).await;
+        }
         // Held until a stopped session is forgotten, so a re-execution never
         // carries one along.
         let calling = self.remote.calls.read().await;
@@ -20246,6 +20276,35 @@ impl SessionRouter {
             self.remote.discard_viewer(id).await;
         }
         result
+    }
+    /// clipboard_write target=host for a session on another machine. The host
+    /// clipboard is the one a viewer paste reads, and that session's viewer
+    /// window is on this machine, with its user: the text goes to this
+    /// machine's clipboard. The call is not forwarded, so neither the text
+    /// nor a secret generated here reaches the session's machine until the
+    /// user pastes it through the viewer, which sends it on the frame socket.
+    async fn write_callers_clipboard(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        host: &str,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let arguments = serde_json::Value::Object(request.arguments.unwrap_or_default());
+        let params: ClipboardWriteParams = serde_json::from_value(arguments)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let label = params.target.label();
+        let (text, secret) = clipboard_write_text(params.text, params.generate_secret)?;
+        let socket = host_clipboard_socket().await?;
+        let length =
+            write_clipboard(self.clipboards.clone(), socket, label, text, secret, false).await?;
+        Ok(structured_result(
+            peer,
+            format!(
+                "wrote {length} characters to the {label} clipboard: this machine's, where the viewer window of the session on {host} opens"
+            ),
+            serde_json::json!({"ok": true, "written_on": local_host_name(), "session_host": host}),
+        )
+        .await)
     }
     /// viewer_open for a session on another machine. The window opens on this
     /// machine; it opens a frame socket of its own to the session's listener,
@@ -20874,6 +20933,15 @@ impl rmcp::ServerHandler for SessionRouter {
             && let Some(result) = self.stop_unregistered(requested_id, &context.peer).await?
         {
             return Ok(result);
+        }
+        // The host clipboard is the one beside the viewer window, which for a
+        // peer's session is on the peer's machine: its server writes it
+        // itself. Nobody who asked for the text sits at this machine's desktop.
+        if self.listener_peer && writes_host_clipboard(&request) {
+            return Err(McpError::invalid_params(
+                "clipboard_write target=host is not accepted over a remote connection: the host clipboard is the calling machine's, which its own kwin-mcp server writes. Update kwin-mcp on the calling machine.",
+                Some(serde_json::json!({"reason": "host_clipboard_is_the_callers", "retry_safe": false})),
+            ));
         }
         let (id, session) = self.resolve(&mut request)?;
         let start = request.name == "session_start";

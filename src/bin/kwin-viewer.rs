@@ -16,8 +16,10 @@
 //! container via org_kde_kwin_fake_input.
 
 use async_tungstenite::tungstenite::Message;
-use kwin_mcp::clipboard::{Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown};
-use kwin_mcp::viewer_stream::{Header, Mode, ModeControl, Notice, Payload};
+use kwin_mcp::clipboard::{
+    ClipContents, Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown, text_contents,
+};
+use kwin_mcp::viewer_stream::{ClipText, Header, Mode, ModeControl, Notice, Payload, Request};
 use kwin_mcp::{dsc, remote, viewer_stream};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
@@ -570,22 +572,30 @@ fn clipboard_chord(code: u32, held: &HashSet<u32>) -> Option<ClipChord> {
     }
 }
 
-// Keeps the viewer user's clipboard on the host. The agent owns the isolated
-// session's clipboard, so a copy made through the viewer moves to the host
-// and a paste made through the viewer reads the host; the agent's selection
-// is put back afterwards either way.
-struct ClipboardBridge {
-    host: Arc<Clipboard>,
+// The session's side of a clipboard handoff. The agent owns the isolated
+// session's clipboard, so a copy made through the viewer moves to the viewer
+// user's clipboard and a paste made through the viewer reads that one; the
+// agent's selection is put back afterwards either way.
+struct SessionClipboard {
     isolated: Arc<Clipboard>,
     restore: Option<JoinHandle<()>>,
     // Set by the next chord so a pending copy wait stops instead of blocking it.
-    superseded: Arc<std::sync::atomic::AtomicBool>,
+    superseded: Arc<AtomicBool>,
 }
 
-impl ClipboardBridge {
-    // Runs before the chord's key press reaches the session.
-    fn before(&mut self, chord: ClipChord) -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
+impl SessionClipboard {
+    fn connect(session_path: &std::path::Path, shutdown: &Shutdown) -> anyhow::Result<Self> {
+        let isolated = Clipboard::spawn(
+            Connection::from_socket(UnixStream::connect(session_path.join("wayland-0"))?)
+                .map_err(|e| anyhow::anyhow!("isolated clipboard connect: {e:?}"))?,
+            "isolated",
+            shutdown,
+        )?;
+        Ok(Self { isolated: Arc::new(isolated), restore: None, superseded: Arc::default() })
+    }
+
+    // Ends the handoff before this one and returns the agent's selection.
+    fn begin(&mut self) -> anyhow::Result<ClipContents> {
         self.superseded.store(true, Ordering::Relaxed);
         if let Some(restore) = self.restore.take()
             && restore.join().is_err()
@@ -593,46 +603,10 @@ impl ClipboardBridge {
             eprintln!("kwin-viewer: clipboard restore thread panicked");
         }
         self.superseded = Arc::new(AtomicBool::new(false));
-        let agent = self.isolated.read()?;
-        let isolated = Arc::clone(&self.isolated);
-        let restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send> = match chord {
-            ClipChord::Copy => {
-                let host = Arc::clone(&self.host);
-                let before = isolated.generation()?;
-                let superseded = Arc::clone(&self.superseded);
-                let pressed = Instant::now();
-                Box::new(move || {
-                    while !isolated.wait_for_change(before, COPY_POLL)? {
-                        if superseded.load(Ordering::Relaxed) {
-                            return Ok(());
-                        }
-                        if pressed.elapsed() >= COPY_TIMEOUT {
-                            eprintln!(
-                                "kwin-viewer: copy shortcut: the session clipboard did not change within {COPY_TIMEOUT:?}; the host clipboard is unchanged"
-                            );
-                            return Ok(());
-                        }
-                    }
-                    host.write(isolated.read()?)?;
-                    isolated.write(agent)?;
-                    eprintln!(
-                        "kwin-viewer: copy shortcut: sent the session selection to the host clipboard after {} ms",
-                        pressed.elapsed().as_millis()
-                    );
-                    Ok(())
-                })
-            }
-            ClipChord::Paste => {
-                isolated.write(self.host.read()?)?;
-                let pasted = Instant::now();
-                // Hand the agent's selection back once the pasting app stops
-                // reading the user's.
-                Box::new(move || {
-                    isolated.wait_for_read_since(pasted, PASTE_SETTLE, PASTE_TIMEOUT)?;
-                    isolated.write(agent)
-                })
-            }
-        };
+        self.isolated.read()
+    }
+
+    fn finish(&mut self, restore: impl FnOnce() -> anyhow::Result<()> + Send + 'static) -> anyhow::Result<()> {
         self.restore = Some(
             std::thread::Builder::new()
                 .name("clipboard-restore".to_owned())
@@ -643,6 +617,267 @@ impl ClipboardBridge {
                 })?,
         );
         Ok(())
+    }
+
+    // Runs before a copy or cut chord's key press reaches the session. Once
+    // the session's selection changes, `deliver` takes it to the viewer
+    // user's clipboard and the agent's selection returns. `deliver` answers
+    // false for a selection that is not the chord's, which then stays.
+    fn copy(
+        &mut self,
+        deliver: impl FnOnce(&Clipboard) -> anyhow::Result<bool> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let agent = self.begin()?;
+        let isolated = Arc::clone(&self.isolated);
+        let before = isolated.generation()?;
+        let superseded = Arc::clone(&self.superseded);
+        let pressed = Instant::now();
+        self.finish(move || {
+            while !isolated.wait_for_change(before, COPY_POLL)? {
+                if superseded.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if pressed.elapsed() >= COPY_TIMEOUT {
+                    eprintln!(
+                        "kwin-viewer: copy shortcut: the session clipboard did not change within {COPY_TIMEOUT:?}; the viewer user's clipboard is unchanged"
+                    );
+                    return Ok(());
+                }
+            }
+            let delivered = deliver(&isolated);
+            if !matches!(delivered, Ok(false)) {
+                isolated.write(agent)?;
+            }
+            if delivered? {
+                eprintln!(
+                    "kwin-viewer: copy shortcut: took the session selection after {} ms and put the agent's back",
+                    pressed.elapsed().as_millis()
+                );
+            }
+            Ok(())
+        })
+    }
+
+    // Runs before a paste chord's key press reaches the session, which then
+    // pastes `contents`: the viewer user's clipboard.
+    fn paste(&mut self, contents: ClipContents) -> anyhow::Result<()> {
+        let agent = self.begin()?;
+        let isolated = Arc::clone(&self.isolated);
+        isolated.write(contents)?;
+        let pasted = Instant::now();
+        // Hand the agent's selection back once the pasting app stops
+        // reading the user's.
+        self.finish(move || {
+            isolated.wait_for_read_since(pasted, PASTE_SETTLE, PASTE_TIMEOUT)?;
+            isolated.write(agent)
+        })
+    }
+}
+
+// The local viewer's handoff: the viewer user's clipboard is this host's.
+struct ClipboardBridge {
+    host: Arc<Clipboard>,
+    session: SessionClipboard,
+}
+
+impl ClipboardBridge {
+    // Runs before the chord's key press reaches the session.
+    fn before(&mut self, chord: ClipChord) -> anyhow::Result<()> {
+        match chord {
+            ClipChord::Copy => {
+                let host = Arc::clone(&self.host);
+                self.session.copy(move |session| host.write(session.read()?).map(|()| true))
+            }
+            ClipChord::Paste => self.session.paste(self.host.read()?),
+        }
+    }
+}
+
+// How long after a copy chord a stream viewer still takes the session's
+// answer: the sender's own wait for the selection to change, and the way back.
+const COPY_ANSWER_TIMEOUT: Duration = Duration::from_secs(COPY_TIMEOUT.as_secs() + 5);
+
+// What a stream viewer's socket thread needs to finish a copy chord: the
+// clipboard of this machine, and the copy request still waiting for its text.
+struct CopyAnswer {
+    host: Arc<Clipboard>,
+    // The request's number and when it went out. A text that names another
+    // number, or that nobody asked for, is not taken.
+    pending: Mutex<Option<(u64, Instant)>>,
+}
+
+impl CopyAnswer {
+    fn pending(&self) -> std::sync::MutexGuard<'_, Option<(u64, Instant)>> {
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // The session's host answered copy request `id`.
+    fn receive(self: &Arc<Self>, id: u64, text: Option<ClipText>) {
+        let asked = {
+            let mut pending = self.pending();
+            let asked = pending.is_some_and(|(asked, at)| asked == id && at.elapsed() <= COPY_ANSWER_TIMEOUT);
+            if asked {
+                *pending = None;
+            }
+            asked
+        };
+        if !asked {
+            eprintln!("kwin-viewer: stream: ignored a clipboard text this viewer is not waiting for");
+            return;
+        }
+        let Some(text) = text else {
+            eprintln!(
+                "kwin-viewer: copy shortcut: the session's selection is not text of at most {} bytes; this machine's clipboard is unchanged",
+                viewer_stream::CLIPBOARD_TEXT_BYTES
+            );
+            return;
+        };
+        // The compositor may take seconds to answer; frames keep arriving.
+        let answer = Arc::clone(self);
+        let written = std::thread::Builder::new().name("clipboard-copy".to_owned()).spawn(move || {
+            match answer.host.write(text_contents(text.as_str(), false)) {
+                Ok(()) => eprintln!("kwin-viewer: copy shortcut: put the session's selection on this machine's clipboard"),
+                Err(error) => eprintln!("kwin-viewer: copy shortcut: this machine's clipboard: {error:#}"),
+            }
+        });
+        if let Err(error) = written {
+            eprintln!("kwin-viewer: copy shortcut: {error}");
+        }
+    }
+}
+
+// A stream viewer's handoff: the viewer user's clipboard is this machine's,
+// and the session's is beside the sender, across the frame socket.
+struct StreamClipboard {
+    answer: Arc<CopyAnswer>,
+    out: OpSink,
+    // The longest text both ends carry, in bytes.
+    limit: usize,
+    copies: u64,
+}
+
+impl StreamClipboard {
+    // Runs before the chord's key press is queued for the session's host, so
+    // the request reaches it first.
+    fn before(&mut self, chord: ClipChord) {
+        let request = match chord {
+            ClipChord::Copy => {
+                self.copies += 1;
+                *self.answer.pending() = Some((self.copies, Instant::now()));
+                Request::ClipboardCopy { id: self.copies, max_bytes: self.limit as u64 }
+            }
+            ClipChord::Paste => {
+                *self.answer.pending() = None;
+                // Without a text the session pastes nothing: never the agent's
+                // selection, which the user did not ask for.
+                let (text, secret) = match self.answer.host.read_utf8(self.limit) {
+                    Ok(Some((text, secret))) => (ClipText::new(text, self.limit), secret),
+                    Ok(None) => {
+                        eprintln!("kwin-viewer: paste shortcut: this machine's clipboard holds no text; nothing is pasted");
+                        (None, false)
+                    }
+                    Err(error) => {
+                        eprintln!("kwin-viewer: paste shortcut: {error:#}; nothing is pasted");
+                        (None, false)
+                    }
+                };
+                Request::ClipboardPaste { secret: secret && text.is_some(), text }
+            }
+        };
+        self.out.request(request);
+    }
+}
+
+// The clipboard handoff of the viewer's kind.
+enum ViewerClipboard {
+    Local(ClipboardBridge),
+    Stream(StreamClipboard),
+}
+
+impl ViewerClipboard {
+    fn before(&mut self, chord: ClipChord) -> anyhow::Result<()> {
+        match self {
+            Self::Local(bridge) => bridge.before(chord),
+            Self::Stream(bridge) => {
+                bridge.before(chord);
+                Ok(())
+            }
+        }
+    }
+}
+
+// A stream sender's handoff: its session's clipboard, and the answer to the
+// viewer's copy request until the picture loop sends it.
+struct SenderClipboard {
+    session: SessionClipboard,
+    outbox: Arc<Mutex<Option<Notice>>>,
+    mailbox: FrameMailbox,
+}
+
+impl SenderClipboard {
+    // Stored under the mailbox lock, as a viewer's size is, so the picture
+    // loop's wake-up cannot fall between its check and its wait.
+    fn post(outbox: &Mutex<Option<Notice>>, mailbox: &FrameMailbox, notice: Notice) {
+        let (latest, ready) = &**mailbox;
+        let guard = latest.lock();
+        *outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notice);
+        drop(guard);
+        ready.notify_all();
+    }
+
+    // A text message from the viewer. It is handled before the key record
+    // that follows it on the socket.
+    fn receive(&mut self, message: &str) {
+        let Some(request) = Request::decode(message) else {
+            eprintln!("kwin-viewer: stream: unreadable request of {} bytes", message.len());
+            return;
+        };
+        let handled = match request {
+            Request::ClipboardPaste { text, secret } => {
+                eprintln!(
+                    "kwin-viewer: paste shortcut: {}",
+                    if text.is_some() {
+                        "the session pastes the text of the viewer's machine, then gets the agent's selection back"
+                    } else {
+                        "the viewer's machine sent no text, so the session pastes nothing"
+                    }
+                );
+                let contents = text.map_or_else(Arc::default, |text| text_contents(text.as_str(), secret));
+                self.session.paste(contents)
+            }
+            Request::ClipboardCopy { id, max_bytes } => {
+                let limit = usize::try_from(max_bytes)
+                    .unwrap_or(usize::MAX)
+                    .min(viewer_stream::CLIPBOARD_TEXT_BYTES);
+                let (outbox, mailbox) = (Arc::clone(&self.outbox), Arc::clone(&self.mailbox));
+                self.session.copy(move |session| {
+                    let text = match session.read_utf8(limit) {
+                        // The marker is on the agent's own generated secret,
+                        // never on what an application copied: the selection
+                        // is not the viewer's copy, so it stays and is not sent.
+                        Ok(Some((_, true))) => {
+                            eprintln!("kwin-viewer: copy shortcut: the session's selection is a generated secret of the agent's; it is not sent");
+                            return Ok(false);
+                        }
+                        Ok(Some((text, false))) => ClipText::new(text, limit),
+                        Ok(None) => None,
+                        Err(error) => {
+                            eprintln!("kwin-viewer: copy shortcut: {error:#}");
+                            None
+                        }
+                    };
+                    if text.is_none() {
+                        eprintln!("kwin-viewer: copy shortcut: the session's selection is not text of at most {limit} bytes; nothing is sent");
+                    }
+                    Self::post(&outbox, &mailbox, Notice::Clipboard { id, text });
+                    Ok(true)
+                })
+            }
+            Request::Unknown => Ok(()),
+        };
+        if let Err(error) = handled {
+            eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
+        }
     }
 }
 
@@ -861,14 +1096,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
             "host",
             &shutdown,
         )?),
-        isolated: Arc::new(Clipboard::spawn(
-            Connection::from_socket(UnixStream::connect(session_path.join("wayland-0"))?)
-                .map_err(|e| anyhow::anyhow!("isolated clipboard connect: {e:?}"))?,
-            "isolated",
-            &shutdown,
-        )?),
-        restore: None,
-        superseded: Arc::default(),
+        session: SessionClipboard::connect(&session_path, &shutdown)?,
     };
 
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
@@ -885,7 +1113,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
         held_buttons: 0,
         active_touch: None,
         held_keys: HashSet::new(),
-        clipboard: Some(clipboard),
+        clipboard: Some(ViewerClipboard::Local(clipboard)),
     };
 
     let run_result = window_loop(
@@ -2132,6 +2360,21 @@ fn stream_sender(
         conn: link.conn.clone(),
         activity: open_input_activity(session_path)?,
     };
+    // This session's clipboard, and no other: the frame socket was paired
+    // with this session by its ticket. Without it the stream runs unbridged.
+    let clipboard_answer: Arc<Mutex<Option<Notice>>> = Arc::default();
+    let mut clipboard = match SessionClipboard::connect(session_path, &shutdown) {
+        Ok(session) => Some(SenderClipboard {
+            session,
+            outbox: Arc::clone(&clipboard_answer),
+            mailbox: Arc::clone(&mailbox),
+        }),
+        Err(error) => {
+            eprintln!("kwin-viewer: stream: no clipboard bridge: {error:#}");
+            None
+        }
+    };
+    let clipboard_text_bytes = clipboard.as_ref().map(|_| viewer_stream::CLIPBOARD_TEXT_BYTES as u64);
     let runtime = stream_runtime()?;
     let socket = runtime.block_on(remote::adopt_frames(socket)).map_err(anyhow::Error::msg)?;
     let (mut sink, mut stream) = StreamExt::split(socket);
@@ -2145,7 +2388,17 @@ fn stream_sender(
                 let record = match message {
                     Message::Binary(record) => record,
                     Message::Close(_) => break,
-                    Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                    // A clipboard request, handled before the next record is
+                    // read: the key that follows it finds the selection set.
+                    // The compositor's answers are waited for off this
+                    // worker, so pictures keep going out meanwhile.
+                    Message::Text(text) => {
+                        if let Some(clipboard) = clipboard.as_mut() {
+                            tokio::task::block_in_place(|| clipboard.receive(text.as_str()));
+                        }
+                        continue;
+                    }
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                 };
                 let Ok(Some(op)) = Op::decode(&mut &record[..]) else {
                     eprintln!("kwin-viewer: stream: invalid input record of {} bytes", record.len());
@@ -2180,6 +2433,7 @@ fn stream_sender(
             title: sent_title.clone(),
             budget_bits_per_second: budget.bits_per_second,
             link: budget.link.clone(),
+            clipboard_text_bytes,
         },
     )?;
     let mut sender = PictureSender::new(budget.bits_per_second, probe, shutdown.clone());
@@ -2213,6 +2467,19 @@ fn stream_sender(
             }
             sent_title = title;
         }
+        // The answer to the viewer's copy request goes out between two
+        // pictures, like them once its last byte has left: it is that
+        // viewer's own request, on that viewer's own socket.
+        let answer = clipboard_answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(answer) = answer {
+            let sent = serde_json::to_string(&answer)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| deliver(&runtime, &mut sink, &sender.probe, &shutdown, Message::text(text)));
+            if let Err(error) = sent {
+                eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
+                break Ok(());
+            }
+        }
         // Wait for the screen to change, unless the picture in hand has to go
         // out again: the viewer changed size, or a still DSC picture is due
         // as exact pixels.
@@ -2220,8 +2487,9 @@ fn stream_sender(
             let (slot, ready) = &*mailbox;
             let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let resized = latest.is_some() && viewer.size().is_some_and(|size| Some(size) != sent_size);
+            let answering = clipboard_answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
             let wait = sender.settle_due_in().map_or(STREAM_IDLE_POLL, |due| due.min(STREAM_IDLE_POLL));
-            if slot.is_none() && !resized && !wait.is_zero() && !shutdown.requested() {
+            if slot.is_none() && !resized && !answering && !wait.is_zero() && !shutdown.requested() {
                 slot = ready.wait_timeout(slot, wait).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
             slot.take()
@@ -2583,16 +2851,19 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         .map_err(|error| anyhow::anyhow!("frame socket to {authority}: {error}"))?;
     let (mut sink, mut stream) = StreamExt::split(socket);
     let hello = runtime.block_on(async { tokio::time::timeout(STREAM_HELLO_TIMEOUT, stream.next()).await });
-    let (virt, first_title) = match hello {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<Notice>(text.as_str())? {
-            Notice::Hello { width, height, title, budget_bits_per_second, link } => {
+    let (virt, first_title, sender_clipboard) = match hello {
+        Ok(Some(Ok(Message::Text(text)))) => match Notice::decode(text.as_str()) {
+            Ok(Notice::Hello { width, height, title, budget_bits_per_second, link, clipboard_text_bytes }) => {
                 eprintln!(
                     "kwin-viewer: stream: session {width}x{height} on {authority}; sender link {link}, budget {}",
                     budget_text(budget_bits_per_second)
                 );
-                ((width, height), title)
+                ((width, height), title, clipboard_text_bytes)
             }
-            Notice::Title { .. } => anyhow::bail!("{authority} did not begin the frame socket with hello"),
+            Ok(Notice::Title { .. } | Notice::Clipboard { .. } | Notice::Unknown) => {
+                anyhow::bail!("{authority} did not begin the frame socket with hello")
+            }
+            Err(reason) => anyhow::bail!("{authority} began the frame socket with an unreadable notice: {reason}"),
         },
         Ok(Some(Ok(_))) => anyhow::bail!("{authority} did not begin the frame socket with hello"),
         Ok(Some(Err(error))) => anyhow::bail!("frame socket to {authority}: {error}"),
@@ -2609,17 +2880,59 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     let stats = Arc::new(StreamStats::default());
 
     // Input records go out as they are queued, whatever the frame thread does.
-    let (ops, mut queued) = tokio::sync::mpsc::channel::<Op>(STREAM_INPUT_QUEUE);
+    let (ops, mut queued) = tokio::sync::mpsc::channel::<Outgoing>(STREAM_INPUT_QUEUE);
     let (closed, sink_closed) = tokio::sync::oneshot::channel::<()>();
     runtime.spawn(async move {
-        while let Some(op) = queued.recv().await {
-            if sink.send(Message::Binary(op.encode().to_vec().into())).await.is_err() {
+        while let Some(outgoing) = queued.recv().await {
+            let message = match outgoing {
+                Outgoing::Op(op) => Message::Binary(op.encode().to_vec().into()),
+                Outgoing::Request(request) => match serde_json::to_string(&request) {
+                    Ok(text) => Message::text(text),
+                    Err(_) => continue,
+                },
+            };
+            if sink.send(message).await.is_err() {
                 break;
             }
         }
         let _ = sink.close().await;
         let _ = closed.send(());
     });
+    let ops = OpSink::Socket(ops, shutdown.clone());
+    // The clipboard of this machine, where the window and its user are. A
+    // sender that does not bridge the clipboard gets no request, and the
+    // window works without the bridge when this machine's compositor gives
+    // no access to its clipboard.
+    let clipboard = match sender_clipboard {
+        None => {
+            eprintln!("kwin-viewer: stream: {authority} does not bridge the clipboard; copy and paste shortcuts stay in the session");
+            None
+        }
+        Some(limit) => match Connection::connect_to_env()
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| Clipboard::spawn(conn, "host", &shutdown))
+        {
+            Ok(host) => {
+                let limit = usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(viewer_stream::CLIPBOARD_TEXT_BYTES);
+                eprintln!(
+                    "kwin-viewer: stream: clipboard bridge: copy and paste shortcuts use this machine's clipboard; UTF-8 text of at most {limit} bytes, unencrypted on the frame socket"
+                );
+                Some(StreamClipboard {
+                    answer: Arc::new(CopyAnswer { host: Arc::new(host), pending: Mutex::new(None) }),
+                    out: ops.clone(),
+                    limit,
+                    copies: 0,
+                })
+            }
+            Err(error) => {
+                eprintln!("kwin-viewer: stream: no clipboard bridge: this machine's clipboard: {error:#}");
+                None
+            }
+        },
+    };
+    let copy_answer = clipboard.as_ref().map(|clipboard| Arc::clone(&clipboard.answer));
     // One thread takes messages off the socket as they arrive and keeps only
     // the newest picture; another decodes it. A viewer that decodes slower
     // than pictures arrive therefore skips to the newest instead of falling
@@ -2685,12 +2998,16 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                         }
                         arrived.notify_one();
                     }
-                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(text.as_str()) {
+                    Some(Ok(Message::Text(text))) => match Notice::decode(text.as_str()) {
                         Ok(Notice::Title { title: next }) => {
                             *title.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
                         }
-                        Ok(Notice::Hello { .. }) => {}
-                        Err(error) => eprintln!("kwin-viewer: stream: unreadable notice: {error}"),
+                        Ok(Notice::Clipboard { id, text }) => match &copy_answer {
+                            Some(answer) => answer.receive(id, text),
+                            None => eprintln!("kwin-viewer: stream: ignored a clipboard text this viewer did not ask for"),
+                        },
+                        Ok(Notice::Hello { .. } | Notice::Unknown) => {}
+                        Err(reason) => eprintln!("kwin-viewer: stream: unreadable notice: {reason}"),
                     },
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
                     Some(Ok(Message::Close(_))) | None => {
@@ -2714,12 +3031,12 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     }
 
     let mut input_state = InputState {
-        out: InputOut::Remote(OpSink::Socket(ops, shutdown.clone())),
+        out: InputOut::Remote(ops),
         last_pos: None,
         held_buttons: 0,
         active_touch: None,
         held_keys: HashSet::new(),
-        clipboard: None,
+        clipboard: clipboard.map(ViewerClipboard::Stream),
     };
     let result = window_loop(
         ViewerTitle::Remote(&title, authority),
@@ -2826,28 +3143,46 @@ impl Op {
 #[derive(Clone)]
 enum OpSink {
     Pipe(Arc<Mutex<std::process::ChildStdin>>),
-    Socket(tokio::sync::mpsc::Sender<Op>, Shutdown),
+    Socket(tokio::sync::mpsc::Sender<Outgoing>, Shutdown),
+}
+
+// What a stream viewer sends, in the order it was queued: an input record (a
+// binary message) or a clipboard request (a text message).
+enum Outgoing {
+    Op(Op),
+    Request(Request),
 }
 
 impl OpSink {
     fn send(&self, op: Op) {
-        use tokio::sync::mpsc::error::TrySendError;
         match self {
             OpSink::Pipe(pipe) => send_remote_op(pipe, op),
-            OpSink::Socket(queue, shutdown) => match queue.try_send(op) {
-                Ok(()) => {}
-                Err(TrySendError::Closed(_)) => eprintln!("kwin-viewer: frame socket closed"),
-                // A dropped record could leave a key held in the session, so
-                // the stream ends instead.
-                Err(TrySendError::Full(_)) => {
-                    if !shutdown.requested() {
-                        eprintln!(
-                            "kwin-viewer: stream: the session's host took none of {STREAM_INPUT_QUEUE} input records; closing"
-                        );
-                    }
-                    shutdown.request();
+            OpSink::Socket(..) => self.queue(Outgoing::Op(op)),
+        }
+    }
+
+    // Queued like an input record, so it reaches the session's host before
+    // the key record queued after it. The pipe of `--serve` carries none.
+    fn request(&self, request: Request) {
+        self.queue(Outgoing::Request(request));
+    }
+
+    fn queue(&self, outgoing: Outgoing) {
+        use tokio::sync::mpsc::error::TrySendError;
+        let OpSink::Socket(queue, shutdown) = self else { return };
+        match queue.try_send(outgoing) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => eprintln!("kwin-viewer: frame socket closed"),
+            // A dropped record could leave a key held in the session, so
+            // the stream ends instead.
+            Err(TrySendError::Full(_)) => {
+                if !shutdown.requested() {
+                    eprintln!(
+                        "kwin-viewer: stream: the session's host took none of {STREAM_INPUT_QUEUE} input records; closing"
+                    );
                 }
-            },
+                shutdown.request();
+            }
         }
     }
 }
@@ -2924,9 +3259,10 @@ struct InputState {
     // stuck inside the container, and every subsequent letter the user
     // types arrives shifted — looks exactly like "I cant type."
     held_keys: HashSet<u32>,
-    // Copy/paste handoff between the host and the session clipboards; a remote
-    // viewer has none yet.
-    clipboard: Option<ClipboardBridge>,
+    // Copy/paste handoff between the viewer user's clipboard and the
+    // session's. The `--remote` viewer has none, and neither has a stream
+    // viewer whose machine or whose sender cannot bridge.
+    clipboard: Option<ViewerClipboard>,
 }
 
 fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {

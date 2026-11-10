@@ -146,6 +146,23 @@ impl Drop for DispatchThread {
 // Clipboard contents as (MIME type, bytes) pairs in offer order. Empty means
 // no selection.
 pub const GENERATED_SECRET_MIME: &str = "application/x-kwin-mcp-generated-secret";
+// The MIME type text is offered as.
+pub const TEXT_MIME: &str = "text/plain;charset=utf-8";
+// Text MIME types a selection is read from, best first.
+const TEXT_MIMES: [&str; 5] = [TEXT_MIME, "UTF8_STRING", "text/plain", "TEXT", "STRING"];
+
+// `text` as clipboard contents. A generated secret also carries the marker,
+// whose value is its length in characters, so `read_text` withholds it.
+pub fn text_contents(text: &str, secret: bool) -> ClipContents {
+    let mut contents = vec![(TEXT_MIME.to_owned(), text.as_bytes().to_vec())];
+    if secret {
+        contents.push((
+            GENERATED_SECRET_MIME.to_owned(),
+            text.chars().count().to_string().into_bytes(),
+        ));
+    }
+    Arc::new(contents)
+}
 
 pub enum ClipboardText {
     Empty,
@@ -515,14 +532,9 @@ impl Clipboard {
             return Ok(Arc::default());
         };
         if text_only {
-            let preferred = [
-                GENERATED_SECRET_MIME,
-                "text/plain;charset=utf-8",
-                "UTF8_STRING",
-                "text/plain",
-                "TEXT",
-                "STRING",
-            ];
+            let preferred: Vec<&str> = std::iter::once(GENERATED_SECRET_MIME)
+                .chain(TEXT_MIMES)
+                .collect();
             mimes = preferred
                 .iter()
                 .find_map(|wanted| {
@@ -537,39 +549,91 @@ impl Clipboard {
         let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
         let mut contents = Vec::with_capacity(mimes.len());
         for mime in mimes {
-            let (mut reader, writer) = std::io::pipe()?;
-            offer.receive(mime.clone(), writer.as_fd());
-            self.dispatch.connection().flush()?;
-            drop(writer);
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 65536];
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                anyhow::ensure!(
-                    !remaining.is_zero(),
-                    "{} clipboard owner did not send {mime} within {CLIPBOARD_TIMEOUT:?}",
-                    self.label
-                );
-                let timeout = PollTimeout::try_from(remaining)
-                    .map_err(|error| anyhow::anyhow!("clipboard poll timeout: {error}"))?;
-                match nix::poll::poll(
-                    &mut [PollFd::new(reader.as_fd(), PollFlags::POLLIN)],
-                    timeout,
-                ) {
-                    Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
-                    Ok(_) => {}
-                    Err(error) => anyhow::bail!("poll {} clipboard pipe: {error}", self.label),
-                }
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
+            let bytes = self.receive(&offer, &mime, deadline, None)?;
             contents.push((mime, bytes));
         }
         Ok(Arc::new(contents))
+    }
+
+    // The bytes `offer` holds for `mime`. With `limit`, an owner that sends
+    // more than that many bytes is an error, and the rest is not read.
+    fn receive(
+        &self,
+        offer: &ExtDataControlOfferV1,
+        mime: &str,
+        deadline: Instant,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (mut reader, writer) = std::io::pipe()?;
+        offer.receive(mime.to_owned(), writer.as_fd());
+        self.dispatch.connection().flush()?;
+        drop(writer);
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 65536];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "{} clipboard owner did not send {mime} within {CLIPBOARD_TIMEOUT:?}",
+                self.label
+            );
+            let timeout = PollTimeout::try_from(remaining)
+                .map_err(|error| anyhow::anyhow!("clipboard poll timeout: {error}"))?;
+            match nix::poll::poll(
+                &mut [PollFd::new(reader.as_fd(), PollFlags::POLLIN)],
+                timeout,
+            ) {
+                Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+                Ok(_) => {}
+                Err(error) => anyhow::bail!("poll {} clipboard pipe: {error}", self.label),
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => bytes.extend_from_slice(chunk.get(..read).unwrap_or_default()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(limit) = limit {
+                anyhow::ensure!(
+                    bytes.len() <= limit,
+                    "{} clipboard text is longer than {limit} bytes",
+                    self.label
+                );
+            }
+        }
+        Ok(bytes)
+    }
+
+    // The selection as UTF-8 text of at most `limit` bytes, and whether it
+    // carries the generated-secret marker. None when it offers no text; an
+    // error when the text is longer or is not UTF-8. No error names the text.
+    pub fn read_utf8(&self, limit: usize) -> anyhow::Result<Option<(String, bool)>> {
+        self.sync()?;
+        let selection = self
+            .shared
+            .watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{} clipboard mutex poisoned", self.label))?
+            .selection
+            .clone();
+        let Some((offer, mimes)) = selection else {
+            return Ok(None);
+        };
+        // The name as the owner spells it.
+        let offered = |wanted: &str| {
+            let at = mimes
+                .iter()
+                .position(|mime| mime.eq_ignore_ascii_case(wanted))?;
+            mimes.get(at)
+        };
+        let Some(mime) = TEXT_MIMES.into_iter().filter_map(offered).next() else {
+            return Ok(None);
+        };
+        let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
+        let bytes = self.receive(&offer, mime, deadline, Some(limit))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("{} clipboard text is not UTF-8", self.label))?;
+        Ok(Some((text, offered(GENERATED_SECRET_MIME).is_some())))
     }
 
     // Make `contents` the selection, and return once the compositor applied it.
