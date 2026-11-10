@@ -96,7 +96,8 @@ intentionally has no PNG.
 
 ```bash
 cargo test --release --test remote_viewer_e2e -- --ignored --test-threads 1 \
-  a_remote_session a_reexecution raw_frames every_way a_window_the_compositor
+  a_remote_session a_reexecution raw_frames every_way a_window_the_compositor \
+  the_remote_viewer_bridges
 cargo test --release --test remote_viewer_e2e -- --ignored two_viewers --nocapture
 cargo test --release --test remote_viewer_e2e -- --ignored measure_the_stream --nocapture
 ```
@@ -175,6 +176,17 @@ running the old build.
   ends while it is minimized.
 - `the_local_viewer_keeps_showing_a_changing_session`: the local viewer, which
   shares the window code, shows different pictures over time.
+- `the_remote_viewer_bridges_the_callers_clipboard_and_gives_the_agent_its_selection_back`
+  (needs KWrite): the isolated desktop that receives the windows stands for the
+  caller's machine, so its clipboard is the caller's and the tester's own is
+  never touched. Ctrl+V and Shift+Insert in the window paste that clipboard
+  into a document in the remote session (read back from the file the session
+  saves), Ctrl+C and Ctrl+X put the session's selection on it, and the agent's
+  selection is back in the session after each. `clipboard_write target=host`
+  on the remote session writes the caller's clipboard, and a generated secret
+  reaches the session only through the viewer paste and is in no result and
+  no log. A second session with its own viewer sees none of it. With
+  `KWIN_MCP_TEST_EVIDENCE=DIR` it keeps screenshots of the window.
 
 Every test that streams also checks that the window presents: frames that
 arrive while `presented` stands still fail it.

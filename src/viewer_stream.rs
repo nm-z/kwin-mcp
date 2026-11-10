@@ -6,15 +6,37 @@
 //! screen. The sender speaks first.
 //!
 //! Sender to viewer:
-//! * text: one JSON [`Notice`] (`hello` once, then `title` on each change);
+//! * text: one JSON [`Notice`] (`hello` once, then `title` on each change,
+//!   and `clipboard` in answer to a copy request);
 //! * binary: a [`Header`] followed by its payload. `Raw` is `width * height`
 //!   pixels of 3 bytes (red, green, blue): the session's own values, exact.
 //!   `Dsc` is one VESA DSC picture for the picture parameter set last sent.
 //!   `Pps` is that 128-byte set, sent before the first DSC picture and again
 //!   whenever size or rate changes.
 //!
-//! Viewer to sender: binary 17-byte input records (the viewer's `Op`), which
-//! include the drawable size and the first-presentation notice.
+//! Viewer to sender:
+//! * binary: 17-byte input records (the viewer's `Op`), which include the
+//!   drawable size and the first-presentation notice;
+//! * text: one JSON [`Request`], sent only to a sender whose `hello` says it
+//!   bridges the clipboard.
+//!
+//! # Clipboard
+//!
+//! The session's clipboard belongs to the agent, and the clipboard of the
+//! viewer's machine to the viewer's user. A paste shortcut pressed in the
+//! window sends that machine's clipboard text ahead of the key
+//! ([`Request::ClipboardPaste`]); a copy or cut shortcut asks for the
+//! session's selection once the key changed it ([`Request::ClipboardCopy`],
+//! answered by [`Notice::Clipboard`]). The sender puts the agent's selection
+//! back after either. Only UTF-8 text crosses, at most
+//! [`CLIPBOARD_TEXT_BYTES`] per message, and a longer one is refused, not cut.
+//! The socket is not encrypted, so the text is readable on the network
+//! between the two machines. A frame socket belongs to one session (its
+//! ticket) and one viewer window, and these messages travel on no other
+//! socket, so a viewer bridges its own session only. A viewer takes a
+//! `clipboard` notice only as the answer to the last copy request it made.
+//! Text messages of a type a peer does not know are ignored, and an older
+//! sender ignores every text message, so either end may be older.
 //!
 //! A picture is sent only when the session's screen changed, scaled down to
 //! the viewer's drawable size (never up). One picture is on its way at a time:
@@ -126,6 +148,52 @@ pub enum StreamError {
     WorkerPanicked,
 }
 
+/// Longest clipboard text one message carries, in bytes of UTF-8. Both ends
+/// refuse a longer one: nothing is cut short.
+pub const CLIPBOARD_TEXT_BYTES: usize = 1 << 20;
+/// Longest text message that can hold such a text. JSON writes one byte of
+/// text as at most six (`\u0000`); the rest is the fields around it.
+pub const CLIPBOARD_MESSAGE_BYTES: usize = CLIPBOARD_TEXT_BYTES * 6 + 256;
+
+/// Clipboard text on the frame socket. It has no `Display`, and its `Debug`
+/// shows nothing of it, so it cannot be logged.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ClipText(String);
+
+impl ClipText {
+    /// None when `text` is longer than `limit` bytes or than
+    /// [`CLIPBOARD_TEXT_BYTES`].
+    pub fn new(text: String, limit: usize) -> Option<Self> {
+        (text.len() <= limit.min(CLIPBOARD_TEXT_BYTES)).then_some(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A message with a longer text does not parse.
+impl TryFrom<String> for ClipText {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::new(text, CLIPBOARD_TEXT_BYTES).ok_or("clipboard text is longer than the limit")
+    }
+}
+
+impl From<ClipText> for String {
+    fn from(text: ClipText) -> Self {
+        text.0
+    }
+}
+
+impl std::fmt::Debug for ClipText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClipText(withheld)")
+    }
+}
+
 /// A text message from the sender.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -139,10 +207,74 @@ pub enum Notice {
         /// Bits per second; absent when unlimited.
         budget_bits_per_second: Option<u64>,
         link: String,
+        /// The sender bridges the clipboard (it takes [`Request`]s), with
+        /// texts of at most this many bytes. Absent from a sender that does
+        /// not, which a viewer then sends no request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clipboard_text_bytes: Option<u64>,
     },
     Title {
         title: String,
     },
+    /// The answer to [`Request::ClipboardCopy`] `id`: the session's selection
+    /// after the copy or cut. No text: the selection has none within the
+    /// limit, and the viewer's clipboard stays as it is.
+    Clipboard {
+        id: u64,
+        #[serde(default)]
+        text: Option<ClipText>,
+    },
+    /// A type this build does not know. It is ignored.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A text message from the viewer: what its user's clipboard shortcut needs
+/// of the session's clipboard. It goes out before the shortcut's key record,
+/// and the sender handles the two in that order. A sender that does not
+/// bridge the clipboard ignores text messages.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// A paste shortcut follows. `text` is the clipboard of the viewer's
+    /// machine and becomes the session's selection for that paste; no text
+    /// empties the selection, so the paste never inserts the agent's.
+    /// `secret`: the text carries the generated-secret marker.
+    ClipboardPaste {
+        #[serde(default)]
+        text: Option<ClipText>,
+        #[serde(default)]
+        secret: bool,
+    },
+    /// A copy or cut shortcut follows. The sender answers with
+    /// [`Notice::Clipboard`] `id` once the session's selection changes, with
+    /// a text of at most `max_bytes` bytes.
+    ClipboardCopy { id: u64, max_bytes: u64 },
+    /// A type this build does not know. It is ignored.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Request {
+    /// The request in `message`; None when the message is too long to be one
+    /// or does not parse. The reason is not reported: it could quote the text.
+    pub fn decode(message: &str) -> Option<Self> {
+        (message.len() <= CLIPBOARD_MESSAGE_BYTES)
+            .then(|| serde_json::from_str(message).ok())
+            .flatten()
+    }
+}
+
+impl Notice {
+    /// The notice in `message`, or where it stops parsing. The parser's own
+    /// message is not reported: it could quote clipboard text.
+    pub fn decode(message: &str) -> Result<Self, String> {
+        if message.len() > CLIPBOARD_MESSAGE_BYTES {
+            return Err(format!("{} bytes is longer than any notice", message.len()));
+        }
+        serde_json::from_str(message)
+            .map_err(|error| format!("{:?} error at column {}", error.classify(), error.column()))
+    }
 }
 
 /// What follows a [`Header`].

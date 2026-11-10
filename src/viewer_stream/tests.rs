@@ -1,9 +1,9 @@
 use super::{
-    DSC_SOONER_PERCENT, ENCODE_REMEASURE_FRAMES, Estimate, HEADER_BYTES, Header, Interface,
-    LINK_SAMPLE_BYTES, LINK_USABLE_PERCENT, Mode, ModeControl, Notice, Payload, RAW_BPP_X16,
-    SETTLE_AFTER, SWITCH_AFTER_FRAMES, Scaler, Sent, Settle, StreamError, UNKNOWN_LINK_MBPS,
-    USABLE_FRAME_TIME, Workers, budget_of, fit_size, pace, pack_rgb, packed_len, unpack_rgb,
-    unsent_bytes,
+    CLIPBOARD_MESSAGE_BYTES, CLIPBOARD_TEXT_BYTES, ClipText, DSC_SOONER_PERCENT,
+    ENCODE_REMEASURE_FRAMES, Estimate, HEADER_BYTES, Header, Interface, LINK_SAMPLE_BYTES,
+    LINK_USABLE_PERCENT, Mode, ModeControl, Notice, Payload, RAW_BPP_X16, Request, SETTLE_AFTER,
+    SWITCH_AFTER_FRAMES, Scaler, Sent, Settle, StreamError, UNKNOWN_LINK_MBPS, USABLE_FRAME_TIME,
+    Workers, budget_of, fit_size, pace, pack_rgb, packed_len, unpack_rgb, unsent_bytes,
 };
 use crate::dsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,9 +71,13 @@ fn notices_are_tagged_json() -> Result<(), serde_json::Error> {
         title: "kwin-viewer s1".to_owned(),
         budget_bits_per_second: None,
         link: "lo, loopback, unlimited".to_owned(),
+        clipboard_text_bytes: None,
     };
     let text = serde_json::to_string(&hello)?;
     assert!(text.contains("\"type\":\"hello\""), "{text}");
+    // A sender without the clipboard bridge says nothing about it, as the
+    // builds before the bridge did.
+    assert!(!text.contains("clipboard"), "{text}");
     assert_eq!(serde_json::from_str::<Notice>(&text)?, hello);
     let title: Notice = serde_json::from_str("{\"type\":\"title\",\"title\":\"Enter the code\"}")?;
     assert_eq!(
@@ -81,6 +85,123 @@ fn notices_are_tagged_json() -> Result<(), serde_json::Error> {
         Notice::Title {
             title: "Enter the code".to_owned()
         }
+    );
+    Ok(())
+}
+
+#[test]
+fn clipboard_messages_are_tagged_json_that_other_builds_ignore() -> Result<(), serde_json::Error> {
+    let limit = u64::try_from(CLIPBOARD_TEXT_BYTES).unwrap_or(u64::MAX);
+    let hello = Notice::Hello {
+        width: 1280,
+        height: 720,
+        title: "kwin-viewer s2".to_owned(),
+        budget_bits_per_second: Some(900_000_000),
+        link: "eth0, 1000 Mb/s".to_owned(),
+        clipboard_text_bytes: Some(limit),
+    };
+    let text = serde_json::to_string(&hello)?;
+    assert!(text.contains("\"clipboard_text_bytes\":1048576"), "{text}");
+    assert_eq!(Notice::decode(&text), Ok(hello));
+
+    let pasted = ClipText::new(
+        "naïve — 日本語\n\ttab \"quoted\"".to_owned(),
+        CLIPBOARD_TEXT_BYTES,
+    );
+    let paste = Request::ClipboardPaste {
+        text: pasted.clone(),
+        secret: true,
+    };
+    let text = serde_json::to_string(&paste)?;
+    assert!(text.starts_with("{\"type\":\"clipboard_paste\""), "{text}");
+    assert_eq!(Request::decode(&text), Some(paste));
+    // No text empties the session's selection for the paste.
+    assert_eq!(
+        Request::decode("{\"type\":\"clipboard_paste\"}"),
+        Some(Request::ClipboardPaste {
+            text: None,
+            secret: false
+        })
+    );
+    let copy = Request::ClipboardCopy {
+        id: 7,
+        max_bytes: limit,
+    };
+    assert_eq!(Request::decode(&serde_json::to_string(&copy)?), Some(copy));
+    let answer = Notice::Clipboard {
+        id: 7,
+        text: pasted,
+    };
+    assert_eq!(Notice::decode(&serde_json::to_string(&answer)?), Ok(answer));
+
+    // A type from a newer build is ignored, not an error, in both directions.
+    assert_eq!(
+        Request::decode("{\"type\":\"clipboard_image\",\"png\":\"AAAA\"}"),
+        Some(Request::Unknown)
+    );
+    assert_eq!(
+        Notice::decode("{\"type\":\"num_lock\",\"enabled\":true}"),
+        Ok(Notice::Unknown)
+    );
+    // Anything else that does not parse is refused whole.
+    assert_eq!(Request::decode("{\"type\":\"clipboard_copy\"}"), None);
+    assert_eq!(Request::decode("not json"), None);
+    Ok(())
+}
+
+#[test]
+fn clipboard_text_is_bounded_and_never_shown() -> Result<(), serde_json::Error> {
+    let longest = "x".repeat(CLIPBOARD_TEXT_BYTES);
+    let too_long = format!("{longest}y");
+    assert!(ClipText::new(longest.clone(), CLIPBOARD_TEXT_BYTES).is_some());
+    assert!(ClipText::new(too_long.clone(), CLIPBOARD_TEXT_BYTES).is_none());
+    // A peer's own lower limit holds too.
+    assert!(ClipText::new("12345".to_owned(), 4).is_none());
+
+    // The longest text crosses; one byte more does not parse at the receiver.
+    let carried = |text: &str| {
+        Request::decode(&format!(
+            "{{\"type\":\"clipboard_paste\",\"text\":{}}}",
+            serde_json::to_string(text).unwrap_or_default()
+        ))
+    };
+    assert!(matches!(
+        carried(&longest),
+        Some(Request::ClipboardPaste { text: Some(text), .. }) if text.as_str() == longest
+    ));
+    assert_eq!(carried(&too_long), None);
+    let answer = format!(
+        "{{\"type\":\"clipboard\",\"id\":1,\"text\":{}}}",
+        serde_json::to_string(&too_long)?
+    );
+    assert!(Notice::decode(&answer).is_err());
+    // The longest text in JSON's longest spelling still fits one message.
+    let escaped = format!(
+        "{{\"type\":\"clipboard_paste\",\"text\":\"{}\"}}",
+        "\\u0001".repeat(CLIPBOARD_TEXT_BYTES)
+    );
+    assert!(escaped.len() <= CLIPBOARD_MESSAGE_BYTES);
+    assert!(Request::decode(&escaped).is_some());
+
+    // Neither the text nor a parser's complaint about it reaches a log.
+    let secret = "hunter2-do-not-log";
+    let text = ClipText::new(secret.to_owned(), CLIPBOARD_TEXT_BYTES);
+    let shown = format!(
+        "{:?} {:?}",
+        Request::ClipboardPaste {
+            text: text.clone(),
+            secret: true
+        },
+        Notice::Clipboard { id: 1, text }
+    );
+    assert!(!shown.contains(secret), "{shown}");
+    let wrong_type = format!("{{\"type\":\"clipboard\",\"id\":\"{secret}\"}}");
+    let refused = Notice::decode(&wrong_type);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|reason| !reason.contains(secret)),
+        "{refused:?}"
     );
     Ok(())
 }

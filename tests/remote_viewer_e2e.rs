@@ -80,12 +80,17 @@ impl Drop for Listener {
 
 impl Listener {
     fn start(home: &Path, options: &[&str]) -> Self {
+        Self::start_command(kwin_mcp(home), home, options)
+    }
+
+    /// A listener that runs `command`, a kwin-mcp of any build.
+    fn start_command(mut command: Command, home: &Path, options: &[&str]) -> Self {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|socket| socket.local_addr())
             .expect("reserve a port")
             .port();
         let address = format!("127.0.0.1:{port}");
-        let mut child = kwin_mcp(home)
+        let mut child = command
             .args(["--listen", &address, "--autoclean"])
             .args(options)
             .stdin(Stdio::null())
@@ -2043,6 +2048,472 @@ fn the_local_viewer_keeps_showing_a_changing_session() {
     desk.stop();
     drop(server);
     std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// The text a `clipboard_read` result holds; None for no text and for a
+/// generated secret, whose value the tool withholds.
+fn clipboard_text(read: &Value) -> Option<String> {
+    read["text"].as_str().map(str::to_owned)
+}
+
+/// The text a `clipboard_read` result holds after a whole saved KWrite
+/// document was copied: without the line end KWrite keeps at its end.
+fn copied_text(read: &Value) -> Option<String> {
+    clipboard_text(read).map(|text| text.trim_end_matches('\n').to_owned())
+}
+
+/// Agent input is refused for a second after input through a viewer.
+fn after_viewer_input() {
+    std::thread::sleep(Duration::from_millis(1200));
+}
+
+/// A session on `host` with an empty KWrite document and an open viewer.
+/// Returns the session, its work directory, the document and the viewer.
+fn session_with_document(server: &mut Server, host: &str) -> (String, PathBuf, PathBuf, Viewer) {
+    let (session, workdir) = server.start_session(json!({"host":host, "width":1280, "height":720}));
+    // The work directory is the same path inside the session.
+    let document = workdir.join("document.txt");
+    std::fs::write(&document, "").expect("create the document");
+    server.tool(
+        "launch_app",
+        json!({
+            "session_id":session,
+            "command":format!("kwrite {}", document.display()),
+            "window_timeout_seconds":40,
+        }),
+    );
+    let opened = server.tool("viewer_open", json!({"session_id":session}));
+    let viewer = Viewer::opened(&opened, "opened", host);
+    wait_for("the first frame", Duration::from_secs(10), || {
+        (viewer.frames() > 0).then_some(())
+    });
+    (session, workdir, document, viewer)
+}
+
+/// The agent saves the session's document until the file holds what
+/// `expected` accepts, and returns that text (without the line end KWrite
+/// adds). The file is the session's own account of what was typed into it.
+fn saved(
+    server: &mut Server,
+    session: &str,
+    document: &Path,
+    what: &str,
+    expected: impl Fn(&str) -> bool,
+) -> String {
+    after_viewer_input();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        server.tool(
+            "keyboard_key",
+            json!({"session_id":session, "key":"ctrl+s"}),
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        let text = std::fs::read_to_string(document).unwrap_or_default();
+        let text = text.trim_end_matches('\n');
+        if expected(text) {
+            return text.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the document holds {text:?}"
+        );
+    }
+}
+
+/// The agent replaces the session's document with `text`, selects it all and
+/// leaves `selection` as its own clipboard selection.
+fn document_selected(
+    server: &mut Server,
+    session: &str,
+    document: &Path,
+    text: &str,
+    selection: &str,
+) {
+    after_viewer_input();
+    server.tool(
+        "keyboard_key",
+        json!({"session_id":session, "key":"ctrl+a"}),
+    );
+    server.tool("keyboard_paste", json!({"session_id":session, "text":text}));
+    saved(server, session, document, "the agent's own text", |held| {
+        held == text
+    });
+    server.tool(
+        "clipboard_write",
+        json!({"session_id":session, "target":"session", "text":selection}),
+    );
+    server.tool(
+        "keyboard_key",
+        json!({"session_id":session, "key":"ctrl+a"}),
+    );
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, KWrite, Vulkan, and input devices"]
+fn the_remote_viewer_bridges_the_callers_clipboard_and_gives_the_agent_its_selection_back() {
+    const AGENT: &str = "the agent's own selection";
+    const OTHER_AGENT: &str = "the other session's agent selection";
+    const CALLER: &str = "from the caller's clipboard: naïve — 日本語 \"quoted\" ✓";
+    const COPIED: &str = "copied in the remote session: Grüße, 東京 ✓";
+    const CUT: &str = "cut in the remote session: åäö 456";
+    const PREPARED: &str = "prepared with target=host: ünïcode ✓";
+    const SECRET_LENGTH: usize = 24;
+
+    let home = home_with_secret("clipboard", "shared-secret-0123456789");
+    // The caller's desktop. The calling server opens its viewer windows in
+    // it, so its clipboard is the clipboard of the machine the viewer window
+    // is on, and the tester's own clipboard is never involved.
+    let mut desk = Desk::start(&home, 1600, 1000);
+    let listener = Listener::start(&home, &[]);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home, "server", Some(&desk.display()), None);
+    let callers_clipboard = |desk: &mut Desk| desk.tool("clipboard_read", json!({}));
+    let sessions_clipboard = |server: &mut Server, session: &str| {
+        clipboard_text(&server.tool("clipboard_read", json!({"session_id":session})))
+    };
+    let agents_selection_returns = |server: &mut Server, session: &str, after: &str| {
+        wait_for(
+            &format!("the agent's selection to return after the {after}"),
+            Duration::from_secs(10),
+            || (sessions_clipboard(server, session).as_deref() == Some(AGENT)).then_some(()),
+        );
+    };
+
+    // Two sessions on the listener, each with a document, a viewer and a
+    // selection of its agent's.
+    let (session, workdir, document, viewer) = session_with_document(&mut server, &host);
+    let (other, other_workdir, other_document, other_viewer) =
+        session_with_document(&mut server, &host);
+    for (id, selection) in [(&session, AGENT), (&other, OTHER_AGENT)] {
+        server.tool(
+            "clipboard_write",
+            json!({"session_id":id, "target":"session", "text":selection}),
+        );
+    }
+    desk.activate(&session);
+
+    // Paste: Ctrl+V in the window pastes the caller's clipboard into the
+    // remote session, not the agent's selection, which then returns.
+    desk.tool(
+        "clipboard_write",
+        json!({"target":"session", "text":CALLER}),
+    );
+    desk.tool("keyboard_key", json!({"key":"ctrl+v"}));
+    saved(
+        &mut server,
+        &session,
+        &document,
+        "the caller's clipboard pasted through the viewer",
+        |text| text == CALLER,
+    );
+    agents_selection_returns(&mut server, &session, "paste");
+    assert_eq!(
+        clipboard_text(&callers_clipboard(&mut desk)).as_deref(),
+        Some(CALLER)
+    );
+    // With `KWIN_MCP_TEST_EVIDENCE`: the viewer window on the caller's
+    // desktop, showing the remote document with the pasted text.
+    keep_evidence(
+        &desk.tool("screenshot", json!({"include_cursor":false})),
+        "clipboard-pasted-through-the-viewer.png",
+    );
+
+    // Copy: Ctrl+C in the window puts the remote session's selection on the
+    // caller's clipboard, and the agent's selection returns.
+    document_selected(&mut server, &session, &document, COPIED, AGENT);
+    desk.tool("keyboard_key", json!({"key":"ctrl+c"}));
+    wait_for(
+        "the session's selection on the caller's clipboard",
+        Duration::from_secs(15),
+        || (copied_text(&callers_clipboard(&mut desk)).as_deref() == Some(COPIED)).then_some(()),
+    );
+    agents_selection_returns(&mut server, &session, "copy");
+
+    // Cut: Ctrl+X does the same and empties the document.
+    document_selected(&mut server, &session, &document, CUT, AGENT);
+    desk.tool("keyboard_key", json!({"key":"ctrl+x"}));
+    wait_for(
+        "the cut text on the caller's clipboard",
+        Duration::from_secs(15),
+        || (copied_text(&callers_clipboard(&mut desk)).as_deref() == Some(CUT)).then_some(()),
+    );
+    agents_selection_returns(&mut server, &session, "cut");
+    saved(
+        &mut server,
+        &session,
+        &document,
+        "the document after the cut",
+        str::is_empty,
+    );
+
+    // Shift+Insert pastes the caller's clipboard too: the text just cut.
+    desk.tool("keyboard_key", json!({"key":"shift+Insert"}));
+    saved(
+        &mut server,
+        &session,
+        &document,
+        "the caller's clipboard pasted with Shift+Insert",
+        |text| text == CUT,
+    );
+    agents_selection_returns(&mut server, &session, "Shift+Insert paste");
+
+    // clipboard_write target=host on the remote session writes the caller's
+    // clipboard, where the user is, and a viewer paste carries it over.
+    let prepared = server.tool(
+        "clipboard_write",
+        json!({"session_id":session, "target":"host", "text":PREPARED}),
+    );
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    assert_eq!(prepared["session_host"], host, "{prepared}");
+    assert_eq!(
+        clipboard_text(&callers_clipboard(&mut desk)).as_deref(),
+        Some(PREPARED)
+    );
+    // target=session and clipboard_read still mean the remote session's.
+    assert_eq!(
+        sessions_clipboard(&mut server, &session).as_deref(),
+        Some(AGENT)
+    );
+    document_selected(&mut server, &session, &document, "to be replaced", AGENT);
+    desk.tool("keyboard_key", json!({"key":"ctrl+v"}));
+    saved(
+        &mut server,
+        &session,
+        &document,
+        "the text prepared with target=host pasted through the viewer",
+        |text| text == PREPARED,
+    );
+    agents_selection_returns(&mut server, &session, "paste of the prepared text");
+    keep_evidence(
+        &desk.tool("screenshot", json!({"include_cursor":false})),
+        "clipboard-target-host-pasted-through-the-viewer.png",
+    );
+
+    // A generated secret is made by the calling server and written to the
+    // caller's clipboard with its marker: no result and no reading tool has
+    // its value.
+    let generated = server.tool(
+        "clipboard_write",
+        json!({
+            "session_id":session, "target":"host",
+            "generate_secret":{
+                "length":SECRET_LENGTH,
+                "character_classes":["lowercase", "uppercase", "digits"],
+            },
+        }),
+    );
+    let withheld = callers_clipboard(&mut desk);
+    assert_eq!(withheld["protected"], true, "{withheld}");
+    assert_eq!(withheld["length"], SECRET_LENGTH, "{withheld}");
+    assert!(withheld["text"].is_null(), "{withheld}");
+    // The user pastes it where it is needed, which is the only time it
+    // crosses to the session's machine.
+    document_selected(&mut server, &session, &document, "to be replaced", AGENT);
+    desk.tool("keyboard_key", json!({"key":"ctrl+v"}));
+    let secret = saved(
+        &mut server,
+        &session,
+        &document,
+        "the generated secret pasted through the viewer",
+        |text| {
+            text.chars().count() == SECRET_LENGTH
+                && text
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        },
+    );
+    agents_selection_returns(&mut server, &session, "paste of the secret");
+    assert!(!generated.to_string().contains(&secret), "{generated}");
+
+    // The other session saw none of it: its document is empty, its agent's
+    // selection is its own, and neither end of its viewer handled a shortcut.
+    server.tool("keyboard_key", json!({"session_id":other, "key":"ctrl+s"}));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::read_to_string(&other_document).unwrap_or_default(),
+        ""
+    );
+    assert_eq!(
+        sessions_clipboard(&mut server, &other).as_deref(),
+        Some(OTHER_AGENT)
+    );
+    let sender_log =
+        |workdir: &Path| std::fs::read_to_string(workdir.join("viewer.log")).expect("sender log");
+    let other_logs = [other_viewer.log_text(), sender_log(&other_workdir)];
+    for log in &other_logs {
+        let handled: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("shortcut:"))
+            .collect();
+        assert_eq!(handled, [""; 0], "the other session's viewer bridged");
+    }
+    // This session's sender handled every one of them.
+    let logs = [viewer.log_text(), sender_log(&workdir)];
+    assert_eq!(
+        logs[1]
+            .matches("paste shortcut: the session pastes")
+            .count(),
+        4,
+        "{}",
+        logs[1]
+    );
+    assert_eq!(
+        logs[1]
+            .matches("copy shortcut: took the session selection")
+            .count(),
+        2,
+        "{}",
+        logs[1]
+    );
+    assert_eq!(
+        logs[0]
+            .matches("copy shortcut: put the session's selection")
+            .count(),
+        2,
+        "{}",
+        logs[0]
+    );
+
+    // Neither end of the stream logged a text that crossed, and the streams
+    // had no failure.
+    for log in &logs {
+        assert!(stream_errors(log).is_empty(), "{log}");
+        for text in [secret.as_str(), CALLER, COPIED, CUT, PREPARED] {
+            assert!(!log.contains(text), "a stream log holds clipboard text");
+        }
+    }
+    // No server's log holds the secret either: the calling server's, the
+    // listener's, the caller's desktop's.
+    let server_logs: Vec<PathBuf> = std::fs::read_dir(&home)
+        .expect("read the test HOME")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+        .collect();
+    assert!(server_logs.len() >= 3, "{server_logs:?}");
+    for path in &server_logs {
+        let log = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !log.contains(&secret),
+            "{} holds the secret",
+            path.display()
+        );
+    }
+
+    for id in [&session, &other] {
+        let closed = server.tool("viewer_close", json!({"session_id":id}));
+        assert_eq!(closed["status"], "closed", "{closed}");
+        server.tool("session_stop", json!({"session_id":id}));
+    }
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+    desk.stop();
+    drop(server);
+    drop(listener);
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+#[test]
+#[ignore = "needs KWIN_MCP_TEST_OLD_BINARY, a kwin-mcp built before the clipboard bridge; requires KDE, KWin, bubblewrap, pasta, KWrite, Vulkan, and input devices"]
+fn a_peer_built_before_the_clipboard_bridge_streams_and_takes_keys_as_before() {
+    const AGENT: &str = "the agent's own selection";
+    const CALLER: &str = "the caller's clipboard";
+    const PREPARED: &str = "prepared with target=host";
+    let old = PathBuf::from(
+        std::env::var_os("KWIN_MCP_TEST_OLD_BINARY")
+            .expect("KWIN_MCP_TEST_OLD_BINARY names a kwin-mcp built before the clipboard bridge"),
+    );
+    let new = server_binary();
+    for (label, listener_binary, caller_binary, caller_bridges) in [
+        ("old-listener", &old, &new, true),
+        ("old-caller", &new, &old, false),
+    ] {
+        let home = home_with_secret(label, "shared-secret-0123456789");
+        let mut desk = Desk::start(&home, 1600, 1000);
+        // The isolated desktop is every server's host desktop here, the
+        // listener's too, so no build can reach the tester's own clipboard.
+        let mut listening = kwin_mcp_at(listener_binary, &home);
+        listening.env("WAYLAND_DISPLAY", desk.display());
+        let listener = Listener::start_command(listening, &home, &[]);
+        let host = listener.address.clone();
+        let mut server = Server::start_command(
+            kwin_mcp_at(caller_binary, &home),
+            &home,
+            "server",
+            Some(&desk.display()),
+            None,
+        );
+        let (session, workdir, document, viewer) = session_with_document(&mut server, &host);
+        server.tool(
+            "clipboard_write",
+            json!({"session_id":session, "target":"session", "text":AGENT}),
+        );
+        desk.tool(
+            "clipboard_write",
+            json!({"target":"session", "text":CALLER}),
+        );
+        desk.activate(&session);
+
+        // One end has no bridge, so the shortcut is a key like any other, as
+        // it was before the bridge: the session pastes its own selection, and
+        // the caller's clipboard stays where it is.
+        desk.tool("keyboard_key", json!({"key":"ctrl+v"}));
+        saved(
+            &mut server,
+            &session,
+            &document,
+            "the session's own selection pasted",
+            |text| text == AGENT,
+        );
+        let callers_clipboard =
+            |desk: &mut Desk| clipboard_text(&desk.tool("clipboard_read", json!({})));
+        assert_eq!(callers_clipboard(&mut desk).as_deref(), Some(CALLER));
+
+        let written = server.request(
+            "tools/call",
+            json!({
+                "name":"clipboard_write",
+                "arguments":{"session_id":session, "target":"host", "text":PREPARED},
+            }),
+        );
+        if caller_bridges {
+            // This build's caller writes its own desktop's clipboard, whatever
+            // the listener's build.
+            assert!(written["error"].is_null(), "{written}");
+            assert_eq!(callers_clipboard(&mut desk).as_deref(), Some(PREPARED));
+        } else {
+            // The old caller forwards the call. This build's listener does
+            // not write a clipboard on the session's machine.
+            assert_eq!(
+                written["error"]["data"]["reason"], "host_clipboard_is_the_callers",
+                "{written}"
+            );
+            assert_eq!(callers_clipboard(&mut desk).as_deref(), Some(CALLER));
+        }
+
+        let logs = [
+            viewer.log_text(),
+            std::fs::read_to_string(workdir.join("viewer.log")).expect("sender log"),
+        ];
+        for log in &logs {
+            assert!(stream_errors(log).is_empty(), "{log}");
+            assert!(!log.contains("shortcut:"), "{log}");
+        }
+        assert_eq!(
+            logs[0].contains("does not bridge the clipboard"),
+            caller_bridges,
+            "{}",
+            logs[0]
+        );
+
+        let closed = server.tool("viewer_close", json!({"session_id":session}));
+        assert_eq!(closed["status"], "closed", "{closed}");
+        server.tool("session_stop", json!({"session_id":session}));
+        assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+        desk.stop();
+        drop(server);
+        drop(listener);
+        std::fs::remove_dir_all(home).expect("remove the test HOME");
+    }
 }
 
 /// A PNG's decoded bytes, whatever its pixel layout.
