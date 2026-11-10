@@ -22,6 +22,9 @@ reis = "0.6"
 png = "0.17"
 chromiumoxide = "0.9"
 futures = "0.3"
+# The WebSocket library chromiumoxide already brings in; --listen and
+# session_start host carry MCP messages over it.
+async-tungstenite = { version = "0.32", features = ["tokio-runtime", "futures-03-sink"] }
 serde-aux = "4.5"
 thiserror = "2"
 evdev = "0.13"

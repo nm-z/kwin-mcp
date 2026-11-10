@@ -133,6 +133,26 @@ Pass `--ttl MINUTES` to tear down an idle session and its viewer after that many
 Each `session_start` attempt records its outcome, duration, server PID, commit, and failure reason in `$XDG_RUNTIME_DIR/kwin-mcp/session-starts.log` when `XDG_RUNTIME_DIR` is set. Run `kwin-mcp --stats [SECONDS]` to print successes and attempts in the requested window (3600 seconds by default), followed by the five most common failure reasons.
 To run the MCP server on another host, set the client's stdio command to `ssh -T HOST /path/to/kwin-mcp`. SSH carries MCP requests and screenshots while the isolated desktop runs on `HOST`. The remote host needs the same KWin, pasta, and device dependencies as a local session.
 
+### Sessions on another machine (`--listen` and `session_start` `host`)
+
+One server can also place individual sessions on other machines over the LAN, without SSH. Each machine that should host sessions runs one WebSocket listener:
+
+```bash
+install -d -m 700 ~/.config/kwin-mcp
+(umask 077; head -c 32 /dev/urandom | base64 > ~/.config/kwin-mcp/remote-secret)
+kwin-mcp --listen 192.168.1.20 --autoclean --ttl 120
+```
+
+`--listen ADDRESS[:PORT]` takes the IP address to bind (default port 47913) and serves kwin-mcp peers instead of an MCP client on stdio; the other options (`--ttl`, `--autoclean`, `--width`, memory limits) apply to the sessions it starts. `--keep-sessions` is rejected with it.
+
+Then pass `host` to `session_start` on the local server: a hostname or IP address with an optional `:port`, for example `{"host": "sentry"}` or `{"host": "192.168.1.20:47913"}`. The local server connects to that listener (one connection per host, reused by later starts), and the listener starts the desktop as its own child process exactly as a local `session_start` does. The returned `session_id` is the listener's; every later call with it is routed over the socket and its result returned unchanged. `session_list` gives each session a `host`: this machine's hostname for local sessions, the `name:port` passed to `session_start` for remote ones.
+
+**Shared secret.** Both sides read `${XDG_CONFIG_HOME:-~/.config}/kwin-mcp/remote-secret`: one line of printable ASCII, in a regular file owned by the user with mode 0600. Copy the same file to every machine. The listener refuses to start when the file is missing, empty, or readable by group or others; it accepts only peers whose WebSocket handshake presents the secret (`Authorization: Bearer`, compared in constant time) and answers others with 401. The secret is never logged. The connection is plain `ws://`, so the secret and all session traffic cross the network unencrypted: bind a LAN address and do not expose the port beyond a trusted network.
+
+**Lifetime.** The listener keeps no session alive by itself. A session it starts belongs to the connection that asked for it: `session_stop` and `--ttl` end it as they do locally, and when that WebSocket drops — the local server's MCP client closed, the local server exited or was killed, or the machine vanished (TCP keepalive notices within about 25 seconds) — the listener stops every session that connection started, as a stdio server does when its client exits. The local server closes its remote connections when its own client closes, even with `--keep-sessions`, and an in-place reload of the local server also drops them. After a drop, calls with the old ID report `remote_connection_lost`, `session_list` shows `connection_lost`, and `session_stop` clears the handle. A peer reaches only the sessions its own connection started; `session_attach` and forwarding to other processes are unavailable over the socket.
+
+**Paths.** A remote session's files are on the remote machine: `host_shared_dir`, screenshot `path`s, `export_file` destinations and `import_file` sources all name that machine's filesystem. Use `screenshot` with `inline=true` to receive the image itself. `viewer_open` on a remote session returns "not yet supported for remote sessions (#915)"; `screenshot` works.
+
 ## Strict host-GUI isolation
 
 Normal Codex shell commands inherit the host desktop's Wayland, X11, and session-bus environment, so an accidental command can open or control a real host window. Launch Codex through `kwin-mcp-strict` to remove those channels from Codex and its shell tools while forwarding the original values only to the configured `kwin-mcp` stdio server:
