@@ -1717,6 +1717,7 @@ name = "kwin-mcp"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-tungstenite",
  "atspi",
  "base64",
  "chromiumoxide",

@@ -301,6 +301,7 @@ mod fuse_bridge {
 }
 mod host_environment;
 mod input_bridge;
+mod remote;
 mod session_registry;
 mod kwin_script {
     use std::collections::HashMap;
@@ -6505,6 +6506,9 @@ struct DisplayConfig {
     /// kwin-mcp processes until they have been idle this long; None shuts them
     /// down with the client.
     keep_sessions: Option<Duration>,
+    /// Serve other machines' kwin-mcp servers over WebSocket at this address
+    /// instead of an MCP client on stdio.
+    listen: Option<std::net::SocketAddr>,
     /// cgroup MemoryHigh for each session's sandbox in bytes; None disables throttling.
     memory_high: Option<u64>,
     memory_max: u64,
@@ -12315,6 +12319,10 @@ struct SessionStartParams {
     /// ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp before startup. Default 2048. A lower
     /// value starts on a fuller disk, but session HOME writes fail once it fills.
     disk_min_free_mib: Option<u64>,
+    /// Machine to run the session on: the hostname or IP address, with an
+    /// optional :port, of a kwin-mcp started there with --listen. Omit for this
+    /// machine. Paths in results and arguments then name that machine's files.
+    host: Option<String>,
 }
 
 impl SessionStartParams {
@@ -12996,13 +13004,20 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. Optional host (name or IP, optional :port) starts the desktop on that machine's kwin-mcp --listen instead; calls with its ID route there, and paths are that machine's. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        // The router sends a start that names a host to that host's listener.
+        if let Some(host) = &params.host {
+            return Err(McpError::invalid_params(
+                format!("host '{host}' was not routed; this desktop starts on the local machine only"),
+                None,
+            ));
+        }
         self.touch_activity().await;
         // The hard limit covers the gate wait too, so a start queued behind a
         // blocked lifecycle operation still answers within it.
@@ -18044,7 +18059,7 @@ impl KwinMcp {
     }
 }
 
-const CLI_USAGE: &str = "Usage: kwin-mcp [OPTIONS]\n       kwin-mcp --describe [OPTIONS]\n       kwin-mcp --stats [SECONDS]";
+const CLI_USAGE: &str = "Usage: kwin-mcp [OPTIONS]\n       kwin-mcp --listen ADDRESS[:PORT] [OPTIONS]\n       kwin-mcp --describe [OPTIONS]\n       kwin-mcp --stats [SECONDS]";
 
 fn print_cli_help() {
     println!(
@@ -18062,12 +18077,17 @@ Options:\n\
   --ttl MINUTES          Expire the session after MINUTES; implies --autoclean\n\
   --keep-sessions MINUTES  After the MCP client closes, keep running sessions for other\n\
                          kwin-mcp processes to forward to until MINUTES idle (default: stop them)\n\
+  --listen ADDRESS[:PORT]  Serve other machines' kwin-mcp servers over WebSocket instead of\n\
+                         stdio (default port: {}); peers must present the shared secret in\n\
+                         ~/.config/kwin-mcp/remote-secret (mode 0600). A peer's sessions\n\
+                         stop when its connection drops\n\
   --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
   --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
   --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
   --stats [SECONDS]      Print recent session_start statistics (default: {DEFAULT_STATS_SECONDS}s)\n\n\
 With no mode flag, serve MCP requests on stdin/stdout. Display dimensions must\n\
 be {MIN_SCREEN_DIM}..={MAX_SCREEN_DIM}; --memory-high must not exceed --memory-max.",
+        remote::DEFAULT_PORT,
         DEFAULT_MEMORY_HIGH / GIB_BYTES,
         DEFAULT_MEMORY_MAX / GIB_BYTES,
         DEFAULT_MEMORY_SWAP_MAX / GIB_BYTES,
@@ -18091,6 +18111,7 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
         autoclean: false,
         ttl: None,
         keep_sessions: None,
+        listen: None,
         memory_high: Some(DEFAULT_MEMORY_HIGH),
         memory_max: DEFAULT_MEMORY_MAX,
         memory_swap_max: DEFAULT_MEMORY_SWAP_MAX,
@@ -18106,6 +18127,12 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
             "--ttl" => cfg.ttl = Some(parse_ttl_arg(&mut args)?),
             "--keep-sessions" => {
                 cfg.keep_sessions = Some(parse_minutes_arg(&mut args, "--keep-sessions")?)
+            }
+            "--listen" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--listen requires ADDRESS[:PORT]".to_owned())?;
+                cfg.listen = Some(remote::parse_listen(&value)?);
             }
             "--memory-high" => {
                 cfg.memory_high = match parse_memory_arg(&mut args, "--memory-high")? {
@@ -18123,6 +18150,12 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
                 ));
             }
         }
+    }
+    if cfg.listen.is_some() && cfg.keep_sessions.is_some() {
+        return Err(
+            "--listen cannot be combined with --keep-sessions: a listener's sessions end with the peer that started them"
+                .to_owned(),
+        );
     }
     if cfg.memory_max == 0 {
         return Err("--memory-max must be positive".to_owned());
@@ -18681,6 +18714,7 @@ const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other age
 const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, expired, or start_blocked to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
 const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const LISTEN_ACCEPT_RETRY: Duration = Duration::from_millis(200);
 const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn session_owner_pid(id: &str) -> Option<u32> {
@@ -19350,6 +19384,111 @@ struct SessionRouter {
     limit: tower::limit::GlobalConcurrencyLimitLayer,
     /// The host's Chrome profiles, read once when the server starts.
     chrome_profiles: Arc<Vec<String>>,
+    /// Sessions this server started on other machines' listeners.
+    remote: Arc<RemoteSessions>,
+    /// This router serves one peer of a `--listen` server. Such a peer reaches
+    /// only the sessions it started: no attach, and no forwarding to another
+    /// process or machine.
+    listener_peer: bool,
+}
+
+type RemoteHost = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>;
+
+/// Sessions on other machines. A listener stops a peer's sessions when the
+/// peer's connection ends, so each host's connection lives as long as this
+/// server's client does and is closed with it.
+#[derive(Default)]
+struct RemoteSessions {
+    /// One connection per listener, keyed by `name:port`.
+    hosts: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteHost>>,
+    /// session_id → the listener that owns it.
+    sessions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+}
+
+fn remote_error(reason: &'static str, host: &str, message: String) -> McpError {
+    McpError::internal_error(
+        message,
+        Some(serde_json::json!({"reason": reason, "host": host, "retry_safe": false})),
+    )
+}
+
+impl RemoteSessions {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, String>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn host_of(&self, id: &str) -> Option<String> {
+        self.sessions().get(id).cloned()
+    }
+    /// The open connection to `host`, if there is one.
+    async fn connected(&self, host: &str) -> Option<rmcp::Peer<rmcp::RoleClient>> {
+        self.hosts
+            .lock()
+            .await
+            .get(host)
+            .filter(|service| !service.is_closed())
+            .map(|service| service.peer().clone())
+    }
+    /// The connection to `host`, opened now unless one is open. The listener
+    /// sees `client`, so it shapes results for the client that reads them.
+    async fn connect(
+        &self,
+        host: &str,
+        client: Option<rmcp::model::ClientInfo>,
+    ) -> Result<rmcp::Peer<rmcp::RoleClient>, McpError> {
+        let mut hosts = self.hosts.lock().await;
+        if let Some(service) = hosts.get(host).filter(|service| !service.is_closed()) {
+            return Ok(service.peer().clone());
+        }
+        let unreachable = |error: String| {
+            remote_error(
+                "remote_host_unreachable",
+                host,
+                format!("kwin-mcp listener {host} could not be reached: {error}. No session was started."),
+            )
+        };
+        let secret = remote::read_secret().map_err(unreachable)?;
+        let transport = remote::connect(host, &secret).await.map_err(unreachable)?;
+        let service = rmcp::service::serve_client(client.unwrap_or_default(), transport)
+            .await
+            .map_err(|error| unreachable(format!("MCP handshake failed: {error}")))?;
+        let peer = service.peer().clone();
+        hosts.insert(host.to_owned(), service);
+        Ok(peer)
+    }
+    /// Ends every connection, which makes each listener stop this server's sessions.
+    async fn close(&self) {
+        let hosts = std::mem::take(&mut *self.hosts.lock().await);
+        for (host, service) in hosts {
+            eprintln!("remote: closing the connection to {host}; its sessions stop with it");
+            let _ = tokio::time::timeout(SESSION_CONTROL_CLOSE_TIMEOUT, service.cancel()).await;
+        }
+    }
+}
+
+async fn remote_call(
+    peer: &rmcp::Peer<rmcp::RoleClient>,
+    host: &str,
+    request: rmcp::model::CallToolRequestParams,
+) -> Result<CallToolResult, McpError> {
+    match peer.call_tool(request).await {
+        Ok(result) => Ok(result),
+        Err(rmcp::service::ServiceError::McpError(error)) => Err(error),
+        Err(error) => Err(remote_error(
+            "remote_connection_failed",
+            host,
+            format!(
+                "the connection to kwin-mcp listener {host} failed while handling the request ({error}); the listener stops this server's sessions when the connection drops"
+            ),
+        )),
+    }
+}
+
+fn local_host_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// `"DIR" ("Name", last used Nov 9, 2026, 2:52 PM)` for each profile in Chrome's
@@ -19442,6 +19581,8 @@ impl SessionRouter {
     fn new(display: DisplayConfig) -> Self {
         Self {
             chrome_profiles: Arc::new(host_chrome_profiles()),
+            remote: Arc::default(),
+            listener_peer: false,
             attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
@@ -19453,6 +19594,170 @@ impl SessionRouter {
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             ),
         }
+    }
+    /// A router for one peer of a `--listen` server: it holds only that peer's
+    /// sessions, and takes session numbers from the shared counter so IDs stay
+    /// unique in the process.
+    fn for_listener_peer(&self) -> Self {
+        Self {
+            attached: Arc::default(),
+            remote_input_orders: Arc::default(),
+            clipboards: Arc::default(),
+            sessions: Arc::default(),
+            remote: Arc::default(),
+            listener_peer: true,
+            ..self.clone()
+        }
+    }
+    /// session_start with `host`: starts the desktop on that machine's listener
+    /// and remembers which host owns the returned ID.
+    async fn start_remote(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        host: &str,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.listener_peer {
+            return Err(McpError::invalid_params(
+                "session_start host is not accepted over a remote connection; this listener starts desktops on its own machine only",
+                None,
+            ));
+        }
+        let host = remote::authority(host).map_err(|error| McpError::invalid_params(error, None))?;
+        if let Some(arguments) = request.arguments.as_mut() {
+            arguments.remove("host");
+        }
+        let listener = self.remote.connect(&host, peer.peer_info().cloned()).await?;
+        let result = remote_call(&listener, &host, request).await;
+        // A failed start can leave a handle too; its error names the ID.
+        let id = match &result {
+            Ok(started) => started.structured_content.as_ref(),
+            Err(error) => error.data.as_ref(),
+        }
+        .and_then(|data| data["session_id"].as_str())
+        .map(str::to_owned);
+        let Some(id) = id else {
+            return result;
+        };
+        let taken = self.entries()?.contains_key(&id)
+            || self.remote.host_of(&id).is_some_and(|owner| owner != host);
+        if taken {
+            let stop = serde_json::from_value(serde_json::json!({
+                "name": "session_stop", "arguments": {"session_id": id},
+            }))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let _ = remote_call(&listener, &host, stop).await;
+            return Err(remote_error(
+                "remote_session_id_collision",
+                &host,
+                format!(
+                    "{host} returned session_id {id}, which this server already uses for another session; the new remote session was stopped. Call session_start again."
+                ),
+            ));
+        }
+        self.remote.sessions().insert(id, host);
+        result
+    }
+    /// A call for a session on another machine, answered by its listener.
+    async fn call_remote(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        id: &str,
+        host: &str,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if request.name == "viewer_open" {
+            let mut result = structured_result(
+                peer,
+                format!(
+                    "viewer_open is not yet supported for remote sessions (#915); session {id} runs on {host}. Use screenshot to observe it."
+                ),
+                serde_json::json!({
+                    "status": "unsupported", "reason": "remote_viewer_unsupported",
+                    "session_id": id, "host": host,
+                }),
+            )
+            .await;
+            result.is_error = Some(true);
+            return Ok(result);
+        }
+        let stop = request.name == "session_stop";
+        let Some(listener) = self.remote.connected(host).await else {
+            // The listener stopped the session when the connection ended.
+            if stop {
+                self.remote.sessions().remove(id);
+                return Ok(structured_result(
+                    peer,
+                    format!(
+                        "session {id} already ended: the connection to {host} dropped, and its listener stops a peer's sessions when that happens"
+                    ),
+                    serde_json::json!({
+                        "status": "already_cleared", "session_status": "connection_lost", "host": host,
+                    }),
+                )
+                .await);
+            }
+            return Err(remote_error(
+                "remote_connection_lost",
+                host,
+                format!(
+                    "session {id} ran on {host}, and the connection to its listener dropped, which stops the session there. Call session_stop to clear the handle, then session_start with host again and relaunch your applications."
+                ),
+            ));
+        };
+        let result = remote_call(&listener, host, request).await;
+        if stop
+            && result.as_ref().is_ok_and(|done| {
+                done.structured_content
+                    .as_ref()
+                    .and_then(|data| data["status"].as_str())
+                    != Some("cleanup_pending")
+            })
+        {
+            self.remote.sessions().remove(id);
+        }
+        result
+    }
+    /// session_list records for sessions on other machines, each with its host.
+    async fn remote_records(&self) -> Vec<serde_json::Value> {
+        let owned = self.remote.sessions().clone();
+        let hosts: std::collections::BTreeSet<&String> = owned.values().collect();
+        let mut records = Vec::new();
+        for host in hosts {
+            let request = serde_json::from_value(
+                serde_json::json!({"name": "session_list", "arguments": {}}),
+            )
+            .ok();
+            let listed = match (self.remote.connected(host).await, request) {
+                (Some(listener), Some(request)) => {
+                    remote_call(&listener, host, request).await.ok()
+                }
+                _ => None,
+            };
+            let sessions = listed
+                .as_ref()
+                .and_then(|result| result.structured_content.as_ref())
+                .and_then(|data| data["sessions"].as_array());
+            match sessions {
+                Some(sessions) => records.extend(sessions.iter().cloned().map(|mut record| {
+                    if let Some(fields) = record.as_object_mut() {
+                        fields.insert("host".to_owned(), serde_json::json!(host));
+                    }
+                    record
+                })),
+                None => records.extend(
+                    owned
+                        .iter()
+                        .filter(|(_, owner)| *owner == host)
+                        .map(|(id, _)| {
+                            serde_json::json!({
+                                "session_id": id, "host": host, "status": "connection_lost",
+                            })
+                        }),
+                ),
+            }
+        }
+        records
     }
     fn entries(&self) -> Result<std::collections::BTreeMap<String, KwinMcp>, McpError> {
         self.sessions
@@ -19656,6 +19961,7 @@ impl SessionRouter {
 
     async fn list(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Result<CallToolResult, McpError> {
         let mut records = Vec::new();
+        let host = local_host_name();
         for (id, service) in self.entries()? {
             // A desktop that exited since its last call is recorded as dead first,
             // so the phase below reports it.
@@ -19667,7 +19973,7 @@ impl SessionRouter {
                 session_registry::Phase::Terminal(status)
                     if status == session_registry::STATUS_START_FAILED => {}
                 session_registry::Phase::Terminal(status) => {
-                    records.push(serde_json::json!({"session_id":id, "pid":std::process::id(), "status":status, "diagnostic":service.death_record().unwrap_or_default()}));
+                    records.push(serde_json::json!({"session_id":id, "host":host, "pid":std::process::id(), "status":status, "diagnostic":service.death_record().unwrap_or_default()}));
                 }
                 session_registry::Phase::Running => {
                     let guard = service.session.read().await;
@@ -19676,7 +19982,7 @@ impl SessionRouter {
                         // scope_unit names the unit once.
                         remove_fields(&mut memory_limits, &["unit"]);
                         let mut record = serde_json::json!({
-                            "session_id": id, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":memory_limits, "input_log":service.input_log.as_ref().map(|log| &log.path),
+                            "session_id": id, "host": host, "pid": std::process::id(), "sandbox_pid": session.sandbox_child.id(), "scope_unit":session.scope.unit, "status":"running", "memory_limits":memory_limits, "input_log":service.input_log.as_ref().map(|log| &log.path),
                             "workdir": session.host_xdg_dir, "host_shared_dir": session.host_xdg_dir, "width": session.screen_width,
                             "host_write_paths": session.host_write_paths,
                             "height": session.screen_height, "idle_seconds": session.last_activity.elapsed().as_secs(),
@@ -19688,6 +19994,7 @@ impl SessionRouter {
                 }
             }
         }
+        records.extend(self.remote_records().await);
         Ok(structured_result(
             peer,
             // The ownership notice and what the list covers are in the tool description.
@@ -19772,7 +20079,7 @@ impl SessionRouter {
         }
         tools.push(rmcp::model::Tool::new(
             "session_list",
-            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Terminal sessions are listed as dead, stopped, expired, or start_blocked. {SESSION_OWNERSHIP_NOTICE}"),
+            format!("List live isolated sessions in this server process. Retained terminal handles are also included. TTL-expired sessions are listed as expired and can be cleared with session_stop. Session IDs do not transfer to a new process after client migration or restart. If a saved ID is missing, a call with that ID reports structured session_status, the previous lifecycle record when available, and recovery guidance. session_list covers only this process; a live session on another same-user process is not listed here, but requests with its ID are forwarded to its owner. Each record's host names its machine; sessions this server started elsewhere with session_start host are included. Terminal sessions are listed as dead, stopped, expired, or start_blocked. {SESSION_OWNERSHIP_NOTICE}"),
             Arc::new(
                 serde_json::from_value(serde_json::json!({"type": "object", "properties": {}}))
                     .unwrap_or_default(),
@@ -19839,7 +20146,39 @@ impl rmcp::ServerHandler for SessionRouter {
                 .await;
         }
         if request.name == "session_attach" {
+            if self.listener_peer {
+                return Err(session_attach_error(
+                    "attach_unavailable_remotely",
+                    "session_attach is not available over a remote connection.",
+                ));
+            }
             return self.attach(&context.peer, request.arguments.clone()).await;
+        }
+        let remote_start_host = (request.name == "session_start")
+            .then(|| request.arguments.as_ref()?.get("host").cloned())
+            .flatten()
+            .filter(|host| !host.is_null());
+        if let Some(host) = remote_start_host {
+            let Some(host) = host.as_str() else {
+                return Err(McpError::invalid_params("host must be a string", None));
+            };
+            return self.start_remote(request, host, &context.peer).await;
+        }
+        let remote_session = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| Some((id.to_owned(), self.remote.host_of(id)?)));
+        if request.name != "session_start"
+            && let Some((id, host)) = remote_session
+        {
+            // As for a local owner below: the turn is held through the reply.
+            let turn = context.extensions.get::<Arc<InputTurn>>().cloned();
+            if let Some(turn) = &turn {
+                turn.wait().await;
+            }
+            return self.call_remote(request, &id, &host, &context.peer).await;
         }
         let requested_id = request
             .arguments
@@ -19847,6 +20186,7 @@ impl rmcp::ServerHandler for SessionRouter {
             .and_then(|arguments| arguments.get("session_id"))
             .and_then(serde_json::Value::as_str);
         if request.name != "session_start"
+            && !self.listener_peer
             && let Some(id) = requested_id
             && let Some(owner_pid) = session_owner_pid(id)
             && owner_pid != std::process::id()
@@ -20982,7 +21322,136 @@ fn client_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(owned)
 }
 
+/// Startup sweeps for `--autoclean`.
+fn sweep_at_startup(display: DisplayConfig) {
+    if !display.autoclean {
+        return;
+    }
+    if let Err(error) = sweep_orphaned_workdirs(None) {
+        eprintln!("autoclean: orphan sweep skipped: {error}");
+    }
+    // A disk twin whose server died without a lease, or whose /tmp workdir is
+    // gone, is not reached by the leased sweep above. Scanning every process
+    // command line is slow on a loaded host, so it stays off the startup path.
+    std::thread::spawn(|| {
+        if let Err(error) = sweep_dead_owner_workdirs(None) {
+            eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+        }
+    });
+}
+
+/// One peer of a `--listen` server, from handshake to the end of its
+/// connection. The peer's sessions end with the connection, as a stdio
+/// server's sessions end with its client.
+async fn serve_listener_peer(
+    router: SessionRouter,
+    stream: tokio::net::TcpStream,
+    address: std::net::SocketAddr,
+    secret: Arc<remote::Secret>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let transport = match remote::accept(stream, &secret).await {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("listen: refused {address}: {error}");
+            return;
+        }
+    };
+    eprintln!("listen: {address} connected");
+    let reaper = tokio::spawn(router.clone().reap());
+    let served = tokio::select! {
+        served = router.clone().serve(transport) => Some(served),
+        _ = stop.changed() => None,
+    };
+    match served {
+        Some(Ok(service)) => tokio::select! {
+            _ = service.waiting() => {
+                eprintln!("listen: {address} disconnected; stopping the sessions it started");
+            }
+            _ = stop.changed() => {}
+        },
+        Some(Err(error)) => eprintln!("listen: MCP handshake with {address} failed: {error}"),
+        None => {}
+    }
+    reaper.abort();
+    let _ = reaper.await;
+    router.shutdown().await;
+}
+
+/// `--listen`: serve other machines' kwin-mcp servers over WebSocket. Every
+/// session belongs to the connection that started it; none outlives it.
+async fn run_listener(
+    display: DisplayConfig,
+    address: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Without the secret every peer would be refused, so do not listen at all.
+    let secret = Arc::new(
+        remote::read_secret().map_err(|error| format!("--listen refused to start: {error}"))?,
+    );
+    unsafe {
+        nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN);
+    }
+    let (process_requests, mut process_commands) = tokio::sync::mpsc::unbounded_channel();
+    PROCESS_REQUESTS
+        .set(process_requests)
+        .map_err(|_| "session process owner already exists")?;
+    sweep_at_startup(display);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    eprintln!(
+        "listen: accepting kwin-mcp peers on ws://{}",
+        listener.local_addr()?
+    );
+    let routers = SessionRouter::new(display);
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut peers = tokio::task::JoinSet::new();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    peers.spawn(serve_listener_peer(
+                        routers.for_listener_peer(),
+                        stream,
+                        peer,
+                        secret.clone(),
+                        stop.subscribe(),
+                    ));
+                }
+                Err(error) => {
+                    eprintln!("listen: accept failed: {error}");
+                    tokio::time::sleep(LISTEN_ACCEPT_RETRY).await;
+                }
+            },
+            Some(result) = peers.join_next(), if !peers.is_empty() => {
+                if let Err(error) = result {
+                    eprintln!("listen: peer task failed: {error}");
+                }
+            }
+            _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
+            _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
+            _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
+            Some(request) = process_commands.recv() => request.execute(),
+        }
+    }
+    drop(listener);
+    let _ = stop.send(true);
+    // Session teardown still spawns helpers through the main thread.
+    loop {
+        tokio::select! {
+            joined = peers.join_next() => if joined.is_none() { break },
+            Some(request) = process_commands.recv() => request.execute(),
+        }
+    }
+    Ok(())
+}
+
 async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::error::Error>> {
+    let display = parse_cli_args()?;
+    if let Some(address) = display.listen {
+        return run_listener(display, address).await;
+    }
     let client = match restored.as_ref().and_then(|state| state.client_fd) {
         Some(descriptor) => adopt_descriptor(descriptor)?,
         None => client_pidfd()?,
@@ -20994,24 +21463,9 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
     PROCESS_REQUESTS
         .set(process_requests)
         .map_err(|_| "session process owner already exists")?;
-    let display = parse_cli_args()?;
     let resumed = restored.is_some();
     let resumed_client = restored.as_ref().and_then(|state| state.client.clone());
-    if display.autoclean
-        && let Err(error) = sweep_orphaned_workdirs(None)
-    {
-        eprintln!("autoclean: orphan sweep skipped: {error}");
-    }
-    // A disk twin whose server died without a lease, or whose /tmp workdir is
-    // gone, is not reached by the leased sweep above. Scanning every process
-    // command line is slow on a loaded host, so it stays off the startup path.
-    if display.autoclean {
-        std::thread::spawn(|| {
-            if let Err(error) = sweep_dead_owner_workdirs(None) {
-                eprintln!("autoclean: leaked workdir sweep skipped: {error}");
-            }
-        });
-    }
+    sweep_at_startup(display);
     eprintln!(
         "kwin-mcp: display default {}x{}{}; viewer on demand",
         display.width,
@@ -21044,6 +21498,7 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         None => tokio::select! {
             result = router.serve(transport) => result?,
             _ = wire.client.readable() => {
+                shutdown.remote.close().await;
                 shutdown.shutdown().await;
                 return Ok(());
             },
@@ -21093,6 +21548,9 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
         Some(Err(error)) => eprintln!("shutdown: the MCP service task failed: {error}"),
         None => {}
     }
+    // Sessions on other machines end with this server's client, --keep-sessions
+    // or not: closing the connections makes their listeners stop them.
+    shutdown.remote.close().await;
     // The client closing is how a host respawns this server. With --keep-sessions
     // the running sessions outlive it, served through the control socket to
     // whichever kwin-mcp the host starts next (session IDs name this process, and
@@ -21479,6 +21937,7 @@ mod instructions_tests {
                 autoclean: false,
                 ttl: None,
                 keep_sessions: None,
+                listen: None,
                 memory_high: None,
                 memory_max: 0,
                 memory_swap_max: 0,
@@ -21796,6 +22255,7 @@ mod startup_report_tests {
             autoclean: false,
             ttl: None,
             keep_sessions: None,
+            listen: None,
             memory_high: None,
             memory_max: 0,
             memory_swap_max: 0,
