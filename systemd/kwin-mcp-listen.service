@@ -1,0 +1,17 @@
+[Unit]
+Description=kwin-mcp WebSocket listener for sessions started from other machines
+After=network-online.target
+ConditionFileIsExecutable=%h/.local/bin/kwin-mcp
+ConditionPathExists=%h/.config/kwin-mcp/remote-secret
+ConditionPathExists=%h/.config/kwin-mcp/listen.env
+
+[Service]
+# listen.env holds one line: KWIN_MCP_LISTEN=ADDRESS[:PORT], a LAN address of this machine.
+EnvironmentFile=%h/.config/kwin-mcp/listen.env
+ExecStart=%h/.local/bin/kwin-mcp --listen ${KWIN_MCP_LISTEN} --no-viewer --autoclean --ttl 120
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
