@@ -48,9 +48,13 @@
 //! Measured, per frame socket:
 //! * `link`: bits per second the socket carried, from each picture of at
 //!   least [`LINK_SAMPLE_BYTES`] and the time until its last byte left. It
-//!   starts at the link budget (the interface's speed times
-//!   [`LINK_USABLE_PERCENT`], which the socket is also paced to) and then
-//!   follows the measurements, a quarter of the difference per picture.
+//!   starts at the stream's share of the link budget (the interface's speed
+//!   times [`LINK_USABLE_PERCENT`], divided among the streams that leave the
+//!   interface: [`crate::links::Shares`], which also sets what the socket is
+//!   paced to) and then follows the measurements, a quarter of the
+//!   difference per picture. When the share changes, it changes in the same
+//!   proportion ([`ModeControl::share`]). A stream alone has the whole
+//!   budget.
 //! * `pack` and `encode`: time to pack a raw picture and to encode a DSC one,
 //!   per pixel, smoothed the same way. While raw is not usable and no DSC
 //!   picture gives it, the sender encodes one picture just to measure
@@ -87,6 +91,7 @@
 //! [`Header::settle`]: a still screen is always shown with exact pixels.
 
 use crate::dsc;
+use crate::links::Interface;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -224,15 +229,22 @@ pub enum Notice {
         #[serde(default)]
         text: Option<ClipText>,
     },
+    /// The stream's share of its interface's budget changed: `streams`
+    /// streams that leave the session's machine on that interface are
+    /// sending pictures in a row, and this one has `bits_per_second`. Until
+    /// the first one, a stream has the whole budget `hello` named. For the
+    /// viewer's log and counters only.
+    Share { bits_per_second: u64, streams: u32 },
     /// A type this build does not know. It is ignored.
     #[serde(other)]
     Unknown,
 }
 
 /// A text message from the viewer: what its user's clipboard shortcut needs
-/// of the session's clipboard. It goes out before the shortcut's key record,
-/// and the sender handles the two in that order. A sender that does not
-/// bridge the clipboard ignores text messages.
+/// of the session's clipboard, which goes out before the shortcut's key
+/// record so that the sender handles the two in that order, or what the
+/// sender should know about the viewer's link. A sender that does not know a
+/// message ignores it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -250,6 +262,9 @@ pub enum Request {
     /// [`Notice::Clipboard`] `id` once the session's selection changes, with
     /// a text of at most `max_bytes` bytes.
     ClipboardCopy { id: u64, max_bytes: u64 },
+    /// The viewer's frame socket is on a path of its own choosing whose
+    /// interface carries `bits_per_second`: the sender paces to no more.
+    Path { bits_per_second: u64 },
     /// A type this build does not know. It is ignored.
     #[serde(other)]
     Unknown,
@@ -375,90 +390,57 @@ pub fn fit_size(session: (u32, u32), drawable: (u32, u32)) -> (u32, u32) {
 /// The bit budget of a frame socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkBudget {
-    /// Bits per second the stream may fill; None is unlimited.
+    /// Bits per second the interface's streams may fill together; None is
+    /// unlimited.
     pub bits_per_second: Option<u64>,
     /// Where the number came from, for the log and the viewer.
     pub link: String,
-}
-
-/// The interface a socket's local address belongs to.
-struct Interface {
-    name: String,
-    loopback: bool,
-    /// Contents of its `speed` file, when readable.
-    speed: Option<String>,
+    /// The interface's name; empty when the address belongs to none.
+    pub interface: String,
 }
 
 fn budget_of(override_mbps: Option<u64>, interface: Option<&Interface>) -> LinkBudget {
     let usable = |mbps: u64| Some(mbps.saturating_mul(1_000_000) / 100 * LINK_USABLE_PERCENT);
     let name = interface.map_or("unknown interface", |interface| interface.name.as_str());
+    let budget = |bits_per_second: Option<u64>, link: String| LinkBudget {
+        bits_per_second,
+        link,
+        interface: interface.map_or_else(String::new, |interface| interface.name.clone()),
+    };
     if let Some(mbps) = override_mbps {
-        return LinkBudget {
-            bits_per_second: usable(mbps),
-            link: format!("{name}, --link-mbps {mbps}"),
-        };
+        return budget(usable(mbps), format!("{name}, --link-mbps {mbps}"));
     }
     let Some(interface) = interface else {
-        return LinkBudget {
-            bits_per_second: usable(UNKNOWN_LINK_MBPS),
-            link: format!("{name}, assumed {UNKNOWN_LINK_MBPS} Mb/s"),
-        };
+        return budget(
+            usable(UNKNOWN_LINK_MBPS),
+            format!("{name}, assumed {UNKNOWN_LINK_MBPS} Mb/s"),
+        );
     };
     if interface.loopback {
-        return LinkBudget {
-            bits_per_second: None,
-            link: format!("{name}, loopback, unlimited"),
-        };
+        return budget(None, format!("{name}, loopback, unlimited"));
     }
-    let speed = interface
-        .speed
-        .as_deref()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .filter(|mbps| *mbps > 0);
-    match speed {
-        Some(mbps) => LinkBudget {
-            bits_per_second: usable(mbps),
-            link: format!("{name}, {mbps} Mb/s"),
-        },
-        None => LinkBudget {
-            bits_per_second: usable(UNKNOWN_LINK_MBPS),
-            link: format!("{name} reports no speed, assumed {UNKNOWN_LINK_MBPS} Mb/s"),
-        },
+    // A wireless interface has no speed of its own to send at: the rate
+    // changes with the station and the second.
+    match interface.mbps.filter(|_| !interface.wireless) {
+        Some(mbps) => budget(usable(mbps), format!("{name}, {mbps} Mb/s")),
+        None => budget(
+            usable(UNKNOWN_LINK_MBPS),
+            format!("{name} reports no speed, assumed {UNKNOWN_LINK_MBPS} Mb/s"),
+        ),
     }
 }
 
 /// The budget for a frame socket whose local address is `local`: the speed of
 /// the interface that holds the address (the one that routes to the peer)
 /// times [`LINK_USABLE_PERCENT`]; unlimited on loopback; `override_mbps`
-/// replaces the interface's speed.
+/// replaces the interface's speed. The streams that leave the interface
+/// share this budget ([`crate::links::Shares`]).
 pub fn link_budget(local: std::net::IpAddr, override_mbps: Option<u64>) -> LinkBudget {
-    let local = local.to_canonical();
-    let interface = nix::ifaddrs::getifaddrs().ok().and_then(|addresses| {
-        addresses
-            .filter(|entry| {
-                let address = entry.address.as_ref();
-                let v4 = address
-                    .and_then(|address| address.as_sockaddr_in())
-                    .map(|address| std::net::IpAddr::V4(address.ip()));
-                let v6 = address
-                    .and_then(|address| address.as_sockaddr_in6())
-                    .map(|address| std::net::IpAddr::V6(address.ip()).to_canonical());
-                v4.or(v6) == Some(local)
-            })
-            .map(|entry| Interface {
-                loopback: entry
-                    .flags
-                    .contains(nix::net::if_::InterfaceFlags::IFF_LOOPBACK),
-                speed: std::fs::read_to_string(format!(
-                    "/sys/class/net/{}/speed",
-                    entry.interface_name
-                ))
-                .ok(),
-                name: entry.interface_name,
-            })
-            .next()
-    });
-    budget_of(override_mbps, interface.as_ref())
+    let table = crate::links::interfaces();
+    budget_of(
+        override_mbps,
+        crate::links::first(&table, |interface| interface.holds(local)),
+    )
 }
 
 /// Has the kernel send `socket`'s bytes no faster than `bits_per_second`
@@ -561,8 +543,11 @@ fn nanos(duration: Duration) -> u64 {
 /// rule.
 #[derive(Clone, Debug)]
 pub struct ModeControl {
+    /// What the interface's streams may fill together.
     budget: Option<u64>,
-    /// Bits per second; the budget until a picture measured it.
+    /// What this stream has of it.
+    share: Option<u64>,
+    /// Bits per second; the share until a picture measured it.
     link: Option<u64>,
     link_measured: bool,
     /// Picoseconds per pixel.
@@ -585,6 +570,7 @@ impl ModeControl {
     pub fn new(budget: Option<u64>) -> Self {
         Self {
             budget,
+            share: budget,
             link: budget,
             link_measured: false,
             pack: None,
@@ -601,6 +587,29 @@ impl ModeControl {
     /// Times the mode changed between raw and DSC.
     pub fn switches(&self) -> u64 {
         self.switches
+    }
+
+    /// The stream now has `share` bits per second of its interface's budget
+    /// ([`crate::links::Grant::share`]). The link speed the rule works with
+    /// changes in the same proportion at once, so the next picture is
+    /// decided for the share the stream has; measurements carry on from
+    /// there. A stream without a budget has no share.
+    pub fn share(&mut self, share: u64) {
+        let (Some(budget), Some(before)) = (self.budget, self.share) else {
+            return;
+        };
+        let share = share.clamp(1, budget.max(1));
+        if share == before {
+            return;
+        }
+        self.share = Some(share);
+        self.link = Some(match self.link.filter(|_| self.link_measured) {
+            Some(link) => {
+                narrow(u128::from(link) * u128::from(share) / u128::from(before.max(1)))
+                    .clamp(1, budget.max(1))
+            }
+            None => share,
+        });
     }
 
     fn wire(&self, bits: u64) -> Duration {

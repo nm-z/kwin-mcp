@@ -20,7 +20,7 @@ use kwin_mcp::clipboard::{
     ClipContents, Clipboard, DISPATCH_POLL_INTERVAL, DispatchThread, Shutdown, text_contents,
 };
 use kwin_mcp::viewer_stream::{ClipText, Header, Mode, ModeControl, Notice, Payload, Request};
-use kwin_mcp::{dsc, remote, viewer_stream};
+use kwin_mcp::{dsc, links, remote, viewer_stream};
 use screen_13::driver::ash::vk;
 use screen_13::driver::buffer::Buffer;
 use screen_13::driver::image::{Image, ImageInfo};
@@ -873,7 +873,8 @@ impl SenderClipboard {
                     Ok(true)
                 })
             }
-            Request::Unknown => Ok(()),
+            // The sender's reader takes a path report before it gets here.
+            Request::Path { .. } | Request::Unknown => Ok(()),
         };
         if let Err(error) = handled {
             eprintln!("kwin-viewer: clipboard handoff failed: {error:#}");
@@ -2041,9 +2042,104 @@ fn deliver(
     Ok(())
 }
 
+// How long a sender waits for the listener's first grant.
+const SHARE_FIRST_GRANT_WAIT: Duration = Duration::from_secs(1);
+
+// A frame sender's word from the listener on what its stream may send
+// (kwin_mcp::links): the listener divides the interface's budget among the
+// senders that have a picture on the wire. The listener's socket is this
+// process's standard output. Without one (an unlimited link, a listener that
+// predates the sharing) the stream has the whole budget, as a stream alone has.
+#[derive(Clone)]
+struct ShareLink {
+    grant: Arc<Mutex<links::Grant>>,
+    changed: Arc<AtomicBool>,
+    reports: Option<Arc<Mutex<std::os::unix::net::UnixStream>>>,
+}
+
+impl ShareLink {
+    // `frames` is the frame socket, which every grant paces.
+    fn connect(budget: Option<u64>, frames: &std::net::TcpStream) -> Self {
+        use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage, getsockname};
+        use std::io::Read;
+        use std::os::fd::{AsFd, AsRawFd};
+        let whole = links::Grant { pace: budget.unwrap_or(0), share: budget.unwrap_or(0), streams: 1 };
+        let mut link =
+            Self { grant: Arc::new(Mutex::new(whole)), changed: Arc::new(AtomicBool::new(false)), reports: None };
+        let Some(budget) = budget else { return link };
+        let stdout = std::io::stdout();
+        let shared = getsockname::<SockaddrStorage>(stdout.as_fd().as_raw_fd())
+            .is_ok_and(|name| name.family() == Some(AddressFamily::Unix));
+        let listener = shared
+            .then(|| stdout.as_fd().try_clone_to_owned().ok())
+            .flatten()
+            .map(std::os::unix::net::UnixStream::from);
+        let (Some(listener), Ok(frames)) = (listener, frames.try_clone()) else {
+            eprintln!("kwin-viewer: stream: no link scheduler; this stream paces itself to the whole budget");
+            return link;
+        };
+        let mut record = [0u8; links::GRANT_BYTES];
+        let _ = listener.set_read_timeout(Some(SHARE_FIRST_GRANT_WAIT));
+        if let Err(error) = (&listener).read_exact(&mut record) {
+            eprintln!("kwin-viewer: stream: the link scheduler granted nothing ({error}); this stream paces itself to the whole budget");
+            return link;
+        }
+        let _ = listener.set_read_timeout(None);
+        *link.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = links::Grant::decode(&record);
+        let Ok(reader) = listener.try_clone() else { return link };
+        link.reports = Some(Arc::new(Mutex::new(listener)));
+        let (grant, changed) = (Arc::clone(&link.grant), Arc::clone(&link.changed));
+        let spawned = std::thread::Builder::new().name("link-share".to_owned()).spawn(move || {
+            let mut record = [0u8; links::GRANT_BYTES];
+            loop {
+                // A listener that is gone grants nothing more: the whole
+                // budget again, as before there was a scheduler.
+                let (next, last) = match (&reader).read_exact(&mut record) {
+                    Ok(()) => (links::Grant::decode(&record), false),
+                    Err(_) => (links::Grant { pace: budget, share: budget, streams: 1 }, true),
+                };
+                if next.pace > 0 {
+                    let _ = viewer_stream::pace(&frames, next.pace);
+                }
+                *grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                changed.store(true, Ordering::Release);
+                if last {
+                    break;
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            eprintln!("kwin-viewer: stream: link scheduler thread: {error}");
+        }
+        link
+    }
+
+    fn grant(&self) -> links::Grant {
+        *self.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // The grant, when it changed since the last call.
+    fn take_change(&self) -> Option<links::Grant> {
+        self.changed.swap(false, Ordering::AcqRel).then(|| self.grant())
+    }
+
+    fn report(&self, report: links::Report) {
+        use std::io::Write;
+        if let Some(reports) = &self.reports {
+            let mut reports = reports.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = reports.write_all(&report.encode());
+        }
+    }
+}
+
 struct PictureSender {
-    // Bits per second; None is unlimited.
+    // Bits per second the interface's streams may fill; None is unlimited.
     budget: Option<u64>,
+    // Where that number came from.
+    link: String,
+    share: ShareLink,
+    // The share and stream count the viewer was last told.
+    told: (u64, u32),
     control: ModeControl,
     settle: viewer_stream::Settle,
     workers: viewer_stream::Workers,
@@ -2069,10 +2165,25 @@ struct PictureSender {
 }
 
 impl PictureSender {
-    fn new(budget: Option<u64>, probe: std::net::TcpStream, shutdown: Shutdown) -> Self {
+    fn new(
+        budget: &viewer_stream::LinkBudget,
+        share: ShareLink,
+        probe: std::net::TcpStream,
+        shutdown: Shutdown,
+    ) -> Self {
+        let mut control = ModeControl::new(budget.bits_per_second);
+        // A stream that starts beside others decides its first picture for
+        // its share.
+        let granted = share.grant();
+        if budget.bits_per_second.is_some() {
+            control.share(granted.share);
+        }
         Self {
-            budget,
-            control: ModeControl::new(budget),
+            budget: budget.bits_per_second,
+            link: budget.link.clone(),
+            share,
+            told: (budget.bits_per_second.unwrap_or(0), 1),
+            control,
             settle: viewer_stream::Settle::default(),
             workers: viewer_stream::Workers::all_cores(),
             threads: codec_threads(),
@@ -2102,6 +2213,40 @@ impl PictureSender {
     // How long until the picture last sent is due again as exact pixels.
     fn settle_due_in(&self) -> Option<Duration> {
         self.settle.due_in(Instant::now())
+    }
+
+    // Takes a changed grant into the mode rule, and returns what the viewer
+    // has to be told when the share or the streams it is divided among
+    // differ from what it knows.
+    fn share_changed(&mut self) -> Option<Notice> {
+        if let Some(grant) = self.share.take_change() {
+            self.control.share(grant.share);
+        }
+        let grant = self.share.grant();
+        let now = (grant.share, grant.streams);
+        (self.budget.is_some() && now != self.told).then(|| {
+            self.told = now;
+            eprintln!("kwin-viewer: stream: this stream now has {}", self.share_text());
+            Notice::Share { bits_per_second: grant.share, streams: grant.streams }
+        })
+    }
+
+    // `450 Mb/s, its share of 900 Mb/s among 2 streams on enp0s25, 1000 Mb/s`.
+    fn share_text(&self) -> String {
+        let grant = self.share.grant();
+        match self.budget {
+            None => format!("unlimited on {}", self.link),
+            Some(budget) if grant.streams <= 1 && grant.share == budget => {
+                format!("{} on {}", budget_text(Some(budget)), self.link)
+            }
+            Some(budget) => format!(
+                "{}, its share of {} among {} streams on {}",
+                budget_text(Some(grant.share)),
+                budget_text(Some(budget)),
+                grant.streams,
+                self.link
+            ),
+        }
     }
 
     // Whether the DSC encoder for `target` exists; a size it cannot cut into
@@ -2247,8 +2392,12 @@ impl PictureSender {
         // The message goes to the socket without a copy and comes back for
         // the next picture once the socket has let go of it.
         let message = async_tungstenite::tungstenite::Bytes::from(std::mem::take(&mut self.message));
+        // The listener divides the interface among the streams that are on
+        // the wire between these two reports.
+        self.share.report(links::Report::Wire(true));
         let delivered =
             deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(message.clone()));
+        self.share.report(links::Report::Wire(false));
         self.message = Vec::from(message);
         delivered?;
         let sent = Instant::now();
@@ -2310,7 +2459,7 @@ impl PictureSender {
             window.frames - window.raw,
             window.settles,
             megabits(window.bytes * 8) / elapsed.as_secs_f64(),
-            budget_text(self.budget),
+            self.share_text(),
             per_frame(window.scale),
             per_frame(window.prepare),
             per_frame(window.wire),
@@ -2372,17 +2521,22 @@ fn stream_sender(
     let socket = std::net::TcpStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     let probe = socket.try_clone()?;
     let budget = viewer_stream::link_budget(socket.local_addr()?.ip(), link_mbps);
-    // The kernel keeps the stream inside its budget.
-    let paced = match budget.bits_per_second.map(|bits| viewer_stream::pace(&socket, bits)) {
+    // The interface's budget is shared with the other streams that leave on
+    // it, and the kernel keeps this one inside what it is granted.
+    let share = ShareLink::connect(budget.bits_per_second, &socket);
+    let granted = share.grant();
+    let paced = match budget.bits_per_second.map(|_| viewer_stream::pace(&socket, granted.pace)) {
         None => "not paced".to_owned(),
-        Some(Ok(())) => "paced to the budget".to_owned(),
+        Some(Ok(())) => format!("paced to {}", budget_text(Some(granted.pace))),
         Some(Err(error)) => format!("not paced ({error})"),
     };
     eprintln!(
-        "kwin-viewer: stream: viewer {} over {}; budget {}, {paced}",
+        "kwin-viewer: stream: viewer {} over {}; budget {}, share {} among {} streams, {paced}",
         socket.peer_addr()?,
         budget.link,
-        budget_text(budget.bits_per_second)
+        budget_text(budget.bits_per_second),
+        budget_text(budget.bits_per_second.map(|_| granted.share)),
+        granted.streams,
     );
 
     pipewire::init();
@@ -2419,6 +2573,7 @@ fn stream_sender(
     runtime.spawn({
         let (viewer, mailbox, shutdown) = (Arc::clone(&viewer), Arc::clone(&mailbox), shutdown.clone());
         let session_path = session_path.to_owned();
+        let share = share.clone();
         async move {
             while let Some(Ok(message)) = stream.next().await {
                 let record = match message {
@@ -2429,6 +2584,17 @@ fn stream_sender(
                     // The compositor's answers are waited for off this
                     // worker, so pictures keep going out meanwhile.
                     Message::Text(text) => {
+                        // The viewer's own link is slower than this
+                        // stream's share may be: the listener gives the
+                        // difference to the other streams.
+                        if let Some(Request::Path { bits_per_second }) = Request::decode(text.as_str()) {
+                            eprintln!(
+                                "kwin-viewer: stream: the viewer's path carries {}; this stream is paced to no more",
+                                budget_text(Some(bits_per_second))
+                            );
+                            share.report(links::Report::Cap(Some(bits_per_second)));
+                            continue;
+                        }
                         if let Some(clipboard) = clipboard.as_mut() {
                             tokio::task::block_in_place(|| clipboard.receive(text.as_str()));
                         }
@@ -2472,7 +2638,7 @@ fn stream_sender(
             clipboard_text_bytes,
         },
     )?;
-    let mut sender = PictureSender::new(budget.bits_per_second, probe, shutdown.clone());
+    let mut sender = PictureSender::new(&budget, share, probe, shutdown.clone());
     let started = Instant::now();
     let mut heartbeat = Instant::now();
     // The newest capture, whether it still has to go out, and the size the
@@ -2502,6 +2668,12 @@ fn stream_sender(
                 break Ok(());
             }
             sent_title = title;
+        }
+        if let Some(share) = sender.share_changed()
+            && let Err(error) = send_notice(&runtime, &mut sink, &share)
+        {
+            eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
+            break Ok(());
         }
         // The answer to the viewer's copy request goes out between two
         // pictures, like them once its last byte has left: it is that
@@ -2583,6 +2755,8 @@ struct StreamStats {
     pool: BufferPool,
     // The swapchain's format and colour space, once the window has drawn.
     surface: Mutex<String>,
+    // The path the frame socket is on, and the stream's share.
+    path: Mutex<StreamPath>,
 }
 
 #[derive(Default, Clone)]
@@ -2630,6 +2804,10 @@ struct RecentCounters {
 impl StreamStats {
     fn counters(&self) -> std::sync::MutexGuard<'_, StreamCounters> {
         self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn path(&self) -> std::sync::MutexGuard<'_, StreamPath> {
+        self.path.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // A picture message came off the socket.
@@ -2754,9 +2932,10 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
         let latency_max = milliseconds(recent.latency_max_micros, 1);
         let sender = milliseconds(recent.sender_micros, recent.frames);
         let decode = milliseconds(recent.decode_micros, recent.frames);
+        let path = stats.path().clone();
         if active {
             eprintln!(
-                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented ({} of them while the window was not shown), {} skipped for a newer one; {} frames and {} parameter sets in total; {} mode switches, {} settles",
+                "kwin-viewer: stream: {frames_per_second:.1} frames/s {mode} {}x{} at {:.2} bpp, {} bytes/frame, {megabits_per_second:.1} Mb/s; capture to present {latency:.1} ms mean, {latency_max:.1} ms max (sender {sender:.1} ms, decode {decode:.1} ms); {} presented ({} of them while the window was not shown), {} skipped for a newer one; {} frames and {} parameter sets in total; {} mode switches, {} settles; {}",
                 counters.width,
                 counters.height,
                 bits_per_pixel(counters.bpp_x16),
@@ -2768,6 +2947,7 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
                 counters.parameter_sets,
                 counters.mode_switches,
                 counters.settles,
+                path.text(),
             );
         } else {
             eprintln!(
@@ -2788,6 +2968,7 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
             "width": counters.width, "height": counters.height, "mode": mode, "stream_mode": stream_mode,
             "bits_per_pixel": bits_per_pixel(counters.bpp_x16), "frame_bytes": counters.frame_bytes,
             "swapchain": surface,
+            "path": path.json(),
             "last_second": {
                 "frames": recent.frames, "presented": recent.presented,
                 "presented_unshown": recent.presented_unshown, "skipped": recent.skipped,
@@ -2873,29 +3054,234 @@ fn run_stream(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     result
 }
 
-fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Result<()> {
-    use futures::{SinkExt, StreamExt};
-    ensure_host_display()?;
-    let ticket = std::env::var(remote::TICKET_ENV).map_err(|_| {
-        anyhow::anyhow!("{} is not set; kwin-mcp viewer_open starts this viewer", remote::TICKET_ENV)
-    })?;
-    let secret = remote::read_secret().map_err(anyhow::Error::msg)?;
-    let runtime = stream_runtime()?;
-    let socket = runtime
-        .block_on(remote::connect_frames(authority, &secret, &ticket))
-        .map_err(|error| anyhow::anyhow!("frame socket to {authority}: {error}"))?;
-    let (mut sink, mut stream) = StreamExt::split(socket);
+// How often a stream viewer that receives nothing looks whether the path its
+// frame socket is on is still usable.
+const STREAM_PATH_CHECK: Duration = Duration::from_secs(1);
+// Frame sockets a viewer tries to open in place of one whose path died.
+const STREAM_RECONNECT_ATTEMPTS: usize = 3;
+// How long the server that started the viewer may take to hand out a ticket.
+const STREAM_TICKET_WAIT: Duration = Duration::from_secs(5);
+
+type FrameStream = futures::stream::SplitStream<remote::FrameSocket>;
+
+// Where a stream viewer's pictures arrive on this machine, and what the
+// sender said of the link they leave on and of this stream's share of it.
+#[derive(Clone, Default)]
+struct StreamPath {
+    interface: String,
+    source: String,
+    // Mb/s the interface reports.
+    mbps: Option<u64>,
+    wireless: bool,
+    // How the socket came to be on the interface: "route" (the routing
+    // table's choice, nothing bound), "device" (bound to the address and,
+    // with SO_BINDTODEVICE, to the interface) or "address" (bound to the
+    // address alone).
+    bound: &'static str,
+    peer: String,
+    sender_link: String,
+    // Bits per second: what the sender's interface gives its streams
+    // together, and what this stream has of it.
+    budget: Option<u64>,
+    share: Option<u64>,
+    streams: u32,
+    // Times the stream moved to another path because its own died.
+    reconnects: u64,
+}
+
+impl StreamPath {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "interface": self.interface, "source": self.source, "link_mbps": self.mbps,
+            "wireless": self.wireless, "bound": self.bound, "peer": self.peer,
+            "sender_link": self.sender_link,
+            "budget_mbps": self.budget.map(megabits), "share_mbps": self.share.map(megabits),
+            "streams": self.streams, "reconnects": self.reconnects,
+        })
+    }
+
+    // `enp10s0 (192.168.1.211, 1000 Mb/s) from sentry:47913 (enp0s25, 1000
+    // Mb/s); share 450 Mb/s of 900 Mb/s among 2 streams`.
+    fn text(&self) -> String {
+        let speed = self.mbps.map_or_else(|| "no speed reported".to_owned(), |mbps| format!("{mbps} Mb/s"));
+        let share = match (self.share, self.budget) {
+            (Some(share), Some(budget)) => format!(
+                "share {} of {} among {} streams",
+                budget_text(Some(share)),
+                budget_text(Some(budget)),
+                self.streams
+            ),
+            _ => "share unlimited".to_owned(),
+        };
+        format!(
+            "path {} ({}, {speed}{}) from {} ({}); {share}",
+            self.interface,
+            self.source,
+            if self.wireless { ", wireless" } else { "" },
+            self.peer,
+            self.sender_link,
+        )
+    }
+
+    // Beside the log, for the server's viewer_open result.
+    fn write(&self, status_dir: &std::path::Path) {
+        let temporary = status_dir.join(format!("{}.tmp", links::PATH_FILE));
+        if std::fs::write(&temporary, self.json().to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, status_dir.join(links::PATH_FILE));
+        }
+    }
+}
+
+// The paths from this machine to a session's listener.
+struct StreamPaths {
+    authority: String,
+    peer: Option<std::net::SocketAddr>,
+    // A file that lists the paths in place of this machine's interfaces.
+    listed: Option<PathBuf>,
+}
+
+impl StreamPaths {
+    fn new(authority: &str) -> Self {
+        use std::net::ToSocketAddrs;
+        Self {
+            authority: authority.to_owned(),
+            peer: authority.to_socket_addrs().ok().and_then(|mut addresses| addresses.next()),
+            listed: std::env::var_os(links::PATHS_ENV).map(PathBuf::from),
+        }
+    }
+
+    // The usable paths now, the preferred first, and where the streams on
+    // them are counted.
+    fn table(&self) -> (Vec<links::Path>, links::Registry) {
+        let routed = self.peer.and_then(links::routed_source);
+        let Some(file) = &self.listed else {
+            // A listener on this machine is reached over no interface.
+            let paths = self
+                .peer
+                .filter(|peer| !peer.ip().to_canonical().is_loopback())
+                .map_or_else(Vec::new, |peer| links::paths_to(&links::interfaces(), peer.ip(), routed));
+            return (paths, links::Registry::new(None));
+        };
+        let table = std::fs::read_to_string(file)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(serde_json::from_str::<links::PathTable>(&text)?))
+            .unwrap_or_else(|error| {
+                eprintln!("kwin-viewer: stream: path table {}: {error:#}", file.display());
+                links::PathTable::default()
+            });
+        let mut paths = table.paths;
+        for path in &mut paths {
+            path.routed = Some(path.source) == routed;
+        }
+        links::prefer(&mut paths);
+        (paths, links::Registry::new(table.registry))
+    }
+
+    // Why a stream on `interface` should move: the interface is no longer a
+    // usable path while another one is.
+    fn dead(&self, interface: &str) -> Option<String> {
+        let (paths, _) = self.table();
+        (!paths.is_empty() && !paths.iter().any(|path| path.interface == interface))
+            .then(|| format!("{interface} is no longer up with an address that reaches {}", self.authority))
+    }
+
+    // Whether a stream could move off `interface`.
+    fn has_other(&self, interface: &str) -> bool {
+        self.table().0.iter().any(|path| path.interface != interface)
+    }
+}
+
+// A frame socket after the sender's hello.
+struct OpenedStream {
+    sink: FrameSink,
+    stream: FrameStream,
+    path: StreamPath,
+    // Where the stream is counted, when this machine has a choice of paths.
+    registry: Option<links::Registry>,
+    virt: (u32, u32),
+    title: String,
+    clipboard_text_bytes: Option<u64>,
+    // Bits per second the sender is asked to pace to: the usable speed of a
+    // path this viewer bound its socket to.
+    cap: Option<u64>,
+}
+
+// Opens the frame socket `ticket` names and reads the sender's hello. On a
+// machine with several paths to the listener the socket is bound to the one
+// kwin_mcp::links chooses, never `avoid`'s; otherwise, and for the routing
+// table's own path, nothing is bound.
+fn open_stream(
+    runtime: &tokio::runtime::Handle,
+    paths: &StreamPaths,
+    secret: &remote::Secret,
+    ticket: &str,
+    avoid: Option<&str>,
+) -> anyhow::Result<OpenedStream> {
+    use futures::StreamExt;
+    let authority = paths.authority.as_str();
+    let (mut table, registry) = paths.table();
+    let choice = table.len() >= 2 || paths.listed.is_some();
+    if let Some(avoid) = avoid {
+        table.retain(|path| path.interface != avoid);
+    }
+    let mut chosen = if choice {
+        registry
+            .claim(&table, authority)
+            .unwrap_or_else(|error| {
+                eprintln!("kwin-viewer: stream: the streams on this machine's paths cannot be counted: {error}");
+                None
+            })
+            .or_else(|| table.first().cloned())
+    } else {
+        None
+    };
+    let source = chosen
+        .as_ref()
+        .filter(|path| !path.routed)
+        .map(|path| remote::Source { address: path.source, interface: path.interface.clone() });
+    let connected = runtime.block_on(remote::connect_frames(authority, secret, ticket, source.as_ref()));
+    let (socket, bound) = match connected {
+        Ok(connected) => connected,
+        // A first socket that does not connect from the chosen path uses the
+        // routing table's, as a viewer without a choice does.
+        Err(error) if source.is_some() && avoid.is_none() => {
+            eprintln!("kwin-viewer: stream: {error}; using the routing table's path");
+            chosen = None;
+            runtime
+                .block_on(remote::connect_frames(authority, secret, ticket, None))
+                .map_err(|error| anyhow::anyhow!("frame socket to {authority}: {error}"))?
+        }
+        Err(error) => anyhow::bail!("frame socket to {authority}: {error}"),
+    };
+    let local = socket.get_ref().get_ref().local_addr()?.ip().to_canonical();
+    // The routing table's path is the interface that holds the socket's address.
+    let path = chosen.unwrap_or_else(|| {
+        let interfaces = links::interfaces();
+        match links::first(&interfaces, |interface| interface.holds(local)) {
+            Some(interface) => links::Path {
+                interface: interface.name.clone(),
+                source: local,
+                wireless: interface.wireless,
+                mbps: interface.mbps,
+                routed: true,
+            },
+            None => links::Path {
+                interface: "unknown interface".to_owned(),
+                source: local,
+                wireless: false,
+                mbps: None,
+                routed: true,
+            },
+        }
+    });
+    let (sink, mut stream) = StreamExt::split(socket);
     let hello = runtime.block_on(async { tokio::time::timeout(STREAM_HELLO_TIMEOUT, stream.next()).await });
-    let (virt, first_title, sender_clipboard) = match hello {
+    let (virt, title, clipboard_text_bytes, budget, sender_link) = match hello {
         Ok(Some(Ok(Message::Text(text)))) => match Notice::decode(text.as_str()) {
             Ok(Notice::Hello { width, height, title, budget_bits_per_second, link, clipboard_text_bytes }) => {
-                eprintln!(
-                    "kwin-viewer: stream: session {width}x{height} on {authority}; sender link {link}, budget {}",
-                    budget_text(budget_bits_per_second)
-                );
-                ((width, height), title, clipboard_text_bytes)
+                ((width, height), title, clipboard_text_bytes, budget_bits_per_second, link)
             }
-            Ok(Notice::Title { .. } | Notice::Clipboard { .. } | Notice::Unknown) => {
+            Ok(Notice::Title { .. } | Notice::Clipboard { .. } | Notice::Share { .. } | Notice::Unknown) => {
                 anyhow::bail!("{authority} did not begin the frame socket with hello")
             }
             Err(reason) => anyhow::bail!("{authority} began the frame socket with an unreadable notice: {reason}"),
@@ -2908,32 +3294,190 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         Err(_) => anyhow::bail!("{authority} sent nothing on the frame socket within {STREAM_HELLO_TIMEOUT:?}"),
     };
     anyhow::ensure!(virt.0 > 0 && virt.1 > 0, "session dimensions must be positive");
+    let bound_text = match bound {
+        None => "route",
+        Some(remote::Bound::Device) => "device",
+        Some(remote::Bound::Address) => "address",
+    };
+    eprintln!(
+        "kwin-viewer: stream: session {}x{} on {authority}; path {}, {}; sender link {sender_link}, budget {}",
+        virt.0,
+        virt.1,
+        path.describe(),
+        match bound {
+            None => "the routing table's choice, nothing bound".to_owned(),
+            Some(remote::Bound::Device) =>
+                format!("socket bound to {} and to the interface (SO_BINDTODEVICE)", path.source),
+            Some(remote::Bound::Address) => format!(
+                "socket bound to {} only: SO_BINDTODEVICE {} was refused, so what this side sends leaves on the routing table's interface",
+                path.source, path.interface
+            ),
+        },
+        budget_text(budget)
+    );
+    let registry = choice.then_some(registry);
+    if let Some(registry) = &registry
+        && let Err(error) = registry.sender_budget(&path.interface, authority, budget)
+    {
+        eprintln!("kwin-viewer: stream: this stream is not counted on its path: {error}");
+    }
+    Ok(OpenedStream {
+        sink,
+        stream,
+        cap: bound.map(|_| path.usable_bits_per_second()).filter(|bits| *bits > 0),
+        path: StreamPath {
+            interface: path.interface,
+            source: local.to_string(),
+            mbps: path.mbps,
+            wireless: path.wireless,
+            bound: bound_text,
+            peer: authority.to_owned(),
+            sender_link,
+            budget,
+            share: budget,
+            streams: 1,
+            reconnects: 0,
+        },
+        registry,
+        virt,
+        title,
+        clipboard_text_bytes,
+    })
+}
+
+// Asks the kwin-mcp server that started this viewer for the ticket of a new
+// frame socket: it has the session's listener start a frame sender on the
+// socket that presents the ticket.
+fn request_ticket(status_dir: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+    let mut socket = std::os::unix::net::UnixStream::connect(status_dir.join(links::RECONNECT_SOCKET))?;
+    socket.set_read_timeout(Some(STREAM_TICKET_WAIT))?;
+    socket.set_write_timeout(Some(STREAM_TICKET_WAIT))?;
+    writeln!(socket, "{}", links::RECONNECT_REQUEST)?;
+    let mut line = String::new();
+    std::io::BufReader::new(&socket).read_line(&mut line)?;
+    let ticket = line.trim();
+    anyhow::ensure!(remote::valid_ticket(ticket), "the server gave no ticket: {ticket}");
+    Ok(ticket.to_owned())
+}
+
+// Whether a frame socket ended because nothing crosses its path any more:
+// the kernel gave up waiting for the peer, or has no way to it. A socket the
+// peer closed or reset ended over a path that works.
+fn path_died(error: &async_tungstenite::tungstenite::Error) -> bool {
+    use nix::libc::{EHOSTUNREACH, ENETDOWN, ENETUNREACH, ETIMEDOUT};
+    matches!(
+        error,
+        async_tungstenite::tungstenite::Error::Io(error)
+            if matches!(error.raw_os_error(), Some(ETIMEDOUT | EHOSTUNREACH | ENETUNREACH | ENETDOWN))
+    )
+}
+
+// What writes a stream viewer's input records and requests to its frame
+// socket, and moves on to the socket that replaces it.
+enum Wrote {
+    Sent,
+    Failed,
+    // The socket, and what its sender is asked to pace to.
+    Replaced((FrameSink, Option<u64>)),
+}
+
+fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    ensure_host_display()?;
+    let ticket = std::env::var(remote::TICKET_ENV).map_err(|_| {
+        anyhow::anyhow!("{} is not set; kwin-mcp viewer_open starts this viewer", remote::TICKET_ENV)
+    })?;
+    let secret = remote::read_secret().map_err(anyhow::Error::msg)?;
+    let runtime = stream_runtime()?;
+    let paths = StreamPaths::new(authority);
+    let OpenedStream { sink, mut stream, path, registry, virt, title: first_title, clipboard_text_bytes, cap } =
+        open_stream(runtime.handle(), &paths, &secret, &ticket, None)?;
+    let sender_clipboard = clipboard_text_bytes;
 
     let title = Arc::new(Mutex::new(first_title));
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let stats = Arc::new(StreamStats::default());
+    path.write(status_dir);
+    *stats.path() = path;
+    let registry = Arc::new(Mutex::new(registry));
 
-    // Input records go out as they are queued, whatever the frame thread does.
+    // Input records go out as they are queued, whatever the frame thread
+    // does. When the socket's path dies, the frame thread hands over the
+    // socket that replaces it: the drawable size and the first-presentation
+    // notice are said again on it, because the frame sender there is new.
     let (ops, mut queued) = tokio::sync::mpsc::channel::<Outgoing>(STREAM_INPUT_QUEUE);
+    let (sinks, mut replaced) = tokio::sync::mpsc::unbounded_channel::<(FrameSink, Option<u64>)>();
     let (closed, sink_closed) = tokio::sync::oneshot::channel::<()>();
     runtime.spawn(async move {
-        while let Some(outgoing) = queued.recv().await {
-            let message = match outgoing {
-                Outgoing::Op(op) => Message::Binary(op.encode().to_vec().into()),
-                Outgoing::Request(request) => match serde_json::to_string(&request) {
-                    Ok(text) => Message::text(text),
-                    Err(_) => continue,
-                },
+        let mut sink = Some(sink);
+        let mut size = None;
+        let mut presented = false;
+        loop {
+            let wrote = {
+                let outgoing = tokio::select! {
+                    biased;
+                    Some(next) = replaced.recv() => Err(next),
+                    outgoing = queued.recv() => Ok(outgoing),
+                };
+                match outgoing {
+                    Err(next) => Wrote::Replaced(next),
+                    Ok(None) => break,
+                    Ok(Some(outgoing)) => {
+                        let message = match outgoing {
+                            Outgoing::Op(op) => {
+                                match op {
+                                    Op::Size(..) => size = Some(op),
+                                    Op::Presented => presented = true,
+                                    Op::Motion(..) | Op::Button(..) | Op::Axis(..) | Op::Key(..) => {}
+                                }
+                                Message::Binary(op.encode().to_vec().into())
+                            }
+                            Outgoing::Request(request) => match serde_json::to_string(&request) {
+                                Ok(text) => Message::text(text),
+                                Err(_) => continue,
+                            },
+                        };
+                        // Without a socket, between one whose path died and
+                        // its replacement, input goes nowhere.
+                        let Some(current) = sink.as_mut() else { continue };
+                        tokio::select! {
+                            biased;
+                            Some(next) = replaced.recv() => Wrote::Replaced(next),
+                            sent = current.send(message) => if sent.is_ok() { Wrote::Sent } else { Wrote::Failed },
+                        }
+                    }
+                }
             };
-            if sink.send(message).await.is_err() {
-                break;
+            match wrote {
+                Wrote::Sent => {}
+                Wrote::Failed => sink = None,
+                Wrote::Replaced((mut next, cap)) => {
+                    let path = cap
+                        .and_then(|bits_per_second| serde_json::to_string(&Request::Path { bits_per_second }).ok())
+                        .map(Message::text);
+                    let again = size
+                        .into_iter()
+                        .chain(presented.then_some(Op::Presented))
+                        .map(|op| Message::Binary(op.encode().to_vec().into()));
+                    let mut said = true;
+                    for message in path.into_iter().chain(again) {
+                        said &= next.send(message).await.is_ok();
+                    }
+                    sink = said.then_some(next);
+                }
             }
         }
-        let _ = sink.close().await;
+        if let Some(mut sink) = sink {
+            let _ = sink.close().await;
+        }
         let _ = closed.send(());
     });
     let ops = OpSink::Socket(ops, shutdown.clone());
+    if let Some(bits_per_second) = cap {
+        ops.request(Request::Path { bits_per_second });
+    }
     // The clipboard of this machine, where the window and its user are. A
     // sender that does not bridge the clipboard gets no request, and the
     // window works without the bridge when this machine's compositor gives
@@ -3000,59 +3544,124 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         })?;
     }
     {
-        let (title, stats, shutdown) = (Arc::clone(&title), Arc::clone(&stats), shutdown.clone());
-        let handle = runtime.handle().clone();
+        let (title, stats, shutdown, registry) =
+            (Arc::clone(&title), Arc::clone(&stats), shutdown.clone(), Arc::clone(&registry));
+        let (handle, status_dir) = (runtime.handle().clone(), status_dir.to_owned());
         std::thread::Builder::new().name("stream-frames".to_owned()).spawn(move || {
             let mut decoder: Option<Arc<dsc::Decoder>> = None;
+            // One pass for each frame socket: the first, and one for every
+            // time the path of the one before died.
             loop {
-                match handle.block_on(stream.next()) {
-                    Some(Ok(Message::Binary(message))) => {
-                        let Some((header, payload)) = Header::decode(&message) else {
-                            eprintln!("kwin-viewer: stream: unknown frame message of {} bytes", message.len());
-                            break;
-                        };
-                        if header.payload == Payload::Pps {
-                            match dsc::Pps::from_bytes(payload).and_then(dsc::Decoder::new) {
-                                Ok(next) => decoder = Some(Arc::new(next)),
-                                Err(error) => {
-                                    eprintln!("kwin-viewer: stream: picture parameter set: {error}");
-                                    break;
-                                }
+                let died = loop {
+                    let next = handle
+                        .block_on(async { tokio::time::timeout(STREAM_PATH_CHECK, stream.next()).await });
+                    match next {
+                        // Nothing arrived: a still screen, or a dead path.
+                        Err(_) => {
+                            if shutdown.requested() {
+                                break None;
                             }
-                            stats.counters().parameter_sets += 1;
-                            continue;
+                            let interface = stats.path().interface.clone();
+                            if let Some(reason) = paths.dead(&interface) {
+                                break Some(reason);
+                            }
                         }
-                        stats.arrived(&header, message.len());
-                        let (newest, arrived) = &*undecoded;
-                        let replaced = newest
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .replace((message, decoder.clone()));
-                        if replaced.is_some() {
-                            stats.counters().recent.skipped += 1;
+                        Ok(Some(Ok(Message::Binary(message)))) => {
+                            let Some((header, payload)) = Header::decode(&message) else {
+                                eprintln!("kwin-viewer: stream: unknown frame message of {} bytes", message.len());
+                                break None;
+                            };
+                            if header.payload == Payload::Pps {
+                                match dsc::Pps::from_bytes(payload).and_then(dsc::Decoder::new) {
+                                    Ok(next) => decoder = Some(Arc::new(next)),
+                                    Err(error) => {
+                                        eprintln!("kwin-viewer: stream: picture parameter set: {error}");
+                                        break None;
+                                    }
+                                }
+                                stats.counters().parameter_sets += 1;
+                                continue;
+                            }
+                            stats.arrived(&header, message.len());
+                            let (newest, arrived) = &*undecoded;
+                            let replaced = newest
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace((message, decoder.clone()));
+                            if replaced.is_some() {
+                                stats.counters().recent.skipped += 1;
+                            }
+                            arrived.notify_one();
                         }
-                        arrived.notify_one();
-                    }
-                    Some(Ok(Message::Text(text))) => match Notice::decode(text.as_str()) {
-                        Ok(Notice::Title { title: next }) => {
-                            *title.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-                        }
-                        Ok(Notice::Clipboard { id, text }) => match &copy_answer {
-                            Some(answer) => answer.receive(id, text),
-                            None => eprintln!("kwin-viewer: stream: ignored a clipboard text this viewer did not ask for"),
+                        Ok(Some(Ok(Message::Text(text)))) => match Notice::decode(text.as_str()) {
+                            Ok(Notice::Title { title: next }) => {
+                                *title.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                            }
+                            Ok(Notice::Clipboard { id, text }) => match &copy_answer {
+                                Some(answer) => answer.receive(id, text),
+                                None => eprintln!("kwin-viewer: stream: ignored a clipboard text this viewer did not ask for"),
+                            },
+                            Ok(Notice::Share { bits_per_second, streams }) => {
+                                let mut path = stats.path();
+                                path.share = Some(bits_per_second);
+                                path.streams = streams;
+                                eprintln!("kwin-viewer: stream: {}", path.text());
+                                path.write(&status_dir);
+                            }
+                            Ok(Notice::Hello { .. } | Notice::Unknown) => {}
+                            Err(reason) => eprintln!("kwin-viewer: stream: unreadable notice: {reason}"),
                         },
-                        Ok(Notice::Hello { .. } | Notice::Unknown) => {}
-                        Err(reason) => eprintln!("kwin-viewer: stream: unreadable notice: {reason}"),
-                    },
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => {
-                        eprintln!("kwin-viewer: stream: the session's host closed the frame socket");
+                        Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => {}
+                        Ok(Some(Ok(Message::Close(_))) | None) => {
+                            eprintln!("kwin-viewer: stream: the session's host closed the frame socket");
+                            break None;
+                        }
+                        Ok(Some(Err(error))) => {
+                            eprintln!("kwin-viewer: stream: frame socket: {error}");
+                            break path_died(&error).then(|| error.to_string());
+                        }
+                    }
+                };
+                // A stream moves only off a dead path, and only when this
+                // machine has another one: the window keeps the picture it
+                // shows until the first one arrives on the new socket.
+                let Some(reason) = died else { break };
+                let before = stats.path().clone();
+                if shutdown.requested() || !paths.has_other(&before.interface) {
+                    break;
+                }
+                eprintln!(
+                    "kwin-viewer: stream: the path over {} died ({reason}); the window keeps its picture while the stream moves to another path",
+                    before.interface
+                );
+                let mut moved = None;
+                for attempt in 1..=STREAM_RECONNECT_ATTEMPTS {
+                    let opened = request_ticket(&status_dir)
+                        .and_then(|ticket| open_stream(&handle, &paths, &secret, &ticket, Some(&before.interface)));
+                    match opened {
+                        Ok(opened) => {
+                            moved = Some(opened);
+                            break;
+                        }
+                        Err(error) => eprintln!(
+                            "kwin-viewer: stream: no frame socket on another path (attempt {attempt} of {STREAM_RECONNECT_ATTEMPTS}): {error:#}"
+                        ),
+                    }
+                    if shutdown.requested() {
                         break;
                     }
-                    Some(Err(error)) => {
-                        eprintln!("kwin-viewer: stream: frame socket: {error}");
-                        break;
-                    }
+                }
+                let Some(opened) = moved else { break };
+                stream = opened.stream;
+                decoder = None;
+                *title.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = opened.title;
+                let path = StreamPath { reconnects: before.reconnects + 1, ..opened.path };
+                eprintln!("kwin-viewer: stream: reconnected: {}", path.text());
+                path.write(&status_dir);
+                *stats.path() = path;
+                *registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = opened.registry;
+                if sinks.send((opened.sink, opened.cap)).is_err() {
+                    break;
                 }
             }
             shutdown.request();
@@ -3089,6 +3698,10 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     // ends with the process.
     drop(input_state);
     let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink_closed).await });
+    // The next viewer no longer counts this stream on its path.
+    if let Some(registry) = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        registry.release();
+    }
     result
 }
 

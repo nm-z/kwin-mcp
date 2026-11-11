@@ -7111,6 +7111,160 @@ enum FrameSlot {
 #[derive(Default)]
 struct FrameSockets {
     slots: std::sync::Mutex<std::collections::BTreeMap<String, FrameSlot>>,
+    /// What the frame senders that took these sockets may send.
+    links: Arc<LinkScheduler>,
+}
+
+/// One interface's streams and where each one's grant goes.
+struct SharedLink {
+    shares: kwin_mcp::links::Shares,
+    grants: std::collections::BTreeMap<u64, tokio::sync::watch::Sender<kwin_mcp::links::Grant>>,
+}
+
+impl SharedLink {
+    /// Hands every sender whose grant changed its new one.
+    fn publish(&self) {
+        for (id, grant) in self.shares.grants() {
+            if let Some(granted) = self.grants.get(&id) {
+                granted.send_if_modified(|current| {
+                    let changed = *current != grant;
+                    *current = grant;
+                    changed
+                });
+            }
+        }
+    }
+}
+
+/// Divides each interface's link budget among the frame senders of a
+/// `--listen` server that send on it, whichever peer and session they belong
+/// to (`kwin_mcp::links::Shares` has the rule). The senders are processes of
+/// their own; each one's standard output is a socket to this scheduler, on
+/// which it reports when a picture is on the wire and reads what it is
+/// granted. A sender that ends closes the socket and leaves.
+#[derive(Default)]
+struct LinkScheduler {
+    links: std::sync::Mutex<std::collections::BTreeMap<String, SharedLink>>,
+    next_stream: std::sync::atomic::AtomicU64,
+}
+
+impl LinkScheduler {
+    fn links(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, SharedLink>> {
+        self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Applies `change` to `interface`'s streams, hands out the grants that
+    /// follow, and returns when a stream next stops counting as streaming.
+    fn change(
+        &self,
+        interface: &str,
+        change: impl FnOnce(&mut SharedLink, std::time::Instant),
+    ) -> Option<std::time::Instant> {
+        let mut links = self.links();
+        let link = links.get_mut(interface)?;
+        let now = std::time::Instant::now();
+        change(link, now);
+        let next = link.shares.expire(now);
+        link.publish();
+        next
+    }
+
+    /// A frame sender starts on `interface`, whose streams may fill `budget`
+    /// bits per second together. Returns the sender's end of the socket.
+    fn join(
+        self: &Arc<Self>,
+        interface: &str,
+        budget: u64,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        let (ours, theirs) = tokio::net::UnixStream::pair()?;
+        let theirs = theirs.into_std()?;
+        theirs.set_nonblocking(false)?;
+        let id = self
+            .next_stream
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (grant, granted) = tokio::sync::watch::channel(kwin_mcp::links::Grant::default());
+        {
+            let mut links = self.links();
+            let link = links
+                .entry(interface.to_owned())
+                .or_insert_with(|| SharedLink {
+                    shares: kwin_mcp::links::Shares::new(budget),
+                    grants: std::collections::BTreeMap::new(),
+                });
+            link.shares.set_budget(budget);
+            link.shares.join(id);
+            link.grants.insert(id, grant);
+            link.publish();
+        }
+        tokio::spawn(Arc::clone(self).serve(interface.to_owned(), id, ours, granted));
+        Ok(theirs.into())
+    }
+
+    /// One sender's socket, until the sender closes it.
+    async fn serve(
+        self: Arc<Self>,
+        interface: String,
+        id: u64,
+        socket: tokio::net::UnixStream,
+        mut granted: tokio::sync::watch::Receiver<kwin_mcp::links::Grant>,
+    ) {
+        use kwin_mcp::links::{REPORT_BYTES, Report};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut reports, mut grants) = socket.into_split();
+        let mut unread: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; REPORT_BYTES * 8];
+        // When a stream of this interface stops counting as streaming.
+        let mut due: Option<std::time::Instant> = None;
+        // The sender waits for its first grant.
+        granted.mark_changed();
+        loop {
+            let lingered = async {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = granted.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let grant = *granted.borrow_and_update();
+                    if grants.write_all(&grant.encode()).await.is_err() {
+                        break;
+                    }
+                }
+                read = reports.read(&mut chunk) => {
+                    let Ok(length @ 1..) = read else { break };
+                    unread.extend_from_slice(chunk.get(..length).unwrap_or_default());
+                    while let Some(record) = unread
+                        .first_chunk::<REPORT_BYTES>()
+                        .copied()
+                    {
+                        unread.drain(..REPORT_BYTES);
+                        if let Some(report) = Report::decode(&record) {
+                            due = self.change(&interface, |link, now| {
+                                link.shares.report(id, report, now);
+                            });
+                        }
+                    }
+                }
+                () = lingered => due = self.change(&interface, |_, _| {}),
+            }
+        }
+        let mut links = self.links();
+        if let Some(link) = links.get_mut(&interface) {
+            link.shares.leave(id);
+            link.grants.remove(&id);
+            link.shares.expire(std::time::Instant::now());
+            link.publish();
+            if link.shares.is_empty() {
+                links.remove(&interface);
+            }
+        }
+    }
 }
 
 impl FrameSockets {
@@ -11041,14 +11195,34 @@ async fn spawn_viewer(
 /// Start the frame sender beside a session whose viewer window is on another
 /// machine: `kwin-viewer --stream-serve` with that viewer's frame socket as its
 /// stdin. It reports through the same status file and log as a local viewer,
-/// and ends when the socket closes or the session stops.
+/// and ends when the socket closes or the session stops. On an interface with
+/// a budget its standard output is its socket to `links`, which divides that
+/// budget among the senders on the interface.
 async fn spawn_frame_sender(
     host_xdg_dir: &Path,
     width: u32,
     height: u32,
     socket: std::net::TcpStream,
     link_mbps: Option<u64>,
+    links: &Arc<LinkScheduler>,
 ) -> Result<SessionProcess, String> {
+    let budget = socket
+        .local_addr()
+        .map(|local| kwin_mcp::viewer_stream::link_budget(local.ip(), link_mbps))
+        .map_err(|error| format!("frame socket: {error}"))?;
+    let shared = match budget.bits_per_second {
+        Some(bits) => match links.join(&budget.interface, bits) {
+            Ok(socket) => std::process::Stdio::from(socket),
+            Err(error) => {
+                eprintln!(
+                    "viewer_open: the frame sender paces itself to the whole budget of {}: {error}",
+                    budget.link
+                );
+                std::process::Stdio::null()
+            }
+        },
+        None => std::process::Stdio::null(),
+    };
     let log_path = host_xdg_dir.join("viewer.log");
     let _ = std::fs::remove_file(host_xdg_dir.join(VIEWER_STATUS_FILE));
     let _ = std::fs::remove_file(host_xdg_dir.join("viewer-pipewire.json"));
@@ -11067,7 +11241,7 @@ async fn spawn_frame_sender(
     }
     command
         .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(socket)))
-        .stdout(std::process::Stdio::null())
+        .stdout(shared)
         .stderr(std::process::Stdio::from(log_file));
     terminate_with_parent(&mut command);
     let child = spawn_session_child(command, false)
@@ -16886,8 +17060,15 @@ impl KwinMcp {
             (Some(child), _) => Ok(child),
             (None, Some((sockets, ticket))) => match sockets.claim(&ticket).await {
                 Ok(socket) => {
-                    spawn_frame_sender(&host_xdg_dir, width, height, socket, self.display.link_mbps)
-                        .await
+                    spawn_frame_sender(
+                        &host_xdg_dir,
+                        width,
+                        height,
+                        socket,
+                        self.display.link_mbps,
+                        &sockets.links,
+                    )
+                    .await
                 }
                 Err(reason) => Err(reason),
             },
@@ -23054,6 +23235,12 @@ impl Drop for RemoteHold<'_> {
 struct RemoteViewer {
     child: Option<SessionProcess>,
     dir: PathBuf,
+    /// The arguments of the viewer_open call that opened the window, for the
+    /// frame socket that replaces one whose path died.
+    arguments: Option<rmcp::model::JsonObject>,
+    /// Hands the window the ticket of such a frame socket
+    /// ([`RemoteSessions::serve_reconnects`]).
+    reconnects: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RemoteViewer {
@@ -23063,12 +23250,18 @@ impl RemoteViewer {
         Self {
             child: None,
             dir: session_runtime_root(&name).join(name),
+            arguments: None,
+            reconnects: None,
         }
     }
 
     /// Closes the window, which closes its frame socket and so ends the
     /// capture on the session's machine.
     async fn close(&mut self) -> bool {
+        if let Some(reconnects) = self.reconnects.take() {
+            reconnects.abort();
+        }
+        let _ = std::fs::remove_file(self.dir.join(kwin_mcp::links::RECONNECT_SOCKET));
         let Some(child) = self.child.take() else {
             return false;
         };
@@ -23118,6 +23311,93 @@ impl RemoteSessions {
     ) -> Result<CallToolResult, McpError> {
         let _calling = self.calls.read().await;
         remote_call(peer, host, request).await
+    }
+    /// Serves the socket in `dir` on which the viewer window of session `id`
+    /// asks for the ticket of a new frame socket, after the path of its
+    /// first one died. Only a process of this user is answered.
+    fn serve_reconnects(
+        self: &Arc<Self>,
+        id: &str,
+        dir: &Path,
+    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        let path = dir.join(kwin_mcp::links::RECONNECT_SOCKET);
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let (remote, id) = (Arc::clone(self), id.to_owned());
+        Ok(tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let own = stream
+                    .peer_cred()
+                    .is_ok_and(|peer| peer.uid() == nix::unistd::geteuid().as_raw());
+                if own {
+                    remote.reticket(&id, stream).await;
+                }
+            }
+        }))
+    }
+    /// Answers one request on a viewer's reconnect socket: makes a ticket,
+    /// gives it to the viewer, which opens a frame socket with it on another
+    /// path, and has the session's listener start a frame sender on that
+    /// socket in place of the one whose path died. The window stays.
+    async fn reticket(&self, id: &str, stream: tokio::net::UnixStream) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (asked, mut answer) = stream.into_split();
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            FRAME_SOCKET_WAIT,
+            tokio::io::BufReader::new(asked).read_line(&mut line),
+        )
+        .await;
+        if !matches!(read, Ok(Ok(_))) || line.trim() != kwin_mcp::links::RECONNECT_REQUEST {
+            return;
+        }
+        // One viewer_open or viewer_close of a session at a time.
+        let viewers = self.viewers.lock().await;
+        let arguments = viewers
+            .get(id)
+            .filter(|viewer| viewer.child.is_some())
+            .map(|viewer| viewer.arguments.clone().unwrap_or_default());
+        let host = self.host_of(id);
+        let listener = match &host {
+            Some(host) => self.connected(host).await,
+            None => None,
+        };
+        let (Some(mut arguments), Some(host), Some(listener)) = (arguments, host, listener) else {
+            let _ = answer
+                .write_all(b"error: the session or its connection is gone\n")
+                .await;
+            return;
+        };
+        let ticket = remote::new_ticket();
+        arguments.insert("session_id".to_owned(), serde_json::json!(id));
+        arguments.insert("frame_ticket".to_owned(), serde_json::json!(ticket));
+        let Ok(request) = serde_json::from_value::<rmcp::model::CallToolRequestParams>(
+            serde_json::json!({"name": "viewer_open", "arguments": arguments}),
+        ) else {
+            return;
+        };
+        if answer
+            .write_all(format!("{ticket}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        eprintln!("viewer of {id}: its path died; {host} gets a new frame socket");
+        match self.call(&listener, &host, request).await {
+            Ok(result) => {
+                let state = result
+                    .structured_content
+                    .as_ref()
+                    .map(|data| viewer_summary(&data["viewer"]))
+                    .unwrap_or_default();
+                eprintln!("viewer of {id}: the frame sender on {host} restarted: {state}");
+            }
+            Err(error) => eprintln!(
+                "viewer of {id}: {host} started no frame sender on the new socket: {}",
+                error.message
+            ),
+        }
     }
     /// The connection to `host`, opened now unless one is open. The listener
     /// sees `client`, so it shapes results for the client that reads them.
@@ -23252,7 +23532,7 @@ impl RemoteSessions {
     /// In the image a server re-executed into: continues on the inherited
     /// control sockets. A session whose connection did not come along is
     /// reported as `connection_lost`, as after any dropped connection.
-    async fn restore(&self, state: RemoteRestore, client: Option<rmcp::model::ClientInfo>) {
+    async fn restore(self: &Arc<Self>, state: RemoteRestore, client: Option<rmcp::model::ClientInfo>) {
         let mut hosts = self.hosts.lock().await;
         for saved in state.hosts {
             let owned = state
@@ -23289,6 +23569,7 @@ impl RemoteSessions {
         for (id, pid) in state.viewers {
             let mut viewer = RemoteViewer::new(&id);
             viewer.child = Some(SessionProcess { pid, status: None });
+            viewer.reconnects = self.serve_reconnects(&id, &viewer.dir).ok();
             viewers.insert(id, viewer);
         }
     }
@@ -23330,6 +23611,20 @@ async fn remote_call(
             ),
         )),
     }
+}
+
+/// `viewer` with the path of the stream viewer whose files are in `dir`: the
+/// interface of this machine its frames arrive on with its speed, the link
+/// they leave the session's machine on, and the stream's share of that
+/// link's budget, as the viewer last wrote them.
+fn with_path(mut viewer: serde_json::Value, dir: &Path) -> serde_json::Value {
+    let path = std::fs::read_to_string(dir.join(kwin_mcp::links::PATH_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    if let (Some(path), Some(viewer)) = (path, viewer.as_object_mut()) {
+        viewer.insert("path".to_owned(), path);
+    }
+    viewer
 }
 
 /// A viewer_open or viewer_close result for a session on `host`, in the form
@@ -23652,7 +23947,7 @@ impl SessionRouter {
                     .and_then(|result| result.structured_content)
                     .is_some_and(|data| data["status"] == "already_open");
                 if sending {
-                    return Ok(remote_viewer_result(peer, "already_open", shown, host).await);
+                    return Ok(remote_viewer_result(peer, "already_open", with_path(shown, &viewer.dir), host).await);
                 }
             }
             viewer.close().await;
@@ -23670,6 +23965,18 @@ impl SessionRouter {
             .arguments
             .get_or_insert_with(Default::default)
             .insert("frame_ticket".to_owned(), serde_json::json!(ticket));
+        viewer.arguments.clone_from(&request.arguments);
+        // The window asks here for a new frame socket when its path dies.
+        match self.remote.serve_reconnects(id, &viewer.dir) {
+            Ok(reconnects) => {
+                if let Some(before) = viewer.reconnects.replace(reconnects) {
+                    before.abort();
+                }
+            }
+            Err(error) => eprintln!(
+                "viewer of {id}: it cannot move to another path if its own dies: {error}"
+            ),
+        }
         // Returns once the frame sender there saw this window present a frame,
         // or with the reason it could not.
         let sender = self.remote.call(listener, host, request).await;
@@ -23726,7 +24033,7 @@ impl SessionRouter {
             return Ok(remote_viewer_result(peer, "unavailable", shown, host).await);
         }
         viewer.child = Some(child);
-        Ok(remote_viewer_result(peer, "opened", shown, host).await)
+        Ok(remote_viewer_result(peer, "opened", with_path(shown, &viewer.dir), host).await)
     }
     /// viewer_close for a session on another machine: closes the window here,
     /// which closes its frame socket, and has the listener reap the sender.

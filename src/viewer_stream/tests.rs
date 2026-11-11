@@ -216,41 +216,99 @@ fn pictures_are_never_larger_than_the_session() {
 
 #[test]
 fn the_budget_is_the_link_speed_unless_loopback_or_overridden() {
-    let wired = Interface {
-        name: "enp10s0".to_owned(),
-        loopback: false,
-        speed: Some("1000\n".to_owned()),
+    let interface = |name: &str, loopback: bool, wireless: bool, mbps: Option<u64>| Interface {
+        name: name.to_owned(),
+        loopback,
+        running: true,
+        wireless,
+        mbps,
+        addresses: Vec::new(),
     };
-    assert_eq!(
-        budget_of(None, Some(&wired)).bits_per_second,
-        Some(900_000_000)
-    );
-    let loopback = Interface {
-        name: "lo".to_owned(),
-        loopback: true,
-        speed: None,
-    };
+    let wired = interface("enp10s0", false, false, Some(1000));
+    let budget = budget_of(None, Some(&wired));
+    assert_eq!(budget.bits_per_second, Some(900_000_000));
+    assert_eq!(budget.interface, "enp10s0");
+    let loopback = interface("lo", true, false, None);
     assert_eq!(budget_of(None, Some(&loopback)).bits_per_second, None);
     assert_eq!(
         budget_of(Some(100), Some(&loopback)).bits_per_second,
         Some(90_000_000)
     );
-    // Wi-Fi and down links report nothing or -1.
+    // A down link reports nothing, and the rate a wireless one receives at
+    // is not what it sends at.
     let assumed = Some(UNKNOWN_LINK_MBPS * 10_000 * LINK_USABLE_PERCENT);
-    for speed in [None, Some("-1\n".to_owned()), Some(String::new())] {
-        let wireless = Interface {
-            name: "wlan0".to_owned(),
-            loopback: false,
-            speed,
-        };
-        assert_eq!(budget_of(None, Some(&wireless)).bits_per_second, assumed);
+    for unknown in [
+        interface("enp3s0", false, false, None),
+        interface("wlan0", false, true, None),
+        interface("wlan0", false, true, Some(864)),
+    ] {
+        assert_eq!(budget_of(None, Some(&unknown)).bits_per_second, assumed);
     }
-    assert_eq!(budget_of(None, None).bits_per_second, assumed);
+    let unknown = budget_of(None, None);
+    assert_eq!(unknown.bits_per_second, assumed);
+    assert_eq!(unknown.interface, "");
     assert!(
         budget_of(Some(250), Some(&wired))
             .link
             .contains("--link-mbps 250")
     );
+}
+
+#[test]
+fn a_changed_share_changes_the_link_speed_the_rule_works_with_at_once() {
+    let megabits = |control: &ModeControl| {
+        control
+            .estimate(PIXELS_1080P)
+            .link_bits_per_second
+            .map(|bits| bits / MEGABIT)
+    };
+    // Alone on a gigabit link: exact 1080p pictures, 56 ms each.
+    let mut control = ModeControl::new(Some(900 * MEGABIT));
+    control.encode_measured(PIXELS_1080P, millis(20));
+    assert_eq!(control.mode(PIXELS_1080P, true), Mode::Raw);
+    control.sent(&sent(Mode::Raw, PIXELS_1080P, millis(2), 880));
+    assert_eq!(megabits(&control), Some(880));
+    // A second viewer starts streaming: half the budget, and the measured
+    // speed halves with it before any picture measured the new share.
+    control.share(450 * MEGABIT);
+    assert_eq!(megabits(&control), Some(440));
+    // Raw now takes 115 ms, DSC at the carried rate far less: the mode
+    // follows the share after the usual four pictures, not at once.
+    for _ in 0..SWITCH_AFTER_FRAMES - 1 {
+        assert_eq!(control.mode(PIXELS_1080P, true), Mode::Raw);
+        control.sent(&sent(Mode::Raw, PIXELS_1080P, millis(2), 440));
+    }
+    assert!(!control.mode(PIXELS_1080P, true).is_raw());
+    assert_eq!(control.switches(), 1);
+    // The same share again changes nothing.
+    control.share(450 * MEGABIT);
+    assert_eq!(megabits(&control), Some(440));
+    // The other viewer stops: the whole budget again, never more than it.
+    control.share(900 * MEGABIT);
+    assert_eq!(megabits(&control), Some(880));
+    control.share(2000 * MEGABIT);
+    assert_eq!(megabits(&control), Some(880));
+    for _ in 0..SWITCH_AFTER_FRAMES {
+        control.mode(PIXELS_1080P, true);
+    }
+    assert_eq!(control.mode(PIXELS_1080P, true), Mode::Raw);
+    assert_eq!(control.switches(), 2);
+
+    // A stream that starts beside another decides its first picture for its
+    // share: 720p raw takes 49 ms on 450 Mb/s, 1080p raw 110 ms.
+    let mut second = ModeControl::new(Some(900 * MEGABIT));
+    second.share(450 * MEGABIT);
+    assert_eq!(megabits(&second), Some(450));
+    second.encode_measured(PIXELS_1080P, millis(20));
+    assert!(!second.mode(PIXELS_1080P, true).is_raw());
+    let mut alone = ModeControl::new(Some(900 * MEGABIT));
+    alone.encode_measured(PIXELS_1080P, millis(20));
+    assert_eq!(alone.mode(PIXELS_1080P, true), Mode::Raw);
+
+    // An unlimited stream has no share.
+    let mut unlimited = ModeControl::new(None);
+    unlimited.share(10 * MEGABIT);
+    assert_eq!(megabits(&unlimited), None);
 }
 
 const PIXELS_1080P: u64 = 1920 * 1080;
