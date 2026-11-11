@@ -16775,6 +16775,32 @@ impl KwinMcp {
             &params.text,
         )
         .await;
+        // A transient window of the browser (its GTK file chooser) is not web
+        // content and exposes nothing to AT-SPI; it types unverified like any app.
+        let needs_editable_target = chrome
+            && !snapshot.transient
+            && !params.text.is_empty()
+            && !params.text.contains(['\t', '\n']);
+        // The browser publishes a focus change to accessibility some time after
+        // the click that caused it, and a loaded renderer takes longer: a field
+        // that shows a caret can still read as focus on the page. Give it a
+        // moment to say where focus went before refusing.
+        let settled = tokio::time::Instant::now() + BROWSER_FOCUS_SETTLE;
+        while needs_editable_target
+            && let Err(error) = &receipt
+            && refuses_browser_typing(error)
+            && !error.is::<input_bridge::TextDiscoveryTimedOut>()
+            && tokio::time::Instant::now() < settled
+        {
+            tokio::time::sleep(BROWSER_FOCUS_POLL).await;
+            receipt = input_bridge::TextReceipt::capture(
+                &sess.atspi_bus_address,
+                active.text_window(),
+                Some([active.cx, active.cy]),
+                &params.text,
+            )
+            .await;
+        }
         if params.replace.unwrap_or(false) {
             // Select all only where the selection can be read back and ctrl+a means
             // select-all: a readable editable field, never a terminal.
@@ -16809,18 +16835,9 @@ impl KwinMcp {
             )
             .await;
         }
-        // A transient window of the browser (its GTK file chooser) is not web
-        // content and exposes nothing to AT-SPI; it types unverified like any app.
-        if !params.text.is_empty()
-            && !params.text.contains(['\t', '\n'])
-            && chrome
-            && !snapshot.transient
+        if needs_editable_target
             && let Err(error) = &receipt
-            && !error.is::<input_bridge::TerminalFocus>()
-            && !error.is::<input_bridge::ProtectedFocus>()
-            // Focus is on an editable field that only cannot be read back: the
-            // keys are sent and the result says the text is unverified.
-            && !error.is::<input_bridge::UnreadableFocus>()
+            && refuses_browser_typing(error)
         {
             // Slowness is not an unobservable field: say so, so the caller retries
             // instead of hunting for a different field.
@@ -19074,6 +19091,20 @@ fn existing_text_warning(prior: &str) -> String {
         "The field already held {:?} and the text was inserted at the caret, not over it. Use replace=true to overwrite the field's text.",
         field_excerpt(prior)
     )
+}
+
+/// How long keyboard_type waits for a browser to publish a focus change before
+/// it refuses to type, and how often it looks.
+const BROWSER_FOCUS_SETTLE: Duration = Duration::from_millis(1500);
+const BROWSER_FOCUS_POLL: Duration = Duration::from_millis(150);
+
+/// Whether a failed read of the focused field stops single-line typing into a
+/// browser. A terminal, a protected field and an editable field that only
+/// cannot be read back take the keys; their result says the text is unverified.
+fn refuses_browser_typing(error: &anyhow::Error) -> bool {
+    !error.is::<input_bridge::TerminalFocus>()
+        && !error.is::<input_bridge::ProtectedFocus>()
+        && !error.is::<input_bridge::UnreadableFocus>()
 }
 
 /// What a paste into a terminal reports: its text shows on screen only.
