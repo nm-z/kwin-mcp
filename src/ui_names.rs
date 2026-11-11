@@ -86,14 +86,20 @@ fn role_names(role: &str) -> impl Iterator<Item = &str> {
     }))
 }
 
+/// Roles of words shown on the screen. A caller asks for them as `text` (#882);
+/// AT-SPI's own `text` role is an editable area.
+const SHOWN_TEXT_ROLES: [&str; 5] = ["static", "label", "paragraph", "heading", "caption"];
+
 /// Whether an element of role `actual` passes a `role` filter of `wanted`, in
-/// either source's vocabulary.
+/// either source's vocabulary. A filter of `text` also passes shown words.
 pub fn role_matches(wanted: Option<&str>, actual: &str) -> bool {
     let Some(wanted) = wanted else {
         return true;
     };
     let wanted = text_key(wanted);
-    role_names(&text_key(actual)).any(|name| name == wanted)
+    let actual = text_key(actual);
+    role_names(&actual).any(|name| name == wanted)
+        || wanted == "text" && SHOWN_TEXT_ROLES.contains(&actual.as_str())
 }
 
 /// Whether an element is what a query asks for. `matches` compares one

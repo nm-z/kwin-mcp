@@ -10938,6 +10938,7 @@ fn capture_target_metadata(window: &WindowGeometry) -> serde_json::Value {
     })
 }
 
+#[derive(Clone)]
 struct AtspiNode {
     name: String,
     role: String,
@@ -11729,12 +11730,15 @@ struct MouseClickElementParams {
     speed: Option<f64>,
     /// Name or role text to find, as for find_ui_elements.
     query: String,
-    /// Semantic role filter; "button" includes native push/toggle buttons.
+    /// Semantic role filter; "button" includes native push/toggle buttons, "text"
+    /// static text and labels.
     role: Option<String>,
-    /// Match the whole name or role instead of any part of it.
+    /// Match the whole name or role instead of any part of it. With a role, a control
+    /// of that role also matches by the whole text of a label inside it.
     exact: Option<bool>,
-    /// Which match to click, counting only visible matches whose bounds are usable
-    /// for clicking, in the order find_ui_elements lists them. Default 0.
+    /// Which match to click, counting only matches shown in the active window,
+    /// controls before plain text, each in the order find_ui_elements lists them.
+    /// Default 0.
     index: Option<usize>,
     button: Option<String>,
     double: Option<bool>,
@@ -11743,31 +11747,247 @@ struct MouseClickElementParams {
     timeout_seconds: Option<u32>,
 }
 
-/// The center of the `index`-th element whose bounds can be clicked, as
-/// window-relative pixels, with how many such elements there were.
-fn clickable_center(
-    elements: &[serde_json::Value],
-    index: usize,
-) -> Result<(i32, i32, usize, serde_json::Value), String> {
-    let usable: Vec<&serde_json::Value> = elements
-        .iter()
-        .filter(|element| element["mouse_coordinates_usable"] == true && element["visible"] != false)
-        .collect();
-    let Some(element) = usable.get(index) else {
-        return Err(format!(
-            "{} of {} matches can be clicked (visible, with bounds in the active window's pixels); index {index} is out of range",
-            usable.len(),
-            elements.len()
-        ));
-    };
+/// Why a match the search returned cannot be clicked where it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClickBlock {
+    /// Known only from the page DOM, in CSS viewport pixels.
+    PageDom,
+    /// Hidden, scrolled out of its frame, or in a minimized window.
+    NotShown,
+    /// Shown in a window of the session that is not the active one.
+    OtherWindow,
+    /// In the active window, under another window.
+    Covered,
+    /// Its frame is not paired with a KWin window, so its bounds are not window pixels.
+    Unmapped,
+}
+
+impl ClickBlock {
+    const ALL: [Self; 5] = [Self::OtherWindow, Self::NotShown, Self::Covered, Self::PageDom, Self::Unmapped];
+
+    fn cause(self) -> &'static str {
+        match self {
+            Self::PageDom => "page_dom_only",
+            Self::NotShown => "not_shown",
+            Self::OtherWindow => "other_window",
+            Self::Covered => "covered",
+            Self::Unmapped => "frame_not_paired_with_window",
+        }
+    }
+}
+
+/// `element` is a match in the form `find_ui_elements` returns without `compact`.
+fn click_block(element: &serde_json::Value) -> Option<ClickBlock> {
+    if element["backend"] == "cdp" {
+        Some(ClickBlock::PageDom)
+    } else if element["visible"] == false {
+        Some(ClickBlock::NotShown)
+    } else if element["mouse_coordinates_usable"] != true {
+        let unpaired = matches!(
+            element["window_association"].as_str(),
+            Some("unverified" | "title_match_geometry_unverified" | FRAME_LINK_SHARED_CAPTION)
+        );
+        Some(if element["window_id"].is_string() && !unpaired { ClickBlock::OtherWindow } else { ClickBlock::Unmapped })
+    } else if element["occluded"] == true {
+        Some(ClickBlock::Covered)
+    } else {
+        None
+    }
+}
+
+/// Controls before plain text, each in listed order: a click by name means the
+/// button called "Your Chrome", not the paragraph that mentions it.
+fn controls_first<'a>(elements: impl Iterator<Item = &'a serde_json::Value>) -> Vec<&'a serde_json::Value> {
+    let (controls, text): (Vec<_>, Vec<_>) =
+        elements.partition(|element| !folds_into_ancestor(element["role"].as_str().unwrap_or_default()));
+    controls.into_iter().chain(text).collect()
+}
+
+/// The matches that can be clicked: shown in the active window, in its pixels.
+fn click_candidates(elements: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    controls_first(elements.iter().filter(|element| click_block(element).is_none()))
+}
+
+/// The window to activate when no match is in the active one.
+fn click_other_window(elements: &[serde_json::Value]) -> Option<&str> {
+    controls_first(elements.iter().filter(|element| click_block(element) == Some(ClickBlock::OtherWindow)))
+        .first()
+        .and_then(|element| element["window_id"].as_str())
+}
+
+/// The center of an element's bounds as window-relative pixels.
+fn element_center(element: &serde_json::Value) -> Result<(i32, i32), String> {
     let bounds = &element["bounds"];
     let number = |key: &str| bounds[key].as_f64().ok_or_else(|| format!("the match has no bounds.{key}"));
     #[expect(clippy::as_conversions)]
-    let (x, y) = (
+    let center = (
         (number("x")? + number("w")? / 2.0).round() as i32,
         (number("y")? + number("h")? / 2.0).round() as i32,
     );
-    Ok((x, y, usable.len(), serde_json::json!({"role": element["role"], "name": element["name"]})))
+    Ok(center)
+}
+
+/// `role 'name'` for up to three elements, with a count of the rest.
+fn click_named(elements: &[&serde_json::Value]) -> String {
+    let mut named: Vec<String> = elements
+        .iter()
+        .take(3)
+        .map(|element| {
+            format!(
+                "{} '{}'",
+                element["role"].as_str().unwrap_or_default(),
+                field_excerpt(element["name"].as_str().unwrap_or_default())
+            )
+        })
+        .collect();
+    if elements.len() > named.len() {
+        named.push(format!("{} more", elements.len() - named.len()));
+    }
+    named.join(", ")
+}
+
+/// What a refused click by name was asked for and what the searches returned.
+struct ClickRefusal<'a> {
+    query: &'a str,
+    role: Option<&'a str>,
+    exact: bool,
+    index: usize,
+    /// The matches of the caller's query.
+    matches: &'a [serde_json::Value],
+    /// The matches of the same text with no role filter and as part of a name; searched
+    /// only when `matches` is empty and a role or `exact` narrowed the query.
+    near: &'a [serde_json::Value],
+    /// Why a search did not cover everything.
+    unfinished: &'a [String],
+}
+
+impl ClickRefusal<'_> {
+    /// The cause as a stable word and the sentence for the caller: what is in the
+    /// way and the next step.
+    fn explain(&self) -> (&'static str, String) {
+        let Self { query, index, .. } = *self;
+        let clickable = click_candidates(self.matches).len();
+        let (cause, mut text) = if clickable > 0 {
+            (
+                "index_out_of_range",
+                format!(
+                    "{clickable} of {} matches of '{query}' can be clicked, so index {index} is out of range; use an index below {clickable}.",
+                    self.matches.len()
+                ),
+            )
+        } else if self.matches.is_empty() {
+            self.explain_no_match()
+        } else {
+            let mut cause = "";
+            let mut parts = Vec::new();
+            for block in ClickBlock::ALL {
+                let blocked: Vec<&serde_json::Value> =
+                    self.matches.iter().filter(|element| click_block(element) == Some(block)).collect();
+                let Some(first) = blocked.first() else { continue };
+                if cause.is_empty() {
+                    cause = block.cause();
+                }
+                let named = click_named(&blocked);
+                parts.push(match block {
+                    ClickBlock::OtherWindow => format!(
+                        "{named}: shown in window {}, which is not the active one; call window_activate with that id, then retry",
+                        first["window_id"].as_str().unwrap_or_default()
+                    ),
+                    ClickBlock::NotShown => format!(
+                        "{named}: not shown (scrolled out of view, in a collapsed part, or in a minimized window); scroll to it or open what holds it, then retry"
+                    ),
+                    ClickBlock::Covered => format!(
+                        "{named}: under another window; close that window or activate the one wanted with window_activate, then retry"
+                    ),
+                    ClickBlock::PageDom => format!(
+                        "{named}: known only from the page DOM, whose bounds are CSS viewport pixels, not window pixels; take a screenshot and use mouse_click with the position seen there"
+                    ),
+                    ClickBlock::Unmapped if first["window_association"] == FRAME_LINK_SHARED_CAPTION => format!(
+                        "{named}: several windows of the session have its frame's caption, so it is not known which of them shows it; take a screenshot of the window wanted and use mouse_click with the position seen there"
+                    ),
+                    ClickBlock::Unmapped => format!(
+                        "{named}: its frame could not be paired with a KWin window, so its bounds are not window pixels; take a screenshot and use mouse_click with the position seen there"
+                    ),
+                });
+            }
+            (
+                cause,
+                format!(
+                    "none of the {} matches of '{query}' can be clicked. {}.",
+                    self.matches.len(),
+                    parts.join(". ")
+                ),
+            )
+        };
+        if !self.unfinished.is_empty() {
+            text.push_str(&format!(
+                " The search did not finish ({}); pass timeout_seconds (up to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}) to search longer.",
+                self.unfinished.join("; ")
+            ));
+        }
+        let cause = if cause == "no_match" && !self.unfinished.is_empty() { "search_unfinished" } else { cause };
+        (cause, text)
+    }
+
+    /// Nothing matched: which of the role filter and `exact` left out an element
+    /// that carries the text.
+    fn explain_no_match(&self) -> (&'static str, String) {
+        let Self { query, role, exact, .. } = *self;
+        let wanted = find_ui_search_text(query);
+        let named = |element: &&serde_json::Value| {
+            let name = find_ui_search_text(element["name"].as_str().unwrap_or_default());
+            if exact { name == wanted } else { name.contains(&wanted) }
+        };
+        let fits = |element: &&serde_json::Value| find_ui_role_matches(role, element["role"].as_str().unwrap_or_default());
+        let exactly = if exact { "exactly " } else { "" };
+        let with_role = role.map(|role| format!(" with role '{role}'")).unwrap_or_default();
+        let near = controls_first(self.near.iter());
+        let other_role: Vec<&serde_json::Value> = near.iter().copied().filter(|element| named(element) && !fits(element)).collect();
+        let other_name: Vec<&serde_json::Value> = near.iter().copied().filter(|element| fits(element) && !named(element)).collect();
+        if !other_role.is_empty() {
+            (
+                "role_excluded",
+                format!(
+                    "no element{with_role} is named {exactly}'{query}'. The role filter left out {}; retry with that role, or without role.",
+                    click_named(&other_role)
+                ),
+            )
+        } else if !other_name.is_empty() {
+            (
+                "exact_excluded",
+                format!(
+                    "no element{with_role} is named {exactly}'{query}'. {} whose name contains it: {}; retry with the whole name, or with exact=false.",
+                    other_name.len(),
+                    click_named(&other_name)
+                ),
+            )
+        } else if !near.is_empty() {
+            (
+                "role_and_exact_excluded",
+                format!(
+                    "no element{with_role} is named {exactly}'{query}'. Elements whose name contains it have other roles: {}; retry with one of those roles and exact=false.",
+                    click_named(&near)
+                ),
+            )
+        } else {
+            (
+                "no_match",
+                format!(
+                    "no element's name or role contains '{query}'. Take a screenshot to see whether it is on screen; a control drawn without an accessible name needs mouse_click with its position."
+                ),
+            )
+        }
+    }
+}
+
+/// The elements and the reasons for an unfinished search in a `find_ui_elements` result.
+fn search_outcome(result: &CallToolResult) -> (Vec<serde_json::Value>, Vec<String>) {
+    let content = result.structured_content.as_ref();
+    let list = |key: &str| content.and_then(|content| content[key].as_array()).cloned().unwrap_or_default();
+    (
+        list("elements"),
+        list("errors").iter().filter_map(|error| error.as_str().map(str::to_owned)).collect(),
+    )
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -13249,25 +13469,101 @@ fn find_ui_role_matches(wanted: Option<&str>, actual: &str) -> bool {
     ui_names::role_matches(wanted, actual)
 }
 
-fn find_ui_frame_window<'a>(
+/// What the search knows about one top-level AT-SPI frame before pairing it with
+/// a KWin window.
+struct FrameFacts<'a> {
+    name: &'a str,
+    bounds: (i32, i32, i32, i32),
+    /// Process of the application that owns the frame, when the bus reports it.
+    pid: Option<u32>,
+}
+
+const FRAME_LINK_TITLE: &str = "unique_title_and_frame_size";
+const FRAME_LINK_PROCESS: &str = "process_and_frame_size";
+/// Several windows carry the frame's caption and nothing tells which one it is.
+const FRAME_LINK_SHARED_CAPTION: &str = "caption_shared_by_windows";
+
+/// The KWin window of each frame, with how it was paired.
+///
+/// A frame whose name is the caption of exactly one window is that window. That
+/// leaves out a frame named differently from its window: Chrome's profile picker is
+/// "Who's using Chrome?" in a window captioned "Google Chrome". Such a frame is
+/// paired by what else is known: the window belongs to the frame's process, has the
+/// frame's size, and no other unpaired frame could be it. Frames whose caption
+/// several windows share (two browser windows on one page) stay unpaired: Chrome
+/// does not reliably mark the active frame, so nothing tells them apart.
+fn pair_frames_with_windows<'a>(
     windows: &'a [WindowSnapshot],
-    name: &str,
-    _bounds: (i32, i32, i32, i32),
-) -> Option<&'a WindowSnapshot> {
-    if name.is_empty() {
-        return None;
+    frames: &[FrameFacts],
+) -> Vec<Option<(&'a WindowSnapshot, &'static str)>> {
+    let mut paired: Vec<Option<(&WindowSnapshot, &'static str)>> = frames
+        .iter()
+        .map(|frame| find_ui_frame_window(windows, frame.name, frame.bounds).map(|window| (window, FRAME_LINK_TITLE)))
+        .collect();
+    loop {
+        let taken = |window: &WindowSnapshot| paired.iter().flatten().any(|(other, _)| other.id == window.id);
+        // An untitled frame is a menu or popup with no KWin window of its own.
+        let open = |index: usize| paired[index].is_none() && !frames[index].name.is_empty();
+        let candidates = |index: usize| -> Vec<&'a WindowSnapshot> {
+            let frame = &frames[index];
+            // A frame captioned like some windows is one of those windows, and a window
+            // captioned like some frame is not the window of a frame named otherwise.
+            let captioned = find_ui_captioned_windows(windows, frame.name);
+            let claimed = |window: &WindowSnapshot| {
+                frames.iter().any(|other| find_ui_captioned_windows(std::slice::from_ref(window), other.name).len() == 1)
+            };
+            windows
+                .iter()
+                .filter(|window| {
+                    !window.popup
+                        && !taken(window)
+                        && find_ui_frame_aligned(window, frame.bounds)
+                        && frame.pid.is_none_or(|pid| i64::from(window.pid) == i64::from(pid))
+                        && if captioned.is_empty() {
+                            !claimed(window)
+                        } else {
+                            captioned.iter().any(|other| other.id == window.id)
+                        }
+                })
+                .collect()
+        };
+        let found = (0..frames.len()).filter(|&index| open(index)).find_map(|index| {
+            let own = candidates(index);
+            let [window] = own.as_slice() else { return None };
+            let contested = (0..frames.len())
+                .any(|other| other != index && open(other) && candidates(other).iter().any(|rival| rival.id == window.id));
+            (!contested).then_some((index, *window))
+        });
+        let Some((index, window)) = found else {
+            return paired;
+        };
+        paired[index] = Some((window, FRAME_LINK_PROCESS));
     }
-    let candidates = windows
+}
+
+/// The windows whose caption is the frame's name.
+fn find_ui_captioned_windows<'a>(windows: &'a [WindowSnapshot], name: &str) -> Vec<&'a WindowSnapshot> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    windows
         .iter()
         .filter(|window| {
             !window.title.is_empty()
                 && (input_bridge::caption_starts_with(&window.title, name)
                     || input_bridge::caption_starts_with(name, &window.title))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn find_ui_frame_window<'a>(
+    windows: &'a [WindowSnapshot],
+    name: &str,
+    _bounds: (i32, i32, i32, i32),
+) -> Option<&'a WindowSnapshot> {
     // A provider can report a window-local origin even for CoordType::Screen.
     // Do not use that origin to disambiguate equal-titled windows.
-    if let [window] = candidates.as_slice() {
+    if let [window] = find_ui_captioned_windows(windows, name).as_slice() {
         Some(*window)
     } else {
         None
@@ -13474,7 +13770,8 @@ fn find_elements_text(elements: &[serde_json::Value], surfaces: &[serde_json::Va
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindUiElementsParams {
     query: String,
-    /// Semantic role filter; "button" includes native push/toggle buttons.
+    /// Semantic role filter; "button" includes native push/toggle buttons, "text"
+    /// static text, labels, paragraphs and headings.
     role: Option<String>,
     /// Keep only matches reported visible; visibility alone does not prove clickability.
     visible_only: Option<bool>,
@@ -17059,7 +17356,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. Names compare with typographic punctuation folded ('…' is '...'); a role matches in its AT-SPI or page spelling (entry is textbox) and may lead the query as accessibility_tree prints it ('entry Ask anything'). An element the page renamed after a tree or search reported it is still matched by that name, and carries it as earlier_name beside its current name. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'); with a role, either also matches a control by a label inside it (matched_label). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. Names compare with typographic punctuation folded ('…' is '...'); a role matches in its AT-SPI or page spelling (entry is textbox) and may lead the query as accessibility_tree prints it ('entry Ask anything'). An element the page renamed after a tree or search reported it is still matched by that name, and carries it as earlier_name beside its current name. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -17166,38 +17463,95 @@ impl KwinMcp {
                 .destination("org.a11y.atspi.Registry").map_err(KwinError::from)?
                 .cache_properties(zbus::proxy::CacheProperties::No).build().await.map_err(KwinError::from)?;
             let mut visited = 0;
-            for app_obj in root.get_children().await.map_err(KwinError::from)? {
+            // Every application's top-level frames are read before any tree is walked:
+            // pairing frames with windows needs all of them, and the walk starts in the
+            // active window so a time limit cuts off other windows, not the one in use.
+            let dbus = zbus::fdo::DBusProxy::new(&bus).await.map_err(KwinError::from)?;
+            let mut tops = Vec::new();
+            for (app_index, app_obj) in root.get_children().await.map_err(KwinError::from)?.into_iter().enumerate() {
                 let Ok(app) = app_obj.as_accessible_proxy(&bus).await else { continue; };
                 let app_name = app.name().await.unwrap_or_default();
-                let mut frames = Vec::new();
+                let pid = dbus.get_connection_unix_process_id(app.inner().destination().to_owned()).await.ok();
                 for frame_obj in app.get_children().await.unwrap_or_default() {
                     let Ok(frame) = frame_obj.as_accessible_proxy(&bus).await else { continue; };
                     let Ok(frame_node) = atspi_node(&frame).await else { continue; };
-                    let associated = find_ui_frame_window(&windows, &frame_node.name, frame_node.bounds);
                     let provider = (frame.inner().destination().to_string(), frame.inner().path().to_string());
                     drop(frame);
-                    frames.push((frame_obj, provider, frame_node, associated));
+                    tops.push((app_index, app_name.clone(), pid, frame_obj, provider, frame_node));
                 }
-                // A Chrome menu or extension popup is an untitled frame of the same
-                // application with no KWin window of its own (#836). It reports screen
-                // coordinates like the frame of the active window it opened from.
-                let parent = frames.iter().find_map(|(_, _, node, window)| {
-                    window
-                        .filter(|window| window.active && find_ui_frame_aligned(window, node.bounds))
-                        .map(|window| (window, node.bounds))
-                });
-                for (frame_obj, (bus_name, frame_path), frame_node, associated) in frames {
-                    let popup = associated.is_none() && frame_node.name.is_empty() && parent.is_some();
-                    let (associated, origin) = match parent {
-                        Some((window, bounds)) if popup => (Some(window), bounds),
-                        _ => (associated, frame_node.bounds),
+            }
+            let facts: Vec<FrameFacts> = tops
+                .iter()
+                .map(|(_, _, pid, _, _, node)| FrameFacts {
+                    name: &node.name,
+                    bounds: node.bounds,
+                    pid: *pid,
+                })
+                .collect();
+            let paired = pair_frames_with_windows(&windows, &facts);
+            // A Chrome menu or extension popup is an untitled frame of the same
+            // application with no KWin window of its own (#836). It reports screen
+            // coordinates like the frame of the active window it opened from.
+            let parents: Vec<_> = tops
+                .iter()
+                .map(|(app, ..)| {
+                    tops.iter().zip(&paired).find_map(|((other, .., node), pair)| {
+                        pair.filter(|(window, _)| other == app && window.active && find_ui_frame_aligned(window, node.bounds))
+                            .map(|(window, _)| (window, node.bounds))
+                    })
+                })
+                .collect();
+            let is_popup = |index: usize| paired[index].is_none() && tops[index].5.name.is_empty() && parents[index].is_some();
+            let mut order: Vec<usize> = (0..tops.len()).collect();
+            order.sort_by_key(|&index| !(is_popup(index) || paired[index].is_some_and(|(window, _)| window.active)));
+            for index in order {
+                {
+                    let (_, app_name, _, frame_obj, (bus_name, frame_path), frame_node) = &tops[index];
+                    let popup = is_popup(index);
+                    let (associated, origin, link) = match parents[index] {
+                        Some((window, bounds)) if popup => (Some(window), bounds, "popup_of_active_window"),
+                        _ => (
+                            paired[index].map(|(window, _)| window),
+                            frame_node.bounds,
+                            match paired[index] {
+                                Some((_, how)) => how,
+                                None if find_ui_captioned_windows(&windows, &frame_node.name).len() > 1 => FRAME_LINK_SHARED_CAPTION,
+                                None => FRAME_LINK_TITLE,
+                            },
+                        ),
                     };
                     let surface = serde_json::json!({"application":app_name,"frame_title":frame_node.name,
                         "frame_screen_bounds":frame_node.bounds,"bus":bus_name,"frame_path":frame_path});
+                    // Popup nodes omit the Visible state; inside the shown popup frame,
+                    // they are on screen.
+                    let listed = |mut node: AtspiNode, path: String| {
+                        let (x, y, w, h) = node.bounds;
+                        let (fx, fy, fw, fh) = frame_node.bounds;
+                        if popup
+                            && x + w / 2 >= fx && y + h / 2 >= fy
+                            && x + w / 2 < fx + fw && y + h / 2 < fy + fh
+                            && !node.states.iter().any(|state| state == "visible")
+                        {
+                            node.states.push("visible".to_owned());
+                        }
+                        let mut matched = find_ui_native_match(&node, associated, &windows, origin);
+                        if link != FRAME_LINK_TITLE {
+                            matched["window_association"] = serde_json::json!(link);
+                        }
+                        matched["surface"] = surface.clone();
+                        matched["object_path"] = serde_json::json!(path);
+                        matched
+                    };
+                    // With a role filter and a whole-name match, a control is also found by
+                    // the text of a label inside it: a menu item named "All settings
+                    // Shift+Ctrl+," holds the text "All settings". `owners` are the controls
+                    // of the wanted role met on the way down, with whether each is listed.
+                    let label_search = params.role.is_some() && match_mode != FindMatch::Contains;
+                    let mut owners: Vec<(AtspiNode, String, bool)> = Vec::new();
                     // Each entry carries the index of the nearest matched ancestor, so a
                     // match inside a matched element is counted there, not listed again.
-                    let mut stack = vec![(frame_obj, None::<usize>)];
-                    while let Some((obj, matched_ancestor)) = stack.pop() {
+                    let mut stack = vec![(frame_obj.clone(), None::<usize>, None::<usize>)];
+                    while let Some((obj, matched_ancestor, owner)) = stack.pop() {
                         visited += 1;
                         if visited > FIND_UI_MAX_NODES || elements.len() >= FIND_UI_MAX_MATCHES {
                             return Err(McpError::internal_error("native search reached its node/match limit", None));
@@ -17205,52 +17559,57 @@ impl KwinMcp {
                         let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
                         let Ok(node) = atspi_node(&acc).await else { continue; };
                         let mut descendant_of = matched_ancestor;
+                        let mut owned_by = owner;
                         let object = format!("{}{}", acc.inner().destination(), acc.inner().path());
                         let asked = |text: &str| match_mode.matches(text, &query);
                         // A page can rename an element between the call that
                         // reported it and this one (a rotating hint): a name it
                         // was reported under still matches it.
                         let earlier_name = self.earlier_name(&object, &node, &asked);
+                        let name = find_ui_search_text(&node.name);
+                        let named = node.is_useful() && asked(&name);
+                        let role_fits = find_ui_role_matches(params.role.as_deref(), &node.role);
                         if node.is_useful()
+                            && role_fits
                             && (earlier_name.is_some() || ui_names::query_matches(&asked, &node.name, &node.role))
-                            && find_ui_role_matches(params.role.as_deref(), &node.role) {
+                        {
                             if let Some(ancestor) = matched_ancestor
                                 && folds_into_ancestor(&node.role)
                             {
                                 let count = elements[ancestor]["children_matched"].as_u64().unwrap_or(0);
                                 elements[ancestor]["children_matched"] = serde_json::json!(count + 1);
                             } else {
-                                // Popup nodes omit the Visible state; inside the shown popup
-                                // frame, they are on screen.
-                                let mut node = node;
-                                let (x, y, w, h) = node.bounds;
-                                let (fx, fy, fw, fh) = frame_node.bounds;
-                                if popup
-                                    && x + w / 2 >= fx && y + h / 2 >= fy
-                                    && x + w / 2 < fx + fw && y + h / 2 < fy + fh
-                                    && !node.states.iter().any(|state| state == "visible")
-                                {
-                                    node.states.push("visible".to_owned());
-                                }
-                                let mut matched = find_ui_native_match(&node, associated, &windows, origin);
-                                if popup {
-                                    matched["window_association"] = serde_json::json!("popup_of_active_window");
-                                }
+                                let current_name = node.name.clone();
+                                let mut matched = listed(node, acc.inner().path().to_string());
                                 if !visible_only || matched["visible"] == true {
-                                    matched["surface"] = surface.clone();
-                                    matched["object_path"] = serde_json::json!(acc.inner().path().to_string());
                                     if let Some(earlier) = &earlier_name {
                                         matched["earlier_name"] = serde_json::json!(earlier);
                                     }
-                                    self.note_name(&object, &node.name);
+                                    self.note_name(&object, &current_name);
                                     elements.push(matched);
                                     descendant_of = Some(elements.len() - 1);
+                                    owned_by = None;
                                 }
                             }
+                        } else if label_search && named && folds_into_ancestor(&node.role) {
+                            if let Some((control, path, shown)) = owner.and_then(|owner| owners.get_mut(owner))
+                                && !*shown
+                                && find_ui_search_text(&control.name).contains(&name)
+                            {
+                                *shown = true;
+                                let mut matched = listed(control.clone(), path.clone());
+                                matched["matched_label"] = serde_json::json!(node.name);
+                                if !visible_only || matched["visible"] == true {
+                                    elements.push(matched);
+                                }
+                            }
+                        } else if label_search && role_fits && node.is_useful() && !folds_into_ancestor(&node.role) {
+                            owners.push((node, acc.inner().path().to_string(), false));
+                            owned_by = Some(owners.len() - 1);
                         }
                         stack.extend(
                             acc.get_children().await.unwrap_or_default().into_iter().rev()
-                                .map(|child| (child, descendant_of)),
+                                .map(|child| (child, descendant_of, owned_by)),
                         );
                     }
                 }
@@ -17867,47 +18226,115 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_click_element",
-        description = "Find an element by name/role as find_ui_elements does, at the moment of the click, and click the center of its bounds. Use it where the layout shifts between steps (an answer check that inserts a feedback block) so coordinates from an earlier look would miss. index picks which clickable match (visible, bounds in the active window's pixels) when several match; default 0. exact, role, button, double and triple work as in find_ui_elements and mouse_click. Reports which element was clicked and how many were clickable. Fails without clicking when nothing clickable matches."
+        description = "Find an element by name/role as find_ui_elements does, at the moment of the click, and click the center of its bounds. Use it where the layout shifts between steps (an answer check that inserts a feedback block) so coordinates from an earlier look would miss. A match is clickable when it is shown in the active window. If none is and a match is shown in another window of the session, that window is activated first and the result names it as activated_window. index picks among the clickable matches, controls before plain text, each in listed order; default 0. exact, role, button, double and triple work as in find_ui_elements and mouse_click. Reports which element was clicked and how many were clickable. Fails without clicking when nothing clickable matches; the error says why (cause: role_excluded, exact_excluded, not_shown, other_window, covered, page_dom_only, frame_not_paired_with_window, index_out_of_range, search_unfinished, no_match), names the elements it saw, and gives the next step."
     )]
     async fn mouse_click_element(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<MouseClickElementParams>,
     ) -> Result<CallToolResult, McpError> {
-        let found = self
-            .find_ui_elements(
-                peer.clone(),
-                Parameters(FindUiElementsParams {
-                    query: params.query.clone(),
-                    role: params.role.clone(),
-                    visible_only: Some(true),
-                    timeout_seconds: params.timeout_seconds,
-                    limit: Some(FIND_UI_MAX_MATCHES),
-                    compact: None,
-                    exact: params.exact,
-                    whole_word: None,
-                }),
+        let index = params.index.unwrap_or(0);
+        // Hidden matches are kept: a refusal names them instead of reporting no match.
+        let search = |role: Option<String>, exact: Option<bool>| {
+            Parameters(FindUiElementsParams {
+                query: params.query.clone(),
+                role,
+                visible_only: None,
+                timeout_seconds: params.timeout_seconds,
+                limit: Some(FIND_UI_MAX_MATCHES),
+                compact: None,
+                exact,
+                whole_word: None,
+            })
+        };
+        let wanted = || search(params.role.clone(), params.exact);
+        let (mut elements, mut unfinished) =
+            search_outcome(&self.find_ui_elements(peer.clone(), wanted()).await?);
+        // A match shown only in another window of the session is clicked there.
+        let mut activated = None;
+        let mut note = String::new();
+        if click_candidates(&elements).is_empty()
+            && let Some(window_id) = click_other_window(&elements).map(str::to_owned)
+        {
+            let activation = activate_window(
+                &self.kwin_conn().await?,
+                &self.kwin_unique_name().await?,
+                &self.host_xdg_dir().await?,
+                &window_id,
             )
-            .await?;
-        let elements = found
-            .structured_content
-            .as_ref()
-            .and_then(|content| content["elements"].as_array())
-            .cloned()
-            .unwrap_or_default();
-        let (x, y, clickable, clicked) = clickable_center(&elements, params.index.unwrap_or(0))
-            .map_err(|detail| {
-                McpError::invalid_params(
-                    format!(
-                        "Nothing was clicked: no element matching '{}' can be clicked: {detail}. Check the query with find_ui_elements.",
-                        params.query
-                    ),
-                    Some(serde_json::json!({
-                        "reason": "no_clickable_element", "retry_safe": true,
-                        "matches": elements.len(),
-                    })),
-                )
-            })?;
+            .await;
+            match activation {
+                Ok(window) => {
+                    self.mark_input().await;
+                    (elements, unfinished) =
+                        search_outcome(&self.find_ui_elements(peer.clone(), wanted()).await?);
+                    note = if window.id == window_id {
+                        format!(" Window {} ('{}') was activated to click it there.", window.id, window.title)
+                    } else {
+                        format!(
+                            " Activating window {window_id} gave focus to its dialog {} ('{}'); answer or close that dialog first.",
+                            window.id, window.title
+                        )
+                    };
+                    activated = Some(serde_json::json!({"id": window.id, "title": window.title}));
+                }
+                Err(error) => note = format!(" Activating window {window_id} failed: {error}."),
+            }
+        }
+        let candidates = click_candidates(&elements);
+        let target = candidates
+            .get(index)
+            .map(|element| element_center(element).map(|center| (center, *element)));
+        let ((x, y), element) = match target {
+            Some(Ok(target)) => target,
+            other => {
+                let near = if elements.is_empty() && (params.role.is_some() || params.exact == Some(true)) {
+                    let (near, more) = search_outcome(&self.find_ui_elements(peer.clone(), search(None, None)).await?);
+                    unfinished.extend(more);
+                    unfinished.dedup();
+                    near
+                } else {
+                    Vec::new()
+                };
+                let (cause, detail) = match other {
+                    Some(Err(detail)) => ("no_bounds", format!("{detail}.")),
+                    Some(Ok(_)) | None => ClickRefusal {
+                        query: &params.query,
+                        role: params.role.as_deref(),
+                        exact: params.exact == Some(true),
+                        index,
+                        matches: &elements,
+                        near: &near,
+                        unfinished: &unfinished,
+                    }
+                    .explain(),
+                };
+                let seen: Vec<serde_json::Value> = controls_first(if elements.is_empty() { near.iter() } else { elements.iter() })
+                    .into_iter()
+                    .take(5)
+                    .map(|element| {
+                        let mut seen = serde_json::json!({"role": element["role"], "name": element["name"]});
+                        for key in ["visible", "window_id"] {
+                            if !element[key].is_null() {
+                                seen[key] = element[key].clone();
+                            }
+                        }
+                        seen
+                    })
+                    .collect();
+                let mut data = serde_json::json!({
+                    "reason": "no_clickable_element", "cause": cause, "retry_safe": true,
+                    "matches": elements.len(), "clickable": candidates.len(), "seen": seen,
+                });
+                if let Some(window) = activated {
+                    data["activated_window"] = window;
+                }
+                return Err(McpError::invalid_params(format!("Nothing was clicked: {detail}{note}"), Some(data)));
+            }
+        };
+        let clicked = serde_json::json!({"role": element["role"], "name": element["name"]});
+        let clickable = candidates.len();
+        let disabled = element["enabled"] == false;
         self.mouse_click(
             peer.clone(),
             Parameters(MouseClickParams {
@@ -17921,12 +18348,18 @@ impl KwinMcp {
             }),
         )
         .await?;
-        Ok(structured_result(
-            &peer,
-            format!("clicked {clicked} at ({x},{y})"),
-            serde_json::json!({"clicked": clicked, "at": [x, y], "clickable": clickable}),
-        )
-        .await)
+        let mut text = format!("clicked {clicked} at ({x},{y})");
+        let mut data = serde_json::json!({"clicked": clicked, "at": [x, y], "clickable": clickable});
+        if let Some(window) = activated {
+            text.push_str(&format!(" after activating its window {} ('{}')", window["id"], window["title"]));
+            data["activated_window"] = window;
+        }
+        if disabled {
+            let warning = "The element reports itself disabled, so the click may have had no effect.";
+            data["warning"] = serde_json::json!(warning);
+            text.push_str(&format!(". {warning}"));
+        }
+        Ok(structured_result(&peer, text, data).await)
     }
 
     #[rmcp::tool(
@@ -25371,7 +25804,7 @@ mod launch_warning_tests {
 mod startup_report_tests {
     use super::{
         DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        FindMatch, ResultView, WindowSnapshot, clickable_center, folds_into_ancestor, place_body, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
+        FindMatch, ResultView, WindowSnapshot, ClickRefusal, click_candidates, click_other_window, element_center, folds_into_ancestor, place_body, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
         descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
@@ -25706,14 +26139,93 @@ mod startup_report_tests {
             element("first", 100.0, true, true),
             element("second", 300.0, true, true),
         ];
-        let (x, y, clickable, clicked) = clickable_center(&elements, 0).expect("a clickable match");
-        assert_eq!((x, y, clickable), (140, 112, 2));
-        assert_eq!(clicked["name"], "first");
-        let (x, ..) = clickable_center(&elements, 1).expect("the second");
-        assert_eq!(x, 340);
-        let error = clickable_center(&elements, 2).expect_err("only two are clickable");
-        assert!(error.contains("2 of 4 matches"), "{error}");
-        assert!(clickable_center(&[], 0).is_err());
+        let clickable = click_candidates(&elements);
+        assert_eq!(clickable.len(), 2);
+        assert_eq!(clickable[0]["name"], "first");
+        assert_eq!(element_center(clickable[0]), Ok((140, 112)));
+        assert_eq!(element_center(clickable[1]), Ok((340, 112)));
+        let refusal = |index: usize, matches: &[serde_json::Value]| {
+            ClickRefusal { query: "x", role: None, exact: false, index, matches, near: &[], unfinished: &[] }.explain()
+        };
+        let (cause, text) = refusal(2, &elements);
+        assert_eq!(cause, "index_out_of_range");
+        assert!(text.contains("2 of 4 matches"), "{text}");
+        assert!(click_candidates(&[]).is_empty());
+        assert_eq!(refusal(0, &[]).0, "no_match");
+    }
+
+    /// #875: the query "Your Chrome" also matches the paragraph above the profile
+    /// cards, which is listed first; the click is meant for the card.
+    #[test]
+    fn a_click_by_name_prefers_a_control_to_text_that_mentions_it() {
+        let element = |role: &str, name: &str| {
+            serde_json::json!({"backend":"atspi","role":role,"name":name,"mouse_coordinates_usable":true,
+                "bounds":{"x":0.0,"y":0.0,"w":10,"h":10}})
+        };
+        let elements = vec![
+            element("static", "With Chrome profiles, you can separate all your Chrome stuff."),
+            element("button", "Open Your Chrome profile. Google membership"),
+            element("button", "More actions for Your Chrome"),
+        ];
+        let names: Vec<_> = click_candidates(&elements).iter().map(|element| element["name"].clone()).collect();
+        assert_eq!(names[0], "Open Your Chrome profile. Google membership");
+        assert_eq!(names[1], "More actions for Your Chrome");
+        assert_eq!(names[2], elements[0]["name"]);
+    }
+
+    #[test]
+    fn a_refused_click_says_what_is_in_the_way_and_the_next_step() {
+        let element = |role: &str, name: &str, extra: serde_json::Value| {
+            let mut element = serde_json::json!({"backend":"atspi","role":role,"name":name,
+                "mouse_coordinates_usable":false,"bounds":{"x":0.0,"y":0.0,"w":10,"h":10}});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                element[key] = value.clone();
+            }
+            element
+        };
+        let explain = |role: Option<&str>, exact: bool, matches: &[serde_json::Value], near: &[serde_json::Value], unfinished: &[String]| {
+            ClickRefusal { query: "Wallet", role, exact, index: 0, matches, near, unfinished }.explain()
+        };
+        // #882: role "text" asked for, and the name belongs to a page tab.
+        let tab = element("page tab", "Wallet", serde_json::json!({"mouse_coordinates_usable":true}));
+        let (cause, text) = explain(Some("text"), true, &[], std::slice::from_ref(&tab), &[]);
+        assert_eq!(cause, "role_excluded");
+        assert!(text.contains("page tab 'Wallet'") && text.contains("without role"), "{text}");
+        // exact asked for, and a longer name of the wanted role holds the text.
+        let long = element("button", "Open Wallet. Google membership", serde_json::json!({}));
+        let (cause, text) = explain(Some("button"), true, &[], std::slice::from_ref(&long), &[]);
+        assert_eq!(cause, "exact_excluded");
+        assert!(text.contains("button 'Open Wallet. Google membership'") && text.contains("exact=false"), "{text}");
+        let (cause, _) = explain(Some("link"), true, &[], std::slice::from_ref(&long), &[]);
+        assert_eq!(cause, "role_and_exact_excluded");
+        // Matches that exist but cannot be clicked where they are.
+        let other = element("button", "Wallet", serde_json::json!({"window_id":"{other}"}));
+        let (cause, text) = explain(None, false, std::slice::from_ref(&other), &[], &[]);
+        assert_eq!(cause, "other_window");
+        assert!(text.contains("window_activate") && text.contains("{other}"), "{text}");
+        let hidden = element("button", "Wallet", serde_json::json!({"visible":false,"mouse_coordinates_usable":true}));
+        let (cause, text) = explain(None, false, std::slice::from_ref(&hidden), &[], &[]);
+        assert_eq!(cause, "not_shown");
+        assert!(text.contains("scroll"), "{text}");
+        let covered = element("button", "Wallet", serde_json::json!({"occluded":true,"mouse_coordinates_usable":true}));
+        assert_eq!(explain(None, false, std::slice::from_ref(&covered), &[], &[]).0, "covered");
+        let dom = element("button", "Wallet", serde_json::json!({"backend":"cdp"}));
+        assert_eq!(explain(None, false, std::slice::from_ref(&dom), &[], &[]).0, "page_dom_only");
+        let unpaired = element("button", "Wallet", serde_json::json!({"window_association":"unverified"}));
+        let (cause, text) = explain(None, false, std::slice::from_ref(&unpaired), &[], &[]);
+        assert_eq!(cause, "frame_not_paired_with_window");
+        assert!(text.contains("screenshot") && text.contains("mouse_click"), "{text}");
+        let twin = element("button", "Wallet", serde_json::json!({"window_association":"caption_shared_by_windows"}));
+        let (cause, text) = explain(None, false, std::slice::from_ref(&twin), &[], &[]);
+        assert_eq!(cause, "frame_not_paired_with_window");
+        assert!(text.contains("several windows") && text.contains("caption"), "{text}");
+        // A search cut short is said, not reported as no match.
+        let cut = ["AT-SPI search reached its 5-second limit".to_owned()];
+        let (cause, text) = explain(None, false, &[], &[], &cut);
+        assert_eq!(cause, "search_unfinished");
+        assert!(text.contains("timeout_seconds") && text.contains("5-second limit"), "{text}");
+        // The window to activate is the one of the first control shown elsewhere.
+        assert_eq!(click_other_window(&[hidden, unpaired, other]), Some("{other}"));
     }
 
     #[test]
@@ -26728,8 +27240,8 @@ mod ssh_config_tests {
 #[cfg(test)]
 mod ui_match_context_tests {
     use super::{
-        AtspiNode, WindowSnapshot, find_ui_frame_window, find_ui_native_match,
-        find_ui_role_matches, find_ui_search_text,
+        AtspiNode, FrameFacts, WindowSnapshot, find_ui_frame_window, find_ui_native_match,
+        find_ui_role_matches, find_ui_search_text, pair_frames_with_windows,
     };
 
     fn window() -> WindowSnapshot {
@@ -26831,6 +27343,119 @@ mod ui_match_context_tests {
         second.x = 0.0;
         second.y = 0.0;
         assert!(find_ui_frame_window(&[win, second], "Dialog", (0, 0, 312, 101)).is_none());
+    }
+
+    fn chrome_window(id: &str, title: &str, active: bool) -> WindowSnapshot {
+        WindowSnapshot {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            pid: 76,
+            active,
+            dialog: false,
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+            ..window()
+        }
+    }
+
+    fn frame(name: &str, pid: Option<u32>) -> FrameFacts<'_> {
+        FrameFacts { name, bounds: (0, 0, 1920, 1080), pid }
+    }
+
+    fn pairs(windows: &[WindowSnapshot], frames: &[FrameFacts]) -> Vec<Option<(String, &'static str)>> {
+        pair_frames_with_windows(windows, frames)
+            .into_iter()
+            .map(|pair| pair.map(|(window, how)| (window.id.clone(), how)))
+            .collect()
+    }
+
+    /// #902 #898 #880 #875 #872: Chrome's profile picker names its frame "Who's
+    /// using Chrome?" while its window is captioned "Google Chrome".
+    #[test]
+    fn issue907_a_frame_named_unlike_its_window_is_paired_by_process_and_size() {
+        let picker = chrome_window("picker", "Google Chrome", true);
+        let paired = pairs(std::slice::from_ref(&picker), &[frame("Who's using Chrome?", Some(76))]);
+        assert_eq!(paired, [Some(("picker".to_owned(), "process_and_frame_size"))]);
+        // A bus that does not report the process leaves the size and the lack of rivals.
+        let paired = pairs(std::slice::from_ref(&picker), &[frame("Who's using Chrome?", None)]);
+        assert_eq!(paired, [Some(("picker".to_owned(), "process_and_frame_size"))]);
+        // The picker beside a browser window that its own frame names.
+        let browser = chrome_window("browser", "Settings - Google Chrome", false);
+        let windows = [browser, picker.clone()];
+        let frames = [
+            frame("Settings - Google Chrome - Sam (Your Chrome)", Some(76)),
+            frame("Who's using Chrome?", Some(76)),
+        ];
+        assert_eq!(
+            pairs(&windows, &frames),
+            [
+                Some(("browser".to_owned(), "unique_title_and_frame_size")),
+                Some(("picker".to_owned(), "process_and_frame_size")),
+            ]
+        );
+        // The matched element then carries window pixels.
+        let result = find_ui_native_match(
+            &AtspiNode {
+                name: "Open Your Chrome profile".to_owned(),
+                role: "button".to_owned(),
+                states: vec!["visible".to_owned(), "enabled".to_owned()],
+                bounds: (879, 506, 162, 178),
+                value: None,
+            },
+            Some(&picker),
+            &windows,
+            (0, 0, 1920, 1080),
+        );
+        assert_eq!(result["mouse_coordinates_usable"], true);
+        assert_eq!(result["bounds"]["x"], 879.0);
+    }
+
+    #[test]
+    fn issue907_a_frame_is_not_paired_with_a_window_it_cannot_be() {
+        let picker = chrome_window("picker", "Google Chrome", true);
+        let windows = std::slice::from_ref(&picker);
+        // Another process, another size, or an untitled popup frame.
+        assert_eq!(pairs(windows, &[frame("Who's using Chrome?", Some(9))]), [None]);
+        let small = FrameFacts { name: "Who's using Chrome?", bounds: (0, 0, 800, 600), pid: Some(76) };
+        assert_eq!(pairs(windows, &[small]), [None]);
+        assert_eq!(pairs(windows, &[frame("", Some(76))]), [None]);
+        // Two frames that could both be the one window.
+        let rivals = [frame("One", Some(76)), frame("Two", Some(76))];
+        assert_eq!(pairs(windows, &rivals), [None, None]);
+    }
+
+    /// Two browser windows on the same page share a caption, and nothing tells
+    /// which frame is which window; a third frame is still paired.
+    #[test]
+    fn issue907_frames_with_one_caption_stay_unpaired() {
+        let windows = [
+            chrome_window("back", "New Tab - Google Chrome", false),
+            chrome_window("front", "New Tab - Google Chrome", true),
+            chrome_window("picker", "Google Chrome", false),
+        ];
+        let frames = [
+            frame("New Tab - Google Chrome", Some(76)),
+            frame("New Tab - Google Chrome", Some(76)),
+            frame("Who's using Chrome?", Some(76)),
+        ];
+        assert_eq!(
+            pairs(&windows, &frames),
+            [None, None, Some(("picker".to_owned(), "process_and_frame_size"))]
+        );
+        // One of the two frames alone is no more certain.
+        assert_eq!(pairs(&windows[..2], &frames[..1]), [None]);
+    }
+
+    /// #882: a caller asks for the role "text" when it means words on the screen.
+    #[test]
+    fn issue907_the_text_role_includes_static_text_and_labels() {
+        for role in ["static", "label", "heading", "paragraph", "text"] {
+            assert!(find_ui_role_matches(Some("text"), role), "{role}");
+        }
+        assert!(!find_ui_role_matches(Some("text"), "page tab"));
+        assert!(!find_ui_role_matches(Some("static"), "text"));
     }
 
     #[test]

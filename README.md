@@ -17,7 +17,7 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `browser_navigate` | Open a URL in the active tab of the focused Chromium-family window and verify where the tab landed. With CDP the tab is navigated directly. Without it the address bar is focused through accessibility, the URL is typed (pasted when longer than 128 characters, restoring the session clipboard), and Return is pressed only once the bar holds exactly the URL. Returns `title`, `url` and `method`, with `redirected: true` after a redirect. A download, Chrome's error page, a tab that kept its page, a tab switch or a search is an error with a `reason`. A URL without a scheme is opened as `http://`. Up to 2097152 characters with CDP, 512000 without. |
-| `mouse_click_element` | Find an element by name/role at click time (as `find_ui_elements`) and click the center of its bounds; `index` picks among several. For pages whose layout shifts between steps. |
+| `mouse_click_element` | Find an element by name/role at click time (as `find_ui_elements`) and click the center of its bounds; `index` picks among several. For pages whose layout shifts between steps. Activates another window of the session when the match is only there; a refusal says why and the next step. |
 | `mouse_move` | Move pointer to window-relative coordinates. |
 | `mouse_scroll` | Scroll at window-relative coordinates. Reports `view_changed` (false at the end of the content), and with CDP `scroll_y`, `scroll_max_y`, `at_end`. |
 | `mouse_drag` | Drag from one window-relative position to another. |
@@ -1314,10 +1314,20 @@ not a count of unique physical widgets.
 
 Use a match's `bounds` with `mouse_click` only when `mouse_coordinates_usable` is
 true. Native coordinates are normalized against the accessibility provider's own
-frame origin after a unique title match and matching frame dimensions. This also
-handles Qt/Wayland providers that report a local origin for AT-SPI Screen extents.
-Ambiguous window titles or unmatched dimensions do not produce usable mouse
-coordinates. CDP bounds remain explicitly labelled CSS viewport pixels: browser
+frame origin once the frame is paired with a KWin window of matching dimensions.
+This also handles Qt/Wayland providers that report a local origin for AT-SPI Screen
+extents. A frame is paired with the one window whose caption is its name. A frame
+named unlike its window (Chrome's profile picker is "Who's using Chrome?" in a
+window captioned "Google Chrome") is paired with the window of the same process and
+size that no other unpaired frame could be; `window_association` then says
+`process_and_frame_size`. Frames whose caption several windows share
+(`caption_shared_by_windows`: two browser windows on one page), other frames that
+stay ambiguous, and unmatched dimensions do not produce usable mouse coordinates. The active window's elements are searched
+and listed first, so a time limit cuts off other windows. `role: "text"` includes
+static text, labels, paragraphs and headings. With a `role` and `exact` or
+`whole_word`, a control of that role is also returned for a label inside it
+(`matched_label`): the menu item named "All settings Shift+Ctrl+," for "All
+settings". CDP bounds remain explicitly labelled CSS viewport pixels: browser
 chrome is not part of that viewport, so those bounds are never advertised as
 window-relative input coordinates. Native accessibility is queried even when CDP
 is connected, making browser chrome attributable too.
@@ -1326,6 +1336,16 @@ Visibility is not clickability. CDP performs a read-only center hit test with
 `elementFromPoint`; covered controls cannot be marked clickable. Native matches
 report compositor-window coverage where known but leave in-application occlusion
 and positive clickability unknown. Inspect the screenshot for those cases.
+
+`mouse_click_element` clicks a match shown in the active window, a control before
+plain text that mentions the same words. When the only shown matches are in another
+window of the session it activates that window first and reports it as
+`activated_window`. A refusal carries `reason: "no_clickable_element"`, a `cause`
+(`role_excluded`, `exact_excluded`, `role_and_exact_excluded`, `not_shown`,
+`other_window`, `covered`, `page_dom_only`, `frame_not_paired_with_window`,
+`index_out_of_range`, `search_unfinished`, `no_match`), up to five elements it saw
+in `seen`, and a message with the next step: for a role filter or `exact` that left
+out an element carrying the text, it names that element's role and whole name.
 
 The result records the active window ID, serving PID and sample time. It is a
 snapshot, not a window lock: re-query after navigation, scrolling, layout changes,
