@@ -2007,17 +2007,68 @@ struct SizedScaler {
 #[error("the stream ended while a message waited for the viewer")]
 struct StreamEnded;
 
+// A picture on the wire, as the listener's scheduler knows it
+// (links::Report::Wire): from the moment the socket has the picture until
+// its last byte has left, but not while the socket sends nothing, because
+// the viewer takes nothing or the path is dead. Such a stream would hold
+// its part of the link, unused, until the kernel gives the connection up.
+struct OnWire<'a> {
+    share: &'a ShareLink,
+    probe: &'a std::net::TcpStream,
+    started: Instant,
+    looked: Instant,
+    told: bool,
+}
+
+impl<'a> OnWire<'a> {
+    // A socket that has sent no data for this long is stalled.
+    const STALLED_AFTER: Duration = links::SHARE_LINGER;
+    const LOOK_EVERY: Duration = Duration::from_millis(50);
+
+    fn begin(share: &'a ShareLink, probe: &'a std::net::TcpStream) -> Self {
+        share.report(links::Report::Wire(true));
+        let now = Instant::now();
+        Self { share, probe, started: now, looked: now, told: true }
+    }
+
+    // Tells the scheduler when the socket stalled or sends again.
+    fn look(&mut self) {
+        if self.started.elapsed() < Self::STALLED_AFTER || self.looked.elapsed() < Self::LOOK_EVERY {
+            return;
+        }
+        self.looked = Instant::now();
+        let sending =
+            !viewer_stream::since_data_sent(self.probe).is_ok_and(|idle| idle >= Self::STALLED_AFTER);
+        if sending != self.told {
+            self.told = sending;
+            self.share.report(links::Report::Wire(sending));
+        }
+    }
+}
+
+impl Drop for OnWire<'_> {
+    fn drop(&mut self) {
+        if self.told {
+            self.share.report(links::Report::Wire(false));
+        }
+    }
+}
+
 // Sends `message` and returns once its last byte has left for the viewer, or
 // with an error when the socket or the stream ended first. A viewer that
 // takes nothing holds the sender here: nothing queues behind the message.
+// With `share`, the message is a picture, which the listener's scheduler
+// counts as on the wire meanwhile.
 fn deliver(
     runtime: &tokio::runtime::Runtime,
     sink: &mut FrameSink,
     probe: &std::net::TcpStream,
     shutdown: &Shutdown,
     message: Message,
+    share: Option<&ShareLink>,
 ) -> anyhow::Result<()> {
     use futures::SinkExt;
+    let mut on_wire = share.map(|share| OnWire::begin(share, probe));
     runtime.block_on(async {
         let mut send = std::pin::pin!(sink.send(message));
         loop {
@@ -2026,6 +2077,9 @@ fn deliver(
                 () = tokio::time::sleep(STREAM_SEND_POLL) => {
                     if shutdown.requested() {
                         break Err(StreamEnded.into());
+                    }
+                    if let Some(on_wire) = on_wire.as_mut() {
+                        on_wire.look();
                     }
                 }
             }
@@ -2036,6 +2090,9 @@ fn deliver(
     while viewer_stream::unsent_bytes(probe).is_ok_and(|unsent| unsent > 0) {
         if shutdown.requested() {
             return Err(StreamEnded.into());
+        }
+        if let Some(on_wire) = on_wire.as_mut() {
+            on_wire.look();
         }
         std::thread::sleep(viewer_stream::LINK_SAMPLE_TIME);
     }
@@ -2373,7 +2430,7 @@ impl PictureSender {
                 if !dsc.pps_sent {
                     let mut pps = Header { payload: Payload::Pps, ..header }.encode().to_vec();
                     pps.extend_from_slice(&dsc.encoder.pps().to_bytes());
-                    deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(pps.into()))?;
+                    deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(pps.into()), None)?;
                     dsc.pps_sent = true;
                     self.window.pps += 1;
                 }
@@ -2409,11 +2466,15 @@ impl PictureSender {
         // the next picture once the socket has let go of it.
         let message = async_tungstenite::tungstenite::Bytes::from(std::mem::take(&mut self.message));
         // The listener divides the interface among the streams that are on
-        // the wire between these two reports.
-        self.share.report(links::Report::Wire(true));
-        let delivered =
-            deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(message.clone()));
-        self.share.report(links::Report::Wire(false));
+        // the wire while this one delivers.
+        let delivered = deliver(
+            runtime,
+            sink,
+            &self.probe,
+            &self.shutdown,
+            Message::Binary(message.clone()),
+            Some(&self.share),
+        );
         self.message = Vec::from(message);
         delivered?;
         let sent = Instant::now();
@@ -2698,7 +2759,7 @@ fn stream_sender(
         if let Some(answer) = answer {
             let sent = serde_json::to_string(&answer)
                 .map_err(anyhow::Error::from)
-                .and_then(|text| deliver(&runtime, &mut sink, &sender.probe, &shutdown, Message::text(text)));
+                .and_then(|text| deliver(&runtime, &mut sink, &sender.probe, &shutdown, Message::text(text), None));
             if let Err(error) = sent {
                 eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
                 break Ok(());

@@ -3,7 +3,8 @@ use super::{
     ENCODE_REMEASURE_FRAMES, Estimate, HEADER_BYTES, Header, Interface, LINK_SAMPLE_BYTES,
     LINK_USABLE_PERCENT, Mode, ModeControl, Notice, Payload, RAW_BPP_X16, Request, SETTLE_AFTER,
     SWITCH_AFTER_FRAMES, Scaler, Sent, Settle, StreamError, UNKNOWN_LINK_MBPS, USABLE_FRAME_TIME,
-    Workers, budget_of, fit_size, pace, pack_rgb, packed_len, unpack_rgb, unsent_bytes,
+    Workers, budget_of, fit_size, pace, pack_rgb, packed_len, since_data_sent, unpack_rgb,
+    unsent_bytes,
 };
 use crate::dsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -792,6 +793,53 @@ fn a_paced_socket_sends_at_its_speed_and_reports_what_has_not_left() -> std::io:
     );
     drop(sender);
     assert_eq!(reader.join().ok(), Some(2 * message.len()));
+    Ok(())
+}
+
+#[test]
+fn a_socket_whose_peer_takes_nothing_stops_sending_data() -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut sender = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (mut receiver, _) = listener.accept()?;
+    // While the peer reads, the socket has sent data a moment ago.
+    sender.write_all(&[7u8; 4096])?;
+    let mut taken = [0u8; 4096];
+    receiver.read_exact(&mut taken)?;
+    assert!(since_data_sent(&sender)? < millis(200));
+    // The peer stops reading: its window fills, and with megabytes still to
+    // send nothing but window probes leaves the socket.
+    sender.set_nonblocking(true)?;
+    let chunk = vec![7u8; 1 << 16];
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        match sender.write(&chunk) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    assert!(unsent_bytes(&sender)? > 0);
+    let idle = since_data_sent(&sender)?;
+    assert!(idle >= millis(250), "data left {idle:?} ago");
+    // It reads again: data flows.
+    let reader = std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 1 << 16];
+        while receiver.read(&mut buffer).is_ok_and(|read| read > 0) {}
+    });
+    let started = Instant::now();
+    while since_data_sent(&sender)? >= millis(250) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the socket never sent again"
+        );
+        let _ = sender.write(&chunk);
+        std::thread::sleep(millis(5));
+    }
+    drop(sender);
+    let _ = reader.join();
     Ok(())
 }
 

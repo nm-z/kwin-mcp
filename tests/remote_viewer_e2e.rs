@@ -2099,6 +2099,22 @@ fn viewers_on_one_interface_share_its_budget_and_an_idle_ones_share_is_taken_ove
         );
     }
 
+    // The second viewer stops taking frames while its session scrolls on (its
+    // process is stopped, as a viewer behind a dead path would be silent):
+    // a stream that sends nothing holds no part of the link, so the first
+    // has the whole budget until the second takes frames again.
+    signal(second.viewer.pid, "STOP");
+    first.sharing(BUDGET, 1, |counters| scrolling(counters, "raw"));
+    let (_, total) = measured("two streams, one viewer stalled", &[&first]);
+    signal(second.viewer.pid, "CONT");
+    assert!(
+        (BUDGET * 0.7..=BUDGET * 1.03).contains(&total),
+        "beside a stalled stream the other received {total:.1} Mb/s of {BUDGET}"
+    );
+    for stream in [&first, &second] {
+        stream.sharing(BUDGET / 2.0, 2, |counters| scrolling(counters, "dsc"));
+    }
+
     // A third: a third each, at a lower DSC rate.
     let third = Shared::open(&mut server, &host, SIZE);
     third.scroll(true);
@@ -2277,8 +2293,13 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     desk.activate(&first);
     let frames_before = first_viewer.idle()["frames"].as_u64().expect("frames");
     let sender_before = sender_pid(&first_dir);
-    let before = desk.tool("screenshot", json!({}));
-    keep_evidence(&before, "916-before-the-path-died.png");
+    // The window as its desktop shows it now, kept as evidence under `name`.
+    let shoot = |desk: &mut Desk, name: &str| {
+        let shot = desk.tool("screenshot", json!({}));
+        keep_evidence(&shot, name);
+        decoded_png(Path::new(shot["path"].as_str().expect("screenshot path")))
+    };
+    let before = shoot(&mut desk, "916-before-the-path-died.png");
 
     // The wired path dies. The stream moves to the other one: a new frame
     // socket from that path's address and a new sender, the same window.
@@ -2316,17 +2337,14 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     // The window shows the picture it showed before.
     first_viewer.idle();
     desk.activate(&first);
-    let after = desk.tool("screenshot", json!({}));
-    keep_evidence(&after, "916-after-the-stream-moved.png");
-    let picture = |shot: &Value| decoded_png(Path::new(shot["path"].as_str().expect("path")));
+    let after = shoot(&mut desk, "916-after-the-stream-moved.png");
     assert!(
-        picture(&before) == picture(&after),
+        before == after,
         "the window's picture changed with the path"
     );
 
-    // The stream works on its new path, in both directions: the agent's
-    // typing arrives as frames, and keys typed into the window reach the
-    // session.
+    // The stream works on its new path, in both directions: keys typed into
+    // the window reach the session, and what they change arrives as frames.
     let frames = first_viewer.frames();
     let typed = first_dir.join("typed-after-the-move");
     for character in format!("touch {}\n", typed.display()).chars() {
@@ -2347,10 +2365,10 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     wait_for("frames on the new path", Duration::from_secs(10), || {
         (first_viewer.frames() > frames).then_some(())
     });
-    let moved_shot = desk.tool("screenshot", json!({}));
-    keep_evidence(&moved_shot, "916-typed-on-the-new-path.png");
+    first_viewer.idle();
+    let typed_shot = shoot(&mut desk, "916-typed-on-the-new-path.png");
     assert!(
-        picture(&moved_shot) != picture(&after),
+        typed_shot != after,
         "the window did not show what was typed"
     );
     // viewer_open reports the window it has, on the path it has now.

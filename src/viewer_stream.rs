@@ -471,6 +471,34 @@ pub fn pace(socket: &impl std::os::fd::AsFd, bits_per_second: u64) -> std::io::R
     }
 }
 
+/// How long ago the TCP `socket` last sent data (`tcpi_last_data_sent` of
+/// the kernel's `TCP_INFO`). On a socket with data to send, a long time means
+/// that the peer takes none or that nothing comes back over the path.
+pub fn since_data_sent(socket: &impl std::os::fd::AsFd) -> std::io::Result<Duration> {
+    use std::os::fd::AsRawFd;
+    let mut info = std::mem::MaybeUninit::<nix::libc::tcp_info>::zeroed();
+    let mut length = nix::libc::socklen_t::try_from(size_of::<nix::libc::tcp_info>())
+        .map_err(std::io::Error::other)?;
+    // SAFETY: the kernel writes at most `length` bytes through the pointer,
+    // which is valid for that many.
+    let result = unsafe {
+        nix::libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            nix::libc::IPPROTO_TCP,
+            nix::libc::TCP_INFO,
+            info.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: every field is an integer, for which the zeroes the kernel
+    // left are a value too.
+    let info = unsafe { info.assume_init() };
+    Ok(Duration::from_millis(u64::from(info.tcpi_last_data_sent)))
+}
+
 /// Bytes written to the TCP `socket` that the kernel has not sent yet. Zero
 /// means the last byte has left for the peer.
 pub fn unsent_bytes(socket: &impl std::os::fd::AsFd) -> std::io::Result<usize> {
