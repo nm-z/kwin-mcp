@@ -7,6 +7,7 @@ macro_rules! eprintln {
     }};
 }
 
+mod browser_address;
 mod file_import;
 
 mod fuse_bridge {
@@ -11412,6 +11413,12 @@ struct ClipboardRestore {
     #[serde(default)]
     primary: bool,
 }
+/// The agent's session selection while a tool borrows the clipboard.
+struct ClipboardLoan {
+    socket: PathBuf,
+    previous: kwin_mcp::clipboard::ClipContents,
+    tracked: bool,
+}
 struct ClipboardEntry {
     clipboard: kwin_mcp::clipboard::Clipboard,
     saved: Option<(u64, Option<u64>, ClipboardRestore)>,
@@ -11470,6 +11477,35 @@ impl ClipboardStore {
             },
         ));
         Ok(length)
+    }
+    /// Make `text` the session's CLIPBOARD selection for one paste by a tool, and
+    /// return what the agent had there so `take_back` can restore it.
+    fn lend(&mut self, socket: &Path, text: &str) -> anyhow::Result<ClipboardLoan> {
+        let entry = self.entry(socket, "session")?;
+        let previous = entry.clipboard.read()?;
+        let tracked = match &entry.saved {
+            Some((generation, _, _)) => entry.clipboard.generation()? == *generation,
+            None => false,
+        };
+        entry
+            .clipboard
+            .write(kwin_mcp::clipboard::text_contents(text, false))?;
+        Ok(ClipboardLoan {
+            socket: socket.to_owned(),
+            previous,
+            tracked,
+        })
+    }
+    fn take_back(&mut self, loan: ClipboardLoan) -> anyhow::Result<()> {
+        let entry = self.entry(&loan.socket, "session")?;
+        entry.clipboard.write(loan.previous)?;
+        // The selection a reload restores is still the agent's: keep it current.
+        if loan.tracked
+            && let Some((generation, _, _)) = &mut entry.saved
+        {
+            *generation = entry.clipboard.generation()?;
+        }
+        Ok(())
     }
     fn saved(&self) -> anyhow::Result<Vec<ClipboardRestore>> {
         let mut saved = Vec::new();
@@ -11566,32 +11602,330 @@ fn clickable_center(
 struct BrowserNavigateParams {
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
-    /// The address to open: printable ASCII, no spaces. A scheme is optional.
+    /// The address to open: printable ASCII, no spaces. Without a scheme it is
+    /// opened as http://, and a leading / as a file path.
     url: String,
 }
 
-/// The reason `url` cannot be typed into the address bar, if any.
-fn navigate_url_problem(url: &str) -> Option<&'static str> {
-    if url.is_empty() {
-        Some("the url is empty")
-    } else if url.chars().count() > 2000 {
-        Some("the url is longer than 2000 characters")
-    } else if url.chars().any(|ch| !ch.is_ascii_graphic()) {
-        Some("the url must be printable ASCII without spaces (percent-encode anything else)")
-    } else {
-        None
+/// How long a navigation may take to reach its server and commit a page.
+const NAVIGATION_COMMIT_WAIT: Duration = Duration::from_secs(15);
+/// How long a committed page may keep loading before it is reported as loading.
+const NAVIGATION_LOAD_WAIT: Duration = Duration::from_secs(8);
+const NAVIGATION_POLL: Duration = Duration::from_millis(200);
+/// One CDP request that the browser process answers without the page.
+const CDP_STEP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the address bar may take to report focus after it was asked for.
+const ADDRESS_FOCUS_WAIT: Duration = Duration::from_millis(1500);
+/// How long the address bar may take to show a typed address.
+const ADDRESS_TEXT_WAIT: Duration = Duration::from_secs(2);
+/// The same for a pasted address, which can be hundreds of thousands of characters.
+const ADDRESS_PASTE_WAIT: Duration = Duration::from_secs(10);
+
+/// A browser_navigate failure: `reason` for the caller's code, the sentence for its reader.
+fn navigation_error(
+    reason: &str,
+    message: String,
+    submitted: bool,
+    retry_safe: bool,
+    mut data: serde_json::Value,
+) -> McpError {
+    data["reason"] = serde_json::json!(reason);
+    data["navigation_submitted"] = serde_json::json!(submitted);
+    data["retry_safe"] = serde_json::json!(retry_safe);
+    McpError::internal_error(message, Some(data))
+}
+
+/// Whether the address bar reports keyboard focus within `wait`.
+async fn address_focus_within(ui: &browser_address::BrowserUi, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if ui.address_focused().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Whether the page at `landed` is the one that was asked for: same host and path,
-/// ignoring the scheme, a leading `www.`, a trailing slash, the query and the fragment.
-fn same_destination(requested: &str, landed: &str) -> bool {
-    let normalize = |url: &str| {
-        let url = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let url = url.split(['?', '#']).next().unwrap_or(url);
-        url.trim_start_matches("www.").trim_end_matches('/').to_ascii_lowercase()
+/// Ok once the address bar holds exactly `address`; after `wait`, what it held.
+async fn address_entered(
+    ui: &browser_address::BrowserUi,
+    address: &str,
+    wait: Duration,
+) -> Result<(), Option<String>> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let text = ui.address_text(wait).await;
+        if text.as_deref() == Some(address) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(text);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Press and release one key or combo, and wait for the compositor to take it.
+async fn navigation_key(eis: &Eis, name: &str, pace: InputPace) -> Result<(), McpError> {
+    let (modifiers, key) = parse_combo(name)?;
+    let mut sent = SentInput::new(eis);
+    for modifier in &modifiers {
+        sent.key(*modifier, true, None).map_err(KwinError::from)?;
+    }
+    if !modifiers.is_empty() {
+        tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
+    }
+    sent.key(key, true, None).map_err(KwinError::from)?;
+    tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
+    sent.key(key, false, None).map_err(KwinError::from)?;
+    for modifier in modifiers.iter().rev() {
+        sent.key(*modifier, false, None).map_err(KwinError::from)?;
+    }
+    drop(sent);
+    eis.roundtrip().await.map_err(KwinError::from)?;
+    Ok(())
+}
+
+/// The committed entry of a tab, from the browser process: it answers while the
+/// page is busy or navigating.
+async fn cdp_entry(page: &chromiumoxide::Page) -> Option<(String, String)> {
+    use chromiumoxide::cdp::browser_protocol::page::GetNavigationHistoryParams;
+    let history = tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        page.execute(GetNavigationHistoryParams::default()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let entry = history
+        .result
+        .entries
+        .get(usize::try_from(history.result.current_index).ok()?)?;
+    Some((entry.url.clone(), entry.title.clone()))
+}
+
+/// Whether a tab is the one its window shows.
+async fn cdp_tab_visible(page: &chromiumoxide::Page) -> bool {
+    tokio::time::timeout(CDP_STEP_TIMEOUT, page.evaluate("document.visibilityState"))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|value| value.value().and_then(|value| value.as_str().map(str::to_owned)))
+        .is_some_and(|state| state == "visible")
+}
+
+/// Whether the browser behind the CDP connection is process `pid`, the client of
+/// a window as KWin reports it.
+async fn cdp_is_process(browser: &chromiumoxide::Browser, pid: i32) -> bool {
+    use chromiumoxide::cdp::browser_protocol::system_info::GetProcessInfoParams;
+    tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        browser.execute(GetProcessInfoParams::default()),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some_and(|processes| {
+        processes
+            .result
+            .process_info
+            .iter()
+            .any(|process| process.r#type == "browser" && process.id == i64::from(pid))
+    })
+}
+
+/// The tab of the CDP browser that its window `caption` shows: exactly one tab
+/// has the caption's title (the showing one, if several do). None leaves the
+/// address bar to do it.
+async fn cdp_active_tab(
+    browser: &chromiumoxide::Browser,
+    caption: &str,
+) -> Option<chromiumoxide::Page> {
+    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+    let targets = tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        browser.execute(GetTargetsParams::default()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut tabs = Vec::new();
+    for target in &targets.result.target_infos {
+        if target.r#type == "page"
+            && browser_address::caption_names_tab(caption, &target.title)
+            && let Ok(Ok(page)) = tokio::time::timeout(
+                CDP_STEP_TIMEOUT,
+                browser.get_page(target.target_id.clone()),
+            )
+            .await
+        {
+            tabs.push(page);
+        }
+    }
+    if tabs.len() > 1 {
+        let mut showing = Vec::new();
+        for tab in tabs {
+            if cdp_tab_visible(&tab).await {
+                showing.push(tab);
+            }
+        }
+        tabs = showing;
+    }
+    (tabs.len() == 1).then(|| tabs.swap_remove(0))
+}
+
+/// How an address gets into the active tab of a browser window.
+enum NavigationRoute {
+    Cdp(chromiumoxide::Page),
+    AddressBar(Box<browser_address::BrowserUi>),
+}
+
+/// How often the active window is looked at again, `NAVIGATION_POLL` apart,
+/// while its caption does not yet name a tab or a browser window.
+const NAVIGATION_CAPTION_LOOKS: usize = 5;
+
+/// What a tab did with an address handed to it through CDP.
+enum CdpLanding {
+    /// Chrome did not accept the address; the tab is untouched.
+    Refused(String),
+    /// No answer from the address yet.
+    Pending,
+    /// The address is a download; the tab keeps its page.
+    Download,
+    /// The navigation ended without a page (an external scheme, an aborted load).
+    NotOpened(String),
+    /// The tab shows Chrome's error page for the address.
+    Failed(String),
+    Committed,
+}
+
+/// Page.navigate for the tab `target_id`, on a connection of its own to the
+/// browser at the session's forwarded CDP `port`. chromiumoxide holds the answer
+/// to this method back until the frame's load events, which a download, an error
+/// page and an aborted navigation never send; Chrome itself answers as soon as the
+/// navigation commits or ends.
+async fn cdp_navigate(port: u16, target_id: &str, url: &str) -> CdpLanding {
+    use async_tungstenite::tungstenite::Message;
+    use futures::StreamExt;
+    const REQUEST_ID: u64 = 1;
+    let exchange = async {
+        let (mut socket, _) = async_tungstenite::tokio::connect_async(format!(
+            "ws://127.0.0.1:{port}/devtools/page/{target_id}"
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        let request = serde_json::json!({
+            "id": REQUEST_ID, "method": "Page.navigate", "params": {"url": url},
+        });
+        socket
+            .send(Message::text(request.to_string()))
+            .await
+            .map_err(|error| error.to_string())?;
+        while let Some(message) = socket.next().await {
+            if let Message::Text(text) = message.map_err(|error| error.to_string())?
+                && let Ok(reply) = serde_json::from_str::<serde_json::Value>(text.as_str())
+                && reply["id"] == REQUEST_ID
+            {
+                let _ = socket.close(None).await;
+                return Ok(reply);
+            }
+        }
+        Err("the browser closed the connection before it answered".to_owned())
     };
-    normalize(requested) == normalize(landed)
+    match tokio::time::timeout(NAVIGATION_COMMIT_WAIT, exchange).await {
+        Err(_) => CdpLanding::Pending,
+        Ok(Err(error)) => CdpLanding::Refused(error),
+        Ok(Ok(reply)) => {
+            if let Some(error) = reply["error"]["message"].as_str() {
+                return CdpLanding::Refused(error.to_owned());
+            }
+            let result = &reply["result"];
+            match result["errorText"].as_str() {
+                None => CdpLanding::Committed,
+                Some(_) if result["isDownload"] == true => CdpLanding::Download,
+                Some(error) if result["loaderId"].is_string() => {
+                    CdpLanding::Failed(error.to_owned())
+                }
+                Some(error) => CdpLanding::NotOpened(error.to_owned()),
+            }
+        }
+    }
+}
+
+/// Wait for a committed page to finish loading; false when it still loads.
+async fn cdp_loaded(page: &chromiumoxide::Page) -> bool {
+    let deadline = tokio::time::Instant::now() + NAVIGATION_LOAD_WAIT;
+    loop {
+        let state = tokio::time::timeout(
+            Duration::from_millis(500),
+            page.evaluate("document.readyState"),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|value| value.value().and_then(|value| value.as_str().map(str::to_owned)));
+        if state.as_deref() == Some("complete") {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(NAVIGATION_POLL).await;
+    }
+}
+
+/// The caption of window `id`, and whether it is the active window.
+async fn window_caption(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    runtime: &Path,
+    id: &str,
+) -> Option<(String, bool)> {
+    window_snapshots(conn, kwin_unique, runtime)
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|window| window.id == id)
+        .map(|window| (window.title, window.active))
+        .next()
+}
+
+/// The result of a navigation whose landing page was read back from the browser.
+fn navigation_result(
+    method: &str,
+    title: &str,
+    requested: &str,
+    landed: &str,
+    loading: bool,
+    window_active: bool,
+) -> (String, serde_json::Value) {
+    let mut data = serde_json::json!({
+        "title": title, "url": browser_address::shown_url(landed), "method": method,
+    });
+    let mut text = format!("navigated: {title} at {}", browser_address::shown_url(landed));
+    if !browser_address::same_destination(requested, landed) {
+        data["redirected"] = serde_json::json!(true);
+        data["requested_url"] = serde_json::json!(browser_address::shown_url(requested));
+        text.push_str(&format!(
+            " (the tab opened {} and the site sent it on)",
+            browser_address::shown_url(requested)
+        ));
+    }
+    if loading {
+        data["loading"] = serde_json::json!(true);
+        text.push_str(&format!(
+            ". The page is still loading after {} s",
+            NAVIGATION_LOAD_WAIT.as_secs()
+        ));
+    }
+    if !window_active {
+        data["window_active"] = serde_json::json!(false);
+        text.push_str(". Another window became active meanwhile; window_activate this one before sending it input");
+    }
+    (text, data)
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -16262,7 +16596,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "browser_navigate",
-        description = "Open a URL in the focused Chromium-family browser window: focus the address bar (ctrl+l), type the URL, press Delete so Chrome's inline autocomplete cannot extend it to another address from history, then Return. Waits for the window title to change and returns it. When the browser has CDP (launch_app reported cdp_port) the result also has the page's url, and matched=false with a warning if it is not the address asked for. Without CDP the landing page is known only by its title: check it. url is printable ASCII without spaces."
+        description = "Open a URL in the active tab of the focused Chromium-family browser window and verify where the tab landed. With CDP (launch_app reported cdp_port) the tab is navigated directly: no keys are sent, the clipboard is untouched, and the page gets keyboard focus. Without CDP the address bar is focused through accessibility (ctrl+l as fallback, so a page that delays or consumes the shortcut cannot swallow the address), the URL is typed, or pasted when longer than 128 characters (the session clipboard is restored), inline completion is removed with Delete, and Return is pressed only after the bar's text equals the URL. Success means the tab reached the address or the page that address redirected to: title, url, method, and redirected=true with requested_url after a redirect; loading=true if the page still loads; window_active=false if another window took focus meanwhile. Anything else is an error whose reason says what happened: download (the tab keeps its page), load_failed (Chrome's error page; the net error with CDP), not_navigated, pending, tab_changed (another tab was selected before the page could be read), searched, unverified, address_bar_unavailable, address_bar_not_focused, address_not_entered (Return was not pressed), url_too_long_for_address_bar. navigation_submitted tells whether the browser was asked to open the address. A URL without a scheme is opened as http:// (Chrome upgrades to https where the site answers there), so a bare host or IP is never searched for; a leading / is a file path. url is printable ASCII without spaces, at most 2097152 characters with CDP (Chrome's own limit) and 512000 without."
     )]
     async fn browser_navigate(
         &self,
@@ -16271,48 +16605,225 @@ impl KwinMcp {
     ) -> Result<CallToolResult, McpError> {
         let pace = InputPace::new(params.speed, None)?;
         self.touch_activity().await;
-        if let Some(problem) = navigate_url_problem(&params.url) {
-            return Err(McpError::invalid_params(
-                format!("Nothing was typed: {problem}."),
-                Some(serde_json::json!({"reason": "invalid_url", "retry_safe": true})),
-            ));
+        let refuse = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!("Nothing was sent to the browser: {detail}."),
+                Some(serde_json::json!({
+                    "reason": reason, "navigation_submitted": false, "retry_safe": true,
+                })),
+            )
+        };
+        if let Some(problem) = browser_address::url_problem(&params.url) {
+            return Err(refuse("invalid_url", problem));
         }
-        let keys = params
-            .url
-            .chars()
-            .map(char_key)
-            .collect::<Result<Vec<_>, _>>()?;
+        let target = browser_address::absolute_url(&params.url);
+        let shown_target = browser_address::shown_url(&target);
+        let characters = target.chars().count();
+        let typed = characters <= browser_address::TYPED_MAX_CHARS;
+        let keys = if typed {
+            target.chars().map(char_key).collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let guard = self.session.read().await;
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let refuse = |reason: &str, detail: String| {
-            McpError::invalid_params(
-                format!("Nothing was typed: {detail}."),
-                Some(serde_json::json!({"reason": reason, "retry_safe": true})),
+        let (conn, unique, runtime) = (
+            sess.kwin_conn.clone(),
+            sess.kwin_unique_name.clone(),
+            sess.host_xdg_dir.clone(),
+        );
+        let requested = serde_json::json!({"requested_url": shown_target});
+        // Both routes start from the caption KWin reports, which can trail the title
+        // the browser already shows for a page that just arrived: look again for a
+        // moment before giving a route up.
+        let mut looks = 0;
+        let (active, window, route) = loop {
+            let active =
+                active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+                    .await
+                    .map(|(_, _, geometry)| geometry)
+                    .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let mut windows =
+                window_snapshots(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
+                    .await
+                    .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let index = windows
+                .iter()
+                .position(|window| window.id == active.id && window.active && !window.minimized)
+                .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
+            let window = windows.swap_remove(index);
+            if !chromium_resource_class(&window.resource_class) {
+                return Err(refuse(
+                    "not_a_browser",
+                    format!(
+                        "the active window is {:?} ({}), not a Chromium-family browser",
+                        window.title, window.resource_class
+                    ),
+                ));
+            }
+            let settling = looks < NAVIGATION_CAPTION_LOOKS;
+            looks += 1;
+            if let Some(browser) = sess.cdp_browser.as_deref()
+                && cdp_is_process(browser, window.pid).await
+            {
+                if let Some(page) = cdp_active_tab(browser, &window.title).await {
+                    break (active, window, NavigationRoute::Cdp(page));
+                }
+                if settling {
+                    tokio::time::sleep(NAVIGATION_POLL).await;
+                    continue;
+                }
+            }
+            match browser_address::BrowserUi::locate(
+                &sess.atspi_bus_address,
+                &window.title,
+                window.pid,
             )
+            .await
+            {
+                Ok(ui) => break (active, window, NavigationRoute::AddressBar(Box::new(ui))),
+                Err(browser_address::UiError::NoWindow) if settling => {
+                    tokio::time::sleep(NAVIGATION_POLL).await;
+                }
+                Err(error) => {
+                    return Err(refuse(
+                        "address_bar_unavailable",
+                        format!(
+                            "{error}, so the address bar cannot be checked and the destination could not be verified. launch_app the browser with a --user-data-dir of its own to navigate through CDP, or drive the address bar with keyboard_key ctrl+l, keyboard_type and a screenshot"
+                        ),
+                    ));
+                }
+            }
         };
-        let active = active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
-            .await
-            .map(|(_, _, geometry)| geometry)
-            .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
-        let window = window_snapshots(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
-            .await
-            .map_err(|error| refuse("target_unverifiable", error.to_string()))?
-            .into_iter()
-            .find(|window| window.id == active.id && window.active && !window.minimized)
-            .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
-        if !chromium_resource_class(&window.resource_class) {
+        let title_before = window.title.clone();
+        let ui = match route {
+            NavigationRoute::AddressBar(ui) => ui,
+            // Through CDP when this window is the connected browser's and its tab
+            // is known: the address reaches the tab itself, whatever holds the
+            // keyboard.
+            NavigationRoute::Cdp(page) => {
+                let port = sess.cdp_forward_port;
+                drop(guard);
+                let landing = cdp_navigate(port, page.target_id().inner(), &target).await;
+                self.mark_input().await;
+                let (tab_url, tab_title) = cdp_entry(&page).await.unwrap_or_default();
+                let shown_tab = if tab_url.is_empty() {
+                    "a page whose address Chrome did not report".to_owned()
+                } else {
+                    browser_address::shown_url(&tab_url)
+                };
+                let mut data = requested.clone();
+                data["method"] = serde_json::json!("cdp");
+                if !tab_url.is_empty() {
+                    data["url"] = serde_json::json!(shown_tab);
+                }
+                match landing {
+                    CdpLanding::Committed => {}
+                    CdpLanding::Refused(error) => {
+                        let reason = if error.contains("invalid URL") {
+                            "invalid_url"
+                        } else {
+                            "cdp_failed"
+                        };
+                        return Err(refuse(
+                            reason,
+                            format!("Chrome did not take {shown_target} through CDP ({error})"),
+                        ));
+                    }
+                    CdpLanding::Pending => {
+                        return Err(navigation_error(
+                            "pending",
+                            format!(
+                                "Chrome asked for {shown_target} and has had no answer for {} s. The tab shows {shown_tab} and may still change; take a screenshot before retrying.",
+                                NAVIGATION_COMMIT_WAIT.as_secs()
+                            ),
+                            true,
+                            false,
+                            data,
+                        ));
+                    }
+                    CdpLanding::Download => {
+                        return Err(navigation_error(
+                            "download",
+                            format!(
+                                "{shown_target} is a download, not a page: Chrome started downloading it and the tab still shows {shown_tab}."
+                            ),
+                            true,
+                            false,
+                            data,
+                        ));
+                    }
+                    CdpLanding::NotOpened(error) => {
+                        data["error"] = serde_json::json!(error);
+                        return Err(navigation_error(
+                            "not_navigated",
+                            format!(
+                                "Chrome did not open {shown_target} ({error}); the tab still shows {shown_tab}."
+                            ),
+                            true,
+                            false,
+                            data,
+                        ));
+                    }
+                    CdpLanding::Failed(error) => {
+                        data["error"] = serde_json::json!(error);
+                        return Err(navigation_error(
+                            "load_failed",
+                            format!(
+                                "{shown_target} did not load ({error}); the tab shows Chrome's error page for it."
+                            ),
+                            true,
+                            false,
+                            data,
+                        ));
+                    }
+                }
+                // Return in the address bar hands the keyboard to the page; so does
+                // this. It also raises the tab's window, so a window that lost the
+                // focus meanwhile is left alone rather than taking it back.
+                if window_caption(&conn, &unique, &runtime, &active.id)
+                    .await
+                    .is_some_and(|(_, window_active)| window_active)
+                {
+                    let _ =
+                        tokio::time::timeout(CDP_STEP_TIMEOUT, page.bring_to_front()).await;
+                }
+                let loaded = cdp_loaded(&page).await;
+                let (landed, entry_title) = cdp_entry(&page).await.unwrap_or((tab_url, tab_title));
+                let (title, window_active) = window_caption(&conn, &unique, &runtime, &active.id)
+                    .await
+                    .unwrap_or((entry_title, true));
+                let (text, data) =
+                    navigation_result("cdp", &title, &target, &landed, !loaded, window_active);
+                return Ok(structured_result(&peer, text, data).await);
+            }
+        };
+
+        // Through the address bar, read back through accessibility at every step.
+        let held = sess.eis.held_modifiers();
+        if !held.is_empty() {
             return Err(refuse(
-                "not_a_browser",
+                "modifier_held",
                 format!(
-                    "the active window is {:?} ({}), not a Chromium-family browser",
-                    window.title, window.resource_class
+                    "release the held modifiers first ({}): they would turn the address into shortcuts",
+                    held.join("+")
                 ),
             ));
         }
-        let title_before = window.title.clone();
-        let combo = |name: &str| -> Result<(Vec<u32>, u32), McpError> { parse_combo(name) };
+        if characters > browser_address::ADDRESS_BAR_MAX_CHARS {
+            return Err(refuse(
+                "url_too_long_for_address_bar",
+                format!(
+                    "the url has {characters} characters and this window has no CDP connection, so it would go through the address bar, which keeps {} pasted characters. launch_app the browser with a --user-data-dir of its own to navigate through CDP, up to {} characters",
+                    browser_address::ADDRESS_BAR_MAX_CHARS,
+                    browser_address::URL_MAX_CHARS
+                ),
+            ));
+        }
+        let page_before = ui.page().await;
+        let tab_before = ui.selected_tab().await;
         let typing_window = TypingWindow {
             connection: &sess.kwin_conn,
             kwin_unique: &sess.kwin_unique_name,
@@ -16320,85 +16831,277 @@ impl KwinMcp {
             window_id: &active.id,
             browser_title: None,
         };
-        // ctrl+l, then the address.
-        {
-            let (mods, main) = combo("ctrl+l")?;
-            let mut sent = SentInput::new(&sess.eis);
-            for m in &mods {
-                sent.key(*m, true, None).map_err(KwinError::from)?;
-            }
-            tokio::time::sleep(pace.hold().map_err(KwinError::from)?).await;
-            sent.key(main, true, None).map_err(KwinError::from)?;
-            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
-            sent.key(main, false, None).map_err(KwinError::from)?;
-            for m in mods.iter().rev() {
-                sent.key(*m, false, None).map_err(KwinError::from)?;
-            }
+        // Asked for also when the bar already reports focus: the report can be
+        // stale, and asking again changes nothing in a bar that has it.
+        ui.focus_address().await;
+        let mut focused = address_focus_within(&ui, ADDRESS_FOCUS_WAIT / 3).await;
+        if !focused {
+            navigation_key(&sess.eis, "ctrl+l", pace).await?;
+            focused = address_focus_within(&ui, ADDRESS_FOCUS_WAIT).await;
         }
-        sess.eis.roundtrip().await.map_err(KwinError::from)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        type_with_profile(&sess.eis, &params.url, &keys, pace, None, &typing_window).await?;
-        // The address bar completes the typed text inline; the completion is
-        // selected, so Delete removes it and Return opens what was typed.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        for name in ["Delete", "Return"] {
-            let (_, main) = combo(name)?;
-            let mut sent = SentInput::new(&sess.eis);
-            sent.key(main, true, None).map_err(KwinError::from)?;
-            tokio::time::sleep(pace.key_hold().map_err(KwinError::from)?).await;
-            sent.key(main, false, None).map_err(KwinError::from)?;
-            drop(sent);
-            sess.eis.roundtrip().await.map_err(KwinError::from)?;
-            tokio::time::sleep(Duration::from_millis(120)).await;
+        if !focused {
+            return Err(navigation_error(
+                "address_bar_not_focused",
+                "The address bar did not take keyboard focus, neither when asked through accessibility nor with ctrl+l (a dialog may hold the window, or the page may consume the shortcut). The address was not typed. Click the address bar and call browser_navigate again: it continues from a focused address bar.".to_owned(),
+                false,
+                true,
+                requested,
+            ));
         }
-        let cdp_browser = sess.cdp_browser.clone();
-        let (conn, unique, runtime) = (
-            sess.kwin_conn.clone(),
-            sess.kwin_unique_name.clone(),
-            sess.host_xdg_dir.clone(),
-        );
+        check_typing_window(&typing_window)
+            .await
+            .map_err(|error| refuse(error.reason(), error.to_string()))?;
+        navigation_key(&sess.eis, "ctrl+a", pace).await?;
+        let mut clipboard_kept = true;
+        let entered = if typed {
+            type_with_profile(&sess.eis, &target, &keys, pace, None, &typing_window)
+                .await
+                .map_err(|mut error| {
+                    error.message = format!(
+                        "The address was not completely typed into the address bar, so Return was not pressed and the tab keeps its page. {}",
+                        error.message
+                    )
+                    .into();
+                    if let Some(data) = error.data.as_mut() {
+                        data["navigation_submitted"] = serde_json::json!(false);
+                    }
+                    error
+                })?;
+            // The address bar completes the typed text inline; the completion is
+            // selected, so Delete removes it and leaves what was typed.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            navigation_key(&sess.eis, "Delete", pace).await?;
+            address_entered(&ui, &target, ADDRESS_TEXT_WAIT).await
+        } else {
+            let socket = sess.host_xdg_dir.join("wayland-0");
+            let (store, text) = (self.clipboards.clone(), target.clone());
+            let loan = tokio::task::spawn_blocking(move || {
+                store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("clipboard store lock poisoned"))?
+                    .lend(&socket, &text)
+            })
+            .await
+            .map_err(|error| KwinError::Msg(format!("clipboard task failed: {error}")))?
+            .map_err(KwinError::from)?;
+            let pasted = navigation_key(&sess.eis, KEYBOARD_PASTE_SHORTCUT, pace).await;
+            // Chrome reads the selection after the shortcut; it is the agent's again
+            // only once the address bar shows the address.
+            let entered = match &pasted {
+                Ok(()) => address_entered(&ui, &target, ADDRESS_PASTE_WAIT).await,
+                Err(_) => Err(None),
+            };
+            let store = self.clipboards.clone();
+            clipboard_kept = tokio::task::spawn_blocking(move || {
+                store.lock().is_ok_and(|mut store| store.take_back(loan).is_ok())
+            })
+            .await
+            .unwrap_or(false);
+            pasted?;
+            entered
+        };
+        if let Err(held_text) = entered {
+            // Put the page's own address back, if the keys can still reach the bar.
+            if ui.address_focused().await {
+                let _ = navigation_key(&sess.eis, "Escape", pace).await;
+                let _ = navigation_key(&sess.eis, "Escape", pace).await;
+            }
+            let held_text = match held_text {
+                Some(text) => format!("held {:?}", browser_address::shown_url(&text)),
+                None => "could not be read".to_owned(),
+            };
+            return Err(navigation_error(
+                "address_not_entered",
+                format!(
+                    "The address bar {held_text} instead of {shown_target} after the address was {}, so Return was not pressed and the tab keeps its page. Some of the text may have reached the page; take a screenshot before retrying.",
+                    if typed { "typed" } else { "pasted" }
+                ),
+                false,
+                false,
+                requested,
+            ));
+        }
+        check_typing_window(&typing_window).await.map_err(|error| {
+            navigation_error(
+                error.reason(),
+                format!("{error}. {shown_target} is in the address bar, but Return was not pressed."),
+                false,
+                false,
+                requested.clone(),
+            )
+        })?;
+        navigation_key(&sess.eis, "Return", pace).await?;
         drop(guard);
         self.mark_input().await;
-        // Wait for the title to change; a page that keeps its title (a reload of the
-        // same address) is reported as unchanged after the wait.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        let mut title = title_before.clone();
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            if let Ok((_, _, now)) = active_window_info(&conn, &unique, &runtime).await
-                && now.title != title_before
-            {
-                title = now.title;
+
+        let commit_deadline = tokio::time::Instant::now() + NAVIGATION_COMMIT_WAIT;
+        let mut load_deadline = None;
+        let mut landed: Option<browser_address::ShownPage> = None;
+        let mut shown = page_before.clone();
+        let mut tab_changed = false;
+        let same_document = page_before
+            .as_ref()
+            .is_some_and(|before| browser_address::same_document(&target, &before.uri));
+        let blank = target == "about:blank" || target.starts_with("about:blank#");
+        loop {
+            tokio::time::sleep(NAVIGATION_POLL).await;
+            let tab = ui.selected_tab().await;
+            let page = ui.page().await;
+            if tab_before.is_some() && tab.is_some() && tab != tab_before {
+                tab_changed = true;
+                shown = page;
+                break;
+            }
+            if let Some(page) = page {
+                let moved = page_before
+                    .as_ref()
+                    .is_none_or(|before| page.replaced(before));
+                shown = Some(page.clone());
+                // An address in the document the tab already shows (another
+                // fragment) is opened without a new document, and the document
+                // keeps reporting the address it was loaded from. Chrome cannot
+                // fail such a navigation; it took it once the bar gave up focus.
+                let anchored = !moved && same_document && !ui.address_focused().await;
+                if page.uri.is_empty() {
+                    // A new document without an address: about:blank stays that
+                    // way, any other page reports its address with its content.
+                    let wait = if blank { NAVIGATION_POLL * 2 } else { NAVIGATION_LOAD_WAIT };
+                    let deadline = *load_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + wait);
+                    if moved && tokio::time::Instant::now() >= deadline {
+                        landed = Some(page);
+                        break;
+                    }
+                } else if moved || anchored || browser_address::same_destination(&target, &page.uri)
+                {
+                    let deadline = *load_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + NAVIGATION_LOAD_WAIT);
+                    let settled = !page.loading || tokio::time::Instant::now() >= deadline;
+                    landed = Some(if anchored { page.at(&target) } else { page });
+                    if settled {
+                        break;
+                    }
+                }
+            }
+            if landed.is_none() && tokio::time::Instant::now() >= commit_deadline {
                 break;
             }
         }
-        let mut data = serde_json::json!({"title": title});
-        let mut text = format!("navigated: {title}");
-        if title == title_before {
-            data["title_changed"] = serde_json::json!(false);
-            text.push_str(" (the title did not change: the page may still be loading, or it is the page that was already open)");
-        }
-        if let Some(browser) = cdp_browser
-            && let Ok(pages) = browser.pages().await
-        {
-            for page in pages {
-                let page_title = page.get_title().await.ok().flatten().unwrap_or_default();
-                if page_title.is_empty() || !title.starts_with(&page_title) {
-                    continue;
+        // The caption follows the page's title a moment after the page itself.
+        let caption_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (title, window_active) = loop {
+            let caption = window_caption(&conn, &unique, &runtime, &active.id).await;
+            match caption {
+                Some((title, _))
+                    if landed.is_some()
+                        && title == title_before
+                        && tokio::time::Instant::now() < caption_deadline =>
+                {
+                    tokio::time::sleep(NAVIGATION_POLL).await;
                 }
-                if let Some(url) = page.url().await.ok().flatten() {
-                    let matched = same_destination(&params.url, &url);
-                    data["url"] = serde_json::json!(url);
-                    if !matched {
-                        data["matched"] = serde_json::json!(false);
-                        data["warning"] = serde_json::json!(
-                            "The page is not at the address that was typed; the address bar may have completed it from history."
-                        );
-                        text.push_str(&format!(". warning: landed on {url}, not {}", params.url));
-                    }
-                    break;
-                }
+                Some(caption) => break caption,
+                None => break (title_before.clone(), true),
             }
+        };
+        let method = if typed { "address_bar_typed" } else { "address_bar_pasted" };
+        let shown_tab = shown
+            .as_ref()
+            .filter(|page| !page.uri.is_empty())
+            .map(|page| browser_address::shown_url(&page.uri));
+        let mut data = requested;
+        data["url"] = serde_json::json!(shown_tab);
+        data["title"] = serde_json::json!(title);
+        data["method"] = serde_json::json!(method);
+        if !clipboard_kept {
+            data["clipboard_replaced"] = serde_json::json!(true);
+        }
+        if tab_changed {
+            return Err(navigation_error(
+                "tab_changed",
+                format!(
+                    "Return was pressed with {shown_target} in the address bar, but another tab became this window's selected tab before the page could be read; that tab shows {}. The address may have opened in the tab selected before: select it and take a screenshot before retrying.",
+                    shown_tab.as_deref().unwrap_or("an unreadable page")
+                ),
+                true,
+                false,
+                data,
+            ));
+        }
+        let Some(landed) = landed else {
+            return Err(match &shown_tab {
+                Some(still) => navigation_error(
+                    "not_navigated",
+                    format!(
+                        "Return was pressed with {shown_target} in the address bar, but the tab still shows {still} after {} s. The address may be a download, its server may not have answered yet, or a page dialog may hold the tab; take a screenshot before retrying.",
+                        NAVIGATION_COMMIT_WAIT.as_secs()
+                    ),
+                    true,
+                    false,
+                    data,
+                ),
+                None => navigation_error(
+                    "unverified",
+                    format!(
+                        "Return was pressed with {shown_target} in the address bar, but this window exposes no page address through accessibility, so where the tab landed is not verified. The window title is {title:?}; take a screenshot."
+                    ),
+                    true,
+                    false,
+                    data,
+                ),
+            });
+        };
+        let landed = if !landed.uri.is_empty() {
+            landed
+        } else if blank && browser_address::caption_names_tab(&title, "about:blank") {
+            // The blank page has no address in accessibility; its caption names it.
+            landed.at(&target)
+        } else {
+            return Err(navigation_error(
+                "unverified",
+                format!(
+                    "Return was pressed with {shown_target} in the address bar and the tab opened a new page, but that page exposes no address through accessibility, so where the tab landed is not verified. The window title is {title:?}; take a screenshot."
+                ),
+                true,
+                false,
+                data,
+            ));
+        };
+        if browser_address::is_error_page(&landed.uri) {
+            return Err(navigation_error(
+                "load_failed",
+                format!(
+                    "{shown_target} did not load: the tab shows Chrome's error page for it ({title}). Take a screenshot for the error."
+                ),
+                true,
+                false,
+                data,
+            ));
+        }
+        if !browser_address::same_destination(&target, &landed.uri)
+            && browser_address::searched_for(&target, &landed.uri)
+        {
+            return Err(navigation_error(
+                "searched",
+                format!(
+                    "Chrome did not take {shown_target} as an address: it searched for the text, and the tab shows {}.",
+                    browser_address::shown_url(&landed.uri)
+                ),
+                true,
+                false,
+                data,
+            ));
+        }
+        let (mut text, mut data) = navigation_result(
+            method,
+            &title,
+            &target,
+            &landed.uri,
+            landed.loading,
+            window_active,
+        );
+        if !clipboard_kept {
+            data["clipboard_replaced"] = serde_json::json!(true);
+            text.push_str(". The session clipboard now holds the address: what it held before could not be restored");
         }
         Ok(structured_result(&peer, text, data).await)
     }
@@ -23447,24 +24150,6 @@ mod startup_report_tests {
         let error = clickable_center(&elements, 2).expect_err("only two are clickable");
         assert!(error.contains("2 of 4 matches"), "{error}");
         assert!(clickable_center(&[], 0).is_err());
-    }
-
-    #[test]
-    fn navigate_urls_are_checked_and_compared_by_destination() {
-        use super::{navigate_url_problem, same_destination};
-        assert!(navigate_url_problem("learn.zybooks.com/zybook/X/chapter/3/section/14").is_none());
-        assert!(navigate_url_problem("https://example.test/a?b=c#d").is_none());
-        assert!(navigate_url_problem("").is_some());
-        assert!(navigate_url_problem("two words").is_some());
-        assert!(navigate_url_problem("caf\u{e9}.test").is_some());
-        assert!(navigate_url_problem(&"a".repeat(2001)).is_some());
-        // The case the issue reports: history completed section/11 to section/14.
-        assert!(!same_destination(
-            "learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/1",
-            "https://learn.zybooks.com/zybook/CSUNECE240HangFall2026/chapter/3/section/14"
-        ));
-        assert!(same_destination("example.test/a", "https://www.example.test/a/?x=1#top"));
-        assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
     }
 
     #[test]

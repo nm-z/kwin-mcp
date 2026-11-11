@@ -1,5 +1,14 @@
 # Real-system test storage
 
+`tests/browser_navigate_e2e.rs` drives `browser_navigate` in fresh sessions
+against a local HTTP server that records what Chrome asked for, so each result
+is checked against the request Chrome made: one test per report of #908 without
+CDP (a page that keeps ctrl+l, a page that returns it late, another window
+taking focus, an address of 3000 characters) and one with CDP. Run a case with
+`systemd-run --user --quiet --wait --pipe --collect --same-dir -p RuntimeMaxSec=600
+--setenv=KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`;
+`KWIN_MCP_E2E_EVIDENCE=<directory>` keeps a screenshot of each landed page.
+
 `ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
 native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks
 multiline UTF-8 field receipts and independently receives the complete values
