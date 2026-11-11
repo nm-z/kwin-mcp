@@ -21527,8 +21527,9 @@ Options:\n\
                          stop when its connection drops\n\
   --link-mbps N          With --listen: speed in Mb/s of the link to remote viewers, in\n\
                          place of the routing interface's own (loopback: unlimited). Frames\n\
-                         are paced to 90% of it and go out as exact pixels, or as DSC\n\
-                         when the link is too slow for those and DSC arrives sooner\n\
+                         are paced to 90% of it, which the viewers on one interface\n\
+                         share, and go out as exact pixels, or as DSC when a viewer's\n\
+                         share is too slow for those and DSC arrives sooner\n\
   --memory-high GIB      Session memory pressure threshold (default: {}; 0 disables)\n\
   --memory-max GIB       Session memory limit (default: {}; must be positive)\n\
   --memory-swap-max GIB  Session swap limit (default: {}; 0 disables)\n\
