@@ -11259,6 +11259,7 @@ async fn spawn_remote_viewer(dir: &Path, host: &str, ticket: &str) -> Result<Ses
     let log_path = dir.join("viewer.log");
     let _ = std::fs::remove_file(dir.join(VIEWER_STATUS_FILE));
     let _ = std::fs::remove_file(dir.join(kwin_mcp::viewer_stream::COUNTERS_FILE));
+    let _ = std::fs::remove_file(dir.join(kwin_mcp::links::PATH_FILE));
     let log_file = std::fs::File::create(&log_path)
         .map_err(|error| format!("create {}: {error}", log_path.display()))?;
     let bin = resolve_viewer_binary()

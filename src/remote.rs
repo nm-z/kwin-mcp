@@ -17,6 +17,8 @@ pub const DEFAULT_PORT: u16 = 47913;
 const SECRET_FILE: &str = "remote-secret";
 const AUTHORIZATION_SCHEME: &str = "Bearer ";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a frame socket bound to a chosen path may take to connect.
+const BOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// A silent peer is probed after this long, then every `KEEPALIVE_INTERVAL`.
 const KEEPALIVE_IDLE_SECONDS: u32 = 10;
 const KEEPALIVE_INTERVAL_SECONDS: u32 = 5;
@@ -754,13 +756,33 @@ async fn connect_from(
                 source.address
             )
         })?;
-    let socket = if peer.is_ipv4() {
+    let (socket, bound) = bound_socket(source)?;
+    let failed = |error: &dyn std::fmt::Display| {
+        format!(
+            "could not connect from {} on {}: {error}",
+            source.address, source.interface
+        )
+    };
+    // A listener on the LAN answers in milliseconds. A path that does not
+    // reach it must fail while the listener still waits for the socket
+    // (the viewer then uses the routing table's path).
+    let stream = tokio::time::timeout(BOUND_CONNECT_TIMEOUT, socket.connect(peer))
+        .await
+        .map_err(|_| failed(&format_args!("no answer in {BOUND_CONNECT_TIMEOUT:?}")))?
+        .map_err(|error| failed(&error))?;
+    Ok((stream, bound))
+}
+
+/// An unconnected TCP socket bound to `source`: to its interface when the
+/// kernel allows that (`SO_BINDTODEVICE`, unprivileged since Linux 5.7 for a
+/// socket that is bound to no device), and to its address.
+pub fn bound_socket(source: &Source) -> Result<(tokio::net::TcpSocket, Bound), String> {
+    let socket = if source.address.is_ipv4() {
         tokio::net::TcpSocket::new_v4()
     } else {
         tokio::net::TcpSocket::new_v6()
     }
     .map_err(|error| format!("frame socket: {error}"))?;
-    // Unprivileged since Linux 5.7 for a socket that is bound to no device.
     let bound = match socket.bind_device(Some(source.interface.as_bytes())) {
         Ok(()) => Bound::Device,
         Err(_) => Bound::Address,
@@ -768,13 +790,7 @@ async fn connect_from(
     socket
         .bind(SocketAddr::new(source.address, 0))
         .map_err(|error| format!("could not bind to {}: {error}", source.address))?;
-    let stream = socket.connect(peer).await.map_err(|error| {
-        format!(
-            "could not connect from {} on {}: {error}",
-            source.address, source.interface
-        )
-    })?;
-    Ok((stream, bound))
+    Ok((socket, bound))
 }
 
 /// Viewer side: opens the frame socket of the `viewer_open` call that carried

@@ -552,3 +552,61 @@ fn the_receive_rate_is_read_from_a_stations_nested_attributes() {
     assert!(!ended);
     assert_eq!(bodies, [&narrow[..]]);
 }
+
+/// Prints this machine's interfaces and, for the IP address in
+/// `KWIN_MCP_TEST_PEER`, its paths to that peer, the path a first, second
+/// and third stream would take, and what a frame socket on each path can be
+/// bound to. Nothing is connected and no packet is sent.
+#[test]
+#[ignore = "inspection: prints this machine's interfaces and its paths to KWIN_MCP_TEST_PEER"]
+fn this_machines_interfaces_and_paths() -> Result<(), String> {
+    let table = super::interfaces();
+    for interface in &table {
+        eprintln!("{interface:?}");
+    }
+    // Every running wireless interface with an address tells its rate.
+    for interface in &table {
+        if interface.wireless && interface.running && !interface.addresses.is_empty() {
+            assert!(interface.mbps.is_some(), "{interface:?}");
+        }
+    }
+    let Ok(peer) = std::env::var("KWIN_MCP_TEST_PEER") else {
+        return Ok(());
+    };
+    let peer: IpAddr = peer
+        .parse()
+        .map_err(|_| format!("{peer} is no IP address"))?;
+    let routed = super::routed_source(std::net::SocketAddr::new(peer, crate::remote::DEFAULT_PORT));
+    eprintln!("the routing table reaches {peer} from {routed:?}");
+    let paths = paths_to(&table, peer, routed);
+    let mut loads = Vec::new();
+    for stream in 1..=3 {
+        let Some(path) = choose(&paths, &loads, "another:47913") else {
+            break;
+        };
+        eprintln!(
+            "stream {stream} from a machine of its own: {} (fair share {} Mb/s)",
+            path.describe(),
+            fair_share(path, &loads, "another:47913") / MEGABIT
+        );
+        loads.push(load(
+            &path.interface,
+            &format!("machine{stream}:47913"),
+            None,
+        ));
+    }
+    for path in &paths {
+        let source = crate::remote::Source {
+            address: path.source,
+            interface: path.interface.clone(),
+        };
+        let (_socket, bound) = crate::remote::bound_socket(&source)?;
+        eprintln!(
+            "{}: usable {} Mb/s, routed {}, a socket binds to {bound:?}",
+            path.describe(),
+            path.usable_bits_per_second() / MEGABIT,
+            path.routed
+        );
+    }
+    Ok(())
+}

@@ -3482,8 +3482,9 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
 
     // Input records go out as they are queued, whatever the frame thread
     // does. When the socket's path dies, the frame thread hands over the
-    // socket that replaces it: the drawable size and the first-presentation
-    // notice are said again on it, because the frame sender there is new.
+    // socket that replaces it: the drawable size, the first-presentation
+    // notice and the pointer's position are said again on it, because the
+    // frame sender there is new.
     let (ops, mut queued) = tokio::sync::mpsc::channel::<Outgoing>(STREAM_INPUT_QUEUE);
     let (sinks, mut replaced) = tokio::sync::mpsc::unbounded_channel::<(FrameSink, Option<u64>)>();
     let (closed, sink_closed) = tokio::sync::oneshot::channel::<()>();
@@ -3491,6 +3492,8 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         let mut sink = Some(sink);
         let mut size = None;
         let mut presented = false;
+        // Where the pointer was last, in the session.
+        let mut pointer = None;
         loop {
             let wrote = {
                 let outgoing = tokio::select! {
@@ -3507,7 +3510,8 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                                 match op {
                                     Op::Size(..) => size = Some(op),
                                     Op::Presented => presented = true,
-                                    Op::Motion(..) | Op::Button(..) | Op::Axis(..) | Op::Key(..) => {}
+                                    Op::Motion(..) => pointer = Some(op),
+                                    Op::Button(..) | Op::Axis(..) | Op::Key(..) => {}
                                 }
                                 Message::Binary(op.encode().to_vec().into())
                             }
@@ -3534,9 +3538,12 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                     let path = cap
                         .and_then(|bits_per_second| serde_json::to_string(&Request::Path { bits_per_second }).ok())
                         .map(Message::text);
+                    // The new sender's pointer device has not moved yet, and
+                    // the session shows no cursor until it does.
                     let again = size
                         .into_iter()
                         .chain(presented.then_some(Op::Presented))
+                        .chain(pointer)
                         .map(|op| Message::Binary(op.encode().to_vec().into()));
                     let mut said = true;
                     for message in path.into_iter().chain(again) {

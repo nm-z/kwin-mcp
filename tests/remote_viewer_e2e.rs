@@ -136,6 +136,16 @@ impl Server {
     /// A stdio server that runs a private copy of the binary and re-executes
     /// itself when that copy changes. Returns the copy's path too.
     fn start_copy(home: &Path, label: &str, display: Option<&Path>) -> (Self, PathBuf) {
+        Self::start_copy_with(home, label, display, &[])
+    }
+
+    /// The same, with `environment` set for the server and its viewers.
+    fn start_copy_with(
+        home: &Path,
+        label: &str,
+        display: Option<&Path>,
+        environment: &[(&str, &Path)],
+    ) -> (Self, PathBuf) {
         let source = server_binary();
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).expect("create the private bin directory");
@@ -148,6 +158,7 @@ impl Server {
         .expect("copy kwin-viewer");
         let mut command = kwin_mcp_at(&program, home);
         command.env("KWIN_MCP_BINARY", &program);
+        command.envs(environment.iter().copied());
         let server = Self::start_command(command, home, label, display, None);
         (server, program)
     }
@@ -2084,7 +2095,10 @@ fn viewers_on_one_interface_share_its_budget_and_an_idle_ones_share_is_taken_ove
     let second = Shared::open(&mut server, &host, SIZE);
     second.scroll(true);
     for stream in [&first, &second] {
-        let halved = stream.sharing(BUDGET / 2.0, 2, |counters| scrolling(counters, "dsc"));
+        // (The last frame of a second may be a settle frame, which is raw.)
+        let halved = stream.sharing(BUDGET / 2.0, 2, |counters| {
+            scrolling(counters, "dsc") && counters["mode"] == "dsc"
+        });
         assert_eq!(halved["bits_per_pixel"].as_f64(), Some(12.0), "{halved}");
     }
     let (rates, total) = measured("two streams", &[&first, &second]);
@@ -2133,6 +2147,19 @@ fn viewers_on_one_interface_share_its_budget_and_an_idle_ones_share_is_taken_ove
         );
     }
     let (rates, total) = measured("three streams", &[&first, &second, &third]);
+    // What the two ends of one of them log each second.
+    let last_line = |log: &str, mark: &str| {
+        let line = log.lines().rev().filter(|line| line.contains(mark)).nth(1);
+        line.unwrap_or_default().to_owned()
+    };
+    eprintln!(
+        "sender: {}",
+        last_line(&first.sender_log(), "stream: sent ")
+    );
+    eprintln!(
+        "viewer: {}",
+        last_line(&first.viewer.log_text(), " frames/s ")
+    );
     assert!(
         (BUDGET * 0.8..=BUDGET * 1.03).contains(&total),
         "three streams received {total:.1} Mb/s of {BUDGET}: {rates:?}"
@@ -2238,9 +2265,12 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     list(json!([wireless, wired]));
     let listener = Listener::start(&home, &[]);
     let host = listener.address.clone();
-    let mut command = kwin_mcp(&home);
-    command.env(kwin_mcp::links::PATHS_ENV, &table);
-    let mut server = Server::start_command(command, &home, "server", Some(&desk.display()), None);
+    let (mut server, program) = Server::start_copy_with(
+        &home,
+        "server",
+        Some(&desk.display()),
+        &[(kwin_mcp::links::PATHS_ENV, &table)],
+    );
     let open = |server: &mut Server| {
         let (session, workdir) =
             server.start_session(json!({"host":host, "width":800, "height":450}));
@@ -2270,6 +2300,10 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     assert!(["device", "address"].contains(&bound), "{opened}");
     let log = sender_log(&first_dir);
     assert!(log.contains("stream: viewer 127.0.0.2:"), "{log}");
+    // The server re-executes itself, as every install makes it do: the
+    // window stays, and the new image answers it when its path dies.
+    reexecute(&program, &home.join("server.log"), &host, 1);
+    assert!(alive(first_viewer.pid), "the window closed with the reload");
 
     // The second takes the wireless path, which gives it more than half of
     // the wired one: bound to that path's address.
@@ -2289,8 +2323,11 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
         .count();
     assert_eq!(counted, 2);
 
-    // The first window shows a still screen.
+    // The first window shows a still screen, with the session's pointer
+    // where the window's is.
     desk.activate(&first);
+    desk.tool("mouse_move", json!({"x":520, "y":300}));
+    std::thread::sleep(Duration::from_secs(1));
     let frames_before = first_viewer.idle()["frames"].as_u64().expect("frames");
     let sender_before = sender_pid(&first_dir);
     // The window as its desktop shows it now, kept as evidence under `name`.
@@ -2334,13 +2371,16 @@ fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
     ] {
         assert!(viewer_log.contains(expected), "{expected}\n{viewer_log}");
     }
-    // The window shows the picture it showed before.
-    first_viewer.idle();
+    // The window shows the picture it showed before, the session's pointer
+    // included, once the new sender's frames have arrived.
     desk.activate(&first);
-    let after = shoot(&mut desk, "916-after-the-stream-moved.png");
-    assert!(
-        before == after,
-        "the window's picture changed with the path"
+    let after = wait_for(
+        "the picture the window showed before",
+        Duration::from_secs(15),
+        || {
+            Some(shoot(&mut desk, "916-after-the-stream-moved.png"))
+                .filter(|after| *after == before)
+        },
     );
 
     // The stream works on its new path, in both directions: keys typed into

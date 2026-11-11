@@ -7,6 +7,7 @@
 //!
 //! Sender to viewer:
 //! * text: one JSON [`Notice`] (`hello` once, then `title` on each change,
+//!   `share` whenever the stream's share of its interface's budget changes,
 //!   and `clipboard` in answer to a copy request);
 //! * binary: a [`Header`] followed by its payload. `Raw` is `width * height`
 //!   pixels of 3 bytes (red, green, blue): the session's own values, exact.
@@ -17,8 +18,9 @@
 //! Viewer to sender:
 //! * binary: 17-byte input records (the viewer's `Op`), which include the
 //!   drawable size and the first-presentation notice;
-//! * text: one JSON [`Request`], sent only to a sender whose `hello` says it
-//!   bridges the clipboard.
+//! * text: one JSON [`Request`]: the clipboard requests, sent only to a
+//!   sender whose `hello` says it bridges the clipboard, and `path` from a
+//!   viewer that chose the path of its socket ([`crate::links`]).
 //!
 //! # Clipboard
 //!
