@@ -1008,6 +1008,13 @@ fn is_insertion(before: &str, after: &str, inserted: &str) -> bool {
         .any(|index| after.get(index..index + shift) == Some(inserted))
 }
 
+/// The number `after` spells when it differs from the number `before` spells.
+/// A value that input does not change cannot show that the input arrived.
+fn changed_number(before: &str, after: &str) -> Option<f64> {
+    let number = after.trim().parse::<f64>().ok().filter(|number| number.is_finite())?;
+    (before.trim().parse::<f64>().ok() != Some(number)).then_some(number)
+}
+
 fn normalize_accessible_offset(text: &str, offset: usize) -> usize {
     text.chars()
         .take(offset)
@@ -1161,6 +1168,9 @@ pub struct TextReceipt {
     bus: zbus::Connection,
     object: atspi::ObjectRefOwned,
     expected: String,
+    // For a number input whose number the input changes: the number it should
+    // then hold, which its Value interface reports apart from its text.
+    expected_number: Option<f64>,
     // The field's text before typing, and whether a selection (not just a caret)
     // was there to be replaced.
     before: String,
@@ -1862,12 +1872,17 @@ impl TextReceipt {
             && (before == normalize_accessible_text(placeholder)
                 || before == normalize_accessible_text(&accessible_name)))
         .then(|| input.to_owned());
-        let expected = before
+        let expected: String = before
             .chars()
             .take(start)
             .chain(input.chars())
             .chain(before.chars().skip(end))
             .collect();
+        let expected_number = if node.get_role().await? == atspi::Role::SpinButton {
+            changed_number(&before, &expected)
+        } else {
+            None
+        };
         let selection_replaced = start != end;
         let prior_text = before.clone();
         // An emptied contenteditable can expose a synthetic newline
@@ -1885,6 +1900,7 @@ impl TextReceipt {
             bus: bus.clone(),
             object: object.clone(),
             expected,
+            expected_number,
             before: prior_text,
             selection_replaced,
             input: normalize_accessible_text(input),
@@ -1922,7 +1938,12 @@ impl TextReceipt {
             use atspi::proxy::accessible::ObjectRefExt;
             use atspi::proxy::proxy_ext::ProxyExt;
             let node = self.object.as_accessible_proxy(&self.bus).await?;
-            let text = node.proxies().await?.text().await?;
+            let proxies = node.proxies().await?;
+            let text = proxies.text().await?;
+            let value = match self.expected_number {
+                Some(_) => proxies.value().await.ok(),
+                None => None,
+            };
             let mut poll_count = 0;
             loop {
                 let states = node.get_state().await?;
@@ -1937,6 +1958,17 @@ impl TextReceipt {
                 observed_text = Some(normalized_observed.clone());
                 if normalized_observed == self.expected {
                     return Ok::<&'static str, anyhow::Error>("atspi_focused_text");
+                }
+                // Chrome can leave a number input's text as it was while its
+                // value is current. The value then says what the field holds.
+                if poll_count % 5 == 4
+                    && let Some(value) = &value
+                    && let Ok(current) = value.current_value().await
+                    && Some(current) == self.expected_number
+                {
+                    observed_count = Some(expected_count);
+                    observed_text = Some(self.expected.clone());
+                    return Ok("atspi_value");
                 }
                 if self
                     .blank_line_replacement
@@ -2414,6 +2446,7 @@ mod null_ref_tests {
     const SHOWING: u32 = 1 << 25;
     // AT-SPI role numbers.
     const FRAME: u32 = 23;
+    const SPIN_BUTTON: u32 = 52;
     const APPLICATION: u32 = 75;
     const ENTRY: u32 = 79;
 
@@ -2495,6 +2528,17 @@ mod null_ref_tests {
         }
     }
 
+    // A number input that holds 7.
+    struct Seven;
+
+    #[zbus::interface(name = "org.a11y.atspi.Value")]
+    impl Seven {
+        #[zbus(property, name = "CurrentValue")]
+        fn current_value(&self) -> f64 {
+            7.0
+        }
+    }
+
     // The registry of a bus with one application.
     struct Registry(Children);
 
@@ -2512,11 +2556,13 @@ mod null_ref_tests {
 
     /// An application with one 1280x800 frame named `frame_name` that holds a
     /// focused editable entry "answer", readable only with `entry_interfaces`.
+    /// With the Value interface the entry is a number input: a spin button.
     async fn serve_application(
         address: &str,
         frame_name: &'static str,
         entry_interfaces: &'static [&'static str],
     ) -> anyhow::Result<(zbus::Connection, zbus::Connection)> {
+        let number_input = entry_interfaces.contains(&"Value");
         let application = zbus::connection::Builder::address(address)?
             .auth_mechanism(zbus::AuthMechanism::Anonymous)
             .build()
@@ -2558,8 +2604,8 @@ mod null_ref_tests {
                 "/entry",
                 Node {
                     name: "answer",
-                    role: ENTRY,
-                    role_name: "entry",
+                    role: if number_input { SPIN_BUTTON } else { ENTRY },
+                    role_name: if number_input { "spin button" } else { "entry" },
                     states: FOCUSED | EDITABLE | SHOWING,
                     children: Vec::new(),
                     interfaces: entry_interfaces,
@@ -2568,6 +2614,7 @@ mod null_ref_tests {
             .await?;
         server.at("/entry", Extents(20, 115, 400, 60)).await?;
         server.at("/entry", EmptyText).await?;
+        server.at("/entry", Seven).await?;
         let registry = zbus::connection::Builder::address(address)?
             .auth_mechanism(zbus::AuthMechanism::Anonymous)
             .name("org.a11y.atspi.Registry")?
@@ -2638,5 +2685,34 @@ mod null_ref_tests {
         let message = error.to_string();
         assert!(message.contains("entry \"answer\" at screen (20,115 400x60)"), "{message}");
         Ok(())
+    }
+
+    // Chrome can leave a number input's text as it was while its value is
+    // current: the stand-in's text stays empty and its value is 7.
+    #[tokio::test]
+    async fn a_number_input_with_stale_text_is_verified_by_its_value() -> anyhow::Result<()> {
+        let (_bus, address) = start_bus()?;
+        let _served = serve_application(
+            &address,
+            "New Tab - Google Chrome",
+            &["Accessible", "Component", "Text", "Value"],
+        )
+        .await?;
+        let receipt = TextReceipt::capture(&address, browser_window(None), None, "7").await?;
+        assert_eq!(receipt.expected_number, Some(7.0));
+        let delivery = receipt.confirm().await;
+        assert_eq!(delivery.status, "verified", "{:?}", delivery.warning);
+        assert_eq!(delivery.method, "atspi_value");
+        assert_eq!(delivery.observed_text.as_deref(), Some("7"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_number_that_input_does_not_change_proves_nothing() {
+        assert_eq!(super::changed_number("-10", "-105"), Some(-105.0));
+        assert_eq!(super::changed_number("", "7"), Some(7.0));
+        // A leading zero changes the text, not the number.
+        assert_eq!(super::changed_number("10", "010"), None);
+        assert_eq!(super::changed_number("", "-"), None);
     }
 }
