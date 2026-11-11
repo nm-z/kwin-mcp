@@ -1241,6 +1241,96 @@ impl std::fmt::Display for TerminalFocus {
 
 impl std::error::Error for TerminalFocus {}
 
+/// Keyboard focus is on an editable control whose text accessibility could not
+/// read, so keys can be sent to it but the result cannot be read back.
+#[derive(Debug)]
+pub struct UnreadableFocus {
+    control: String,
+    reason: String,
+}
+
+impl std::fmt::Display for UnreadableFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "keyboard focus is on {}, an editable field whose text accessibility could not read ({})",
+            self.control, self.reason
+        )
+    }
+}
+
+impl std::error::Error for UnreadableFocus {}
+
+/// The active window a receipt is bound to, as KWin reports it.
+#[derive(Clone, Copy)]
+pub struct TextWindow<'a> {
+    pub title: &'a str,
+    /// The client area: x, y, width, height.
+    pub bounds: [f64; 4],
+    /// The process that owns the window, when KWin reported one.
+    pub pid: Option<u32>,
+}
+
+/// The process behind an accessibility bus name, as the bus daemon sees it.
+async fn bus_name_pid(bus: &zbus::Connection, name: &str) -> Option<u32> {
+    bus.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "GetConnectionUnixProcessID",
+        &(name,),
+    )
+    .await
+    .ok()?
+    .body()
+    .deserialize::<u32>()
+    .ok()
+}
+
+/// Whether an accessibility frame covers the window's client area.
+async fn frame_covers(
+    frame: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    bounds: [f64; 4],
+) -> anyhow::Result<bool> {
+    use atspi::proxy::proxy_ext::ProxyExt;
+    let (x, y, w, h) = frame
+        .proxies()
+        .await?
+        .component()
+        .await?
+        .get_extents(atspi::CoordType::Screen)
+        .await?;
+    Ok([x, y, w, h]
+        .into_iter()
+        .zip(bounds)
+        .all(|(actual, expected)| {
+            (f64::from(actual) - expected).abs() <= TEXT_WINDOW_BOUNDS_TOLERANCE
+        }))
+}
+
+/// A focused control as a refusal or a warning names it: role, name and place.
+async fn describe_control(node: &atspi::proxy::accessible::AccessibleProxy<'_>) -> String {
+    use atspi::proxy::proxy_ext::ProxyExt;
+    let bounds = match node.proxies().await {
+        Ok(proxies) => match proxies.component().await {
+            Ok(component) => component
+                .get_extents(atspi::CoordType::Screen)
+                .await
+                .ok(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    format!(
+        "{} \"{}\"{}",
+        node.get_role_name().await.unwrap_or_default(),
+        node.name().await.unwrap_or_default(),
+        bounds
+            .map(|(x, y, w, h)| format!(" at screen ({x},{y} {w}x{h})"))
+            .unwrap_or_default(),
+    )
+}
+
 impl TextDelivery {
     fn ambiguous_window(expected_count: usize, observed_count: Option<usize>) -> Self {
         Self {
@@ -1488,63 +1578,48 @@ impl TextReceipt {
     /// the focused field is looked for there before the whole page is walked.
     pub async fn capture(
         address: &str,
-        title: &str,
-        bounds: [f64; 4],
+        window: TextWindow<'_>,
         pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
         if input.contains(['\t', '\n']) {
             anyhow::bail!("Tab or Return may change focus or submit the field");
         }
-        Self::capture_paste(address, title, bounds, pointer, input).await
+        Self::capture_paste(address, window, pointer, input).await
     }
 
     pub async fn capture_paste(
         address: &str,
-        title: &str,
-        bounds: [f64; 4],
+        window: TextWindow<'_>,
         pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
-        Self::capture_within(
-            TEXT_DISCOVERY_TIMEOUT,
-            address,
-            title,
-            bounds,
-            pointer,
-            input,
-        )
-        .await
+        Self::capture_within(TEXT_DISCOVERY_TIMEOUT, address, window, pointer, input).await
     }
 
     async fn capture_within(
         timeout: std::time::Duration,
         address: &str,
-        title: &str,
-        bounds: [f64; 4],
+        window: TextWindow<'_>,
         pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
-        if title.is_empty() {
+        if window.title.is_empty() {
             anyhow::bail!("there is no active window");
         }
-        tokio::time::timeout(
-            timeout,
-            Self::discover(address, title, bounds, pointer, input),
-        )
-        .await
-        .map_err(|_| TextDiscoveryTimedOut(timeout))?
+        tokio::time::timeout(timeout, Self::discover(address, window, pointer, input))
+            .await
+            .map_err(|_| TextDiscoveryTimedOut(timeout))?
     }
 
     async fn discover(
         address: &str,
-        title: &str,
-        bounds: [f64; 4],
+        window: TextWindow<'_>,
         pointer: Option<[f64; 2]>,
         input: &str,
     ) -> anyhow::Result<Self> {
         use atspi::proxy::accessible::ObjectRefExt;
-        use atspi::proxy::proxy_ext::ProxyExt;
+        let TextWindow { title, bounds, pid } = window;
         let bus = zbus::connection::Builder::address(address)?
             .auth_mechanism(zbus::AuthMechanism::Anonymous)
             .build()
@@ -1566,6 +1641,7 @@ impl TextReceipt {
                 continue;
             };
             let mut matching_frames = Vec::new();
+            let mut renamed_frames = Vec::new();
             let Ok(frame_objects) = app.get_children().await else {
                 continue;
             };
@@ -1575,27 +1651,34 @@ impl TextReceipt {
                 };
                 let name = frame.name().await.unwrap_or_default();
                 if !caption_starts_with(&name, title) {
+                    renamed_frames.push(frame_object);
                     continue;
                 }
                 // Electron may retain Focused on nodes in several windows with
                 // the same caption. Bind the receipt to the active client area.
-                let (x, y, w, h) = frame
-                    .proxies()
-                    .await?
-                    .component()
-                    .await?
-                    .get_extents(atspi::CoordType::Screen)
-                    .await?;
-                if [x, y, w, h]
-                    .into_iter()
-                    .zip(bounds)
-                    .any(|(actual, expected)| {
-                        (f64::from(actual) - expected).abs() > TEXT_WINDOW_BOUNDS_TOLERANCE
-                    })
-                {
-                    continue;
+                if frame_covers(&frame, bounds).await? {
+                    matching_frames.push(frame_object);
                 }
-                matching_frames.push(frame_object);
+            }
+            // Chrome can name a window's frame after a child widget instead of
+            // the window: once its in-page search bar has been used, the frame
+            // stays "<search bar title> <page title>" until the page title next
+            // changes, and no frame carries the caption. The window is then the
+            // frame of the window's own process that covers its client area.
+            if matching_frames.is_empty()
+                && !renamed_frames.is_empty()
+                && let Some(pid) = pid
+                && let Some(app_name) = app_object.name()
+                && bus_name_pid(&bus, &app_name.to_string()).await == Some(pid)
+            {
+                for frame_object in renamed_frames {
+                    let Ok(frame) = frame_object.as_accessible_proxy(&bus).await else {
+                        continue;
+                    };
+                    if frame_covers(&frame, bounds).await.unwrap_or(false) {
+                        matching_frames.push(frame_object);
+                    }
+                }
             }
             // Chrome does not expose the Active state on its accessibility
             // frames. Two maximized windows on the same URL can have identical
@@ -1652,14 +1735,6 @@ impl TextReceipt {
                         && node.get_role().await? != atspi::Role::Terminal
                     {
                         let role = node.get_role().await?;
-                        let role_name = node.get_role_name().await.unwrap_or_default();
-                        let bounds = match node.proxies().await?.component().await {
-                            Ok(component) => component
-                                .get_extents(atspi::CoordType::Screen)
-                                .await
-                                .ok(),
-                            Err(_) => None,
-                        };
                         // A text input without the Editable state is read-only or
                         // disabled (a graded answer, a locked field), not a missed click.
                         let input_like = matches!(
@@ -1667,12 +1742,8 @@ impl TextReceipt {
                             atspi::Role::Entry | atspi::Role::SpinButton | atspi::Role::ComboBox
                         );
                         focus = Some(format!(
-                            "{} \"{}\"{}{}",
-                            role_name,
-                            node.name().await.unwrap_or_default(),
-                            bounds
-                                .map(|(x, y, w, h)| format!(" at screen ({x},{y} {w}x{h})"))
-                                .unwrap_or_default(),
+                            "{}{}",
+                            describe_control(&node).await,
                             if input_like {
                                 " (a text input without the Editable state: read-only or disabled)"
                             } else {
@@ -1691,92 +1762,26 @@ impl TextReceipt {
                         if role == atspi::Role::Terminal {
                             return Err(TerminalFocus.into());
                         }
-                        let text = node.proxies().await?.text().await?;
-                        let count = text.character_count().await?;
-                        if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {
-                            anyhow::bail!("focused field exceeds the text snapshot limit");
-                        }
-                        let before = text.get_text(0, -1).await?;
-                        let initial_blank_line = before == "\n";
-                        if before.chars().count() != usize::try_from(count)? {
-                            anyhow::bail!(
-                                "focused field character offsets do not match its text snapshot"
-                            );
-                        }
-                        // atspi-proxies 0.13 derives "GetNselections" from its
-                        // Rust spelling; the wire protocol uses "GetNSelections".
-                        let selections: i32 = text.inner().call("GetNSelections", &()).await?;
-                        let (start, end) = if selections == 0 {
-                            let caret = text.caret_offset().await?;
-                            (caret, caret)
-                        } else if selections == 1 {
-                            let (a, b) = text.get_selection(0).await?;
-                            (a.min(b), a.max(b))
-                        } else {
-                            anyhow::bail!("focused field has multiple selections");
-                        };
-                        if start < 0 || end < start || end > count {
-                            anyhow::bail!("focused field supplied invalid insertion offsets");
-                        }
-                        let start = normalize_accessible_offset(&before, usize::try_from(start)?);
-                        let end = normalize_accessible_offset(&before, usize::try_from(end)?);
-                        let before = normalize_accessible_text(&before);
-                        let before_count = before.chars().count();
-                        if start > before_count || end > before_count {
-                            anyhow::bail!("focused field supplied invalid text insertion offsets");
-                        }
-                        // Chromium can expose a rendered placeholder through
-                        // Text.GetText. Real text can equal that label too, so
-                        // retain the ordinary expectation and recognize this
-                        // alternative only as an unverified post-input change.
-                        let attributes = node.get_attributes().await.unwrap_or_default();
-                        let accessible_name = node.name().await.unwrap_or_default();
-                        let placeholder = attributes
-                            .get("placeholder-text")
-                            .map(String::as_str)
-                            .unwrap_or_default();
-                        let placeholder_replacement = (start == end
-                            && !before.is_empty()
-                            && !input.is_empty()
-                            && (before == normalize_accessible_text(placeholder)
-                                || before == normalize_accessible_text(&accessible_name)))
-                        .then(|| input.to_owned());
-                        let expected = before
-                            .chars()
-                            .take(start)
-                            .chain(input.chars())
-                            .chain(before.chars().skip(end))
-                            .collect();
-                        let selection_replaced = start != end;
-                        let prior_text = before.clone();
-                        // An emptied contenteditable can expose a synthetic newline
-                        // which the application removes when typing starts. Keep
-                        // the exact expectation, but distinguish this observable
-                        // transformation from missing or delayed input.
-                        let blank_line_replacement =
-                            (initial_blank_line && start == end && !input.is_empty())
-                                .then(|| input.to_owned());
-                        let (initial_descendant_snapshot, initial_descendant_snapshot_error) =
-                            match descendant_text_snapshot(&object, &bus).await {
-                                Ok(snapshot) => (Some(snapshot), None),
-                                Err(error) => (None, Some(error.to_string())),
-                            };
-                        drop(text);
-                        drop(node);
-                        return Ok(Self {
-                            bus: bus.clone(),
-                            object,
-                            expected,
-                            before: prior_text,
-                            selection_replaced,
-                            input: normalize_accessible_text(input),
+                        // Focus is on an editable control from here on. A field
+                        // that cannot be read (no Text interface, more text than a
+                        // snapshot holds, offsets that do not fit) still takes keys.
+                        let read = Self::read_focused(
+                            &bus,
+                            &object,
+                            &node,
+                            input,
                             ambiguous_frame,
-                            blank_line_replacement,
-                            placeholder_replacement,
-                            browser_toolbar: prefer_chrome_toolbar_focus && !inside_web_document,
-                            initial_descendant_snapshot,
-                            initial_descendant_snapshot_error,
-                        });
+                            prefer_chrome_toolbar_focus && !inside_web_document,
+                        )
+                        .await;
+                        return match read {
+                            Ok(receipt) => Ok(receipt),
+                            Err(error) => Err(UnreadableFocus {
+                                control: describe_control(&node).await,
+                                reason: error.to_string(),
+                            }
+                            .into()),
+                        };
                     }
                     let mut children = node.get_children().await?;
                     if prefer_chrome_toolbar_focus {
@@ -1794,6 +1799,102 @@ impl TextReceipt {
             return Err(FocusNotEditable(focus).into());
         }
         anyhow::bail!("the active window exposes no focused editable text through accessibility");
+    }
+
+    /// The focused editable `node` as it is before input: its text, where the
+    /// input goes, and the text the field should hold afterwards.
+    async fn read_focused(
+        bus: &zbus::Connection,
+        object: &atspi::ObjectRefOwned,
+        node: &atspi::proxy::accessible::AccessibleProxy<'_>,
+        input: &str,
+        ambiguous_frame: bool,
+        browser_toolbar: bool,
+    ) -> anyhow::Result<Self> {
+        use atspi::proxy::proxy_ext::ProxyExt;
+        let text = node.proxies().await?.text().await?;
+        let count = text.character_count().await?;
+        if !(0..=TEXT_SNAPSHOT_MAX_CHARS).contains(&count) {
+            anyhow::bail!("focused field exceeds the text snapshot limit");
+        }
+        let before = text.get_text(0, -1).await?;
+        let initial_blank_line = before == "\n";
+        if before.chars().count() != usize::try_from(count)? {
+            anyhow::bail!(
+                "focused field character offsets do not match its text snapshot"
+            );
+        }
+        // atspi-proxies 0.13 derives "GetNselections" from its
+        // Rust spelling; the wire protocol uses "GetNSelections".
+        let selections: i32 = text.inner().call("GetNSelections", &()).await?;
+        let (start, end) = if selections == 0 {
+            let caret = text.caret_offset().await?;
+            (caret, caret)
+        } else if selections == 1 {
+            let (a, b) = text.get_selection(0).await?;
+            (a.min(b), a.max(b))
+        } else {
+            anyhow::bail!("focused field has multiple selections");
+        };
+        if start < 0 || end < start || end > count {
+            anyhow::bail!("focused field supplied invalid insertion offsets");
+        }
+        let start = normalize_accessible_offset(&before, usize::try_from(start)?);
+        let end = normalize_accessible_offset(&before, usize::try_from(end)?);
+        let before = normalize_accessible_text(&before);
+        let before_count = before.chars().count();
+        if start > before_count || end > before_count {
+            anyhow::bail!("focused field supplied invalid text insertion offsets");
+        }
+        // Chromium can expose a rendered placeholder through
+        // Text.GetText. Real text can equal that label too, so
+        // retain the ordinary expectation and recognize this
+        // alternative only as an unverified post-input change.
+        let attributes = node.get_attributes().await.unwrap_or_default();
+        let accessible_name = node.name().await.unwrap_or_default();
+        let placeholder = attributes
+            .get("placeholder-text")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let placeholder_replacement = (start == end
+            && !before.is_empty()
+            && !input.is_empty()
+            && (before == normalize_accessible_text(placeholder)
+                || before == normalize_accessible_text(&accessible_name)))
+        .then(|| input.to_owned());
+        let expected = before
+            .chars()
+            .take(start)
+            .chain(input.chars())
+            .chain(before.chars().skip(end))
+            .collect();
+        let selection_replaced = start != end;
+        let prior_text = before.clone();
+        // An emptied contenteditable can expose a synthetic newline
+        // which the application removes when typing starts. Keep
+        // the exact expectation, but distinguish this observable
+        // transformation from missing or delayed input.
+        let blank_line_replacement =
+            (initial_blank_line && start == end && !input.is_empty()).then(|| input.to_owned());
+        let (initial_descendant_snapshot, initial_descendant_snapshot_error) =
+            match descendant_text_snapshot(object, bus).await {
+                Ok(snapshot) => (Some(snapshot), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        Ok(Self {
+            bus: bus.clone(),
+            object: object.clone(),
+            expected,
+            before: prior_text,
+            selection_replaced,
+            input: normalize_accessible_text(input),
+            ambiguous_frame,
+            blank_line_replacement,
+            placeholder_replacement,
+            browser_toolbar,
+            initial_descendant_snapshot,
+            initial_descendant_snapshot_error,
+        })
     }
 
     /// The field's text before typing, when there was any.
@@ -2178,8 +2279,14 @@ mod text_receipt_tests {
 
 #[cfg(test)]
 mod null_ref_tests {
-    use super::TextReceipt;
+    use super::{TextReceipt, TextWindow};
     use std::io::{BufRead, Write};
+
+    const SOME_WINDOW: TextWindow<'static> = TextWindow {
+        title: "Some Window",
+        bounds: [0.0; 4],
+        pid: None,
+    };
 
     struct Bus {
         child: std::process::Child,
@@ -2267,7 +2374,7 @@ mod null_ref_tests {
         let budget = std::time::Duration::from_millis(300);
         let began = std::time::Instant::now();
         let Err(error) =
-            TextReceipt::capture_within(budget, &address, "Some Window", [0.0; 4], None, "x").await
+            TextReceipt::capture_within(budget, &address, SOME_WINDOW, None, "x").await
         else {
             anyhow::bail!("a registry that never answers produced a focused field");
         };
@@ -2289,8 +2396,7 @@ mod null_ref_tests {
             .serve_at("/org/a11y/atspi/accessible/root", NullRegistry)?
             .build()
             .await?;
-        let Err(error) = TextReceipt::capture(&address, "Some Window", [0.0; 4], None, "x").await
-        else {
+        let Err(error) = TextReceipt::capture(&address, SOME_WINDOW, None, "x").await else {
             anyhow::bail!("an empty accessibility tree produced a focused field");
         };
         assert!(

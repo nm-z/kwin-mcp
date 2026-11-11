@@ -10409,8 +10409,8 @@ async fn active_window_info(
          var c = workspace.cursorPos;\
          var result = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
          w:w.clientGeometry.width,h:w.clientGeometry.height,\
-         title:w.caption,id:w.internalId.toString(),\
-         cx:c.x,cy:c.y} : null;",
+         title:w.caption,id:w.internalId.toString(),pid:w.pid,\
+         transient:w.transient === true,cx:c.x,cy:c.y} : null;",
     )
     .await?;
     if json == "null" {
@@ -10751,10 +10751,30 @@ struct WindowGeometry {
     title: String,
     #[serde(default)]
     id: String,
+    /// The owning process as KWin sees it; zero when unknown.
+    #[serde(default)]
+    pid: i32,
+    #[serde(default)]
+    transient: bool,
     #[serde(default)]
     cx: f64,
     #[serde(default)]
     cy: f64,
+}
+
+impl WindowGeometry {
+    /// The window as a typing or paste receipt binds to it. A transient window
+    /// (Chrome's file chooser) can cover its parent exactly and has no frame of
+    /// its own, so it is never bound through its process.
+    fn text_window(&self) -> input_bridge::TextWindow<'_> {
+        input_bridge::TextWindow {
+            title: &self.title,
+            bounds: [self.x, self.y, self.w, self.h],
+            pid: u32::try_from(self.pid)
+                .ok()
+                .filter(|pid| *pid != 0 && !self.transient),
+        }
+    }
 }
 
 fn capture_target_metadata(window: &WindowGeometry) -> serde_json::Value {
@@ -12122,6 +12142,8 @@ fn launch_window_geometry(window: &WindowSnapshot) -> WindowGeometry {
         h: window.h,
         title: window.title.clone(),
         id: window.id.clone(),
+        pid: window.pid,
+        transient: window.transient,
         cx: 0.0,
         cy: 0.0,
     }
@@ -16677,7 +16699,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (readable editable fields, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals and protected fields remain unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (readable editable fields, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals, protected fields and editable fields whose text cannot be read are typed into and stay unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
     )]
     async fn keyboard_type(
         &self,
@@ -16748,8 +16770,7 @@ impl KwinMcp {
         let chrome = chromium_resource_class(&snapshot.resource_class);
         let mut receipt = input_bridge::TextReceipt::capture(
             &sess.atspi_bus_address,
-            &active.title,
-            [active.x, active.y, active.w, active.h],
+            active.text_window(),
             Some([active.cx, active.cy]),
             &params.text,
         )
@@ -16782,8 +16803,7 @@ impl KwinMcp {
             tokio::time::sleep(Duration::from_millis(150)).await;
             receipt = input_bridge::TextReceipt::capture(
                 &sess.atspi_bus_address,
-                &active.title,
-                [active.x, active.y, active.w, active.h],
+                active.text_window(),
                 Some([active.cx, active.cy]),
                 &params.text,
             )
@@ -16798,6 +16818,9 @@ impl KwinMcp {
             && let Err(error) = &receipt
             && !error.is::<input_bridge::TerminalFocus>()
             && !error.is::<input_bridge::ProtectedFocus>()
+            // Focus is on an editable field that only cannot be read back: the
+            // keys are sent and the result says the text is unverified.
+            && !error.is::<input_bridge::UnreadableFocus>()
         {
             // Slowness is not an unobservable field: say so, so the caller retries
             // instead of hunting for a different field.
@@ -16900,8 +16923,7 @@ impl KwinMcp {
                 {
                     let after = input_bridge::TextReceipt::capture(
                         &sess.atspi_bus_address,
-                        &active.title,
-                        [active.x, active.y, active.w, active.h],
+                        active.text_window(),
                         None,
                         "",
                     )
@@ -17001,7 +17023,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_paste",
-        description = "Paste UTF-8 text into the focused application using the session clipboard and one Shift+Insert shortcut. Use this for fast long-text or terminal input; keyboard_type remains paced ASCII key input. Click or Tab into the target first. Leaves this text in the session clipboard and PRIMARY selection; the host clipboard is separate. Pasted newlines are clipboard content, not separate Return key presses, but the application may interpret them. Use keyboard_key Return when you intend to submit a terminal command. Reports clipboard length, shortcut submission, and compositor acknowledgement separately. The field is read before and after through accessibility: delivery.status is verified only when the pasted text appeared, otherwise unverified (terminals and fields AT-SPI cannot read), and form submission is not observed. Inspect the application or its output before retrying, because another paste can duplicate text or commands."
+        description = "Paste UTF-8 text into the focused application using the session clipboard and one Shift+Insert shortcut. Use this for fast long-text or terminal input; keyboard_type remains paced ASCII key input. Click or Tab into the target first. Leaves this text in the session clipboard and PRIMARY selection; the host clipboard is separate. Pasted newlines are clipboard content, not separate Return key presses, but the application may interpret them. Use keyboard_key Return when you intend to submit a terminal command. Reports clipboard length, shortcut submission, and compositor acknowledgement separately. The field is read before and after through accessibility: delivery.status is verified only when the pasted text appeared, otherwise unverified (terminals and fields AT-SPI cannot read), and form submission is not observed. With no active window after a 2 s wait, nothing is sent. If the application opens a dialog instead of pasting (Konsole asks about control characters), delivery.method is paste_dialog and dialog names it: answer it first. Inspect the application or its output before retrying, because another paste can duplicate text or commands."
     )]
     async fn keyboard_paste(
         &self,
@@ -17019,6 +17041,32 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
+        // Keys sent while no window has focus reach nothing, and a window that
+        // was just launched takes a moment to become active. Wait for it, and
+        // refuse rather than report a paste that went nowhere.
+        let active = match awaited_active_window_info(
+            &sess.kwin_conn,
+            &sess.kwin_unique_name,
+            &sess.host_xdg_dir,
+        )
+        .await
+        {
+            Ok((_, _, geometry)) => Some(geometry),
+            Err(KwinError::Msg(message)) if message.starts_with(NO_ACTIVE_WINDOW) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Paste was not started: no window was active within {} seconds, so the shortcut would have reached nothing. A newly launched window needs a moment to take focus; call window_list and window_activate for the target, then paste again.",
+                        ACTIVE_WINDOW_WAIT.as_secs()
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "no_active_window", "action": "paste",
+                        "shortcut": KEYBOARD_PASTE_SHORTCUT, "shortcut_submitted": false,
+                        "submission_complete": false, "retry_safe": true,
+                    })),
+                ));
+            }
+            Err(_) => None,
+        };
         let socket = sess.host_xdg_dir.join("wayland-0");
         let store = self.clipboards.clone();
         let text = params.text;
@@ -17035,23 +17083,16 @@ impl KwinMcp {
         // Read the focused field before pasting, as the paste shortcut of keyboard_key
         // does, so the field can be read again afterwards and a paste that did not
         // land is told apart from one that did.
-        let preparation = match active_window_info(
-            &sess.kwin_conn,
-            &sess.kwin_unique_name,
-            &sess.host_xdg_dir,
-        )
-        .await
-        {
-            Ok((_, _, geometry)) => {
+        let preparation = match &active {
+            Some(geometry) => {
                 prepare_paste_text(
                     kwin_mcp::clipboard::ClipboardText::Text(pasted.into_bytes()),
                     &sess.atspi_bus_address,
-                    &geometry.title,
-                    [geometry.x, geometry.y, geometry.w, geometry.h],
+                    geometry.text_window(),
                 )
                 .await
             }
-            Err(_) => PreparedPaste::Unavailable {
+            None => PreparedPaste::Unavailable {
                 method: "paste_target_unobservable",
                 warning: "The active window could not be observed for paste verification. The native shortcut was still submitted.",
             },
@@ -17093,7 +17134,22 @@ impl KwinMcp {
                 })),
             ));
         }
-        let delivery = finish_prepared_paste(preparation).await;
+        let mut delivery = finish_prepared_paste(preparation).await;
+        let dialog = match &active {
+            Some(target) if delivery.status != "verified" => {
+                paste_dialog(
+                    &sess.kwin_conn,
+                    &sess.kwin_unique_name,
+                    &sess.host_xdg_dir,
+                    &target.id,
+                )
+                .await
+            }
+            _ => None,
+        };
+        if let Some(dialog) = &dialog {
+            paste_dialog_delivery(&mut delivery, dialog);
+        }
         drop(guard);
         self.mark_input().await;
         let mut pasted = serde_json::json!({
@@ -17105,6 +17161,9 @@ impl KwinMcp {
                 "form_submission": "not_observed",
                 "delivery": delivery, "elapsed_ms": started.elapsed().as_millis(),
         });
+        if let Some(dialog) = &dialog {
+            pasted["dialog"] = serde_json::json!({"id": dialog.id, "title": dialog.title});
+        }
         compact_paste_result(&mut pasted);
         let result = structured_result(
             &peer,
@@ -17191,13 +17250,7 @@ impl KwinMcp {
                     .await;
                     Some(match snapshot {
                         Ok(Ok(snapshot)) => {
-                            prepare_paste_text(
-                                snapshot,
-                                &address,
-                                &geometry.title,
-                                [geometry.x, geometry.y, geometry.w, geometry.h],
-                            )
-                            .await
+                            prepare_paste_text(snapshot, &address, geometry.text_window()).await
                         }
                         _ => PreparedPaste::Unavailable {
                             method: "paste_text_unavailable",
@@ -17264,7 +17317,16 @@ impl KwinMcp {
             ));
         }
         let paste_delivery = match paste_preparation {
-            Some(preparation) => Some(finish_prepared_paste(preparation).await),
+            Some(preparation) => {
+                let mut delivery = finish_prepared_paste(preparation).await;
+                if delivery.status != "verified"
+                    && let Ok(target) = &active
+                    && let Some(dialog) = paste_dialog(&conn, &kwin_unique, &xdg, &target.id).await
+                {
+                    paste_dialog_delivery(&mut delivery, &dialog);
+                }
+                Some(delivery)
+            }
             None => None,
         };
         let paste_is_error = paste_delivery.as_ref().is_some_and(|delivery| {
@@ -18932,8 +18994,7 @@ fn is_native_paste_combo(modifiers: &[u32], key: u32) -> bool {
 async fn prepare_paste_text(
     snapshot: kwin_mcp::clipboard::ClipboardText,
     address: &str,
-    title: &str,
-    bounds: [f64; 4],
+    window: input_bridge::TextWindow<'_>,
 ) -> PreparedPaste {
     use kwin_mcp::clipboard::ClipboardText;
     let bytes = match snapshot {
@@ -18963,8 +19024,14 @@ async fn prepare_paste_text(
             warning: "The clipboard did not provide supported UTF-8 text for editable-value verification.",
         };
     };
-    match input_bridge::TextReceipt::capture_paste(address, title, bounds, None, &text).await {
+    match input_bridge::TextReceipt::capture_paste(address, window, None, &text).await {
         Ok(receipt) => PreparedPaste::Ready(receipt),
+        // A terminal takes the paste but shows it only on screen, so say that
+        // instead of calling the target unobservable.
+        Err(error) if error.is::<input_bridge::TerminalFocus>() => PreparedPaste::Unavailable {
+            method: "terminal",
+            warning: PASTE_TERMINAL_WARNING,
+        },
         Err(_) => PreparedPaste::Unavailable {
             method: "paste_target_unobservable",
             warning: "The native paste shortcut was submitted, but the focused editable value could not be observed.",
@@ -19007,6 +19074,51 @@ fn existing_text_warning(prior: &str) -> String {
         "The field already held {:?} and the text was inserted at the caret, not over it. Use replace=true to overwrite the field's text.",
         field_excerpt(prior)
     )
+}
+
+/// What a paste into a terminal reports: its text shows on screen only.
+const PASTE_TERMINAL_WARNING: &str = "KWin acknowledged the paste shortcut, but the focused terminal's text cannot be read through AT-SPI, so the paste was not verified. Take a screenshot to see the pasted text before pressing Return; pasting again can repeat the command.";
+
+/// How long a paste that could not be verified waits for the application to
+/// answer it with a dialog instead of inserting the text.
+const PASTE_DIALOG_WAIT: Duration = Duration::from_millis(400);
+const PASTE_DIALOG_POLL: Duration = Duration::from_millis(50);
+
+/// The dialog an application opened in answer to a paste into the window
+/// `target`, when it did. Konsole asks before it pastes text that holds control
+/// characters; until that is answered nothing is inserted and keys go to the dialog.
+async fn paste_dialog(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    runtime: &Path,
+    target: &str,
+) -> Option<WindowSnapshot> {
+    let deadline = tokio::time::Instant::now() + PASTE_DIALOG_WAIT;
+    loop {
+        if let Ok(windows) = window_snapshots(conn, kwin_unique, runtime).await {
+            for window in windows {
+                let answers_target = window.transient_for.as_deref() == Some(target)
+                    || window.modal
+                    || window.dialog;
+                if window.active && window.id != target && answers_target {
+                    return Some(window);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(PASTE_DIALOG_POLL).await;
+    }
+}
+
+fn paste_dialog_delivery(delivery: &mut input_bridge::TextDelivery, dialog: &WindowSnapshot) {
+    delivery.status = "unverified";
+    delivery.method = "paste_dialog";
+    delivery.warning = Some(format!(
+        "The application answered the paste with the dialog {:?} instead of inserting the text. Nothing is pasted until that dialog is answered, and further keys go to it: take a screenshot and answer it before continuing.",
+        dialog.title
+    ));
 }
 
 async fn finish_prepared_paste(preparation: PreparedPaste) -> input_bridge::TextDelivery {
