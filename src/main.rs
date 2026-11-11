@@ -25001,22 +25001,31 @@ fn client_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(owned)
 }
 
-/// Startup sweeps for `--autoclean`.
+/// Startup sweeps for `--autoclean`, on a thread of their own. Nothing a
+/// client asks first depends on them, and both take as long as the host makes
+/// them: the leased sweep deletes each orphaned workdir with its disk twin (a
+/// browser profile is hundreds of thousands of files), and the other scans
+/// every process's command line. Run before the MCP handshake, they made
+/// `initialize` wait for another server's leftovers on a busy disk (#879).
 fn sweep_at_startup(display: DisplayConfig) {
     if !display.autoclean {
         return;
     }
-    if let Err(error) = sweep_orphaned_workdirs(None) {
-        eprintln!("autoclean: orphan sweep skipped: {error}");
+    let sweeps = std::thread::Builder::new()
+        .name("kwin-mcp-sweep".to_owned())
+        .spawn(|| {
+            if let Err(error) = sweep_orphaned_workdirs(None) {
+                eprintln!("autoclean: orphan sweep skipped: {error}");
+            }
+            // A disk twin whose server died without a lease, or whose /tmp
+            // workdir is gone, is not reached by the leased sweep above.
+            if let Err(error) = sweep_dead_owner_workdirs(None) {
+                eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+            }
+        });
+    if let Err(error) = sweeps {
+        eprintln!("autoclean: startup sweeps skipped: {error}");
     }
-    // A disk twin whose server died without a lease, or whose /tmp workdir is
-    // gone, is not reached by the leased sweep above. Scanning every process
-    // command line is slow on a loaded host, so it stays off the startup path.
-    std::thread::spawn(|| {
-        if let Err(error) = sweep_dead_owner_workdirs(None) {
-            eprintln!("autoclean: leaked workdir sweep skipped: {error}");
-        }
-    });
 }
 
 /// One peer of a `--listen` server, from handshake to the end of its
