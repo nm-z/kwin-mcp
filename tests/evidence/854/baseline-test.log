@@ -1,0 +1,15 @@
+
+running 1 test
+cursor-free dominant colors: [([37, 66, 96, 255], 375000)]
+
+thread 'screenshot_can_omit_both_cursor_layers_without_moving_the_pointer' (3272072) panicked at tests/session_lifecycle_e2e.rs:1826:9:
+region: save_as default baked the pointer into the saved PNG
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test screenshot_can_omit_both_cursor_layers_without_moving_the_pointer ... FAILED
+
+failures:
+
+failures:
+    screenshot_can_omit_both_cursor_layers_without_moving_the_pointer
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 84 filtered out; finished in 6.89s

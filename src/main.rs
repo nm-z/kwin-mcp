@@ -302,8 +302,11 @@ mod fuse_bridge {
 }
 mod host_environment;
 mod input_bridge;
+mod loopback_forward;
 mod netns_holder;
+mod secret_service;
 mod session_registry;
+mod ui_names;
 use kwin_mcp::remote;
 mod kwin_script {
     use std::collections::HashMap;
@@ -851,7 +854,7 @@ mod wallet_mediator {
 
     type HostResult<T> = zbus::Result<T>;
 
-    async fn host_call<B, R>(proxy: &zbus::Proxy<'_>, method: &str, body: &B) -> HostResult<R>
+    pub(super) async fn host_call<B, R>(proxy: &zbus::Proxy<'_>, method: &str, body: &B) -> HostResult<R>
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
         R: serde::de::DeserializeOwned + zbus::zvariant::Type,
@@ -873,7 +876,7 @@ mod wallet_mediator {
         .ok_or_else(|| zbus::Error::Failure(format!("{method}: no reply")))
     }
 
-    async fn name_has_owner(host: &zbus::Connection, name: &str) -> bool {
+    pub(super) async fn name_has_owner(host: &zbus::Connection, name: &str) -> bool {
         let Ok(proxy) = zbus::fdo::DBusProxy::new(host).await else {
             return false;
         };
@@ -885,14 +888,14 @@ mod wallet_mediator {
 
     /// Serializes snapshots across processes with a lock file in the user runtime
     /// directory, and spaces them SNAPSHOT_SPACING apart.
-    struct HostSlot {
+    pub(super) struct HostSlot {
         file: nix::fcntl::Flock<std::fs::File>,
         /// Touched when kwalletd6 does not answer; see KWALLETD_BACKOFF.
         kwalletd_unreachable: std::path::PathBuf,
     }
 
     impl HostSlot {
-        async fn take(runtime: &std::path::Path) -> Result<Self, String> {
+        pub(super) async fn take(runtime: &std::path::Path) -> Result<Self, String> {
             let directory = runtime.join("kwin-mcp");
             std::fs::create_dir_all(&directory)
                 .map_err(|error| format!("create {}: {error}", directory.display()))?;
@@ -4411,7 +4414,13 @@ const NO_DRI_WARNING: &str = "this host has no /dev/dri, so KWin composites with
 fn compact_session_result(payload: &mut serde_json::Value, sqlite_access: &SqliteAccessReport) {
     drop_empty_fields(
         payload,
-        &["runtime_root_fallback", "cookie_errors", "oversized_read_only_files", "host_write_paths"],
+        &[
+            "runtime_root_fallback",
+            "cookie_errors",
+            "oversized_read_only_files",
+            "host_write_paths",
+            "host_loopback_warning",
+        ],
     );
     if let Some(object) = payload.as_object_mut() {
         object.extend(sqlite_access.result_fields());
@@ -4478,6 +4487,8 @@ struct OverlayPlan {
     socket_binds: Vec<PathBuf>,
     /// Known graphical socket names must stay hidden through aliases and HOME paths.
     graphical_socket_paths: Vec<PathBuf>,
+    /// Graphical socket names the session sees as absent (see `hide_host_socket`).
+    absent_socket_paths: Vec<PathBuf>,
     /// Directory binds preserve SQLite sidecar name lookup across WAL rotation.
     sqlite_binds: Vec<PathBuf>,
     sqlite_access: SqliteAccessReport,
@@ -4653,9 +4664,84 @@ impl OverlayPlan {
         for path in self
             .graphical_socket_paths
             .iter()
-            .filter(|path| path.starts_with(target))
+            .filter(|path| path.starts_with(target) && !self.absent_socket_paths.contains(path))
         {
             command.arg("--ro-bind-try").arg("/dev/null").arg(path);
+        }
+    }
+
+    /// Make the host's graphical socket at `path` absent in the session instead
+    /// of masking it with /dev/null. An application that finds a file where its
+    /// single-instance socket belongs takes it for a running or crashed instance:
+    /// Zed asks the name for its instance, cannot remove the mount point that
+    /// answers "connection refused", and exits with "zed is already running"
+    /// (#869). With no entry there it starts its own instance and creates its
+    /// own socket, which lives in the session's overlay and never reaches the
+    /// host instance.
+    ///
+    /// Under a writable overlay the name is hidden by a whiteout in the upper
+    /// layer (a 0:0 character device, which any user may create since Linux
+    /// 5.8), unless the upper layer already has an entry of the session's own
+    /// there. In a staged directory of a split overlay the socket was never
+    /// copied, so there is nothing to hide. Returns false where neither holds
+    /// (a read-only bind, a shared host directory, a filesystem refusing the
+    /// device node); the caller then keeps the /dev/null mask.
+    fn hide_host_socket(&self, target: &Path, path: &Path) -> bool {
+        if self.host_write_paths.iter().any(|shared| path.starts_with(shared)) {
+            return false;
+        }
+        let missing = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let Some((upper, overlay)) = self.upper_path(path) else {
+            let staged = self.staging_root.as_ref().and_then(|root| {
+                let covered = self
+                    .read_only_binds
+                    .iter()
+                    .chain(self.overlays.iter().map(|overlay| &overlay.destination))
+                    .any(|mount| path.starts_with(mount));
+                (!covered).then(|| path.strip_prefix(target).ok().map(|relative| root.join(relative)))?
+            });
+            return staged.is_some_and(|staged| missing(&staged));
+        };
+        if !missing(&upper) {
+            return std::fs::symlink_metadata(&upper).is_ok();
+        }
+        let Ok(relative) = path.strip_prefix(&overlay.destination) else {
+            return false;
+        };
+        // Directories made here merge with the lower ones and show their own
+        // mode, so each takes the mode of the directory it stands for.
+        let mut directory = PathBuf::new();
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            directory.push(component);
+            let made = overlay.upper.join(&directory);
+            if !missing(&made) {
+                continue;
+            }
+            let mode = std::fs::metadata(overlay.lower.join(&directory)).map(|meta| meta.permissions());
+            if std::fs::create_dir(&made).is_err() {
+                return false;
+            }
+            if let Ok(mode) = mode {
+                let _ = std::fs::set_permissions(&made, mode);
+            }
+        }
+        match nix::sys::stat::mknod(
+            &upper,
+            nix::sys::stat::SFlag::S_IFCHR,
+            nix::sys::stat::Mode::empty(),
+            0,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "session_start: cannot hide host socket {} with a whiteout ({error}); it is masked instead",
+                    path.display()
+                );
+                false
+            }
         }
     }
 
@@ -4693,6 +4779,12 @@ impl OverlayPlan {
         self.graphical_socket_paths.dedup();
         self.read_only_binds
             .retain(|mount| !self.graphical_socket_paths.contains(mount));
+        self.absent_socket_paths = self
+            .graphical_socket_paths
+            .iter()
+            .filter(|path| path.starts_with(target) && self.hide_host_socket(target, path))
+            .cloned()
+            .collect();
         // Read-only data mounts still permit socket IPC; hide these names
         // through SQLite aliases and retain the separate helper socket policy.
         self.sqlite_blocked_sockets = socket_inventory
@@ -5139,6 +5231,7 @@ fn prepare_overlay_plan(
             read_only_binds: Vec::new(),
             socket_binds: Vec::new(),
             graphical_socket_paths: Vec::new(),
+            absent_socket_paths: Vec::new(),
             sqlite_binds: Vec::new(),
             sqlite_access: SqliteAccessReport::default(),
             sqlite_blocked_sockets: Vec::new(),
@@ -5197,6 +5290,7 @@ fn prepare_overlay_plan(
         read_only_binds,
         socket_binds: Vec::new(),
         graphical_socket_paths: Vec::new(),
+        absent_socket_paths: Vec::new(),
         sqlite_binds: Vec::new(),
         sqlite_access: SqliteAccessReport::default(),
         sqlite_blocked_sockets: Vec::new(),
@@ -6499,6 +6593,8 @@ struct Session {
     last_input: Option<std::time::Instant>,
     /// Mediator between session apps and the host KWallet.
     wallet: Option<wallet_mediator::WalletMediator>,
+    /// The session's own Secret Service, started from the host copy.
+    secrets: Option<secret_service::SecretService>,
     /// Why the session has no wallet (host wallet unavailable, locked, ...), or
     /// None when the session-local wallet holds the host copy. launch_app tells
     /// the agent when a browser starts without it.
@@ -6717,6 +6813,8 @@ fn test_stop_bwrap(child: &std::process::Child) {
 struct KwinMcp {
     death: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     clipboards: Arc<std::sync::Mutex<ClipboardStore>>,
+    /// Names accessibility objects were reported under (see ui_names).
+    seen_names: Arc<std::sync::Mutex<ui_names::SeenNames>>,
     session_id: String,
     input_log: Option<Arc<InputLog>>,
     path: PathBuf,
@@ -7181,6 +7279,7 @@ impl KwinMcp {
         Self {
             death: Arc::new(std::sync::Mutex::new(None)),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
+            seen_names: Arc::default(),
             session_id: String::new(),
             input_log: None,
             session: Arc::new(tokio::sync::RwLock::new(None)),
@@ -7205,6 +7304,32 @@ impl KwinMcp {
             frame_sockets: None,
         }
     }
+    /// Remember that an accessibility object (bus name and path) was reported
+    /// to the caller under `name`.
+    fn note_name(&self, object: &str, name: &str) {
+        if let Ok(mut seen) = self.seen_names.lock() {
+            seen.record(object, name, std::time::Instant::now());
+        }
+    }
+
+    /// A name `object` was reported under before that `asked` accepts, when the
+    /// name it has now does not.
+    fn earlier_name(
+        &self,
+        object: &str,
+        node: &AtspiNode,
+        asked: &dyn Fn(&str) -> bool,
+    ) -> Option<String> {
+        if ui_names::query_matches(asked, &node.name, &node.role) {
+            return None;
+        }
+        let seen = self.seen_names.lock().ok()?;
+        seen.earlier_name(object, &node.name, std::time::Instant::now(), &|name| {
+            ui_names::query_matches(asked, name, &node.role)
+        })
+        .map(str::to_owned)
+    }
+
     /// Logs a startup checkpoint that runs once per start.
     fn set_start_stage(&self, stage: impl Into<String>) {
         let stage = stage.into();
@@ -8285,6 +8410,9 @@ async fn teardown_blocking(mut sess: Session) -> Vec<String> {
     };
     if let Some(wallet) = sess.wallet.take() {
         let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
+    }
+    if let Some(secrets) = sess.secrets.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(15), secrets.shutdown()).await;
     }
     match tokio::task::spawn_blocking(move || teardown(sess)).await {
         Ok(mut teardown_errors) => {
@@ -11273,8 +11401,9 @@ struct ScreenshotParams {
     /// where a click would land. Mutually exclusive with `region`.
     #[serde(default)]
     cursor: bool,
-    /// Whether to draw the pointer in the image. Defaults to true. Set false
-    /// for pixel comparisons or clean captures without moving the pointer.
+    /// Whether to draw the pointer in the image. Defaults to false with
+    /// `save_as`, true otherwise. Set false for pixel comparisons or clean
+    /// captures without moving the pointer.
     /// Independent of `cursor`, which selects a crop around its position.
     #[serde(default)]
     include_cursor: Option<bool>,
@@ -11291,6 +11420,8 @@ struct ScreenshotParams {
     structured_metadata: bool,
     /// Absolute host path to also save this PNG to, so the next screenshot
     /// does not replace it. The file must not exist; its directory must.
+    /// Omits the pointer by default; set `include_cursor: true` to keep it.
+    /// The workdir PNG and inline image use the same cursor setting.
     #[serde(default)]
     save_as: Option<String>,
 }
@@ -13111,20 +13242,11 @@ const FIND_UI_MAX_NODES: usize = 100_000;
 const FIND_UI_MAX_PAGES: usize = 10;
 
 fn find_ui_search_text(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    ui_names::text_key(text)
 }
 
 fn find_ui_role_matches(wanted: Option<&str>, actual: &str) -> bool {
-    let Some(wanted) = wanted else {
-        return true;
-    };
-    let wanted = wanted.trim().to_lowercase();
-    let actual = actual.trim().to_lowercase();
-    wanted == actual
-        || wanted == "button" && matches!(actual.as_str(), "push button" | "toggle button")
+    ui_names::role_matches(wanted, actual)
 }
 
 fn find_ui_frame_window<'a>(
@@ -13277,7 +13399,7 @@ fn compact_find_elements(
             })
         });
         if compact {
-            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "value" | "bounds" | "mouse_coordinates_usable" | "backend"));
+            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "earlier_name" | "value" | "bounds" | "mouse_coordinates_usable" | "backend"));
         } else {
             // The window is named only when it is not the active one the result names once.
             if let Some(window) = fields.remove("window")
@@ -13340,6 +13462,9 @@ fn find_elements_text(elements: &[serde_json::Value], surfaces: &[serde_json::Va
         }
         if let Some(index) = element["surface"].as_u64() {
             line.push_str(&format!("\tsurface={index}"));
+        }
+        if let Some(earlier) = element["earlier_name"].as_str() {
+            line.push_str(&format!("\trenamed from '{}'", tree_field(earlier)));
         }
         lines.push(line);
     }
@@ -14695,14 +14820,49 @@ impl KwinMcp {
         };
         // The one and only host contact: a guarded read-only snapshot. The
         // session is then served from memory and never reaches the host wallet.
-        let wallet_snapshot = match host_bus {
-            Ok(host_bus) => wallet_mediator::snapshot(&host_bus, &host_runtime).await,
-            Err(error) => wallet_mediator::Snapshot {
-                wallet: None,
-                reason: format!("host session bus unavailable: {error}"),
-            },
+        let (wallet_snapshot, secret_snapshot) = match host_bus {
+            Ok(host_bus) => {
+                let wallet = wallet_mediator::snapshot(&host_bus, &host_runtime).await;
+                // The same rules for the host's Secret Service (see secret_service).
+                let secrets = match std::env::var(secret_service::HOST_ADDRESS_ENV) {
+                    Ok(address) => match zbus::connection::Builder::address(address.as_str()) {
+                        Ok(builder) => match builder.build().await {
+                            Ok(bus) => secret_service::snapshot(&bus, &host_runtime).await,
+                            Err(error) => secret_service::empty(format!(
+                                "{} is unavailable: {error}",
+                                secret_service::HOST_ADDRESS_ENV
+                            )),
+                        },
+                        Err(error) => secret_service::empty(format!(
+                            "{} is not a D-Bus address: {error}",
+                            secret_service::HOST_ADDRESS_ENV
+                        )),
+                    },
+                    Err(_) => secret_service::snapshot(&host_bus, &host_runtime).await,
+                };
+                (wallet, secrets)
+            }
+            Err(error) => (
+                wallet_mediator::Snapshot {
+                    wallet: None,
+                    reason: format!("host session bus unavailable: {error}"),
+                },
+                secret_service::empty(format!("host session bus unavailable: {error}")),
+            ),
         };
         eprintln!("session_start: KWallet: {}", wallet_snapshot.reason);
+        eprintln!("session_start: Secret Service: {}", secret_snapshot.reason);
+        let secrets = match secret_service::SecretService::start(
+            &wallet_bus_address,
+            secret_snapshot.store,
+        )
+        .await
+        {
+            Ok(service) => service,
+            Err(error) => {
+                return cleanup_err(format!("session Secret Service: {error}"), &mut startup);
+            }
+        };
         let wallet = match wallet_mediator::WalletMediator::start(
             &wallet_bus_address,
             wallet_snapshot.wallet.clone(),
@@ -14716,7 +14876,8 @@ impl KwinMcp {
             &wallet_bus_address,
             &service_proxy_socket,
             // This upstream is created for this session and contains only its
-            // in-memory wallet and applications, never host desktop services.
+            // in-memory wallet and keyring (wallet_mediator, secret_service) and
+            // its applications, never host desktop services.
             // Apps need normal bus ownership and peer calls (KDBusService exits
             // before mapping a window when RequestName is denied).
             &[],
@@ -14746,12 +14907,15 @@ impl KwinMcp {
         let uid = identity.uid().to_string();
         let gid = identity.gid().to_string();
         let ssh_config_overrides = prepare_ssh_config_overrides(&host_xdg_dir, identity.uid());
-        // pasta gives the session its own loopback. Into the host it forwards
-        // only the session's CDP port. Host listeners are reachable from the
-        // session via --tcp-ns, but pasta's default `auto` ranges omit the host's
-        // ephemeral port range. Scan every usable port with auto enabled so
-        // active listeners are forwarded while unbound ports remain
-        // private. The CDP port is excluded so the session's browser can bind it.
+        // pasta gives the session its own loopback. From the host into the
+        // session it forwards only the session's CDP port. The host's TCP
+        // listeners reach the session through loopback_forward, which offers
+        // each port only in the address families the host accepts it on;
+        // pasta's own --tcp-ns offers every one on ::1 as well and resets what
+        // it cannot deliver (#862). UDP keeps pasta's --udp-ns: its default
+        // `auto` ranges omit the host's ephemeral port range, so every usable
+        // port is scanned and only bound ones are forwarded. The CDP port is
+        // excluded so the session's browser can bind it.
         let fuse = fuse_support();
         let hold_netns = no_new_privs();
         // The FUSE helper inside the sandbox and the namespace holder outside
@@ -14837,7 +15001,7 @@ impl KwinMcp {
             "--udp-ports",
             "none",
             "--tcp-ns",
-            &host_ports_spec,
+            "none",
             "--udp-ns",
             &host_ports_spec,
             "--",
@@ -14999,6 +15163,7 @@ impl KwinMcp {
         for (copy, destination) in &ssh_config_overrides {
             cmd.arg("--ro-bind").arg(copy).arg(destination);
         }
+        cmd.args(mdns_socket_bind(Path::new(AVAHI_SOCKET)));
         // NVIDIA Vulkan clients need character devices outside /dev/dri. Keep them
         // available when all DRM nodes are exposed or a selected node is NVIDIA-backed,
         // without granting them to sessions selecting only another renderer.
@@ -15112,6 +15277,33 @@ impl KwinMcp {
         {
             *slot = Some(sandbox_pid);
         }
+        // The host's loopback listeners, offered in the session per address
+        // family (see loopback_forward). It is this image, so a rebuilt binary
+        // on disk does not change it, and it ends with the session's namespace.
+        let host_loopback_warning = {
+            let log = std::fs::File::create(host_xdg_dir.join("loopback-forwarder.log"));
+            let mut forwarder = std::process::Command::new("/proc/self/exe");
+            forwarder
+                .arg(loopback_forward::FORWARDER_FLAG)
+                .arg(sandbox_pid.to_string())
+                .arg(cdp_forward_port.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(log.map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from));
+            terminate_with_parent(&mut forwarder);
+            match spawn_session_child(forwarder, false).await {
+                Ok(child) => {
+                    startup.add_proxy(child);
+                    None
+                }
+                Err(error) => {
+                    eprintln!("session_start: host loopback forwarder: {error}");
+                    Some(format!(
+                        "servers listening on the host's 127.0.0.1 or ::1 are not reachable from this session: the forwarder did not start ({error})"
+                    ))
+                }
+            }
+        };
         if let Some(child) = startup.sandbox_child.as_ref() {
             test_stop_bwrap(child);
         }
@@ -15429,6 +15621,7 @@ impl KwinMcp {
             last_input: None,
             fuse_enabled: fuse.is_some(),
             wallet: Some(wallet),
+            secrets: Some(secrets),
             wallet_note: wallet_snapshot
                 .wallet
                 .is_none()
@@ -15454,10 +15647,16 @@ impl KwinMcp {
             "cookie_errors": cookie_errors,
             "oversized_read_only_files": oversized_read_only_files,
             "host_write_paths": host_write_paths,
+            "host_loopback_warning": host_loopback_warning,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
                 "reason": wallet_snapshot.reason,
+            },
+            "secrets": {
+                "mode": if secret_snapshot.copied > 0 { "session-local copy" } else { "session-local, empty" },
+                "items": secret_snapshot.copied,
+                "reason": secret_snapshot.reason,
             },
         });
         compact_session_result(&mut started, &sqlite_access);
@@ -16144,7 +16343,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false (default true) omits both pointer layers without moving it, also for cursor crops. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops; it defaults to false with save_as, else true. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -16222,7 +16421,7 @@ impl KwinMcp {
             .build()
             .await
             .map_err(KwinError::from)?;
-        let include_cursor = params.include_cursor.unwrap_or(true);
+        let include_cursor = params.include_cursor.unwrap_or(params.save_as.is_none());
         let (mut width, mut height, mut stride, mut pixels, settle) =
             capture_settled_frame(&proxy, self.last_input().await, include_cursor).await?;
         // CaptureScreen returns the composited display, which can change focus
@@ -16476,7 +16675,7 @@ impl KwinMcp {
             },
         });
         // Defaults and what the caller can derive are left out: a target that did
-        // not match is an error, the cursor is included unless asked otherwise, and
+        // not match is an error, only an omitted cursor is reported, and
         // the region is the whole window unless a region or cursor crop was asked for.
         if include_cursor {
             remove_fields(&mut payload, &["include_cursor"]);
@@ -16780,6 +16979,7 @@ impl KwinMcp {
                     .await
                     .map_err(|e| McpError::invalid_params(format!("root '{root}': {e}"), None))?;
                 visited.insert(root.clone());
+                self.note_name(root, &node.name);
                 let id = tree.push(node.text(), root.clone(), None);
                 level.push((id, acc));
             }
@@ -16813,6 +17013,7 @@ impl KwinMcp {
                     continue;
                 };
                 if shown(&node) {
+                    self.note_name(&identity, &node.name);
                     let at = tree.push(node.text(), identity, parent);
                     level.push((at, acc));
                 } else {
@@ -16858,7 +17059,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. Names compare with typographic punctuation folded ('…' is '...'); a role matches in its AT-SPI or page spelling (entry is textbox) and may lead the query as accessibility_tree prints it ('entry Ask anything'). An element the page renamed after a tree or search reported it is still matched by that name, and carries it as earlier_name beside its current name. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -16928,7 +17129,7 @@ impl KwinMcp {
                         if elements.len() >= FIND_UI_MAX_MATCHES { return Err("match limit reached".to_owned()); }
                         let name = element["name"].as_str().unwrap_or_default();
                         let role = element["role"].as_str().unwrap_or_default();
-                        if !(match_mode.matches(&find_ui_search_text(name), &query) || match_mode.matches(&find_ui_search_text(role), &query))
+                        if !ui_names::query_matches(&|text: &str| match_mode.matches(text, &query), name, role)
                             || !find_ui_role_matches(params.role.as_deref(), role)
                             || visible_only && element["visible"] != true { continue; }
                         let mut matched = element.clone();
@@ -17004,8 +17205,14 @@ impl KwinMcp {
                         let Ok(acc) = obj.as_accessible_proxy(&bus).await else { continue; };
                         let Ok(node) = atspi_node(&acc).await else { continue; };
                         let mut descendant_of = matched_ancestor;
+                        let object = format!("{}{}", acc.inner().destination(), acc.inner().path());
+                        let asked = |text: &str| match_mode.matches(text, &query);
+                        // A page can rename an element between the call that
+                        // reported it and this one (a rotating hint): a name it
+                        // was reported under still matches it.
+                        let earlier_name = self.earlier_name(&object, &node, &asked);
                         if node.is_useful()
-                            && (match_mode.matches(&find_ui_search_text(&node.name), &query) || match_mode.matches(&find_ui_search_text(&node.role), &query))
+                            && (earlier_name.is_some() || ui_names::query_matches(&asked, &node.name, &node.role))
                             && find_ui_role_matches(params.role.as_deref(), &node.role) {
                             if let Some(ancestor) = matched_ancestor
                                 && folds_into_ancestor(&node.role)
@@ -17032,6 +17239,10 @@ impl KwinMcp {
                                 if !visible_only || matched["visible"] == true {
                                     matched["surface"] = surface.clone();
                                     matched["object_path"] = serde_json::json!(acc.inner().path().to_string());
+                                    if let Some(earlier) = &earlier_name {
+                                        matched["earlier_name"] = serde_json::json!(earlier);
+                                    }
+                                    self.note_name(&object, &node.name);
                                     elements.push(matched);
                                     descendant_of = Some(elements.len() - 1);
                                 }
@@ -19993,6 +20204,25 @@ fn host_default_ipv4() -> anyhow::Result<Option<(std::net::Ipv4Addr, u32)>> {
     Ok(Some((address, prefix)))
 }
 
+/// Where nss-mdns (`mdns4_minimal` and its siblings in nsswitch.conf) reaches the
+/// host's Avahi daemon to resolve `.local` names.
+const AVAHI_SOCKET: &str = "/run/avahi-daemon/socket";
+
+/// bwrap arguments that show the host's Avahi socket at its own path in the
+/// session, whose /run is otherwise an empty tmpfs: without it every `.local`
+/// lookup ends at nsswitch's `[NOTFOUND=return]` and never reaches DNS (#864).
+/// Only the socket is bound, not its directory. It speaks Avahi's simple
+/// protocol, which resolves names and addresses and can publish nothing;
+/// publishing goes through the system bus, which the session reaches only
+/// through its filtered proxy. Nothing is bound when the host runs no Avahi.
+fn mdns_socket_bind(socket: &Path) -> Vec<std::ffi::OsString> {
+    use std::os::unix::fs::FileTypeExt;
+    if !std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        return Vec::new();
+    }
+    vec!["--ro-bind".into(), socket.into(), socket.into()]
+}
+
 /// Descriptor limit (soft:hard) for every process in a session. A scope cannot
 /// carry rlimits, so prlimit applies it to pasta, which the whole tree inherits.
 const SESSION_NOFILE: &str = "--nofile=1024:65536";
@@ -20178,6 +20408,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .unwrap_or_else(|| fuse_bridge::HELPER_SOCKET.to_owned());
             fuse_bridge::run_helper(Path::new(&socket))?;
+            return Ok(());
+        }
+        Some(loopback_forward::FORWARDER_FLAG) => {
+            loopback_forward::run_forwarder(argv)?;
+            return Ok(());
+        }
+        // Still single-threaded here, which entering a user namespace needs.
+        Some(loopback_forward::SOCKETS_FLAG) => {
+            loopback_forward::run_socket_maker(argv)?;
             return Ok(());
         }
         // One orphan sweep, then exit: kwin-mcp-shim runs this on a timer so
@@ -23364,6 +23603,9 @@ struct SessionRestore {
     idle_millis: u64,
     input_millis: Option<u64>,
     wallet: Option<wallet_mediator::State>,
+    /// Absent in a state saved by a server without the session Secret Service.
+    #[serde(default)]
+    secrets: Option<secret_service::Store>,
     wallet_note: Option<String>,
     fuse_enabled: bool,
     lease_fd: Option<i32>,
@@ -23510,6 +23752,13 @@ impl SessionRouter {
                 }
                 None => None,
             };
+            let secrets = match saved.secrets {
+                Some(store) => {
+                    let address = format!("unix:path={}", saved.path.join("kwallet_bus").display());
+                    Some(secret_service::SecretService::start(&address, store).await?)
+                }
+                None => None,
+            };
             if saved.lease_fd.is_some() {
                 service.workdir.inherit_lease(&saved.path, saved.lease_fd)?;
             }
@@ -23562,6 +23811,7 @@ impl SessionRouter {
                     std::time::Instant::now().checked_sub(Duration::from_millis(millis))
                 }),
                 wallet,
+                secrets,
                 wallet_note: saved.wallet_note,
                 fuse_enabled: saved.fuse_enabled,
             });
@@ -23691,6 +23941,11 @@ impl SessionRouter {
                     .wallet
                     .as_ref()
                     .map(wallet_mediator::WalletMediator::saved_state)
+                    .transpose()?,
+                secrets: session
+                    .secrets
+                    .as_ref()
+                    .map(secret_service::SecretService::saved_state)
                     .transpose()?,
                 wallet_note: session.wallet_note.clone(),
                 fuse_enabled: session.fuse_enabled,
@@ -26886,5 +27141,74 @@ mod chrome_profile_tests {
             "x".repeat(2040)
         );
         assert_eq!(with_chrome_profiles("d".to_owned(), &[]), "d");
+    }
+}
+
+#[cfg(test)]
+mod session_reach_tests {
+    use super::{mdns_socket_bind, prepare_overlay_plan};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> std::io::Result<PathBuf> {
+        let root = std::env::temp_dir().join(format!("kwin-mcp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    #[test]
+    fn only_a_live_avahi_socket_is_bound_and_only_the_socket() -> std::io::Result<()> {
+        let root = scratch("mdns")?;
+        let socket = root.join("socket");
+        assert!(mdns_socket_bind(&socket).is_empty(), "a host without Avahi binds nothing");
+        std::fs::write(&socket, b"")?;
+        assert!(mdns_socket_bind(&socket).is_empty(), "a plain file is not the socket");
+        std::fs::remove_file(&socket)?;
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let arguments = mdns_socket_bind(&socket);
+        assert_eq!(arguments, ["--ro-bind".into(), socket.clone().into_os_string(), socket.into_os_string()]);
+        std::fs::remove_dir_all(root)
+    }
+
+    #[test]
+    fn a_host_application_socket_is_hidden_by_a_whiteout_not_a_mask() -> anyhow::Result<()> {
+        let root = scratch("absent-socket")?;
+        let (home, twin) = (root.join("home"), root.join("twin"));
+        let directory = home.join(".local/share/zed");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))?;
+        let socket = directory.join("zed-stable.sock");
+        // A file stands in for the host's socket: hiding it does not depend on
+        // its type, and a build directory can be too long for a socket address.
+        std::fs::write(&socket, b"")?;
+        let mut plan = prepare_overlay_plan(&home, &twin, &[], &[], &[], &[])?;
+        plan.graphical_socket_paths = vec![socket.clone()];
+
+        assert!(plan.hide_host_socket(&home, &socket));
+        let upper = twin.join("overlay-upper/.local/share/zed");
+        let whiteout = std::fs::symlink_metadata(upper.join("zed-stable.sock"))?;
+        // Overlayfs shows no entry where the upper layer has a 0:0 character device.
+        assert!(whiteout.file_type().is_char_device() && whiteout.rdev() == 0);
+        // The directory made for it shows the host directory's mode in the session.
+        assert_eq!(std::fs::metadata(&upper)?.permissions().mode() & 0o7777, 0o750);
+        // Asked again (a restored session), the entry that is there is kept.
+        assert!(plan.hide_host_socket(&home, &socket));
+
+        let mask = |plan: &super::OverlayPlan| {
+            let mut command = std::process::Command::new("bwrap");
+            plan.add_bwrap_args(&mut command, &home, &[]);
+            let arguments: Vec<_> = command.get_args().map(std::ffi::OsStr::to_owned).collect();
+            arguments.windows(2).any(|pair| pair[0] == "/dev/null" && pair[1] == socket.as_os_str())
+        };
+        assert!(mask(&plan), "a socket that is not hidden keeps its mask");
+        plan.absent_socket_paths = vec![socket.clone()];
+        assert!(!mask(&plan), "a hidden socket must not get a mount point in its place");
+
+        // In a directory shared with the host there is no upper layer to hide it in.
+        plan.host_write_paths = vec![directory.clone()];
+        assert!(!plan.hide_host_socket(&home, &socket));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

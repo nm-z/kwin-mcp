@@ -93,6 +93,55 @@ that the host system bus still denies name ownership. Set
 `KWIN_MCP_TEST_ARTIFACT_DIR` to save RPC evidence and the screenshot. The same
 test fails against the pre-fix server supplied with `KWIN_MCP_E2E_SERVER`.
 
+## Saved screenshots and the pointer (#854)
+
+```bash
+KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
+  screenshot_can_omit_both_cursor_layers_without_moving_the_pointer -- --ignored --exact --nocapture
+```
+
+The production stdio test opens a static Chrome page and independently checks
+that a clean crop contains only its background color. It compares saved PNG
+bytes for omitted, false, and true `include_cursor` settings across full-window,
+region, and cursor crops, and checks agreement with workdir and inline images.
+Ordinary captures still show the pointer by default. Set
+`KWIN_MCP_E2E_PROOF_DIR` to keep images and metadata, and `KWIN_MCP_E2E_SERVER`
+to exercise a pre-fix binary with the same test (it must fail on the saved crop).
+
+## What a session reaches and how its tools name things (#862, #864, #869, #870, #891)
+
+```bash
+systemd-run --user --wait --pipe --collect --same-dir --setenv=KWIN_MCP_E2E=1 \
+  --setenv=KWIN_MCP_E2E_SERVER=target/release/kwin-mcp \
+  target/release/deps/session_one_offs_e2e-<hash> --ignored --test-threads=1 --exact NAME
+```
+
+`tests/session_one_offs_e2e.rs` holds one production-stdio case per report; each
+fails against a server built before its fix (`KWIN_MCP_E2E_SERVER`):
+
+- `mdns_names`: the host's own `.local` name resolves in a session to the address
+  the host gets. Needs avahi-daemon and nss-mdns on the host.
+- `absent_host_socket`: a display-attached host process holds
+  `~/.local/share/zed/zed-stable.sock`; the session sees no file there, a
+  single-instance start (the test executable, run inside the session as
+  `session_side_single_instance`) binds its own socket, and the host instance
+  receives nothing.
+- `session_keyring`: a private bus with an unlocked gnome-keyring stands in for
+  the host Secret Service (`KWIN_MCP_SECRET_SERVICE_ADDRESS`). The session reads
+  the host item with `secret-tool`, stores and changes items of its own, and the
+  host keyring is unchanged afterwards; after `secret-tool lock` a new session
+  copies nothing, says so, still stores its own items, and the host collection
+  is still locked. Needs gnome-keyring-daemon and secret-tool.
+- `renamed_element`: Chrome without a debugging port shows a `contenteditable`
+  composer named by `aria-label`; the element search finds it by the name as
+  typed (`...` for `…`), by `textbox` as well as `entry`, and by the tree's
+  `entry <name>` line; after the page renames it, the earlier name still returns
+  it with `earlier_name`.
+- `concurrent_localhost`: two servers start sessions together, each with a host
+  HTTP server on `127.0.0.1`; in each session 100 of 100 `curl
+  http://localhost:PORT` requests succeed, Chrome shows the page, a server on
+  `::1` only and one started after the session are reached too.
+
 # DevTools placeholder receipt
 
 Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`
