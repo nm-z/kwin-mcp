@@ -17,6 +17,8 @@ pub const DEFAULT_PORT: u16 = 47913;
 const SECRET_FILE: &str = "remote-secret";
 const AUTHORIZATION_SCHEME: &str = "Bearer ";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a frame socket bound to a chosen path may take to connect.
+const BOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// A silent peer is probed after this long, then every `KEEPALIVE_INTERVAL`.
 const KEEPALIVE_IDLE_SECONDS: u32 = 10;
 const KEEPALIVE_INTERVAL_SECONDS: u32 = 5;
@@ -717,22 +719,107 @@ fn handshake_error(error: tungstenite::Error) -> String {
     }
 }
 
+/// Where a frame socket leaves the viewer's machine when the routing table's
+/// own choice is not wanted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    /// The local address the socket is bound to before it connects.
+    pub address: IpAddr,
+    /// The interface that holds the address.
+    pub interface: String,
+}
+
+/// How a frame socket was tied to its [`Source`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// To the address and, with `SO_BINDTODEVICE`, to the interface:
+    /// everything the socket sends leaves on that interface.
+    Device,
+    /// To the address alone, because binding to the interface was refused.
+    /// The peer sends to that address; what this side sends (acknowledgements
+    /// and input) leaves on the interface the routing table picks.
+    Address,
+}
+
+/// A TCP connection to `authority` from `source`: bound before it connects.
+async fn connect_from(
+    authority: &str,
+    source: &Source,
+) -> Result<(tokio::net::TcpStream, Bound), String> {
+    let peers = tokio::net::lookup_host(authority)
+        .await
+        .map_err(|error| format!("could not resolve {authority}: {error}"))?;
+    let peer = crate::links::first(peers, |peer| peer.is_ipv4() == source.address.is_ipv4())
+        .ok_or_else(|| {
+            format!(
+                "{authority} has no address of the family of {}",
+                source.address
+            )
+        })?;
+    let (socket, bound) = bound_socket(source)?;
+    let failed = |error: &dyn std::fmt::Display| {
+        format!(
+            "could not connect from {} on {}: {error}",
+            source.address, source.interface
+        )
+    };
+    // A listener on the LAN answers in milliseconds. A path that does not
+    // reach it must fail while the listener still waits for the socket
+    // (the viewer then uses the routing table's path).
+    let stream = tokio::time::timeout(BOUND_CONNECT_TIMEOUT, socket.connect(peer))
+        .await
+        .map_err(|_| failed(&format_args!("no answer in {BOUND_CONNECT_TIMEOUT:?}")))?
+        .map_err(|error| failed(&error))?;
+    Ok((stream, bound))
+}
+
+/// An unconnected TCP socket bound to `source`: to its interface when the
+/// kernel allows that (`SO_BINDTODEVICE`, unprivileged since Linux 5.7 for a
+/// socket that is bound to no device), and to its address.
+pub fn bound_socket(source: &Source) -> Result<(tokio::net::TcpSocket, Bound), String> {
+    let socket = if source.address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }
+    .map_err(|error| format!("frame socket: {error}"))?;
+    let bound = match socket.bind_device(Some(source.interface.as_bytes())) {
+        Ok(()) => Bound::Device,
+        Err(_) => Bound::Address,
+    };
+    socket
+        .bind(SocketAddr::new(source.address, 0))
+        .map_err(|error| format!("could not bind to {}: {error}", source.address))?;
+    Ok((socket, bound))
+}
+
 /// Viewer side: opens the frame socket of the `viewer_open` call that carried
-/// `ticket` on the control socket.
+/// `ticket` on the control socket. With `source`, the socket is bound to that
+/// address and interface before it connects; the result says how.
 pub async fn connect_frames(
     authority: &str,
     secret: &Secret,
     ticket: &str,
-) -> Result<FrameSocket, String> {
+    source: Option<&Source>,
+) -> Result<(FrameSocket, Option<Bound>), String> {
     let mut request = client_request(authority, FRAMES_PATH, secret)?;
     request.headers_mut().insert(
         TICKET_HEADER,
         http::HeaderValue::from_str(ticket).map_err(|_| "invalid frame ticket".to_owned())?,
     );
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let stream = tokio::net::TcpStream::connect(authority)
-            .await
-            .map_err(|error| format!("could not connect: {error}"))?;
+        let (stream, bound) = match source {
+            Some(source) => {
+                let (stream, bound) = connect_from(authority, source).await?;
+                (stream, Some(bound))
+            }
+            None => (
+                tokio::net::TcpStream::connect(authority)
+                    .await
+                    .map_err(|error| format!("could not connect: {error}"))?,
+                None,
+            ),
+        };
         detect_dead_peer(&stream).map_err(|error| format!("socket options: {error}"))?;
         bound_frame_buffers(&stream).map_err(|error| format!("socket options: {error}"))?;
         let (socket, _) = async_tungstenite::tokio::client_async_with_config(
@@ -742,7 +829,7 @@ pub async fn connect_frames(
         )
         .await
         .map_err(handshake_error)?;
-        Ok(socket)
+        Ok((socket, bound))
     })
     .await
     .map_err(|_| "connecting timed out".to_owned())?
