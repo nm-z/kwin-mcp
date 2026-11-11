@@ -336,3 +336,22 @@ choose the output. Run it once with the screens on and once with them off
 not ask for. A 1920x1080 session on an output at scale 1.25 gives a window of
 2400x1350 device pixels, larger than the session; a 2400x1350 session there is
 shown one to one.
+
+## Viewer target and session end
+
+`tests/viewer_target_e2e.rs` covers the viewer's link to its session (#911)
+and `session_stop`'s report of processes that are still exiting (#922).
+`viewer_close_succeeds_for_a_session_whose_owner_is_gone` needs no desktop.
+The others start real isolated desktops and open every viewer window inside
+one of them:
+
+```bash
+KWIN_MCP_E2E=1 cargo test --release --test viewer_target_e2e -- --ignored --test-threads=1
+```
+
+`the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon` starts
+two private PipeWire daemons with their own WirePlumber and a bare
+`kwin_wayland --virtual`, so it needs `pipewire`, `wireplumber` and
+`dbus-run-session` on PATH. `a_confined_server_links_no_host_socket_and_its_viewer_opens`
+runs the server under `unshare --user --map-current-user`, which needs
+unprivileged user namespaces.

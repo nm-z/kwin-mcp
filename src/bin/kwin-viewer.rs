@@ -939,6 +939,38 @@ struct SessionLink {
     _wl_dispatch: DispatchThread,
     pw_quit: pipewire::channel::Sender<()>,
     pw_thread: JoinHandle<()>,
+    // Why the capture ended, when PipeWire ended it.
+    capture_failure: Arc<Mutex<Option<String>>>,
+}
+
+// The capture's own failure in place of a result that does not name one: the
+// window and the senders leave quietly once the capture requests shutdown.
+fn with_capture_failure(result: anyhow::Result<()>, failure: Option<String>) -> anyhow::Result<()> {
+    match (result, failure) {
+        (Ok(()), Some(reason)) => Err(anyhow::anyhow!(reason)),
+        (result, _) => result,
+    }
+}
+
+// The media class PipeWire gives the compositor's screencast stream.
+const SCREENCAST_MEDIA_CLASS: &str = "Stream/Output/Video";
+
+// The compositor named a node that the PipeWire daemon the viewer reads does
+// not have, so the compositor is connected to another daemon. No stream to
+// that node can be linked here; the session manager would answer "no target
+// node available" and the window would wait for a frame that never comes.
+fn foreign_node_reason(node_id: u32, socket: &std::path::Path) -> String {
+    format!(
+        "the session compositor's screencast node {node_id} is not in the session's PipeWire daemon ({}): the compositor is connected to another PipeWire daemon, so its picture cannot reach the viewer. This happens when pipewire-0 in the session's runtime directory named the host's daemon while the compositor started. Stop this session and start a new one",
+        socket.display()
+    )
+}
+
+fn write_pipewire_state(path: &std::path::Path, node_id: u32, state: &str) {
+    let temporary = path.with_extension("tmp");
+    if std::fs::write(&temporary, serde_json::json!({"node_id": node_id, "state": state}).to_string()).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
 }
 
 impl SessionLink {
@@ -1003,14 +1035,18 @@ impl SessionLink {
         // channel, so main can join it instead of leaving it behind on exit.
         let pipewire_sock = session_path.join("pipewire-0");
         let (pw_quit, pw_quit_rx) = pipewire::channel::channel::<()>();
+        let capture_failure = Arc::new(Mutex::new(None));
         let pw_thread = {
             let mailbox = Arc::clone(mailbox);
             let shutdown = shutdown.clone();
+            let capture_failure = Arc::clone(&capture_failure);
             std::thread::Builder::new()
                 .name("pipewire".to_owned())
                 .spawn(move || {
                     if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx, layout) {
                         eprintln!("kwin-viewer: pipewire loop exited: {e}");
+                        *capture_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(format!("{e:#}"));
                     }
                     // Losing the video feed ends the viewer the same way a dead
                     // wayland connection does.
@@ -1025,18 +1061,19 @@ impl SessionLink {
         // viewer.
         let wl_dispatch = DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, shutdown)?;
         let conn = wl_dispatch.connection().clone();
-        Ok(Self { fake_input, conn, _wl_dispatch: wl_dispatch, pw_quit, pw_thread })
+        Ok(Self { fake_input, conn, _wl_dispatch: wl_dispatch, pw_quit, pw_thread, capture_failure })
     }
 
     // Stop the PipeWire loop and wait for it. The caller has already requested
-    // shutdown.
-    fn close(self) {
+    // shutdown. Returns why the capture ended, when PipeWire ended it.
+    fn close(self) -> Option<String> {
         if self.pw_quit.send(()).is_err() {
             eprintln!("kwin-viewer: pipewire loop already gone");
         }
         if self.pw_thread.join().is_err() {
             eprintln!("kwin-viewer: pipewire thread panicked");
         }
+        self.capture_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
     }
 }
 
@@ -1134,8 +1171,7 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     // joined here, and dropping the link and numlock joins the remaining
     // threads and closes their sockets.
     shutdown.request();
-    link.close();
-    run_result
+    with_capture_failure(run_result, link.close())
 }
 
 // The viewer window: shows the latest frame from the mailbox and forwards the
@@ -1707,7 +1743,7 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         }
     }
     shutdown.request();
-    link.close();
+    let result = with_capture_failure(result, link.close());
     match &result {
         Ok(()) => write_status(&session_path,"closed","remote viewer disconnected"),
         Err(error) => write_status(&session_path,"failed",&error.to_string()),
@@ -2534,8 +2570,7 @@ fn stream_sender(
     };
     shutdown.request();
     let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink.close()).await });
-    link.close();
-    result
+    with_capture_failure(result, link.close())
 }
 
 // What a `--stream` viewer received and presented.
@@ -3503,9 +3538,14 @@ fn run_pipewire(
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     // Lets main stop this loop and join the thread instead of leaving it
     // running on a session that is going away.
+    let quit_requested = std::rc::Rc::new(Cell::new(false));
     let _quit = quit.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
-        move |()| mainloop.quit()
+        let quit_requested = std::rc::Rc::clone(&quit_requested);
+        move |()| {
+            quit_requested.set(true);
+            mainloop.quit();
+        }
     });
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     // remote.name as an absolute path bypasses XDG_RUNTIME_DIR joining, so we
@@ -3515,6 +3555,56 @@ fn run_pipewire(
         *pw::keys::REMOTE_NAME => socket_path.to_string_lossy().to_string(),
     };
     let core = context.connect_rc(Some(remote_props))?;
+
+    let state_path=socket_path.parent().unwrap_or(std::path::Path::new(".")).join("viewer-pipewire.json");
+    // The node the compositor named must be one of this daemon's. The list
+    // of its objects is complete once the daemon answers the sync that
+    // follows the registry request.
+    write_pipewire_state(&state_path, node_id, "listing the nodes of the session's PipeWire daemon");
+    let node_listed = std::rc::Rc::new(Cell::new(false));
+    {
+        let registry = core.get_registry()?;
+        let _globals = registry
+            .add_listener_local()
+            .global({
+                let node_listed = std::rc::Rc::clone(&node_listed);
+                move |global| {
+                    // Another daemon's node number can be some other node
+                    // here, a camera for one; only a screencast stream is
+                    // what the compositor named.
+                    if global.id == node_id
+                        && global.type_ == pw::types::ObjectType::Node
+                        && global
+                            .props
+                            .is_some_and(|props| props.get("media.class") == Some(SCREENCAST_MEDIA_CLASS))
+                    {
+                        node_listed.set(true);
+                    }
+                }
+            })
+            .register();
+        let listed = core.sync(0)?;
+        let _done = core
+            .add_listener_local()
+            .done({
+                let mainloop = mainloop.clone();
+                move |id, seq| {
+                    if id == pw::core::PW_ID_CORE && seq == listed {
+                        mainloop.quit();
+                    }
+                }
+            })
+            .register();
+        mainloop.run();
+    }
+    if quit_requested.get() {
+        return Ok(());
+    }
+    if !node_listed.get() {
+        let reason = foreign_node_reason(node_id, &socket_path);
+        write_pipewire_state(&state_path, node_id, &reason);
+        anyhow::bail!(reason);
+    }
 
     struct UserData {
         format: spa::param::video::VideoInfoRaw,
@@ -3541,14 +3631,21 @@ fn run_pipewire(
         },
     )?;
 
-    let state_path=socket_path.parent().unwrap_or(std::path::Path::new(".")).join("viewer-pipewire.json");
+    // What PipeWire said when it ended the stream. Nothing puts a stream that
+    // is in the error state back to work, so the loop ends with it.
+    let stream_error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let _listener = stream
         .add_local_listener_with_user_data(data)
-        .state_changed(move |_, _, old, new| {
-            eprintln!("kwin-viewer: pw stream {old:?} -> {new:?}");
-            let temporary=state_path.with_extension("tmp");
-            if std::fs::write(&temporary,serde_json::json!({"node_id":node_id,"state":format!("{new:?}")}).to_string()).is_ok() {
-                let _=std::fs::rename(temporary,&state_path);
+        .state_changed({
+            let stream_error = std::rc::Rc::clone(&stream_error);
+            let mainloop = mainloop.clone();
+            move |_, _, old, new| {
+                eprintln!("kwin-viewer: pw stream {old:?} -> {new:?}");
+                write_pipewire_state(&state_path, node_id, &format!("{new:?}"));
+                if let pw::stream::StreamState::Error(message) = new {
+                    stream_error.borrow_mut().get_or_insert(message);
+                    mainloop.quit();
+                }
             }
         })
         .param_changed(|_, ud, id, param| {
@@ -3628,6 +3725,11 @@ fn run_pipewire(
     )?;
 
     mainloop.run();
+    if let Some(message) = stream_error.borrow_mut().take() {
+        anyhow::bail!(
+            "the session's PipeWire daemon ended the stream from screencast node {node_id}: {message}"
+        );
+    }
     Ok(())
 }
 
