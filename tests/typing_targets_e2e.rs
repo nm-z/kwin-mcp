@@ -171,7 +171,8 @@ const PAGE: &str = "<!doctype html><html><head><title>typing targets</title><sty
     <input aria-label=\"locked\" value=\"graded\" readonly style=\"top:100px\">\
     <textarea aria-label=\"long\" style=\"top:180px\"></textarea>\
     <p style=\"position:absolute;top:260px;left:20px;font-size:22px\">Enter the quotient</p>\
-    <script>document.querySelector('textarea').value='lorem '.repeat(60000)</script>\
+    <script>const long=document.querySelector('textarea');long.value='lorem '.repeat(60000);\
+    long.addEventListener('input',event=>{document.title='long field got '+event.data})</script>\
     </body></html>";
 const NUMBER: (i64, i64) = (220, 145);
 const LOCKED: (i64, i64) = (220, 225);
@@ -231,6 +232,16 @@ fn chrome_fields_that_are_focused_and_editable_take_typing() {
     // 360,000 characters are more than a snapshot reads: typed, not verified.
     desktop.click(LONG.0, LONG.1);
     let long = desktop.type_text("z");
+    // The page puts what the field received into its title.
+    let mut long_received = false;
+    for _ in 0..50 {
+        let windows = desktop.tool("window_list", json!({})).to_string();
+        long_received = windows.contains("long field got z");
+        if long_received {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     desktop.evidence("6-unreadable-field");
     drop(desktop);
     for (step, reply) in [
@@ -268,6 +279,7 @@ fn chrome_fields_that_are_focused_and_editable_take_typing() {
         "the read-only input was not refused by name: {locked}"
     );
     assert_eq!(status(&long), "unverified", "unreadable field: {long}");
+    assert!(long_received, "the unreadable field did not receive the key: {long}");
     let warning = long["result"]["structuredContent"]["delivery"]["warning"]
         .as_str()
         .unwrap_or_default();
