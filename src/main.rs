@@ -23028,9 +23028,8 @@ mod user_namespace_guidance_tests {
             "kwin-mcp: {}: EPERM: Operation not permitted\n",
             super::netns_holder::NAMESPACE_REFUSAL
         );
-        let guidance = user_namespace_guidance(&stderr, &confined())
-            .expect("a refused namespace gets guidance");
-        assert!(guidance.contains("NoNewPrivs: 1"), "{guidance}");
+        let guidance = user_namespace_guidance(&stderr, &confined()).unwrap_or_default();
+        assert!(guidance.contains("NoNewPrivs: 1"), "no guidance for: {stderr}");
     }
 
     #[test]
