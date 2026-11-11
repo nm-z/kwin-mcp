@@ -2405,4 +2405,238 @@ mod null_ref_tests {
         );
         Ok(())
     }
+
+    type Children = Vec<(String, zbus::zvariant::OwnedObjectPath)>;
+
+    // AT-SPI state bits of the first state word.
+    const EDITABLE: u32 = 1 << 7;
+    const FOCUSED: u32 = 1 << 12;
+    const SHOWING: u32 = 1 << 25;
+    // AT-SPI role numbers.
+    const FRAME: u32 = 23;
+    const APPLICATION: u32 = 75;
+    const ENTRY: u32 = 79;
+
+    // One accessible of a stand-in application.
+    struct Node {
+        name: &'static str,
+        role: u32,
+        role_name: &'static str,
+        states: u32,
+        children: Children,
+        interfaces: &'static [&'static str],
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl Node {
+        #[zbus(property, name = "Name")]
+        fn name(&self) -> String {
+            self.name.to_owned()
+        }
+        #[zbus(name = "GetChildren")]
+        fn get_children(&self) -> Children {
+            self.children.clone()
+        }
+        #[zbus(name = "GetRole")]
+        fn get_role(&self) -> u32 {
+            self.role
+        }
+        #[zbus(name = "GetRoleName")]
+        fn get_role_name(&self) -> String {
+            self.role_name.to_owned()
+        }
+        #[zbus(name = "GetState")]
+        fn get_state(&self) -> Vec<u32> {
+            vec![self.states, 0]
+        }
+        #[zbus(name = "GetInterfaces")]
+        fn get_interfaces(&self) -> Vec<String> {
+            self.interfaces
+                .iter()
+                .map(|interface| format!("org.a11y.atspi.{interface}"))
+                .collect()
+        }
+        #[zbus(name = "GetAttributes")]
+        fn get_attributes(&self) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    struct Extents(i32, i32, i32, i32);
+
+    #[zbus::interface(name = "org.a11y.atspi.Component")]
+    impl Extents {
+        #[zbus(name = "GetExtents")]
+        fn get_extents(&self, _coord_type: u32) -> ((i32, i32, i32, i32),) {
+            ((self.0, self.1, self.2, self.3),)
+        }
+    }
+
+    // An empty text field with the caret at its start.
+    struct EmptyText;
+
+    #[zbus::interface(name = "org.a11y.atspi.Text")]
+    impl EmptyText {
+        #[zbus(property, name = "CharacterCount")]
+        fn character_count(&self) -> i32 {
+            0
+        }
+        #[zbus(property, name = "CaretOffset")]
+        fn caret_offset(&self) -> i32 {
+            0
+        }
+        #[zbus(name = "GetText")]
+        fn get_text(&self, _start: i32, _end: i32) -> String {
+            String::new()
+        }
+        #[zbus(name = "GetNSelections")]
+        fn get_n_selections(&self) -> i32 {
+            0
+        }
+    }
+
+    // The registry of a bus with one application.
+    struct Registry(Children);
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl Registry {
+        #[zbus(name = "GetChildren")]
+        fn get_children(&self) -> Children {
+            self.0.clone()
+        }
+    }
+
+    fn path(text: &str) -> anyhow::Result<zbus::zvariant::OwnedObjectPath> {
+        Ok(zbus::zvariant::OwnedObjectPath::try_from(text)?)
+    }
+
+    /// An application with one 1280x800 frame named `frame_name` that holds a
+    /// focused editable entry "answer", readable only with `entry_interfaces`.
+    async fn serve_application(
+        address: &str,
+        frame_name: &'static str,
+        entry_interfaces: &'static [&'static str],
+    ) -> anyhow::Result<(zbus::Connection, zbus::Connection)> {
+        let application = zbus::connection::Builder::address(address)?
+            .auth_mechanism(zbus::AuthMechanism::Anonymous)
+            .build()
+            .await?;
+        let name = application
+            .unique_name()
+            .ok_or_else(|| anyhow::anyhow!("the application has no bus name"))?
+            .to_string();
+        let server = application.object_server();
+        server
+            .at(
+                "/app",
+                Node {
+                    name: "App",
+                    role: APPLICATION,
+                    role_name: "application",
+                    states: SHOWING,
+                    children: vec![(name.clone(), path("/frame")?)],
+                    interfaces: &["Accessible"],
+                },
+            )
+            .await?;
+        server
+            .at(
+                "/frame",
+                Node {
+                    name: frame_name,
+                    role: FRAME,
+                    role_name: "frame",
+                    states: SHOWING,
+                    children: vec![(name.clone(), path("/entry")?)],
+                    interfaces: &["Accessible", "Component"],
+                },
+            )
+            .await?;
+        server.at("/frame", Extents(0, 0, 1280, 800)).await?;
+        server
+            .at(
+                "/entry",
+                Node {
+                    name: "answer",
+                    role: ENTRY,
+                    role_name: "entry",
+                    states: FOCUSED | EDITABLE | SHOWING,
+                    children: Vec::new(),
+                    interfaces: entry_interfaces,
+                },
+            )
+            .await?;
+        server.at("/entry", Extents(20, 115, 400, 60)).await?;
+        server.at("/entry", EmptyText).await?;
+        let registry = zbus::connection::Builder::address(address)?
+            .auth_mechanism(zbus::AuthMechanism::Anonymous)
+            .name("org.a11y.atspi.Registry")?
+            .serve_at(
+                "/org/a11y/atspi/accessible/root",
+                Registry(vec![(name, path("/app")?)]),
+            )?
+            .build()
+            .await?;
+        Ok((application, registry))
+    }
+
+    fn browser_window(pid: Option<u32>) -> TextWindow<'static> {
+        TextWindow {
+            title: "New Tab - Google Chrome",
+            bounds: [0.0, 0.0, 1280.0, 800.0],
+            pid,
+        }
+    }
+
+    // Chrome names a window's frame after its in-page search bar once that bar
+    // was used. The caption then matches no frame, and the window is found as
+    // the frame of its own process that covers it.
+    #[tokio::test]
+    async fn a_frame_renamed_by_its_application_is_bound_through_its_process() -> anyhow::Result<()> {
+        let (_bus, address) = start_bus()?;
+        let _served = serve_application(
+            &address,
+            "Search bar\n    New Tab",
+            &["Accessible", "Component", "Text"],
+        )
+        .await?;
+        let own = std::process::id();
+
+        let Err(by_caption) = TextReceipt::capture(&address, browser_window(None), None, "7").await
+        else {
+            anyhow::bail!("a frame with another name was bound without knowing its process");
+        };
+        assert!(by_caption.to_string().contains("no focused editable text"), "{by_caption}");
+        let other = TextReceipt::capture(&address, browser_window(Some(own + 1)), None, "7").await;
+        assert!(other.is_err(), "a frame of another process was bound");
+        let elsewhere = TextWindow {
+            bounds: [0.0, 0.0, 640.0, 480.0],
+            ..browser_window(Some(own))
+        };
+        let moved = TextReceipt::capture(&address, elsewhere, None, "7").await;
+        assert!(moved.is_err(), "a frame that does not cover the window was bound");
+
+        let receipt = TextReceipt::capture(&address, browser_window(Some(own)), None, "7").await?;
+        assert_eq!(receipt.expected, "7");
+        assert!(!receipt.ambiguous_frame);
+        Ok(())
+    }
+
+    // A focused editable control without a Text interface cannot be read back,
+    // which is not the same as focus on something that takes no text.
+    #[tokio::test]
+    async fn a_focused_editable_field_without_readable_text_is_named() -> anyhow::Result<()> {
+        let (_bus, address) = start_bus()?;
+        let _served =
+            serve_application(&address, "New Tab - Google Chrome", &["Accessible", "Component"])
+                .await?;
+        let Err(error) = TextReceipt::capture(&address, browser_window(None), None, "7").await
+        else {
+            anyhow::bail!("a field without a Text interface produced a receipt");
+        };
+        assert!(error.is::<super::UnreadableFocus>(), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("entry \"answer\" at screen (20,115 400x60)"), "{message}");
+        Ok(())
+    }
 }

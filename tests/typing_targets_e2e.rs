@@ -3,14 +3,17 @@
 //! `keyboard_type` and `keyboard_paste` reach fields that are focused and
 //! editable even when accessibility describes the window badly.
 //!
-//! Chrome names a window's accessibility frame after its in-page search bar
-//! once that bar has been used and DevTools opened ("<bar title> <page
+//! Chrome sometimes names a window's accessibility frame after its in-page
+//! search bar once that bar was used and DevTools opened ("<bar title> <page
 //! title>" instead of the window caption), and keeps that name until the page
 //! title changes. `keyboard_type` matched frames by caption only, so from then
 //! on it refused every field of the window: a number input, the DevTools
-//! console prompt, the search bar itself (#896, #883, #871). A read-only input
-//! must still be refused by name, and a field too long to read back is typed
-//! into and reported unverified.
+//! console prompt, the search bar itself (#896, #883, #871). Chrome does not
+//! do it on every run, so a unit test of `input_bridge` covers that binding
+//! and this case covers the fields: each takes typing, also after DevTools was
+//! open, and under memory pressure, when Chrome publishes focus late. A
+//! read-only input must still be refused by name, and a field too long to read
+//! back is typed into and reported unverified.
 //!
 //! `keyboard_paste` sent its shortcut even while no window was active, as
 //! right after `launch_app`, so the text reached nothing; and it did not say
@@ -176,7 +179,7 @@ const LONG: (i64, i64) = (220, 305);
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
-fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
+fn chrome_fields_that_are_focused_and_editable_take_typing() {
     let mut desktop = Desktop::start("typing-targets-e2e");
     let workdir = desktop.workdir.clone();
     std::fs::write(format!("{workdir}/targets.html"), PAGE).expect("write page");
@@ -202,7 +205,7 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
     desktop.key("Escape");
     std::thread::sleep(Duration::from_millis(500));
 
-    // Opening DevTools after that leaves the window's frame named after the
+    // Opening DevTools after that can leave the window's frame named after the
     // search bar. The console prompt has focus.
     desktop.key("ctrl+shift+j");
     std::thread::sleep(Duration::from_secs(5));
@@ -211,14 +214,14 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
     desktop.key("F12");
     std::thread::sleep(Duration::from_secs(2));
 
-    // The frame keeps that name with DevTools closed.
+    // A renamed frame keeps its name with DevTools closed.
     desktop.click(NUMBER.0, NUMBER.1);
     let number_again = desktop.type_text("5");
-    desktop.evidence("4-number-input-renamed-frame");
+    desktop.evidence("4-number-input-after-devtools");
     desktop.key("ctrl+f");
     std::thread::sleep(Duration::from_secs(1));
     let search_again = desktop.type_text("Enter");
-    desktop.evidence("5-search-bar-renamed-frame");
+    desktop.evidence("5-search-bar-after-devtools");
     desktop.key("Escape");
     std::thread::sleep(Duration::from_millis(500));
 
@@ -234,8 +237,8 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
         ("number input", &number),
         ("search bar", &search),
         ("DevTools console", &console),
-        ("number input, renamed frame", &number_again),
-        ("search bar, renamed frame", &search_again),
+        ("number input after DevTools", &number_again),
+        ("search bar after DevTools", &search_again),
         ("read-only input", &locked),
         ("unreadable field", &long),
     ] {
@@ -250,7 +253,7 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
     );
     assert_eq!(
         status(&number_again), "verified",
-        "number input in the renamed frame: {number_again}"
+        "number input after DevTools: {number_again}"
     );
     assert_eq!(
         number_again["result"]["structuredContent"]["value_after"], "-105",
@@ -258,7 +261,7 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
     );
     assert_eq!(
         status(&search_again), "verified",
-        "search bar in the renamed frame: {search_again}"
+        "search bar after DevTools: {search_again}"
     );
     assert!(
         refusal(&locked).contains("\"locked\"") && refusal(&locked).contains("read-only or disabled"),
@@ -279,6 +282,8 @@ fn chrome_fields_take_typing_after_the_search_bar_renamed_the_frame() {
 fn konsole_paste_waits_for_the_window_and_names_its_confirmation_dialog() {
     let mut desktop = Desktop::start("konsole-paste-e2e");
     let proof = format!("{}/paste-proof.txt", desktop.workdir);
+    // With no window the shortcut reaches nothing, so nothing may be sent.
+    let nowhere = desktop.tool("keyboard_paste", json!({"text":"echo nowhere"}));
     let launched = desktop.tool(
         "launch_app",
         json!({"command":"konsole", "window_timeout_seconds":60}),
@@ -308,6 +313,9 @@ fn konsole_paste_waits_for_the_window_and_names_its_confirmation_dialog() {
     desktop.key("Escape");
     drop(desktop);
 
+    assert_eq!(nowhere["error"]["data"]["reason"], "no_active_window", "{nowhere}");
+    assert_eq!(nowhere["error"]["data"]["shortcut_submitted"], false, "{nowhere}");
+    assert_eq!(nowhere["error"]["data"]["retry_safe"], true, "{nowhere}");
     assert!(pasted["error"].is_null(), "{pasted}");
     assert_eq!(
         pasted["result"]["structuredContent"]["delivery"]["method"], "terminal",

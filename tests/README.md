@@ -107,6 +107,21 @@ button must fail preflight with zero key events. The script saves JSON, input
 journal and screenshots, then stops its session and removes its private HOME
 and temp root. Chrome and the ordinary desktop dependencies are required.
 
+## Typing and paste targets
+
+`tests/typing_targets_e2e.rs` has two ignored cases. The Chrome case types into
+a number input, the in-page search bar and the DevTools console prompt, repeats
+the first two after DevTools was opened and closed, checks that a read-only
+input is refused by name and that a 360,000-character field is typed into and
+reported `unverified`. The Konsole case pastes a command right after
+`launch_app`, runs it and reads the file it writes, then pastes a control
+character and expects the confirmation dialog in the result.
+`KWIN_MCP_E2E_SERVER` selects the server binary and `KWIN_MCP_E2E_EVIDENCE` a
+directory for screenshots. Chrome names a window's frame after the search bar
+only some of the time, so that binding is covered by the unit test
+`a_frame_renamed_by_its_application_is_bound_through_its_process` on a stand-in
+accessibility bus.
+
 ## File chooser capture identity
 
 ```bash
