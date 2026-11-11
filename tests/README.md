@@ -32,6 +32,41 @@ KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
 ```
 
 The desktop cases require the dependencies stated on each ignored test.
+
+The same command works from a checkout whose shell has `NoNewPrivs=1`, such
+as a sandboxed worker's: the runner and the server it starts inherit the flag
+and the server starts sessions under it. `no_new_privs_e2e.rs` starts the
+server through `setpriv --no-new-privs` and inside a `bwrap` user namespace
+and checks a window, a screenshot, the session's network and files, and that
+`session_stop` leaves no process, scope or directory behind:
+
+```bash
+KWIN_MCP_E2E=1 cargo test --test no_new_privs_e2e -- --ignored --test-threads=1
+```
+
+## Startup stderr without autoclean (#852)
+
+```bash
+cargo test --test startup_uid_map_e2e -- --ignored --test-threads=1 --nocapture
+```
+
+These production-stdio cases run the real server and pasta with a stand-in
+`bwrap` that prints the refusal the real one prints where nested user
+namespaces are forbidden (`NoNewPrivs` alone no longer causes one). They
+require uinput access and the host's systemd user D-Bus. Both leave `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` unset to
+exercise the validated host fallback from the issue.
+
+The default mode must return the actual UID-map refusal, structured stderr and
+namespace guidance while retaining its workdir. The `--autoclean` mode must
+return the same diagnostics after deleting its workdir and disk twin. The tests
+independently read the retained sandbox log, clear the failed session handle,
+and require successful server exit on stdin EOF. All fixture files are private
+and removed afterward; no desktop is started.
+
+To show the regression against an older binary, set `KWIN_MCP_E2E_SERVER` to its
+absolute path. Before the fix, the default case fails because its response omits
+the stderr, while the autoclean case passes.
+
 # DevTools placeholder receipt
 
 Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`

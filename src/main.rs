@@ -301,6 +301,7 @@ mod fuse_bridge {
 }
 mod host_environment;
 mod input_bridge;
+mod netns_holder;
 mod session_registry;
 use kwin_mcp::remote;
 mod kwin_script {
@@ -3763,11 +3764,13 @@ fn wallet_bus_startup_error(message: String, stderr_path: &Path) -> String {
     }
 }
 
-/// What bwrap prints when the kernel refuses it a user namespace or its id map.
-const USER_NAMESPACE_REFUSALS: [&str; 3] = [
+/// What bwrap, or the namespace holder that starts it under no_new_privs,
+/// prints when the kernel refuses a user namespace or its id map.
+const USER_NAMESPACE_REFUSALS: [&str; 4] = [
     "setting up uid map",
     "setting up gid map",
     "No permissions to create new namespace",
+    netns_holder::NAMESPACE_REFUSAL,
 ];
 
 /// Kernel settings that decide whether this process may create a user
@@ -3812,17 +3815,10 @@ fn user_namespace_guidance(stderr: &str, facts: &UserNamespaceFacts) -> Option<S
         .iter()
         .any(|refusal| stderr.contains(refusal))
         .then(|| {
-            // NoNewPrivs alone causes it: pasta runs the sandbox command with only the
-            // few capabilities pasta kept, and under NoNewPrivs exec cannot restore
-            // CAP_SETUID/CAP_SETFCAP, which bwrap needs to map ids. Reproduced with
-            // `setpriv --no-new-privs pasta --config-net -- bwrap --unshare-user ...`.
-            let no_new_privs = if facts.no_new_privs == "1" {
-                ". NoNewPrivs is set, which is enough on its own: it stops the command pasta runs from regaining the capabilities bwrap needs to map ids (`setpriv --no-new-privs pasta --config-net -- bwrap --unshare-user --ro-bind / / true` fails the same way), and a capability added to the sandbox does not change that. The process that launches kwin-mcp must not set NoNewPrivs: start the server as `systemd-run --user --quiet --wait --pipe --collect /path/to/kwin-mcp ...`, which runs it from the user manager instead of the sandbox (verified from inside a NoNewPrivs sandbox)"
-            } else {
-                ""
-            };
+            // NoNewPrivs is reported but is not a cause: the server starts
+            // sessions under it through the namespace holder.
             format!(
-                "bwrap could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones{no_new_privs}. Start kwin-mcp outside that sandbox, or allow nested user namespaces for it, then call session_start again",
+                "kwin-mcp could not create the session's user namespace, so no desktop was started. The kernel refused it for this kwin-mcp process (uid_map: {}; user.max_user_namespaces: {}; NoNewPrivs: {}; Seccomp: {}; kernel.apparmor_restrict_unprivileged_userns: {}). This happens when the server runs inside another sandbox or container that restricts nested user namespaces, or when the host disables unprivileged ones. NoNewPrivs alone does not cause it. Start kwin-mcp outside that sandbox (`systemd-run --user --quiet --wait --pipe --collect /path/to/kwin-mcp ...` runs it from the user manager), or allow nested user namespaces for it, then call session_start again",
                 facts.uid_map,
                 facts.max_user_namespaces,
                 facts.no_new_privs,
@@ -6578,9 +6574,10 @@ struct StartupResources {
     sandbox_child: Option<std::process::Child>,
     sandbox_stdin: Option<std::process::ChildStdin>,
     service_proxy_children: Vec<std::process::Child>,
-    /// Disk-backed image staged for the FUSE helper, until Session owns the
-    /// whole disk twin or failed startup cleanup removes the image.
-    fuse_bridge_exe: Option<PathBuf>,
+    /// Disk-backed image staged for the FUSE helper and the namespace holder,
+    /// until Session owns the whole disk twin or failed startup cleanup
+    /// removes the image.
+    staged_image: Option<PathBuf>,
 }
 
 impl StartupResources {
@@ -6590,7 +6587,7 @@ impl StartupResources {
             sandbox_child: None,
             sandbox_stdin: None,
             service_proxy_children: Vec::new(),
-            fuse_bridge_exe: None,
+            staged_image: None,
         }
     }
 
@@ -6609,11 +6606,11 @@ impl StartupResources {
         for proxy in self.service_proxy_children.drain(..) {
             terminate_child(proxy, false, "startup D-Bus proxy");
         }
-        if let Some(exe) = self.fuse_bridge_exe.take()
+        if let Some(exe) = self.staged_image.take()
             && let Err(error) = std::fs::remove_file(&exe)
         {
             eprintln!(
-                "startup: could not remove staged FUSE bridge {}: {error}",
+                "startup: could not remove staged server image {}: {error}",
                 exe.display()
             );
         }
@@ -6627,7 +6624,7 @@ impl StartupResources {
         Vec<std::process::Child>,
     ) {
         self.scope_unit.take();
-        self.fuse_bridge_exe.take();
+        self.staged_image.take();
         let Some(sandbox_child) = self.sandbox_child.take() else {
             panic!("startup sandbox child missing at Session publication");
         };
@@ -7421,10 +7418,17 @@ impl KwinMcp {
         if self.session.read().await.is_some() {
             return error;
         }
-        // Process guards have stopped startup children, but the owned disk
-        // twin still exists here. Keep bounded diagnostics in the response
-        // before autoclean removes the only copy of their stderr.
-        let error = if self.workdir.owned().is_some() {
+        // Process guards have stopped startup children, but their disk twin
+        // still exists here. Report bounded stderr even when --autoclean is
+        // off: workdir ownership controls deletion, not startup diagnostics.
+        // With autoclean, preserve it before removing the only copy. A start
+        // that spawned no sandbox wrote no log: the directory it refused to
+        // reuse may hold another run's.
+        let spawned_sandbox = self
+            .startup_sandbox_pid
+            .lock()
+            .is_ok_and(|slot| slot.is_some());
+        let error = if self.workdir.owned().is_some() || spawned_sandbox {
             preserve_startup_sandbox_diagnostics(error, &self.path)
         } else {
             error
@@ -8738,7 +8742,9 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Root directory of the sandbox's mount namespace as seen from the host:
-/// /proc/<pid>/root of bwrap's inner child, two levels below pasta.
+/// /proc/<pid>/root of bwrap's inner child, two levels below pasta. Under
+/// no_new_privs the top process is the namespace holder, whose children are
+/// bwrap and pasta; only bwrap has a child.
 fn sandbox_root(sandbox_pid: u32) -> Option<PathBuf> {
     let children = |parent: i32| -> Vec<i32> {
         procfs::process::all_processes()
@@ -8749,9 +8755,10 @@ fn sandbox_root(sandbox_pid: u32) -> Option<PathBuf> {
             .map(|process| process.pid)
             .collect()
     };
-    let pasta = i32::try_from(sandbox_pid).ok()?;
-    let outer = *children(pasta).first()?;
-    let inner = *children(outer).first()?;
+    let top = i32::try_from(sandbox_pid).ok()?;
+    let inner = children(top)
+        .into_iter()
+        .find_map(|outer| children(outer).first().copied())?;
     let root = PathBuf::from(format!("/proc/{inner}/root"));
     std::fs::read_dir(&root).ok().map(|_| root)
 }
@@ -13903,17 +13910,60 @@ impl KwinMcp {
         // ephemeral port range. Scan every usable port with auto enabled so
         // active listeners are forwarded while unbound ports remain
         // private. The CDP port is excluded so the session's browser can bind it.
+        let fuse = fuse_support();
+        let hold_netns = no_new_privs();
+        // The FUSE helper inside the sandbox and the namespace holder outside
+        // it both run this server's image, from a copy (the FUSE bind below
+        // says why).
+        let staged_image = if fuse.is_some() || hold_netns {
+            // Keep this large copy on the disk-backed session twin. Putting it
+            // in host_xdg_dir charges it to /tmp's per-user tmpfs quota and can
+            // leave later session operations unable to write there.
+            let exe = session_disk_path(&host_xdg_dir).join("kwin-mcp-exe");
+            let temporary = exe.with_extension("partial");
+            let copied = std::fs::copy("/proc/self/exe", &temporary)
+                .and_then(|_| std::fs::rename(&temporary, &exe));
+            if let Err(error) = copied {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(ver_err(format!(
+                    "copy running binary for the session: {}",
+                    describe_write_failure(&temporary, &error)
+                )));
+            }
+            startup.staged_image = Some(exe.clone());
+            Some(exe)
+        } else {
+            None
+        };
+        let pasta_ready_file = session_disk_path(&host_xdg_dir).join("pasta.pid");
+        let holder = staged_image
+            .as_deref()
+            .filter(|_| hold_netns)
+            .map(|image| NetnsHolder {
+                image,
+                ready_file: &pasta_ready_file,
+            });
+        if holder.is_some() {
+            eprintln!(
+                "session_start: NoNewPrivs is set; pasta attaches to namespaces the session creates"
+            );
+        }
         let scope_unit = format!(
             "{}.scope",
             self.path.file_name().unwrap_or_default().to_string_lossy()
         );
         let scope = SessionScope::new(&self.path, memory);
         startup.scope_unit = Some(scope_unit.clone());
-        let mut cmd =
-            match sandbox_launcher(memory, &host_runtime, &host_session_bus, Some(&scope_unit)) {
-                Ok(command) => command,
-                Err(error) => return cleanup_err(error, &mut startup),
-            };
+        let mut cmd = match sandbox_launcher(
+            memory,
+            &host_runtime,
+            &host_session_bus,
+            Some(&scope_unit),
+            holder,
+        ) {
+            Ok(command) => command,
+            Err(error) => return cleanup_err(error, &mut startup),
+        };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         // With auto, an explicit range defines the complete scan set, not
         // an addition to the default non-ephemeral range. Include all usable
@@ -13957,7 +14007,6 @@ impl KwinMcp {
         // capability cannot mount. So with FUSE, bwrap stays at uid 0 in one
         // namespace for the helper, and the entrypoint nests the namespace
         // that maps the real uid for everything else.
-        let fuse = fuse_support();
         let (sandbox_uid, sandbox_gid) = if fuse.is_some() {
             ("0", "0")
         } else {
@@ -13976,26 +14025,6 @@ impl KwinMcp {
             host_name,
             "--unshare-ipc",
         ]);
-        let fuse_exe = if fuse.is_some() {
-            // Keep this large copy on the disk-backed session twin. Putting it
-            // in host_xdg_dir charges it to /tmp's per-user tmpfs quota and can
-            // leave later session operations unable to write there.
-            let exe = session_disk_path(&host_xdg_dir).join("kwin-mcp-exe");
-            let temporary = exe.with_extension("partial");
-            let copied = std::fs::copy("/proc/self/exe", &temporary)
-                .and_then(|_| std::fs::rename(&temporary, &exe));
-            if let Err(error) = copied {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(ver_err(format!(
-                    "copy running binary for the FUSE bridge: {}",
-                    describe_write_failure(&temporary, &error)
-                )));
-            }
-            startup.fuse_bridge_exe = Some(exe.clone());
-            Some(exe)
-        } else {
-            None
-        };
         let mut pre_overlay_binds = Vec::new();
         // Keep the real agent inside the same filtered bus and sandbox. Only
         // its known missing-PolicyKit registration diagnostic moves to a log;
@@ -14020,7 +14049,7 @@ impl KwinMcp {
             ));
             pre_overlay_binds.push((shim, agent));
         }
-        if let (Some(binaries), Some(exe)) = (&fuse, &fuse_exe) {
+        if let (Some(binaries), Some(exe)) = (&fuse, &staged_image) {
             pre_overlay_binds.push((exe.clone(), PathBuf::from(fuse_bridge::BRIDGE_EXECUTABLE)));
             for (real, program) in binaries {
                 let hidden = PathBuf::from(format!("{}/{program}", fuse_bridge::REAL_BINARY_DIR));
@@ -18494,6 +18523,20 @@ fn on_path(program: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
+/// Whether this server runs under no_new_privs, as every process started
+/// inside a bwrap-based sandbox does. pasta cannot start bwrap then (see
+/// netns_holder), so the session's namespaces are made the other way round.
+fn no_new_privs() -> bool {
+    nix::sys::prctl::get_no_new_privs().unwrap_or(false)
+}
+
+/// The holder that takes pasta's place under no_new_privs: this server's
+/// staged image, and the file pasta marks the session's network ready with.
+struct NetnsHolder<'a> {
+    image: &'a Path,
+    ready_file: &'a Path,
+}
+
 /// Start the pasta and bwrap tree in a bounded systemd user scope.
 /// Refuse startup when the scope is unavailable instead of running uncapped.
 fn sandbox_launcher(
@@ -18501,6 +18544,7 @@ fn sandbox_launcher(
     runtime: &Path,
     session_bus: &str,
     scope_unit: Option<&str>,
+    holder: Option<NetnsHolder>,
 ) -> Result<std::process::Command, String> {
     let usable = std::process::Command::new("systemd-run")
         .env("XDG_RUNTIME_DIR", runtime)
@@ -18550,6 +18594,14 @@ fn sandbox_launcher(
             "session_start: prlimit not found; the session keeps the default descriptor limit"
         );
     }
+    // The pasta options and the bwrap command the caller appends are the same
+    // either way; the holder attaches pasta to namespaces bwrap can start in.
+    if let Some(holder) = holder {
+        command
+            .arg(holder.image)
+            .arg(netns_holder::FLAG)
+            .arg(holder.ready_file);
+    }
     command.arg("pasta");
     Ok(command)
 }
@@ -18589,6 +18641,16 @@ fn parse_dim_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Under no_new_privs this binary also holds a session's network namespace
+    // (see netns_holder). Its arguments are bwrap's, which need not be UTF-8.
+    let mut holder_arguments = std::env::args_os().skip(1);
+    if holder_arguments
+        .next()
+        .is_some_and(|flag| flag == netns_holder::FLAG)
+    {
+        let invocation = netns_holder::Invocation::parse(holder_arguments)?;
+        std::process::exit(netns_holder::run(&invocation));
+    }
     // Inside the sandbox this binary also serves FUSE (see fuse_bridge).
     let mut argv = std::env::args();
     if let Some(program) = argv.next().as_deref().and_then(fuse_bridge::shim_program) {
@@ -22613,9 +22675,28 @@ mod memory_limit_tests {
                 super::host_environment::runtime_dir().map_err(|error| error.to_string())?;
             let session_bus = super::host_environment::session_bus_address(&runtime)
                 .map_err(|error| error.to_string())?;
-            let launcher = sandbox_launcher(config, &runtime, &session_bus, None)?;
+            let launcher = sandbox_launcher(config, &runtime, &session_bus, None, None)?;
             let mut args: Vec<_> = launcher.get_args().map(std::ffi::OsStr::to_owned).collect();
             assert_eq!(args.pop().as_deref(), Some(std::ffi::OsStr::new("pasta")));
+            // Under no_new_privs the holder runs in the same scope, directly
+            // ahead of the pasta options it passes on.
+            let held = sandbox_launcher(
+                config,
+                &runtime,
+                &session_bus,
+                None,
+                Some(super::NetnsHolder {
+                    image: std::path::Path::new("/disk/kwin-mcp-exe"),
+                    ready_file: std::path::Path::new("/disk/pasta.pid"),
+                }),
+            )?;
+            let held: Vec<_> = held.get_args().map(std::ffi::OsStr::to_owned).collect();
+            assert_eq!(held[..args.len()], args[..]);
+            assert_eq!(
+                held[args.len()..],
+                ["/disk/kwin-mcp-exe", "--netns-holder", "/disk/pasta.pid", "pasta"]
+                    .map(std::ffi::OsString::from)
+            );
             // Exercise the same scope properties with a readback process
             // instead of starting a compositor or application.
             let output = std::process::Command::new(launcher.get_program())
@@ -22934,16 +23015,21 @@ mod user_namespace_guidance_tests {
             "Seccomp: 2",
             "kernel.apparmor_restrict_unprivileged_userns: 1",
             "Start kwin-mcp outside that sandbox",
-            "NoNewPrivs is set, which is enough on its own",
+            "NoNewPrivs alone does not cause it",
             "systemd-run --user --quiet --wait --pipe --collect",
         ] {
             assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
         }
-        let mut free = confined();
-        free.no_new_privs = "0".to_owned();
-        let without = user_namespace_guidance("bwrap: setting up uid map: Operation not permitted", &free)
-            .expect("guidance without NoNewPrivs");
-        assert!(!without.contains("NoNewPrivs is set"), "{without}");
+    }
+
+    #[test]
+    fn a_refusal_from_the_namespace_holder_is_explained_too() {
+        let stderr = format!(
+            "kwin-mcp: {}: EPERM: Operation not permitted\n",
+            super::netns_holder::NAMESPACE_REFUSAL
+        );
+        let guidance = user_namespace_guidance(&stderr, &confined()).unwrap_or_default();
+        assert!(guidance.contains("NoNewPrivs: 1"), "no guidance for: {stderr}");
     }
 
     #[test]
