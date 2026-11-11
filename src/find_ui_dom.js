@@ -1,7 +1,14 @@
 JSON.stringify((() => {
-  const roleOf = el => el.getAttribute('role') || ({A:'link', BUTTON:'button', TEXTAREA:'textbox', SELECT:'combobox', INPUT:({button:'button',submit:'button',reset:'button',checkbox:'checkbox',radio:'radio'}[el.type] || 'textbox')})[el.tagName] || el.tagName.toLowerCase();
-  const nameOf = el => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.textContent || (el.tagName==='INPUT' && ['button','submit','reset'].includes(el.type) ? el.value : '') || '').trim().slice(0, 120);
-  const candidates=[...document.querySelectorAll('button,a,input,select,textarea,[role],[onclick],[tabindex]')];
+  const text = s => (s || '').trim();
+  const roleOf = el => el.getAttribute('role') || ({A:'link', BUTTON:'button', TEXTAREA:'textbox', SELECT:'combobox', INPUT:({button:'button',submit:'button',reset:'button',checkbox:'checkbox',radio:'radio'}[el.type] || 'textbox')})[el.tagName] || (el.isContentEditable ? 'textbox' : el.tagName.toLowerCase());
+  // The accessible name in the order the browser computes it: the elements
+  // aria-labelledby names, aria-label, a <label>, then the hint or alternative
+  // text, the content (never for a field, whose content is its value), and title.
+  const labelledBy = el => text((el.getAttribute('aria-labelledby') || '').split(/\s+/).map(id => id && document.getElementById(id)).filter(Boolean).map(node => node.textContent).join(' '));
+  const labelOf = el => text(el.labels && el.labels.length ? [...el.labels].map(label => label.textContent).join(' ') : '');
+  const holdsValue = el => ['textbox','searchbox','combobox','spinbutton','slider'].includes(roleOf(el));
+  const nameOf = el => (labelledBy(el) || text(el.getAttribute('aria-label')) || labelOf(el) || text(el.getAttribute('placeholder')) || text(el.getAttribute('aria-placeholder')) || text(el.getAttribute('alt')) || (holdsValue(el) ? '' : text(el.textContent)) || (el.tagName==='INPUT' && ['button','submit','reset'].includes(el.type) ? el.value : '') || text(el.getAttribute('title')) || '').slice(0, 120);
+  const candidates=[...document.querySelectorAll('button,a,input,select,textarea,[role],[onclick],[tabindex],[contenteditable]:not([contenteditable="false"])')];
   return {
     truncated:candidates.length>2000,
     title:document.title, page_focused:document.hasFocus(),
