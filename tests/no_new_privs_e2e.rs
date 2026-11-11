@@ -138,7 +138,6 @@ impl Server {
             assert!(Instant::now() < deadline, "server did not exit");
             std::thread::sleep(Duration::from_millis(50));
         }
-        std::fs::remove_dir_all(&self.home).expect("remove private HOME");
     }
 }
 
@@ -153,6 +152,7 @@ impl Drop for Server {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.home);
     }
 }
 

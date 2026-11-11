@@ -1,11 +1,15 @@
 #![allow(clippy::expect_used)]
 
-//! Real production-stdio regression for #852. NoNewPrivs makes the bwrap
-//! launched by pasta fail its UID map. Both retained and autocleaned workdirs
-//! must report that stderr and the existing namespace guidance to the caller.
+//! Production-stdio regression for #852. A bwrap that is refused its UID map
+//! ends the startup sandbox. Both retained and autocleaned workdirs must
+//! report that stderr and the namespace guidance to the caller. NoNewPrivs no
+//! longer causes the refusal (see `no_new_privs_e2e.rs`), so a stand-in `bwrap`
+//! first on PATH prints what the real one prints where nested user namespaces
+//! are forbidden; the server still starts its real pasta and systemd scope.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -93,17 +97,32 @@ fn refused_uid_map_is_reported(autoclean: bool) {
     let fixture = Fixture(root.join(format!("k852-{}-{mode}", std::process::id())));
     let home = fixture.0.join("home");
     let runtime = fixture.0.join("run");
+    let bin = fixture.0.join("bin");
     std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
     std::fs::create_dir_all(&runtime).expect("create private runtime root");
+    std::fs::create_dir_all(&bin).expect("create stand-in directory");
+    let bwrap = bin.join("bwrap");
+    std::fs::write(
+        &bwrap,
+        format!("#!/bin/sh\necho '{UID_MAP_REFUSAL}' >&2\nexit 1\n"),
+    )
+    .expect("write stand-in bwrap");
+    std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755))
+        .expect("make stand-in executable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH is set")
+    );
     let server = std::env::var_os("KWIN_MCP_E2E_SERVER")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_kwin-mcp").into());
-    let mut command = Command::new("setpriv");
-    command.args(["--no-new-privs", "--"]).arg(server);
+    let mut command = Command::new(server);
     command.arg("--no-viewer");
     if autoclean {
         command.arg("--autoclean");
     }
     let mut child = command
+        .env("PATH", path)
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("XDG_STATE_HOME", home.join(".state"))
@@ -119,7 +138,7 @@ fn refused_uid_map_is_reported(autoclean: bool) {
             std::fs::File::create(fixture.0.join("server.stderr")).expect("create stderr log"),
         ))
         .spawn()
-        .expect("spawn real kwin-mcp under NoNewPrivs");
+        .expect("spawn kwin-mcp");
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("server stdout");
     let (sender, responses) = mpsc::channel();
@@ -189,8 +208,9 @@ fn refused_uid_map_is_reported(autoclean: bool) {
         "{response}"
     );
     let guidance = data["guidance"].as_str().expect("structured guidance");
-    assert!(guidance.contains("NoNewPrivs: 1"), "{guidance}");
-    assert!(guidance.contains("systemd-run --user"), "{guidance}");
+    for fact in ["uid_map:", "NoNewPrivs:", "systemd-run --user"] {
+        assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
+    }
     assert!(data["input_log"].is_string(), "{response}");
 
     let stopped = server.call(3, "session_stop", json!({"session_id":session}));
@@ -208,13 +228,13 @@ fn refused_uid_map_is_reported(autoclean: bool) {
 }
 
 #[test]
-#[ignore = "requires pasta, non-setuid bwrap, uinput, setpriv and systemd user D-Bus"]
+#[ignore = "requires pasta, uinput and systemd user D-Bus"]
 fn a_refused_uid_map_is_reported_without_autoclean() {
     refused_uid_map_is_reported(false);
 }
 
 #[test]
-#[ignore = "requires pasta, non-setuid bwrap, uinput, setpriv and systemd user D-Bus"]
+#[ignore = "requires pasta, uinput and systemd user D-Bus"]
 fn a_refused_uid_map_is_reported_with_autoclean() {
     refused_uid_map_is_reported(true);
 }

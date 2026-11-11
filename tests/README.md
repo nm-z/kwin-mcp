@@ -50,9 +50,10 @@ KWIN_MCP_E2E=1 cargo test --test no_new_privs_e2e -- --ignored --test-threads=1
 cargo test --test startup_uid_map_e2e -- --ignored --test-threads=1 --nocapture
 ```
 
-These production-stdio cases run the real server, pasta and non-setuid bwrap
-under `setpriv --no-new-privs`. They require uinput access and the host's systemd
-user D-Bus. Both leave `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` unset to
+These production-stdio cases run the real server and pasta with a stand-in
+`bwrap` that prints the refusal the real one prints where nested user
+namespaces are forbidden (`NoNewPrivs` alone no longer causes one). They
+require uinput access and the host's systemd user D-Bus. Both leave `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` unset to
 exercise the validated host fallback from the issue.
 
 The default mode must return the actual UID-map refusal, structured stderr and
