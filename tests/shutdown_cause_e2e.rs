@@ -20,7 +20,10 @@ struct Server {
 fn start_server() -> Server {
     let home = std::env::temp_dir().join(format!("kwin-mcp-shutdown-cause-{}", std::process::id()));
     std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
+    // `KWIN_MCP_E2E_SERVER` names another server binary.
+    let server = std::env::var_os("KWIN_MCP_E2E_SERVER")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_kwin-mcp").into());
+    let mut child = Command::new(server)
         .args(["--no-viewer"])
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
@@ -123,5 +126,13 @@ fn sigterm_is_reported_as_sigterm() {
     assert!(
         stderr.contains("shutdown: SIGTERM"),
         "stderr did not name the cause:\n{stderr}"
+    );
+    // The sender is named too: this test process (#867, #868).
+    assert!(
+        stderr.contains(&format!(
+            "shutdown: SIGTERM from PID {} (",
+            std::process::id()
+        )),
+        "stderr did not name the sender:\n{stderr}"
     );
 }

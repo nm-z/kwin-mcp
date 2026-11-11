@@ -3849,33 +3849,35 @@ fn user_namespace_guidance(stderr: &str, facts: &UserNamespaceFacts) -> Option<S
         })
 }
 
-fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> McpError {
+/// The last `limit` bytes of the session's stderr, and whether the log is
+/// longer. It lives in the workdir's disk twin, which every teardown removes,
+/// so whoever reports a failure reads it before cleaning up.
+fn sandbox_log_tail(path: &Path, limit: u64) -> std::io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandbox stderr is not a regular file",
+        ));
+    }
+    let length = metadata.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(limit)))?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), length > limit))
+}
+
+fn preserve_startup_sandbox_diagnostics(mut error: McpError, workdir: &Path) -> McpError {
     const DIAGNOSTIC_LIMIT: u64 = 16 * 1024;
 
     let path = session_disk_path(workdir).join("sandbox.log");
-    let diagnostic = (|| -> std::io::Result<(String, bool)> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "sandbox stderr is not a regular file",
-            ));
-        }
-        let length = metadata.len();
-        file.seek(SeekFrom::Start(length.saturating_sub(DIAGNOSTIC_LIMIT)))?;
-        let mut bytes = Vec::new();
-        file.take(DIAGNOSTIC_LIMIT).read_to_end(&mut bytes)?;
-        Ok((
-            String::from_utf8_lossy(&bytes).into_owned(),
-            length > DIAGNOSTIC_LIMIT,
-        ))
-    })();
+    let diagnostic = sandbox_log_tail(&path, DIAGNOSTIC_LIMIT);
     let (tail, truncated) = match diagnostic {
         Ok(diagnostic) => diagnostic,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return error,
@@ -6269,13 +6271,15 @@ impl SessionScope {
                             "MemoryCurrent",
                             "-p",
                             "ControlGroup",
+                            "-p",
+                            "LoadState",
                         ])
                         .output(),
                 )
             })
             .flatten()
             .and_then(Result::ok);
-        let properties: std::collections::BTreeMap<String, String> = output
+        let mut properties: std::collections::BTreeMap<String, String> = output
             .filter(|output| output.status.success())
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
@@ -6287,6 +6291,15 @@ impl SessionScope {
                     .collect()
             })
             .unwrap_or_default();
+        // systemd forgets a scope once its last process is gone, and then
+        // answers with every property's default: `Result=success` for a unit
+        // it knows nothing about says nothing about how the session ended.
+        if properties
+            .get("LoadState")
+            .is_some_and(|state| state != "loaded")
+        {
+            properties.retain(|name, _| name == "LoadState");
+        }
         let events = properties
             .get("ControlGroup")
             .filter(|path| !path.is_empty())
@@ -6345,6 +6358,156 @@ impl SessionScope {
             high_events,
         })
     }
+}
+
+/// How much of the session's stderr a death record keeps: its last bytes.
+const DEATH_LOG_TAIL_BYTES: u64 = 2048;
+/// How much of that tail the lifecycle record's one-line detail repeats.
+const DEATH_DETAIL_LOG_CHARS: usize = 300;
+/// The reaper looks at every session once a second, so a compositor exit at
+/// least this much older than the moment its sandbox was found gone came first.
+const EXIT_ORDER_MARGIN: Duration = Duration::from_secs(3);
+/// The process a session's scope starts, whose exit status is the sandbox's:
+/// pasta, or this binary holding the network namespace under no_new_privs.
+const SANDBOX_TOP_PASTA: &str = "pasta";
+const SANDBOX_TOP_HOLDER: &str = "kwin-mcp --netns-holder";
+
+fn signal_label(signal: i32) -> String {
+    nix::sys::signal::Signal::try_from(signal).map_or_else(
+        |_| format!("signal {signal}"),
+        |name| format!("{name} (signal {signal})"),
+    )
+}
+
+/// Which of the compositor and the sandbox ended first, and what the sandbox's
+/// exit status says about why. `kwin_exit` is the status the entrypoint wrote
+/// when kwin_wayland ended and how long before the sandbox was found gone.
+fn sandbox_exit_summary(
+    top_process: &str,
+    status: std::process::ExitStatus,
+    kwin_exit: Option<(&str, Duration)>,
+) -> (&'static str, String) {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (status.code(), status.signal()) {
+        (_, Some(signal)) => format!("was killed by {}", signal_label(signal)),
+        (Some(code), None) => format!("exited with status {code}"),
+        (None, None) => format!("ended with {status}"),
+    };
+    let (first, order) = match kwin_exit {
+        Some((kwin, age)) if age >= EXIT_ORDER_MARGIN => (
+            "kwin_wayland",
+            format!(
+                "kwin_wayland exited first, with status {kwin}, {} s before the sandbox was found gone; the sandbox's top process ({top_process}) {ended}",
+                age.as_secs()
+            ),
+        ),
+        Some((kwin, _)) => (
+            "together",
+            format!(
+                "kwin_wayland (status {kwin}) and the sandbox's top process ({top_process}, which {ended}) ended within {} s of each other",
+                EXIT_ORDER_MARGIN.as_secs()
+            ),
+        ),
+        None => (
+            "sandbox_top_process",
+            format!(
+                "the sandbox's top process ({top_process}) {ended} while kwin_wayland was still running"
+            ),
+        ),
+    };
+    let cause = match (status.code(), status.signal()) {
+        // The entrypoint also returns 0 when its command pipe closes, but
+        // this server holds that pipe open for as long as the session lives.
+        (Some(0), None) if top_process == SANDBOX_TOP_PASTA && kwin_exit.is_none() => {
+            ". pasta exits with status 0 when it receives SIGTERM or SIGQUIT, and this server still held the session's command pipe, so the session was ended from outside this server: by a signal sent to its processes, or by its systemd scope being stopped".to_owned()
+        }
+        (Some(code), None) if code > netns_holder::SIGNAL_EXIT_BASE => format!(
+            ". Status {code} is {} plus a signal number: the sandbox's bwrap was killed by {}",
+            netns_holder::SIGNAL_EXIT_BASE,
+            signal_label(code - netns_holder::SIGNAL_EXIT_BASE)
+        ),
+        (_, Some(nix::libc::SIGKILL)) => {
+            ". SIGKILL comes from the kernel's out-of-memory killer or from another process".to_owned()
+        }
+        _ => String::new(),
+    };
+    (first, format!("{order}{cause}"))
+}
+
+/// What is left of a sandbox that ended on its own, read before teardown
+/// removes it: which process ended first, the compositor's own exit status and
+/// the last lines of the session's log. These go into the death record, which
+/// every later call for the session returns (#868).
+fn sandbox_exit_evidence(
+    status: std::process::ExitStatus,
+    workdir: &Path,
+    log: &Path,
+    top_process: &str,
+    now: std::time::SystemTime,
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::os::unix::process::ExitStatusExt;
+    let kwin_exit_file = workdir.join(KWIN_EXIT_FILE);
+    let kwin_status = std::fs::read_to_string(&kwin_exit_file)
+        .ok()
+        .map(|text| text.trim().chars().take(16).collect::<String>());
+    let kwin_age = std::fs::metadata(&kwin_exit_file)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(|written| now.duration_since(written).unwrap_or_default());
+    let kwin_exit = kwin_status.as_deref().zip(kwin_age);
+    let (first, summary) = sandbox_exit_summary(top_process, status, kwin_exit);
+    let mut evidence = serde_json::Map::new();
+    let mut put = |key: &str, value: serde_json::Value| {
+        evidence.insert(key.to_owned(), value);
+    };
+    put("exit_code", serde_json::json!(status.code()));
+    put("exit_signal", serde_json::json!(status.signal()));
+    put("sandbox_top_process", serde_json::json!(top_process));
+    put("ended_first", serde_json::json!(first));
+    put("kwin_exit_status", serde_json::json!(kwin_status));
+    put(
+        "kwin_exited_seconds_before_detection",
+        serde_json::json!(kwin_age.map(|age| age.as_secs())),
+    );
+    put("exit_summary", serde_json::json!(summary));
+    put(
+        "session_ended_at_unix_seconds",
+        serde_json::json!(
+            now.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+    );
+    match sandbox_log_tail(log, DEATH_LOG_TAIL_BYTES) {
+        Ok((tail, truncated)) => {
+            put("sandbox_log_tail", serde_json::json!(tail.trim()));
+            put("sandbox_log_truncated", serde_json::json!(truncated));
+        }
+        Err(error) => put("sandbox_log_error", serde_json::json!(error.to_string())),
+    }
+    evidence
+}
+
+/// The exit summary of a dead session, as the part of an error message that
+/// follows the reason. Empty for a session that did not die by itself.
+fn death_summary_note(death: &serde_json::Value) -> String {
+    death["exit_summary"]
+        .as_str()
+        .map_or_else(String::new, |summary| format!(": {summary}"))
+}
+
+/// The one-line detail a dead session's lifecycle record keeps: the exit
+/// summary and the end of the sandbox log.
+fn death_detail(death: &serde_json::Value) -> Option<String> {
+    let summary = death["exit_summary"].as_str()?;
+    let log = death["sandbox_log_tail"].as_str().unwrap_or_default();
+    let skipped = log.chars().count().saturating_sub(DEATH_DETAIL_LOG_CHARS);
+    let log: String = log.chars().skip(skipped).collect();
+    Some(if log.trim().is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}. Sandbox log ended: {}", log.trim())
+    })
 }
 
 const SESSION_MEMORY_PSI_WARNING_PERCENT: f64 = 10.0;
@@ -6922,6 +7085,9 @@ struct KwinMcp {
     pending_cleanup: Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// Launches whose launch_app call returned before their window mapped.
     launches: Arc<std::sync::Mutex<LaunchLedger>>,
+    /// The cleanup of a stop that answered before it had ended. The next
+    /// session_stop, or shutdown, waits for it here.
+    pending_stop: Arc<tokio::sync::Mutex<Option<PendingStop>>>,
     display: DisplayConfig,
     /// Set for a session a `--listen` peer started: its viewer window is on
     /// the peer's machine, and viewer_open takes the peer's frame socket here.
@@ -7212,15 +7378,24 @@ impl KwinMcp {
     }
 
     fn record_lifecycle(&self, state: &str, reason: &str, workdir_cleanup: &str) {
-        let ended_at = self
-            .death_record()
+        let death = self.death_record();
+        let ended_at = death
+            .as_ref()
             .and_then(|record| record["session_ended_at_unix_seconds"].as_u64());
+        // A session its server stopped on the way out names why the server
+        // exited; one whose sandbox ended by itself names how.
+        let detail = if state == SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED {
+            shutdown_cause().map(str::to_owned)
+        } else {
+            death.as_ref().and_then(death_detail)
+        };
         match append_session_lifecycle_event(
             &self.session_id,
             state,
             reason,
             workdir_cleanup,
             ended_at,
+            detail.as_deref(),
         ) {
             Ok(()) => eprintln!(
                 "session lifecycle: session_id={} state={state} reason={reason}",
@@ -7280,8 +7455,30 @@ impl KwinMcp {
             }
         };
         let scope = session.scope.clone();
-        let diagnostic = tokio::task::spawn_blocking(move || scope.diagnose(status)).await
-            .unwrap_or_else(|error| serde_json::json!({"status":"dead", "reason":"sandbox_exited", "diagnostic_error":error.to_string()}));
+        let workdir = session.host_xdg_dir.clone();
+        // Teardown below removes the sandbox log and the workdir's files, so
+        // what they say about the exit is read into the death record first.
+        let diagnostic = tokio::task::spawn_blocking(move || {
+            let mut diagnostic = scope.diagnose(status);
+            let top_process = if no_new_privs() {
+                SANDBOX_TOP_HOLDER
+            } else {
+                SANDBOX_TOP_PASTA
+            };
+            let evidence = sandbox_exit_evidence(
+                status,
+                &workdir,
+                &session_disk_path(&workdir).join("sandbox.log"),
+                top_process,
+                std::time::SystemTime::now(),
+            );
+            if let Some(fields) = diagnostic.as_object_mut() {
+                fields.extend(evidence);
+            }
+            diagnostic
+        })
+        .await
+        .unwrap_or_else(|error| serde_json::json!({"status":"dead", "reason":"sandbox_exited", "diagnostic_error":error.to_string()}));
         self.set_death(diagnostic.clone());
         let stopped = guard.take();
         drop(guard);
@@ -7289,7 +7486,10 @@ impl KwinMcp {
             // The sandbox is already gone. No browser can flush to the
             // mediator, and this cleanup must survive cancellation of a tool
             // or of the reaper itself during transport shutdown.
-            let _ = tokio::task::spawn_blocking(move || teardown(session)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                teardown(session, &StopProgress::default())
+            })
+            .await;
         }
         eprintln!("session died: {}: {diagnostic}", self.session_id);
         Some(diagnostic)
@@ -7376,6 +7576,7 @@ impl KwinMcp {
             startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             pending_cleanup: Arc::new(std::sync::Mutex::new(None)),
             launches: Arc::default(),
+            pending_stop: Arc::default(),
             display,
             frame_sockets: None,
         }
@@ -7693,6 +7894,12 @@ impl KwinMcp {
             .await;
         if let Err(error) = &gate {
             eprintln!("shutdown: {}; cleaning up without it", error.message);
+        }
+        // A stop whose cleanup outlasted its caller's limit finishes first:
+        // it owns the session's processes and the workdir's removal.
+        if let Some(stop) = self.pending_stop.lock().await.take() {
+            eprintln!("shutdown: waiting for the cleanup of a stopped session");
+            let _ = stop.outcome.await;
         }
         if let Some(dir) = self.workdir.owned() {
             eprintln!("shutdown: autoclean owns {}", dir.display());
@@ -8464,15 +8671,180 @@ impl WorkdirOwnership {
     }
 }
 
-/// Teardown signals and reaps processes with bounded sleeps; keep that off the
-/// async workers that answer other MCP requests. Browsers flush before the
-/// session-local wallet and sandbox stop; nothing on the host is touched.
-async fn teardown_blocking(mut sess: Session) -> TeardownReport {
-    let kwin_windows_closed = request_kwin_browser_close(&sess).await;
-    let cdp_close_attempted = request_cdp_browser_close(&sess).await;
+/// The longest `session_stop` takes to answer (#899). A stop normally ends in
+/// a fraction of a second; a stopped compositor, a browser that does not exit
+/// or a saturated disk used to stretch it past a minute with nothing said.
+/// Within the limit it now answers that the session stopped, or that it
+/// stopped and which part of the cleanup is still running.
+const SESSION_STOP_LIMIT: Duration = Duration::from_secs(30);
+/// The part of that limit kept for ending the session's processes and
+/// deleting its files. The graceful part before it, in which browsers close
+/// and flush their cookies, is given up when only this much is left.
+const STOP_FORCED_RESERVE: Duration = Duration::from_secs(15);
+/// How long KWin gets to close the browser windows. It answers in
+/// milliseconds; a compositor that does not is killed with the sandbox.
+const STOP_KWIN_CLOSE_LIMIT: Duration = Duration::from_secs(3);
+const STOP_WALLET_LIMIT: Duration = Duration::from_secs(2);
+/// A stop that took at least this long lists its stages in its answer.
+const SLOW_STOP_REPORT: Duration = Duration::from_secs(2);
+
+const STAGE_KWIN_CLOSE: &str = "asking KWin to close browser windows";
+const STAGE_CDP_CLOSE: &str = "asking browsers to close through CDP";
+const STAGE_BROWSER_EXIT: &str = "waiting for browsers to exit and flush cookies";
+const STAGE_WALLET: &str = "closing the session's wallet and keyring";
+const STAGE_VIEWER: &str = "closing the viewer";
+const STAGE_SCOPE: &str = "stopping the session's scope";
+const STAGE_SANDBOX: &str = "ending the sandbox processes";
+const STAGE_SCOPE_EXIT: &str = "waiting for the scope to empty";
+const STAGE_PROXIES: &str = "ending the session's D-Bus proxies";
+const STAGE_COOKIES: &str = "saving browser cookies";
+const STAGE_STORAGE: &str = "deleting the session's overlay and runtime files";
+const STAGE_WORKDIR: &str = "deleting the session workdir";
+
+/// One finished stage of a teardown and how long it took.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct StopStage {
+    stage: &'static str,
+    ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[derive(Default)]
+struct StopProgressState {
+    finished: Vec<StopStage>,
+    running: Option<(&'static str, std::time::Instant)>,
+}
+
+/// Where a teardown is and what each stage before cost. The stop that started
+/// it reads this when its time is up, so its answer names the stage that is
+/// still running; every stage's time is logged as it ends.
+#[derive(Default)]
+struct StopProgress {
+    state: std::sync::Mutex<StopProgressState>,
+}
+
+impl StopProgress {
+    fn state(&self) -> std::sync::MutexGuard<'_, StopProgressState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn close(state: &mut StopProgressState, note: Option<String>) {
+        let Some((stage, since)) = state.running.take() else {
+            return;
+        };
+        let ms = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match &note {
+            Some(note) => eprintln!("teardown: {stage}: {ms} ms ({note})"),
+            None => eprintln!("teardown: {stage}: {ms} ms"),
+        }
+        state.finished.push(StopStage { stage, ms, note });
+    }
+    /// Ends the running stage and starts `stage`.
+    fn begin(&self, stage: &'static str) {
+        let mut state = self.state();
+        Self::close(&mut state, None);
+        state.running = Some((stage, std::time::Instant::now()));
+    }
+    /// Ends the running stage, with what went wrong in it.
+    fn end_with(&self, note: impl Into<String>) {
+        Self::close(&mut self.state(), Some(note.into()));
+    }
+    fn end(&self) {
+        Self::close(&mut self.state(), None);
+    }
+    fn stages(&self) -> Vec<StopStage> {
+        self.state().finished.clone()
+    }
+    /// The stage that is running and for how long.
+    fn running(&self) -> Option<(&'static str, Duration)> {
+        self.state()
+            .running
+            .map(|(stage, since)| (stage, since.elapsed()))
+    }
+}
+
+/// How the cleanup of a stop ended.
+struct StopOutcome {
+    /// Whether a running desktop was torn down, or a handle only cleared.
+    teardown: bool,
+    cookie_errors: Vec<String>,
+    /// Processes that were killed and had not left the session's scope when
+    /// the bounded wait for them ended.
+    processes_exiting: Option<serde_json::Value>,
+    /// The handle's terminal status when the cleanup ended.
+    recorded: String,
+    /// The workdir that was removed, if one was owned; or the one that is
+    /// still there and why.
+    removed: Result<Option<PathBuf>, (PathBuf, String)>,
+    terminal: Option<serde_json::Value>,
+}
+
+/// The cleanup of a stop, running by itself. `session_stop` waits for it up
+/// to its limit and leaves it with the handle when the limit comes first.
+struct PendingStop {
+    outcome: tokio::sync::oneshot::Receiver<StopOutcome>,
+    progress: Arc<StopProgress>,
+}
+
+/// The answer of a stop whose limit came while its cleanup was still running:
+/// what is unfinished, and what that means for the session's processes.
+fn stop_pending_report(
+    progress: &StopProgress,
+    session_status: &str,
+    elapsed: Duration,
+) -> (String, serde_json::Value) {
+    let (stage, running) = progress
+        .running()
+        .unwrap_or(("finishing", Duration::ZERO));
+    let processes = if matches!(stage, STAGE_COOKIES | STAGE_STORAGE | STAGE_WORKDIR) {
+        "Every process of the session has ended; what is left is deleting its files, which a busy disk slows down."
+    } else {
+        "The session's processes were told to end, and those that have not are being killed."
+    };
+    let message = format!(
+        "session {session_status}, but its cleanup has not finished after {} s: {stage} has been running for {:.1} s. {processes} The cleanup goes on by itself; call session_stop again to learn how it ended and to clear the handle.",
+        elapsed.as_secs(),
+        running.as_secs_f64(),
+    );
+    let data = serde_json::json!({
+        "status": "cleanup_pending",
+        "session_status": session_status,
+        "cookie_errors": [],
+        "unfinished": {
+            "stage": stage,
+            "running_ms": u64::try_from(running.as_millis()).unwrap_or(u64::MAX),
+        },
+        "stages": progress.stages(),
+        "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "limit_seconds": SESSION_STOP_LIMIT.as_secs(),
+    });
+    (message, data)
+}
+
+/// The graceful part of a teardown: browsers are asked to close and given
+/// time to flush their cookies while the compositor, the network and the
+/// wallet still run. Each stage is bounded; nothing on the host is touched.
+async fn close_session_apps(sess: &mut Session, progress: &StopProgress) -> Vec<String> {
+    progress.begin(STAGE_KWIN_CLOSE);
+    let kwin_windows_closed =
+        match tokio::time::timeout(STOP_KWIN_CLOSE_LIMIT, request_kwin_browser_close(sess)).await {
+            Ok(closed) => closed,
+            Err(_) => {
+                progress.end_with(format!(
+                    "KWin did not answer within {} s; the compositor may be stopped or blocked",
+                    STOP_KWIN_CLOSE_LIMIT.as_secs()
+                ));
+                0
+            }
+        };
+    progress.begin(STAGE_CDP_CLOSE);
+    let cdp_close_attempted = request_cdp_browser_close(sess).await;
     let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
     let sandbox_pid = sess.sandbox_child.id();
-    let mut cookie_errors = match tokio::task::spawn_blocking(move || {
+    progress.begin(STAGE_BROWSER_EXIT);
+    let cookie_errors = match tokio::task::spawn_blocking(move || {
         close_session_browsers(sandbox_pid, graceful_close_attempted)
     })
     .await
@@ -8484,13 +8856,33 @@ async fn teardown_blocking(mut sess: Session) -> TeardownReport {
             vec![message]
         }
     };
-    if let Some(wallet) = sess.wallet.take() {
-        let _ = tokio::time::timeout(Duration::from_secs(15), wallet.shutdown()).await;
+    if let Some(first) = cookie_errors.first() {
+        progress.end_with(first.clone());
     }
-    if let Some(secrets) = sess.secrets.take() {
-        let _ = tokio::time::timeout(Duration::from_secs(15), secrets.shutdown()).await;
+    let (wallet, secrets) = (sess.wallet.take(), sess.secrets.take());
+    if wallet.is_some() || secrets.is_some() {
+        progress.begin(STAGE_WALLET);
+        let _ = tokio::time::timeout(STOP_WALLET_LIMIT, async {
+            if let Some(wallet) = wallet {
+                wallet.shutdown().await;
+            }
+            if let Some(secrets) = secrets {
+                secrets.shutdown().await;
+            }
+        })
+        .await;
     }
-    match tokio::task::spawn_blocking(move || teardown(sess)).await {
+    progress.end();
+    cookie_errors
+}
+
+/// A whole teardown, for the paths that have nobody waiting for an answer:
+/// expiry and server shutdown. Signalling and reaping processes sleeps, so
+/// that part stays off the async workers that answer other MCP requests.
+async fn teardown_blocking(mut sess: Session) -> TeardownReport {
+    let progress = Arc::new(StopProgress::default());
+    let mut cookie_errors = close_session_apps(&mut sess, &progress).await;
+    match tokio::task::spawn_blocking(move || teardown(sess, &progress)).await {
         Ok((mut teardown_errors, exiting)) => {
             cookie_errors.append(&mut teardown_errors);
             (cookie_errors, exiting)
@@ -8505,7 +8897,8 @@ async fn teardown_blocking(mut sess: Session) -> TeardownReport {
 }
 
 const CDP_BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// How long a browser that was signalled gets to exit and flush its cookies.
+const BROWSER_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 const BROWSER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 async fn request_kwin_browser_close(sess: &Session) -> usize {
@@ -8949,30 +9342,57 @@ fn wait_for_scope_exit(unit: &str, directory: &Path, wait: Duration) -> Option<s
 /// the processes still leaving the session's scope.
 type TeardownReport = (Vec<String>, Option<serde_json::Value>);
 
-fn teardown(mut sess: Session) -> TeardownReport {
+/// Debug-only stand-in for a disk too busy to delete a session's files within
+/// a stop's limit: a thread sleep where the deletion starts.
+fn test_slow_storage() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(millis) = std::env::var("KWIN_MCP_TEST_STOP_STORAGE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    eprintln!("teardown: test storage delay of {millis}ms");
+    std::thread::sleep(Duration::from_millis(millis));
+}
+
+/// The forced part of a teardown: the session's processes are ended and its
+/// files deleted. It blocks, so it runs on a blocking thread; `progress`
+/// names the stage it is in for whoever waits.
+fn teardown(mut sess: Session, progress: &StopProgress) -> TeardownReport {
     let mut cookie_errors = std::mem::take(&mut sess.cookie_errors);
     drop(sess.cdp_browser);
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(viewer) = sess.viewer_child.take() {
+        progress.begin(STAGE_VIEWER);
         terminate_child(viewer, false, "viewer");
     }
     drop(sess.sandbox_stdin);
     let scope_directory =
         session_scope_cgroup_directory(sess.sandbox_child.id(), &sess.scope.unit);
+    progress.begin(STAGE_SCOPE);
     sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
+    progress.begin(STAGE_SANDBOX);
     terminate_child(sess.sandbox_child, true, "sandbox");
+    progress.begin(STAGE_SCOPE_EXIT);
     let exiting = scope_directory
         .and_then(|directory| wait_for_scope_exit(&sess.scope.unit, &directory, SCOPE_EXIT_WAIT));
+    progress.begin(STAGE_PROXIES);
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
+    progress.begin(STAGE_COOKIES);
     if let Err(error) = kwin_mcp::browser_cookies::persist(&sess.cookie_roots) {
         let message = format!("{error:#}");
         eprintln!("teardown: browser cookies were not saved: {error:#}");
         cookie_errors.push(message);
     }
+    progress.begin(STAGE_STORAGE);
+    test_slow_storage();
     use std::os::unix::fs::PermissionsExt;
     for path in &sess.overlay_work_paths {
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -8987,6 +9407,7 @@ fn teardown(mut sess: Session) -> TeardownReport {
         eprintln!("teardown: retained {}: {error}", disk.display());
     }
     cleanup_stale_session_files(&sess.host_xdg_dir);
+    progress.end();
     (cookie_errors, exiting)
 }
 
@@ -14207,6 +14628,31 @@ struct SessionLifecycleRecord {
     reason: String,
     finished_at_unix_seconds: u64,
     workdir_cleanup: String,
+    /// What ended the session, in words: for a dead sandbox which process
+    /// ended first and the last lines of its log, for a server shutdown what
+    /// made the server exit. Older records and older servers have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// Longest `detail` a lifecycle record keeps. The log holds a megabyte of
+/// records for every server of this user.
+const SESSION_LIFECYCLE_DETAIL_MAX_CHARS: usize = 800;
+
+/// `text` on one line and within the lifecycle record's bound.
+fn lifecycle_detail(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= SESSION_LIFECYCLE_DETAIL_MAX_CHARS {
+        return Some(line);
+    }
+    let kept: String = line
+        .chars()
+        .take(SESSION_LIFECYCLE_DETAIL_MAX_CHARS)
+        .collect();
+    Some(format!("{kept}…"))
 }
 
 impl SessionLifecycleRecord {
@@ -14307,6 +14753,7 @@ fn append_session_lifecycle_event(
     reason: &str,
     workdir_cleanup: &str,
     ended_at: Option<u64>,
+    detail: Option<&str>,
 ) -> std::io::Result<()> {
     let finished_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -14319,12 +14766,18 @@ fn append_session_lifecycle_event(
         reason: reason.to_owned(),
         finished_at_unix_seconds: ended_at.unwrap_or(finished_at),
         workdir_cleanup: workdir_cleanup.to_owned(),
+        detail: detail.and_then(lifecycle_detail),
     }
     .validate()?;
     migrate_legacy_lifecycle_records()?;
     append_lifecycle_record(&current_session_lifecycle_log_path(), &record)?;
     if record.legacy_compatible() {
-        append_lifecycle_record(&session_lifecycle_log_path(), &record)?;
+        // Servers from before the detail existed read the legacy file.
+        let legacy = SessionLifecycleRecord {
+            detail: None,
+            ..record
+        };
+        append_lifecycle_record(&session_lifecycle_log_path(), &legacy)?;
     }
     Ok(())
 }
@@ -16574,7 +17027,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and its container processes. With --autoclean or --ttl (session_start reports workdir_removed_on_stop), remove the session workdir, including files the host wrote to host_shared_dir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. Waits up to 5 s for killed processes to leave the session's scope; processes_exiting lists any that are still exiting then (for example blocked in the kernel on a saturated disk) and why. They end by themselves and are not a leak. No-op if no session is running and nothing is left to clean.",
+        description = "Tear down the current session and its container processes. With --autoclean or --ttl (session_start reports workdir_removed_on_stop), remove the session workdir, including files the host wrote to host_shared_dir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. Waits up to 5 s for killed processes to leave the session's scope; processes_exiting lists any that are still exiting then (for example blocked in the kernel on a saturated disk) and why. They end by themselves and are not a leak. No-op if no session is running and nothing is left to clean. Answers within 30 seconds: a stop that took over 2 seconds lists its stages, and status cleanup_pending names the cleanup stage still running; call session_stop again then.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(
@@ -16582,6 +17035,8 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        let started = tokio::time::Instant::now();
+        let deadline = started + SESSION_STOP_LIMIT;
         // A start whose host call is still blocked holds the lifecycle gate until
         // that call returns. Its stop is recorded now: the handle stays until the
         // cleanup it owns runs, and a later session_stop clears it.
@@ -16608,50 +17063,47 @@ impl KwinMcp {
                 "session_stop",
             )
             .await?;
-        let plan = session_registry::stop_plan(&self.registry_phase().await);
-        let mut cookie_errors = Vec::new();
-        // Processes that were killed and had not left the session's scope
-        // when the bounded wait for them ended.
-        let mut processes_exiting = None;
-        match plan {
-            session_registry::StopPlan::Teardown => {
-                // The stopped status is recorded before the desktop is released,
-                // so a reader sees the desktop or its status, never neither.
-                let mut guard = self.session.write().await;
-                if guard.is_some() {
-                    self.set_death(serde_json::json!({
-                        "status": "stopped",
-                        "session_status": "stopped",
-                        "session_available_here": false,
-                        "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                        "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
-                        "session_ended_at_unix_seconds": unix_now(),
-                    }));
-                }
-                let stopped = guard.take();
-                drop(guard);
-                if let Some(sess) = stopped {
-                    if let Ok(mut clipboards) = self.clipboards.lock() {
-                        clipboards
-                            .entries
-                            .remove(&sess.host_xdg_dir.join("wayland-0"));
-                    }
-                    (cookie_errors, processes_exiting) = teardown_blocking(sess).await;
-                }
+        // A stop that answered before its cleanup had ended left it running;
+        // this call waits for that same cleanup and reports how it went.
+        let pending = self.pending_stop.lock().await.take();
+        let mut stop = match pending {
+            Some(stop) => stop,
+            None => self.begin_stop(deadline).await,
+        };
+        let outcome = match tokio::time::timeout_at(deadline, &mut stop.outcome).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
+                return Err(McpError::internal_error(
+                    "the session's cleanup worker ended without a result; call session_stop again to retry",
+                    Some(serde_json::json!({"reason": "cleanup_worker_failed", "retry_safe": true})),
+                ));
             }
-            session_registry::StopPlan::Clear => {}
-            session_registry::StopPlan::Abandon => self.set_death(terminal_record(
-                session_registry::STATUS_START_FAILED,
-                SESSION_LIFECYCLE_REASON_START_FAILED,
-            )),
-        }
-        let teardown = matches!(plan, session_registry::StopPlan::Teardown);
-        let removed = match self.workdir.remove() {
-            WorkdirCleanup::NothingOwned => None,
-            WorkdirCleanup::Removed(dir) => Some(dir),
-            WorkdirCleanup::Retained { dir, error } => {
-                self.record_terminal_cleanup("retained");
+            // The limit: say what is still running instead of staying silent.
+            // The handle keeps the cleanup, and the router keeps the handle.
+            Err(_) => {
                 let terminal = self.death_record();
+                let session_status = terminal
+                    .as_ref()
+                    .and_then(terminal_status)
+                    .unwrap_or(session_registry::STATUS_STOPPED);
+                let (message, data) =
+                    stop_pending_report(&stop.progress, session_status, started.elapsed());
+                eprintln!("session_stop: {message}");
+                *self.pending_stop.lock().await = Some(stop);
+                return Ok(structured_result(&peer, message, data).await);
+            }
+        };
+        let StopOutcome {
+            teardown,
+            cookie_errors,
+            processes_exiting,
+            recorded,
+            removed,
+            terminal,
+        } = outcome;
+        let removed = match removed {
+            Ok(removed) => removed,
+            Err((dir, error)) => {
                 // The Session is already torn down, so name that too: cleanup
                 // ownership is the only state left, and another session_stop is
                 // its retry.
@@ -16680,25 +17132,6 @@ impl KwinMcp {
                 ));
             }
         };
-        // The cleanup record is written unless a clear removed nothing and the
-        // handle's end is already recorded. Teardown always records its stop.
-        let recorded = self
-            .death_record()
-            .as_ref()
-            .and_then(terminal_status)
-            .map(str::to_owned)
-            .unwrap_or_default();
-        let cleanup = if removed.is_some() {
-            "removed"
-        } else {
-            "not_requested"
-        };
-        if teardown
-            || matches!(plan, session_registry::StopPlan::Abandon)
-            || session_registry::clear_writes_record(&recorded, removed.is_some())
-        {
-            self.record_terminal_cleanup(cleanup);
-        }
         let workdir_removed = removed.map(|dir| dir.display().to_string());
         let (status, subject) = if teardown {
             ("stopped", "session stopped".to_owned())
@@ -16715,17 +17148,180 @@ impl KwinMcp {
         {
             message = format!("{message}; {summary}");
         }
+        // A slow stop says where its time went.
+        let elapsed = started.elapsed();
+        let stages = if elapsed >= SLOW_STOP_REPORT {
+            stop.progress.stages()
+        } else {
+            Vec::new()
+        };
+        if let Some(slowest) = stages.iter().max_by_key(|stage| stage.ms) {
+            message = format!(
+                "{message}; this call took {:.1} s, the slowest stage of the stop being {} ({:.1} s{})",
+                elapsed.as_secs_f64(),
+                slowest.stage,
+                Duration::from_millis(slowest.ms).as_secs_f64(),
+                slowest
+                    .note
+                    .as_deref()
+                    .map_or_else(String::new, |note| format!(": {note}")),
+            );
+        }
         let mut stopped = serde_json::json!({
             "status": status,
             "workdir_removed": workdir_removed,
             "cookie_errors": cookie_errors,
             "processes_exiting": processes_exiting,
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "stages": stages,
         });
         drop_empty_fields(
             &mut stopped,
-            &["workdir_removed", "cookie_errors", "processes_exiting"],
+            &[
+                "workdir_removed",
+                "cookie_errors",
+                "processes_exiting",
+                "stages",
+            ],
         );
         Ok(structured_result(&peer, message, stopped).await)
+    }
+
+    /// Starts stopping this handle and returns its cleanup, which runs by
+    /// itself from here. A running desktop first gets the graceful part of
+    /// its teardown, which is over when only [`STOP_FORCED_RESERVE`] of the
+    /// caller's time is left; its processes are then ended and its files and
+    /// workdir deleted on a blocking thread.
+    async fn begin_stop(&self, deadline: tokio::time::Instant) -> PendingStop {
+        let plan = session_registry::stop_plan(&self.registry_phase().await);
+        let progress = Arc::new(StopProgress::default());
+        let mut cookie_errors = Vec::new();
+        let mut session = None;
+        match plan {
+            session_registry::StopPlan::Teardown => {
+                // The stopped status is recorded before the desktop is released,
+                // so a reader sees the desktop or its status, never neither.
+                let mut guard = self.session.write().await;
+                if guard.is_some() {
+                    self.set_death(serde_json::json!({
+                        "status": "stopped",
+                        "session_status": "stopped",
+                        "session_available_here": false,
+                        "reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                        "session_end_reason": SESSION_LIFECYCLE_REASON_SESSION_STOP,
+                        "session_ended_at_unix_seconds": unix_now(),
+                    }));
+                }
+                let stopped = guard.take();
+                drop(guard);
+                if let Some(mut sess) = stopped {
+                    if let Ok(mut clipboards) = self.clipboards.lock() {
+                        clipboards
+                            .entries
+                            .remove(&sess.host_xdg_dir.join("wayland-0"));
+                    }
+                    let graceful_until = deadline
+                        .checked_sub(STOP_FORCED_RESERVE)
+                        .unwrap_or(deadline);
+                    let graceful = close_session_apps(&mut sess, &progress);
+                    match tokio::time::timeout_at(graceful_until, graceful).await {
+                        Ok(errors) => cookie_errors = errors,
+                        Err(_) => {
+                            let message = format!(
+                                "browsers were not given their full time to close and flush cookies: {} s of the {} s stop limit are kept for ending the session's processes",
+                                STOP_FORCED_RESERVE.as_secs(),
+                                SESSION_STOP_LIMIT.as_secs()
+                            );
+                            progress.end_with(message.clone());
+                            cookie_errors.push(message);
+                        }
+                    }
+                    session = Some(sess);
+                }
+            }
+            session_registry::StopPlan::Clear => {}
+            session_registry::StopPlan::Abandon => self.set_death(terminal_record(
+                session_registry::STATUS_START_FAILED,
+                SESSION_LIFECYCLE_REASON_START_FAILED,
+            )),
+        }
+        let desktop_stopped = matches!(plan, session_registry::StopPlan::Teardown);
+        let abandon = matches!(plan, session_registry::StopPlan::Abandon);
+        let workdir = Arc::clone(&self.workdir);
+        let job_progress = Arc::clone(&progress);
+        let job = tokio::task::spawn_blocking(move || {
+            let report: TeardownReport = session
+                .map(|sess| teardown(sess, &job_progress))
+                .unwrap_or_default();
+            job_progress.begin(STAGE_WORKDIR);
+            let cleanup = workdir.remove();
+            job_progress.end();
+            (report, cleanup)
+        });
+        // The cleanup's end is recorded whether or not a caller still waits.
+        let (done, outcome) = tokio::sync::oneshot::channel();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let ((mut errors, exiting), cleanup) = match job.await {
+                Ok(finished) => finished,
+                Err(error) => {
+                    eprintln!("teardown: session cleanup worker failed: {error}");
+                    return;
+                }
+            };
+            cookie_errors.append(&mut errors);
+            let report = (cookie_errors, exiting);
+            let outcome = this.conclude_stop(desktop_stopped, abandon, report, cleanup);
+            let _ = done.send(outcome);
+        });
+        PendingStop { outcome, progress }
+    }
+
+    /// Records how a stop's cleanup ended and gathers what its answer says.
+    fn conclude_stop(
+        &self,
+        teardown: bool,
+        abandon: bool,
+        (cookie_errors, processes_exiting): TeardownReport,
+        cleanup: WorkdirCleanup,
+    ) -> StopOutcome {
+        let removed = match cleanup {
+            WorkdirCleanup::NothingOwned => Ok(None),
+            WorkdirCleanup::Removed(dir) => Ok(Some(dir)),
+            WorkdirCleanup::Retained { dir, error } => {
+                self.record_terminal_cleanup("retained");
+                Err((dir, error.to_string()))
+            }
+        };
+        // The cleanup record is written unless a clear removed nothing and the
+        // handle's end is already recorded. Teardown always records its stop.
+        let recorded = self
+            .death_record()
+            .as_ref()
+            .and_then(terminal_status)
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if let Ok(removed) = &removed {
+            let cleanup = if removed.is_some() {
+                "removed"
+            } else {
+                "not_requested"
+            };
+            if teardown
+                || abandon
+                || session_registry::clear_writes_record(&recorded, removed.is_some())
+            {
+                self.record_terminal_cleanup(cleanup);
+            }
+        }
+        StopOutcome {
+            teardown,
+            cookie_errors,
+            processes_exiting,
+            recorded,
+            removed,
+            terminal: self.death_record(),
+        }
     }
 
     #[rmcp::tool(
@@ -21529,6 +22125,10 @@ const SESSION_OWNERSHIP_NOTICE: &str = "This shared server may contain other age
 const SESSION_RESUME_GUIDANCE: &str = "Call session_list to inspect sessions owned by this kwin-mcp process. Use session_stop with an ID listed as dead, stopped, expired, or start_blocked to clear it. If the original process is no longer running and the saved ID is absent, call session_start without session_id to create a new desktop, relaunch the applications, and restore your task. The old desktop cannot be resumed here.";
 const SESSION_CONTROL_SOCKET_PREFIX: &str = "kwin-mcp-control-";
 const SESSION_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a forwarded call keeps trying to reach an owner that is running
+/// but not answering on its control socket, and how often it tries.
+const SESSION_CONTROL_RETRY_WAIT: Duration = Duration::from_secs(5);
+const SESSION_CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const LISTEN_ACCEPT_RETRY: Duration = Duration::from_millis(200);
 const SESSION_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a re-execution waits for requests to other machines to return
@@ -21726,8 +22326,14 @@ impl SessionControlSocket {
                             );
                             continue;
                         }
+                        // A server about to re-execute takes no forwarded call
+                        // it could not answer; the caller connects again.
+                        let Some(call) = router.control_calls.enter() else {
+                            continue;
+                        };
                         let router = router.clone();
                         connections.spawn(async move {
+                            let _call = call;
                             match router.serve(stream).await {
                                 Ok(service) => {
                                     if let Err(error) = service.waiting().await {
@@ -21752,6 +22358,69 @@ impl SessionControlSocket {
                 }
             }
         }
+    }
+}
+
+/// The forwarded calls a server is answering on its control socket. A
+/// re-execution waits for them, as it waits for its own client's calls, and
+/// lets no new one start: the image that would answer is about to be replaced,
+/// and a call cut off by the exec reached its caller as a lost connection.
+#[derive(Default)]
+struct ControlCalls {
+    /// Whether new calls are refused, and how many are running.
+    state: std::sync::Mutex<(bool, usize)>,
+    changed: tokio::sync::Notify,
+}
+
+/// One forwarded call's connection, counted until it is dropped.
+struct ControlCall(Arc<ControlCalls>);
+
+impl ControlCalls {
+    fn state(&self) -> std::sync::MutexGuard<'_, (bool, usize)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn enter(self: &Arc<Self>) -> Option<ControlCall> {
+        let mut state = self.state();
+        if state.0 {
+            return None;
+        }
+        state.1 += 1;
+        Some(ControlCall(Arc::clone(self)))
+    }
+    /// Refuses new calls and waits up to `limit` for the running ones.
+    /// Returns whether all of them ended.
+    async fn pause(&self, limit: Duration) -> bool {
+        self.state().0 = true;
+        self.idle(limit).await
+    }
+    /// Waits up to `limit` until no call is running; returns whether none is.
+    async fn idle(&self, limit: Duration) -> bool {
+        let idle = async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.state().1 == 0 {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(limit, idle).await.is_ok()
+    }
+    fn resume(&self) {
+        self.state().0 = false;
+    }
+}
+
+impl Drop for ControlCall {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        state.1 = state.1.saturating_sub(1);
+        drop(state);
+        self.0.changed.notify_waiters();
     }
 }
 
@@ -21922,29 +22591,44 @@ async fn forward_session_call_checked(
     if let Some(expected) = expected_owner {
         verify_attached_owner(server_pid, expected)?;
     }
-    let connected = tokio::time::timeout(SESSION_CONTROL_CONNECT_TIMEOUT, async {
-        let path = match session_control_socket_path(server_pid) {
-            Ok(path) => path,
-            Err(_) => return None,
-        };
-        let stream = match tokio::net::UnixStream::connect(path).await {
-            Ok(stream) => stream,
-            Err(_) => return None,
-        };
-        let credentials = match stream.peer_cred() {
-            Ok(credentials) => credentials,
-            Err(_) => return None,
-        };
-        let effective_uid = unsafe { nix::libc::geteuid() };
-        if credentials.uid() != effective_uid
-            || credentials.pid().and_then(|pid| u32::try_from(pid).ok()) != Some(server_pid)
-        {
-            return None;
-        }
+    let tool = request.name.to_string();
+    let connect = || {
+        tokio::time::timeout(SESSION_CONTROL_CONNECT_TIMEOUT, async {
+            let path = match session_control_socket_path(server_pid) {
+                Ok(path) => path,
+                Err(_) => return None,
+            };
+            let stream = match tokio::net::UnixStream::connect(path).await {
+                Ok(stream) => stream,
+                Err(_) => return None,
+            };
+            let credentials = match stream.peer_cred() {
+                Ok(credentials) => credentials,
+                Err(_) => return None,
+            };
+            let effective_uid = unsafe { nix::libc::geteuid() };
+            if credentials.uid() != effective_uid
+                || credentials.pid().and_then(|pid| u32::try_from(pid).ok()) != Some(server_pid)
+            {
+                return None;
+            }
 
-        rmcp::service::serve_client((), stream).await.ok()
-    })
-    .await;
+            rmcp::service::serve_client((), stream).await.ok()
+        })
+    };
+    // An owner that is re-executing itself for a new binary refuses forwarded
+    // calls until its new image listens again, which takes a moment. While
+    // the owner is running the connection is tried again, so the caller sees
+    // a slower call and not a session that seems to be gone (#867).
+    let began = std::time::Instant::now();
+    let mut connected = connect().await;
+    while !matches!(connected, Ok(Some(_)))
+        && began.elapsed() < SESSION_CONTROL_RETRY_WAIT
+        && kwin_mcp_server_running(server_pid)
+    {
+        tokio::time::sleep(SESSION_CONTROL_RETRY_INTERVAL).await;
+        connected = connect().await;
+    }
     let Ok(Some(mut service)) = connected else {
         return if expected_owner.is_some() {
             Err(session_attach_error(
@@ -21961,17 +22645,30 @@ async fn forward_session_call_checked(
     let result = match service.peer().call_tool(request).await {
         Ok(result) => Ok(Some(result)),
         Err(rmcp::service::ServiceError::McpError(error)) => Err(error),
-        Err(error) => Err(McpError::internal_error(
-            format!(
-                "session owner process {server_pid} lost the control connection while handling the request; inspect the session before retrying"
-            ),
-            Some(serde_json::json!({
-                "reason": "session_owner_connection_failed",
-                "retry_safe": false,
-                "session_server_pid": server_pid,
-                "transport_error": error.to_string(),
-            })),
-        )),
+        Err(error) => {
+            // An owner that shuts down answers first, so this is an owner
+            // that was killed, crashed or replaced its image mid-call.
+            let running = kwin_mcp_server_running(server_pid);
+            let message = if running {
+                format!(
+                    "session owner process {server_pid} lost the control connection while handling {tool} and is still running; the call may have taken effect, so inspect the session before retrying"
+                )
+            } else {
+                format!(
+                    "session owner process {server_pid} exited while handling {tool}, and its sessions ended with it. Call session_start without session_id and relaunch your applications."
+                )
+            };
+            Err(McpError::internal_error(
+                message,
+                Some(serde_json::json!({
+                    "reason": "session_owner_connection_failed",
+                    "retry_safe": false,
+                    "session_server_pid": server_pid,
+                    "session_server_running": running,
+                    "transport_error": error.to_string(),
+                })),
+            ))
+        }
     };
     let _ = tokio::time::timeout(SESSION_CONTROL_CLOSE_TIMEOUT, service.close()).await;
     result
@@ -22034,12 +22731,16 @@ fn unknown_session_error_with_lifecycle(id: &str) -> Result<McpError, McpError> 
                 _ => "session lifecycle transition",
             };
             error.message = format!(
-                "{} Session status is {status}. The previous server (PID {}) recorded {event_description} at Unix time {} (reason: {}, workdir cleanup: {}).",
+                "{} Session status is {status}. The previous server (PID {}) recorded {event_description} at Unix time {} (reason: {}, workdir cleanup: {}).{}",
                 error.message,
                 record.server_pid,
                 record.finished_at_unix_seconds,
                 record.reason,
                 record.workdir_cleanup,
+                record
+                    .detail
+                    .as_deref()
+                    .map_or_else(String::new, |detail| format!(" What ended it: {detail}.")),
             )
             .into();
             let mut data = match error.data.take() {
@@ -22273,6 +22974,8 @@ struct SessionRouter {
     /// Held while launch_app starts the session it found missing, so two such
     /// calls arriving together start one desktop between them.
     implicit_start: Arc<tokio::sync::Mutex<()>>,
+    /// Calls other local servers forwarded here that are still running.
+    control_calls: Arc<ControlCalls>,
 }
 
 /// The connection to one listener: the MCP client on its control socket, and
@@ -22749,6 +23452,7 @@ impl SessionRouter {
             listener_peer: false,
             frame_sockets: Arc::default(),
             implicit_start: Arc::default(),
+            control_calls: Arc::default(),
             attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
@@ -23508,15 +24212,43 @@ impl rmcp::ServerHandler for SessionRouter {
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
         self.tools().into_iter().find(|tool| tool.name == name)
     }
+    /// Every tool call, from the client or forwarded by another server. Once
+    /// this server has begun to exit, a call gets that as its answer: the
+    /// session it names is being stopped, and a client that only saw its
+    /// transport close could not tell what had happened to it (#867).
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: ToolContext,
     ) -> Result<CallToolResult, McpError> {
-        if request.name == "launch_app" {
-            return self.launch(request, context).await;
+        let tool = request.name.to_string();
+        let session_id = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(cause) = shutdown_cause() {
+            return Err(server_ending_error(&tool, session_id.as_deref(), cause));
         }
-        self.route_tool(request, context).await
+        // A start or stop under way owns processes and storage. It runs to
+        // its end, and shutdown waits for it at the session's lifecycle gate.
+        if matches!(tool.as_str(), "session_start" | "session_stop") {
+            return self.route_tool(request, context).await;
+        }
+        let call = async {
+            if request.name == "launch_app" {
+                return self.launch(request, context).await;
+            }
+            self.route_tool(request, context).await
+        };
+        tokio::select! {
+            biased;
+            cause = server_ending() => {
+                Err(server_ending_error(&tool, session_id.as_deref(), cause))
+            }
+            result = call => result,
+        }
     }
 }
 
@@ -23847,8 +24579,9 @@ impl SessionRouter {
             }
             return Err(McpError::internal_error(
                 format!(
-                    "Session {id} is {status}: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
+                    "Session {id} is {status}: {}{} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
                     death["reason"],
+                    death_summary_note(&death),
                     death["memory_max_bytes"]
                         .as_u64()
                         .map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
@@ -23972,7 +24705,7 @@ impl SessionRouter {
                         format!(". Typing report: {}. Some input may have arrived; do not retype blindly", error.message)
                     } else { String::new() };
                     McpError::internal_error(
-                        format!("Session {id} died: {}{original}; call session_stop then session_start without session_id to resume in a new desktop", death["reason"]),
+                        format!("Session {id} died: {}{}{original}; call session_stop then session_start without session_id to resume in a new desktop", death["reason"], death_summary_note(&death)),
                         Some(death),
                     )
                 }),
@@ -24210,6 +24943,28 @@ impl SessionStdio {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .paused = false;
         self.changed.notify_waiters();
+    }
+    /// Waits, for at most `limit`, until every request the client sent has
+    /// its answer written to it.
+    async fn answered(&self, limit: Duration) {
+        let all_answered = async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .incoming
+                    .is_empty()
+                {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        let _ = tokio::time::timeout(limit, all_answered).await;
     }
 }
 impl rmcp::transport::Transport<rmcp::RoleServer> for SessionStdio {
@@ -24704,6 +25459,12 @@ impl SessionRouter {
     ) -> anyhow::Result<()> {
         use std::os::fd::AsRawFd;
         wire.freeze().await;
+        if !self.control_calls.pause(REMOTE_HOLD_WAIT).await {
+            eprintln!(
+                "reload: calls forwarded by other servers still ran after {} s; re-executing without their answers",
+                REMOTE_HOLD_WAIT.as_secs()
+            );
+        }
         let mut retained = Vec::new();
         let mut saved = Vec::new();
         let mut cleanup = Vec::new();
@@ -24968,6 +25729,7 @@ async fn watch_reload(
                 .await
             {
                 wire.thaw();
+                router.control_calls.resume();
                 eprintln!("reload: re-execution failed: {error}");
             }
             binary = next;
@@ -25099,10 +25861,11 @@ async fn run_listener(
     let routers = SessionRouter::new(display);
     let (stop, _) = tokio::sync::watch::channel(false);
     let mut peers = tokio::task::JoinSet::new();
+    signal_sender::watch();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    loop {
+    let cause = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
@@ -25124,12 +25887,17 @@ async fn run_listener(
                     eprintln!("listen: peer task failed: {error}");
                 }
             }
-            _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
-            _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
-            _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
+            _ = sigterm.recv() => break signal_cause("SIGTERM", nix::libc::SIGTERM),
+            _ = sigint.recv() => break signal_cause("SIGINT", nix::libc::SIGINT),
+            _ = sighup.recv() => break signal_cause("SIGHUP", nix::libc::SIGHUP),
             Some(request) = process_commands.recv() => request.execute(),
         }
-    }
+    };
+    eprintln!("shutdown: {cause}");
+    // The peers' running calls are answered with the cause before their
+    // connections close.
+    begin_shutdown(cause);
+    tokio::time::sleep(LISTEN_SHUTDOWN_REPLY_WAIT).await;
     drop(listener);
     let _ = stop.send(true);
     // Session teardown still spawns helpers through the main thread.
@@ -25209,40 +25977,46 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
     ));
     let cancellation = service.cancellation_token();
     let reaper = tokio::spawn(shutdown.clone().reap());
+    signal_sender::watch();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    // Why the server is going away. It is logged, given to every call that is
+    // still running, and kept in the lifecycle record of each session stopped.
+    let mut cause;
     let waited = {
         let wait_future = service.waiting();
         tokio::pin!(wait_future);
         loop {
             tokio::select! {
-                result = &mut wait_future => break Some(result),
-                _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break None },
-                _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break None },
-                _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break None },
+                result = &mut wait_future => {
+                    // A host that respawns the server looks the same as a crash
+                    // from the client side, and every owned session goes with it.
+                    cause = match &result {
+                        Ok(reason) => quit_cause(reason),
+                        Err(error) => format!("the MCP service task failed: {error}"),
+                    };
+                    break Some(result);
+                },
+                _ = sigterm.recv() => { cause = signal_cause("SIGTERM", nix::libc::SIGTERM); break None },
+                _ = sigint.recv() => { cause = signal_cause("SIGINT", nix::libc::SIGINT); break None },
+                _ = sighup.recv() => { cause = signal_cause("SIGHUP", nix::libc::SIGHUP); break None },
                 result = wire.client.readable() => {
                     if let Err(error) = result { eprintln!("client lifetime watcher: {error}"); }
-                    eprintln!("shutdown: launching client exited; stopping owned session scopes");
+                    cause = "launching client exited; stopping owned session scopes".to_owned();
                     break None;
                 },
                 request = process_commands.recv() => match request {
                     Some(request) => request.execute(),
                     None => {
-                        eprintln!("shutdown: the process command channel closed");
+                        cause = "the process command channel closed".to_owned();
                         break None;
                     },
                 },
             }
         }
     };
-    // Say why the server is going away: a host that respawns it looks the same
-    // as a crash from the client side, and every owned session goes with it.
-    match &waited {
-        Some(Ok(reason)) => eprintln!("shutdown: {}", quit_cause(reason)),
-        Some(Err(error)) => eprintln!("shutdown: the MCP service task failed: {error}"),
-        None => {}
-    }
+    eprintln!("shutdown: {cause}");
     // Sessions on other machines end with this server's client, --keep-sessions
     // or not: closing the connections makes their listeners stop them.
     shutdown.remote.close().await;
@@ -25271,18 +26045,23 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
                             break;
                         }
                         Some(idle) if idle >= grace => {
+                            cause = format!(
+                                "the MCP client closed the connection and the kept sessions were idle for {} s, past --keep-sessions",
+                                idle.as_secs()
+                            );
                             eprintln!("shutdown: sessions idle for {} s, past --keep-sessions", idle.as_secs());
                             break;
                         }
                         Some(_) => {}
                     }
                 },
-                _ = sigterm.recv() => { eprintln!("shutdown: SIGTERM"); break },
-                _ = sigint.recv() => { eprintln!("shutdown: SIGINT"); break },
-                _ = sighup.recv() => { eprintln!("shutdown: SIGHUP"); break },
+                _ = sigterm.recv() => { cause = signal_cause("SIGTERM", nix::libc::SIGTERM); eprintln!("shutdown: {cause}"); break },
+                _ = sigint.recv() => { cause = signal_cause("SIGINT", nix::libc::SIGINT); eprintln!("shutdown: {cause}"); break },
+                _ = sighup.recv() => { cause = signal_cause("SIGHUP", nix::libc::SIGHUP); eprintln!("shutdown: {cause}"); break },
                 result = wire.client.readable() => {
                     if let Err(error) = result { eprintln!("client lifetime watcher: {error}"); }
-                    eprintln!("shutdown: launching client exited; stopping owned session scopes");
+                    cause = "launching client exited; stopping owned session scopes".to_owned();
+                    eprintln!("shutdown: {cause}");
                     break;
                 },
                 request = process_commands.recv() => match request {
@@ -25292,10 +26071,18 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
             }
         }
     }
-    if let Some(session_control) = session_control {
-        session_control.abort();
-        let _ = session_control.await;
+    // From here every call is answered with the cause. A client that is still
+    // there (the server was signalled, its client did not close) gets that
+    // answer for the calls it has running before its transport closes.
+    begin_shutdown(cause);
+    if waited.is_none() {
+        wire.answered(SHUTDOWN_REPLY_WAIT).await;
     }
+    // The same for calls other servers forwarded here: a connection ends when
+    // its server has read the answer. The control socket stays open while the
+    // sessions are stopped below, so a call forwarded meanwhile is answered
+    // with the cause as well.
+    shutdown.control_calls.idle(SHUTDOWN_REPLY_WAIT).await;
     drop(process_commands);
     if waited.is_none() {
         cancellation.cancel();
@@ -25305,10 +26092,236 @@ async fn run_server(restored: Option<ServerRestore>) -> Result<(), Box<dyn std::
     reaper.abort();
     let _ = reaper.await;
     shutdown.shutdown().await;
+    if let Some(session_control) = session_control {
+        session_control.abort();
+        let _ = session_control.await;
+    }
     if let Some(result) = waited {
         result?;
     }
     Ok(())
+}
+
+/// Who sent a signal that ends this server. A server that several unrelated
+/// processes lose at the same moment was not ended by its client, and the
+/// report of it (#867, #868) could only say that the sender was unknown.
+mod signal_sender {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+
+    /// The kernel's limit for a process name, with its terminator.
+    const NAME_BYTES: usize = 16;
+    /// "/proc/", a PID's ten digits, "/comm" and the terminator fit.
+    const PATH_BYTES: usize = 32;
+
+    /// The last sender of one watched signal, written by its handler.
+    struct Sender {
+        signal: i32,
+        seen: AtomicBool,
+        from_process: AtomicBool,
+        pid: AtomicI32,
+        uid: AtomicU32,
+        name_len: AtomicUsize,
+        name: [AtomicU8; NAME_BYTES],
+    }
+
+    impl Sender {
+        const fn new(signal: i32) -> Self {
+            Self {
+                signal,
+                seen: AtomicBool::new(false),
+                from_process: AtomicBool::new(false),
+                pid: AtomicI32::new(0),
+                uid: AtomicU32::new(0),
+                name_len: AtomicUsize::new(0),
+                name: [const { AtomicU8::new(0) }; NAME_BYTES],
+            }
+        }
+    }
+
+    static SENDERS: [Sender; 3] = [
+        Sender::new(nix::libc::SIGTERM),
+        Sender::new(nix::libc::SIGINT),
+        Sender::new(nix::libc::SIGHUP),
+    ];
+
+    /// The signal handler. A sender such as pkill is gone a moment after it
+    /// signalled, so its name is read here and not when the server gets to
+    /// log the shutdown. Everything called is async-signal-safe: atomics and
+    /// open, read and close; errno is put back.
+    fn record(sender: &Sender, info: &nix::libc::siginfo_t) {
+        let errno = nix::errno::Errno::last_raw();
+        sender.seen.store(true, Ordering::Relaxed);
+        // A positive code is a signal the kernel raised; it has no sender.
+        let from_process = info.si_code <= 0;
+        sender.from_process.store(from_process, Ordering::Relaxed);
+        if from_process {
+            // SAFETY: for a signal a process sent, the kernel filled these in.
+            let (pid, uid) = unsafe { (info.si_pid(), info.si_uid()) };
+            sender.pid.store(pid, Ordering::Relaxed);
+            sender.uid.store(uid, Ordering::Relaxed);
+            sender.name_len.store(0, Ordering::Relaxed);
+            let mut digits = [0u8; 10];
+            let mut count = 0;
+            let mut rest = pid;
+            while rest > 0 && count < digits.len() {
+                digits[count] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+                rest /= 10;
+                count += 1;
+            }
+            let mut path = [0u8; PATH_BYTES];
+            let name = b"/proc/"
+                .iter()
+                .chain(digits[..count].iter().rev())
+                .chain(b"/comm");
+            for (slot, byte) in path.iter_mut().zip(name) {
+                *slot = *byte;
+            }
+            // SAFETY: `path` is NUL-terminated, since it is longer than what
+            // was written and began zeroed; the buffer outlives the calls.
+            let descriptor = unsafe {
+                nix::libc::open(
+                    path.as_ptr().cast(),
+                    nix::libc::O_RDONLY | nix::libc::O_CLOEXEC,
+                )
+            };
+            if count > 0 && descriptor >= 0 {
+                let mut name = [0u8; NAME_BYTES];
+                // SAFETY: reads at most the buffer's length into it.
+                let read =
+                    unsafe { nix::libc::read(descriptor, name.as_mut_ptr().cast(), NAME_BYTES) };
+                let read = usize::try_from(read).unwrap_or(0).min(NAME_BYTES);
+                for (slot, byte) in sender.name.iter().zip(&name[..read]) {
+                    slot.store(*byte, Ordering::Relaxed);
+                }
+                sender.name_len.store(read, Ordering::Relaxed);
+            }
+            if descriptor >= 0 {
+                // SAFETY: closes the descriptor opened above.
+                unsafe { nix::libc::close(descriptor) };
+            }
+        }
+        nix::errno::Errno::set_raw(errno);
+    }
+
+    /// Starts recording the senders of SIGTERM, SIGINT and SIGHUP. Called just
+    /// before the server installs its own handlers for them, so that this
+    /// handler has run by the time the server sees the signal.
+    pub(crate) fn watch() {
+        for sender in &SENDERS {
+            // SAFETY: `record` calls only async-signal-safe functions.
+            let registered = unsafe {
+                signal_hook_registry::register_sigaction(sender.signal, move |info| {
+                    record(sender, info);
+                })
+            };
+            if let Err(error) = registered {
+                eprintln!(
+                    "signals: the sender of signal {} will not be named: {error}",
+                    sender.signal
+                );
+            }
+        }
+    }
+
+    /// "from PID 1234 (pkill, uid 1000)" for the last `signal` received, or
+    /// an empty string when nothing was recorded.
+    pub(crate) fn describe(signal: i32) -> String {
+        let recorded = SENDERS
+            .iter()
+            .position(|sender| sender.signal == signal && sender.seen.load(Ordering::Relaxed))
+            .and_then(|index| SENDERS.get(index));
+        let Some(sender) = recorded else {
+            return String::new();
+        };
+        if !sender.from_process.load(Ordering::Relaxed) {
+            return "from the kernel".to_owned();
+        }
+        let pid = sender.pid.load(Ordering::Relaxed);
+        let uid = sender.uid.load(Ordering::Relaxed);
+        if pid <= 0 {
+            return format!("from a process outside this PID namespace (uid {uid})");
+        }
+        let length = sender.name_len.load(Ordering::Relaxed).min(NAME_BYTES);
+        let name: Vec<u8> = sender.name[..length]
+            .iter()
+            .map(|byte| byte.load(Ordering::Relaxed))
+            .collect();
+        let name = String::from_utf8_lossy(&name).trim().to_owned();
+        if name.is_empty() {
+            format!("from PID {pid} (uid {uid}; the process had already exited)")
+        } else {
+            format!("from PID {pid} ({name}, uid {uid})")
+        }
+    }
+}
+
+/// Why this server is exiting, once it is. It ends every call still running
+/// and is named in the lifecycle record of each session the server stops, so
+/// a later caller of one of those sessions is told what ended it.
+static SHUTDOWN_CAUSE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SHUTDOWN_BEGAN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn shutdown_cause() -> Option<&'static str> {
+    SHUTDOWN_CAUSE.get().map(String::as_str)
+}
+
+/// Records why the server is exiting and ends the calls that are running.
+fn begin_shutdown(cause: String) -> &'static str {
+    let cause = SHUTDOWN_CAUSE.get_or_init(|| cause);
+    SHUTDOWN_BEGAN.notify_waiters();
+    cause
+}
+
+/// Returns the cause once the server has begun to exit.
+async fn server_ending() -> &'static str {
+    loop {
+        let began = SHUTDOWN_BEGAN.notified();
+        tokio::pin!(began);
+        began.as_mut().enable();
+        if let Some(cause) = shutdown_cause() {
+            return cause;
+        }
+        began.await;
+    }
+}
+
+/// How long an exiting server waits for the calls it just ended to be answered.
+const SHUTDOWN_REPLY_WAIT: Duration = Duration::from_secs(1);
+/// The same for a `--listen` server, whose peers' answers cross the network
+/// and are not counted: it waits this long before it closes their connections.
+const LISTEN_SHUTDOWN_REPLY_WAIT: Duration = Duration::from_millis(200);
+
+/// The answer to a call that an exiting server cannot finish or take. Without
+/// it the caller's client reports only that the transport closed (#867).
+fn server_ending_error(tool: &str, session_id: Option<&str>, cause: &str) -> McpError {
+    let server_pid = std::process::id();
+    let session = session_id.map_or_else(String::new, |id| format!(" for session {id}"));
+    let recovery = "A session ends with the server that owns it. Once the MCP host has started the server again, call session_start without session_id and relaunch your applications.";
+    McpError::internal_error(
+        format!(
+            "kwin-mcp process {server_pid} is shutting down ({cause}), so {tool}{session} was not completed and the sessions this server owns are being stopped. {recovery}"
+        ),
+        Some(serde_json::json!({
+            "reason": "server_shutting_down",
+            "shutdown_cause": cause,
+            "server_pid": server_pid,
+            "session_id": session_id,
+            "session_status": "stopping",
+            "session_available_here": false,
+            "retry_safe": false,
+            "recovery": recovery,
+        })),
+    )
+}
+
+/// The cause text for a signal, with its sender when the handler saw one.
+fn signal_cause(name: &str, signal: i32) -> String {
+    let sender = signal_sender::describe(signal);
+    if sender.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} {sender}")
+    }
 }
 
 fn quit_cause(reason: &rmcp::service::QuitReason) -> String {
@@ -28311,6 +29324,7 @@ mod viewer_and_scope_exit_tests {
             reason: SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN.to_owned(),
             finished_at_unix_seconds: 1_794_200_000,
             workdir_cleanup: "removed".to_owned(),
+            detail: None,
         };
         let (status, detail) = ended_session_viewer_state(Some(&record), Some(4242), Some(false))
             .unwrap_or_default();
@@ -28387,5 +29401,257 @@ mod viewer_and_scope_exit_tests {
         std::fs::remove_dir_all(&directory).map_err(|error| error.to_string())?;
         assert!(wait_for_scope_exit("kwin-mcp-1-1.scope", &directory, wait).is_none());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_end_report_tests {
+    use super::{
+        BROWSER_SHUTDOWN_GRACE, CDP_BROWSER_CLOSE_TIMEOUT, DEATH_LOG_TAIL_BYTES,
+        EXIT_ORDER_MARGIN, KWIN_EXIT_FILE, SANDBOX_TOP_HOLDER, SANDBOX_TOP_PASTA,
+        SESSION_LIFECYCLE_DETAIL_MAX_CHARS, SESSION_STOP_LIMIT, STAGE_KWIN_CLOSE, STAGE_SANDBOX,
+        STAGE_SCOPE, STAGE_STORAGE, STOP_FORCED_RESERVE, STOP_KWIN_CLOSE_LIMIT,
+        STOP_WALLET_LIMIT, SessionLifecycleRecord, StopProgress, death_detail,
+        death_summary_note, lifecycle_detail, sandbox_exit_evidence, sandbox_exit_summary,
+        server_ending_error, signal_sender, stop_pending_report,
+    };
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use std::time::Duration;
+
+    fn exited(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    // #868: the exit the report could not explain. pasta turns SIGTERM into
+    // status 0, which read as a clean exit of an apparently healthy desktop.
+    #[test]
+    fn status_0_from_pasta_while_kwin_runs_is_an_outside_termination() {
+        let (first, summary) = sandbox_exit_summary(SANDBOX_TOP_PASTA, exited(0), None);
+        assert_eq!(first, "sandbox_top_process");
+        assert!(
+            summary.starts_with(
+                "the sandbox's top process (pasta) exited with status 0 while kwin_wayland was still running"
+            ),
+            "{summary}"
+        );
+        assert!(summary.contains("SIGTERM or SIGQUIT"), "{summary}");
+        assert!(summary.contains("from outside this server"), "{summary}");
+        // The holder exits with bwrap's status, so its 0 says no such thing.
+        let (_, holder) = sandbox_exit_summary(SANDBOX_TOP_HOLDER, exited(0), None);
+        assert!(!holder.contains("SIGTERM"), "{holder}");
+    }
+
+    #[test]
+    fn the_compositor_ending_first_is_told_apart_from_the_sandbox() {
+        let (first, summary) = sandbox_exit_summary(
+            SANDBOX_TOP_PASTA,
+            exited(0),
+            Some(("139", Duration::from_secs(40))),
+        );
+        assert_eq!(first, "kwin_wayland");
+        assert!(
+            summary.starts_with("kwin_wayland exited first, with status 139, 40 s before"),
+            "{summary}"
+        );
+        assert!(!summary.contains("from outside this server"), "{summary}");
+        let (together, _) = sandbox_exit_summary(
+            SANDBOX_TOP_PASTA,
+            exited(0),
+            Some(("0", EXIT_ORDER_MARGIN - Duration::from_millis(1))),
+        );
+        assert_eq!(together, "together");
+    }
+
+    #[test]
+    fn a_signal_and_a_signal_status_are_named() {
+        let (_, killed) =
+            sandbox_exit_summary(SANDBOX_TOP_PASTA, ExitStatus::from_raw(nix::libc::SIGKILL), None);
+        assert!(killed.contains("was killed by SIGKILL (signal 9)"), "{killed}");
+        assert!(killed.contains("out-of-memory killer"), "{killed}");
+        let (_, relayed) = sandbox_exit_summary(SANDBOX_TOP_PASTA, exited(143), None);
+        assert!(
+            relayed.contains("Status 143 is 128 plus a signal number")
+                && relayed.contains("SIGTERM (signal 15)"),
+            "{relayed}"
+        );
+    }
+
+    // The log and the compositor's exit file are gone after teardown, so the
+    // death record must already hold what they said.
+    #[test]
+    fn evidence_keeps_the_log_tail_and_the_compositor_status() -> Result<(), String> {
+        let root = std::env::temp_dir().join(format!("kwin-mcp-exit-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let log = root.join("sandbox.log");
+        let filler = "x".repeat(usize::try_from(DEATH_LOG_TAIL_BYTES).unwrap_or(0));
+        std::fs::write(&log, format!("{filler}\nkwin_wayland: lost the GPU\nlast line\n"))
+            .map_err(|error| error.to_string())?;
+        let now = std::time::SystemTime::now();
+        let running = sandbox_exit_evidence(exited(0), &root, &log, SANDBOX_TOP_PASTA, now);
+        assert_eq!(running["ended_first"], "sandbox_top_process");
+        assert_eq!(running["kwin_exit_status"], serde_json::Value::Null);
+        assert_eq!(running["exit_code"], 0);
+        assert_eq!(running["sandbox_log_truncated"], true);
+        let tail = running["sandbox_log_tail"].as_str().unwrap_or_default();
+        assert!(tail.ends_with("kwin_wayland: lost the GPU\nlast line"), "{tail}");
+        assert!(
+            u64::try_from(tail.len()).unwrap_or(u64::MAX) <= DEATH_LOG_TAIL_BYTES,
+            "{}",
+            tail.len()
+        );
+
+        std::fs::write(root.join(KWIN_EXIT_FILE), "11\n").map_err(|error| error.to_string())?;
+        let later = now + Duration::from_secs(60);
+        let crashed = sandbox_exit_evidence(exited(0), &root, &log, SANDBOX_TOP_PASTA, later);
+        assert_eq!(crashed["ended_first"], "kwin_wayland");
+        assert_eq!(crashed["kwin_exit_status"], "11");
+        let detail = death_detail(&serde_json::Value::Object(crashed.clone()))
+            .ok_or("a dead session has a lifecycle detail")?;
+        assert!(detail.starts_with("kwin_wayland exited first, with status 11"), "{detail}");
+        assert!(
+            detail.contains(". Sandbox log ended: x")
+                && detail.ends_with("x\nkwin_wayland: lost the GPU\nlast line"),
+            "{detail}"
+        );
+        assert!(
+            death_summary_note(&serde_json::Value::Object(crashed))
+                .starts_with(": kwin_wayland exited first")
+        );
+
+        // A log that is already gone is said to be, and nothing else is lost.
+        let missing = sandbox_exit_evidence(
+            exited(0),
+            &root,
+            &root.join("absent.log"),
+            SANDBOX_TOP_PASTA,
+            now,
+        );
+        assert!(missing["sandbox_log_error"].is_string(), "{missing:?}");
+        assert!(missing["exit_summary"].is_string());
+        std::fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_lifecycle_detail_is_one_bounded_line_and_optional() -> Result<(), String> {
+        assert_eq!(lifecycle_detail(" \n "), None);
+        assert_eq!(
+            lifecycle_detail("first line\n  second\tline").as_deref(),
+            Some("first line second line")
+        );
+        let long = lifecycle_detail(&"y".repeat(SESSION_LIFECYCLE_DETAIL_MAX_CHARS * 2))
+            .ok_or("long text keeps a detail")?;
+        assert_eq!(long.chars().count(), SESSION_LIFECYCLE_DETAIL_MAX_CHARS + 1);
+
+        // Records written before the detail existed still parse, and a record
+        // without one is written as before.
+        let old = r#"{"session_id":"s7-1","server_pid":7,"state":"session_dead","reason":"sandbox_exited","finished_at_unix_seconds":5,"workdir_cleanup":"removed"}"#;
+        let parsed: SessionLifecycleRecord =
+            serde_json::from_str(old).map_err(|error| error.to_string())?;
+        assert!(parsed.detail.is_none());
+        assert_eq!(
+            serde_json::to_string(&parsed).map_err(|error| error.to_string())?,
+            old
+        );
+        let with_detail = SessionLifecycleRecord {
+            detail: Some("SIGTERM from PID 9 (pkill, uid 1000)".to_owned()),
+            ..parsed
+        };
+        let line = serde_json::to_string(&with_detail).map_err(|error| error.to_string())?;
+        assert!(line.contains(r#""detail":"SIGTERM from PID 9 (pkill, uid 1000)""#), "{line}");
+        Ok(())
+    }
+
+    // #867: what a call gets from a server that is exiting, in place of a
+    // transport that closes without a word.
+    #[test]
+    fn a_call_to_an_exiting_server_is_told_why_and_what_to_do() {
+        let error = server_ending_error(
+            "window_list",
+            Some("s3680185-1"),
+            "SIGTERM from PID 42 (pkill, uid 1000)",
+        );
+        let message = error.message.to_string();
+        assert!(message.contains("is shutting down (SIGTERM from PID 42 (pkill, uid 1000))"), "{message}");
+        assert!(message.contains("window_list for session s3680185-1 was not completed"), "{message}");
+        assert!(message.contains("call session_start without session_id"), "{message}");
+        let data = error.data.unwrap_or_default();
+        assert_eq!(data["reason"], "server_shutting_down");
+        assert_eq!(data["session_id"], "s3680185-1");
+        assert_eq!(data["session_status"], "stopping");
+        assert_eq!(data["retry_safe"], false);
+        assert_eq!(data["server_pid"], std::process::id());
+    }
+
+    // #899: the graceful stages' bounds fit in the part of the stop limit
+    // that is theirs, so a stop whose every stage runs out still answers.
+    #[test]
+    fn the_graceful_stages_fit_in_their_share_of_the_stop_limit() {
+        let graceful = STOP_KWIN_CLOSE_LIMIT
+            + CDP_BROWSER_CLOSE_TIMEOUT
+            + CDP_BROWSER_CLOSE_TIMEOUT
+            + BROWSER_SHUTDOWN_GRACE
+            + STOP_WALLET_LIMIT;
+        assert!(
+            graceful <= SESSION_STOP_LIMIT - STOP_FORCED_RESERVE,
+            "{graceful:?}"
+        );
+    }
+
+    #[test]
+    fn stop_progress_times_each_stage_and_names_the_running_one() {
+        let progress = StopProgress::default();
+        assert!(progress.running().is_none());
+        progress.begin(STAGE_KWIN_CLOSE);
+        progress.end_with("KWin did not answer");
+        progress.begin(STAGE_SCOPE);
+        progress.begin(STAGE_STORAGE);
+        let stages = progress.stages();
+        assert_eq!(
+            stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+            [STAGE_KWIN_CLOSE, STAGE_SCOPE]
+        );
+        assert_eq!(stages[0].note.as_deref(), Some("KWin did not answer"));
+        assert_eq!(stages[1].note, None);
+        assert_eq!(progress.running().map(|(stage, _)| stage), Some(STAGE_STORAGE));
+        progress.end();
+        assert!(progress.running().is_none());
+        assert_eq!(progress.stages().len(), 3);
+    }
+
+    #[test]
+    fn a_stop_past_its_limit_says_what_is_still_running() {
+        let deleting = StopProgress::default();
+        deleting.begin(STAGE_SANDBOX);
+        deleting.begin(STAGE_STORAGE);
+        let (message, data) = stop_pending_report(&deleting, "stopped", SESSION_STOP_LIMIT);
+        assert!(
+            message.starts_with(
+                "session stopped, but its cleanup has not finished after 30 s: deleting the session's overlay and runtime files has been running for"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Every process of the session has ended"), "{message}");
+        assert!(message.contains("call session_stop again"), "{message}");
+        assert_eq!(data["status"], "cleanup_pending");
+        assert_eq!(data["session_status"], "stopped");
+        assert_eq!(data["unfinished"]["stage"], STAGE_STORAGE);
+        assert_eq!(data["limit_seconds"], 30);
+        assert_eq!(data["stages"][0]["stage"], STAGE_SANDBOX);
+
+        let killing = StopProgress::default();
+        killing.begin(STAGE_SCOPE);
+        let (message, data) = stop_pending_report(&killing, "stopped", SESSION_STOP_LIMIT);
+        assert!(message.contains("those that have not are being killed"), "{message}");
+        assert!(!message.contains("Every process"), "{message}");
+        assert_eq!(data["unfinished"]["stage"], STAGE_SCOPE);
+    }
+
+    #[test]
+    fn a_signal_nobody_sent_has_no_sender() {
+        assert_eq!(signal_sender::describe(nix::libc::SIGHUP), "");
+        assert_eq!(signal_sender::describe(nix::libc::SIGUSR1), "");
     }
 }

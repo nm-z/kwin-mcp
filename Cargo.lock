@@ -1740,6 +1740,7 @@ dependencies = [
  "serde-aux",
  "serde_json",
  "shlex",
+ "signal-hook-registry",
  "thiserror 2.0.18",
  "tokio",
  "tower",

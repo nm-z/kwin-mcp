@@ -493,6 +493,30 @@ limits are recovered from the sandbox PID cgroup; values that cannot be
 recovered remain unknown. Stop the dead handle, start a new desktop without
 `session_id`, and relaunch the applications to continue.
 
+The dead entry keeps what the teardown would otherwise delete: `exit_summary`
+(which of `kwin_wayland` and the sandbox's top process ended first, and what
+the exit status says), `ended_first`, `kwin_exit_status`, `exit_code` or
+`exit_signal`, and `sandbox_log_tail`, the last 2 KiB of the session's stderr.
+Every later call for that session returns them, and the lifecycle record keeps
+the summary and the end of the log as `detail`. pasta, the top process of a
+session's scope, exits with status 0 when it receives SIGTERM or SIGQUIT, so
+`exit status: 0` with `kwin_wayland` still running means the session was ended
+from outside the server (a signal to its processes, or its scope being
+stopped), not that the desktop finished. `scope_properties` holds only
+`LoadState` once systemd has forgotten the scope: its other properties would be
+defaults, and `Result=success` among them says nothing.
+
+`session_stop` answers within 30 seconds. It normally takes a fraction of a
+second; a stop that took over 2 seconds returns `stages`, the time of each
+teardown stage, and names the slowest in its text. The graceful part (KWin
+closes browser windows within 3 s, CDP within 2 s, browsers exit and flush
+cookies within 2 s and 6 s more after SIGTERM) ends at the latest 15 seconds
+before the limit; the session's processes are then killed and its files
+deleted. When the limit comes first, the answer is `status: cleanup_pending`
+with `session_status: stopped`, `unfinished.stage` and whether every process
+has already ended; the cleanup goes on by itself and the next `session_stop`
+reports how it ended.
+
 Every handle `session_list` shows is accepted by `session_stop`: a running desktop
 is stopped, and a dead, expired, or blocked-start handle is cleared with its
 lifecycle record. A `session_start` whose host call stays blocked past its budget
@@ -878,6 +902,19 @@ to discard its session cookie history. This does not sign out the host browser.
 Point your MCP client at `target/release/kwin-mcp`. One server process owns its isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Use only IDs returned by your own `session_start` calls. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops owned by that server. Requests carrying a live session ID owned by another kwin-mcp process running as the same user on the same host are forwarded to that process through a private Unix socket.
 
 Session IDs belong to the server process that returned them. A DSH migration or client/server restart does not transfer sessions; when the old client connection closes, that server shuts down its desktops, unless it was started with `--keep-sessions MINUTES`. With that flag a server whose client closed (the usual way a host respawns it) stays up while it owns a running session and serves it, through its control socket, to the kwin-mcp the host starts next: calls with the old session ID are forwarded to it as for any other live same-user server, `session_stop` ends it, and it exits when no session is running or every session has been idle for MINUTES. A signal, or the process that launched the server exiting, still stops everything at once, and `--ttl` still expires idle sessions. An in-place source reload preserves its PID, pipes, and live sessions, including the sessions it started on other machines with `host` and their viewer windows. Calls with a session ID from another live same-user server on this host are automatically forwarded after checking the target PID and effective UID. The replacement server's `session_list` covers only its own process. Session stops, idle TTL expirations, and completed server-shutdown cleanup are recorded in `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/session-lifecycle-v2.jsonl`; the log is capped at 1 MiB and retains recent records, so older details may be absent. An unavailable-ID error includes `session_status`: `stopped` or `expired` with the recorded end time and reason when known, `owned_by_another_process` when the ID belongs elsewhere but its final state is unknown, or `not_found`. A request without an ID when no session is active reports `none_running`. These responses also report whether the ID is available in the current process and provide recovery guidance. TTL-expired handles appear as `expired` in the current process's `session_list` and can be cleared with `session_stop`. If the owning process is unavailable, call `session_start` without `session_id`, relaunch the applications, and restore the task.
+
+A server that exits says why. On SIGTERM, SIGINT or SIGHUP it logs the sender
+(`shutdown: SIGTERM from PID 1234 (pkill, uid 1000)`), answers every call that
+is still running, and every call that still arrives, with a
+`server_shutting_down` error carrying that cause, and only then stops its
+sessions and closes its transport. The cause is kept as `detail` in the
+lifecycle record of each session it stopped, so a later call with one of those
+IDs, which reaches the server the host started next, is told that the owner
+exited, what ended it, and to call `session_start` again. A server that is
+killed outright records nothing; the later call still names the exited owner.
+A server that re-executes itself for a new binary finishes the calls other
+servers forwarded to it first, and a forwarding server retries for up to
+5 seconds while the owner is running, so such a call is slower, not lost.
 
 Completed server-shutdown records are also mirrored to the legacy
 `session-lifecycle.jsonl` format for older servers. Explicit stops and expiry
