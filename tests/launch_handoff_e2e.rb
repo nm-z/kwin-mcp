@@ -161,7 +161,9 @@ class LaunchHandoffProbe
   # A command still running with no window at the deadline is a failed window
   # launch, but it keeps running; exit 0 and expect_window=false still succeed.
   def window_timeout
-    late = call('launch_app', command: 'sleep 3; kdialog --title kwin-254-late --msgbox late', window_timeout_seconds: 1)
+    # The sleep outlasts the deadline and the two seconds launch_app then samples
+    # the command's processes: idle ones are window_not_observed, busy ones slow_start.
+    late = call('launch_app', command: 'sleep 6; kdialog --title kwin-254-late --msgbox late', window_timeout_seconds: 1)
     payload = late.dig('result', 'structuredContent') || (raise "timeout returned no result: #{late}")
     raise "timeout was not an error: #{late}" unless late.dig('result', 'isError') == true
     expected = {'window_outcome' => 'timeout', 'reason' => 'window_not_observed', 'command_submitted' => true, 'retry_safe' => false}

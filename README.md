@@ -25,7 +25,7 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `keyboard_paste` | Paste UTF-8 text through the session clipboard with an acknowledged shortcut. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `keyboard_press` / `keyboard_release` | Hold a key or combo down across calls, then release it with the same string. For a shortcut use `keyboard_key`: a modifier left held makes every typed character a shortcut (`h` becomes Ctrl+H), so `keyboard_type` refuses with `modifier_held` until it is released. |
-| `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. |
+| `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. With no session it starts a default one and returns its `session_id`. |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 | `import_file` | Refresh a running session's file from the host, with byte verification and explicit overwrite control. |
@@ -1225,6 +1225,60 @@ The real stdio regression `tests/launch_failure_context_e2e.rb` makes only its o
 session workdir temporarily unwritable, verifies that no command ran, restores its
 permissions, and verifies a new window in the same session. It does not fill a
 host disk or change a user quota.
+
+### Launches without a session, slow starts and late windows
+
+`launch_app` without `session_id` on a server that has no session starts a
+default desktop first and launches in it. The result then carries `session_id`,
+`session_started: true`, a `session_note` and the new session's
+`host_shared_dir`, size and wallet state under `session`; `viewer: true` also
+opens the viewer once the launch has its window. The implicit start happens only
+when the server uses no session at all: with a live session the call runs there
+as before, an unknown `session_id` is still an error, and a server whose only
+sessions are on another machine or attached answers `session_id_required` with
+their IDs. Call `session_start` yourself for any non-default option.
+
+Each launch names itself in the environment of its script's shell
+(`KWIN_MCP_LAUNCH`), so the session's processes can be traced to the launch that
+started them through `/proc` inside the sandbox. When the deadline passes with
+the command still running and no window, `launch_app` samples the launch's
+processes for two seconds:
+
+| `reason` | `launch_processes.state` | Meaning |
+| --- | --- | --- |
+| `slow_start` | `busy` | The processes are using CPU: the application is still starting. Do not launch it again. |
+| `window_not_observed` | `idle` | The processes use no CPU: nothing shows a window is coming (a background or non-GUI command, or one blocked on something). |
+| `window_not_observed` | absent | The sandbox's process table could not be read. |
+
+Either way the launch stays on record (`late_window_tracked: true`) for ten
+minutes or until its processes are gone. `window_list` reports it under
+`pending_launches`, and once its window maps, lists that window with `launch`
+(`command`, `seen_after_seconds`, `launch_gave_up_after_seconds`,
+`attributed_by`). `attributed_by` is `process` when the window's process was
+started by the launch, and `timing` when the process names no launch and the
+window mapped while this was the oldest launch still waiting. A later
+`launch_app` call does not take such a window as its own unless its command
+exited 0, which is a hand-off to the earlier launch's process.
+
+A browser command that exits 0 handed its request to the running browser. A new
+window or a title that changes and holds is reported as before. If neither
+happens within three seconds, the result is still `reused_existing`, with
+`reuse_evidence`: `window_changed` (exactly one existing browser window changed
+its title, even briefly, or was raised), `active_browser_window` (no window
+changed and a browser window has the focus, which is where a browser opens a
+handed-over request and where Chrome's profile picker stays), or
+`only_browser_window`. Several changed windows remain `unattributed`. A second
+start of another single-instance application (`plasma-systemmonitor`, `dolphin`)
+is reported the same way with `same_application`, when a window named after the
+command's program was already open.
+
+Applications launched in a session share a private D-Bus session bus (the one
+that carries the session-local KWallet): they can own names and call each other,
+and a single-instance KDE application can register itself. Host services are not
+on that bus, and nothing is activated on it, so `plasma-systemmonitor` opens with
+its sensors unavailable unless `ksystemstats` is started in the session first
+(`launch_app` with `expect_window: false`); CPU, GPU, memory and network then
+report, disks do not.
 
 ### Attributable element lookup
 

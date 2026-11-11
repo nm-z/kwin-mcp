@@ -2086,6 +2086,23 @@ const LAUNCH_PID_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_EXIT_STATUS_GRACE: Duration = Duration::from_secs(1);
 const LAUNCH_LATE_WINDOW_GRACE: Duration = Duration::from_secs(2);
 const LAUNCH_TIMEOUT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+// Every process a launch_app command starts inherits this variable, whose value
+// names the launch: a window is traced to its launch through its process, and
+// a launch's CPU use is read from its processes.
+const LAUNCH_ENV: &str = "KWIN_MCP_LAUNCH";
+// A launch with no window at its deadline is a slow start when its processes
+// used at least this much CPU during LAUNCH_LATE_WINDOW_GRACE (one clock tick
+// is 10 ms, so two ticks in two seconds is 1% of a core); below it they are idle.
+const LAUNCH_BUSY_TICKS: u64 = 2;
+// A launch that gave up waiting keeps its claim on a later window this long.
+const PENDING_LAUNCH_LIFETIME: Duration = Duration::from_secs(600);
+// A browser command that exits 0 handed its request to the running browser. A
+// window that shows it (new, retitled or raised) normally follows within a poll
+// or two; after this long without one, the browser window that already had the
+// focus is the one that took the request.
+const LAUNCH_HANDOFF_SETTLE: Duration = Duration::from_secs(3);
+// How far up a process's ancestry its launch is searched.
+const LAUNCH_ANCESTRY_LIMIT: usize = 32;
 // A launch that exits without a window reports this many stderr lines, read
 // from the bytes sandbox.log gained since the command was submitted.
 const LAUNCH_STDERR_TAIL_LINES: usize = 20;
@@ -4378,6 +4395,7 @@ fn compact_launch_result(payload: &mut serde_json::Value) {
             "warning",
             "extension_warning",
             "window_reused",
+            "reuse_evidence",
             "window_observed_after_timeout",
             "window_baseline_errors",
         ],
@@ -6728,6 +6746,8 @@ struct KwinMcp {
     /// lifecycle gate. Set when that cleanup is deferred and cleared just
     /// before the gate is released.
     pending_cleanup: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// Launches whose launch_app call returned before their window mapped.
+    launches: Arc<std::sync::Mutex<LaunchLedger>>,
     display: DisplayConfig,
     /// Set for a session a `--listen` peer started: its viewer window is on
     /// the peer's machine, and viewer_open takes the peer's frame socket here.
@@ -7180,6 +7200,7 @@ impl KwinMcp {
             startup_snapshot: Arc::new(std::sync::Mutex::new(None)),
             startup_deadline: Arc::new(std::sync::Mutex::new(None)),
             pending_cleanup: Arc::new(std::sync::Mutex::new(None)),
+            launches: Arc::default(),
             display,
             frame_sockets: None,
         }
@@ -12174,14 +12195,301 @@ fn parse_launch_pid(text: &str) -> Option<u32> {
     text.trim().parse::<u32>().ok().filter(|pid| *pid != 0)
 }
 
+/// The topmost window mapped since `previous`, leaving out `others`: windows
+/// that belong to an earlier launch.
 fn newly_mapped_window<'a>(
     previous: &[WindowSnapshot],
     current: &'a [WindowSnapshot],
+    others: &[String],
 ) -> Option<&'a WindowSnapshot> {
     current
         .iter()
-        .filter(|window| !previous.iter().any(|before| before.id == window.id))
+        .filter(|window| {
+            !previous.iter().any(|before| before.id == window.id) && !others.contains(&window.id)
+        })
         .max_by_key(|window| (window.active, window.stacking_order))
+}
+
+/// One process inside the session's sandbox, read from its /proc.
+struct SandboxProcess {
+    pid: i32,
+    parent: i32,
+    /// User plus system CPU time in clock ticks.
+    cpu_ticks: u64,
+    /// The launch_app call that started it: its [`LAUNCH_ENV`] value.
+    launch: Option<String>,
+}
+
+/// Parent PID and CPU ticks from a /proc/PID/stat line. The command name sits
+/// in parentheses and may itself contain spaces and parentheses.
+fn parse_process_stat(stat: &str) -> Option<(i32, u64)> {
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let parent = fields.get(1)?.parse().ok()?;
+    let user: u64 = fields.get(11)?.parse().ok()?;
+    let system: u64 = fields.get(12)?.parse().ok()?;
+    Some((parent, user.checked_add(system)?))
+}
+
+/// The launch named in a /proc/PID/environ image.
+fn launch_marker(environ: &[u8]) -> Option<String> {
+    for entry in environ.split(|byte| *byte == 0) {
+        if let Some(value) = entry
+            .strip_prefix(LAUNCH_ENV.as_bytes())
+            .and_then(|rest| rest.strip_prefix(b"="))
+        {
+            return String::from_utf8(value.to_vec()).ok();
+        }
+    }
+    None
+}
+
+/// Every process in the sandbox whose root is `root`. A process that exits
+/// while it is read is left out.
+fn sandbox_processes(root: &Path) -> Vec<SandboxProcess> {
+    let Ok(entries) = std::fs::read_dir(root.join("proc")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (parent, cpu_ticks) = parse_process_stat(&stat)?;
+            // Unreadable for a process that dropped its dumpable flag, such as
+            // a sandboxed renderer; its launch is then its parent's.
+            let launch = std::fs::read(entry.path().join("environ"))
+                .ok()
+                .and_then(|environ| launch_marker(&environ));
+            Some(SandboxProcess {
+                pid,
+                parent,
+                cpu_ticks,
+                launch,
+            })
+        })
+        .collect()
+}
+
+/// The session's process table, or None when the sandbox cannot be read.
+async fn sandbox_process_table(sandbox_pid: u32) -> Option<Vec<SandboxProcess>> {
+    tokio::task::spawn_blocking(move || {
+        sandbox_root(sandbox_pid).map(|root| sandbox_processes(&root))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// The launch that started `pid`: named in its own environment, or in that of
+/// its nearest ancestor that names one.
+fn process_launch(processes: &[SandboxProcess], pid: i32) -> Option<&str> {
+    let mut current = pid;
+    for _ in 0..LAUNCH_ANCESTRY_LIMIT {
+        let index = processes
+            .iter()
+            .position(|process| process.pid == current)?;
+        let process = processes.get(index)?;
+        if let Some(launch) = &process.launch {
+            return Some(launch);
+        }
+        current = process.parent;
+    }
+    None
+}
+
+/// CPU ticks of each live process of launch `marker`, by PID.
+fn launch_cpu(processes: &[SandboxProcess], marker: &str) -> std::collections::BTreeMap<i32, u64> {
+    processes
+        .iter()
+        .filter(|process| process_launch(processes, process.pid) == Some(marker))
+        .map(|process| (process.pid, process.cpu_ticks))
+        .collect()
+}
+
+/// What a launch's processes did during the grace period after its deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaunchCpu {
+    processes: usize,
+    total_ticks: u64,
+    /// Ticks used between the two samples, including by processes started
+    /// between them.
+    recent_ticks: u64,
+}
+
+impl LaunchCpu {
+    /// None when either sample is missing or the launch has no process left.
+    fn between(
+        earlier: Option<&std::collections::BTreeMap<i32, u64>>,
+        later: Option<&std::collections::BTreeMap<i32, u64>>,
+    ) -> Option<Self> {
+        let (earlier, later) = (earlier?, later?);
+        if later.is_empty() {
+            return None;
+        }
+        Some(Self {
+            processes: later.len(),
+            total_ticks: later.values().sum(),
+            recent_ticks: later
+                .iter()
+                .map(|(pid, ticks)| ticks.saturating_sub(earlier.get(pid).copied().unwrap_or(0)))
+                .sum(),
+        })
+    }
+
+    /// Still working towards a window, as opposed to sitting idle.
+    fn busy(&self) -> bool {
+        self.recent_ticks >= LAUNCH_BUSY_TICKS
+    }
+
+    fn report(&self) -> serde_json::Value {
+        let seconds = |ticks: u64| {
+            Duration::from_millis(ticks.saturating_mul(1000) / procfs::ticks_per_second().max(1))
+                .as_secs_f64()
+        };
+        serde_json::json!({
+            "count": self.processes,
+            "cpu_seconds": seconds(self.total_ticks),
+            "recent_cpu_seconds": seconds(self.recent_ticks),
+            "sample_seconds": LAUNCH_LATE_WINDOW_GRACE.as_secs(),
+            "state": if self.busy() { "busy" } else { "idle" },
+        })
+    }
+}
+
+/// A launch_app call that returned without a window while its command was
+/// still running. A window the command maps later is still its window.
+struct PendingLaunch {
+    marker: String,
+    command: String,
+    submitted: std::time::Instant,
+    /// How long launch_app waited before it gave up.
+    waited: Duration,
+    /// Windows that were open before the command was submitted.
+    baseline: Vec<String>,
+}
+
+/// A window credited to a launch after that launch_app call had returned.
+#[derive(Clone)]
+struct LateLaunchWindow {
+    window: String,
+    command: String,
+    waited: Duration,
+    /// Time from submission until the window was first seen here.
+    seen_after: Duration,
+    /// "process": the window's process was started by the launch. "timing":
+    /// the window's process names no launch and it mapped while this was the
+    /// oldest launch still waiting.
+    attributed_by: &'static str,
+}
+
+impl LateLaunchWindow {
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "command": self.command,
+            "launch_gave_up_after_seconds": self.waited.as_secs(),
+            "seen_after_seconds": self.seen_after.as_secs(),
+            "attributed_by": self.attributed_by,
+        })
+    }
+}
+
+/// A session's launches that are waiting for a window past their launch_app
+/// call, and the windows that later settled them.
+#[derive(Default)]
+struct LaunchLedger {
+    pending: Vec<PendingLaunch>,
+    late: Vec<LateLaunchWindow>,
+    /// Windows a launch_app call returned as its own.
+    claimed: Vec<String>,
+}
+
+impl LaunchLedger {
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.late.is_empty()
+    }
+
+    /// Credits windows mapped since a waiting launch's baseline to that launch.
+    /// A window whose process the launch started is its window. With `by_timing`,
+    /// a window whose process names no launch goes to the oldest waiting launch;
+    /// a launch_app call that is itself waiting passes false, because such a
+    /// window is its own. A launch whose processes are all gone, or that has
+    /// waited [`PENDING_LAUNCH_LIFETIME`], stops waiting.
+    fn settle(
+        &mut self,
+        windows: &[WindowSnapshot],
+        processes: Option<&[SandboxProcess]>,
+        now: std::time::Instant,
+        by_timing: bool,
+    ) {
+        let open = |id: &String| windows.iter().any(|window| &window.id == id);
+        self.late.retain(|late| open(&late.window));
+        self.claimed.retain(open);
+        let owner = |window: &WindowSnapshot| {
+            processes.and_then(|processes| process_launch(processes, window.pid))
+        };
+        let mut waiting = Vec::new();
+        for launch in std::mem::take(&mut self.pending) {
+            let age = now.saturating_duration_since(launch.submitted);
+            if age > PENDING_LAUNCH_LIFETIME {
+                continue;
+            }
+            let fresh = || {
+                windows.iter().filter(|window| {
+                    !launch.baseline.contains(&window.id)
+                        && !self.claimed.contains(&window.id)
+                        && !self.late.iter().any(|late| late.window == window.id)
+                })
+            };
+            let topmost = |window: &&WindowSnapshot| (window.active, window.stacking_order);
+            let credited = fresh()
+                .filter(|window| owner(window) == Some(launch.marker.as_str()))
+                .max_by_key(topmost)
+                .map(|window| (window, "process"))
+                .or_else(|| {
+                    // An unreadable process table says nothing about any window.
+                    (by_timing && processes.is_some() && waiting.is_empty())
+                        .then(|| fresh().filter(|window| owner(window).is_none()).max_by_key(topmost))
+                        .flatten()
+                        .map(|window| (window, "timing"))
+                });
+            match credited {
+                Some((window, attributed_by)) => self.late.push(LateLaunchWindow {
+                    window: window.id.clone(),
+                    command: launch.command,
+                    waited: launch.waited,
+                    seen_after: age,
+                    attributed_by,
+                }),
+                None => {
+                    let ended = processes
+                        .is_some_and(|processes| launch_cpu(processes, &launch.marker).is_empty());
+                    if !ended {
+                        waiting.push(launch);
+                    }
+                }
+            }
+        }
+        self.pending = waiting;
+    }
+
+    /// The launches still waiting, for a caller to read.
+    fn waiting_report(
+        &self,
+        processes: Option<&[SandboxProcess]>,
+        now: std::time::Instant,
+    ) -> Vec<serde_json::Value> {
+        self.pending
+            .iter()
+            .map(|launch| {
+                serde_json::json!({
+                    "command": launch.command,
+                    "submitted_seconds_ago": now.saturating_duration_since(launch.submitted).as_secs(),
+                    "launch_gave_up_after_seconds": launch.waited.as_secs(),
+                    "processes": processes.map(|processes| launch_cpu(processes, &launch.marker).len()),
+                })
+            })
+            .collect()
+    }
 }
 
 fn launch_window_snapshot(windows: &[WindowSnapshot]) -> serde_json::Value {
@@ -12269,19 +12577,181 @@ fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
     ))
 }
 
-async fn poll_launch_window(
+/// What a launch_app call needs while it waits for its window.
+#[derive(Clone)]
+struct LaunchWatch {
     conn: zbus::Connection,
     kwin_unique: String,
     xdg: PathBuf,
+    /// The window that was active before the command was submitted.
     previous: Option<String>,
     previous_windows: Option<Vec<WindowSnapshot>>,
     chromium_launch: bool,
+    /// The file name of the command's program, when its first word is literal.
+    program: Option<String>,
     exit_file: PathBuf,
-) -> Result<Option<LaunchWindow>, McpError> {
+    sandbox_pid: u32,
+    ledger: Arc<std::sync::Mutex<LaunchLedger>>,
+}
+
+/// Whether `window` belongs to the application `program` starts: KWin names a
+/// window after its executable and its desktop file (org.kde.dolphin).
+fn same_application(window: &WindowSnapshot, program: &str) -> bool {
+    [&window.resource_name, &window.resource_class]
+        .iter()
+        .any(|name| {
+            name.eq_ignore_ascii_case(program)
+                || name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|last| last.eq_ignore_ascii_case(program))
+        })
+}
+
+/// The window a single-instance application already had open when a second
+/// start of it exited 0 without a new window: the only window of that
+/// application, or with several the one that has the focus.
+fn running_instance_window<'a>(
+    previous: &[WindowSnapshot],
+    current: &'a [WindowSnapshot],
+    program: &str,
+) -> Option<&'a WindowSnapshot> {
+    let open: Vec<&WindowSnapshot> = current
+        .iter()
+        .filter(|window| {
+            same_application(window, program)
+                && previous.iter().any(|before| before.id == window.id)
+        })
+        .collect();
+    match open.as_slice() {
+        [window] => Some(window),
+        several => several
+            .iter()
+            .position(|window| window.active)
+            .and_then(|index| several.get(index).copied()),
+    }
+}
+
+impl LaunchWatch {
+    /// Windows among `windows` that belong to an earlier launch still waiting
+    /// for its window; each is credited to that launch. `known` holds the ones
+    /// already credited, so the session's processes are read only when another
+    /// window has mapped.
+    async fn other_launch_windows(&self, windows: &[WindowSnapshot], known: &mut Vec<String>) {
+        let Some(before) = self.previous_windows.as_deref() else {
+            return;
+        };
+        let unexplained = windows.iter().any(|window| {
+            !before.iter().any(|earlier| earlier.id == window.id) && !known.contains(&window.id)
+        });
+        let waiting = self
+            .ledger
+            .lock()
+            .is_ok_and(|ledger| !ledger.pending.is_empty());
+        if !unexplained {
+            return;
+        }
+        let processes = if waiting {
+            sandbox_process_table(self.sandbox_pid).await
+        } else {
+            None
+        };
+        if let Ok(mut ledger) = self.ledger.lock() {
+            if waiting {
+                ledger.settle(
+                    windows,
+                    processes.as_deref(),
+                    std::time::Instant::now(),
+                    false,
+                );
+            }
+            // Also the windows credited before this call looked.
+            for late in &ledger.late {
+                if !known.contains(&late.window) {
+                    known.push(late.window.clone());
+                }
+            }
+        }
+    }
+}
+
+fn active_window(windows: &[WindowSnapshot]) -> Option<&WindowSnapshot> {
+    windows
+        .iter()
+        .position(|window| window.active)
+        .and_then(|index| windows.get(index))
+}
+
+/// What the session's existing browser windows did after a browser command
+/// exited 0, which is what handing the request to the running browser looks like.
+#[derive(Default)]
+struct HandoffEvidence {
+    /// Existing browser windows whose title, activation or minimized state
+    /// differed from the baseline in any poll. A title can change for one poll
+    /// only: a new tab shows its URL, then a title equal to the old tab's.
+    changed: Vec<String>,
+}
+
+impl HandoffEvidence {
+    fn observe(&mut self, previous: &[WindowSnapshot], current: &[WindowSnapshot]) {
+        for window in changed_existing_browser_windows(previous, current) {
+            if !self.changed.contains(&window.id) {
+                self.changed.push(window.id.clone());
+            }
+        }
+    }
+
+    /// The window that took the request, and how it is known: the only browser
+    /// window that changed; with none changed, the browser window that has the
+    /// focus, where a browser opens a handed-over request; without one, the
+    /// session's only browser window. None while several windows qualify.
+    fn target<'a>(
+        &self,
+        current: &'a [WindowSnapshot],
+    ) -> Option<(&'a WindowSnapshot, &'static str)> {
+        let changed: Vec<&WindowSnapshot> = current
+            .iter()
+            .filter(|window| self.changed.contains(&window.id))
+            .collect();
+        match changed.as_slice() {
+            [window] => Some((window, "window_changed")),
+            [] => {
+                let browsers: Vec<&WindowSnapshot> = current
+                    .iter()
+                    .filter(|window| is_chromium_window(window))
+                    .collect();
+                match (active_window(current), browsers.as_slice()) {
+                    (Some(active), _) if is_chromium_window(active) => {
+                        Some((active, "active_browser_window"))
+                    }
+                    (_, [window]) => Some((window, "only_browser_window")),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+async fn poll_launch_window(watch: LaunchWatch) -> Result<Option<LaunchWindow>, McpError> {
+    let LaunchWatch {
+        conn,
+        kwin_unique,
+        xdg,
+        previous,
+        previous_windows,
+        chromium_launch,
+        exit_file,
+        ..
+    } = &watch;
+    let chromium_launch = *chromium_launch;
     let mut pending_reused: Option<(String, String)> = None;
+    let mut others = Vec::new();
+    let mut handoff = HandoffEvidence::default();
+    let mut handed_off_at = None;
     loop {
         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
-        let exit_status = std::fs::read_to_string(&exit_file)
+        let exit_status = std::fs::read_to_string(exit_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
         // An existing window is the launch's window only when the command has
@@ -12289,41 +12759,53 @@ async fn poll_launch_window(
         // has not opened that window, so its activation for another reason
         // (focus returning, another client raising it) says nothing about it.
         let handed_off = exit_status == Some(0);
-        let current_windows = window_snapshots(&conn, &kwin_unique, &xdg).await;
+        if handed_off && handed_off_at.is_none() {
+            handed_off_at = Some(tokio::time::Instant::now());
+        }
+        let current_windows = window_snapshots(conn, kwin_unique, xdg).await;
         if let Ok(windows) = &current_windows {
+            watch.other_launch_windows(windows, &mut others).await;
+            // A window of an earlier launch that is still starting is not this
+            // launch's, unless this command exited 0: it then handed its
+            // request to that launch's process, and the window shows it.
+            let excluded: &[String] = if handed_off { &[] } else { &others };
             if let Some(window) = previous_windows
                 .as_deref()
-                .and_then(|before| newly_mapped_window(before, windows))
+                .and_then(|before| newly_mapped_window(before, windows, excluded))
             {
                 return Ok(Some(LaunchWindow {
                     geometry: launch_window_geometry(window),
                     reused: false,
+                    evidence: None,
                 }));
             }
-            if let Some(active) = windows.iter().find(|window| window.active)
+            if let Some(active) = active_window(windows)
                 && previous.as_deref() != Some(&active.id)
             {
-                let reused = previous_windows
-                    .as_ref()
-                    .is_some_and(|before| before.iter().any(|window| window.id == active.id));
                 let current = (active.id.clone(), active.title.clone());
-                if !reused {
+                // Without a baseline, any window that took the focus counts.
+                if previous_windows.is_none() {
                     return Ok(Some(LaunchWindow {
                         geometry: launch_window_geometry(active),
                         reused: false,
+                        evidence: None,
                     }));
                 }
-                if !chromium_launch && handed_off {
+                let reused = previous_windows
+                    .as_ref()
+                    .is_some_and(|before| before.iter().any(|window| window.id == active.id));
+                if reused && !chromium_launch && handed_off {
                     if pending_reused.as_ref() == Some(&current) {
                         return Ok(Some(LaunchWindow {
                             geometry: launch_window_geometry(active),
                             reused: true,
+                            evidence: Some("activated"),
                         }));
                     }
                     pending_reused = Some(current);
                 }
             }
-        } else if let Ok((_, _, geometry)) = active_window_info(&conn, &kwin_unique, &xdg).await
+        } else if let Ok((_, _, geometry)) = active_window_info(conn, kwin_unique, xdg).await
             && previous.as_deref() != Some(&geometry.id)
         {
             let reused = previous_windows
@@ -12334,6 +12816,7 @@ async fn poll_launch_window(
                 return Ok(Some(LaunchWindow {
                     geometry,
                     reused: false,
+                    evidence: None,
                 }));
             }
             if !chromium_launch && handed_off {
@@ -12341,6 +12824,7 @@ async fn poll_launch_window(
                     return Ok(Some(LaunchWindow {
                         geometry,
                         reused: true,
+                        evidence: Some("activated"),
                     }));
                 }
                 pending_reused = Some(current);
@@ -12349,11 +12833,28 @@ async fn poll_launch_window(
         if exit_status.is_some_and(|status| status != 0) {
             return Ok(None);
         }
+        // A second start of a single-instance application exits 0 after
+        // passing its request to the running one, whose window may already
+        // have the focus and then shows no change at all.
+        if !chromium_launch
+            && handed_off_at.is_some_and(|since| since.elapsed() >= LAUNCH_HANDOFF_SETTLE)
+            && let Some(program) = watch.program.as_deref()
+            && let Some(previous_windows) = previous_windows.as_deref()
+            && let Ok(current_windows) = &current_windows
+            && let Some(window) = running_instance_window(previous_windows, current_windows, program)
+        {
+            return Ok(Some(LaunchWindow {
+                geometry: launch_window_geometry(window),
+                reused: true,
+                evidence: Some("same_application"),
+            }));
+        }
         if chromium_launch
-            && exit_status == Some(0)
+            && handed_off
             && let Some(previous_windows) = previous_windows.as_deref()
             && let Ok(current_windows) = current_windows
         {
+            handoff.observe(previous_windows, &current_windows);
             let titled = changed_existing_browser_window_titles(previous_windows, &current_windows);
             if let [window] = titled.as_slice() {
                 let current = (window.id.clone(), window.title.clone());
@@ -12361,11 +12862,24 @@ async fn poll_launch_window(
                     return Ok(Some(LaunchWindow {
                         geometry: launch_window_geometry(window),
                         reused: true,
+                        evidence: Some("title_changed"),
                     }));
                 }
                 pending_reused = Some(current);
             } else {
                 pending_reused = None;
+            }
+            // The page may still be loading into a retitled tab; a title that
+            // holds for two polls above is the better report, so this waits.
+            if pending_reused.is_none()
+                && handed_off_at.is_some_and(|since| since.elapsed() >= LAUNCH_HANDOFF_SETTLE)
+                && let Some((window, evidence)) = handoff.target(&current_windows)
+            {
+                return Ok(Some(LaunchWindow {
+                    geometry: launch_window_geometry(window),
+                    reused: true,
+                    evidence: Some(evidence),
+                }));
             }
         }
     }
@@ -12374,6 +12888,8 @@ async fn poll_launch_window(
 struct LaunchWindow {
     geometry: WindowGeometry,
     reused: bool,
+    /// How an existing window is known to be the launch's.
+    evidence: Option<&'static str>,
 }
 
 fn is_chromium_window(window: &WindowSnapshot) -> bool {
@@ -15463,18 +15979,58 @@ impl KwinMcp {
                 window.hidden = true;
             }
         }
+        // A window that mapped after its launch_app call stopped waiting names
+        // that launch, and a launch still without a window is listed as pending.
+        let sandbox_pid = self
+            .with_session(|sess| Ok(sess.sandbox_child.id()))
+            .await?;
+        let (late, pending) = self.settle_launches(&windows, sandbox_pid).await;
+        let launch_of = |window: &WindowSnapshot| {
+            late.iter()
+                .position(|late| late.window == window.id)
+                .and_then(|index| late.get(index))
+        };
         let mut text = if windows.is_empty() {
             "no managed windows".to_owned()
         } else {
             windows
                 .iter()
-                .map(WindowSnapshot::summary)
+                .map(|window| match launch_of(window) {
+                    Some(launch) => format!(
+                        "{} launch={:?} (seen {}s after submission; its launch_app stopped waiting at {}s)",
+                        window.summary(),
+                        launch.command,
+                        launch.seen_after.as_secs(),
+                        launch.waited.as_secs(),
+                    ),
+                    None => window.summary(),
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
         let mut data = serde_json::json!({
-            "windows": windows.iter().map(WindowSnapshot::compact).collect::<Vec<_>>(),
+            "windows": windows
+                .iter()
+                .map(|window| {
+                    let mut listed = window.compact();
+                    if let Some(launch) = launch_of(window) {
+                        listed["launch"] = launch.report();
+                    }
+                    listed
+                })
+                .collect::<Vec<_>>(),
         });
+        if !pending.is_empty() {
+            for launch in &pending {
+                text.push_str(&format!(
+                    "\npending launch: {} has no window yet ({}s since submission; processes running: {})",
+                    launch["command"],
+                    launch["submitted_seconds_ago"],
+                    launch["processes"],
+                ));
+            }
+            data["pending_launches"] = serde_json::json!(pending);
+        }
         // Only the unusual states are reported: show desktop on, or KWin not answering.
         if showing != Some(false) {
             data["showing_desktop"] = serde_json::json!(showing);
@@ -18410,7 +18966,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. Waits 30s by default (window_timeout_seconds 1-120) for a new or attributable existing browser window. A command still running with no window by then is an error (window_not_observed). expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. command_submitted and retry_safe describe the submission, so inspect state before repeating it. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process; on timeout a late window is reported or a fresh window_snapshot attached. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -18470,6 +19026,39 @@ impl KwinMcp {
         attach_home_overlay_report(result, &home_report)
     }
 
+    /// Credits `windows` to the launches that outlived their launch_app call.
+    /// Returns the late windows that are still open, each with its launch, and
+    /// a report of the launches still waiting.
+    async fn settle_launches(
+        &self,
+        windows: &[WindowSnapshot],
+        sandbox_pid: u32,
+    ) -> (Vec<LateLaunchWindow>, Vec<serde_json::Value>) {
+        let (idle, waiting) = self
+            .launches
+            .lock()
+            .map(|ledger| (ledger.is_idle(), !ledger.pending.is_empty()))
+            .unwrap_or((true, false));
+        if idle {
+            return (Vec::new(), Vec::new());
+        }
+        // The session's processes are read only while a launch is waiting.
+        let processes = if waiting {
+            sandbox_process_table(sandbox_pid).await
+        } else {
+            None
+        };
+        let Ok(mut ledger) = self.launches.lock() else {
+            return (Vec::new(), Vec::new());
+        };
+        let now = std::time::Instant::now();
+        ledger.settle(windows, processes.as_deref(), now, true);
+        (
+            ledger.late.clone(),
+            ledger.waiting_report(processes.as_deref(), now),
+        )
+    }
+
     /// The HOME overlay report for a launch, taken before the command runs so
     /// it describes the files the command starts with.
     async fn launch_home_overlay_report(&self, command: &str) -> HomeOverlayReport {
@@ -18525,6 +19114,7 @@ impl KwinMcp {
             cdp_port,
             fuse_enabled,
             wallet_note,
+            sandbox_pid,
         ) = {
             let guard = self.session.read().await;
             let sess = guard.as_ref().ok_or_else(|| {
@@ -18539,6 +19129,7 @@ impl KwinMcp {
                 sess.cdp_forward_port,
                 sess.fuse_enabled,
                 sess.wallet_note.clone(),
+                sess.sandbox_child.id(),
             )
         };
         if let Ok(mut progress) = progress.lock() {
@@ -18562,8 +19153,22 @@ impl KwinMcp {
         if let Ok(mut progress) = progress.lock() {
             progress.window_baseline_errors.clone_from(&baseline_errors);
         }
+        // Windows that mapped since an earlier launch gave up are that launch's;
+        // credit them before this launch's own wait begins.
+        if let Some(windows) = previous_windows.as_deref() {
+            self.settle_launches(windows, sandbox_pid).await;
+        }
 
         let launch_id = NEXT_BROWSER_LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The counter restarts with the server while a session's processes
+        // live on, so the submission time keeps the name unique.
+        let launch_marker = format!(
+            "{launch_id}-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        );
+        let submitted = std::time::Instant::now();
         let browser_marker = xdg.join(format!("browser-launch-{launch_id}"));
         let path_error_file = xdg.join(format!("launch-{launch_id}.path-error"));
         let command_paths = launch_path_words(&params.command);
@@ -18651,7 +19256,11 @@ impl KwinMcp {
             .write_all(script_body.as_bytes())
             .map_err(|error| launch_script_write_error(&command_file.path, &error))?;
         drop(script);
-        let dispatch = format!("bash {quoted_path}\n");
+        // The script's shell lives as long as the command and carries the
+        // launch's name in its environment. Its descendants are found through
+        // it: Chromium overwrites its own environment image when it sets its
+        // process title, so the browser process itself no longer shows the name.
+        let dispatch = format!("{LAUNCH_ENV}={launch_marker} bash {quoted_path}\n");
         // A short pipe write is atomic, so cancellation cannot leave half a
         // shell command that the next launch would complete accidentally.
         if dispatch.len() > nix::libc::PIPE_BUF {
@@ -18760,28 +19369,35 @@ impl KwinMcp {
             progress.window_baseline_errors.clone_from(&baseline_errors);
         }
         let chromium_launch = launches_chromium(&params.command);
-        let waiting = tower::service_fn(|()| {
-            poll_launch_window(
-                conn.clone(),
-                kwin_unique.clone(),
-                xdg.clone(),
-                prev_window_id.clone(),
-                previous_windows.clone(),
-                chromium_launch,
-                exit_file.clone(),
-            )
-        });
+        let watch = LaunchWatch {
+            conn: conn.clone(),
+            kwin_unique: kwin_unique.clone(),
+            xdg: xdg.clone(),
+            previous: prev_window_id.clone(),
+            previous_windows: previous_windows.clone(),
+            chromium_launch,
+            program: launch_program_name(&params.command).and_then(|program| {
+                Path::new(&program)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            }),
+            exit_file: exit_file.clone(),
+            sandbox_pid,
+            ledger: self.launches.clone(),
+        };
+        let waiting = tower::service_fn(|()| poll_launch_window(watch.clone()));
         let mut window_timed_out = false;
-        let (mut win_geo, mut window_reused) =
+        let (mut win_geo, mut window_reused, reuse_evidence) =
             match tower::timeout::Timeout::new(waiting, window_timeout)
                 .oneshot(())
                 .await
             {
-                Ok(Some(window)) => (Some(window.geometry), window.reused),
-                Ok(None) => (None, false),
+                Ok(Some(window)) => (Some(window.geometry), window.reused, window.evidence),
+                Ok(None) => (None, false, None),
                 Err(error) if error.is::<tower::timeout::error::Elapsed>() => {
                     window_timed_out = true;
-                    (None, false)
+                    (None, false, None)
                 }
                 Err(error) => {
                     return Err(match error.downcast::<McpError>() {
@@ -18793,11 +19409,23 @@ impl KwinMcp {
         let mut window_observed_after_timeout = false;
         let mut timeout_window_snapshot = None;
         let mut timeout_window_snapshot_error = None;
+        // What the launch's processes did after the deadline, when it passed
+        // without a window, and the windows open then.
+        let mut launch_cpu_use = None;
+        let mut timeout_window_ids = None;
         let mut exit_status = std::fs::read_to_string(&exit_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok());
         if win_geo.is_none() && window_timed_out && exit_status.is_none_or(|status| status == 0) {
+            let cpu_at = |marker: String| async move {
+                sandbox_process_table(sandbox_pid)
+                    .await
+                    .map(|processes| launch_cpu(&processes, &marker))
+            };
+            let cpu_before = cpu_at(launch_marker.clone()).await;
             tokio::time::sleep(LAUNCH_LATE_WINDOW_GRACE).await;
+            let cpu_after = cpu_at(launch_marker.clone()).await;
+            launch_cpu_use = LaunchCpu::between(cpu_before.as_ref(), cpu_after.as_ref());
             match tokio::time::timeout(
                 LAUNCH_TIMEOUT_SNAPSHOT_TIMEOUT,
                 window_snapshots(&conn, &kwin_unique, &xdg),
@@ -18805,13 +19433,17 @@ impl KwinMcp {
             .await
             {
                 Ok(Ok(windows)) => {
+                    let mut others = Vec::new();
+                    watch.other_launch_windows(&windows, &mut others).await;
                     if let Some(window) = previous_windows
                         .as_deref()
-                        .and_then(|before| newly_mapped_window(before, &windows))
+                        .and_then(|before| newly_mapped_window(before, &windows, &others))
                     {
                         win_geo = Some(launch_window_geometry(window));
                         window_observed_after_timeout = true;
                     } else {
+                        timeout_window_ids =
+                            Some(windows.iter().map(|window| window.id.clone()).collect::<Vec<_>>());
                         timeout_window_snapshot = Some(launch_window_snapshot(&windows));
                     }
                 }
@@ -18942,12 +19574,65 @@ impl KwinMcp {
             }
         };
         let suffix = format!("{suffix}{baseline_note}");
+        // The call gives up here, but a command that is still running (or left
+        // processes behind when it exited 0) may map its window yet. The launch
+        // keeps waiting in the ledger, where window_list and the next launch_app
+        // credit that window to it.
+        let outlives_call = win_geo.is_none()
+            && window_timed_out
+            && match exit_status {
+                None => true,
+                Some(0) => launch_cpu_use.is_some(),
+                Some(_) => false,
+            };
+        let keeps_waiting = outlives_call
+            && previous_windows
+                .as_ref()
+                .map(|windows| windows.iter().map(|window| window.id.clone()).collect())
+                .or(timeout_window_ids)
+                .is_some_and(|baseline| {
+                    self.launches.lock().is_ok_and(|mut ledger| {
+                        ledger.pending.push(PendingLaunch {
+                            marker: launch_marker.clone(),
+                            command: params.command.clone(),
+                            submitted,
+                            waited: window_timeout,
+                            baseline,
+                        });
+                        true
+                    })
+                });
+        let late_window_note = if keeps_waiting {
+            " A window it maps later is still credited to this launch: window_list then shows that window with launch set to this command."
+        } else {
+            ""
+        };
         match (win_geo, exit_status) {
             (Some(geo), _) => {
+                if let Ok(mut ledger) = self.launches.lock()
+                    && !ledger.claimed.contains(&geo.id)
+                {
+                    ledger.claimed.push(geo.id.clone());
+                }
                 let (outcome, description) = if window_reused {
+                    let how = match reuse_evidence {
+                        Some("window_changed") => {
+                            " (the running browser took the request and changed only this window)"
+                        }
+                        Some("active_browser_window") => {
+                            " (the running browser took the request and no window changed; this browser window has the focus)"
+                        }
+                        Some("only_browser_window") => {
+                            " (the running browser took the request and no window changed; this is its only window)"
+                        }
+                        Some("same_application") => {
+                            " (the command exited 0 without a new window; this window of the same application was already open)"
+                        }
+                        _ => "",
+                    };
                     (
                         "reused_existing",
-                        format!("reused window: {} title: {:?}", geo.id, geo.title),
+                        format!("reused window: {} title: {:?}{how}", geo.id, geo.title),
                     )
                 } else if window_observed_after_timeout {
                     (
@@ -18961,7 +19646,7 @@ impl KwinMcp {
                     "action": "launch", "command": params.command, "window": geo.id, "command_submitted": true,
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_observed_after_timeout": window_observed_after_timeout,
-                    "window_title": geo.title,
+                    "window_title": geo.title, "reuse_evidence": reuse_evidence,
                     "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
@@ -18987,9 +19672,14 @@ impl KwinMcp {
                         window_timeout.as_secs(),
                     ),
                     0 => format!(
-                        "launched: {} (exited with status 0; no window after {}s){suffix}",
+                        "launched: {} (exited with status 0; no window after {}s){suffix}{}",
                         params.command,
-                        window_timeout.as_secs()
+                        window_timeout.as_secs(),
+                        if keeps_waiting {
+                            ". Processes it started are still running; a window they map later is credited to this launch, and window_list then shows it with launch set to this command"
+                        } else {
+                            ""
+                        }
                     ),
                     127 => format!(
                         "{} failed: command not found (exit status 127)",
@@ -19030,6 +19720,8 @@ impl KwinMcp {
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                     "window_snapshot": timeout_window_snapshot,
                     "window_snapshot_error": timeout_window_snapshot_error,
+                    "launch_processes": launch_cpu_use.map(|cpu| cpu.report()),
+                    "late_window_tracked": keeps_waiting,
                     "stderr_tail": diagnostics.stderr,
                     "sandbox_log_line": diagnostics.sandbox_line,
                     "stderr_error": diagnostics.unavailable,
@@ -19058,19 +19750,54 @@ impl KwinMcp {
                 } else {
                     String::new()
                 };
+                // Busy processes are a start that is slow; idle ones give no
+                // sign that a window is coming.
+                let (reason, state, advice) = match launch_cpu_use {
+                    Some(cpu) if cpu.busy() => (
+                        "slow_start",
+                        format!(
+                            "is still starting: its {} processes used {:.2}s of CPU in the last {}s ({:.1}s since launch)",
+                            cpu.processes,
+                            cpu.report()["recent_cpu_seconds"].as_f64().unwrap_or_default(),
+                            LAUNCH_LATE_WINDOW_GRACE.as_secs(),
+                            cpu.report()["cpu_seconds"].as_f64().unwrap_or_default(),
+                        ),
+                        "It was submitted once and is running: do not launch it again. Poll window_list, or wait longer with window_timeout_seconds.",
+                    ),
+                    Some(cpu) => (
+                        "window_not_observed",
+                        format!(
+                            "is still running, but its {} processes are idle (no CPU used in the last {}s, {:.1}s since launch), so nothing shows that a window is coming",
+                            cpu.processes,
+                            LAUNCH_LATE_WINDOW_GRACE.as_secs(),
+                            cpu.report()["cpu_seconds"].as_f64().unwrap_or_default(),
+                        ),
+                        "It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.",
+                    ),
+                    None => (
+                        "window_not_observed",
+                        "is still running".to_owned(),
+                        "It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.",
+                    ),
+                };
+                // The notes after the advice each begin with ". ".
+                let notes = format!("{suffix}{snapshot_note}");
                 let mut result = structured_result(&peer, format!(
-                    "{} opened no window within {}s and is still running. It was submitted once; inspect window_list and screenshot before any retry, or wait longer with window_timeout_seconds. Pass expect_window: false for background or non-GUI commands.{suffix}{snapshot_note}",
+                    "{} opened no window within {}s and {state}. {advice}{late_window_note}{}",
                     params.command,
-                    window_timeout.as_secs()
+                    window_timeout.as_secs(),
+                    notes.strip_prefix('.').unwrap_or(&notes),
                 ), serde_json::json!({
                     "action": "launch", "command": params.command, "window": "timeout",
-                    "window_outcome": "timeout", "reason": "window_not_observed",
+                    "window_outcome": "timeout", "reason": reason,
                     "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
                     "stage": "waiting for a window", "command_submitted": true, "retry_safe": false,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                     "window_snapshot": timeout_window_snapshot,
                     "window_snapshot_error": timeout_window_snapshot_error,
+                    "launch_processes": launch_cpu_use.map(|cpu| cpu.report()),
+                    "late_window_tracked": keeps_waiting,
                 })).await;
                 result.is_error = Some(true);
                 Ok(result)
@@ -20536,6 +21263,9 @@ struct SessionRouter {
     /// Frame sockets this `--listen` server accepted and no viewer_open call
     /// has taken yet; shared by the routers of all its peers.
     frame_sockets: Arc<FrameSockets>,
+    /// Held while launch_app starts the session it found missing, so two such
+    /// calls arriving together start one desktop between them.
+    implicit_start: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The connection to one listener: the MCP client on its control socket, and
@@ -21011,6 +21741,7 @@ impl SessionRouter {
             remote: Arc::default(),
             listener_peer: false,
             frame_sockets: Arc::default(),
+            implicit_start: Arc::default(),
             attached: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             remote_input_orders: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             clipboards: Arc::new(std::sync::Mutex::new(ClipboardStore::default())),
@@ -21660,6 +22391,9 @@ impl SessionRouter {
                 .or_insert_with(|| serde_json::json!({}));
             if let Some(properties) = properties.as_object_mut() {
                 properties.insert("session_id".to_owned(), serde_json::json!({"type": "string", "description": "Session returned by session_start. Required when several sessions exist. Requests for a live session owned by another same-user kwin-mcp process are forwarded to its owner."}));
+                if tool.name == "launch_app" {
+                    properties.insert("viewer".to_owned(), serde_json::json!({"type": "boolean", "description": "true also opens the live viewer (viewer_open) once the launch has its window, for a user who asked to watch. Defaults to false."}));
+                }
             }
             let description = tool.description.take().unwrap_or_default();
             let description = format!(
@@ -21725,6 +22459,204 @@ impl rmcp::ServerHandler for SessionRouter {
         self.tools().into_iter().find(|tool| tool.name == name)
     }
     async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        if request.name == "launch_app" {
+            return self.launch(request, context).await;
+        }
+        self.route_tool(request, context).await
+    }
+}
+
+/// Fields of a session_start result that a launch_app call which started the
+/// session repeats under `session`.
+const IMPLICIT_SESSION_FIELDS: &[&str] = &[
+    "host_shared_dir",
+    "width",
+    "height",
+    "workdir_removed_on_stop",
+    "wallet",
+    "warning",
+];
+
+impl SessionRouter {
+    /// Sessions this server uses without holding their desktop: started on
+    /// another machine, or attached to.
+    async fn outside_sessions(&self) -> Vec<String> {
+        let mut known: Vec<String> = self.remote.sessions().keys().cloned().collect();
+        known.extend(self.attached.read().await.keys().cloned());
+        known
+    }
+
+    /// launch_app. A call that names no session while none exists starts a
+    /// default desktop first and returns its session_id, so opening an
+    /// application takes one call; `viewer: true` then opens the viewer too.
+    async fn launch(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let argument = |request: &rmcp::model::CallToolRequestParams, name: &str| {
+            request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get(name))
+                .cloned()
+        };
+        // The router acts on `viewer`; the session's launch_app never sees it.
+        let viewer = match request
+            .arguments
+            .as_mut()
+            .and_then(|arguments| arguments.remove("viewer"))
+        {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(viewer)) => viewer,
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    "viewer must be true or false",
+                    None,
+                ));
+            }
+        };
+        let mut started = None;
+        if argument(&request, "session_id").is_none() && !self.listener_peer {
+            let _starting = self.implicit_start.lock().await;
+            let local = self.entries().is_ok_and(|sessions| {
+                sessions
+                    .values()
+                    .any(|session| session.death_record().is_none())
+            });
+            let known = self.outside_sessions().await;
+            if !local && !known.is_empty() {
+                // A desktop on another machine or an attached one is already in
+                // use; which one the command belongs in is the caller's choice.
+                return Err(McpError::invalid_params(
+                    format!(
+                        "launch_app needs session_id: this server has no desktop of its own but uses {} ({}). Pass one of those as session_id to launch there, or call session_start (no arguments) for a new local desktop and pass its session_id.",
+                        if known.len() == 1 { "this session" } else { "these sessions" },
+                        known.join(", "),
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "session_id_required", "sessions": known,
+                        "command_submitted": false, "retry_safe": true,
+                    })),
+                ));
+            }
+            if !local {
+                let start = serde_json::from_value(
+                    serde_json::json!({"name": "session_start", "arguments": {}}),
+                )
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let session = self
+                    .route_tool(start, context.clone())
+                    .await
+                    .map_err(|mut error| {
+                        error.message = format!(
+                            "launch_app found no session and could not start one, so the command was not submitted. Call session_start to see the failure by itself, then launch_app with its session_id. session_start: {}",
+                            error.message
+                        )
+                        .into();
+                        error
+                    })?
+                    .structured_content
+                    .unwrap_or_default();
+                let Some(id) = session["session_id"].as_str().map(str::to_owned) else {
+                    return Err(McpError::internal_error(
+                        "launch_app started a session whose session_start result has no session_id; call session_list, then launch_app with that session_id",
+                        Some(session),
+                    ));
+                };
+                request
+                    .arguments
+                    .get_or_insert_with(Default::default)
+                    .insert("session_id".to_owned(), serde_json::json!(id));
+                started = Some((id, session));
+            }
+        }
+        let session_id = argument(&request, "session_id");
+        let note = started.as_ref().map(|(id, _)| {
+            format!(
+                "No session existed, so launch_app started a default one: session_id {id}. It is a new, empty desktop. Pass this session_id to later calls; session_stop ends it."
+            )
+        });
+        let annotate = |data: &mut serde_json::Map<String, serde_json::Value>| {
+            if let (Some((id, session)), Some(note)) = (&started, &note) {
+                data.insert("session_id".to_owned(), serde_json::json!(id));
+                data.insert("session_started".to_owned(), serde_json::json!(true));
+                data.insert("session_note".to_owned(), serde_json::json!(note));
+                let kept: serde_json::Map<String, serde_json::Value> = IMPLICIT_SESSION_FIELDS
+                    .iter()
+                    .filter_map(|field| Some(((*field).to_owned(), session.get(*field)?.clone())))
+                    .collect();
+                data.insert("session".to_owned(), serde_json::Value::Object(kept));
+            }
+        };
+        let mut result = match self.route_tool(request, context.clone()).await {
+            Ok(result) => result,
+            Err(mut error) => {
+                if let Some(note) = &note {
+                    error.message = format!("{} {note}", error.message).into();
+                    let mut data = match error.data.take() {
+                        Some(serde_json::Value::Object(data)) => data,
+                        _ => serde_json::Map::new(),
+                    };
+                    annotate(&mut data);
+                    error.data = Some(serde_json::Value::Object(data));
+                }
+                return Err(error);
+            }
+        };
+        if let Some(data) = result
+            .structured_content
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            annotate(data);
+        }
+        if let Some(note) = &note {
+            result.content.push(Content::text(note.clone()));
+        }
+        // The viewer is for a window the user should see; a launch that
+        // failed has none.
+        if viewer && result.is_error != Some(true) {
+            let open = serde_json::from_value(serde_json::json!({
+                "name": "viewer_open",
+                "arguments": session_id.map_or_else(
+                    || serde_json::json!({}),
+                    |id| serde_json::json!({"session_id": id}),
+                ),
+            }))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let (shown, text) = match Box::pin(self.route_tool(open, context)).await {
+                Ok(opened) => (
+                    opened.structured_content.unwrap_or_default(),
+                    opened
+                        .content
+                        .iter()
+                        .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(error) => (
+                    serde_json::json!({"status": "unavailable", "reason": error.message}),
+                    format!("viewer_open failed: {}", error.message),
+                ),
+            };
+            if let Some(data) = result
+                .structured_content
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                data.insert("viewer".to_owned(), shown);
+            }
+            result.content.push(Content::text(format!("viewer: {text}")));
+        }
+        Ok(result)
+    }
+
+    async fn route_tool(
         &self,
         mut request: rmcp::model::CallToolRequestParams,
         context: ToolContext,
@@ -23637,6 +24569,270 @@ mod instructions_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_attribution_tests {
+    use super::{
+        HandoffEvidence, LAUNCH_BUSY_TICKS, LaunchCpu, LaunchLedger, PENDING_LAUNCH_LIFETIME,
+        PendingLaunch, SandboxProcess, WindowSnapshot, launch_cpu, launch_marker,
+        newly_mapped_window, parse_process_stat, process_launch, running_instance_window,
+    };
+    use std::time::{Duration, Instant};
+
+    fn window(id: &str, pid: i32, class: &str, title: &str, active: bool) -> WindowSnapshot {
+        WindowSnapshot {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            resource_class: class.to_owned(),
+            resource_name: class.to_owned(),
+            pid,
+            active,
+            minimized: false,
+            hidden: false,
+            modal: false,
+            transient: false,
+            dialog: false,
+            popup: false,
+            transient_for: None,
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+            stacking_order: 0,
+        }
+    }
+
+    fn process(pid: i32, parent: i32, cpu_ticks: u64, launch: Option<&str>) -> SandboxProcess {
+        SandboxProcess {
+            pid,
+            parent,
+            cpu_ticks,
+            launch: launch.map(str::to_owned),
+        }
+    }
+
+    fn pending(marker: &str, command: &str, baseline: &[&str], submitted: Instant) -> PendingLaunch {
+        PendingLaunch {
+            marker: marker.to_owned(),
+            command: command.to_owned(),
+            submitted,
+            waited: Duration::from_secs(30),
+            baseline: baseline.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_stat_line_gives_parent_and_cpu_even_with_a_spaced_command_name() {
+        let stat = "73 (Web Content) (x) S 61 61 61 0 -1 4194560 900 0 3 0 41 17 0 0 20 0 30 0 5000 1 1";
+        assert_eq!(parse_process_stat(stat), Some((61, 58)));
+        assert_eq!(parse_process_stat("73 (chrome"), None);
+    }
+
+    #[test]
+    fn the_launch_is_read_from_the_environment_or_the_nearest_ancestor() {
+        assert_eq!(
+            launch_marker(b"HOME=/h\0KWIN_MCP_LAUNCH=4-1f\0KWIN_MCP_LAUNCHED=no\0"),
+            Some("4-1f".to_owned())
+        );
+        assert_eq!(launch_marker(b"HOME=/h\0KWIN_MCP_LAUNCHED=no\0"), None);
+        // 80 is a sandboxed renderer whose environment cannot be read.
+        let table = [
+            process(1, 0, 5, None),
+            process(70, 1, 9, Some("a")),
+            process(80, 70, 30, None),
+            process(90, 1, 2, Some("b")),
+        ];
+        assert_eq!(process_launch(&table, 80), Some("a"));
+        assert_eq!(process_launch(&table, 90), Some("b"));
+        assert_eq!(process_launch(&table, 1), None);
+        assert_eq!(process_launch(&table, 999), None);
+        assert_eq!(launch_cpu(&table, "a").into_iter().collect::<Vec<_>>(), [(70, 9), (80, 30)]);
+    }
+
+    #[test]
+    fn busy_processes_are_a_slow_start_and_idle_ones_are_not() {
+        let earlier = [(70, 100), (80, 40)].into_iter().collect();
+        let working = [(70, 130), (80, 40), (81, 7)].into_iter().collect();
+        let cpu = LaunchCpu::between(Some(&earlier), Some(&working));
+        assert_eq!(
+            cpu,
+            Some(LaunchCpu {
+                processes: 3,
+                total_ticks: 177,
+                recent_ticks: 37
+            })
+        );
+        assert_eq!(cpu.map(|cpu| cpu.busy()), Some(true));
+        assert_eq!(cpu.map(|cpu| cpu.report()["state"].clone()), Some("busy".into()));
+        let resting = [(70, 100 + LAUNCH_BUSY_TICKS - 1), (80, 40)].into_iter().collect();
+        let cpu = LaunchCpu::between(Some(&earlier), Some(&resting));
+        assert_eq!(cpu.map(|cpu| cpu.busy()), Some(false));
+        assert_eq!(cpu.map(|cpu| cpu.report()["state"].clone()), Some("idle".into()));
+        // Nothing can be said without both samples, or once the processes are gone.
+        assert_eq!(LaunchCpu::between(None, Some(&working)), None);
+        assert_eq!(LaunchCpu::between(Some(&earlier), Some(&Default::default())), None);
+    }
+
+    #[test]
+    fn a_late_window_goes_to_the_launch_that_started_its_process() {
+        let now = Instant::now();
+        let mut ledger = LaunchLedger::default();
+        ledger.pending.push(pending("slow", "slow-app", &["old"], now));
+        ledger.pending.push(pending("other", "other-app", &["old"], now));
+        let table = [
+            process(70, 1, 10, Some("slow")),
+            process(71, 1, 10, Some("other")),
+            process(72, 1, 10, Some("done")),
+        ];
+        // Nothing has mapped: both keep waiting.
+        ledger.settle(&[window("old", 60, "konsole", "old", true)], Some(&table), now, true);
+        assert_eq!(ledger.pending.len(), 2);
+        assert!(ledger.late.is_empty());
+        // The second launch's window maps first, then one of a finished launch.
+        let windows = [
+            window("old", 60, "konsole", "old", false),
+            window("w-other", 71, "kdialog", "other", true),
+            window("w-done", 72, "kdialog", "done", false),
+        ];
+        ledger.settle(&windows, Some(&table), now + Duration::from_secs(40), true);
+        assert_eq!(ledger.pending.len(), 1, "the slow launch still waits");
+        assert_eq!(ledger.pending[0].marker, "slow");
+        assert_eq!(ledger.late.len(), 1);
+        assert_eq!(ledger.late[0].window, "w-other");
+        assert_eq!(ledger.late[0].command, "other-app");
+        assert_eq!(ledger.late[0].attributed_by, "process");
+        assert_eq!(ledger.late[0].report()["seen_after_seconds"], 40);
+        // A late window that closes is forgotten, and so is a launch whose
+        // processes are gone.
+        ledger.settle(&[], Some(&table[1..]), now + Duration::from_secs(50), true);
+        assert!(ledger.late.is_empty());
+        assert!(ledger.pending.is_empty());
+    }
+
+    #[test]
+    fn a_window_of_an_unknown_process_goes_to_the_oldest_waiting_launch_only_by_timing() {
+        let now = Instant::now();
+        let table = [process(70, 1, 10, Some("slow")), process(75, 1, 3, None)];
+        let windows = [window("helper", 75, "kdialog", "helper", true)];
+        let waiting = || {
+            let mut ledger = LaunchLedger::default();
+            ledger.pending.push(pending("slow", "slow-app", &[], now));
+            ledger
+        };
+        // A launch_app call that is itself waiting keeps such a window.
+        let mut ledger = waiting();
+        ledger.settle(&windows, Some(&table), now, false);
+        assert!(ledger.late.is_empty());
+        // An unreadable process table credits nothing.
+        ledger.settle(&windows, None, now, true);
+        assert!(ledger.late.is_empty());
+        assert_eq!(ledger.pending.len(), 1);
+        ledger.settle(&windows, Some(&table), now, true);
+        assert_eq!(ledger.late.len(), 1);
+        assert_eq!(ledger.late[0].attributed_by, "timing");
+        // A window some launch_app call already returned is never credited again.
+        let mut ledger = waiting();
+        ledger.claimed.push("helper".to_owned());
+        ledger.settle(&windows, Some(&table), now, true);
+        assert!(ledger.late.is_empty());
+        // A launch stops waiting after its lifetime.
+        let mut ledger = waiting();
+        let later = now + PENDING_LAUNCH_LIFETIME + Duration::from_secs(1);
+        ledger.settle(&[], Some(&table), later, true);
+        assert!(ledger.pending.is_empty());
+    }
+
+    #[test]
+    fn a_new_window_of_an_earlier_launch_is_not_this_launch_s_window() {
+        let before = [window("old", 60, "konsole", "old", true)];
+        let now = [
+            window("old", 60, "konsole", "old", false),
+            window("theirs", 70, "chrome", "Chrome", true),
+            window("mine", 71, "kdialog", "mine", false),
+        ];
+        let id = |window: Option<&WindowSnapshot>| window.map(|window| window.id.clone());
+        assert_eq!(id(newly_mapped_window(&before, &now, &[])), Some("theirs".to_owned()));
+        assert_eq!(
+            id(newly_mapped_window(&before, &now, &["theirs".to_owned()])),
+            Some("mine".to_owned())
+        );
+        assert_eq!(
+            id(newly_mapped_window(&before, &now[..2], &["theirs".to_owned()])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_second_start_of_a_running_application_names_its_open_window() {
+        let monitor = window("mon", 70, "org.kde.plasma-systemmonitor", "Overview", true);
+        let mut terminal = window("term", 60, "org.kde.konsole", "sh", false);
+        terminal.resource_name = "konsole".to_owned();
+        let open = [monitor.clone(), terminal.clone()];
+        let id = |window: Option<&WindowSnapshot>| window.map(|window| window.id.clone());
+        assert_eq!(
+            id(running_instance_window(&open, &open, "plasma-systemmonitor")),
+            Some("mon".to_owned())
+        );
+        assert_eq!(id(running_instance_window(&open, &open, "konsole")), Some("term".to_owned()));
+        // A command that is no open application's has no window, and neither
+        // has one whose only window mapped after the launch.
+        assert_eq!(id(running_instance_window(&open, &open, "true")), None);
+        assert_eq!(id(running_instance_window(&open[1..], &open, "plasma-systemmonitor")), None);
+        // Of several windows of the application, the one with the focus.
+        let mut second = terminal.clone();
+        second.id = "term-2".to_owned();
+        let two = [monitor, terminal.clone(), second.clone()];
+        assert_eq!(id(running_instance_window(&two, &two, "konsole")), None);
+        second.active = true;
+        let two = [terminal, second];
+        assert_eq!(id(running_instance_window(&two, &two, "konsole")), Some("term-2".to_owned()));
+    }
+
+    #[test]
+    fn a_browser_hand_off_names_the_window_that_took_the_request() {
+        let picker = window("picker", 70, "google-chrome", "Google Chrome", true);
+        let page = window("page", 70, "google-chrome", "Example - Google Chrome", false);
+        let terminal = window("term", 60, "konsole", "sh", false);
+        let id = |target: Option<(&WindowSnapshot, &'static str)>| {
+            target.map(|(window, evidence)| (window.id.clone(), evidence))
+        };
+        // Nothing changed: the browser window with the focus took it.
+        let mut evidence = HandoffEvidence::default();
+        let before = [picker.clone(), page.clone(), terminal.clone()];
+        evidence.observe(&before, &before);
+        assert_eq!(
+            id(evidence.target(&before)),
+            Some(("picker".to_owned(), "active_browser_window"))
+        );
+        // A title that changed for one poll only still marks its window.
+        let mut retitled = page.clone();
+        retitled.title = "example.com/ - Google Chrome".to_owned();
+        evidence.observe(&before, &[picker.clone(), retitled, terminal.clone()]);
+        evidence.observe(&before, &before);
+        assert_eq!(
+            id(evidence.target(&before)),
+            Some(("page".to_owned(), "window_changed"))
+        );
+        // Two changed windows cannot be told apart.
+        let mut raised = picker.clone();
+        raised.title = "Profiles".to_owned();
+        evidence.observe(&before, &[raised, page.clone(), terminal.clone()]);
+        assert_eq!(id(evidence.target(&before)), None);
+        // With the focus elsewhere, a single browser window is the one.
+        let mut focused = terminal.clone();
+        focused.active = true;
+        let mut unfocused = page.clone();
+        unfocused.active = false;
+        let one = [focused.clone(), unfocused.clone()];
+        assert_eq!(
+            id(HandoffEvidence::default().target(&one)),
+            Some(("page".to_owned(), "only_browser_window"))
+        );
+        let mut second = unfocused.clone();
+        second.id = "page-2".to_owned();
+        assert_eq!(id(HandoffEvidence::default().target(&[focused, unfocused, second])), None);
     }
 }
 
