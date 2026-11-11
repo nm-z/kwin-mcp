@@ -2055,6 +2055,9 @@ struct ShareLink {
     grant: Arc<Mutex<links::Grant>>,
     changed: Arc<AtomicBool>,
     reports: Option<Arc<Mutex<std::os::unix::net::UnixStream>>>,
+    // Without a scheduler: the budget and the frame socket, for a viewer
+    // that reports a slower link of its own.
+    alone: Option<(Option<u64>, Arc<std::net::TcpStream>)>,
 }
 
 impl ShareLink {
@@ -2064,8 +2067,12 @@ impl ShareLink {
         use std::io::Read;
         use std::os::fd::{AsFd, AsRawFd};
         let whole = links::Grant { pace: budget.unwrap_or(0), share: budget.unwrap_or(0), streams: 1 };
-        let mut link =
-            Self { grant: Arc::new(Mutex::new(whole)), changed: Arc::new(AtomicBool::new(false)), reports: None };
+        let mut link = Self {
+            grant: Arc::new(Mutex::new(whole)),
+            changed: Arc::new(AtomicBool::new(false)),
+            reports: None,
+            alone: frames.try_clone().ok().map(|frames| (budget, Arc::new(frames))),
+        };
         let Some(budget) = budget else { return link };
         let stdout = std::io::stdout();
         let shared = getsockname::<SockaddrStorage>(stdout.as_fd().as_raw_fd())
@@ -2088,6 +2095,7 @@ impl ShareLink {
         *link.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = links::Grant::decode(&record);
         let Ok(reader) = listener.try_clone() else { return link };
         link.reports = Some(Arc::new(Mutex::new(listener)));
+        link.alone = None;
         let (grant, changed) = (Arc::clone(&link.grant), Arc::clone(&link.changed));
         let spawned = std::thread::Builder::new().name("link-share".to_owned()).spawn(move || {
             let mut record = [0u8; links::GRANT_BYTES];
@@ -2128,6 +2136,14 @@ impl ShareLink {
         if let Some(reports) = &self.reports {
             let mut reports = reports.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = reports.write_all(&report.encode());
+        } else if let (links::Report::Cap(Some(cap)), Some((budget, frames))) = (report, &self.alone) {
+            // Nobody to share with: the stream holds itself to the slower of
+            // its own link and the viewer's.
+            let pace = budget.map_or(cap, |budget| budget.min(cap)).max(1);
+            let _ = viewer_stream::pace(&**frames, pace);
+            *self.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                links::Grant { pace, share: pace, streams: 1 };
+            self.changed.store(true, Ordering::Release);
         }
     }
 }
@@ -3552,18 +3568,23 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
             // One pass for each frame socket: the first, and one for every
             // time the path of the one before died.
             loop {
+                let mut path_checked = Instant::now();
                 let died = loop {
+                    // Once a second, whether pictures arrive or not (a dead
+                    // path delivers none): is the socket's path still one?
+                    if path_checked.elapsed() >= STREAM_PATH_CHECK {
+                        path_checked = Instant::now();
+                        let interface = stats.path().interface.clone();
+                        if let Some(reason) = paths.dead(&interface) {
+                            break Some(reason);
+                        }
+                    }
                     let next = handle
                         .block_on(async { tokio::time::timeout(STREAM_PATH_CHECK, stream.next()).await });
                     match next {
-                        // Nothing arrived: a still screen, or a dead path.
                         Err(_) => {
                             if shutdown.requested() {
                                 break None;
-                            }
-                            let interface = stats.path().interface.clone();
-                            if let Some(reason) = paths.dead(&interface) {
-                                break Some(reason);
                             }
                         }
                         Ok(Some(Ok(Message::Binary(message)))) => {

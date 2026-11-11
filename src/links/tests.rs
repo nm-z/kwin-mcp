@@ -10,7 +10,8 @@ const MEGABIT: u64 = 1_000_000;
 const BUDGET: u64 = 900 * MEGABIT;
 
 fn grant(shares: &Shares, id: u64) -> Grant {
-    first(shares.grants(), |(stream, _)| *stream == id).map_or_else(Grant::default, |(_, grant)| grant)
+    first(shares.grants(), |(stream, _)| *stream == id)
+        .map_or_else(Grant::default, |(_, grant)| grant)
 }
 
 /// The paces of the streams with a picture on the wire, added up.
@@ -216,7 +217,8 @@ fn a_stream_behind_a_slower_link_leaves_the_rest_to_the_others() {
 }
 
 fn address(text: &str) -> IpAddr {
-    text.parse().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    text.parse()
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
 }
 
 fn interface(name: &str, wireless: bool, mbps: Option<u64>, addresses: &[(&str, u8)]) -> Interface {
@@ -282,7 +284,10 @@ fn the_paths_are_the_running_interfaces_in_the_peers_subnet_wired_first() {
     // Half of what the wireless interface receives at.
     assert_eq!(paths[1].usable_bits_per_second(), 432 * MEGABIT);
     assert_eq!(paths[0].describe(), "enp10s0 (192.168.1.211, 1000 Mb/s)");
-    assert_eq!(paths[1].describe(), "wlan0 (192.168.1.6, 864 Mb/s, wireless)");
+    assert_eq!(
+        paths[1].describe(),
+        "wlan0 (192.168.1.6, 864 Mb/s, wireless)"
+    );
 
     // The routing table may prefer the wireless one; wired still comes first.
     let paths = paths_to(&table, peer, Some(address("192.168.1.6")));
@@ -302,8 +307,17 @@ fn the_paths_are_the_running_interfaces_in_the_peers_subnet_wired_first() {
     assert_eq!(paths[0].source, address("fd00::211"));
     assert_eq!(paths_to(&table, address("fe80::20"), None), []);
     // A machine with one interface has one path.
-    let wired_only = [interface("enp0s25", false, Some(1000), &[("192.168.1.20", 24)])];
-    let paths = paths_to(&wired_only, address("192.168.1.211"), Some(address("192.168.1.20")));
+    let wired_only = [interface(
+        "enp0s25",
+        false,
+        Some(1000),
+        &[("192.168.1.20", 24)],
+    )];
+    let paths = paths_to(
+        &wired_only,
+        address("192.168.1.211"),
+        Some(address("192.168.1.20")),
+    );
     assert_eq!(names(&paths), ["enp0s25"]);
     // Two wired interfaces: the faster first.
     let two_wired = [
@@ -320,8 +334,16 @@ fn the_paths_are_the_running_interfaces_in_the_peers_subnet_wired_first() {
 fn the_first_stream_takes_the_wired_path_whatever_the_wireless_one_reports() {
     for wireless in [Some(864), Some(2400), Some(5000), None] {
         let table = two_paths(wireless);
-        let paths = paths_to(&table, address("192.168.1.20"), Some(address("192.168.1.6")));
-        assert_eq!(chosen(&paths, &[], "sentry:47913"), "enp10s0", "{wireless:?}");
+        let paths = paths_to(
+            &table,
+            address("192.168.1.20"),
+            Some(address("192.168.1.6")),
+        );
+        assert_eq!(
+            chosen(&paths, &[], "sentry:47913"),
+            "enp10s0",
+            "{wireless:?}"
+        );
     }
     // Without a wired path the wireless one carries it, speed or no speed.
     let wireless_only = [interface("wlan0", true, None, &[("192.168.1.6", 24)])];
@@ -347,7 +369,11 @@ fn a_second_path_is_used_only_when_it_gives_more_than_a_fair_share_of_the_first(
     assert_eq!(fair_share(&slow[1], &two, "benji:47913"), 432 * MEGABIT);
     assert_eq!(chosen(&slow, &two, "benji:47913"), "wlan0");
     // The fourth: 300 on the wire against 216 beside the wireless stream.
-    let three = [two[0].clone(), two[1].clone(), load("wlan0", "benji:47913", Some(900))];
+    let three = [
+        two[0].clone(),
+        two[1].clone(),
+        load("wlan0", "benji:47913", Some(900)),
+    ];
     assert_eq!(chosen(&slow, &three, "azb1:47913"), "enp10s0");
 
     // A faster wireless link (2400 Mb/s carries 1200) takes the second.
@@ -398,7 +424,10 @@ fn a_listed_table_reads_as_paths() -> Result<(), serde_json::Error> {
         table.registry.as_deref(),
         Some(std::path::Path::new("/run/user/1000/test-streams"))
     );
-    assert_eq!(serde_json::from_str::<PathTable>(r#"{"paths":[]}"#)?, PathTable::default());
+    assert_eq!(
+        serde_json::from_str::<PathTable>(r#"{"paths":[]}"#)?,
+        PathTable::default()
+    );
     Ok(())
 }
 
@@ -414,12 +443,18 @@ fn the_registry_counts_the_streams_of_running_viewers_only() -> std::io::Result<
     );
     // Nothing is open: the wired path, and this process is recorded on it.
     let own = registry.claim(&paths, "sentry:47913")?;
-    assert_eq!(own.as_ref().map(|path| path.interface.as_str()), Some("enp10s0"));
+    assert_eq!(
+        own.as_ref().map(|path| path.interface.as_str()),
+        Some("enp10s0")
+    );
     let recorded = dir.join(format!("{}.json", std::process::id()));
     assert!(std::fs::read_to_string(&recorded)?.contains("enp10s0"));
     // This process's own stream does not count against itself.
     let again = registry.claim(&paths, "sentry:47913")?;
-    assert_eq!(again.map(|path| path.interface), own.map(|path| path.interface));
+    assert_eq!(
+        again.map(|path| path.interface),
+        own.map(|path| path.interface)
+    );
     registry.sender_budget("enp10s0", "sentry:47913", Some(900 * MEGABIT))?;
     assert!(std::fs::read_to_string(&recorded)?.contains("900000000"));
     // Another viewer that runs (this test's parent, with its start time) is
@@ -436,11 +471,16 @@ fn the_registry_counts_the_streams_of_running_viewers_only() -> std::io::Result<
     assert_eq!(next.map(|path| path.interface).as_deref(), Some("wlan0"));
     // A file of a process that is gone, or of a later process with the same
     // number, is not a stream, and is removed.
-    for (name, pid, started) in [("gone", 0x3fff_fff0u32, 1u64), ("reused", parent, started + 1)] {
+    for (name, pid, started) in [
+        ("gone", 0x3fff_fff0u32, 1u64),
+        ("reused", parent, started + 1),
+    ] {
         let stale = dir.join(format!("{name}.json"));
         std::fs::write(
             &stale,
-            format!(r#"{{"pid":{pid},"started":{started},"interface":"wlan0","peer":"benji:47913"}}"#),
+            format!(
+                r#"{{"pid":{pid},"started":{started},"interface":"wlan0","peer":"benji:47913"}}"#
+            ),
         )?;
         registry.claim(&paths, "archy:47913")?;
         assert!(!stale.exists(), "{name}");
@@ -487,7 +527,10 @@ fn the_receive_rate_is_read_from_a_stations_nested_attributes() {
     assert_eq!(nl80211::receive_rate(&sending_only), None);
     assert_eq!(nl80211::receive_rate(&station[..station.len() - 3]), None);
     assert_eq!(nl80211::receive_rate(&[]), None);
-    assert_eq!(nl80211::lookup(&[9, 0, 1, 0, 1, 2, 3, 4, 5, 0, 0, 0], 1), Some(&[1u8, 2, 3, 4, 5][..]));
+    assert_eq!(
+        nl80211::lookup(&[9, 0, 1, 0, 1, 2, 3, 4, 5, 0, 0, 0], 1),
+        Some(&[1u8, 2, 3, 4, 5][..])
+    );
     assert_eq!(nl80211::lookup(&[2, 0, 1, 0], 1), None);
 
     // A reply datagram: two station messages, then the end of the dump.

@@ -234,7 +234,10 @@ pub enum Notice {
     /// sending pictures in a row, and this one has `bits_per_second`. Until
     /// the first one, a stream has the whole budget `hello` named. For the
     /// viewer's log and counters only.
-    Share { bits_per_second: u64, streams: u32 },
+    Share {
+        bits_per_second: u64,
+        streams: u32,
+    },
     /// A type this build does not know. It is ignored.
     #[serde(other)]
     Unknown,
@@ -604,10 +607,8 @@ impl ModeControl {
         }
         self.share = Some(share);
         self.link = Some(match self.link.filter(|_| self.link_measured) {
-            Some(link) => {
-                narrow(u128::from(link) * u128::from(share) / u128::from(before.max(1)))
-                    .clamp(1, budget.max(1))
-            }
+            Some(link) => narrow(u128::from(link) * u128::from(share) / u128::from(before.max(1)))
+                .clamp(1, budget.max(1)),
             None => share,
         });
     }

@@ -747,15 +747,13 @@ async fn connect_from(
     let peers = tokio::net::lookup_host(authority)
         .await
         .map_err(|error| format!("could not resolve {authority}: {error}"))?;
-    let peer = crate::links::first(peers, |peer| {
-        peer.is_ipv4() == source.address.is_ipv4()
-    })
-    .ok_or_else(|| {
-        format!(
-            "{authority} has no address of the family of {}",
-            source.address
-        )
-    })?;
+    let peer = crate::links::first(peers, |peer| peer.is_ipv4() == source.address.is_ipv4())
+        .ok_or_else(|| {
+            format!(
+                "{authority} has no address of the family of {}",
+                source.address
+            )
+        })?;
     let socket = if peer.is_ipv4() {
         tokio::net::TcpSocket::new_v4()
     } else {

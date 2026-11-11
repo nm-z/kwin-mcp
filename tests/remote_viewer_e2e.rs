@@ -611,10 +611,18 @@ fn difference(left: &[u8], right: &[u8], width: u32, skip: (u32, u32, u32, u32))
     (differing, largest)
 }
 
+/// The text file the sessions scroll: `KWIN_MCP_TEST_SCROLL_TEXT`, or this
+/// repository's README where the test was built (a test built on another
+/// machine names a file of this one).
+fn text_to_scroll() -> String {
+    std::env::var("KWIN_MCP_TEST_SCROLL_TEXT")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/README.md").to_owned())
+}
+
 /// A command for `launch_app` that scrolls text in a maximized Konsole for
 /// `scroll` seconds, pauses for `pause` seconds, and starts again.
 fn scrolling_text(scroll: u32, pause: u32) -> String {
-    let text = concat!(env!("CARGO_MANIFEST_DIR"), "/README.md");
+    let text = text_to_scroll();
     format!(
         "konsole -e bash -c 'while :; do end=$((SECONDS+{scroll})); while [ $SECONDS -lt $end ]; do cat {text}; done; sleep {pause}; done'"
     )
@@ -1677,10 +1685,13 @@ fn two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches(
     let home = home_with_secret("soak", "shared-secret-0123456789");
     let mut desk = Desk::start(&home, 2700, 1500);
 
-    // A 40 Mb/s link carries 36 Mb/s. A 1280x720 frame would take 614 ms raw
-    // and goes out as DSC at 6 bpp (154 ms); a 480x270 frame takes 86 ms raw
-    // and goes out exactly. Every resize between the two changes the mode.
-    let listener = Listener::start(&home, &["--link-mbps", "40"]);
+    // A 80 Mb/s link carries 72 Mb/s, which the two streams share: 36 Mb/s
+    // each while both scroll, all of it for one while the other pauses. A
+    // 1280x720 frame would take 307 ms raw even alone and goes out as DSC
+    // (6 bpp, 154 ms, with half the link); a 480x270 frame takes 86 ms raw
+    // even with half and goes out exactly. Every resize between the two
+    // changes the mode.
+    let listener = Listener::start(&home, &["--link-mbps", "80"]);
     let host = listener.address.clone();
     let mut server = Server::start(&home, "server", Some(&desk.display()), None);
     let mut streams: Vec<Soaked> = (0..2)
@@ -1889,6 +1900,485 @@ fn two_viewers_stay_stable_through_minutes_of_changes_resizes_and_mode_switches(
             let _ = std::fs::remove_dir_all(directory);
         }
     }
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// A command for `launch_app` that scrolls text in Konsole for as long as the
+/// file `gate` exists. A session's work directory is the same path inside
+/// the session and outside, so the test starts and stops the scrolling.
+fn gated_scrolling_text(gate: &Path) -> String {
+    let text = text_to_scroll();
+    format!(
+        "konsole -e bash -c 'while :; do if [ -e {} ]; then cat {text}; else sleep 0.1; fi; done'",
+        gate.display()
+    )
+}
+
+/// One of several streams that leave a listener on one interface.
+struct Shared {
+    session: String,
+    workdir: PathBuf,
+    /// The session scrolls text while this file exists.
+    gate: PathBuf,
+    viewer: Viewer,
+}
+
+impl Shared {
+    fn open(server: &mut Server, host: &str, size: (u32, u32)) -> Self {
+        let (session, workdir) =
+            server.start_session(json!({"host":host, "width":size.0, "height":size.1}));
+        let gate = workdir.join("scroll");
+        server.tool(
+            "launch_app",
+            json!({
+                "session_id":session,
+                "command":gated_scrolling_text(&gate),
+                "window_timeout_seconds":40,
+            }),
+        );
+        let opened = server.tool("viewer_open", json!({"session_id":session}));
+        let viewer = Viewer::opened(&opened, "opened", host);
+        viewer.sized(u64::from(size.0), u64::from(size.1));
+        Self {
+            session,
+            workdir,
+            gate,
+            viewer,
+        }
+    }
+
+    fn scroll(&self, on: bool) {
+        if on {
+            std::fs::write(&self.gate, "").expect("start the scrolling");
+        } else {
+            let _ = std::fs::remove_file(&self.gate);
+        }
+    }
+
+    /// Waits until the viewer's counters say the stream has `share` Mb/s
+    /// among `streams` streams and `accepted` holds, and returns them.
+    fn sharing(&self, share: f64, streams: u64, accepted: impl Fn(&Value) -> bool) -> Value {
+        wait_for(
+            &format!("a share of {share} Mb/s among {streams} streams"),
+            Duration::from_secs(30),
+            || {
+                self.viewer.counters().filter(|counters| {
+                    counters["path"]["streams"] == streams
+                        && counters["path"]["share_mbps"].as_f64() == Some(share)
+                        && accepted(counters)
+                })
+            },
+        )
+    }
+
+    fn sender_log(&self) -> String {
+        std::fs::read_to_string(self.workdir.join("viewer.log")).unwrap_or_default()
+    }
+}
+
+/// What each of `streams` received in Mb/s, as the mean of the seconds its
+/// viewer reported during `seconds` seconds.
+fn received_mbps(streams: &[&Shared], seconds: u64) -> Vec<f64> {
+    let mut samples: Vec<Vec<(u64, f64)>> = streams.iter().map(|_| Vec::new()).collect();
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until {
+        for (stream, samples) in streams.iter().zip(&mut samples) {
+            let Some(counters) = stream.viewer.counters() else {
+                continue;
+            };
+            // One report a second; the total of frames tells them apart.
+            let report = (
+                counters["frames"].as_u64().unwrap_or(0),
+                counters["last_second"]["megabits_per_second"]
+                    .as_f64()
+                    .unwrap_or(0.0),
+            );
+            if samples.last().is_none_or(|last| last.0 != report.0) {
+                samples.push(report);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    samples
+        .iter()
+        .map(|samples| {
+            // The first report may hold a second from before the sampling.
+            let counted = samples.get(1..).unwrap_or(&[]);
+            assert!(counted.len() >= 2, "too few reports: {samples:?}");
+            counted.iter().map(|sample| sample.1).sum::<f64>()
+                / f64::from(u32::try_from(counted.len()).expect("sample count"))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn viewers_on_one_interface_share_its_budget_and_an_idle_ones_share_is_taken_over() {
+    // A 80 Mb/s link carries 72 Mb/s. A 640x360 frame is 5.5 Mbit raw:
+    // 77 ms with the whole budget, so a stream alone sends exact pixels;
+    // 154 ms with half of it, so two streams send DSC at 12 bpp (2.8 Mbit,
+    // 77 ms); with a third of it the rate falls below 12 bpp.
+    const SIZE: (u32, u32) = (640, 360);
+    const BUDGET: f64 = 72.0;
+    const SAMPLE_SECONDS: u64 = 8;
+    let home = home_with_secret("share", "shared-secret-0123456789");
+    let desk = Desk::start(&home, 2200, 900);
+    let listener = Listener::start(&home, &["--link-mbps", "80"]);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home, "server", Some(&desk.display()), None);
+    let scrolling = |counters: &Value, mode: &str| {
+        counters["stream_mode"] == mode
+            && counters["last_second"]["frames"]
+                .as_u64()
+                .is_some_and(|frames| frames >= 3)
+    };
+    let mut rows = Vec::new();
+    let mut measured = |what: &str, streams: &[&Shared]| {
+        let rates = received_mbps(streams, SAMPLE_SECONDS);
+        let total: f64 = rates.iter().sum();
+        let row = format!(
+            "| {what} | {} | {total:.1} | {BUDGET} |",
+            rates
+                .iter()
+                .map(|rate| format!("{rate:.1}"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+        eprintln!("{row}");
+        rows.push(row);
+        (rates, total)
+    };
+
+    // One stream scrolls alone: the whole budget, exact pixels.
+    let first = Shared::open(&mut server, &host, SIZE);
+    // viewer_open names the path and the share.
+    let opened = server.tool("viewer_open", json!({"session_id":first.session}));
+    assert_eq!(opened["status"], "already_open", "{opened}");
+    let path = &opened["viewer"]["path"];
+    assert_eq!(path["interface"], "lo", "{opened}");
+    assert_eq!(path["bound"], "route", "{opened}");
+    assert_eq!(path["budget_mbps"].as_f64(), Some(BUDGET), "{opened}");
+    assert_eq!(path["share_mbps"].as_f64(), Some(BUDGET), "{opened}");
+    assert_eq!(path["streams"], 1, "{opened}");
+    assert!(
+        path["sender_link"]
+            .as_str()
+            .is_some_and(|link| link.contains("--link-mbps 80")),
+        "{opened}"
+    );
+    first.scroll(true);
+    let alone = first.sharing(BUDGET, 1, |counters| scrolling(counters, "raw"));
+    assert_eq!(
+        alone["frame_bytes"],
+        header_bytes() + u64::from(SIZE.0 * SIZE.1) * 3,
+        "{alone}"
+    );
+    let (_, total) = measured("one stream", &[&first]);
+    assert!(
+        (BUDGET * 0.7..=BUDGET * 1.03).contains(&total),
+        "a stream alone received {total:.1} Mb/s of {BUDGET}"
+    );
+
+    // A second viewer scrolls too: half each, and both go to DSC, because
+    // exact pixels would now take longer than a tenth of a second.
+    let second = Shared::open(&mut server, &host, SIZE);
+    second.scroll(true);
+    for stream in [&first, &second] {
+        let halved = stream.sharing(BUDGET / 2.0, 2, |counters| scrolling(counters, "dsc"));
+        assert_eq!(halved["bits_per_pixel"].as_f64(), Some(12.0), "{halved}");
+    }
+    let (rates, total) = measured("two streams", &[&first, &second]);
+    assert!(
+        (BUDGET * 0.8..=BUDGET * 1.03).contains(&total),
+        "two streams received {total:.1} Mb/s of {BUDGET}: {rates:?}"
+    );
+    for rate in &rates {
+        assert!(
+            (BUDGET * 0.35..=BUDGET * 0.65).contains(rate),
+            "the two streams received {rates:?} Mb/s"
+        );
+    }
+
+    // A third: a third each, at a lower DSC rate.
+    let third = Shared::open(&mut server, &host, SIZE);
+    third.scroll(true);
+    for stream in [&first, &second, &third] {
+        let third_each = stream.sharing(BUDGET / 3.0, 3, |counters| {
+            scrolling(counters, "dsc")
+                && counters["bits_per_pixel"]
+                    .as_f64()
+                    .is_some_and(|rate| rate < 12.0)
+        });
+        assert!(
+            third_each["bits_per_pixel"]
+                .as_f64()
+                .is_some_and(|rate| rate >= 6.0),
+            "{third_each}"
+        );
+    }
+    let (rates, total) = measured("three streams", &[&first, &second, &third]);
+    assert!(
+        (BUDGET * 0.8..=BUDGET * 1.03).contains(&total),
+        "three streams received {total:.1} Mb/s of {BUDGET}: {rates:?}"
+    );
+    for rate in &rates {
+        assert!(
+            (BUDGET * 0.2..=BUDGET * 0.47).contains(rate),
+            "the three streams received {rates:?} Mb/s"
+        );
+    }
+
+    // Two of them stop: their screens settle to exact pixels, and the one
+    // that still scrolls has the whole budget again and returns to raw.
+    second.scroll(false);
+    third.scroll(false);
+    for stream in [&second, &third] {
+        let still = stream.viewer.still_and_exact();
+        assert_eq!(still["mode"], "raw", "{still}");
+    }
+    let again = first.sharing(BUDGET, 1, |counters| scrolling(counters, "raw"));
+    assert!(
+        again["mode_switches"]
+            .as_u64()
+            .is_some_and(|switches| switches >= 2),
+        "{again}"
+    );
+    let (_, total) = measured("one stream again", &[&first]);
+    assert!(
+        (BUDGET * 0.7..=BUDGET * 1.03).contains(&total),
+        "the stream that carried on received {total:.1} Mb/s of {BUDGET}"
+    );
+    first.scroll(false);
+    first.viewer.still_and_exact();
+
+    // Both ends name the share in their logs, and nothing failed.
+    let sender_log = first.sender_log();
+    for expected in [
+        "share 72 Mb/s among 1 streams",
+        "36 Mb/s, its share of 72 Mb/s among 2 streams on lo, --link-mbps 80",
+        "24 Mb/s, its share of 72 Mb/s among 3 streams on lo, --link-mbps 80",
+    ] {
+        assert!(sender_log.contains(expected), "{expected}\n{sender_log}");
+    }
+    let viewer_log = first.viewer.log_text();
+    for expected in [
+        "path lo (127.0.0.1, no speed reported) from ",
+        "share 36 Mb/s of 72 Mb/s among 2 streams",
+        "share 24 Mb/s of 72 Mb/s among 3 streams",
+    ] {
+        assert!(viewer_log.contains(expected), "{expected}\n{viewer_log}");
+    }
+    for stream in [&first, &second, &third] {
+        let log = stream.viewer.log_text();
+        assert!(stream_errors(&log).is_empty(), "{log}");
+        let log = stream.sender_log();
+        assert!(stream_errors(&log).is_empty(), "{log}");
+    }
+    eprintln!("| streams scrolling | received Mb/s | sum | budget |\n|---|---|---|---|");
+    for row in &rows {
+        eprintln!("{row}");
+    }
+
+    for stream in [&first, &second, &third] {
+        server.tool("session_stop", json!({"session_id":stream.session}));
+        stopped("the window to close with its session", stream.viewer.pid);
+    }
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+    desk.stop();
+    drop(server);
+    drop(listener);
+    std::fs::remove_dir_all(home).expect("remove the test HOME");
+}
+
+/// What a stream viewer last wrote about its path.
+fn stream_path(viewer: &Viewer) -> Option<Value> {
+    read_json(&viewer.log.parent()?.join(kwin_mcp::links::PATH_FILE))
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, Vulkan, and input devices"]
+fn a_stream_is_bound_to_its_path_and_moves_to_another_when_that_path_dies() {
+    let home = home_with_secret("paths", "shared-secret-0123456789");
+    let mut desk = Desk::start(&home, 1800, 1000);
+    // Two paths to the listener in place of this machine's interfaces. Both
+    // are loopback addresses, so the sockets are real: "lo" is a wired
+    // gigabit path, and "spare0" a wireless one that carries more than half
+    // of it. No interface is called spare0, so that socket can be bound to
+    // its address only.
+    let table = home.join("paths.json");
+    let registry = home.join("streams");
+    let list = |paths: Value| {
+        let temporary = table.with_extension("tmp");
+        std::fs::write(
+            &temporary,
+            json!({"registry":registry, "paths":paths}).to_string(),
+        )
+        .expect("write the path table");
+        std::fs::rename(&temporary, &table).expect("place the path table");
+    };
+    let wired = json!({"interface":"lo", "source":"127.0.0.2", "mbps":1000});
+    let wireless =
+        json!({"interface":"spare0", "source":"127.0.0.3", "mbps":2400, "wireless":true});
+    list(json!([wireless, wired]));
+    let listener = Listener::start(&home, &[]);
+    let host = listener.address.clone();
+    let mut command = kwin_mcp(&home);
+    command.env(kwin_mcp::links::PATHS_ENV, &table);
+    let mut server = Server::start_command(command, &home, "server", Some(&desk.display()), None);
+    let open = |server: &mut Server| {
+        let (session, workdir) =
+            server.start_session(json!({"host":host, "width":800, "height":450}));
+        server.tool(
+            "launch_app",
+            json!({"session_id":session, "command":"konsole", "window_timeout_seconds":40}),
+        );
+        let opened = server.tool("viewer_open", json!({"session_id":session}));
+        let viewer = Viewer::opened(&opened, "opened", &host);
+        (session, workdir, viewer, opened)
+    };
+    let sender_log =
+        |workdir: &Path| std::fs::read_to_string(workdir.join("viewer.log")).unwrap_or_default();
+
+    // The first stream takes the wired path: its socket is bound to that
+    // path's address before it connects, and the listener sees it come from
+    // there.
+    let (first, first_dir, first_viewer, opened) = open(&mut server);
+    let path = &opened["viewer"]["path"];
+    assert_eq!(path["interface"], "lo", "{opened}");
+    assert_eq!(path["source"], "127.0.0.2", "{opened}");
+    assert_eq!(path["link_mbps"], 1000, "{opened}");
+    assert_eq!(path["reconnects"], 0, "{opened}");
+    // SO_BINDTODEVICE is allowed without privileges since Linux 5.7.
+    let bound = path["bound"].as_str().expect("how the socket was bound");
+    eprintln!("the socket on lo was bound to its {bound}");
+    assert!(["device", "address"].contains(&bound), "{opened}");
+    let log = sender_log(&first_dir);
+    assert!(log.contains("stream: viewer 127.0.0.2:"), "{log}");
+
+    // The second takes the wireless path, which gives it more than half of
+    // the wired one: bound to that path's address.
+    let (second, second_dir, second_viewer, opened) = open(&mut server);
+    let path = &opened["viewer"]["path"];
+    assert_eq!(path["interface"], "spare0", "{opened}");
+    assert_eq!(path["source"], "127.0.0.3", "{opened}");
+    assert_eq!(path["bound"], "address", "{opened}");
+    assert_eq!(path["wireless"], true, "{opened}");
+    let log = sender_log(&second_dir);
+    assert!(log.contains("stream: viewer 127.0.0.3:"), "{log}");
+    // Both are counted where the next viewer looks.
+    let counted = std::fs::read_dir(&registry)
+        .expect("the registry")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|kind| kind == "json"))
+        .count();
+    assert_eq!(counted, 2);
+
+    // The first window shows a still screen.
+    desk.activate(&first);
+    let frames_before = first_viewer.idle()["frames"].as_u64().expect("frames");
+    let sender_before = sender_pid(&first_dir);
+    let before = desk.tool("screenshot", json!({}));
+    keep_evidence(&before, "916-before-the-path-died.png");
+
+    // The wired path dies. The stream moves to the other one: a new frame
+    // socket from that path's address and a new sender, the same window.
+    list(json!([wireless]));
+    let moved = wait_for(
+        "the stream on the other path",
+        Duration::from_secs(30),
+        || stream_path(&first_viewer).filter(|path| path["reconnects"] == 1),
+    );
+    // The new sender's first frame is the screen as it is.
+    wait_for("a frame on the other path", Duration::from_secs(15), || {
+        (first_viewer.frames() > frames_before).then_some(())
+    });
+    assert_eq!(moved["interface"], "spare0", "{moved}");
+    assert_eq!(moved["source"], "127.0.0.3", "{moved}");
+    assert!(alive(first_viewer.pid), "the window closed");
+    let sender_after = wait_for("the new frame sender", Duration::from_secs(15), || {
+        read_json(&first_dir.join("viewer-status.json"))
+            .filter(|status| status["state"] == "ready")
+            .and_then(|status| status["pid"].as_u64())
+            .filter(|pid| *pid != sender_before)
+    });
+    stopped("the sender on the dead path", sender_before);
+    assert!(alive(sender_after));
+    let log = sender_log(&first_dir);
+    assert!(log.contains("stream: viewer 127.0.0.3:"), "{log}");
+    let viewer_log = first_viewer.log_text();
+    for expected in [
+        "the path over lo died",
+        "the window keeps its picture",
+        "reconnected: path spare0 (127.0.0.3, 2400 Mb/s, wireless)",
+    ] {
+        assert!(viewer_log.contains(expected), "{expected}\n{viewer_log}");
+    }
+    // The window shows the picture it showed before.
+    first_viewer.idle();
+    desk.activate(&first);
+    let after = desk.tool("screenshot", json!({}));
+    keep_evidence(&after, "916-after-the-stream-moved.png");
+    let picture = |shot: &Value| decoded_png(Path::new(shot["path"].as_str().expect("path")));
+    assert!(
+        picture(&before) == picture(&after),
+        "the window's picture changed with the path"
+    );
+
+    // The stream works on its new path, in both directions: the agent's
+    // typing arrives as frames, and keys typed into the window reach the
+    // session.
+    let frames = first_viewer.frames();
+    let typed = first_dir.join("typed-after-the-move");
+    for character in format!("touch {}\n", typed.display()).chars() {
+        let key = match character {
+            ' ' => "Space".to_owned(),
+            '/' => "slash".to_owned(),
+            '-' => "minus".to_owned(),
+            '\n' => "Return".to_owned(),
+            other => other.to_string(),
+        };
+        desk.tool("keyboard_key", json!({"key":key}));
+    }
+    wait_for(
+        "the file made from the window",
+        Duration::from_secs(10),
+        || typed.exists().then_some(()),
+    );
+    wait_for("frames on the new path", Duration::from_secs(10), || {
+        (first_viewer.frames() > frames).then_some(())
+    });
+    let moved_shot = desk.tool("screenshot", json!({}));
+    keep_evidence(&moved_shot, "916-typed-on-the-new-path.png");
+    assert!(
+        picture(&moved_shot) != picture(&after),
+        "the window did not show what was typed"
+    );
+    // viewer_open reports the window it has, on the path it has now.
+    let again = server.tool("viewer_open", json!({"session_id":first}));
+    assert_eq!(
+        Viewer::opened(&again, "already_open", &host).pid,
+        first_viewer.pid
+    );
+    assert_eq!(again["viewer"]["path"]["interface"], "spare0", "{again}");
+    assert_eq!(again["viewer"]["path"]["reconnects"], 1, "{again}");
+
+    // The other stream never moved.
+    let other = stream_path(&second_viewer).expect("the second path");
+    assert_eq!(other["reconnects"], 0, "{other}");
+    assert!(alive(second_viewer.pid));
+    for viewer in [&first_viewer, &second_viewer] {
+        let log = viewer.log_text();
+        assert!(stream_errors(&log).is_empty(), "{log}");
+    }
+
+    for (session, viewer) in [(&first, &first_viewer), (&second, &second_viewer)] {
+        server.tool("session_stop", json!({"session_id":session}));
+        stopped("the window to close with its session", viewer.pid);
+    }
+    assert_eq!(viewers_under(&home), [], "viewers or senders still run");
+    desk.stop();
+    drop(server);
+    drop(listener);
     std::fs::remove_dir_all(home).expect("remove the test HOME");
 }
 

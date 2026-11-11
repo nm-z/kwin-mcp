@@ -71,13 +71,17 @@ pub const PATHS_ENV: &str = "KWIN_VIEWER_STREAM_PATHS";
 const BITS_PER_MEGABIT: u64 = 1_000_000;
 
 /// The first of `items` that `wanted` accepts.
-pub fn first<T>(items: impl IntoIterator<Item = T>, mut wanted: impl FnMut(&T) -> bool) -> Option<T> {
-    for item in items {
+pub fn first<T>(
+    items: impl IntoIterator<Item = T>,
+    mut wanted: impl FnMut(&T) -> bool,
+) -> Option<T> {
+    let mut items = items.into_iter();
+    loop {
+        let item = items.next()?;
         if wanted(&item) {
             return Some(item);
         }
     }
-    None
 }
 
 /// What the listener grants one sender, in bits per second.
@@ -793,9 +797,10 @@ mod nl80211 {
     pub(super) fn messages(mut datagram: &[u8]) -> (Vec<&[u8]>, bool) {
         let mut bodies = Vec::new();
         while let Some(header) = datagram.get(..NLMSG_HEADER_BYTES) {
-            let length =
-                usize::try_from(u32::from_ne_bytes([header[0], header[1], header[2], header[3]]))
-                    .unwrap_or(usize::MAX);
+            let length = usize::try_from(u32::from_ne_bytes([
+                header[0], header[1], header[2], header[3],
+            ]))
+            .unwrap_or(usize::MAX);
             let kind = u16::from_ne_bytes([header[4], header[5]]);
             if kind == NLMSG_ERROR || kind == NLMSG_DONE {
                 return (bodies, true);

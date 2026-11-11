@@ -86,6 +86,24 @@ fn notices_are_tagged_json() -> Result<(), serde_json::Error> {
             title: "Enter the code".to_owned()
         }
     );
+    // What the two ends say about the links: the sender the stream's share,
+    // the viewer the speed of a path it chose.
+    let share = Notice::Share {
+        bits_per_second: 450_000_000,
+        streams: 2,
+    };
+    let text = serde_json::to_string(&share)?;
+    assert_eq!(
+        text,
+        "{\"type\":\"share\",\"bits_per_second\":450000000,\"streams\":2}"
+    );
+    assert_eq!(Notice::decode(&text), Ok(share));
+    let path = Request::Path {
+        bits_per_second: 432_000_000,
+    };
+    let text = serde_json::to_string(&path)?;
+    assert_eq!(text, "{\"type\":\"path\",\"bits_per_second\":432000000}");
+    assert_eq!(Request::decode(&text), Some(path));
     Ok(())
 }
 
