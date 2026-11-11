@@ -283,10 +283,34 @@ fn a_confined_server_links_no_host_socket_and_its_viewer_opens() {
     assert_eq!(closed["result"]["structuredContent"]["status"], "closed", "{closed}");
 }
 
+/// A child that leads its own process group, ended with the whole group:
+/// `dbus-run-session` leaves its bus and the compositor behind when it alone
+/// is killed.
 struct Kill(Child);
+
+impl Kill {
+    fn spawn(command: &mut Command, what: &str) -> Self {
+        use std::os::unix::process::CommandExt;
+        Self(command.process_group(0).spawn().unwrap_or_else(|error| panic!("spawn {what}: {error}")))
+    }
+
+    fn signal(&self, signal: nix::sys::signal::Signal) {
+        if let Ok(group) = i32::try_from(self.0.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), signal);
+        }
+    }
+}
+
 impl Drop for Kill {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        self.signal(nix::sys::signal::Signal::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && matches!(self.0.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // What the leader left behind has had its moment to write and leave.
+        std::thread::sleep(Duration::from_millis(300));
+        self.signal(nix::sys::signal::Signal::SIGKILL);
         let _ = self.0.wait();
     }
 }
@@ -314,7 +338,7 @@ fn daemon(program: &str, arguments: &[&str], home: &Path, runtime: &Path) -> Kil
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Kill(command.spawn().unwrap_or_else(|error| panic!("spawn {program}: {error}")))
+    Kill::spawn(&mut command, program)
 }
 
 // #897, #895, the viewer's half: a compositor whose screencast node is in
@@ -368,7 +392,7 @@ fn the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        Kill(command.spawn().expect("spawn kwin_wayland"))
+        Kill::spawn(&mut command, "kwin_wayland")
     };
     wait_for("the compositor's Wayland socket", || own.join("wayland-0").exists());
     // The compositor connects to PipeWire as it starts.
