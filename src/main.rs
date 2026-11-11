@@ -4280,6 +4280,37 @@ const STAGING_BUDGET_EXEMPT_BYTES: u64 = 4 * 1024 * 1024;
 /// masks them.
 const HOST_SECRET_ENTRIES: &[&str] = &["bus", "keyring", "p11-kit"];
 
+/// Entries of the host user runtime directory that belong to the host's media
+/// services: its PipeWire daemon and its PulseAudio server. A session runs its
+/// own PipeWire under the same names, and its compositor connects to
+/// `$XDG_RUNTIME_DIR/pipewire-0` as it starts, before that daemon is up. A
+/// link to the host's socket there puts the compositor's screencast node into
+/// the host's graph, where the viewer, which reads the session's daemon, gets
+/// "no target node available" from the session manager. They are hidden by
+/// name because systemd alone holds a socket-activated one while its service
+/// is not running, and systemd is not a desktop process.
+const HOST_MEDIA_ENTRIES: &[&str] = &["pipewire-0", "pipewire-0-manager", "pulse"];
+
+/// Whether `relative`, a path below the host user runtime directory, is one
+/// of the entries a session never reaches.
+fn hidden_host_runtime_entry(relative: &Path) -> bool {
+    relative.components().next().is_some_and(|first| {
+        HOST_SECRET_ENTRIES
+            .iter()
+            .chain(HOST_MEDIA_ENTRIES)
+            .any(|name| first.as_os_str() == std::ffi::OsStr::new(name))
+    })
+}
+
+/// Whether the descriptors of the user's other processes are hidden from this
+/// server: more of them refused the read than allowed it. A desktop has a few
+/// such processes (ssh-agent and others that are not dumpable); a server
+/// confined by its launcher (a Landlock domain or a user namespace) is refused
+/// by nearly all of them, and then cannot tell a desktop socket from a helper.
+fn descriptors_hidden(readable: usize, refused: usize) -> bool {
+    refused > readable
+}
+
 fn mount_descendants(mounts: &[procfs::process::MountInfo], path: &Path) -> Vec<PathBuf> {
     let mut descendants: Vec<PathBuf> = mounts
         .iter()
@@ -4643,7 +4674,7 @@ impl OverlayPlan {
                 .as_ref()
                 .is_some_and(|runtime| runtime == source)
             {
-                for name in HOST_SECRET_ENTRIES {
+                for name in HOST_SECRET_ENTRIES.iter().chain(HOST_MEDIA_ENTRIES) {
                     let Ok(metadata) = std::fs::symlink_metadata(source.join(name)) else {
                         continue;
                     };
@@ -4761,7 +4792,7 @@ impl OverlayPlan {
         let socket_inventory = procfs::net::unix()?;
         self.graphical_socket_paths = socket_inventory
             .iter()
-            .filter(|entry| inventory.graphical_sockets.contains(&entry.inode))
+            .filter(|entry| inventory.graphical(entry.inode))
             .filter_map(|entry| entry.path.as_ref())
             // Other servers' control sockets come and go while this session
             // starts, and a mask over one that disappears fails startup. They
@@ -4816,7 +4847,7 @@ impl OverlayPlan {
                 let metadata = std::fs::metadata(&path).ok()?;
                 if metadata.uid() != current_uid
                     || !metadata.file_type().is_socket()
-                    || inventory.graphical_sockets.contains(&entry.inode)
+                    || inventory.graphical(entry.inode)
                 {
                     return None;
                 }
@@ -4826,13 +4857,7 @@ impl OverlayPlan {
                     && parent.starts_with(&canonical_runtime)
                     && !path
                         .strip_prefix(host_runtime)
-                        .ok()
-                        .and_then(|relative| relative.components().next())
-                        .is_some_and(|first| {
-                            HOST_SECRET_ENTRIES
-                                .iter()
-                                .any(|name| first.as_os_str() == std::ffi::OsStr::new(name))
-                        })
+                        .is_ok_and(hidden_host_runtime_entry)
                 {
                     Some((
                         path.clone(),
@@ -4906,24 +4931,54 @@ impl OverlayPlan {
 
 struct HostProcessInventory {
     graphical_sockets: std::collections::HashSet<u64>,
+    /// The user's other processes hide their descriptors from this server, so
+    /// no socket can be shown not to belong to the desktop.
+    descriptors_hidden: bool,
     live_databases: Vec<PathBuf>,
+}
+
+impl HostProcessInventory {
+    /// Whether the socket with this inode must stay out of a session: a
+    /// desktop process holds it, or nothing can tell who holds it.
+    fn graphical(&self, inode: u64) -> bool {
+        self.descriptors_hidden || self.graphical_sockets.contains(&inode)
+    }
 }
 
 /// Link targets of one process's descriptors. procfs' `fd()` also opens and
 /// stats every descriptor, which classification never reads; reading only the
 /// links cut the scan of a desktop with 21k descriptors by about 40%.
-fn descriptor_targets(pid: i32) -> Vec<procfs::process::FDTarget> {
+///
+/// The directory of a process this server may not inspect still lists its
+/// descriptors by number; it is reading a link that is refused, and that is
+/// the refusal reported here.
+fn read_descriptor_targets(pid: i32) -> std::io::Result<Vec<procfs::process::FDTarget>> {
     use std::str::FromStr;
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let link = std::fs::read_link(entry.path()).ok()?;
-            procfs::process::FDTarget::from_str(link.to_str()?).ok()
-        })
-        .collect()
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))?.flatten() {
+        match std::fs::read_link(entry.path()) {
+            Ok(link) => {
+                if let Some(target) = link
+                    .to_str()
+                    .and_then(|link| procfs::process::FDTarget::from_str(link).ok())
+                {
+                    targets.push(target);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(error);
+            }
+            // The descriptor was closed between the listing and the read.
+            Err(_) => {}
+        }
+    }
+    Ok(targets)
+}
+
+/// The same, with nothing for a process that is gone or refuses the read.
+#[cfg(test)]
+fn descriptor_targets(pid: i32) -> Vec<procfs::process::FDTarget> {
+    read_descriptor_targets(pid).unwrap_or_default()
 }
 
 /// Read descriptors once for both graphical socket isolation and live WAL files.
@@ -4934,6 +4989,9 @@ fn host_process_inventory(
     use procfs::process::FDTarget;
     let mut graphical = std::collections::HashSet::new();
     let mut databases = Vec::new();
+    // Of the processes whose descriptors this server may ask for, how many
+    // showed them and how many refused.
+    let (mut readable, mut refused) = (0_usize, 0_usize);
     let uid = procfs::process::Process::myself()?.uid()?;
     let canonical_target = std::fs::canonicalize(target)?;
     for process in procfs::process::all_processes()?.flatten() {
@@ -4964,7 +5022,18 @@ fn host_process_inventory(
         // Descriptors of another user's process are unreadable to a server
         // that is not root, so those reads are skipped as well.
         let descriptors = if owned || uid == 0 {
-            descriptor_targets(process.pid)
+            match read_descriptor_targets(process.pid) {
+                Ok(descriptors) => {
+                    readable += 1;
+                    descriptors
+                }
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        refused += 1;
+                    }
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -4999,8 +5068,15 @@ fn host_process_inventory(
     }
     databases.sort();
     databases.dedup();
+    let descriptors_hidden = descriptors_hidden(readable, refused);
+    if descriptors_hidden {
+        eprintln!(
+            "session_start: {refused} of the user's processes hide their descriptors from this server and {readable} show them (a confined launcher: a Landlock domain or a user namespace); no host socket can be told from a desktop socket, so the session gets none"
+        );
+    }
     Ok(HostProcessInventory {
         graphical_sockets: graphical,
+        descriptors_hidden,
         live_databases: databases,
     })
 }
@@ -8391,7 +8467,7 @@ impl WorkdirOwnership {
 /// Teardown signals and reaps processes with bounded sleeps; keep that off the
 /// async workers that answer other MCP requests. Browsers flush before the
 /// session-local wallet and sandbox stop; nothing on the host is touched.
-async fn teardown_blocking(mut sess: Session) -> Vec<String> {
+async fn teardown_blocking(mut sess: Session) -> TeardownReport {
     let kwin_windows_closed = request_kwin_browser_close(&sess).await;
     let cdp_close_attempted = request_cdp_browser_close(&sess).await;
     let graceful_close_attempted = kwin_windows_closed > 0 || cdp_close_attempted;
@@ -8415,15 +8491,15 @@ async fn teardown_blocking(mut sess: Session) -> Vec<String> {
         let _ = tokio::time::timeout(Duration::from_secs(15), secrets.shutdown()).await;
     }
     match tokio::task::spawn_blocking(move || teardown(sess)).await {
-        Ok(mut teardown_errors) => {
+        Ok((mut teardown_errors, exiting)) => {
             cookie_errors.append(&mut teardown_errors);
-            cookie_errors
+            (cookie_errors, exiting)
         }
         Err(error) => {
             let message = format!("session cleanup worker failed: {error}");
             eprintln!("teardown: {message}");
             cookie_errors.push(message);
-            cookie_errors
+            (cookie_errors, None)
         }
     }
 }
@@ -8690,7 +8766,190 @@ fn close_session_browsers(sandbox_pid: u32, graceful_close_attempted: bool) -> V
     cookie_errors
 }
 
-fn teardown(mut sess: Session) -> Vec<String> {
+/// How long teardown waits, after the session's processes were killed, for the
+/// last of them to leave the session's scope. A process blocked in the kernel
+/// (state D, for instance behind writeback throttling on a saturated disk)
+/// cannot act on SIGKILL until that wait ends, and systemd keeps the scope
+/// "deactivating" for as long.
+const SCOPE_EXIT_WAIT: Duration = Duration::from_secs(5);
+const SCOPE_EXIT_POLL: Duration = Duration::from_millis(50);
+/// Host disk pressure (PSI "some", 10 s average, percent) from which it is
+/// named as the likely reason processes are slow to exit.
+const IO_PRESSURE_NOTABLE: f64 = 10.0;
+
+/// A process that is still in a stopped session's scope.
+#[derive(Clone, Debug, PartialEq)]
+struct ExitingProcess {
+    pid: i32,
+    name: String,
+    /// The state letter of /proc/<pid>/stat.
+    state: char,
+    /// The kernel function it sleeps in (/proc/<pid>/wchan), when it sleeps.
+    waiting_in: Option<String>,
+}
+
+impl ExitingProcess {
+    fn read(pid: i32) -> Option<Self> {
+        let stat = procfs::process::Process::new(pid).ok()?.stat().ok()?;
+        let waiting_in = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+            .ok()
+            .map(|symbol| symbol.trim().to_owned())
+            .filter(|symbol| !symbol.is_empty() && symbol != "0");
+        Some(Self {
+            pid,
+            name: stat.comm,
+            state: stat.state,
+            waiting_in,
+        })
+    }
+
+    fn describe(&self) -> String {
+        let state = match self.state {
+            'D' => "uninterruptible kernel wait",
+            'Z' => "exited, not yet reaped",
+            'R' => "running",
+            'S' | 'I' => "sleeping",
+            'T' | 't' => "stopped",
+            _ => "exiting",
+        };
+        match &self.waiting_in {
+            Some(symbol) => format!("{}[{}] {state} in {symbol}", self.name, self.pid),
+            None => format!("{}[{}] {state}", self.name, self.pid),
+        }
+    }
+}
+
+/// The 10 s average of the "some" line of a PSI file such as /proc/pressure/io.
+fn pressure_some_avg10(text: &str) -> Option<f64> {
+    text.lines()
+        .filter(|line| line.starts_with("some "))
+        .flat_map(str::split_whitespace)
+        .filter_map(|field| field.strip_prefix("avg10="))
+        .filter_map(|value| value.parse().ok())
+        .next()
+}
+
+/// One sentence on the processes that outlived the wait and, when it shows,
+/// why: the disk is saturated, or they sit in a kernel wait.
+fn exiting_summary(unit: &str, processes: &[ExitingProcess], io_pressure: Option<f64>) -> String {
+    let listed = if processes.is_empty() {
+        "exited processes that are not reaped yet".to_owned()
+    } else {
+        processes
+            .iter()
+            .map(ExitingProcess::describe)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let blocked = processes.iter().any(|process| process.state == 'D');
+    let cause = match io_pressure.filter(|pressure| *pressure >= IO_PRESSURE_NOTABLE) {
+        Some(pressure) => format!(
+            "; host disk I/O pressure is {pressure:.0}%, so they are waiting on the disk"
+        ),
+        None if blocked => "; they are blocked in the kernel".to_owned(),
+        None => String::new(),
+    };
+    format!(
+        "{} process(es) of {unit} are still exiting after SIGKILL ({listed}){cause}. They end by themselves when that wait does; they are not a leak and nothing is left to clean up",
+        processes.len().max(1)
+    )
+}
+
+/// The members of a scope's cgroup and whether the kernel still counts it as
+/// populated; a cgroup that is gone has neither.
+fn scope_population(directory: &Path) -> (Vec<i32>, bool) {
+    let members = std::fs::read_to_string(directory.join("cgroup.procs"))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect::<Vec<i32>>()
+        })
+        .unwrap_or_default();
+    let populated = std::fs::read_to_string(directory.join("cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|line| line.trim() == "populated 1"));
+    (members, populated)
+}
+
+/// The processes whose /proc entry names this cgroup, zombies included.
+fn scope_processes_by_cgroup(directory: &Path) -> Vec<i32> {
+    let Ok(relative) = directory.strip_prefix("/sys/fs/cgroup") else {
+        return Vec::new();
+    };
+    let group = format!("0::/{}", relative.display());
+    let Ok(processes) = procfs::process::all_processes() else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter(|process| {
+            std::fs::read_to_string(format!("/proc/{}/cgroup", process.pid)).is_ok_and(|groups| {
+                groups
+                    .lines()
+                    .any(|line| line == group || line.strip_suffix(" (deleted)") == Some(&group))
+            })
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// Wait up to `wait` for a stopped session's scope to empty. Returns what is
+/// still in it afterwards, or None once it is empty or gone.
+fn wait_for_scope_exit(unit: &str, directory: &Path, wait: Duration) -> Option<serde_json::Value> {
+    let started = std::time::Instant::now();
+    let mut killed = false;
+    let members = loop {
+        let (members, populated) = scope_population(directory);
+        if members.is_empty() && !populated {
+            return None;
+        }
+        if started.elapsed() >= wait {
+            break members;
+        }
+        // The scope was stopped and its group killed. Whatever is left gets
+        // the kernel's own kill of the whole cgroup once more, which reaches
+        // members that left the process group.
+        if !killed && started.elapsed() >= wait / 4 {
+            killed = true;
+            let _ = std::fs::write(directory.join("cgroup.kill"), "1");
+        }
+        std::thread::sleep(SCOPE_EXIT_POLL);
+    };
+    // A populated cgroup can list no process (the leader of a dying process
+    // is gone while a thread of it still is not); /proc still names the
+    // cgroup of whatever is left.
+    let members = if members.is_empty() {
+        scope_processes_by_cgroup(directory)
+    } else {
+        members
+    };
+    let processes: Vec<ExitingProcess> = members
+        .iter()
+        .filter_map(|pid| ExitingProcess::read(*pid))
+        .collect();
+    let io_pressure = std::fs::read_to_string("/proc/pressure/io")
+        .ok()
+        .and_then(|text| pressure_some_avg10(&text));
+    let summary = exiting_summary(unit, &processes, io_pressure);
+    eprintln!("teardown: {summary}");
+    Some(serde_json::json!({
+        "scope": unit,
+        "waited_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "processes": processes.iter().map(|process| serde_json::json!({
+            "pid": process.pid,
+            "name": process.name,
+            "state": process.state.to_string(),
+            "waiting_in": process.waiting_in,
+        })).collect::<Vec<_>>(),
+        "host_io_pressure_some_avg10": io_pressure,
+        "summary": summary,
+    }))
+}
+
+/// What a teardown could not finish: cookie stores that were not saved, and
+/// the processes still leaving the session's scope.
+type TeardownReport = (Vec<String>, Option<serde_json::Value>);
+
+fn teardown(mut sess: Session) -> TeardownReport {
     let mut cookie_errors = std::mem::take(&mut sess.cookie_errors);
     drop(sess.cdp_browser);
     // Kill the viewer first so it can flush any pending wayland requests
@@ -8699,9 +8958,13 @@ fn teardown(mut sess: Session) -> Vec<String> {
         terminate_child(viewer, false, "viewer");
     }
     drop(sess.sandbox_stdin);
+    let scope_directory =
+        session_scope_cgroup_directory(sess.sandbox_child.id(), &sess.scope.unit);
     sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
     terminate_child(sess.sandbox_child, true, "sandbox");
+    let exiting = scope_directory
+        .and_then(|directory| wait_for_scope_exit(&sess.scope.unit, &directory, SCOPE_EXIT_WAIT));
     for proxy in std::mem::take(&mut sess.service_proxy_children) {
         terminate_child(proxy, false, "session D-Bus proxy");
     }
@@ -8724,7 +8987,7 @@ fn teardown(mut sess: Session) -> Vec<String> {
         eprintln!("teardown: retained {}: {error}", disk.display());
     }
     cleanup_stale_session_files(&sess.host_xdg_dir);
-    cookie_errors
+    (cookie_errors, exiting)
 }
 
 /// Linux quotactl command for reading one user's quota (Q_GETQUOTA) and the
@@ -15975,7 +16238,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "viewer_close",
-        description = "Close the host viewer window when the user asks, without stopping the isolated session. Completing a user-facing step does not require closing the viewer; the user may keep watching or close it directly. No-op if the viewer is already closed. Call viewer_open again if the user needs to act or asks to watch later."
+        description = "Close the host viewer window when the user asks, without stopping the isolated session. Completing a user-facing step does not require closing the viewer; the user may keep watching or close it directly. No-op if the viewer is already closed, also for a session that ended or whose owning server exited: the result then reports already_closed with that session_status. Call viewer_open again if the user needs to act or asks to watch later."
     )]
     async fn viewer_close(
         &self,
@@ -16014,7 +16277,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "session_stop",
-        description = "Tear down the current session and its container processes. With --autoclean or --ttl (session_start reports workdir_removed_on_stop), remove the session workdir, including files the host wrote to host_shared_dir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. No-op if no session is running and nothing is left to clean.",
+        description = "Tear down the current session and its container processes. With --autoclean or --ttl (session_start reports workdir_removed_on_stop), remove the session workdir, including files the host wrote to host_shared_dir; if removal fails, calling session_stop again retries it. Transport shutdown also cleans up. Waits up to 5 s for killed processes to leave the session's scope; processes_exiting lists any that are still exiting then (for example blocked in the kernel on a saturated disk) and why. They end by themselves and are not a leak. No-op if no session is running and nothing is left to clean.",
         annotations(destructive_hint = true)
     )]
     async fn session_stop(
@@ -16050,6 +16313,9 @@ impl KwinMcp {
             .await?;
         let plan = session_registry::stop_plan(&self.registry_phase().await);
         let mut cookie_errors = Vec::new();
+        // Processes that were killed and had not left the session's scope
+        // when the bounded wait for them ended.
+        let mut processes_exiting = None;
         match plan {
             session_registry::StopPlan::Teardown => {
                 // The stopped status is recorded before the desktop is released,
@@ -16073,7 +16339,7 @@ impl KwinMcp {
                             .entries
                             .remove(&sess.host_xdg_dir.join("wayland-0"));
                     }
-                    cookie_errors = teardown_blocking(sess).await;
+                    (cookie_errors, processes_exiting) = teardown_blocking(sess).await;
                 }
             }
             session_registry::StopPlan::Clear => {}
@@ -16142,16 +16408,26 @@ impl KwinMcp {
         } else {
             ("cleaned", format!("cleared {recorded} session"))
         };
-        let message = match &workdir_removed {
+        let mut message = match &workdir_removed {
             Some(workdir) => format!("{subject}, workdir {workdir} removed"),
             None => subject,
         };
+        if let Some(summary) = processes_exiting
+            .as_ref()
+            .and_then(|exiting| exiting["summary"].as_str())
+        {
+            message = format!("{message}; {summary}");
+        }
         let mut stopped = serde_json::json!({
             "status": status,
             "workdir_removed": workdir_removed,
             "cookie_errors": cookie_errors,
+            "processes_exiting": processes_exiting,
         });
-        drop_empty_fields(&mut stopped, &["workdir_removed", "cookie_errors"]);
+        drop_empty_fields(
+            &mut stopped,
+            &["workdir_removed", "cookie_errors", "processes_exiting"],
+        );
         Ok(structured_result(&peer, message, stopped).await)
     }
 
@@ -21480,6 +21756,65 @@ fn unknown_session_error(id: &str) -> McpError {
     )
 }
 
+/// Status reported for a session whose owning server exited without recording
+/// how the session ended.
+const SESSION_STATUS_OWNER_EXITED: &str = "owner_exited";
+
+/// The state of a session that has no viewer left because it ended, and why:
+/// its recorded end, or an owning server that is no longer running. None while
+/// the session may still be running under an owner that could not be reached.
+fn ended_session_viewer_state(
+    record: Option<&SessionLifecycleRecord>,
+    owner: Option<u32>,
+    owner_running: Option<bool>,
+) -> Option<(&'static str, String)> {
+    let owner_note = match (owner, owner_running) {
+        (Some(pid), Some(false)) => {
+            format!("its owner, kwin-mcp process {pid}, is no longer running; ")
+        }
+        _ => String::new(),
+    };
+    match (record, owner, owner_running) {
+        (Some(record), _, _) => Some((
+            record.status(),
+            format!(
+                "{owner_note}the session ended at Unix time {} (reason: {}) and its viewer ended with it",
+                record.finished_at_unix_seconds, record.reason
+            ),
+        )),
+        (None, Some(_), Some(false)) => Some((
+            SESSION_STATUS_OWNER_EXITED,
+            format!("{owner_note}a session and its viewer end with the server that owns them"),
+        )),
+        _ => None,
+    }
+}
+
+/// The idempotent viewer_close answer for a session that already ended.
+async fn viewer_closed_with_session(
+    peer: &rmcp::Peer<rmcp::RoleServer>,
+    id: &str,
+    status: &str,
+    detail: &str,
+    extra: serde_json::Value,
+) -> CallToolResult {
+    let mut data = serde_json::json!({
+        "status": "already_closed",
+        "session_id": id,
+        "session_status": status,
+        "viewer": {"state": "closed", "reason": format!("session is {status}")},
+    });
+    if let (Some(data), serde_json::Value::Object(extra)) = (data.as_object_mut(), extra) {
+        data.extend(extra);
+    }
+    structured_result(
+        peer,
+        format!("viewer already_closed: session {id} is {status}; {detail}. Nothing to close."),
+        data,
+    )
+    .await
+}
+
 #[derive(Clone)]
 struct SessionRouter {
     attached: Arc<tokio::sync::RwLock<std::collections::BTreeMap<String, AttachedSession>>>,
@@ -22440,6 +22775,49 @@ impl SessionRouter {
             Some(_) | None => Ok(None),
         }
     }
+    /// viewer_close for a session this process holds no handle for and whose
+    /// owner did not answer. A session that ended, by its lifecycle record or
+    /// because its owning server is no longer running, has no viewer: a
+    /// viewer ends with its session and with the server that started it. That
+    /// is the closed state the call asks for, so it succeeds and names the
+    /// session's real state. Anything else is left to the caller's error.
+    async fn close_viewer_unregistered(
+        &self,
+        requested: Option<&str>,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        let Some(id) = requested else {
+            return Ok(None);
+        };
+        if self.entries()?.contains_key(id) {
+            return Ok(None);
+        }
+        let owner = session_owner_pid(id).filter(|pid| *pid != std::process::id());
+        let owner_running = owner.map(kwin_mcp_server_running);
+        let record = previous_session_lifecycle(id).ok().flatten();
+        let Some((status, detail)) =
+            ended_session_viewer_state(record.as_ref(), owner, owner_running)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            viewer_closed_with_session(
+                peer,
+                id,
+                status,
+                &detail,
+                serde_json::json!({
+                    "session_available_here": false,
+                    "session_server_pid": owner,
+                    "session_server_running": owner_running,
+                    "session_end_reason": record.as_ref().map(|record| record.reason.as_str()),
+                    "session_ended_at_unix_seconds":
+                        record.as_ref().map(|record| record.finished_at_unix_seconds),
+                }),
+            )
+            .await,
+        ))
+    }
     async fn attach(
         &self,
         peer: &rmcp::Peer<rmcp::RoleServer>,
@@ -22970,13 +23348,32 @@ impl SessionRouter {
                 .map(|attached| attached.owner);
             let forwarded = match expected {
                 Some(expected) => {
-                    forward_session_call_checked(owner_pid, request.clone(), Some(expected)).await?
+                    forward_session_call_checked(owner_pid, request.clone(), Some(expected)).await
                 }
-                None => forward_session_call(owner_pid, request.clone()).await?,
+                None => forward_session_call(owner_pid, request.clone()).await,
+            };
+            let forwarded = match forwarded {
+                Ok(forwarded) => forwarded,
+                // An owner that is gone cannot be asked, and its viewer went
+                // with it: that is the state viewer_close asks for.
+                Err(error) if request.name == "viewer_close" => {
+                    match self.close_viewer_unregistered(Some(id), &context.peer).await? {
+                        Some(result) => return Ok(result),
+                        None => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
             };
             if let Some(result) = forwarded {
                 return Ok(result);
             }
+        }
+        if request.name == "viewer_close"
+            && let Some(result) = self
+                .close_viewer_unregistered(requested_id, &context.peer)
+                .await?
+        {
+            return Ok(result);
         }
         if request.name == "session_stop"
             && let Some(result) = self.stop_unregistered(requested_id, &context.peer).await?
@@ -23003,6 +23400,18 @@ impl SessionRouter {
                 .get("session_status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("dead");
+            // A session that ended took its viewer with it, which is what
+            // viewer_close asks for; the handle itself is session_stop's.
+            if request.name == "viewer_close" {
+                return Ok(viewer_closed_with_session(
+                    &context.peer,
+                    &id,
+                    status,
+                    "its viewer ended with it; call session_stop to clear the handle",
+                    serde_json::json!({"session_end_reason": death["reason"]}),
+                )
+                .await);
+            }
             return Err(McpError::internal_error(
                 format!(
                     "Session {id} is {status}: {} (RAM limit {}). Call session_stop, then session_start without session_id; relaunch apps to resume your task.",
@@ -27209,6 +27618,140 @@ mod session_reach_tests {
         plan.host_write_paths = vec![directory.clone()];
         assert!(!plan.hide_host_socket(&home, &socket));
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod viewer_and_scope_exit_tests {
+    use super::{
+        ExitingProcess, HostProcessInventory, SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN,
+        SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED, SESSION_STATUS_OWNER_EXITED,
+        SessionLifecycleRecord, descriptors_hidden, ended_session_viewer_state, exiting_summary,
+        hidden_host_runtime_entry, pressure_some_avg10, scope_population, wait_for_scope_exit,
+    };
+    use std::path::Path;
+    use std::time::Duration;
+
+    // #897, #895: the host's PipeWire and PulseAudio sockets never reach a
+    // session, whoever holds them.
+    #[test]
+    fn the_hosts_media_sockets_are_hidden_from_a_session_by_name() {
+        for hidden in ["pipewire-0", "pipewire-0-manager", "pulse/native", "bus", "keyring/control"] {
+            assert!(hidden_host_runtime_entry(Path::new(hidden)), "{hidden}");
+        }
+        for shown in ["ssh-agent.socket", "gnupg/S.gpg-agent", "pipewire-0.lock.d/x", "app/pulse"] {
+            assert!(!hidden_host_runtime_entry(Path::new(shown)), "{shown}");
+        }
+    }
+
+    // A server whose launcher hides other processes' descriptors cannot
+    // classify any socket, so every socket counts as a desktop socket.
+    #[test]
+    fn hidden_descriptors_make_every_socket_a_desktop_socket() {
+        assert!(!descriptors_hidden(400, 3));
+        assert!(!descriptors_hidden(0, 0));
+        assert!(descriptors_hidden(2, 400));
+        let blind = HostProcessInventory {
+            graphical_sockets: std::collections::HashSet::new(),
+            descriptors_hidden: true,
+            live_databases: Vec::new(),
+        };
+        assert!(blind.graphical(15960));
+        let seeing = HostProcessInventory {
+            graphical_sockets: std::collections::HashSet::from([15960]),
+            descriptors_hidden: false,
+            live_databases: Vec::new(),
+        };
+        assert!(seeing.graphical(15960));
+        assert!(!seeing.graphical(15962));
+    }
+
+    // #894: viewer_close for a session that ended is the closed state.
+    #[test]
+    fn a_session_that_ended_has_no_viewer_to_close() {
+        let record = SessionLifecycleRecord {
+            session_id: "s4242-1".to_owned(),
+            server_pid: 4242,
+            state: SESSION_LIFECYCLE_STATE_SHUTDOWN_FINISHED.to_owned(),
+            reason: SESSION_LIFECYCLE_REASON_SERVER_SHUTDOWN.to_owned(),
+            finished_at_unix_seconds: 1_794_200_000,
+            workdir_cleanup: "removed".to_owned(),
+        };
+        let (status, detail) = ended_session_viewer_state(Some(&record), Some(4242), Some(false))
+            .unwrap_or_default();
+        assert_eq!(status, "stopped");
+        assert!(detail.contains("kwin-mcp process 4242, is no longer running"), "{detail}");
+        assert!(detail.contains("1794200000"), "{detail}");
+        // The owner was killed and recorded nothing: its sessions went with it.
+        let (status, detail) =
+            ended_session_viewer_state(None, Some(4242), Some(false)).unwrap_or_default();
+        assert_eq!(status, SESSION_STATUS_OWNER_EXITED);
+        assert!(detail.contains("end with the server that owns them"), "{detail}");
+        // A live owner that could not be reached may still show a viewer.
+        assert!(ended_session_viewer_state(None, Some(4242), Some(true)).is_none());
+        assert!(ended_session_viewer_state(None, None, None).is_none());
+    }
+
+    // #922: what session_stop says about processes that outlive the wait.
+    #[test]
+    fn processes_still_exiting_are_named_with_the_reason() {
+        let kwin = ExitingProcess {
+            pid: 7,
+            name: "kwin_wayland".to_owned(),
+            state: 'D',
+            waiting_in: Some("rq_qos_wait".to_owned()),
+        };
+        let saturated = exiting_summary("kwin-mcp-1-1.scope", std::slice::from_ref(&kwin), Some(92.4));
+        assert!(saturated.starts_with("1 process(es) of kwin-mcp-1-1.scope are still exiting after SIGKILL (kwin_wayland[7] uninterruptible kernel wait in rq_qos_wait)"), "{saturated}");
+        assert!(saturated.contains("host disk I/O pressure is 92%"), "{saturated}");
+        assert!(saturated.contains("not a leak"), "{saturated}");
+        let idle_disk = exiting_summary("kwin-mcp-1-1.scope", &[kwin], Some(0.3));
+        assert!(idle_disk.contains("blocked in the kernel"), "{idle_disk}");
+        assert!(!idle_disk.contains("I/O pressure"), "{idle_disk}");
+        let zombie = ExitingProcess { pid: 9, name: "bwrap".to_owned(), state: 'Z', waiting_in: None };
+        let reaping = exiting_summary("kwin-mcp-1-1.scope", &[zombie], None);
+        assert!(reaping.contains("bwrap[9] exited, not yet reaped)."), "{reaping}");
+    }
+
+    #[test]
+    fn io_pressure_is_read_from_the_some_line() {
+        let text = "some avg10=92.41 avg60=80.02 avg300=41.00 total=123\nfull avg10=71.00 avg60=60.00 avg300=30.00 total=99\n";
+        assert_eq!(pressure_some_avg10(text), Some(92.41));
+        assert_eq!(pressure_some_avg10("full avg10=1.00\n"), None);
+    }
+
+    // A scope's cgroup that keeps a member past the wait is reported, with
+    // the member; one that is gone or empty is not.
+    #[test]
+    fn a_scope_that_stays_populated_is_reported_after_the_wait() -> Result<(), String> {
+        let directory = std::env::temp_dir().join(format!("kwin-mcp-scope-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let write = |name: &str, text: &str| {
+            std::fs::write(directory.join(name), text).map_err(|error| error.to_string())
+        };
+        write("cgroup.procs", &format!("{}\n", std::process::id()))?;
+        write("cgroup.events", "populated 1\nfrozen 0\n")?;
+        assert_eq!(scope_population(&directory).0.len(), 1);
+        let started = std::time::Instant::now();
+        let wait = Duration::from_millis(300);
+        let report = wait_for_scope_exit("kwin-mcp-1-1.scope", &directory, wait);
+        assert!(started.elapsed() >= wait);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let report = report.ok_or("a populated scope must be reported")?;
+        assert_eq!(report["scope"], "kwin-mcp-1-1.scope");
+        assert_eq!(report["processes"][0]["pid"], std::process::id());
+        assert!(report["summary"].as_str().is_some_and(|text| text.contains("still exiting")));
+        // The kill of the whole cgroup was asked for once more.
+        assert_eq!(
+            std::fs::read_to_string(directory.join("cgroup.kill")).map_err(|error| error.to_string())?,
+            "1"
+        );
+        write("cgroup.procs", "")?;
+        write("cgroup.events", "populated 0\nfrozen 0\n")?;
+        assert!(wait_for_scope_exit("kwin-mcp-1-1.scope", &directory, wait).is_none());
+        std::fs::remove_dir_all(&directory).map_err(|error| error.to_string())?;
+        assert!(wait_for_scope_exit("kwin-mcp-1-1.scope", &directory, wait).is_none());
         Ok(())
     }
 }
