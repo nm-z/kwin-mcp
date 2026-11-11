@@ -45,7 +45,7 @@ const POLL: Duration = Duration::from_millis(5);
 /// Shell convention for a command that could not be executed.
 const EXEC_FAILED: i32 = 126;
 /// Shell convention for a command ended by a signal: this plus its number.
-const SIGNAL_EXIT_BASE: i32 = 128;
+pub(crate) const SIGNAL_EXIT_BASE: i32 = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {

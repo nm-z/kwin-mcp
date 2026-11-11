@@ -11,6 +11,9 @@ procfs = "0.18"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 nix = { version = "0.30", features = ["signal", "fs", "poll", "socket", "uio", "net", "process", "sched", "user"] }
+# The registry tokio's own signal handling uses; it passes a handler the
+# sender's siginfo, which tokio's streams do not.
+signal-hook-registry = "1.4"
 serde_json = "1"
 # Never use mcpkit — missing _meta, no adoption. rmcp is the official MCP SDK.
 rmcp = { version = "1.3", features = ["client", "server", "transport-io"] }

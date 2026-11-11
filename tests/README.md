@@ -53,6 +53,40 @@ and checks a window, a screenshot, the session's network and files, and that
 KWIN_MCP_E2E=1 cargo test --test no_new_privs_e2e -- --ignored --test-threads=1
 ```
 
+## How sessions end (#867, #868, #879, #893, #899)
+
+`session_end_reports_e2e.rs` starts real desktops and ends them the ways the
+reports describe:
+
+```bash
+systemd-run --user --quiet --wait --pipe --collect --same-dir -p RuntimeMaxSec=900 \
+  --setenv=KWIN_MCP_E2E=1 --setenv=KWIN_MCP_E2E_SERVER=target/release/kwin-mcp \
+  <test executable> --ignored --test-threads=1
+```
+
+- the sandbox's top process gets SIGTERM from outside: every later call and
+  the lifecycle record keep which process ended first, the compositor's exit
+  status and the sandbox log tail, and a later server repeats them;
+- the server gets SIGTERM while a call runs: the call is answered with
+  `server_shutting_down` and the sender (the test's own PID) before the
+  transport closes, and a later server names the exited owner, what ended it
+  and the recovery;
+- the server is killed: its session ends with it and a later server names the
+  exited owner;
+- the owner re-executes while another server forwards calls to it: the running
+  call finishes first and the next one is retried;
+- `session_stop` with a stopped compositor, with processes that ignore
+  SIGTERM, and with a browser that does not exit (needs Google Chrome) answers
+  within its bounds, lists its stages, and leaves nothing of the session
+  running.
+
+`session_stop_reports_a_cleanup_that_outlasts_its_limit` needs a debug build
+of the server (`KWIN_MCP_E2E_SERVER=target/debug/kwin-mcp`), whose
+`KWIN_MCP_TEST_STOP_STORAGE_DELAY_MS` stands in for a disk too busy to delete
+the session's files; run it by name. `startup_handshake_e2e.rs` needs no
+desktop: it seeds an orphaned workdir with 150,000 files and checks that
+`initialize` is answered before the startup sweep has removed them.
+
 ## Startup stderr without autoclean (#852)
 
 ```bash
