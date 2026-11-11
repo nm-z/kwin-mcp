@@ -32,6 +32,17 @@ KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
 ```
 
 The desktop cases require the dependencies stated on each ignored test.
+
+The same command works from a checkout whose shell has `NoNewPrivs=1`, such
+as a sandboxed worker's: the runner and the server it starts inherit the flag
+and the server starts sessions under it. `no_new_privs_e2e.rs` starts the
+server through `setpriv --no-new-privs` and inside a `bwrap` user namespace
+and checks a window, a screenshot, the session's network and files, and that
+`session_stop` leaves no process, scope or directory behind:
+
+```bash
+KWIN_MCP_E2E=1 cargo test --test no_new_privs_e2e -- --ignored --test-threads=1
+```
 # DevTools placeholder receipt
 
 Run `ruby tests/devtools_placeholder_e2e.rb /path/to/kwin-mcp /path/to/evidence`
