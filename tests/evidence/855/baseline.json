@@ -1,0 +1,15 @@
+{
+  "launch": {
+    "is_error": true,
+    "message": "plasma-systemmonitor exited with status 1 without opening a window\nno stderr was written\nfirst command token resolution: plasma-systemmonitor -> /usr/bin/plasma-systemmonitor",
+    "outcome": "exited",
+    "exit_status": 1,
+    "stderr_tail": []
+  },
+  "qt_failure": {
+    "is_error": true,
+    "exit_status": 134,
+    "qt_plugin_stderr": []
+  },
+  "windows": []
+}

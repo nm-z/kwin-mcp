@@ -21,6 +21,12 @@
 //!   reaped_viewer_reload (#842) input works after a reload that follows the viewer's exit
 //!   result_once (#808) a result is not sent again as a log notification
 //!   extension_popup (#836) a Chrome extension popup's button has clickable bounds
+//!   slow_start    (#874, #876) a command still working at the deadline is a slow start, its
+//!                 late window names it in window_list, and no other launch is given that window
+//!   launch_without_session (#857) launch_app with no session starts one and returns its ID
+//!   launch_with_viewer (#857) launch_app viewer=true also opens the viewer
+//!   unchanged_browser_handoff (#876) a running browser that takes a command without changing
+//!                 any window still gets its window reported
 //!
 //! Run the ignored case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
@@ -1200,5 +1206,241 @@ fn result_once() {
     assert_eq!(
         server.log_notices, 0,
         "results were sent again as notifications/message log notifications"
+    );
+}
+
+/// The listed window with exactly this title.
+fn window_titled(windows: &Value, title: &str) -> Option<Value> {
+    let listed = windows["windows"].as_array()?;
+    listed
+        .iter()
+        .position(|window| window["title"] == json!(title))
+        .map(|index| listed[index].clone())
+}
+
+/// Copies the session's screenshot into `KWIN_MCP_TEST_ARTIFACT_DIR`, when set.
+fn keep_screenshot(server: &mut Server, name: &str) {
+    let Some(directory) = std::env::var_os("KWIN_MCP_TEST_ARTIFACT_DIR") else {
+        return;
+    };
+    let shot = server.data("screenshot", json!({}));
+    let path = shot["path"].as_str().expect("screenshot path");
+    std::fs::copy(path, PathBuf::from(directory).join(name)).expect("keep screenshot");
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap, KDialog, and input devices"]
+fn slow_start() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({"window_mode":"native"}));
+    let title = format!("kwin909-slow-{:x}", nonce());
+    // Eight seconds of work before the window: a start that is slow, not absent.
+    let command = format!(
+        "end=$((SECONDS+8)); while [ $SECONDS -lt $end ]; do :; done; exec kdialog --title {title} --msgbox slow"
+    );
+    let slow = server.call(
+        "launch_app",
+        json!({"command":command, "window_timeout_seconds":1}),
+    );
+    let report = &slow["result"]["structuredContent"];
+    assert_eq!(slow["result"]["isError"], json!(true), "{slow}");
+    assert_eq!(report["reason"], json!("slow_start"), "{slow}");
+    assert_eq!(report["launch_processes"]["state"], json!("busy"), "{slow}");
+    assert_eq!(report["late_window_tracked"], json!(true), "{slow}");
+    assert_eq!(report["retry_safe"], json!(false), "{slow}");
+    let waiting = server.windows();
+    assert_eq!(
+        waiting["pending_launches"][0]["command"],
+        json!(command),
+        "window_list does not name the launch that is still starting: {waiting}"
+    );
+
+    // A second command that never maps a window waits past the moment the
+    // first one's window appears. That window is not its window.
+    let idle = server.call(
+        "launch_app",
+        json!({"command":"sleep 40", "window_timeout_seconds":12}),
+    );
+    let report = &idle["result"]["structuredContent"];
+    assert_eq!(
+        report["window_outcome"],
+        json!("timeout"),
+        "a launch was given the window of an earlier, slower launch: {idle}"
+    );
+    assert_eq!(report["reason"], json!("window_not_observed"), "{idle}");
+    assert_eq!(report["launch_processes"]["state"], json!("idle"), "{idle}");
+
+    let (window, windows) = wait_until(10, "the slow launch's window", || {
+        let windows = server.windows();
+        window_titled(&windows, &title).map(|window| (window, windows))
+    });
+    assert_eq!(
+        window["launch"]["command"],
+        json!(command),
+        "the late window does not name its launch: {windows}"
+    );
+    assert_eq!(
+        window["launch"]["attributed_by"],
+        json!("process"),
+        "{windows}"
+    );
+    assert_eq!(
+        window["launch"]["launch_gave_up_after_seconds"],
+        json!(1),
+        "{windows}"
+    );
+    let still_waiting: Vec<&Value> = windows["pending_launches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|launch| &launch["command"])
+        .collect();
+    assert_eq!(still_waiting, [&json!("sleep 40")], "{windows}");
+    keep_screenshot(&mut server, "slow-start-late-window.png");
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap, KDialog, and input devices"]
+fn launch_without_session() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    let title = format!("kwin857-{:x}", nonce());
+    let launched = server.data(
+        "launch_app",
+        json!({"command":format!("kdialog --title {title} --msgbox one-call")}),
+    );
+    assert_eq!(launched["session_started"], json!(true), "{launched}");
+    assert_eq!(launched["window_outcome"], json!("new"), "{launched}");
+    let session = launched["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no session_id in the launch result: {launched}"))
+        .to_owned();
+    assert!(
+        launched["session"]["host_shared_dir"].is_string(),
+        "{launched}"
+    );
+
+    // The next call without session_id runs in that session and starts none.
+    let again = server.data(
+        "launch_app",
+        json!({"command":format!("kdialog --title {title}-2 --msgbox same-session")}),
+    );
+    assert!(again["session_started"].is_null(), "{again}");
+    let sessions = server.data("session_list", json!({}));
+    let listed: Vec<&Value> = sessions["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|record| &record["session_id"])
+        .collect();
+    assert_eq!(listed, [&json!(session)], "{sessions}");
+
+    server.session = Some(session);
+    let windows = server.windows();
+    for expected in [title.clone(), format!("{title}-2")] {
+        assert!(
+            window_titled(&windows, &expected).is_some(),
+            "{expected} is not in the session launch_app started: {windows}"
+        );
+    }
+    keep_screenshot(&mut server, "launch-without-session.png");
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap, KDialog, and input devices"]
+fn launch_with_viewer() {
+    require_e2e();
+    // The outer session is the desktop the viewer window opens on.
+    let mut outer = Server::start(&["--autoclean"]);
+    let outer_started = outer.start_session(json!({"width":1600, "height":1000}));
+    let outer_wayland = format!(
+        "{}/wayland-0",
+        outer_started["host_shared_dir"]
+            .as_str()
+            .expect("outer host_shared_dir")
+    );
+    // The session launch_app starts takes the server's default size.
+    let mut inner = Server::start_with_env(
+        &["--autoclean", "--width", "1280", "--height", "720"],
+        &[("WAYLAND_DISPLAY", &outer_wayland)],
+    );
+    let launched = inner.data(
+        "launch_app",
+        json!({"command":"kdialog --title kwin857-viewer --msgbox shown", "viewer":true}),
+    );
+    assert_eq!(launched["session"]["width"], json!(1280), "{launched}");
+    inner.session = launched["session_id"].as_str().map(str::to_owned);
+    assert_eq!(launched["session_started"], json!(true), "{launched}");
+    assert!(
+        matches!(
+            launched["viewer"]["viewer"]["state"].as_str(),
+            Some("ready" | "starting")
+        ),
+        "launch_app viewer=true did not open the viewer: {launched}"
+    );
+    wait_until(30, "the viewer window on the outer desktop", || {
+        let windows = outer.windows();
+        windows["windows"]
+            .as_array()?
+            .iter()
+            .any(|window| {
+                ["resourceClass", "title"].iter().any(|field| {
+                    window[*field]
+                        .as_str()
+                        .is_some_and(|text| text.contains("kwin-viewer"))
+                })
+            })
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    keep_screenshot(&mut outer, "launch-with-viewer.png");
+}
+
+#[test]
+#[ignore = "needs a real KDE session, bubblewrap and Chrome"]
+fn unchanged_browser_handoff() {
+    require_e2e();
+    let mut server = Server::start(&["--autoclean"]);
+    server.start_session(json!({}));
+    let title = format!("kwin909-same-{:x}", nonce());
+    let command = format!(
+        "google-chrome-stable --user-data-dir=$HOME/chrome-909 'data:text/html,<title>{title}</title>same'"
+    );
+    let first = server.data(
+        "launch_app",
+        json!({"command":command, "window_timeout_seconds":40}),
+    );
+    assert_eq!(first["window_outcome"], json!("new"), "{first}");
+    wait_until(20, "the page title", || {
+        let windows = server.windows();
+        windows["windows"]
+            .as_array()?
+            .iter()
+            .any(|window| {
+                window["id"] == first["window"]
+                    && window["title"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&title))
+            })
+            .then_some(())
+    });
+    // The running browser opens the same page in another tab: no new window,
+    // and the window that takes it keeps its title and its focus.
+    let begun = Instant::now();
+    let again = server.data(
+        "launch_app",
+        json!({"command":command, "window_timeout_seconds":20}),
+    );
+    assert_eq!(
+        again["window_outcome"],
+        json!("reused_existing"),
+        "the browser window that took the request was not reported: {again}"
+    );
+    assert_eq!(again["window"], first["window"], "{again}");
+    assert!(
+        begun.elapsed() < Duration::from_secs(15),
+        "the hand-off was reported after {:?}: {again}",
+        begun.elapsed()
     );
 }
