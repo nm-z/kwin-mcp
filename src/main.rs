@@ -17162,7 +17162,7 @@ impl KwinMcp {
                 )
                 .await
             }
-            _ => None,
+            Some(_) | None => None,
         };
         if let Some(dialog) = &dialog {
             paste_dialog_delivery(&mut delivery, dialog);
