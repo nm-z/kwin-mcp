@@ -5900,7 +5900,7 @@ fn launch_app_reports_commands_that_exit_without_a_window() {
         "{missing}"
     );
     assert_eq!(
-        missing["result"]["structuredContent"]["window_timeout_seconds"], 15,
+        missing["result"]["structuredContent"]["window_timeout_seconds"], 30,
         "{missing}"
     );
     assert!(
@@ -11855,7 +11855,7 @@ fn systemmonitor_registers_on_the_private_app_bus_and_qt_failures_reach_stderr()
         &mut client,
         2,
         "session_start",
-        json!({"browser_profiles":"fresh","width":1280,"height":720}),
+        json!({"width":1280,"height":720}),
     );
     let session = session_handle(&started);
     let workdir = workdir(&started);

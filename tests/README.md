@@ -85,7 +85,7 @@ KWIN_MCP_E2E=1 cargo test --test session_lifecycle_e2e \
 ```
 
 Requires `plasma-systemmonitor` and the normal KDE session dependencies. The
-production stdio test launches System Monitor with fresh browser profiles,
+production stdio test launches System Monitor in a default session,
 checks its window through KWin and a screenshot, checks private app service
 ownership and wallet access, and requires a Qt platform failure to report its
 reason on stderr. It also checks that the app bus differs from the host bus and
