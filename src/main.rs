@@ -13259,7 +13259,7 @@ const BROWSER_OWN_PAGES: [&str; 4] = [
 ];
 
 /// What browser_read says when the session's browser offers no CDP connection.
-const PAGE_READ_NEEDS_CDP: &str = "browser_read reads the page through the Chrome DevTools Protocol (CDP), and this session has no CDP connection to a browser. launch_app connects one when it reports cdp_port; Google Chrome and Edge allow it only with a non-default --user-data-dir (launch_app the browser with --user-data-dir=<a directory of its own>). Without CDP, accessibility_tree show_links=true and find_ui_elements still report each link's href";
+const PAGE_READ_NEEDS_CDP: &str = "browser_read reads the page through the Chrome DevTools Protocol (CDP), and this session has no CDP connection to a browser. launch_app connects one when it reports cdp_port: start the browser by its command name, without cdp=false (a browser started by an absolute path, or with cdp=false, has no port, and a later launch that reuses it adds none). Without CDP, accessibility_tree show_links=true and find_ui_elements still report each link's href";
 
 /// One reply of browser_read: `content` is characters `start..end` of `total`.
 /// The body goes where the client shows it, like the accessibility tree. A reader

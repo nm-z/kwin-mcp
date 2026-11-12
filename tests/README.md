@@ -9,7 +9,6 @@ taking focus, an address of 3000 characters) and one with CDP. Run a case with
 --setenv=KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`;
 `KWIN_MCP_E2E_EVIDENCE=<directory>` keeps a screenshot of each landed page.
 
-<<<<<<< HEAD
 `tests/link_targets_e2e.rs` serves a results page of 300 cards (relative,
 absolute, fragment-only, `javascript:` and `mailto:` targets, a link without
 `href`, links inside an iframe, a 3,000-character target) from 127.0.0.1 and
@@ -19,7 +18,7 @@ characters) and `browser_read` name the same absolute targets, and that the
 page read returns no password value, cookie, storage or script text; without
 CDP it checks the AT-SPI targets and the `cdp_unavailable` refusal; the third
 case types over the name in Chrome's save dialog with `replace=true`.
-=======
+
 `tests/default_profile_cdp_e2e.rs` covers the CDP port on the default profile
 of Google Chrome and Microsoft Edge (#948), each case on a synthetic profile in
 a private HOME, so no account data is involved: a launch without
@@ -33,7 +32,6 @@ Edge case runs when `microsoft-edge-stable` is on PATH or `KWIN_MCP_E2E_EDGE`
 names an Edge launcher (an unpacked `.deb`'s `opt/microsoft/msedge/microsoft-edge`
 on a path a session sees, such as under `/var/tmp`), and reports itself skipped
 otherwise.
->>>>>>> 465a680 (Report a refused port, keep both profiles in the description, add e2e coverage (#948))
 
 `ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
 native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks

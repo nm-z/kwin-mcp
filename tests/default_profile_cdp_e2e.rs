@@ -18,7 +18,8 @@
 //! data is involved. Run an ignored case with `systemd-run --user --wait --pipe
 //! --collect env KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1
 //! NAME`; without KWIN_MCP_E2E_SERVER the binary built with the test is used.
-//! KWIN_MCP_E2E_EVIDENCE=<dir> keeps a screenshot of each case.
+//! KWIN_MCP_E2E_EVIDENCE=<dir> keeps a screenshot of each case; tests/evidence/948
+//! holds one run's.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -477,7 +478,7 @@ fn the_profile_picker_window_has_the_port() {
     let browser = desk.window_titled(" - Google Chrome", 40);
     let navigated = desk.tool("browser_navigate", json!({"url":page}));
     let open = tabs_include(port, &[&page]);
-    let (default, second) = opened_profiles(&mut desk);
+    let (_, second) = opened_profiles(&mut desk);
     desk.evidence("picker-after");
 
     assert_eq!(launched["window_title"], "Google Chrome", "the picker: {launched}");
@@ -488,7 +489,8 @@ fn the_profile_picker_window_has_the_port() {
         "{navigated}"
     );
     assert!(open.contains(&page), "{open:?}");
-    assert!(second && !default, "opened Default: {default}, Profile 2: {second}");
+    // The picker itself loads the last used profile, so Default exists too.
+    assert!(second, "Profile 2 was not opened");
 }
 
 #[test]

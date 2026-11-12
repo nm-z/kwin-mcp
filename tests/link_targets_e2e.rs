@@ -11,7 +11,7 @@
 //! absolute, scheme-relative, fragment-only, `javascript:` and `mailto:` targets, a
 //! link without `href`, a `role=link` span, a target of 3,000 characters and two
 //! links inside an iframe. One case runs Chrome with CDP (a `--user-data-dir` of
-//! its own), one without, and one types over the name in Chrome's save dialog with
+//! its own), one without (`cdp: false`), and one types over the name in Chrome's save dialog with
 //! `keyboard_type replace=true`.
 //!
 //! The server binary is `KWIN_MCP_E2E_SERVER` when set, else the one cargo built.
@@ -184,7 +184,7 @@ impl Wire {
             .env("XDG_CACHE_HOME", home.join(".cache"))
             // A tester's own CHROME_CONFIG_HOME names a profile outside the private
             // HOME, read-only in the session: Chrome would not start without a
-            // --user-data-dir, which is how the case without CDP runs it.
+            // --user-data-dir, which is how two of the cases run it.
             .env_remove("CHROME_CONFIG_HOME")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -302,9 +302,14 @@ impl Wire {
     }
 
     fn launch(&mut self, command: String) -> Value {
+        self.launch_with(command, true)
+    }
+
+    /// `cdp` false starts a browser without a debugging port.
+    fn launch_with(&mut self, command: String, cdp: bool) -> Value {
         let launched = self.tool(
             "launch_app",
-            json!({"command":command, "window_timeout_seconds":60}),
+            json!({"command":command, "window_timeout_seconds":60, "cdp":cdp}),
         );
         assert!(launched["error"].is_null(), "{launched}");
         launched["result"]["structuredContent"].clone()
@@ -634,8 +639,9 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
     let fixture = Fixture::start();
     let base = fixture.base();
     let mut wire = Wire::start("atspi");
-    // Chrome's default profile directory: no CDP.
-    let launched = wire.launch(format!("google-chrome-stable {base}/index.html"));
+    // A flagless Chrome gets the port on its default profile too (#948), so
+    // this case asks for none.
+    let launched = wire.launch_with(format!("google-chrome-stable {base}/index.html"), false);
     assert!(launched["cdp_port"].is_null(), "CDP connected: {launched}");
 
     let found = wire.links("Listing 7 ", json!({}));
@@ -680,7 +686,7 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
 
     let (reason, message) = wire.refused("browser_read", json!({"format":"links"}));
     assert_eq!(reason, "cdp_unavailable");
-    assert!(message.contains("CDP") && message.contains("--user-data-dir"), "{message}");
+    assert!(message.contains("CDP") && message.contains("cdp=false"), "{message}");
 }
 
 #[test]
