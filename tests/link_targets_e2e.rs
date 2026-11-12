@@ -358,6 +358,16 @@ impl Wire {
     /// Every row of `accessibility_tree role=link`, read a page of rows at a time,
     /// with the number of calls it took. Each reply must fit the tree's budget.
     fn link_rows(&mut self, show_links: bool, show_elements: bool) -> (Vec<String>, usize) {
+        self.link_rows_from(show_links, show_elements, "window")
+    }
+
+    /// The same from one tree: `window` (AT-SPI) or `page` (the active tab, CDP).
+    fn link_rows_from(
+        &mut self,
+        show_links: bool,
+        show_elements: bool,
+        source: &str,
+    ) -> (Vec<String>, usize) {
         let mut rows = Vec::new();
         let mut offset = 0;
         let mut calls = 0;
@@ -365,7 +375,7 @@ impl Wire {
             let tree = self.data(
                 "accessibility_tree",
                 json!({"role":"link", "show_links":show_links, "show_elements":show_elements,
-                    "offset":offset, "timeout_seconds":30}),
+                    "offset":offset, "timeout_seconds":30, "source":source}),
             );
             calls += 1;
             let text = tree["tree"].as_str().expect("the tree");
@@ -535,12 +545,12 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
     assert!(compact.iter().all(|element| element["bounds"].is_object()), "{compact:?}");
 
     // The tree: without show_links no row carries a target.
-    let (plain, plain_calls) = wire.link_rows(false, false);
+    let (plain, plain_calls) = wire.link_rows_from(false, false, "page");
     assert!(plain.iter().all(|row| row_target(row).is_none()), "{plain:?}");
     assert!(plain.len() >= CARDS, "{} link rows", plain.len());
     // With it every card's row ends in the target the search reported, a page of rows
     // at a time.
-    let (rows, calls) = wire.link_rows(true, false);
+    let (rows, calls) = wire.link_rows_from(true, false, "page");
     eprintln!("tree: {} rows in {plain_calls} call(s) without targets, {} rows in {calls} calls with", plain.len(), rows.len());
     assert_eq!(rows.len(), plain.len(), "the paged rows are the rows");
     assert!(calls > 1, "300 targets fit one reply?");
@@ -736,4 +746,48 @@ fn replace_types_over_the_name_in_chromes_save_dialog() {
         thread::sleep(Duration::from_millis(300));
     }
     assert!(!wire.workdir.join("saved-947.htm.html").exists(), "the old extension stayed");
+}
+
+/// #951: with a CDP port open the tree is still the browser window's own
+/// (frame, tab strip, toolbar, AT-SPI role names), and the page tree comes only
+/// when asked for and is the tab the window shows, not another tab.
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
+fn with_a_cdp_port_the_tree_is_the_window_and_the_page_tree_is_the_active_tab() {
+    let fixture = Fixture::start();
+    let base = fixture.base();
+    let mut wire = Wire::start("tree-source");
+    let profile = wire.workdir.join("profile");
+    // Two tabs: the second command line address is the one the window shows.
+    let launched = wire.launch(format!(
+        "google-chrome-stable --user-data-dir={} {base}/index.html about:blank",
+        profile.display()
+    ));
+    assert!(launched["cdp_port"].as_u64().is_some(), "no CDP: {launched}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let tree = loop {
+        let tree = wire.data("accessibility_tree", json!({"max_depth": 12, "timeout_seconds": 15}));
+        let text = tree["tree"].as_str().unwrap_or_default();
+        if text.lines().filter(|line| line.trim_start().starts_with("page tab\t")).count() >= 2 {
+            break tree;
+        }
+        assert!(Instant::now() < deadline, "the window tree never showed two tabs: {tree}");
+        thread::sleep(Duration::from_millis(500));
+    };
+    let text = tree["tree"].as_str().expect("tree");
+    assert!(tree.get("source").is_none_or(|source| source != "page"), "{tree}");
+    assert!(text.starts_with("frame\t"), "the tree does not start at the browser window: {text}");
+    assert!(!text.contains("RootWebArea"), "CDP role names in the window tree: {text}");
+
+    let titles = wire.window_titles();
+    let page = wire.data("accessibility_tree", json!({"source": "page", "max_depth": 3}));
+    assert_eq!(page["source"], "page", "{page}");
+    let rows = page["tree"].as_str().expect("page tree");
+    assert!(rows.starts_with("RootWebArea\t"), "{rows}");
+    // Two tabs are open; the page tree is the one whose title the window carries.
+    let root = rows.lines().next().and_then(|row| row.split('\t').nth(1)).unwrap_or_default();
+    assert!(
+        !root.is_empty() && titles.iter().any(|title| title.starts_with(root)),
+        "the page tree {root:?} is not the tab the window shows ({titles:?})"
+    );
 }

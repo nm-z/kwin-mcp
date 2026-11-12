@@ -14809,6 +14809,17 @@ struct AccessibilityTreeParams {
     /// Rows to skip in a level too large for one reply: the K of a previous
     /// reply's "+N more rows offset=K" line, with the other arguments unchanged.
     offset: Option<usize>,
+    /// window (default): the application's windows through AT-SPI, with the
+    /// browser's frame, tab strip and toolbar. page: the active tab's own tree
+    /// through CDP, with the browser's role names.
+    source: Option<TreeSource>,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum TreeSource {
+    Window,
+    Page,
 }
 
 const FIND_UI_MAX_MATCHES: usize = 200;
@@ -18592,7 +18603,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. show_links=true (default false) ends each link's row in href=URL, its absolute target, the value find_ui_elements gives as href; a target longer than 1,000 characters shows its first and last 500 with '…[N more characters]…' between. A level too large for one reply (role lifts every match to the first level) returns the rows that fit, each ending in root=ID, then '+N more rows offset=K': call again with offset=K and the same arguments.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. show_links=true (default false) ends each link's row in href=URL, its absolute target, the value find_ui_elements gives as href; a target longer than 1,000 characters shows its first and last 500 with '…[N more characters]…' between. A level too large for one reply (role lifts every match to the first level) returns the rows that fit, each ending in root=ID, then '+N more rows offset=K': call again with offset=K and the same arguments. source=window (default) is the application's windows through AT-SPI: a browser's frame, tab strip, toolbar and the page inside them. source=page is the page tree of the active tab of the focused browser window through CDP, with the browser's own role names (RootWebArea, StaticText); it needs cdp_port.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -18649,6 +18660,81 @@ impl KwinMcp {
         }
     }
 
+    /// The tab the active window shows, when that window is a Chromium-family
+    /// browser the session's CDP connection reaches. A refusal starts with
+    /// `prefix` and carries its reason.
+    async fn active_browser_page(&self, prefix: &str) -> Result<chromiumoxide::Page, McpError> {
+        let refuse = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!("{prefix}: {detail}."),
+                Some(serde_json::json!({"reason": reason})),
+            )
+        };
+        let (conn, unique, runtime, browser) = self
+            .with_session(|s| {
+                Ok((
+                    s.kwin_conn.clone(),
+                    s.kwin_unique_name.clone(),
+                    s.host_xdg_dir.clone(),
+                    s.cdp_browser.clone(),
+                ))
+            })
+            .await?;
+        // The caption KWin reports can trail the title of a page that just
+        // arrived: look again for a moment before giving the tab up.
+        let mut looks = 0;
+        let page = loop {
+            let active = active_window_info(&conn, &unique, &runtime)
+                .await
+                .map(|(_, _, geometry)| geometry)
+                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let mut windows = window_snapshots(&conn, &unique, &runtime)
+                .await
+                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let index = windows
+                .iter()
+                .position(|window| window.id == active.id && window.active && !window.minimized)
+                .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
+            let window = windows.swap_remove(index);
+            if !chromium_resource_class(&window.resource_class) {
+                return Err(refuse(
+                    "not_a_browser",
+                    format!(
+                        "the active window is {:?} ({}), not a Chromium-family browser",
+                        window.title, window.resource_class
+                    ),
+                ));
+            }
+            let Some(browser) = browser.as_deref() else {
+                return Err(refuse("cdp_unavailable", PAGE_READ_NEEDS_CDP.to_owned()));
+            };
+            if !cdp_is_process(browser, window.pid).await {
+                return Err(refuse(
+                    "cdp_unavailable",
+                    format!(
+                        "{PAGE_READ_NEEDS_CDP}. The active window {:?} belongs to browser process {}, which is not the browser the session's CDP connection reaches",
+                        window.title, window.pid
+                    ),
+                ));
+            }
+            if let Some(page) = cdp_active_tab(browser, &window.title).await {
+                break page;
+            }
+            looks += 1;
+            if looks > NAVIGATION_CAPTION_LOOKS {
+                return Err(refuse(
+                    "tab_not_found",
+                    format!(
+                        "no single tab of the connected browser has the title of the active window {:?} (a dialog such as a file chooser, or a window that shows no page)",
+                        window.title
+                    ),
+                ));
+            }
+            tokio::time::sleep(NAVIGATION_POLL).await;
+        };
+        Ok(page)
+    }
+
     async fn accessibility_tree_result(
         &self,
         peer: rmcp::Peer<rmcp::RoleServer>,
@@ -18667,27 +18753,26 @@ impl KwinMcp {
             role.as_ref()
                 .is_none_or(|needle| name.to_lowercase().contains(needle))
         };
-        // CDP path for Chromium/Electron apps
-        let cdp_browser = self
-            .session
-            .read()
-            .await
-            .as_ref()
-            .and_then(|s| s.cdp_browser.clone());
-        if let Some(browser) = cdp_browser
-            && let Ok(pages) = browser.pages().await
-        {
-            for page in &pages {
-                let url = page.url().await.ok().flatten().unwrap_or_default();
-                if url.starts_with("chrome://") || url.starts_with("chrome-extension://") {
-                    continue;
-                }
+        // The page tree is read only when asked for: source=page, or a root that
+        // names a node of it. It is the tab the active window shows, never another
+        // tab of the connected browser. Everything else is the window tree.
+        let page_root = params.root.as_ref().is_some_and(|root| !root.contains('/'));
+        if matches!(params.source, Some(TreeSource::Page)) || page_root {
+            let page = self.active_browser_page("No page tree").await?;
+            {
+                let page = &page;
                 use chromiumoxide::cdp::browser_protocol::accessibility::{
                     GetFullAxTreeParams, GetFullAxTreeReturns,
                 };
-                let Ok(result) = page.execute(GetFullAxTreeParams::builder().build()).await else {
-                    continue;
-                };
+                let result = page
+                    .execute(GetFullAxTreeParams::builder().build())
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!("No page tree: the tab did not return its accessibility tree: {error}."),
+                            Some(serde_json::json!({"reason": "page_unresponsive"})),
+                        )
+                    })?;
                 let returns: &GetFullAxTreeReturns = &result;
                 let index: std::collections::HashMap<String, usize> = returns
                     .nodes
@@ -18724,11 +18809,17 @@ impl KwinMcp {
                 };
                 // Map the AX tree onto shown nodes; hidden ones pass their children up.
                 let starts: Vec<usize> = match &params.root {
-                    Some(root) if !root.contains('/') => {
-                        let Some(&at) = index.get(root) else { continue };
+                    Some(root) => {
+                        let Some(&at) = index.get(root) else {
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "root '{root}' is not present in the page tree of the active tab"
+                                ),
+                                None,
+                            ));
+                        };
                         vec![at]
                     }
-                    Some(_) => continue,
                     None => returns
                         .nodes
                         .iter()
@@ -18777,19 +18868,11 @@ impl KwinMcp {
                     }
                 }
                 let (tree, mut info) = tree.render(max_levels);
-                info["source"] = serde_json::json!("cdp");
+                info["source"] = serde_json::json!("page");
                 return Ok(tree_result(&peer, tree, info).await);
             }
         }
-        // AT-SPI path for native apps
-        if let Some(root) = &params.root
-            && !root.contains('/')
-        {
-            return Err(McpError::invalid_params(
-                format!("root '{root}' is not present in the browser accessibility tree"),
-                None,
-            ));
-        }
+        // The window tree, through AT-SPI.
         let (zbus_conn, screen) = self
             .with_session(|s| Ok((s.kwin_conn.clone(), (s.screen_width, s.screen_height))))
             .await?;
@@ -19321,68 +19404,7 @@ impl KwinMcp {
         }
         self.touch_activity().await;
         self.settle_input().await?;
-        let (conn, unique, runtime, browser) = self
-            .with_session(|s| {
-                Ok((
-                    s.kwin_conn.clone(),
-                    s.kwin_unique_name.clone(),
-                    s.host_xdg_dir.clone(),
-                    s.cdp_browser.clone(),
-                ))
-            })
-            .await?;
-        // The caption KWin reports can trail the title of a page that just
-        // arrived: look again for a moment before giving the tab up.
-        let mut looks = 0;
-        let page = loop {
-            let active = active_window_info(&conn, &unique, &runtime)
-                .await
-                .map(|(_, _, geometry)| geometry)
-                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
-            let mut windows = window_snapshots(&conn, &unique, &runtime)
-                .await
-                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
-            let index = windows
-                .iter()
-                .position(|window| window.id == active.id && window.active && !window.minimized)
-                .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
-            let window = windows.swap_remove(index);
-            if !chromium_resource_class(&window.resource_class) {
-                return Err(refuse(
-                    "not_a_browser",
-                    format!(
-                        "the active window is {:?} ({}), not a Chromium-family browser",
-                        window.title, window.resource_class
-                    ),
-                ));
-            }
-            let Some(browser) = browser.as_deref() else {
-                return Err(refuse("cdp_unavailable", PAGE_READ_NEEDS_CDP.to_owned()));
-            };
-            if !cdp_is_process(browser, window.pid).await {
-                return Err(refuse(
-                    "cdp_unavailable",
-                    format!(
-                        "{PAGE_READ_NEEDS_CDP}. The active window {:?} belongs to browser process {}, which is not the browser the session's CDP connection reaches",
-                        window.title, window.pid
-                    ),
-                ));
-            }
-            if let Some(page) = cdp_active_tab(browser, &window.title).await {
-                break page;
-            }
-            looks += 1;
-            if looks > NAVIGATION_CAPTION_LOOKS {
-                return Err(refuse(
-                    "tab_not_found",
-                    format!(
-                        "no single tab of the connected browser has the title of the active window {:?} (a dialog such as a file chooser, or a window that shows no page)",
-                        window.title
-                    ),
-                ));
-            }
-            tokio::time::sleep(NAVIGATION_POLL).await;
-        };
+        let page = self.active_browser_page("Nothing was read").await?;
         let address = cdp_entry(&page)
             .await
             .map(|(url, _)| url)
