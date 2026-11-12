@@ -943,6 +943,29 @@ jar. Browser flush timeouts and cookie save failures are returned in
 reported there as well. Remove the profile's saved database from this directory
 to discard its session cookie history. This does not sign out the host browser.
 
+### Browser page storage continuity
+
+Sites that keep a sign-in in Local Storage or IndexedDB rather than a cookie stay
+signed in from one session to the next as well. At `session_start` each Chromium
+profile's `Local Storage/leveldb` and `IndexedDB` are copied into the session's
+disk (tables as hard links, which LevelDB never rewrites) and mounted over the
+profile's own as the read-only lower layer of a separate overlay, so the session's
+browser writes only into that overlay. At `session_stop` kwin-mcp saves what the
+session changed under `${XDG_STATE_HOME:-~/.local/state}/kwin-mcp/page-storage`
+(private, `0700`/`0600`), and the next session starts from the host's stores with
+those changes applied. The host profile stays read-only.
+
+Local Storage is carried key by key: a saved key records the value the session
+started with and the value it left. The next session takes the saved value where
+the host still holds the starting value; where the host changed the key as well,
+the later change wins. An IndexedDB origin is carried whole: the saved copy is
+used while the host has not written that origin since the session started from
+it, and otherwise when it is newer than the host's. Stores that cannot be copied
+(for example past a 512 MiB copy limit when the session disk is on another file
+system than the profile) keep working as before without continuity, and the
+reason is reported in `cookie_errors`. Remove a profile's directory under
+`page-storage` to discard what sessions saved for it.
+
 
 Point your MCP client at `target/release/kwin-mcp`. One server process owns its isolated desktops. Every `session_start` creates a new desktop and returns its ID; this tool does not accept `session_id`. Use only IDs returned by your own `session_start` calls. Pass that ID to later calls; omitting it is permitted only when one session exists. `session_list` lists live desktops owned by that server. Requests carrying a live session ID owned by another kwin-mcp process running as the same user on the same host are forwarded to that process through a private Unix socket.
 

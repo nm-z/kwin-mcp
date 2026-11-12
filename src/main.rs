@@ -5898,6 +5898,53 @@ fn mark_browser_exits_clean(
     Ok(marked)
 }
 
+/// Gives the session's browsers private copies of each profile's Local Storage
+/// and IndexedDB, each mounted as the lower layer of an overlay of its own,
+/// with what earlier sessions saved applied (`kwin_mcp::page_storage`, #955).
+/// The copies live in the session's disk twin, where teardown saves what the
+/// session changed. A store that cannot be copied stays on the HOME overlay
+/// and its reason joins `errors`.
+fn prepare_page_storage(
+    plan: &mut OverlayPlan,
+    target: &Path,
+    disk: &Path,
+    errors: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let state = kwin_mcp::page_storage::state_root()?;
+    if state.starts_with(target) {
+        plan.empty_dirs.push(state);
+    }
+    let root = disk.join(PAGE_STORAGE_DIR);
+    let prepared = match kwin_mcp::page_storage::prepare(target, BROWSER_CONFIG_DIRS, &root) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("session_start: browser page storage keeps no continuity: {error:#}");
+            errors.push(format!("page storage: {error:#}"));
+            return Ok(());
+        }
+    };
+    for error in prepared.errors {
+        eprintln!("session_start: page storage without continuity: {error}");
+        errors.push(format!("page storage: {error}"));
+    }
+    for mount in prepared.mounts {
+        // A profile with no IndexedDB yet needs the mount point in the session.
+        if !mount.destination.exists() {
+            std::fs::create_dir_all(upper_file(plan, &mount.destination)?)?;
+        }
+        plan.overlays.push(OverlayMount {
+            lower: mount.lower,
+            upper: mount.upper,
+            work: mount.work,
+            destination: mount.destination,
+        });
+    }
+    Ok(())
+}
+
+/// The directory in a session's disk twin that holds its page storage layers.
+const PAGE_STORAGE_DIR: &str = "page-storage";
+
 /// Host state session_start reads before it spawns the sandbox.
 struct HostView {
     overlay_plan: OverlayPlan,
@@ -5925,6 +5972,7 @@ fn validate_host_write_paths(
         session_disk_root(),
         host_runtime.to_path_buf(),
         kwin_mcp::browser_cookies::state_root()?,
+        kwin_mcp::page_storage::state_root()?,
         target.join(BROWSER_CACHE_DIR),
     ];
     for path in &host_write_paths {
@@ -6083,12 +6131,14 @@ fn prepare_host_view(
     service.set_start_stage("preparing browser profiles");
     let discarded = discarded_session_databases(target, service)?;
     empty_session_databases(&overlay_plan, &discarded, service)?;
-    let (cookie_roots, cookie_errors) = prepare_browser_cookies(
+    let (cookie_roots, mut cookie_errors) = prepare_browser_cookies(
         &mut overlay_plan,
         target,
         &disk.join("cookie-baselines"),
         service,
     )?;
+    service.host_step("copying browser page storage")?;
+    prepare_page_storage(&mut overlay_plan, target, &disk, &mut cookie_errors)?;
     let marked = mark_browser_exits_clean(&overlay_plan, target, service)?;
     hide_browser_sessions(&mut overlay_plan, target, service)?;
     eprintln!("session_start: marked {marked} browser profile(s) clean");
@@ -8902,6 +8952,7 @@ const STAGE_SANDBOX: &str = "ending the sandbox processes";
 const STAGE_SCOPE_EXIT: &str = "waiting for the scope to empty";
 const STAGE_PROXIES: &str = "ending the session's D-Bus proxies";
 const STAGE_COOKIES: &str = "saving browser cookies";
+const STAGE_PAGE_STORAGE: &str = "saving browser page storage";
 const STAGE_STORAGE: &str = "deleting the session's overlay and runtime files";
 const STAGE_WORKDIR: &str = "deleting the session workdir";
 
@@ -9002,7 +9053,10 @@ fn stop_pending_report(
     let (stage, running) = progress
         .running()
         .unwrap_or(("finishing", Duration::ZERO));
-    let processes = if matches!(stage, STAGE_COOKIES | STAGE_STORAGE | STAGE_WORKDIR) {
+    let processes = if matches!(
+        stage,
+        STAGE_COOKIES | STAGE_PAGE_STORAGE | STAGE_STORAGE | STAGE_WORKDIR
+    ) {
         "Every process of the session has ended; what is left is deleting its files, which a busy disk slows down."
     } else {
         "The session's processes were told to end, and those that have not are being killed."
@@ -9594,6 +9648,12 @@ fn teardown(mut sess: Session, progress: &StopProgress) -> TeardownReport {
         let message = format!("{error:#}");
         eprintln!("teardown: browser cookies were not saved: {error:#}");
         cookie_errors.push(message);
+    }
+    progress.begin(STAGE_PAGE_STORAGE);
+    let page_storage = session_disk_path(&sess.host_xdg_dir).join(PAGE_STORAGE_DIR);
+    if let Err(error) = kwin_mcp::page_storage::persist(&page_storage) {
+        eprintln!("teardown: browser page storage was not saved: {error:#}");
+        cookie_errors.push(format!("page storage: {error:#}"));
     }
     progress.begin(STAGE_STORAGE);
     test_slow_storage();
