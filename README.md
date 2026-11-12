@@ -13,8 +13,9 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `screenshot` | Capture the active window as PNG. |
 | `window_list` | List all isolated-session windows, including hidden prompts and modal relationships. `showing_desktop: true` (with `hidden: true` on each window) means KDE show desktop (`super+d`) hides them without minimizing them; `screenshot` and `keyboard_type` warn about the same state. |
 | `window_activate` | Reveal and focus a window by the ID returned from `window_list`. |
-| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). |
-| `find_ui_elements` | Search UI elements by name/role with bounding boxes. |
+| `accessibility_tree` | Traverse the AT-SPI2 accessibility tree with configurable depth/filters, subtree continuation, and a bounded per-call time budget (5 seconds by default, up to 30 seconds). `show_links: true` adds each link's absolute target to its row; a level too large for one reply is returned a page of rows at a time (`offset`). |
+| `find_ui_elements` | Search UI elements by name/role with bounding boxes. A link carries its absolute target as `href`. |
+| `browser_read` | Read the page in the active tab of the focused Chromium-family window through CDP: its text, its outer HTML, or its links with their absolute targets, optionally scoped by a CSS selector, at most 30,000 characters per call with `next_offset` to continue. Never returns cookies, storage or the values of fields. |
 | `mouse_click` | Click at window-relative coordinates. |
 | `browser_navigate` | Open a URL in the active tab of the focused Chromium-family window and verify where the tab landed. With CDP the tab is navigated directly. Without it the address bar is focused through accessibility, the URL is typed (pasted when longer than 128 characters, restoring the session clipboard), and Return is pressed only once the bar holds exactly the URL. Returns `title`, `url` and `method`, with `redirected: true` after a redirect. A download, Chrome's error page, a tab that kept its page, a tab switch or a search is an error with a `reason`. A URL without a scheme is opened as `http://`. Up to 2097152 characters with CDP, 512000 without. |
 | `mouse_click_element` | Find an element by name/role at click time (as `find_ui_elements`) and click the center of its bounds; `index` picks among several. For pages whose layout shifts between steps. Activates another window of the session when the match is only there; a refusal says why and the next step. |
@@ -72,6 +73,17 @@ For Chrome's chooser, click the file input, press Ctrl+L, enter the verified
 absolute session path, and use Alt+O. Then verify the application's selected
 filename and byte size or upload outcome before submitting the form.
 
+Chrome's save dialog (Ctrl+S) is the same in-process GTK dialog, and nothing in
+it is exposed through AT-SPI. It opens with only the stem of the suggested name
+selected, so text typed there keeps the old extension; `keyboard_type` with
+`replace=true` presses Ctrl+A first and replaces the whole name. The result is
+`unverified` and says the field could not be read back: check it with a
+screenshot. Return in the name field does not accept this dialog, also when
+pressed twice and with no completion popup showing (the same keys accept
+zenity's GTK chooser, so this is Chrome's dialog, not key delivery); use Alt+S,
+the Save mnemonic, or click **Save**. To read a page's content, `browser_read`
+needs no dialog at all.
+
 ## Transient-window screenshots
 
 For an active dialog, modal, or transient window, `screenshot` compares the
@@ -96,6 +108,18 @@ semantically up to date.
 ## Large accessibility trees
 
 `accessibility_tree` has a five-second default budget. Set `timeout_seconds` from 1 to 30 when a large page needs more traversal time. If the result is incomplete, continue from a node marked `root=ID` by passing that ID as `root` and using a smaller `max_depth`. The `root` parameter is part of the MCP tool schema; refresh the client's tool list if it is missing.
+
+A reply holds whole levels, as deep as fit in 30,000 characters. One level can be larger than that by itself: a `role` filter lifts every match to the first level, and a results page has several hundred links. That level (the first one, or with `root=ID` the one below the root) is returned a page of rows at a time: the rows that fit, each ending in `root=ID`, and a last line `+N more rows offset=K`, with `more_rows` and `next_offset` in the structured result. Call again with `offset=K` and the same arguments until no such line follows. Before this such a call returned an empty tree.
+
+## Link targets and page content
+
+A link's target is part of what the element tools report ([#947](https://github.com/nm-z/kwin-mcp/issues/947)):
+
+- `find_ui_elements` gives every element of role `link` an `href`, the absolute URL the browser would open: a relative, scheme-relative or fragment-only `href` is resolved against its document (an iframe's links against the iframe's address), and `javascript:` and `mailto:` targets are returned as written. The `cdp` backend reads the element's resolved `href` property; the `atspi` backend reads the URI of the object's AT-SPI Hyperlink interface, which Chrome publishes already resolved (it puts no target in the object attributes). The two agree. An `<a>` without `href` and a `role=link` element have no `href` field. `compact=true` leaves `href` out: compact is the cheap list of click targets, and a tracking URL is longer than everything else it keeps. A target longer than 8,000 characters (a `data:` URL) is cut to its first and last 4,000 with `…[N more characters]…` between, and `href_chars` gives its length.
+- `accessibility_tree` adds the target to link rows only with `show_links=true`, as a last field `href=URL`, so the default tree of a link-heavy page keeps its depth. A target longer than 1,000 characters is shown as its first and last 500 with `…[N more characters]…` between, the rule long names follow at 8,000; the element search returns that target whole. With `role=link` the links of a results page are one level, returned in pages as described above.
+- `browser_read` returns the page itself through CDP, without a save dialog: `format=text` (the text a reader sees), `html` (outer HTML without style sheets and without what scripts hold: code, and JSON data blocks, where a page keeps its state and tokens; only `application/ld+json` metadata stays), or `links` (one line per `a[href]`: its text, a tab, its absolute target). `selector` limits the read to the elements a CSS selector matches. A call returns at most `max_chars` characters (1 to 30,000, counted as JavaScript counts them) starting at `offset`, with `total_chars` and, while more remains, `next_offset`. It reads the active tab of the focused browser window and only its top document. It needs CDP: without a connection the error has `reason: cdp_unavailable` and says how to launch the browser so that one exists; the two tools above work either way. It does not read `chrome://` or extension pages.
+
+`browser_read` reads the DOM only. It never reads `document.cookie`, `localStorage` or `sessionStorage`, and it returns no field's current value; in `html` the `value` attribute a page wrote on a password field is removed (also on a field that a "show password" switch turned into a text field, recognised by `autocomplete`, `name` or `id`, and inside a `<template>`). `format=links` lists every `a[href]` of the document, including links the accessibility tree leaves out (collapsed menus, links without a name), so it can list more targets than the tree does; every target the tree shows is in it.
 
 ## Element names in `accessibility_tree` and `find_ui_elements`
 
