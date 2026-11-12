@@ -5602,6 +5602,14 @@ const BROWSER_CONFIG_DIRS: &[&str] = &[
 
 const BROWSER_CACHE_DIR: &str = ".cache/google-chrome";
 
+/// Beside `browser-bin` in the session workdir: the config homes the browser
+/// wrapper gives Chrome and Edge, whose entries are symlinks to the real data
+/// directories, and the `unlinked` mark that ends the linking.
+const BROWSER_CONFIG_STORE: &str = "browser-config";
+
+/// The file in that store which tells the wrapper to stop linking.
+const BROWSER_CONFIG_UNLINKED: &str = "unlinked";
+
 const EMPTY_BROWSER_DATABASES: &[&str] = &["History", "HistoryEmbeddings", "Favicons"];
 
 fn prepare_browser_cookies(
@@ -8296,7 +8304,14 @@ fn cleanup_stale_session_files(dir: &std::path::Path) {
         "viewer.log",
         VIEWER_STATUS_FILE,
     ];
-    const STALE_DIRS: &[&str] = &["at-spi", "browser-bin", "dbus-1", "dconf", "doc"];
+    const STALE_DIRS: &[&str] = &[
+        "at-spi",
+        "browser-bin",
+        BROWSER_CONFIG_STORE,
+        "dbus-1",
+        "dconf",
+        "doc",
+    ];
     for name in STALE_FILES {
         let _ = std::fs::remove_file(dir.join(name));
     }
@@ -10849,9 +10864,99 @@ case "$name" in
     (( default_check )) || flags+=(--no-default-browser-check)
     ;;
 esac
+# Google Chrome and Microsoft Edge open no debugging port on their default data
+# directory (Chromium, Brave and Vivaldi do). They call a directory the default
+# when the directory they run on, resolved, equals as text the unresolved path
+# they derive from CHROME_CONFIG_HOME. With a config home whose entry for the
+# browser is a symlink to the real directory, and the real path as
+# --user-data-dir, the profile is the same one and the two paths differ (#948).
+# The variable is set for the browser alone. Programs the browser starts
+# inherit it, and a browser among them that is started without --user-data-dir
+# reaches its real directory through the same symlinks.
+default_dir=
+case "$name" in
+  google-chrome|google-chrome-stable) default_dir=google-chrome ;;
+  microsoft-edge|microsoft-edge-stable|msedge) default_dir=microsoft-edge ;;
+esac
+
+# The data directory a launcher script adds from its flags file (Arch:
+# ~/.config/chrome-flags.conf). Its switches come ahead of ours, where the
+# argument scan above does not see them.
+launcher_data_dir() {
+  local magic line flag_line conf word words lines=0 found=
+  read -r -N 2 magic < "$real" || return 0
+  [[ $magic == '#!' ]] || return 0
+  while IFS= read -r line && (( ++lines <= 400 )); do
+    [[ $line =~ ([A-Za-z0-9._-]+flags\.conf) ]] || continue
+    conf=${XDG_CONFIG_HOME:-$HOME/.config}/${BASH_REMATCH[1]}
+    [[ -f $conf ]] || continue
+    while IFS= read -r flag_line || [[ -n $flag_line ]]; do
+      [[ $flag_line == '#'* ]] && continue
+      read -ra words <<< "$flag_line" || continue
+      for word in "${words[@]}"; do
+        [[ $word == --user-data-dir=?* ]] && found=${word#*=}
+      done
+    done < "$conf"
+  done < "$real"
+  [[ -z $found ]] || realpath -m -- "$found"
+}
+
+# Makes the config home the browser is given in place of $config_home: each
+# Chromium-family directory that exists there, and this browser's, as a symlink
+# to the real directory.
+link_config_home() {
+  local dir target link
+  mkdir -p -- "$config_link" "$profile" || return 1
+  for dir in @CONFIG_DIRS@; do
+    if [[ $dir == "$default_dir" ]]; then
+      target=$profile
+    else
+      [[ -d $config_home/$dir ]] || continue
+      target=$(realpath -- "$config_home/$dir") || continue
+    fi
+    link=$config_link/$dir
+    [[ -L $link && $(readlink -- "$link") == "$target" ]] && continue
+    mkdir -p -- "${link%/*}" && ln -sfn -- "$target" "$link" || return 1
+  done
+}
+
+# Sets default_profile when the browser can have its port on the directory a
+# launch without --user-data-dir opens.
+default_profile=
+prepare_default_profile() {
+  local store launcher_dir
+  config_home=${CHROME_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}}
+  profile=$(realpath -m -- "$config_home/$default_dir") || return 0
+  store=$(realpath -m -- "${0%/*}/../@CONFIG_STORE@") || return 0
+  launcher_dir=$(launcher_data_dir) || return 0
+  if [[ -n $launcher_dir && $launcher_dir != "$profile" ]]; then
+    # The launcher runs the browser on another directory; the port opens there.
+    default_profile=launcher
+    return 0
+  fi
+  if [[ -e $store/@UNLINKED@ ]]; then
+    # The server saw this browser refuse the port on a linked default (it
+    # resolved the link), so the default becomes a directory with no profile.
+    config_link=$store/@UNLINKED@-config
+    default_profile=unlinked
+  else
+    case "$config_home" in
+      "$store"/*) config_link=$config_home ;;
+      *) config_link=$store$(realpath -m -- "$config_home") || return 0 ;;
+    esac
+    link_config_home || return 0
+    default_profile=linked
+  fi
+  export CHROME_CONFIG_HOME=$config_link
+  [[ -n $launcher_dir ]] || flags+=("--user-data-dir=$profile")
+}
+if [[ -n $default_dir && -n ${KWIN_MCP_CDP_PORT:-} ]] && (( ! custom_profile )); then
+  prepare_default_profile 2>/dev/null || true
+fi
 cdp=1
 case "$name" in
-  google-chrome*|chrome|microsoft-edge*|msedge*) (( custom_profile )) || cdp=0 ;;
+  google-chrome*|chrome|microsoft-edge*|msedge*)
+    (( custom_profile )) || [[ -n $default_profile ]] || cdp=0 ;;
 esac
 if [[ -n ${KWIN_MCP_CDP_PORT:-} ]] && (( cdp )); then
   # The server connects through the port reserved and forwarded for this
@@ -10870,7 +10975,8 @@ if [[ -n ${KWIN_MCP_CDP_PORT:-} ]] && (( cdp )); then
     esac
   done
   flags+=("--remote-debugging-port=$KWIN_MCP_CDP_PORT")
-  [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] || printf cdp > "$KWIN_MCP_BROWSER_MARKER"
+  # "cdp", then how the default data directory got its port, if it did.
+  [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] || printf 'cdp %s' "$default_profile" > "$KWIN_MCP_BROWSER_MARKER"
   set -- "${browser_args[@]}"
 fi
 exec "$real" "${flags[@]}" "$@"
@@ -10881,7 +10987,17 @@ fn create_browser_wrappers(workdir: &Path) -> std::io::Result<PathBuf> {
     let bin = workdir.join("browser-bin");
     std::fs::create_dir_all(&bin)?;
     let wrapper = bin.join("kwin-browser");
-    std::fs::write(&wrapper, BROWSER_WRAPPER)?;
+    let config_dirs: Vec<&str> = BROWSER_CONFIG_DIRS
+        .iter()
+        .filter_map(|directory| directory.strip_prefix(".config/"))
+        .collect();
+    std::fs::write(
+        &wrapper,
+        BROWSER_WRAPPER
+            .replace("@CONFIG_DIRS@", &config_dirs.join(" "))
+            .replace("@CONFIG_STORE@", BROWSER_CONFIG_STORE)
+            .replace("@UNLINKED@", BROWSER_CONFIG_UNLINKED),
+    )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
     for name in BROWSER_COMMANDS {
         symlink("kwin-browser", bin.join(name))?;
@@ -10894,8 +11010,8 @@ static NEXT_BROWSER_LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Browser launch commands we know how to detect. The container mounts the host
 /// root read-only, so anything on the host's PATH is runnable inside the session
 /// by the same command. Ordered most- to least-common so the injected hint reads
-/// sensibly. `chromium` is called out separately by callers because it's the only
-/// one that exposes CDP on its default profile.
+/// sensibly. Chrome and Edge alone refuse CDP on their default profile; the
+/// browser wrapper gives them the port there too.
 const KNOWN_BROWSERS: &[&str] = &[
     "google-chrome-stable",
     "google-chrome",
@@ -13720,6 +13836,58 @@ struct LaunchAppParams {
     /// status, then returns promptly with the PID if it is still running.
     /// Defaults to true.
     expect_window: Option<bool>,
+    /// Set false to start a browser without a debugging port: the port is
+    /// forwarded to the host's loopback, where any program of this user can
+    /// drive a browser that holds a signed-in profile. Defaults to true.
+    cdp: Option<bool>,
+}
+
+/// Chrome's own line when it gives its data directory no debugging port.
+const DEFAULT_DIRECTORY_REFUSAL: &str = "requires a non-default data directory";
+
+/// What the browser wrapper recorded about a launch it gave the session's
+/// debugging port: how the default data directory got that port, if it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultProfilePort {
+    /// A `--user-data-dir` of the caller's, or a browser that needs nothing.
+    NotInvolved,
+    /// The browser's default is a symlink to the directory it runs on.
+    Linked,
+    /// The browser's default is a directory that holds no profile.
+    Unlinked,
+}
+
+impl DefaultProfilePort {
+    /// `None` when the wrapper asked for no port.
+    fn from_marker(marker: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(marker).ok()?;
+        let mut words = text.split_whitespace();
+        (words.next() == Some("cdp")).then(|| match words.next() {
+            Some("linked") => Self::Linked,
+            Some("unlinked") => Self::Unlinked,
+            _ => Self::NotInvolved,
+        })
+    }
+
+    /// What to tell the caller when the port did not open and `output`, the
+    /// session log since the launch, holds the browser's refusal. The flag is
+    /// true when later launches should stop linking the default directory.
+    fn refusal(self, output: &str) -> Option<(bool, &'static str)> {
+        if !output.contains(DEFAULT_DIRECTORY_REFUSAL) {
+            return None;
+        }
+        match self {
+            Self::Linked => Some((
+                true,
+                "the browser refused the debugging port on its default profile: it resolved the linked default directory. Close it and launch it again; from now on this session gives the browser a default directory with no profile in it, which opens the port (a browser that this one starts without --user-data-dir then gets a new profile)",
+            )),
+            Self::Unlinked => Some((
+                false,
+                "the browser refused the debugging port on its default profile; launch it with a --user-data-dir of its own for CDP",
+            )),
+            Self::NotInvolved => None,
+        }
+    }
 }
 
 /// The PID the command's shell wrote to its launch file. Zero and text that is
@@ -19390,7 +19558,7 @@ impl KwinMcp {
                     return Err(refuse(
                         "address_bar_unavailable",
                         format!(
-                            "{error}, so the address bar cannot be checked and the destination could not be verified. launch_app the browser with a --user-data-dir of its own to navigate through CDP, or drive the address bar with keyboard_key ctrl+l, keyboard_type and a screenshot"
+                            "{error}, so the address bar cannot be checked and the destination could not be verified. launch_app the browser by its command name, without cdp=false, to navigate through CDP, or drive the address bar with keyboard_key ctrl+l, keyboard_type and a screenshot"
                         ),
                     ));
                 }
@@ -19515,7 +19683,7 @@ impl KwinMcp {
             return Err(refuse(
                 "url_too_long_for_address_bar",
                 format!(
-                    "the url has {characters} characters and this window has no CDP connection, so it would go through the address bar, which keeps {} pasted characters. launch_app the browser with a --user-data-dir of its own to navigate through CDP, up to {} characters",
+                    "the url has {characters} characters and this window has no CDP connection, so it would go through the address bar, which keeps {} pasted characters. launch_app the browser by its command name, without cdp=false, to navigate through CDP, up to {} characters",
                     browser_address::ADDRESS_BAR_MAX_CHARS,
                     browser_address::URL_MAX_CHARS
                 ),
@@ -19993,7 +20161,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "mouse_scroll",
-        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels in Chromium-family browsers and 120 is one wheel notch in other apps (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window. The result has view_changed: false when the screen did not change (the end of the content, or nothing there scrolls); with CDP (a browser launched with its own --user-data-dir) also scroll_y, scroll_max_y and at_end."
+        description = "Scroll at (x,y) in window-relative pixels — the cursor moves there first, then wheel events fire. delta is signed: positive = down (or right, with horizontal=true); negative = up/left. Default is smooth scroll, where delta is pixels in Chromium-family browsers and 120 is one wheel notch in other apps (good for documents and web); set discrete=true and delta counts wheel notches (better for lists, dropdowns, sliders). Choose (x,y) inside the element you want to scroll, not just anywhere in the window. The result has view_changed: false when the screen did not change (the end of the content, or nothing there scrolls); with CDP (launch_app reported cdp_port) also scroll_y, scroll_max_y and at_end."
     )]
     async fn mouse_scroll(
         &self,
@@ -21210,7 +21378,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium also gets a server-assigned forwarded CDP port, replacing --remote-debugging-port. Chrome and Edge need a non-default --user-data-dir for CDP. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned CDP port, forwarded to host loopback and replacing --remote-debugging-port, Chrome and Edge on their signed-in default profile too. cdp=false gives no port. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -21464,7 +21632,7 @@ impl KwinMcp {
             .map(|file| format!(" > {}", shell_quote(&file.display().to_string())))
             .unwrap_or_default();
         let launch_cmd = format!(
-            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={cdp_port} KWIN_MCP_BROWSER_MARKER={} bash -c {}{stdout_redirect}; echo $? > {}",
+            "for x_socket in /tmp/.X11-unix/X*; do if [ -S \"$x_socket\" ]; then export DISPLAY=\":${{x_socket##*X}}\"; break; fi; done; env {}PATH={}:\"$PATH\" DBUS_SESSION_BUS_ADDRESS={} AT_SPI_BUS_ADDRESS={} KWIN_MCP_CDP_PORT={} KWIN_MCP_BROWSER_MARKER={} bash -c {}{stdout_redirect}; echo $? > {}",
             if fuse_enabled {
                 ""
             } else {
@@ -21473,6 +21641,13 @@ impl KwinMcp {
             shell_quote(&xdg.join("browser-bin").display().to_string()),
             shell_quote(&service_bus_address),
             shell_quote(&atspi_bus_address),
+            // The wrapper adds no port, and leaves the default data directory
+            // alone, when it is given none.
+            if params.cdp == Some(false) {
+                String::new()
+            } else {
+                cdp_port.to_string()
+            },
             shell_quote(&browser_marker.display().to_string()),
             shell_quote(&checked_command),
             shell_quote(&exit_file.display().to_string()),
@@ -21767,9 +21942,13 @@ impl KwinMcp {
         }
 
         // The browser wrapper records CDP intent only when it actually ran.
-        let cdp_requested = std::fs::read(&browser_marker).is_ok_and(|value| value == b"cdp");
+        let default_profile_port = std::fs::read(&browser_marker)
+            .ok()
+            .and_then(|marker| DefaultProfilePort::from_marker(&marker));
+        let cdp_requested = default_profile_port.is_some();
         let _ = std::fs::remove_file(&browser_marker);
         let mut cdp_connected = false;
+        let mut cdp_refused = None;
         if cdp_requested && win_geo.is_some() {
             if let Ok(mut progress) = progress.lock() {
                 progress.stage = "connecting to browser accessibility";
@@ -21790,6 +21969,21 @@ impl KwinMcp {
                         tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
                     }
                 }
+            }
+            // A browser that begins to resolve its linked default directory
+            // refuses the port and says so; the wrapper then stops linking.
+            if !cdp_connected
+                && let Some(port) = default_profile_port
+                && let Ok(offset) = &sandbox_log_offset
+                && let Ok(output) = sandbox_log_since(&sandbox_log, *offset)
+                && let Some((unlink, note)) = port.refusal(&output)
+            {
+                if unlink {
+                    let store = xdg.join(BROWSER_CONFIG_STORE);
+                    let _ = std::fs::create_dir_all(&store);
+                    let _ = std::fs::write(store.join(BROWSER_CONFIG_UNLINKED), []);
+                }
+                cdp_refused = Some(note);
             }
         }
 
@@ -24258,8 +24452,11 @@ fn local_time_12h(seconds: i64) -> Option<String> {
 /// The host's Chrome profiles from `google-chrome/Local State`, empty when
 /// Chrome has none.
 fn host_chrome_profiles() -> Vec<String> {
-    let Some(config) = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
+    // Chrome's own order, which the browser wrapper follows too.
+    let Some(config) = ["CHROME_CONFIG_HOME", "XDG_CONFIG_HOME"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+        .next()
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     else {
@@ -30078,6 +30275,289 @@ mod browser_alias_tests {
         assert_eq!(String::from_utf8_lossy(&aliased.stdout).trim(), "stub-ran");
         assert_eq!(missing.status.code(), Some(127));
         Ok(())
+    }
+}
+
+/// #948: Chrome and Edge get the session's debugging port on the data directory
+/// a launch without `--user-data-dir` opens.
+#[cfg(test)]
+mod default_profile_port_tests {
+    use super::{DefaultProfilePort, create_browser_wrappers};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// A launcher as Arch packages it: switches from a flags file come first.
+    const LAUNCHER: &str = "#!/usr/bin/env bash\nXDG_CONFIG_HOME=${XDG_CONFIG_HOME:-~/.config}\nif [[ -f $XDG_CONFIG_HOME/chrome-flags.conf ]]; then\n  FLAGS=\"$(cat $XDG_CONFIG_HOME/chrome-flags.conf)\"\nfi\nprintf '%s\\n' \"config=${CHROME_CONFIG_HOME-unset}\" $FLAGS \"$@\"\n";
+
+    struct Fixture {
+        root: PathBuf,
+        bin: PathBuf,
+    }
+
+    struct Run {
+        /// The browser's argv, one switch per entry.
+        args: Vec<String>,
+        /// The browser's `CHROME_CONFIG_HOME`, `None` when it had none.
+        config_home: Option<PathBuf>,
+        marker: Option<String>,
+    }
+
+    impl Run {
+        fn data_dirs(&self) -> Vec<&str> {
+            self.args
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--user-data-dir="))
+                .collect()
+        }
+        fn has_port(&self) -> bool {
+            self.args.iter().any(|arg| arg == "--remote-debugging-port=4321")
+        }
+    }
+
+    impl Fixture {
+        fn new(name: &str, browsers: &[&str]) -> std::io::Result<Self> {
+            let root = std::env::temp_dir().join(format!("kwin-mcp-948-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("stubs"))?;
+            std::fs::create_dir_all(root.join("home/.config"))?;
+            let root = root.canonicalize()?;
+            for browser in browsers {
+                let stub = root.join("stubs").join(browser);
+                std::fs::write(&stub, LAUNCHER)?;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let bin = create_browser_wrappers(&root)?;
+            Ok(Self { root, bin })
+        }
+
+        fn config(&self) -> PathBuf {
+            self.root.join("home/.config")
+        }
+
+        fn store(&self) -> PathBuf {
+            self.root.join(super::BROWSER_CONFIG_STORE)
+        }
+
+        /// Runs `browser` through the wrapper as launch_app does. `port` is
+        /// false for `cdp=false`.
+        fn run(
+            &self,
+            browser: &str,
+            args: &[&str],
+            port: bool,
+            config_home: Option<&Path>,
+        ) -> std::io::Result<Run> {
+            let marker = self.root.join("marker");
+            let _ = std::fs::remove_file(&marker);
+            let mut command = std::process::Command::new(self.bin.join(browser));
+            command
+                .args(args)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}:/usr/bin:/bin",
+                        self.bin.display(),
+                        self.root.join("stubs").display()
+                    ),
+                )
+                .env("HOME", self.root.join("home"))
+                .env("KWIN_MCP_CDP_PORT", if port { "4321" } else { "" })
+                .env("KWIN_MCP_BROWSER_MARKER", &marker)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("CHROME_CONFIG_HOME");
+            if let Some(config_home) = config_home {
+                command.env("CHROME_CONFIG_HOME", config_home);
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            let config_home = lines
+                .remove(0)
+                .strip_prefix("config=")
+                .filter(|value| *value != "unset")
+                .map(PathBuf::from);
+            Ok(Run {
+                args: lines,
+                config_home,
+                marker: std::fs::read_to_string(&marker)
+                    .ok()
+                    .map(|text| text.trim().to_owned()),
+            })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn chrome_without_a_data_directory_runs_on_its_default_with_the_port() -> std::io::Result<()> {
+        let fixture = Fixture::new("linked", &["google-chrome-stable"])?;
+        std::fs::create_dir_all(fixture.config().join("chromium"))?;
+        let profile = fixture.config().join("google-chrome");
+        for name in ["google-chrome-stable", "google-chrome"] {
+            let run = fixture.run(name, &["--profile-directory=Profile 2", "about:blank"], true, None)?;
+            assert_eq!(run.data_dirs(), [profile.to_string_lossy()], "{name}");
+            assert!(run.has_port(), "{:?}", run.args);
+            assert!(run.args.iter().any(|arg| arg == "--profile-directory=Profile 2"));
+            assert_eq!(run.marker.as_deref(), Some("cdp linked"));
+            // The default Chrome derives is a symlink to the directory it runs
+            // on, inside the session's own store.
+            let config_home = run.config_home.unwrap_or_default();
+            assert!(config_home.starts_with(fixture.store()), "{config_home:?}");
+            let link = config_home.join("google-chrome");
+            assert_ne!(link, profile);
+            assert_eq!(std::fs::read_link(&link)?, profile);
+            // Another family member that Chrome starts lands on its real
+            // directory; one with no directory gets no dangling link.
+            assert_eq!(
+                std::fs::read_link(config_home.join("chromium"))?,
+                fixture.config().join("chromium")
+            );
+            assert!(std::fs::symlink_metadata(config_home.join("microsoft-edge")).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edge_runs_on_its_own_default_directory() -> std::io::Result<()> {
+        let fixture = Fixture::new("edge", &["microsoft-edge-stable"])?;
+        let run = fixture.run("microsoft-edge-stable", &[], true, None)?;
+        let profile = fixture.config().join("microsoft-edge");
+        assert_eq!(run.data_dirs(), [profile.to_string_lossy()]);
+        assert!(run.has_port());
+        let link = run.config_home.unwrap_or_default().join("microsoft-edge");
+        assert_eq!(std::fs::read_link(link)?, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn a_callers_data_directory_and_other_browsers_are_left_alone() -> std::io::Result<()> {
+        let fixture = Fixture::new("alone", &["google-chrome-stable", "chromium", "chrome", "brave"])?;
+        for args in [vec!["--user-data-dir=/elsewhere"], vec!["--user-data-dir", "/elsewhere"]] {
+            let run = fixture.run("google-chrome-stable", &args, true, None)?;
+            assert!(run.config_home.is_none(), "{:?}", run.config_home);
+            assert!(run.args.ends_with(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()));
+            assert!(run.data_dirs().len() <= 1 && run.has_port(), "{:?}", run.args);
+            assert_eq!(run.marker.as_deref(), Some("cdp"));
+        }
+        for name in ["chromium", "brave"] {
+            let run = fixture.run(name, &[], true, None)?;
+            assert!(run.config_home.is_none() && run.data_dirs().is_empty() && run.has_port());
+            assert_eq!(run.marker.as_deref(), Some("cdp"));
+        }
+        // A program named chrome may be Chrome for Testing, with another default.
+        let run = fixture.run("chrome", &[], true, None)?;
+        assert!(run.config_home.is_none() && run.data_dirs().is_empty() && !run.has_port());
+        assert_eq!(run.marker, None);
+        assert!(!fixture.store().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_false_starts_chrome_as_a_plain_launch_does() -> std::io::Result<()> {
+        let fixture = Fixture::new("optout", &["google-chrome-stable"])?;
+        let run = fixture.run("google-chrome-stable", &["about:blank"], false, None)?;
+        assert!(run.config_home.is_none() && run.data_dirs().is_empty() && !run.has_port());
+        assert_eq!(run.marker, None);
+        assert!(!fixture.store().exists());
+        Ok(())
+    }
+
+    /// The host shape of #948: the environment already names a config home
+    /// whose entry is a symlink, and the launcher's flags file the real path.
+    #[test]
+    fn a_launcher_flags_file_and_a_preset_config_home_are_followed() -> std::io::Result<()> {
+        let fixture = Fixture::new("preset", &["google-chrome-stable"])?;
+        let profile = fixture.config().join("google-chrome");
+        std::fs::create_dir_all(&profile)?;
+        let preset = fixture.config().join("chrome-default");
+        std::fs::create_dir_all(&preset)?;
+        std::os::unix::fs::symlink(&profile, preset.join("google-chrome"))?;
+        let flags = fixture.config().join("chrome-flags.conf");
+
+        // The variable alone: the wrapper names the real path, not the link.
+        let run = fixture.run("google-chrome-stable", &[], true, Some(&preset))?;
+        assert_eq!(run.data_dirs(), [profile.to_string_lossy()]);
+        assert_eq!(run.marker.as_deref(), Some("cdp linked"));
+
+        // The flags file names the same directory: nothing is added twice.
+        std::fs::write(&flags, format!("# comment\n--no-sandbox\n--user-data-dir={}\n", profile.display()))?;
+        for config_home in [None, Some(preset.as_path())] {
+            let run = fixture.run("google-chrome-stable", &[], true, config_home)?;
+            assert_eq!(run.data_dirs(), [profile.to_string_lossy()], "{:?}", run.args);
+            assert!(run.has_port());
+            assert_eq!(run.marker.as_deref(), Some("cdp linked"));
+            let link = run.config_home.unwrap_or_default().join("google-chrome");
+            assert_eq!(std::fs::read_link(link)?, profile);
+        }
+
+        // The flags file names another directory: Chrome runs there, and the
+        // wrapper neither overrides it nor changes the default.
+        std::fs::write(&flags, "--user-data-dir=/elsewhere\n")?;
+        let run = fixture.run("google-chrome-stable", &[], true, None)?;
+        assert_eq!(run.data_dirs(), ["/elsewhere"]);
+        assert!(run.config_home.is_none() && run.has_port());
+        assert_eq!(run.marker.as_deref(), Some("cdp launcher"));
+
+        // A caller's own directory still comes last, where Chrome takes it.
+        let run = fixture.run("google-chrome-stable", &["--user-data-dir=/mine"], true, None)?;
+        assert_eq!(run.data_dirs(), ["/elsewhere", "/mine"]);
+        assert!(run.config_home.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_browser_started_by_the_browser_keeps_the_same_config_home() -> std::io::Result<()> {
+        let fixture = Fixture::new("child", &["google-chrome-stable"])?;
+        let first = fixture.run("google-chrome-stable", &[], true, None)?;
+        let inherited = first.config_home.clone().unwrap_or_default();
+        let second = fixture.run("google-chrome-stable", &[], true, Some(&inherited))?;
+        assert_eq!(second.config_home.as_deref(), Some(inherited.as_path()));
+        assert_eq!(second.data_dirs(), first.data_dirs());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_port_ends_the_linking() -> std::io::Result<()> {
+        let fixture = Fixture::new("unlinked", &["google-chrome-stable"])?;
+        std::fs::create_dir_all(fixture.store())?;
+        std::fs::write(fixture.store().join(super::BROWSER_CONFIG_UNLINKED), [])?;
+        let run = fixture.run("google-chrome-stable", &[], true, None)?;
+        let profile = fixture.config().join("google-chrome");
+        assert_eq!(run.data_dirs(), [profile.to_string_lossy()]);
+        assert_eq!(run.marker.as_deref(), Some("cdp unlinked"));
+        let config_home = run.config_home.unwrap_or_default();
+        assert!(config_home.starts_with(fixture.store()) && !config_home.exists(), "{config_home:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_marker_tells_how_the_default_directory_got_its_port() {
+        assert_eq!(DefaultProfilePort::from_marker(b"cdp"), Some(DefaultProfilePort::NotInvolved));
+        assert_eq!(DefaultProfilePort::from_marker(b"cdp "), Some(DefaultProfilePort::NotInvolved));
+        assert_eq!(DefaultProfilePort::from_marker(b"cdp launcher"), Some(DefaultProfilePort::NotInvolved));
+        assert_eq!(DefaultProfilePort::from_marker(b"cdp linked"), Some(DefaultProfilePort::Linked));
+        assert_eq!(DefaultProfilePort::from_marker(b"cdp unlinked"), Some(DefaultProfilePort::Unlinked));
+        assert_eq!(DefaultProfilePort::from_marker(b""), None);
+        assert_eq!(DefaultProfilePort::from_marker(b"other"), None);
+
+        // Chrome 156's own line.
+        let refusal = "[12:12:1112/013433.2:ERROR:chrome/browser/devtools/remote_debugging_server.cc:91] DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.\n";
+        let listening = "DevTools listening on ws://127.0.0.1:35013/devtools/browser/0\n";
+        assert!(matches!(DefaultProfilePort::Linked.refusal(refusal), Some((true, _))));
+        assert!(matches!(DefaultProfilePort::Unlinked.refusal(refusal), Some((false, _))));
+        assert_eq!(DefaultProfilePort::NotInvolved.refusal(refusal), None);
+        assert_eq!(DefaultProfilePort::Linked.refusal(listening), None);
     }
 }
 
