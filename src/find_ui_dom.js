@@ -8,6 +8,21 @@ JSON.stringify((() => {
   const labelOf = el => text(el.labels && el.labels.length ? [...el.labels].map(label => label.textContent).join(' ') : '');
   const holdsValue = el => ['textbox','searchbox','combobox','spinbutton','slider'].includes(roleOf(el));
   const nameOf = el => (labelledBy(el) || text(el.getAttribute('aria-label')) || labelOf(el) || text(el.getAttribute('placeholder')) || text(el.getAttribute('aria-placeholder')) || text(el.getAttribute('alt')) || (holdsValue(el) ? '' : text(el.textContent)) || (el.tagName==='INPUT' && ['button','submit','reset'].includes(el.type) ? el.value : '') || text(el.getAttribute('title')) || '').slice(0, 120);
+  // Where a link points: the element's resolved (absolute) href, which is what the
+  // browser's accessibility tree publishes for it too. An SVG link holds it as an
+  // animated string. Null for a role=link element without one. A target longer than
+  // HREF_MAX characters (FIND_UI_HREF_MAX_CHARS; a `data:` URL can be megabytes) is
+  // handed over as its two ends and its length.
+  const HREF_MAX = 8000;
+  const hrefOf = el => {
+    if (roleOf(el) !== 'link') return null;
+    let href = el.href;
+    if (href && typeof href.baseVal === 'string') {
+      try { href = href.baseVal && new URL(href.baseVal, el.baseURI).href; } catch (error) { return null; }
+    }
+    if (typeof href !== 'string' || !href) return null;
+    return href.length > HREF_MAX ? {head:href.slice(0, HREF_MAX/2), tail:href.slice(-HREF_MAX/2), chars:href.length} : href;
+  };
   const candidates=[...document.querySelectorAll('button,a,input,select,textarea,[role],[onclick],[tabindex],[contenteditable]:not([contenteditable="false"])')];
   return {
     truncated:candidates.length>2000,
@@ -20,7 +35,7 @@ JSON.stringify((() => {
       const actionable=['BUTTON','A','INPUT','SELECT','TEXTAREA'].includes(el.tagName) || ['button','link','checkbox','radio','textbox','combobox','menuitem','slider','tab','switch'].includes(roleOf(el)) || el.hasAttribute('onclick');
       const center_hit=visible && !!hit && (hit===el || el.contains(hit));
       const enabled=!el.disabled && el.getAttribute('aria-disabled')!=='true';
-      return {role:roleOf(el),name:nameOf(el),bounds:{x:r.x,y:r.y,w:r.width,h:r.height},visible,enabled,
+      return {role:roleOf(el),name:nameOf(el),href:hrefOf(el),bounds:{x:r.x,y:r.y,w:r.width,h:r.height},visible,enabled,
         occluded:visible ? !center_hit : null,center_hit,clickable:actionable && visible && enabled && center_hit && document.hasFocus(),
         center_hit_target:hit ? {role:roleOf(hit),name:nameOf(hit)} : null};
     })

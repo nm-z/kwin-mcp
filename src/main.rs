@@ -2048,6 +2048,21 @@ const A11Y_TREE_MAX_CHARS: usize = 30_000;
 // looks for the end of a message in the page, as a chat shim does, still finds it);
 // find_ui_elements returns a name whole.
 const A11Y_NAME_MAX_CHARS: usize = 8_000;
+// Longest link target accessibility_tree shows whole with show_links=true. A results page has
+// hundreds of links and a tracking URL runs to thousands of characters, so a longer target is cut
+// the way a long name is: its first and last half of this many characters (the address and item
+// are at the start) with a count of the characters between.
+const A11Y_HREF_MAX_CHARS: usize = 1_000;
+// Longest link target find_ui_elements returns whole. A page can link a `data:` URL of megabytes;
+// a longer target is cut the same way and its length is given as `href_chars`. browser_read
+// format=links returns every target whole, a page at a time.
+const FIND_UI_HREF_MAX_CHARS: usize = 8_000;
+// Room kept at the end of a paged accessibility_tree level for its '+N more rows offset=K' line.
+const A11Y_TREE_PAGE_NOTE_CHARS: usize = 64;
+// browser_read returns at most this many characters of a page per call, the tree's budget.
+const PAGE_READ_MAX_CHARS: usize = A11Y_TREE_MAX_CHARS;
+// How long the page may take to hand its content over.
+const PAGE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Let KWin publish an activated window before reading its geometry.
 const WINDOW_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
@@ -8235,10 +8250,14 @@ async fn tree_result(
     mut info: serde_json::Value,
 ) -> CallToolResult {
     let summary = format!(
-        "accessibility tree: {} nodes, {} levels{} (in structuredContent.tree)",
+        "accessibility tree: {} nodes, {} levels{}{} (in structuredContent.tree)",
         info["nodes"],
         info["levels"],
-        if info["more_below"] == true || info["incomplete"] == true { ", more below" } else { "" }
+        if info["more_below"] == true || info["incomplete"] == true { ", more below" } else { "" },
+        match info["next_offset"].as_u64() {
+            Some(next) => format!(", more rows from offset={next}"),
+            None => String::new(),
+        }
     );
     // The body key is dropped for a text-only client and set for the others.
     info.as_object_mut().map(|object| object.remove("tree"));
@@ -12107,25 +12126,143 @@ fn tree_field(value: &str) -> String {
 /// A node name as accessibility_tree shows it: whole up to A11Y_NAME_MAX_CHARS characters, else
 /// its first and last A11Y_NAME_MAX_CHARS / 2 characters and a count of the characters between.
 fn tree_name(value: &str) -> String {
-    let chars = value.chars().count();
-    if chars <= A11Y_NAME_MAX_CHARS {
-        return tree_field(value);
-    }
-    let half = A11Y_NAME_MAX_CHARS / 2;
-    let head: String = value.chars().take(half).collect();
-    let tail: String = value.chars().skip(chars - half).collect();
-    format!(
-        "{}…[{} more characters; find_ui_elements returns the whole name]…{}",
-        tree_field(&head),
-        chars - 2 * half,
-        tree_field(&tail)
+    cut_middle(
+        value,
+        A11Y_NAME_MAX_CHARS,
+        "; find_ui_elements returns the whole name",
     )
 }
 
+/// `value` on one line: whole up to `max` characters, else its first and last `max / 2`
+/// characters around '…[N more characters<note>]…', N being the characters left out.
+fn cut_middle(value: &str, max: usize, note: &str) -> String {
+    let chars = value.chars().count();
+    if chars <= max {
+        return tree_field(value);
+    }
+    let half = max / 2;
+    let head: String = value.chars().take(half).collect();
+    let tail: String = value.chars().skip(chars - half).collect();
+    cut_ends(&head, &tail, chars - 2 * half, note)
+}
+
+/// The two ends of a cut value around the count of what lies between.
+fn cut_ends(head: &str, tail: &str, omitted: usize, note: &str) -> String {
+    format!(
+        "{}…[{omitted} more characters{note}]…{}",
+        tree_field(head),
+        tree_field(tail)
+    )
+}
+
+/// Puts on a page match the link target the page script (find_ui_dom.js) read: a
+/// string, or for a target past FIND_UI_HREF_MAX_CHARS its two ends and length.
+fn set_page_href(matched: &mut serde_json::Value, href: &serde_json::Value) {
+    if let Some(target) = href.as_str() {
+        set_href(matched, target);
+    } else if let (Some(head), Some(tail), Some(chars)) = (
+        href["head"].as_str(),
+        href["tail"].as_str(),
+        href["chars"].as_u64(),
+    ) {
+        let omitted = usize::try_from(chars)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(FIND_UI_HREF_MAX_CHARS);
+        matched["href"] = serde_json::json!(cut_ends(head, tail, omitted, ""));
+        matched["href_chars"] = serde_json::json!(chars);
+    }
+}
+
+/// A link target as an accessibility_tree row carries it with show_links=true.
+fn tree_href(target: &str) -> String {
+    format!("\thref={}", cut_middle(target, A11Y_HREF_MAX_CHARS, ""))
+}
+
+/// Puts a link's target on a find_ui_elements match: whole up to
+/// FIND_UI_HREF_MAX_CHARS characters, else cut like a tree row's with its length
+/// beside it.
+fn set_href(matched: &mut serde_json::Value, target: &str) {
+    let chars = target.chars().count();
+    if chars > FIND_UI_HREF_MAX_CHARS {
+        matched["href_chars"] = serde_json::json!(chars);
+    }
+    matched["href"] = serde_json::json!(cut_middle(target, FIND_UI_HREF_MAX_CHARS, ""));
+}
+
+/// Where a link points, as its application publishes it through AT-SPI: the URI of
+/// the first anchor of the object's Hyperlink interface. Chrome answers with the
+/// address already resolved against the page (`#top` comes back as the page's
+/// address with that fragment) and with an empty string for a `role=link` element
+/// that has no `href`; it puts no target in the object attributes. None when the
+/// object has no such interface or no target.
+async fn atspi_link_target(bus: &zbus::Connection, destination: &str, path: &str) -> Option<String> {
+    let link = atspi::proxy::hyperlink::HyperlinkProxy::builder(bus)
+        .destination(destination.to_owned())
+        .ok()?
+        .path(path.to_owned())
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let target = link.get_uri(0).await.ok()?;
+    (!target.is_empty()).then_some(target)
+}
+
+/// An AT-SPI node's accessibility_tree row, a link's with its target when asked.
+async fn tree_row(
+    bus: &zbus::Connection,
+    acc: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    node: &AtspiNode,
+    show_links: bool,
+) -> String {
+    let target = if show_links && node.role == "link" {
+        atspi_link_target(bus, acc.inner().destination().as_str(), acc.inner().path().as_str())
+            .await
+    } else {
+        None
+    };
+    format!(
+        "{}{}",
+        node.text(),
+        target.as_deref().map(tree_href).unwrap_or_default()
+    )
+}
+
+/// Where the page's own accessibility tree says a node points: its `url` property,
+/// which Chrome fills from the element's resolved `href`.
+fn ax_link_target(
+    node: &chromiumoxide::cdp::browser_protocol::accessibility::AxNode,
+) -> Option<String> {
+    use chromiumoxide::cdp::browser_protocol::accessibility::AxPropertyName;
+    node.properties
+        .iter()
+        .flatten()
+        .find_map(|property| {
+            (property.name == AxPropertyName::Url)
+                .then(|| property.value.value.as_ref().and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned)
+}
+
 /// An accessibility tree gathered breadth-first, rendered as whole levels.
+///
+/// One level can outweigh the budget by itself: a `role` filter lifts every match
+/// to the first level, and a results page has hundreds of links. That level (the
+/// first one, or with `root=ID` the one below the root) is then returned a page of
+/// rows at a time: as many rows as fit, and a last line '+N more rows offset=K'
+/// for the call that continues it.
 #[derive(Default)]
 struct LevelTree {
     nodes: Vec<LevelNode>,
+    /// The level that is paged when it does not fit: 0, or 1 below a `root=ID`.
+    paged_level: usize,
+    /// Rows of the paged level the caller asked to skip (`offset`).
+    skip: usize,
+    /// How many of them have been skipped so far.
+    skipped: usize,
 }
 
 struct LevelNode {
@@ -12136,6 +12273,30 @@ struct LevelNode {
 }
 
 impl LevelTree {
+    /// A tree whose paged level starts `offset` rows in; `below_root` when the
+    /// call names a root, whose own row is level 0.
+    fn paged(offset: usize, below_root: bool) -> Self {
+        Self {
+            paged_level: usize::from(below_root),
+            skip: offset,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the row about to be pushed under `parent` is one the caller asked to
+    /// skip. It is counted; the caller neither pushes nor expands it.
+    fn skips_row(&mut self, parent: Option<usize>) -> bool {
+        let depth = parent
+            .and_then(|p| self.nodes.get(p))
+            .map_or(0, |p| p.depth + 1);
+        if depth == self.paged_level && self.skipped < self.skip {
+            self.skipped += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn push(&mut self, text: String, id: String, parent: Option<usize>) -> usize {
         let at = self.nodes.len();
         let depth = parent
@@ -12211,8 +12372,63 @@ impl LevelTree {
         self.render_partial(max_levels, false)
     }
 
+    /// What a row of a paged level ends in: its child count when the level below
+    /// was read, else the id that opens it.
+    fn row_note(node: &LevelNode, incomplete: bool) -> String {
+        if incomplete {
+            format!("\tmore may follow\troot={}", node.id)
+        } else if node.children.is_empty() {
+            format!("\troot={}", node.id)
+        } else {
+            Self::suffix(node)
+        }
+    }
+
+    /// The rows of the paged level to show when `fit` whole levels end just above
+    /// it: the leading ones that fit beside the levels above and the continuation
+    /// line. None when that level fits whole, is not reached, or shows no row.
+    fn page_rows(&self, fit: usize, max_levels: usize, incomplete: bool) -> Option<Vec<usize>> {
+        let level = self.paged_level;
+        if fit != level || max_levels <= level {
+            return None;
+        }
+        let mut used: usize = self
+            .nodes
+            .iter()
+            .filter(|node| node.depth < level)
+            .map(|node| {
+                Self::line_cost(node)
+                    + if incomplete {
+                        Self::row_note(node, true).chars().count()
+                    } else {
+                        0
+                    }
+            })
+            .sum();
+        let budget = A11Y_TREE_MAX_CHARS.saturating_sub(A11Y_TREE_PAGE_NOTE_CHARS);
+        let mut rows = Vec::new();
+        for (at, node) in self.nodes.iter().enumerate() {
+            if node.depth != level {
+                continue;
+            }
+            used += Self::line_cost(node) + Self::row_note(node, incomplete).chars().count();
+            if used > budget {
+                break;
+            }
+            rows.push(at);
+        }
+        (!rows.is_empty()).then_some(rows)
+    }
+
     fn render_partial(&self, max_levels: usize, incomplete: bool) -> (String, serde_json::Value) {
         let fit = self.fitting_partial_levels(max_levels, incomplete);
+        let page = self.page_rows(fit, max_levels, incomplete);
+        let last_row = page.as_ref().and_then(|rows| rows.last().copied());
+        let levels = if page.is_some() {
+            self.paged_level + 1
+        } else {
+            fit
+        };
         let mut out = String::new();
         let mut shown = 0usize;
         let roots: Vec<usize> = (0..self.nodes.len())
@@ -12221,27 +12437,50 @@ impl LevelTree {
         let mut stack: Vec<usize> = roots.into_iter().rev().collect();
         while let Some(at) = stack.pop() {
             let node = &self.nodes[at];
-            if node.depth >= fit {
+            // Rows of one level are pushed, and so numbered, in the order shown.
+            let paged_row = last_row.filter(|_| node.depth == self.paged_level);
+            if node.depth >= levels || paged_row.is_some_and(|last| at > last) {
                 continue;
             }
             out.push_str(&"\t".repeat(node.depth));
             out.push_str(&node.text);
-            if incomplete {
-                out.push_str(&format!("\tmore may follow\troot={}", node.id));
-            } else if node.depth + 1 == fit && !node.children.is_empty() {
+            if incomplete || paged_row.is_some() {
+                out.push_str(&Self::row_note(node, incomplete));
+            } else if page.is_none() && node.depth + 1 == fit && !node.children.is_empty() {
                 out.push_str(&Self::suffix(node));
             }
             out.push('\n');
             shown += 1;
             stack.extend(node.children.iter().rev());
         }
-        let deeper = incomplete || self.levels() > fit;
-        let chars = out.chars().count();
+        let deeper = incomplete || self.levels() > levels || page.is_some();
         // Some MCP clients show only structuredContent and drop the text
         // content, so the tree rides in both.
-        let info = serde_json::json!({
-            "levels": fit, "nodes": shown, "chars": chars, "more_below": deeper, "tree": out,
+        let mut info = serde_json::json!({
+            "levels": levels, "nodes": shown, "more_below": deeper,
         });
+        if self.skipped > 0 {
+            info["offset"] = serde_json::json!(self.skipped);
+        }
+        if let Some(rows) = &page {
+            let total = self
+                .nodes
+                .iter()
+                .filter(|node| node.depth == self.paged_level)
+                .count();
+            let more = total - rows.len();
+            let next = self.skipped + rows.len();
+            if incomplete {
+                out.push_str(&format!("more rows may follow\toffset={next}\n"));
+                info["next_offset"] = serde_json::json!(next);
+            } else if more > 0 {
+                out.push_str(&format!("+{more} more rows\toffset={next}\n"));
+                info["more_rows"] = serde_json::json!(more);
+                info["next_offset"] = serde_json::json!(next);
+            }
+        }
+        info["chars"] = serde_json::json!(out.chars().count());
+        info["tree"] = serde_json::json!(out);
         (out, info)
     }
 }
@@ -12858,6 +13097,89 @@ struct BrowserNavigateParams {
     url: String,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PageFormat {
+    /// The text a reader sees.
+    #[default]
+    Text,
+    /// Outer HTML, without script contents, style sheets and password values.
+    Html,
+    /// One line per link: its text, a tab, its absolute target.
+    Links,
+}
+
+impl PageFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Html => "html",
+            Self::Links => "links",
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct BrowserReadParams {
+    /// text (default), html or links.
+    #[serde(default)]
+    format: PageFormat,
+    /// CSS selector: only the elements it matches are read. Omit for the whole page.
+    selector: Option<String>,
+    /// Where to continue: the next_offset of the previous reply. Default 0.
+    offset: Option<usize>,
+    /// Most characters to return, 1 to 30000 (the default).
+    max_chars: Option<usize>,
+}
+
+/// Pages of the browser itself (settings, the password manager, extensions,
+/// DevTools). The element tools skip them and browser_read does not read them.
+const BROWSER_OWN_PAGES: [&str; 4] = [
+    "chrome://",
+    "chrome-extension://",
+    "chrome-untrusted://",
+    "devtools://",
+];
+
+/// What browser_read says when the session's browser offers no CDP connection.
+const PAGE_READ_NEEDS_CDP: &str = "browser_read reads the page through the Chrome DevTools Protocol (CDP), and this session has no CDP connection to a browser. launch_app connects one when it reports cdp_port; Google Chrome and Edge allow it only with a non-default --user-data-dir (launch_app the browser with --user-data-dir=<a directory of its own>). Without CDP, accessibility_tree show_links=true and find_ui_elements still report each link's href";
+
+/// One reply of browser_read: `content` is characters `start..end` of `total`.
+/// The body goes where the client shows it, like the accessibility tree. A reader
+/// of the text alone gets the continuation as a last line, since the offsets are
+/// otherwise only in the structured half.
+fn page_read_result(view: ResultView, content: String, mut info: serde_json::Value) -> CallToolResult {
+    let (start, end, total) = (info["offset"].clone(), info["end"].clone(), info["total_chars"].clone());
+    if let Some(object) = info.as_object_mut() {
+        object.remove("end");
+    }
+    let more = info["next_offset"].as_u64();
+    let range = format!("characters {start} to {end} of {total}");
+    let summary = format!(
+        "page {}: {range}{} (in structuredContent.content)",
+        info["format"].as_str().unwrap_or_default(),
+        more.map(|next| format!("; continue with offset={next}")).unwrap_or_default(),
+    );
+    let shown = match more {
+        Some(next) => format!("{content}\n[browser_read: {range}; continue with offset={next}]"),
+        None => content.clone(),
+    };
+    let text = match view {
+        ResultView::StructuredOnly => {
+            info["content"] = serde_json::json!(content);
+            summary
+        }
+        ResultView::TextOnly => shown,
+        ResultView::Both => {
+            info["content"] = serde_json::json!(content);
+            shown
+        }
+    };
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    result.structured_content = Some(info);
+    result
+}
+
 /// How long a navigation may take to reach its server and commit a page.
 const NAVIGATION_COMMIT_WAIT: Duration = Duration::from_secs(15);
 /// How long a committed page may keep loading before it is reported as loading.
@@ -13230,8 +13552,9 @@ struct KeyboardTypeParams {
     speed: Option<f64>,
     text: String,
     /// Select the field's existing text first (ctrl+a) so the typed text replaces
-    /// it. Needs a focused editable field that accessibility can read; refused for
-    /// terminals, where ctrl+a is not select-all.
+    /// it. Needs a focused editable field, or a dialog that shows accessibility
+    /// nothing at all (Chrome's file chooser), where the selection and the result
+    /// stay unverified; refused for terminals, where ctrl+a is not select-all.
     replace: Option<bool>,
 }
 
@@ -14311,6 +14634,12 @@ struct AccessibilityTreeParams {
     /// Node id from a previous reply's "+N children root=ID" note; the tree
     /// starts at that node.
     root: Option<String>,
+    /// Add each link's absolute target to its row as href=URL. Off by default:
+    /// a results page carries hundreds of long URLs.
+    show_links: Option<bool>,
+    /// Rows to skip in a level too large for one reply: the K of a previous
+    /// reply's "+N more rows offset=K" line, with the other arguments unchanged.
+    offset: Option<usize>,
 }
 
 const FIND_UI_MAX_MATCHES: usize = 200;
@@ -14554,6 +14883,8 @@ fn compact_find_elements(
             })
         });
         if compact {
+            // A link's href is left out too: compact is the cheap list of click
+            // targets, and a tracking URL is longer than everything it keeps.
             fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "earlier_name" | "value" | "bounds" | "mouse_coordinates_usable" | "backend"));
         } else {
             // The window is named only when it is not the active one the result names once.
@@ -14621,6 +14952,9 @@ fn find_elements_text(elements: &[serde_json::Value], surfaces: &[serde_json::Va
         if let Some(earlier) = element["earlier_name"].as_str() {
             line.push_str(&format!("\trenamed from '{}'", tree_field(earlier)));
         }
+        if let Some(target) = element["href"].as_str() {
+            line.push_str(&format!("\thref={target}"));
+        }
         lines.push(line);
     }
     lines.join("\n")
@@ -14640,7 +14974,8 @@ struct FindUiElementsParams {
     /// Most elements to return, 1 to 200; defaults to 50. `matches` counts every
     /// match found and `more` says how many were left out.
     limit: Option<usize>,
-    /// Return only role, name, bounds and whether the bounds are click-usable.
+    /// Return only role, name, bounds and whether the bounds are click-usable:
+    /// no href, which is usually longer than all of those.
     compact: Option<bool>,
     /// Match the whole name or role (case-insensitive, whitespace collapsed)
     /// instead of any part of it.
@@ -18088,7 +18423,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The default traversal budget is 5 seconds; set timeout_seconds from 1 to 30 for a shorter or longer bounded call. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. show_links=true (default false) ends each link's row in href=URL, its absolute target, the value find_ui_elements gives as href; a target longer than 1,000 characters shows its first and last 500 with '…[N more characters]…' between. A level too large for one reply (role lifts every match to the first level) returns the rows that fit, each ending in root=ID, then '+N more rows offset=K': call again with offset=K and the same arguments.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -18116,7 +18451,7 @@ impl KwinMcp {
         };
         self.touch_activity().await;
         self.settle_input().await?;
-        let mut tree = LevelTree::default();
+        let mut tree = LevelTree::paged(params.offset.unwrap_or(0), params.root.is_some());
         let max_levels = params.max_depth.map_or(usize::MAX, |depth| {
             usize::try_from(depth)
                 .unwrap_or(usize::MAX)
@@ -18157,6 +18492,7 @@ impl KwinMcp {
                 .saturating_add(1)
         });
         let show_elements = params.show_elements.unwrap_or(false);
+        let show_links = params.show_links.unwrap_or(false);
         let role = params.role.map(|s| s.to_lowercase());
         let role_ok = |name: &str| {
             role.as_ref()
@@ -18206,10 +18542,14 @@ impl KwinMcp {
                         && (!name.is_empty() || show_elements)
                         && role_ok(&role);
                     shown.then(|| {
+                        let target = (show_links && role == "link")
+                            .then(|| ax_link_target(node))
+                            .flatten();
                         format!(
-                            "{}\t{}",
+                            "{}\t{}{}",
                             tree_field(if role.is_empty() { "none" } else { &role }),
-                            tree_name(&name)
+                            tree_name(&name),
+                            target.as_deref().map(tree_href).unwrap_or_default()
                         )
                     })
                 };
@@ -18239,6 +18579,9 @@ impl KwinMcp {
                         }
                         let forced = params.root.is_some() && parent.is_none();
                         if let Some(line) = text(i).or_else(|| forced.then(|| "root".to_owned())) {
+                            if tree.skips_row(parent) {
+                                continue;
+                            }
                             let at = tree.push(
                                 line,
                                 returns.nodes[i].node_id.inner().to_string(),
@@ -18331,7 +18674,8 @@ impl KwinMcp {
                     .map_err(|e| McpError::invalid_params(format!("root '{root}': {e}"), None))?;
                 visited.insert(root.clone());
                 self.note_name(root, &node.name);
-                let id = tree.push(node.text(), root.clone(), None);
+                let row = tree_row(&a11y_bus, &acc, &node, show_links).await;
+                let id = tree.push(row, root.clone(), None);
                 level.push((id, acc));
             }
             None => {
@@ -18364,8 +18708,12 @@ impl KwinMcp {
                     continue;
                 };
                 if shown(&node) {
+                    if tree.skips_row(parent) {
+                        continue;
+                    }
                     self.note_name(&identity, &node.name);
-                    let at = tree.push(node.text(), identity, parent);
+                    let row = tree_row(&a11y_bus, &acc, &node, show_links).await;
+                    let at = tree.push(row, identity, parent);
                     level.push((at, acc));
                 } else {
                     for child in acc
@@ -18410,7 +18758,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "find_ui_elements",
-        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. Optional role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'); with a role, either also matches a control by a label inside it (matched_label). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. Names compare with typographic punctuation folded ('…' is '...'); a role matches in its AT-SPI or page spelling (entry is textbox) and may lead the query as accessibility_tree prints it ('entry Ask anything'). An element the page renamed after a tree or search reported it is still matched by that name, and carries it as earlier_name beside its current name. A visible match is not proof that it is clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
+        description = "Find widgets by case-insensitive name/role text with whitespace collapsed. role filters semantic roles (button includes push button); visible_only removes reported hidden/offscreen matches. Returns at most limit (default 50) elements; matches counts all and more says how many were left out. Each element has backend, role, name, bounds, a link's absolute URL as href, the text of an entry or spin button as value (never a password), and the index of its surface (application/frame or page, listed once in surfaces); window_id, states, and visible/enabled/occluded appear only when they differ from the usual case. compact=true returns role, name, bounds and mouse_coordinates_usable only; exact=true matches the whole name or role, whole_word=true whole words only ('Start' skips 'StartFraction'); with a role, either also matches a control by a label inside it (matched_label). A non-control match inside an already matched element is counted in that element's children_matched instead of listed again; controls are always listed. visible_only is off by default so matches far down a long page are still found. Only bounds with mouse_coordinates_usable=true use the active-window pixel frame accepted by mouse_click. CDP bounds are CSS viewport pixels, not browser-window pixels. Names compare with typographic punctuation folded ('…' is '...'); a role matches in its AT-SPI or page spelling (entry is textbox) and may lead the query as accessibility_tree prints it ('entry Ask anything'). An element the page renamed after a tree or search reported it is still matched by that name, and carries it as earlier_name beside its current name. A visible match may not be clickable: native visibility and KWin geometry do not exclude an in-app overlay. Re-query after scrolling, navigation or switching windows; inspect screenshot for unknown or obscured matches.",
         annotations(read_only_hint = true)
     )]
     async fn find_ui_elements(
@@ -18484,6 +18832,7 @@ impl KwinMcp {
                             || !find_ui_role_matches(params.role.as_deref(), role)
                             || visible_only && element["visible"] != true { continue; }
                         let mut matched = element.clone();
+                        set_page_href(&mut matched, &element["href"]);
                         matched["backend"] = serde_json::json!("cdp");
                         matched["surface"] = serde_json::json!({"url":url,"title":snapshot["title"],
                             "page_focused":snapshot["page_focused"],"viewport":snapshot["viewport"]});
@@ -18634,8 +18983,15 @@ impl KwinMcp {
                                 elements[ancestor]["children_matched"] = serde_json::json!(count + 1);
                             } else {
                                 let current_name = node.name.clone();
+                                let link = node.role == "link";
                                 let mut matched = listed(node, acc.inner().path().to_string());
                                 if !visible_only || matched["visible"] == true {
+                                    if link
+                                        && let Some(target) =
+                                            atspi_link_target(&bus, acc.inner().destination().as_str(), acc.inner().path().as_str()).await
+                                    {
+                                        set_href(&mut matched, &target);
+                                    }
                                     if let Some(earlier) = &earlier_name {
                                         matched["earlier_name"] = serde_json::json!(earlier);
                                     }
@@ -18654,6 +19010,11 @@ impl KwinMcp {
                                 let mut matched = listed(control.clone(), path.clone());
                                 matched["matched_label"] = serde_json::json!(node.name);
                                 if !visible_only || matched["visible"] == true {
+                                    if control.role == "link"
+                                        && let Some(target) = atspi_link_target(&bus, bus_name, path).await
+                                    {
+                                        set_href(&mut matched, &target);
+                                    }
                                     elements.push(matched);
                                 }
                             }
@@ -18764,6 +19125,172 @@ impl KwinMcp {
             serde_json::json!({"ok": true}),
         )
         .await)
+    }
+
+    #[rmcp::tool(
+        name = "browser_read",
+        description = "Read the page in the active tab of the focused Chromium-family browser window through CDP, without a save dialog. format=text (default) is the text a reader sees; html is the outer HTML without the contents of scripts (ld+json metadata stays) and style sheets; links is one line per link: its text, a tab, its absolute href (the same value find_ui_elements and accessibility_tree show_links=true report). selector is a CSS selector: only the elements it matches are read (outermost matches, joined by newlines; matched counts them), else the whole document. One call returns at most max_chars characters (1 to 30000, the default; JavaScript string units) from offset; the result has url, title, offset, chars, total_chars, and next_offset while more remains: call again with offset=next_offset and the same arguments. The page is read again on every call, so a page that changed in between shows as a different total_chars. Reads the top document only: an iframe's content, cookies, storage and the values typed into fields are never returned, and the value attribute of a password field is removed from html. Needs CDP (launch_app reported cdp_port; Chrome and Edge need a non-default --user-data-dir): without it the error has reason cdp_unavailable and nothing is read. Other reasons: not_a_browser, tab_not_found (the active window is a dialog or shows no page of the connected browser), internal_page (chrome:// and extension pages are not read), invalid_selector, no_match, page_unresponsive.",
+        annotations(read_only_hint = true)
+    )]
+    async fn browser_read(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<BrowserReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let refuse = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!("Nothing was read: {detail}."),
+                Some(serde_json::json!({"reason": reason})),
+            )
+        };
+        let max = params.max_chars.unwrap_or(PAGE_READ_MAX_CHARS);
+        if !(1..=PAGE_READ_MAX_CHARS).contains(&max) {
+            return Err(refuse(
+                "invalid_max_chars",
+                format!("max_chars must be between 1 and {PAGE_READ_MAX_CHARS}"),
+            ));
+        }
+        self.touch_activity().await;
+        self.settle_input().await?;
+        let (conn, unique, runtime, browser) = self
+            .with_session(|s| {
+                Ok((
+                    s.kwin_conn.clone(),
+                    s.kwin_unique_name.clone(),
+                    s.host_xdg_dir.clone(),
+                    s.cdp_browser.clone(),
+                ))
+            })
+            .await?;
+        // The caption KWin reports can trail the title of a page that just
+        // arrived: look again for a moment before giving the tab up.
+        let mut looks = 0;
+        let page = loop {
+            let active = active_window_info(&conn, &unique, &runtime)
+                .await
+                .map(|(_, _, geometry)| geometry)
+                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let mut windows = window_snapshots(&conn, &unique, &runtime)
+                .await
+                .map_err(|error| refuse("target_unverifiable", error.to_string()))?;
+            let index = windows
+                .iter()
+                .position(|window| window.id == active.id && window.active && !window.minimized)
+                .ok_or_else(|| refuse("target_changed", "the active window changed".to_owned()))?;
+            let window = windows.swap_remove(index);
+            if !chromium_resource_class(&window.resource_class) {
+                return Err(refuse(
+                    "not_a_browser",
+                    format!(
+                        "the active window is {:?} ({}), not a Chromium-family browser",
+                        window.title, window.resource_class
+                    ),
+                ));
+            }
+            let Some(browser) = browser.as_deref() else {
+                return Err(refuse("cdp_unavailable", PAGE_READ_NEEDS_CDP.to_owned()));
+            };
+            if !cdp_is_process(browser, window.pid).await {
+                return Err(refuse(
+                    "cdp_unavailable",
+                    format!(
+                        "{PAGE_READ_NEEDS_CDP}. The active window {:?} belongs to browser process {}, which is not the browser the session's CDP connection reaches",
+                        window.title, window.pid
+                    ),
+                ));
+            }
+            if let Some(page) = cdp_active_tab(browser, &window.title).await {
+                break page;
+            }
+            looks += 1;
+            if looks > NAVIGATION_CAPTION_LOOKS {
+                return Err(refuse(
+                    "tab_not_found",
+                    format!(
+                        "no single tab of the connected browser has the title of the active window {:?} (a dialog such as a file chooser, or a window that shows no page)",
+                        window.title
+                    ),
+                ));
+            }
+            tokio::time::sleep(NAVIGATION_POLL).await;
+        };
+        let address = cdp_entry(&page)
+            .await
+            .map(|(url, _)| url)
+            .unwrap_or_default();
+        if BROWSER_OWN_PAGES
+            .iter()
+            .any(|scheme| address.starts_with(scheme))
+        {
+            return Err(refuse(
+                "internal_page",
+                format!(
+                    "{} is a page of the browser itself, which browser_read does not read",
+                    browser_address::shown_url(&address)
+                ),
+            ));
+        }
+        let arguments = serde_json::json!({
+            "format": params.format.label(), "selector": params.selector,
+            "offset": params.offset.unwrap_or(0), "max": max,
+        });
+        let script = format!("{}({arguments})", include_str!("page_read.js").trim_end());
+        let evaluated = tokio::time::timeout(
+            PAGE_READ_TIMEOUT,
+            page.evaluate_expression(
+                chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::new(script),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            refuse(
+                "page_unresponsive",
+                format!(
+                    "the page did not hand over its content within {} seconds",
+                    PAGE_READ_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+        .map_err(|error| refuse("cdp_failed", format!("the page could not be read ({error})")))?;
+        let read: serde_json::Value = evaluated
+            .value()
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| serde_json::from_str(text).ok())
+            .ok_or_else(|| refuse("cdp_failed", "the page returned no content".to_owned()))?;
+        let selector = params.selector.as_deref().unwrap_or_default();
+        if read["problem"] == "invalid_selector" {
+            return Err(refuse(
+                "invalid_selector",
+                format!(
+                    "{selector:?} is not a CSS selector the page accepts ({})",
+                    read["detail"].as_str().unwrap_or_default()
+                ),
+            ));
+        }
+        let url = browser_address::shown_url(read["url"].as_str().unwrap_or_default());
+        if read["matched"] == 0 {
+            return Err(refuse(
+                "no_match",
+                format!("no element of {url} matches the selector {selector:?}"),
+            ));
+        }
+        let (start, end, total) = (
+            read["start"].as_u64().unwrap_or(0),
+            read["end"].as_u64().unwrap_or(0),
+            read["total"].as_u64().unwrap_or(0),
+        );
+        let mut info = serde_json::json!({
+            "source": "cdp", "format": params.format.label(), "url": url, "title": read["title"],
+            "offset": start, "end": end, "chars": end.saturating_sub(start), "total_chars": total,
+        });
+        if params.selector.is_some() {
+            info["matched"] = read["matched"].clone();
+        }
+        if end < total {
+            info["next_offset"] = serde_json::json!(end);
+        }
+        let content = read["content"].as_str().unwrap_or_default().to_owned();
+        Ok(page_read_result(ResultView::of_peer(&peer), content, info))
     }
 
     #[rmcp::tool(
@@ -19626,7 +20153,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (readable editable fields, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals, protected fields and editable fields whose text cannot be read are typed into and stay unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (editable fields or an inaccessible dialog's entry, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals, protected fields and editable fields whose text cannot be read are typed into and stay unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
     )]
     async fn keyboard_type(
         &self,
@@ -19728,14 +20255,26 @@ impl KwinMcp {
             )
             .await;
         }
+        // replace=true selected, with ctrl+a, text that accessibility cannot read back.
+        let mut blind_replace = false;
         if params.replace.unwrap_or(false) {
-            // Select all only where the selection can be read back and ctrl+a means
-            // select-all: a readable editable field, never a terminal.
+            // Select all only where ctrl+a means select-all in a field: an editable
+            // field accessibility reads, one it shows focused but cannot read (typed
+            // into all the same, #940), and the entry of a dialog whose toolkit
+            // publishes nothing at all (#947: Chrome's GTK file chooser opens with
+            // only the stem of the name selected). Never a terminal, a protected
+            // field, a focused control that is not editable, or a main window
+            // nothing is known about, where ctrl+a can mean anything.
             if let Err(error) = &receipt {
-                return Err(preflight_error(
-                    "replace_unavailable",
-                    format!("replace=true needs a focused editable field that accessibility can read, and {error}"),
-                ));
+                blind_replace = error.is::<input_bridge::UnreadableFocus>()
+                    || ((snapshot.transient || snapshot.dialog)
+                        && error.is::<input_bridge::NoAccessibleFocus>());
+                if !blind_replace {
+                    return Err(preflight_error(
+                        "replace_unavailable",
+                        format!("replace=true needs a focused editable field or a dialog's entry, and {error}"),
+                    ));
+                }
             }
             let (modifiers, key) = parse_combo("ctrl+a")?;
             {
@@ -19901,6 +20440,13 @@ impl KwinMcp {
             delivery.warning = Some(match delivery.warning.take() {
                 Some(warning) => format!("{warning} {note}"),
                 None => note,
+            });
+        }
+        if blind_replace {
+            let note = "replace=true pressed ctrl+a first, but accessibility cannot read this field, so neither the selection nor the result was checked: take a screenshot.";
+            delivery.warning = Some(match delivery.warning.take() {
+                Some(warning) => format!("{warning} {note}"),
+                None => note.to_owned(),
             });
         }
         let verification_context = delivery.verification_context();
@@ -26901,7 +27447,7 @@ mod memory_limit_tests {
 
 #[cfg(test)]
 mod level_tree_tests {
-    use super::{A11Y_TREE_MAX_CHARS, LevelTree, tree_field};
+    use super::{A11Y_TREE_MAX_CHARS, LevelTree, tree_field, tree_href};
 
     #[test]
     fn budget_excludes_an_entire_wide_level_and_counts_its_children() {
@@ -26953,6 +27499,145 @@ mod level_tree_tests {
     #[test]
     fn labels_cannot_create_extra_lines_or_indentation() {
         assert_eq!(tree_field("a\nb\rc\td"), "a\\nb\\rc\\td");
+    }
+
+    /// The rows a `role=link show_links=true` call gathers on a results page:
+    /// every link on the first level, each with a target of `href` characters.
+    fn link_rows(tree: &mut LevelTree, parent: Option<usize>, rows: usize, href: usize) -> Vec<String> {
+        let mut pushed = Vec::new();
+        for row in 0..rows {
+            if tree.skips_row(parent) {
+                continue;
+            }
+            let text = format!("link\tListing {row}{}", tree_href(&"u".repeat(href)));
+            tree.push(text.clone(), format!("id-{row}"), parent);
+            pushed.push(text);
+        }
+        pushed
+    }
+
+    #[test]
+    fn a_first_level_too_large_for_one_reply_is_returned_a_page_of_rows_at_a_time() {
+        // 463 links of 300 characters each: 140,000 characters on one level.
+        let mut offset = 0;
+        let mut seen = Vec::new();
+        let mut calls = 0;
+        loop {
+            let mut tree = LevelTree::paged(offset, false);
+            link_rows(&mut tree, None, 463, 300);
+            let (text, info) = tree.render(usize::MAX);
+            calls += 1;
+            assert!(text.chars().count() <= A11Y_TREE_MAX_CHARS, "{}", text.chars().count());
+            assert_eq!(info["chars"], text.chars().count());
+            assert_eq!(info["levels"], 1);
+            let rows: Vec<&str> = text.lines().filter(|line| line.starts_with("link\t")).collect();
+            assert!(!rows.is_empty());
+            seen.extend(rows.iter().map(|row| row.to_string()));
+            let Some(next) = info["next_offset"].as_u64() else {
+                // The rows left fit whole: an ordinary last level.
+                assert!(info["more_rows"].is_null());
+                assert_eq!(info["more_below"], false);
+                break;
+            };
+            // Every row of a page names the node that opens it.
+            assert!(rows.iter().all(|row| row.contains("\troot=id-")), "{text}");
+            let more = info["more_rows"].as_u64().unwrap_or(0);
+            assert_eq!(text.lines().last(), Some(format!("+{more} more rows\toffset={next}").as_str()));
+            assert_eq!(usize::try_from(next).ok(), Some(seen.len()));
+            assert_eq!(usize::try_from(more).ok(), Some(463 - seen.len()));
+            offset = seen.len();
+        }
+        assert_eq!(seen.len(), 463);
+        assert!(seen[462].starts_with("link\tListing 462\thref="));
+        assert!(calls > 4, "{calls} calls");
+    }
+
+    #[test]
+    fn the_level_below_a_named_root_is_paged_under_its_root_row() {
+        let mut tree = LevelTree::paged(0, true);
+        let root = tree.push("list\tResults".to_owned(), "list-id".to_owned(), None);
+        link_rows(&mut tree, Some(root), 200, 300);
+        let (text, info) = tree.render(usize::MAX);
+        assert!(text.chars().count() <= A11Y_TREE_MAX_CHARS);
+        assert!(text.starts_with("list\tResults\n\tlink\tListing 0\thref="), "{}", &text[..80]);
+        assert_eq!(info["levels"], 2);
+        let next = info["next_offset"].as_u64().and_then(|next| usize::try_from(next).ok()).unwrap_or(0);
+        assert!(next > 0 && next < 200, "{info}");
+        // The next call skips those rows of the root, not the root.
+        let mut tree = LevelTree::paged(next, true);
+        let root = tree.push("list\tResults".to_owned(), "list-id".to_owned(), None);
+        link_rows(&mut tree, Some(root), 200, 300);
+        let (text, info) = tree.render(usize::MAX);
+        assert!(text.starts_with(&format!("list\tResults\n\tlink\tListing {next}\thref=")), "{}", &text[..80]);
+        assert_eq!(info["offset"], next);
+    }
+
+    #[test]
+    fn a_level_that_fits_is_whole_and_names_no_offset() {
+        let mut tree = LevelTree::paged(0, false);
+        link_rows(&mut tree, None, 40, 300);
+        let (text, info) = tree.render(usize::MAX);
+        assert_eq!(text.lines().count(), 40);
+        assert!(info["next_offset"].is_null() && info["offset"].is_null(), "{info}");
+        assert!(!text.contains("root="), "a leaf of a whole level carries no id");
+    }
+
+    #[test]
+    fn a_long_link_target_keeps_both_ends_like_a_long_name() {
+        use super::{A11Y_HREF_MAX_CHARS, FIND_UI_HREF_MAX_CHARS, set_href, set_page_href};
+        let short = "https://example.com/itm/1?hash=item1";
+        assert_eq!(tree_href(short), format!("\thref={short}"));
+        let long = format!("https://example.com/itm/1?q={}&end=1", "z".repeat(3_000));
+        let shown = tree_href(&long);
+        let omitted = long.chars().count() - A11Y_HREF_MAX_CHARS;
+        assert!(shown.starts_with("\thref=https://example.com/itm/1?q=zzz"), "{shown}");
+        assert!(shown.ends_with("zzz&end=1"), "{shown}");
+        assert!(shown.contains(&format!("…[{omitted} more characters]…")), "{shown}");
+        assert_eq!(shown.chars().count(), "\thref=".len() + A11Y_HREF_MAX_CHARS + format!("…[{omitted} more characters]…").chars().count());
+        // The element search returns that target whole, and cuts only past its own bound.
+        let mut matched = serde_json::json!({});
+        set_href(&mut matched, &long);
+        assert_eq!(matched["href"], long);
+        assert!(matched["href_chars"].is_null());
+        let data = format!("data:text/plain,{}", "d".repeat(FIND_UI_HREF_MAX_CHARS));
+        set_href(&mut matched, &data);
+        assert_eq!(matched["href_chars"], data.len());
+        let cut = matched["href"].as_str().unwrap_or_default().to_owned();
+        assert!(cut.starts_with("data:text/plain,ddd") && cut.contains("…[16 more characters]…"), "{}", &cut[..40]);
+        // The page script hands such a target over as its ends and its length.
+        let mut from_page = serde_json::json!({});
+        let half = FIND_UI_HREF_MAX_CHARS / 2;
+        set_page_href(
+            &mut from_page,
+            &serde_json::json!({"head": &data[..half], "tail": &data[data.len() - half..], "chars": data.len()}),
+        );
+        assert_eq!(from_page, matched);
+        assert!(include_str!("find_ui_dom.js").contains(&format!("HREF_MAX = {FIND_UI_HREF_MAX_CHARS};")));
+    }
+
+    #[test]
+    fn a_page_read_names_its_continuation_in_the_half_the_client_shows() {
+        use super::{ResultView, page_read_result};
+        let info = || {
+            serde_json::json!({"format":"links", "offset":0, "end":5, "chars":5, "total_chars":12, "next_offset":5})
+        };
+        let text_of = |result: &rmcp::model::CallToolResult| {
+            result.content.first().and_then(|content| content.as_text()).map(|text| text.text.clone()).unwrap_or_default()
+        };
+        let structured = page_read_result(ResultView::StructuredOnly, "a\tb\nc".to_owned(), info());
+        let content = structured.structured_content.clone().unwrap_or_default();
+        assert_eq!(content["content"], "a\tb\nc");
+        assert_eq!(content["next_offset"], 5);
+        assert!(content["end"].is_null());
+        assert!(text_of(&structured).contains("continue with offset=5"));
+        assert!(!text_of(&structured).contains("a\tb"));
+        let text = page_read_result(ResultView::TextOnly, "a\tb\nc".to_owned(), info());
+        assert_eq!(text_of(&text), "a\tb\nc\n[browser_read: characters 0 to 5 of 12; continue with offset=5]");
+        assert!(text.structured_content.unwrap_or_default()["content"].is_null());
+        let mut last = info();
+        last.as_object_mut().map(|object| object.remove("next_offset"));
+        let whole = page_read_result(ResultView::TextOnly, "tail".to_owned(), last);
+        assert_eq!(text_of(&whole), "tail");
     }
 }
 

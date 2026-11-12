@@ -1251,6 +1251,22 @@ impl std::fmt::Display for TerminalFocus {
 
 impl std::error::Error for TerminalFocus {}
 
+/// Accessibility shows no focused control at all in the window: the window's
+/// toolkit publishes nothing (Chrome's GTK file chooser), or focus is nowhere.
+#[derive(Debug)]
+pub struct NoAccessibleFocus;
+
+impl std::fmt::Display for NoAccessibleFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the active window exposes no focused editable text through accessibility"
+        )
+    }
+}
+
+impl std::error::Error for NoAccessibleFocus {}
+
 /// Keyboard focus is on an editable control whose text accessibility could not
 /// read, so keys can be sent to it but the result cannot be read back.
 #[derive(Debug)]
@@ -1808,7 +1824,7 @@ impl TextReceipt {
         if let Some(focus) = focus {
             return Err(FocusNotEditable(focus).into());
         }
-        anyhow::bail!("the active window exposes no focused editable text through accessibility");
+        Err(NoAccessibleFocus.into())
     }
 
     /// The focused editable `node` as it is before input: its text, where the
