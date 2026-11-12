@@ -4443,6 +4443,7 @@ fn compact_launch_result(payload: &mut serde_json::Value) {
         &[
             "cdp",
             "cdp_port",
+            "cdp_refused",
             "warning",
             "extension_warning",
             "window_reused",
@@ -21378,7 +21379,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned CDP port, forwarded to host loopback and replacing --remote-debugging-port, Chrome and Edge on their signed-in default profile too. cdp=false gives no port. Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned forwarded CDP port, replacing --remote-debugging-port, on the signed-in default profile too (cdp=false: no port). Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -21995,7 +21996,7 @@ impl KwinMcp {
                 "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
             });
         let mut suffix = String::new();
-        for text in [warning.as_deref(), extension_warning.as_deref()]
+        for text in [warning.as_deref(), extension_warning.as_deref(), cdp_refused]
             .into_iter()
             .flatten()
         {
@@ -22085,7 +22086,8 @@ impl KwinMcp {
                     "window_outcome": outcome, "window_reused": window_reused,
                     "window_observed_after_timeout": window_observed_after_timeout,
                     "window_title": geo.title, "reuse_evidence": reuse_evidence,
-                    "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port), "warning": warning,
+                    "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port),
+                    "cdp_refused": cdp_refused, "warning": warning,
                     "extension_warning": extension_warning,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
