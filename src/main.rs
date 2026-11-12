@@ -5784,11 +5784,13 @@ fn empty_session_databases(
 /// profile's copy in the session's upper layer as a clean exit. The host
 /// Preferences files are only read.
 /// Session browsers start on a new tab instead of reopening every tab the user
-/// has open on the host: each profile's `Sessions` directory (the saved
-/// windows and tabs) is shown to the session as an empty tmpfs. The restore
-/// setting itself is left alone, because switching Chrome off "continue where
-/// you left off" makes it delete session-only cookies at startup and would
-/// drop logins that live in them.
+/// has open on the host: each profile's saved windows and tabs are shown to
+/// the session as empty tmpfs directories. That is `Sessions` and its siblings
+/// named `Sessions_*`: Chrome 156 keeps a second copy in `Sessions_Encrypted`
+/// and restores from it when `Sessions` is empty (#953). The restore setting
+/// itself is left alone, because switching Chrome off "continue where you
+/// left off" makes it delete session-only cookies at startup and would drop
+/// logins that live in them.
 fn hide_browser_sessions(
     plan: &mut OverlayPlan,
     target: &Path,
@@ -5803,14 +5805,27 @@ fn hide_browser_sessions(
             .flatten()
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         {
-            let sessions = profile.path().join("Sessions");
-            service.profile_operation("inspect saved tabs", &sessions)?;
-            if sessions.is_dir() {
-                plan.empty_dirs.push(sessions);
+            service.profile_operation("inspect saved tabs", &profile.path())?;
+            let Ok(entries) = std::fs::read_dir(profile.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if is_saved_tabs_dir(&entry.file_name())
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
+                    plan.empty_dirs.push(entry.path());
+                }
             }
         }
     }
     Ok(())
+}
+
+/// A profile directory's entry that holds saved windows and tabs: `Sessions`,
+/// or a variant of it such as Chrome 156's `Sessions_Encrypted`.
+fn is_saved_tabs_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name == "Sessions" || name.starts_with("Sessions_"))
 }
 
 fn mark_browser_exits_clean(
@@ -30695,6 +30710,17 @@ mod chrome_profile_tests {
             "x".repeat(2040)
         );
         assert_eq!(with_chrome_profiles("d".to_owned(), &[]), "d");
+    }
+
+    #[test]
+    fn every_saved_tabs_directory_is_hidden_and_nothing_else() {
+        use std::ffi::OsStr;
+        for name in ["Sessions", "Sessions_Encrypted", "Sessions_Next"] {
+            assert!(super::is_saved_tabs_dir(OsStr::new(name)), "{name}");
+        }
+        for name in ["Session Storage", "SessionsX", "sessions"] {
+            assert!(!super::is_saved_tabs_dir(OsStr::new(name)), "{name}");
+        }
     }
 }
 
