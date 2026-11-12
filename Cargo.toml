@@ -42,6 +42,10 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 pipewire = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+# Reads Chromium's Local Storage (LevelDB) for page storage continuity (#955).
+rusty-leveldb = "4.0.2"
+crc32c = "0.6.8"
+libc = "0.2"
 
 [[bin]]
 name = "kwin-mcp"
