@@ -26,7 +26,7 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `keyboard_paste` | Paste UTF-8 text through the session clipboard with an acknowledged shortcut. |
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `keyboard_press` / `keyboard_release` | Hold a key or combo down across calls, then release it with the same string. For a shortcut use `keyboard_key`: a modifier left held makes every typed character a shortcut (`h` becomes Ctrl+H), so `keyboard_type` refuses with `modifier_held` until it is released. |
-| `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. With no session it starts a default one and returns its `session_id`. |
+| `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. With no session it starts a default one and returns its `session_id`. `cdp: false` starts a browser without a debugging port (see [Browser CDP](#browser-cdp)). |
 | `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
 | `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
 | `import_file` | Refresh a running session's file from the host, with byte verification and explicit overwrite control. |
@@ -132,13 +132,21 @@ Both tools report the same objects, and a name copied from one works in the othe
 
 ## Browser CDP
 
-`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port. Google Chrome and Edge need a non-default user data directory; for example:
+`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port, on the profile the command opens:
 
 ```text
+google-chrome-stable https://example.com/
+google-chrome-stable --profile-directory="Profile 2" https://example.com/
 google-chrome-stable --user-data-dir="$HOME/.cache/kwin-mcp/cdp-profile" https://example.com/
 ```
 
-The session assigns the CDP port. Do not pass `--remote-debugging-port`; if supplied, `launch_app` replaces it with the session port. A successful connection returns `cdp_port` in the structured result, and that port is forwarded to the host on `127.0.0.1`. Chrome 136 and later ignore remote-debugging switches for the default data directory, so use a private, non-default profile as shown in [Chrome's remote debugging guidance](https://developer.chrome.com/blog/remote-debugging-port).
+The first two run on the session's copy of your signed-in Chrome profile (the `launch_app` description lists its profile directories), the third on a profile of its own. The session assigns the CDP port. Do not pass `--remote-debugging-port`; if supplied, `launch_app` replaces it with the session port. A successful connection returns `cdp_port` in the structured result, and that port is forwarded to the host on `127.0.0.1`.
+
+The port is forwarded to the host's `127.0.0.1` without authentication, so any program running as you can drive that browser, its signed-in profile included; pass `cdp: false` to `launch_app` to start a browser without a port (`browser_navigate` then goes through the address bar).
+
+Chrome 136 and later, and Edge, [ignore remote-debugging switches for the default data directory](https://developer.chrome.com/blog/remote-debugging-port). They decide what is the default by comparing the directory they run on, resolved, with the path they derive from `CHROME_CONFIG_HOME`, as text. So for `google-chrome`, `google-chrome-stable`, `microsoft-edge`, `microsoft-edge-stable` and `msedge` started without `--user-data-dir`, the wrapper sets `CHROME_CONFIG_HOME` for that browser process alone to a directory in the session workdir (`browser-config/…`) whose `google-chrome` or `microsoft-edge` entry is a symlink to the real data directory, and passes the real path as `--user-data-dir`. The browser runs on the same directory as before, with the same lock, cookies, extensions and profiles. Nothing is copied, the session's other programs do not see the variable, and a browser that Chrome itself starts inherits it and reaches the real directories through the same symlinks. The real directory is `${CHROME_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}}/<name>`, resolved; a `--user-data-dir` in a distribution launcher's flags file (Arch's `~/.config/chrome-flags.conf`) is followed instead of doubled. Chromium, Brave and Vivaldi open the port on their default directory by themselves and are started as before, as is a program named `chrome`.
+
+Should a later Chrome resolve that symlink and refuse the port, `launch_app` reports `cdp_refused` once; after the browser is closed and launched again, the session gives it a default directory with no profile in it, which also opens the port (checked on Chrome 156 and, headless, on Edge 157), at the cost that a browser started by that browser without `--user-data-dir` gets a new profile.
 
 Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
 
