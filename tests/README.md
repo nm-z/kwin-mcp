@@ -9,6 +9,16 @@ taking focus, an address of 3000 characters) and one with CDP. Run a case with
 --setenv=KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`;
 `KWIN_MCP_E2E_EVIDENCE=<directory>` keeps a screenshot of each landed page.
 
+`tests/link_targets_e2e.rs` serves a results page of 300 cards (relative,
+absolute, fragment-only, `javascript:` and `mailto:` targets, a link without
+`href`, links inside an iframe, a 3,000-character target) from 127.0.0.1 and
+runs the same way. With CDP it checks that both backends of the element search,
+`accessibility_tree show_links=true` (paged, every reply within 30,000
+characters) and `browser_read` name the same absolute targets, and that the
+page read returns no password value, cookie, storage or script text; without
+CDP it checks the AT-SPI targets and the `cdp_unavailable` refusal; the third
+case types over the name in Chrome's save dialog with `replace=true`.
+
 `ruby tests/native_paste_e2e.rb /path/to/kwin-mcp /absolute/evidence` exercises
 native Ctrl+V and Shift+Insert through a fresh stdio/KWin/Chrome session. It checks
 multiline UTF-8 field receipts and independently receives the complete values
