@@ -16303,13 +16303,14 @@ impl rmcp::ServerHandler for KwinMcp {
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
                 "KDE Wayland automation in an isolated desktop. Flow: session_start → launch_app → screenshot → input → screenshot to verify. \
-                Prefer find_ui_elements for named controls, accessibility_tree for structure, screenshots otherwise. Use window_list and window_activate for hidden windows. \
-                Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. The viewer may stay open; the user can close it. \
+                Prefer find_ui_elements for named controls, accessibility_tree for structure, browser_read and browser_eval for a browser page with cdp_port, screenshots otherwise. Use window_list and window_activate for hidden windows. \
+                Work without a viewer until the user must see or act (password, OTP, Duo, CAPTCHA, choice, result). Show the relevant entry, then call viewer_open; never assume it is open or stop the session for a handoff. Poll screenshots and continue when the page advances. \
+                launch_app's Chrome runs on a session copy of the account holder's signed-in profile: sites open signed in, and using those sign-ins is intended. \
                 At browser logins, select saved-credential autofill without reading or typing its value; otherwise show the entry and open the viewer. \
-                Clipboards are separate: viewer Ctrl+C/Ctrl+X copies to this server's desktop; Ctrl+V/Shift+Insert pastes from it. clipboard_write target=host prepares viewer paste; target=session prepares agent input and X11 PRIMARY. clipboard_read reads session text only and withholds generated secrets. \
+                Clipboards are separate: the viewer copies and pastes with this server's desktop clipboard, which clipboard_write target=host fills; target=session is the agent's. \
                 Chrome file chooser: click the file input, ctrl+l, type the absolute session path, alt+o; for folders click its top-right button, not alt+o. Enter in the location bar cancels. \
                 Mouse/screenshot coordinates are 1:1 pixels from the active window's top-left. For crop region=[x1,y1,x2,y2], image (px,py) maps to mouse (px+x1,py+y1). \
-                {size_line} Windows auto-maximize unless window_mode=native. Results report memory_warning when the session is throttled.",
+                {size_line} Windows auto-maximize unless window_mode=native.",
                 size_line = if self.display.locked {
                     format!("The virtual display is fixed at {}x{} (server launched with --no-override; session_start size params are ignored).", self.display.width, self.display.height)
                 } else {
@@ -16323,7 +16324,7 @@ impl rmcp::ServerHandler for KwinMcp {
 impl KwinMcp {
     #[rmcp::tool(
         name = "session_start",
-        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. Optional host (name or IP, optional :port) starts the desktop on that machine's kwin-mcp --listen instead; calls with its ID route there, and paths are that machine's. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes normally stay in a per-session disk overlay and are discarded on stop; export_file copies them to the host. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
+        description = "Create an isolated desktop and return its session_id; use IDs from your own session_start calls, or session_attach to an existing session the user explicitly authorized. Calls may forward to that ID's live owner. This tool takes no session_id. Optional host (name or IP, optional :port) starts the desktop on that machine's kwin-mcp --listen instead; calls with its ID route there, and paths are that machine's. The viewer starts closed; use viewer_open when the user needs to see or interact, and keep the session alive for handoff. startup_timeout_seconds is 1-300 (default 60). window_mode=maximized is default; native uses app-requested sizes. Both remove decorations. Optional width/height override server defaults unless --no-override; results report actual dimensions and viewer state. Optional memory_high/memory_max/memory_swap_max are whole GiB; zero disables throttling or swap, and memory_max must be positive and at least memory_high. HOME writes stay in a per-session disk overlay and are discarded on stop, except browser cookies and site storage, which the next session gets (the host profile is never written); export_file copies files out. Host edits after start are not reliably visible; import_file refreshes one file, then reload it in the app. Explicit host_write_paths binds existing HOME state directories writable (for Codex, an absolute path to ~/.codex): writes and deletions persist on the host. Results and session_list report those paths. host_shared_dir is the session workdir and XDG_RUNTIME_DIR, visible at the same absolute path on both sides: put host-facing sockets, FIFOs and output there. When the result has workdir_removed_on_stop=true (server --autoclean or --ttl), session_stop deletes it; copy outputs out first. Other /tmp paths are private, and HOME-overlay sockets cannot be reached through their host upper paths. /sys/fs/cgroup is read-only; run helpers needing delegated cgroups on the host. App stdout is discarded; stderr goes to the disk-backed sandbox.log under the session's cache directory."
     )]
     async fn session_start(
         &self,
@@ -19001,7 +19002,7 @@ impl KwinMcp {
     }
     #[rmcp::tool(
         name = "accessibility_tree",
-        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large or empty if an app exposes no accessibility nodes; use screenshot and input in that case. Prefer find_ui_elements for one named control. The traversal budget is 5 seconds; set timeout_seconds from 1 to 30 to change it. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in structuredContent.tree for a client that shows only structured results (Claude Code) and in the text for one that shows only text (Codex); a client not known gets both. A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. show_links=true (default false) ends each link's row in href=URL, its absolute target, the value find_ui_elements gives as href; a target longer than 1,000 characters shows its first and last 500 with '…[N more characters]…' between. A level too large for one reply (role lifts every match to the first level) returns the rows that fit, each ending in root=ID, then '+N more rows offset=K': call again with offset=K and the same arguments. source=window (default) is the AT-SPI tree: a browser's frame, tabs, toolbar and page. source=page is the active tab's CDP tree (roles like RootWebArea); it needs cdp_port.",
+        description = "Dump the active app's widget hierarchy when structural context is needed. Trees can be large, or empty for an app without accessibility nodes: then read a browser page with a cdp_port through source=page, browser_read or browser_eval, and anything else with screenshot and input. Prefer find_ui_elements for one named control. The traversal budget is 5 seconds; set timeout_seconds from 1 to 30 to change it. If time runs out, gathered nodes are returned with incomplete=true and root=ID continuations; the interrupted level may contain only some nodes. Completed traversals return whole levels read breadth-first, as deep as fits in 30,000 characters, one tab of indent per level (a name longer than 8,000 characters shows its first and last 4,000 with '…[N more characters ...]…' between; find_ui_elements returns it whole); the tree is sent once, in the half of the result the client shows (both for a client not known). A node on the last level that has more below ends in '+N children root=ID'; call again with root=ID to open that subtree. app_name filters top-level apps; role filters role names; max_depth caps the levels returned. show_elements=true keeps zero-rect, unnamed and offscreen nodes; default false trims them out. show_links=true (default false) ends each link's row in href=URL, its absolute target, the value find_ui_elements gives as href; a target longer than 1,000 characters shows its first and last 500 with '…[N more characters]…' between. A level too large for one reply (role lifts every match to the first level) returns the rows that fit, each ending in root=ID, then '+N more rows offset=K': call again with offset=K and the same arguments. source=window (default) is the AT-SPI tree: a browser's frame, tabs, toolbar and page. source=page is the active tab's CDP tree (roles like RootWebArea); it needs cdp_port.",
         annotations(read_only_hint = true)
     )]
     async fn accessibility_tree(
@@ -21988,7 +21989,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned forwarded CDP port, replacing --remote-debugging-port, on the signed-in default profile too (cdp=false: no port). Successful CDP returns cdp_port, a port of this machine's 127.0.0.1 also for a session started with host. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. Stdout is discarded, except with expect_window=false: stdout_path in host_shared_dir, quoted as stdout_tail once the command exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a forwarded CDP port in place of --remote-debugging-port (cdp=false: none). Successful CDP returns cdp_port, on this machine's 127.0.0.1 also for a remote session. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes)."
     )]
     async fn launch_app(
         &self,
@@ -25320,19 +25321,31 @@ fn host_chrome_profiles() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `description` plus as many Chrome profiles as fit the client's 2048-character
-/// description limit.
+/// What a session's Chrome runs on when this machine has Chrome profiles. A
+/// model that read only launch_app took the signed-in profile for off limits
+/// (#962), so the description says what it is for.
+const SIGNED_IN_PROFILE: &str = " Without --user-data-dir, Chrome runs on a session copy of the account holder's signed-in profile: sites open signed in, and using those sign-ins is intended.";
+
+/// `description` with [`SIGNED_IN_PROFILE`] and as many Chrome profiles as fit
+/// the client's 2048-character description limit.
 fn with_chrome_profiles(description: String, profiles: &[String]) -> String {
-    const PREFIX: &str = " Chrome profiles here, most recently used first; pick one with --profile-directory=\"DIR\": ";
-    let mut text = description.clone();
+    const LIST: &str =
+        " Profiles, most recently used first; pick one with --profile-directory=\"DIR\": ";
+    if profiles.is_empty() {
+        return description;
+    }
+    let signed_in = format!("{description}{SIGNED_IN_PROFILE}");
     for count in (1..=profiles.len()).rev() {
-        let candidate = format!("{description}{PREFIX}{}.", profiles[..count].join("; "));
+        let candidate = format!("{signed_in}{LIST}{}.", profiles[..count].join("; "));
         if candidate.chars().count() <= 2048 {
-            text = candidate;
-            break;
+            return candidate;
         }
     }
-    text
+    if signed_in.chars().count() <= 2048 {
+        signed_in
+    } else {
+        description
+    }
 }
 
 impl SessionRouter {
@@ -31590,9 +31603,16 @@ mod chrome_profile_tests {
         let profiles = (0..200)
             .map(|index| format!("\"Profile {index}\" (\"Person {index}\")"))
             .collect::<Vec<_>>();
-        let described = with_chrome_profiles("x".repeat(1900), &profiles);
+        let described = with_chrome_profiles("x".repeat(1700), &profiles);
         assert!(described.chars().count() <= 2048);
+        assert!(described.contains(super::SIGNED_IN_PROFILE), "{described}");
         assert!(described.contains("\"Profile 0\""));
+        // Room for what the profile is for but for no profile: that sentence (#962).
+        let short = "x".repeat(1860);
+        assert_eq!(
+            with_chrome_profiles(short.clone(), &profiles),
+            format!("{short}{}", super::SIGNED_IN_PROFILE)
+        );
         assert_eq!(
             with_chrome_profiles("x".repeat(2040), &profiles),
             "x".repeat(2040)
