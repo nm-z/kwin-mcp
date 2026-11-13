@@ -4458,72 +4458,99 @@ fn compact_launch_result(payload: &mut serde_json::Value) {
 /// backend then composites with QPainter, where screen capture is cancelled.
 const NO_DRI_WARNING: &str = "this host has no /dev/dri, so KWin composites without OpenGL: screenshot and the viewer do not work. Load a DRM device (sudo modprobe vgem gives a software one) and start a new session.";
 
-/// The `session_start` result without its empty fields, and the SQLite access
-/// report in its short form.
-fn compact_session_result(payload: &mut serde_json::Value, sqlite_access: &SqliteAccessReport) {
+/// The `session_start` result without its empty fields.
+fn compact_session_result(payload: &mut serde_json::Value) {
     drop_empty_fields(
         payload,
         &[
             "runtime_root_fallback",
             "cookie_errors",
-            "oversized_read_only_files",
             "host_write_paths",
             "host_loopback_warning",
+            "host_access",
         ],
     );
-    if let Some(object) = payload.as_object_mut() {
-        object.extend(sqlite_access.result_fields());
-    }
 }
 
+/// File in the session workdir that lists the host paths session_start reports
+/// only as counts: the SQLite databases and the oversized files the session
+/// sees read-only (#957).
+const HOST_ACCESS_REPORT: &str = "host-access.json";
+
+/// What the session sees of the host read-only or as private copies.
 #[derive(Default, Serialize)]
 struct SqliteAccessReport {
     databases: Vec<serde_json::Value>,
     total_databases: usize,
+    /// How many databases have each mode, also past the list's limit.
+    #[serde(skip)]
+    modes: std::collections::BTreeMap<&'static str, usize>,
+    /// The databases whose requested access could not be given, all of them.
+    #[serde(skip)]
+    notes: Vec<serde_json::Value>,
 }
 
 impl SqliteAccessReport {
     fn record(&mut self, path: &Path, mode: &'static str) {
-        self.total_databases += 1;
-        if self.databases.len() < 128 {
-            self.databases
-                .push(serde_json::json!({"path": path, "mode": mode}));
-        }
-    }
-
-    /// The report as result fields. A list of databases that are all live read-only
-    /// is one list of paths, `live_ro_dbs`, not a mode repeated per database;
-    /// any other mode, or a note, keeps the full `sqlite_access` report.
-    fn result_fields(&self) -> serde_json::Map<String, serde_json::Value> {
-        let mut fields = serde_json::Map::new();
-        if self.total_databases == 0 {
-            return fields;
-        }
-        let all_live_read_only = self.databases.iter().all(|entry| {
-            entry["mode"] == "live_read_only" && entry.get("note").is_none()
-        });
-        if all_live_read_only {
-            let paths: Vec<_> = self.databases.iter().map(|entry| entry["path"].clone()).collect();
-            fields.insert("live_ro_dbs".to_owned(), serde_json::Value::Array(paths));
-            if self.total_databases > self.databases.len() {
-                fields.insert("live_ro_dbs_total".to_owned(), serde_json::json!(self.total_databases));
-            }
-        } else {
-            fields.insert(
-                "sqlite_access".to_owned(),
-                serde_json::json!({"databases": self.databases, "total_databases": self.total_databases}),
-            );
-        }
-        fields
+        self.add(serde_json::json!({"path": path, "mode": mode}), mode);
     }
 
     /// A database whose requested access could not be given, with the reason.
     fn record_with_note(&mut self, path: &Path, mode: &'static str, note: String) {
+        let entry = serde_json::json!({"path": path, "mode": mode, "note": note});
+        self.notes.push(entry.clone());
+        self.add(entry, mode);
+    }
+
+    fn add(&mut self, entry: serde_json::Value, mode: &'static str) {
         self.total_databases += 1;
+        *self.modes.entry(mode).or_default() += 1;
         if self.databases.len() < 128 {
-            self.databases
-                .push(serde_json::json!({"path": path, "mode": mode, "note": note}));
+            self.databases.push(entry);
         }
+    }
+
+    fn count(&self, mode: &str) -> usize {
+        self.modes.get(mode).copied().unwrap_or(0)
+    }
+
+    /// The `host_access` field of the session_start result: counts in place of
+    /// paths, the databases whose requested access could not be given, and
+    /// `report`, the file in `dir` with every path. Null, and no file, when
+    /// there is nothing to say.
+    fn host_access(&self, oversized_files: &[PathBuf], dir: &Path) -> serde_json::Value {
+        if self.total_databases == 0 && oversized_files.is_empty() {
+            return serde_json::Value::Null;
+        }
+        let report = self.write_report(oversized_files, dir);
+        let mut access = serde_json::json!({});
+        if self.total_databases > 0 {
+            access["sqlite"] = serde_json::json!(self.modes);
+        }
+        if !oversized_files.is_empty() {
+            access["oversized_read_only_files"] = serde_json::json!(oversized_files.len());
+        }
+        if !self.notes.is_empty() {
+            access["notes"] = serde_json::json!(self.notes);
+        }
+        match report {
+            Ok(path) => access["report"] = serde_json::json!(path),
+            Err(error) => access["report_error"] = serde_json::json!(error),
+        }
+        access
+    }
+
+    /// Writes the full lists to `dir`/[`HOST_ACCESS_REPORT`] and returns its path.
+    fn write_report(&self, oversized_files: &[PathBuf], dir: &Path) -> Result<PathBuf, String> {
+        let path = dir.join(HOST_ACCESS_REPORT);
+        let report = serde_json::json!({
+            "sqlite_access": self,
+            "oversized_read_only_files": oversized_files,
+        });
+        let text = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+        std::fs::write(&path, text)
+            .map_err(|error| format!("{} could not be written: {error}", path.display()))?;
+        Ok(path)
     }
 }
 
@@ -6903,7 +6930,7 @@ struct Session {
     _uinput_keyboard: std::os::fd::OwnedFd,
     mouse_sysname: String,
     kbd_sysname: String,
-    cdp_browser: Option<Arc<chromiumoxide::Browser>>,
+    cdp: Arc<CdpSlot>,
     cdp_forward_port: u16,
     service_proxy_children: Vec<SessionProcess>,
     viewer_child: Option<SessionProcess>,
@@ -9208,7 +9235,12 @@ async fn request_kwin_browser_close(sess: &Session) -> usize {
 }
 
 async fn request_cdp_browser_close(sess: &Session) -> bool {
-    let Some(browser) = sess.cdp_browser.as_ref() else {
+    // A re-execution keeps no connection: a browser with a port gets a new one.
+    let link = match sess.cdp.current() {
+        Some(link) => Some(link),
+        None => cdp_dial(sess.cdp_forward_port).await.ok(),
+    };
+    let Some(link) = link else {
         eprintln!("teardown: no CDP browser handle for graceful close");
         return false;
     };
@@ -9216,7 +9248,7 @@ async fn request_cdp_browser_close(sess: &Session) -> bool {
     eprintln!("teardown: requesting graceful Chrome close through CDP");
     match tokio::time::timeout(
         CDP_BROWSER_CLOSE_TIMEOUT,
-        browser.execute(CloseParams::default()),
+        link.browser.execute(CloseParams::default()),
     )
     .await
     {
@@ -9621,7 +9653,7 @@ fn test_slow_storage() {
 /// names the stage it is in for whoever waits.
 fn teardown(mut sess: Session, progress: &StopProgress) -> TeardownReport {
     let mut cookie_errors = std::mem::take(&mut sess.cookie_errors);
-    drop(sess.cdp_browser);
+    drop(sess.cdp.set(None));
     // Kill the viewer first so it can flush any pending wayland requests
     // before the container's compositor disappears.
     if let Some(viewer) = sess.viewer_child.take() {
@@ -13322,6 +13354,11 @@ struct BrowserReadParams {
     offset: Option<usize>,
     /// Most characters to return, 1 to 30000 (the default).
     max_chars: Option<usize>,
+    /// format=links: each href without its ?query and #fragment. Default false.
+    strip_query: Option<bool>,
+    /// format=links: one line per href, named by the first of its links with
+    /// text. Default false.
+    dedupe: Option<bool>,
 }
 
 /// Pages of the browser itself (settings, the password manager, extensions,
@@ -13454,6 +13491,209 @@ async fn navigation_key(eis: &Eis, name: &str, pace: InputPace) -> Result<(), Mc
     Ok(())
 }
 
+/// How long a new CDP connection to the session's browser may take to open.
+const CDP_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The task that drives one CDP connection. It is aborted, which closes the
+/// connection, once the last holder of its link lets go.
+struct CdpDriver(tokio::task::AbortHandle);
+
+impl Drop for CdpDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One CDP connection to the browser on the session's forwarded port.
+#[derive(Clone)]
+struct CdpLink {
+    browser: Arc<chromiumoxide::Browser>,
+    _driver: Arc<CdpDriver>,
+    /// The browser process it reaches, as the browser said when it connected.
+    pid: Option<i64>,
+}
+
+impl CdpLink {
+    /// Whether the connection reaches browser process `pid`, the client of a
+    /// window as KWin reports it.
+    async fn reaches(&self, pid: i32) -> bool {
+        match self.pid {
+            Some(own) => own == i64::from(pid),
+            None => cdp_is_process(&self.browser, pid).await,
+        }
+    }
+}
+
+/// Why the session has no CDP link that answers.
+enum CdpTrouble {
+    /// Nothing answers on the session's CDP port: no browser was started with one.
+    NoBrowser,
+    /// The browser on the port answered neither on the kept connection nor on
+    /// a new one in time.
+    Unresponsive(String),
+}
+
+/// The browser's targets, or None when it does not answer in time.
+async fn cdp_targets(
+    browser: &chromiumoxide::Browser,
+) -> Option<Vec<chromiumoxide::cdp::browser_protocol::target::TargetInfo>> {
+    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+    tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        browser.execute(GetTargetsParams::default()),
+    )
+    .await
+    .ok()?
+    .ok()
+    .map(|targets| targets.result.target_infos)
+}
+
+/// The process ID of the browser behind a CDP connection.
+async fn cdp_browser_pid(browser: &chromiumoxide::Browser) -> Option<i64> {
+    use chromiumoxide::cdp::browser_protocol::system_info::GetProcessInfoParams;
+    let processes = tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        browser.execute(GetProcessInfoParams::default()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    processes
+        .result
+        .process_info
+        .iter()
+        .filter(|process| process.r#type == "browser")
+        .map(|process| process.id)
+        .next()
+}
+
+/// A new CDP connection to the browser on the forwarded `port`.
+async fn cdp_dial(port: u16) -> Result<CdpLink, String> {
+    use futures::StreamExt;
+    let address = format!("http://127.0.0.1:{port}");
+    let (browser, mut handler) =
+        tokio::time::timeout(CDP_DIAL_TIMEOUT, chromiumoxide::Browser::connect(address))
+            .await
+            .map_err(|_| format!("no answer within {} s", CDP_DIAL_TIMEOUT.as_secs()))?
+            .map_err(|error| error.to_string())?;
+    let driver = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let driver = Arc::new(CdpDriver(driver.abort_handle()));
+    let browser = Arc::new(browser);
+    let pid = cdp_browser_pid(&browser).await;
+    // The connection attaches to each tab on its own; a tab is reachable only
+    // once it has.
+    let deadline = tokio::time::Instant::now() + CDP_DIAL_TIMEOUT;
+    loop {
+        let tabs = cdp_targets(&browser).await.map(|targets| {
+            targets
+                .iter()
+                .filter(|target| target.r#type == "page")
+                .count()
+        });
+        let attached = tokio::time::timeout(CDP_STEP_TIMEOUT, browser.pages())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map_or(0, |pages| pages.len());
+        if tabs.is_some_and(|tabs| attached >= tabs) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(CdpLink {
+        browser,
+        _driver: driver,
+        pid,
+    })
+}
+
+/// The session's CDP link to its browser. launch_app makes it; it is made
+/// again on demand when there is none, as after a re-execution, which keeps no
+/// connection, or when the kept one stops answering (#957).
+#[derive(Default)]
+struct CdpSlot {
+    link: std::sync::Mutex<Option<CdpLink>>,
+    /// Held while a new connection is dialed, so concurrent calls make one.
+    dialing: tokio::sync::Mutex<()>,
+}
+
+impl CdpSlot {
+    fn current(&self) -> Option<CdpLink> {
+        self.link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Puts `link` in place of the kept one, which is returned.
+    fn set(&self, link: Option<CdpLink>) -> Option<CdpLink> {
+        let mut kept = self
+            .link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *kept, link)
+    }
+
+    /// A link that answers, with the browser's targets: the kept one, else a
+    /// new connection to `port`, which is kept from then on.
+    async fn answering(
+        &self,
+        port: u16,
+    ) -> Result<
+        (
+            CdpLink,
+            Vec<chromiumoxide::cdp::browser_protocol::target::TargetInfo>,
+        ),
+        CdpTrouble,
+    > {
+        let asked = self.current();
+        if let Some(link) = &asked
+            && let Some(targets) = cdp_targets(&link.browser).await
+        {
+            return Ok((link.clone(), targets));
+        }
+        let _dialing = self.dialing.lock().await;
+        // Another call may have put a new one in place meanwhile.
+        let kept = self.current();
+        let replaced = match (&asked, &kept) {
+            (Some(asked), Some(kept)) => !Arc::ptr_eq(&asked.browser, &kept.browser),
+            (None, kept) => kept.is_some(),
+            (Some(_), None) => false,
+        };
+        if replaced
+            && let Some(link) = &kept
+            && let Some(targets) = cdp_targets(&link.browser).await
+        {
+            return Ok((link.clone(), targets));
+        }
+        let silent = format!(
+            "the browser on CDP port {port} did not answer within {} s",
+            CDP_STEP_TIMEOUT.as_secs()
+        );
+        let link = cdp_dial(port).await.map_err(|error| match &kept {
+            None => CdpTrouble::NoBrowser,
+            Some(_) => {
+                CdpTrouble::Unresponsive(format!("{silent}, and a new connection failed: {error}"))
+            }
+        })?;
+        let Some(targets) = cdp_targets(&link.browser).await else {
+            return Err(CdpTrouble::Unresponsive(format!(
+                "{silent}, also on a new connection"
+            )));
+        };
+        eprintln!(
+            "cdp: {} the browser on port {port}",
+            if kept.is_some() {
+                "the kept connection stopped answering; a new one reaches"
+            } else {
+                "connected to"
+            }
+        );
+        self.set(Some(link.clone()));
+        Ok((link, targets))
+    }
+}
+
 /// The committed entry of a tab, from the browser process: it answers while the
 /// page is busy or navigating.
 async fn cdp_entry(page: &chromiumoxide::Page) -> Option<(String, String)> {
@@ -13502,23 +13742,16 @@ async fn cdp_is_process(browser: &chromiumoxide::Browser, pid: i32) -> bool {
     })
 }
 
-/// The tab of the CDP browser that its window `caption` shows: exactly one tab
-/// has the caption's title (the showing one, if several do). None leaves the
-/// address bar to do it.
+/// The tab of the CDP browser that its window `caption` shows, out of the
+/// browser's `targets`: exactly one tab has the caption's title (the showing
+/// one, if several do). None leaves the address bar to do it.
 async fn cdp_active_tab(
     browser: &chromiumoxide::Browser,
+    targets: &[chromiumoxide::cdp::browser_protocol::target::TargetInfo],
     caption: &str,
 ) -> Option<chromiumoxide::Page> {
-    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
-    let targets = tokio::time::timeout(
-        CDP_STEP_TIMEOUT,
-        browser.execute(GetTargetsParams::default()),
-    )
-    .await
-    .ok()?
-    .ok()?;
     let mut tabs = Vec::new();
-    for target in &targets.result.target_infos {
+    for target in targets {
         if target.r#type == "page"
             && browser_address::caption_names_tab(caption, &target.title)
             && let Ok(Ok(page)) = tokio::time::timeout(
@@ -17332,18 +17565,21 @@ impl KwinMcp {
         };
         let oversized_read_only_files = std::mem::take(&mut overlay_plan.oversized_read_only_files);
         let sqlite_access = std::mem::take(&mut overlay_plan.sqlite_access);
-        let msg = if sqlite_access.total_databases == 0 {
+        // Counts in the result; the paths go to a file in the workdir (#957).
+        let host_access = sqlite_access.host_access(&oversized_read_only_files, &host_xdg_dir);
+        let live_read_only = sqlite_access.count("live_read_only");
+        let msg = if live_read_only == 0 {
             msg
         } else {
             format!(
-                "{msg}; live_read_only databases (live_ro_dbs, or sqlite_access when other modes are present) cannot support application writes; request writable_paths on a new session for private writable snapshots."
+                "{msg}; {live_read_only} SQLite database(s) are live read-only and cannot take application writes (host_access.report lists them); request writable_paths on a new session for private writable snapshots."
             )
         };
         let msg = if oversized_read_only_files.is_empty() {
             msg
         } else {
             format!(
-                "{msg}; {} oversized ancestor file(s) are read-only; see oversized_read_only_files. Request writable_paths on a new session for private writable copies.",
+                "{msg}; {} oversized ancestor file(s) are read-only (host_access.report lists them). Request writable_paths on a new session for private writable copies.",
                 oversized_read_only_files.len()
             )
         };
@@ -17378,7 +17614,7 @@ impl KwinMcp {
             host_xdg_dir,
             _uinput_mouse: uinput_mouse_fd,
             _uinput_keyboard: uinput_keyboard_fd,
-            cdp_browser: None,
+            cdp: Arc::default(),
             cdp_forward_port,
             service_proxy_children: service_proxy_children
                 .into_iter()
@@ -17423,7 +17659,7 @@ impl KwinMcp {
             "height": screen_h,
             "viewer": viewer,
             "cookie_errors": cookie_errors,
-            "oversized_read_only_files": oversized_read_only_files,
+            "host_access": host_access,
             "host_write_paths": host_write_paths,
             "host_loopback_warning": host_loopback_warning,
             "wallet": {
@@ -17437,7 +17673,7 @@ impl KwinMcp {
                 "reason": secret_snapshot.reason,
             },
         });
-        compact_session_result(&mut started, &sqlite_access);
+        compact_session_result(&mut started);
         if let (false, Some(object)) = (Path::new("/dev/dri").is_dir(), started.as_object_mut()) {
             object.insert("graphics_warning".to_owned(), NO_DRI_WARNING.into());
         }
@@ -18745,13 +18981,14 @@ impl KwinMcp {
                 Some(serde_json::json!({"reason": reason})),
             )
         };
-        let (conn, unique, runtime, browser) = self
+        let (conn, unique, runtime, cdp, port) = self
             .with_session(|s| {
                 Ok((
                     s.kwin_conn.clone(),
                     s.kwin_unique_name.clone(),
                     s.host_xdg_dir.clone(),
-                    s.cdp_browser.clone(),
+                    s.cdp.clone(),
+                    s.cdp_forward_port,
                 ))
             })
             .await?;
@@ -18780,10 +19017,16 @@ impl KwinMcp {
                     ),
                 ));
             }
-            let Some(browser) = browser.as_deref() else {
-                return Err(refuse("cdp_unavailable", PAGE_READ_NEEDS_CDP.to_owned()));
-            };
-            if !cdp_is_process(browser, window.pid).await {
+            let (link, targets) = cdp.answering(port).await.map_err(|trouble| match trouble {
+                CdpTrouble::NoBrowser => refuse("cdp_unavailable", PAGE_READ_NEEDS_CDP.to_owned()),
+                CdpTrouble::Unresponsive(detail) => refuse(
+                    "cdp_unresponsive",
+                    format!(
+                        "{detail}. The browser may be busy or short of memory; try again, or use screenshot and accessibility_tree"
+                    ),
+                ),
+            })?;
+            if !link.reaches(window.pid).await {
                 return Err(refuse(
                     "cdp_unavailable",
                     format!(
@@ -18792,7 +19035,7 @@ impl KwinMcp {
                     ),
                 ));
             }
-            if let Some(page) = cdp_active_tab(browser, &window.title).await {
+            if let Some(page) = cdp_active_tab(&link.browser, &targets, &window.title).await {
                 break page;
             }
             looks += 1;
@@ -19135,14 +19378,20 @@ impl KwinMcp {
             .iter()
             .find(|window| window.active)
             .map(|window| window.id.clone());
-        let cdp_browser = self
+        let cdp_slot = self
             .session
             .read()
             .await
             .as_ref()
-            .and_then(|s| s.cdp_browser.clone());
-        if let Some(browser) = cdp_browser {
+            .map(|s| (s.cdp.clone(), s.cdp_forward_port));
+        if let Some((slot, port)) = cdp_slot {
             let cdp = tokio::time::timeout(search_timeout, async {
+                let browser = match slot.answering(port).await {
+                    Ok((link, _)) => link.browser,
+                    // No browser with a CDP port: accessibility alone answers.
+                    Err(CdpTrouble::NoBrowser) => return Ok(()),
+                    Err(CdpTrouble::Unresponsive(detail)) => return Err(detail),
+                };
                 let pages = browser.pages().await.map_err(|error| error.to_string())?;
                 for page in pages.iter().take(FIND_UI_MAX_PAGES) {
                     let url = page.url().await.ok().flatten().unwrap_or_default();
@@ -19456,7 +19705,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "browser_read",
-        description = "Read the page in the active tab of the focused Chromium-family browser window through CDP, without a save dialog. format=text (default) is the text a reader sees; html is the outer HTML without the contents of scripts (ld+json metadata stays) and style sheets; links is one line per link: its text, a tab, its absolute href (the same value find_ui_elements and accessibility_tree show_links=true report). selector is a CSS selector: only the elements it matches are read (outermost matches, joined by newlines; matched counts them), else the whole document. One call returns at most max_chars characters (1 to 30000, the default; JavaScript string units) from offset; the result has url, title, offset, chars, total_chars, and next_offset while more remains: call again with offset=next_offset and the same arguments. The page is read again on every call, so a page that changed in between shows as a different total_chars. Reads the top document only: an iframe's content, cookies, storage and the values typed into fields are never returned, and the value attribute of a password field is removed from html. Needs CDP (launch_app reported cdp_port; pass cdp=false there to go without): without it the error has reason cdp_unavailable and nothing is read. Other reasons: not_a_browser, tab_not_found (the active window is a dialog or shows no page of the connected browser), internal_page (chrome:// and extension pages are not read), invalid_selector, no_match, page_unresponsive.",
+        description = "Read the page in the active tab of the focused Chromium-family browser window through CDP, without a save dialog. format=text (default) is the text a reader sees; html is the outer HTML without the contents of scripts (ld+json metadata stays) and style sheets; links is one line per link: its text, a tab, its absolute href (the same value find_ui_elements and accessibility_tree show_links=true report); for links, strip_query=true drops each href's ?query and #fragment and dedupe=true keeps one line per href. selector is a CSS selector: only the elements it matches are read (outermost matches, joined by newlines; matched counts them), else the whole document. One call returns at most max_chars characters (1 to 30000, the default; JavaScript string units) from offset; the result has url, title, offset, chars, total_chars, and next_offset while more remains: call again with offset=next_offset and the same arguments. The page is read again on every call, so a page that changed in between shows as a different total_chars. Reads the top document only: an iframe's content, cookies, storage and the values typed into fields are never returned, and the value attribute of a password field is removed from html. Needs CDP (launch_app reported cdp_port; pass cdp=false there to go without): without it the error has reason cdp_unavailable and nothing is read. A connection that stopped answering, or that a server reload dropped, is made again on the same port; cdp_unresponsive means the browser answered on neither. Other reasons: not_a_browser, tab_not_found (the active window is a dialog or shows no page of the connected browser), internal_page (chrome:// and extension pages are not read), invalid_selector, invalid_option, no_match, page_unresponsive.",
         annotations(read_only_hint = true)
     )]
     async fn browser_read(
@@ -19475,6 +19724,16 @@ impl KwinMcp {
             return Err(refuse(
                 "invalid_max_chars",
                 format!("max_chars must be between 1 and {PAGE_READ_MAX_CHARS}"),
+            ));
+        }
+        let (strip_query, dedupe) = (
+            params.strip_query.unwrap_or(false),
+            params.dedupe.unwrap_or(false),
+        );
+        if (strip_query || dedupe) && !matches!(params.format, PageFormat::Links) {
+            return Err(refuse(
+                "invalid_option",
+                "strip_query and dedupe shape the lines of format=links and apply to no other format".to_owned(),
             ));
         }
         self.touch_activity().await;
@@ -19499,6 +19758,7 @@ impl KwinMcp {
         let arguments = serde_json::json!({
             "format": params.format.label(), "selector": params.selector,
             "offset": params.offset.unwrap_or(0), "max": max,
+            "bare": strip_query, "dedupe": dedupe,
         });
         let script = format!("{}({arguments})", include_str!("page_read.js").trim_end());
         let evaluated = tokio::time::timeout(
@@ -19604,6 +19864,8 @@ impl KwinMcp {
         // the browser already shows for a page that just arrived: look again for a
         // moment before giving a route up.
         let mut looks = 0;
+        // Why CDP was given up; it is not asked again within this call.
+        let mut cdp_trouble = None;
         let (active, window, route) = loop {
             let active =
                 active_window_info(&sess.kwin_conn, &sess.kwin_unique_name, &sess.host_xdg_dir)
@@ -19630,15 +19892,21 @@ impl KwinMcp {
             }
             let settling = looks < NAVIGATION_CAPTION_LOOKS;
             looks += 1;
-            if let Some(browser) = sess.cdp_browser.as_deref()
-                && cdp_is_process(browser, window.pid).await
-            {
-                if let Some(page) = cdp_active_tab(browser, &window.title).await {
-                    break (active, window, NavigationRoute::Cdp(page));
-                }
-                if settling {
-                    tokio::time::sleep(NAVIGATION_POLL).await;
-                    continue;
+            if cdp_trouble.is_none() {
+                match sess.cdp.answering(sess.cdp_forward_port).await {
+                    Ok((link, targets)) if link.reaches(window.pid).await => {
+                        if let Some(page) =
+                            cdp_active_tab(&link.browser, &targets, &window.title).await
+                        {
+                            break (active, window, NavigationRoute::Cdp(page));
+                        }
+                        if settling {
+                            tokio::time::sleep(NAVIGATION_POLL).await;
+                            continue;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(trouble) => cdp_trouble = Some(trouble),
                 }
             }
             match browser_address::BrowserUi::locate(
@@ -20064,6 +20332,11 @@ impl KwinMcp {
             landed.loading,
             window_active,
         );
+        // The browser has a CDP port that did not answer: say why it was not used.
+        if let Some(CdpTrouble::Unresponsive(detail)) = &cdp_trouble {
+            data["cdp_skipped"] = serde_json::json!(detail);
+            text.push_str(&format!(". CDP was not used: {detail}"));
+        }
         if !clipboard_kept {
             data["clipboard_replaced"] = serde_json::json!(true);
             text.push_str(". The session clipboard now holds the address: what it held before could not be restored");
@@ -20284,7 +20557,8 @@ impl KwinMcp {
         let sess = guard.as_ref().ok_or_else(|| {
             McpError::internal_error("no session — call session_start first", None)
         })?;
-        let cdp_browser = sess.cdp_browser.clone();
+        // Only a kept connection: a scroll does not wait for a new one.
+        let cdp_link = sess.cdp.current();
         let (ax, ay) = (
             f32::from(i16::try_from(wx + x).map_err(KwinError::from)?),
             f32::from(i16::try_from(wy + y).map_err(KwinError::from)?),
@@ -20347,9 +20621,13 @@ impl KwinMcp {
                 text.push_str(": the view did not change (the end of the content, or the pointer was not over something that scrolls)");
             }
         }
-        if let Some(browser) = cdp_browser
+        if let Some(link) = cdp_link
             && let Ok((_, _, active)) = active_window_info(&view_conn, &view_unique, &self.host_xdg_dir().await?).await
-            && let Some((scroll_y, max_y)) = cdp_scroll_position(&browser, &active.title).await
+            && let Ok(Some((scroll_y, max_y))) = tokio::time::timeout(
+                CDP_STEP_TIMEOUT,
+                cdp_scroll_position(&link.browser, &active.title),
+            )
+            .await
         {
             data["scroll_y"] = serde_json::json!(scroll_y.round());
             data["scroll_max_y"] = serde_json::json!(max_y.round());
@@ -21609,7 +21887,6 @@ impl KwinMcp {
         window_timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
-        use futures::StreamExt;
         use std::os::fd::AsFd;
         use std::os::unix::fs::OpenOptionsExt;
         use tokio::io::AsyncWriteExt;
@@ -22051,15 +22328,11 @@ impl KwinMcp {
             if let Ok(mut progress) = progress.lock() {
                 progress.stage = "connecting to browser accessibility";
             }
-            let cdp_url = format!("http://127.0.0.1:{cdp_port}");
+            let slot = self.with_session(|s| Ok(s.cdp.clone())).await?;
             for _ in 0..CDP_CONNECT_POLLS {
-                match chromiumoxide::Browser::connect(&cdp_url).await {
-                    Ok((browser, mut handler)) => {
-                        tokio::spawn(async move { while handler.next().await.is_some() {} });
-                        let mut guard = self.session.write().await;
-                        if let Some(sess) = guard.as_mut() {
-                            sess.cdp_browser = Some(Arc::new(browser));
-                        }
+                match cdp_dial(cdp_port).await {
+                    Ok(link) => {
+                        drop(slot.set(Some(link)));
                         cdp_connected = true;
                         break;
                     }
@@ -26679,7 +26952,8 @@ impl SessionRouter {
                 _uinput_keyboard: adopt_descriptor(saved.keyboard_fd)?,
                 mouse_sysname: saved.mouse_sysname,
                 kbd_sysname: saved.kbd_sysname,
-                cdp_browser: None,
+                // The browser keeps its port; the next CDP call connects again (#957).
+                cdp: Arc::default(),
                 cdp_forward_port: saved.cdp_port,
                 service_proxy_children: saved
                     .proxies
@@ -28667,7 +28941,7 @@ mod launch_warning_tests {
 #[cfg(test)]
 mod startup_report_tests {
     use super::{
-        DisplayConfig, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
+        DisplayConfig, HOST_ACCESS_REPORT, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
         FindMatch, ResultView, WindowSnapshot, ClickRefusal, click_candidates, click_other_window, element_center, folds_into_ancestor, place_body, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
         compact_typing_result, find_elements_text,
         SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
@@ -29148,38 +29422,46 @@ mod startup_report_tests {
     }
 
     #[test]
-    fn live_read_only_databases_are_one_list_of_paths() {
+    fn the_result_counts_host_paths_and_the_report_file_lists_them() -> Result<(), String> {
+        let failed = |error: std::io::Error| error.to_string();
+        let dir = std::env::temp_dir().join(format!("kwin-mcp-host-access-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(failed)?;
+        let report = SqliteAccessReport::default();
+        let none = report.host_access(&[], &dir);
+        assert!(none.is_null(), "{none}");
+        let nothing = dir.join(HOST_ACCESS_REPORT);
+        assert!(!nothing.exists(), "a report of nothing");
         let mut report = SqliteAccessReport::default();
-        assert!(report.result_fields().is_empty());
-        for index in 0..3 {
-            report.record(Path::new(&format!("/home/u/.config/a/db{index}")), "live_read_only");
+        for index in 0..200 {
+            let path = format!("/home/u/.config/a/db{index}");
+            report.record(Path::new(&path), "live_read_only");
         }
-        let fields = report.result_fields();
-        assert_eq!(
-            serde_json::Value::Object(fields),
-            serde_json::json!({"live_ro_dbs": ["/home/u/.config/a/db0", "/home/u/.config/a/db1", "/home/u/.config/a/db2"]})
-        );
-        // Past the list's limit the full count is still reported.
-        for index in 3..200 {
-            report.record(Path::new(&format!("/home/u/.config/a/db{index}")), "live_read_only");
-        }
-        let fields = report.result_fields();
-        assert_eq!(fields["live_ro_dbs"].as_array().map(Vec::len), Some(128));
-        assert_eq!(fields["live_ro_dbs_total"], 200);
-    }
-
-    #[test]
-    fn any_other_sqlite_mode_keeps_the_full_report() {
-        let mut report = SqliteAccessReport::default();
-        report.record(Path::new("/home/u/a.db"), "live_read_only");
         report.record(Path::new("/home/u/b.db"), "private_writable_snapshot");
-        let fields = report.result_fields();
-        assert!(fields.get("live_ro_dbs").is_none());
-        assert_eq!(fields["sqlite_access"]["total_databases"], 2);
-        assert_eq!(fields["sqlite_access"]["databases"][1]["mode"], "private_writable_snapshot");
-        let mut noted = SqliteAccessReport::default();
-        noted.record_with_note(Path::new("/home/u/c.db"), "live_read_only", "snapshot failed".to_owned());
-        assert!(noted.result_fields().get("sqlite_access").is_some());
+        let note = "snapshot failed".to_owned();
+        report.record_with_note(Path::new("/home/u/c.db"), "live_read_only", note);
+        let oversized = [PathBuf::from("/home/u/big.bin")];
+        let access = report.host_access(&oversized, &dir);
+        // Counts only, past the list's limit too; no path but the noted one's and the report's.
+        assert_eq!(
+            access["sqlite"],
+            serde_json::json!({"live_read_only": 201, "private_writable_snapshot": 1})
+        );
+        assert_eq!(access["oversized_read_only_files"], 1);
+        assert_eq!(access["notes"][0]["path"], "/home/u/c.db");
+        assert_eq!(access["notes"].as_array().map(Vec::len), Some(1));
+        assert!(!access.to_string().contains("/home/u/.config"), "{access}");
+        let path = dir.join(HOST_ACCESS_REPORT);
+        assert_eq!(access["report"], serde_json::json!(path));
+        let listed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).map_err(failed)?)
+                .map_err(|error| error.to_string())?;
+        let databases = &listed["sqlite_access"]["databases"];
+        assert_eq!(listed["sqlite_access"]["total_databases"], 202);
+        assert_eq!(databases.as_array().map(Vec::len), Some(128));
+        assert_eq!(databases[0]["path"], "/home/u/.config/a/db0");
+        assert_eq!(listed["oversized_read_only_files"][0], "/home/u/big.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
@@ -29218,17 +29500,12 @@ mod startup_report_tests {
     fn a_session_start_result_leaves_out_empty_fields() {
         let mut payload = serde_json::json!({
             "status": "started", "runtime_root_fallback": null, "cookie_errors": [],
-            "oversized_read_only_files": [], "host_write_paths": [], "workdir": "/tmp/w",
+            "host_access": null, "host_write_paths": [], "workdir": "/tmp/w",
         });
-        let mut report = SqliteAccessReport::default();
-        report.record(Path::new("/home/u/a.db"), "live_read_only");
-        compact_session_result(&mut payload, &report);
-        assert_eq!(
-            payload,
-            serde_json::json!({"status": "started", "workdir": "/tmp/w", "live_ro_dbs": ["/home/u/a.db"]})
-        );
+        compact_session_result(&mut payload);
+        assert_eq!(payload, serde_json::json!({"status": "started", "workdir": "/tmp/w"}));
         let mut kept = serde_json::json!({"cookie_errors": ["host cookie snapshot failed"], "host_write_paths": ["/home/u/.codex"]});
-        compact_session_result(&mut kept, &SqliteAccessReport::default());
+        compact_session_result(&mut kept);
         assert_eq!(kept["cookie_errors"][0], "host cookie snapshot failed");
         assert_eq!(kept["host_write_paths"][0], "/home/u/.codex");
     }

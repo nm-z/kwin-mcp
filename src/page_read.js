@@ -1,7 +1,7 @@
 (args => {
   // browser_read: one page of a document's text, outer HTML or links. Reads the
   // DOM only: never document.cookie, storage, or the live value of any field.
-  const {format, selector, offset, max} = args;
+  const {format, selector, offset, max, bare, dedupe} = args;
   let roots = [document.documentElement];
   if (selector) {
     let all;
@@ -35,14 +35,27 @@
     if (typeof href === 'string') return href;
     try { return href && href.baseVal ? new URL(href.baseVal, el.baseURI).href : ''; } catch (error) { return ''; }
   };
+  // strip_query: the address without its query and fragment, where tracking lives.
+  const strip = href => {
+    try { const url = new URL(href); url.search = ''; url.hash = ''; return url.href; } catch (error) { return href.replace(/[?#][^]*$/, ''); }
+  };
   const links = root => {
     const anchors = [...root.querySelectorAll('a[href],area[href]')];
     if (root.matches('a[href],area[href]')) anchors.unshift(root);
-    return anchors.map(el => {
+    let rows = anchors.map(el => {
       const image = el.querySelector('img[alt]');
       const name = line(el.getAttribute('aria-label')) || line(el.innerText || el.textContent) || line(el.getAttribute('alt')) || line(image && image.alt) || line(el.getAttribute('title'));
-      return [...name].slice(0, 120).join('') + '\t' + target(el);
-    }).filter(row => !row.endsWith('\t')).join('\n');
+      const href = target(el);
+      return [[...name].slice(0, 120).join(''), bare && href ? strip(href) : href];
+    }).filter(([, href]) => href);
+    // dedupe: one row per address, in the order addresses first appear, named by
+    // the first of its links that has a name (a card often links an image first).
+    if (dedupe) {
+      const named = new Map();
+      for (const [name, href] of rows) if (!named.get(href)) named.set(href, name);
+      rows = [...named].map(([href, name]) => [name, href]);
+    }
+    return rows.map(([name, href]) => name + '\t' + href).join('\n');
   };
   const text = root => typeof root.innerText === 'string' ? root.innerText : (root.textContent || '');
   const read = {html, links, text}[format];

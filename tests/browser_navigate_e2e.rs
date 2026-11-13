@@ -27,6 +27,9 @@ const TRAP: &str = "<script>addEventListener('keydown',e=>{if((e.ctrlKey&&e.key=
 /// busy page does: the address bar takes focus only after typing has begun (#865).
 const STALL: &str = "<script>addEventListener('keydown',e=>{if(e.ctrlKey&&e.key=='l'){const t=Date.now();while(Date.now()-t<1500);}},true)</script>";
 const SLOW_PAGE: Duration = Duration::from_secs(3);
+/// A listing card: its image and its title link to one item through tracking
+/// queries, as on a shop's result page (#957).
+const LINKS: &str = "<a href='/item?id=7&track=aaaa#photo'><img alt=''></a><a href='/item?id=7&track=bbbb'>Item seven</a><a href='/other?ref=x'>Other</a>";
 
 struct Fixture {
     port: u16,
@@ -98,6 +101,7 @@ impl Fixture {
             "/favicon.ico" => ("404 Not Found", "", String::new()),
             "/trap" => ("200 OK", "Content-Type: text/html\r\n", page(TRAP)),
             "/stall" => ("200 OK", "Content-Type: text/html\r\n", page(STALL)),
+            "/links" => ("200 OK", "Content-Type: text/html\r\n", page(LINKS)),
             _ => {
                 if path == "/slow" {
                     thread::sleep(SLOW_PAGE);
@@ -156,17 +160,38 @@ struct Wire {
 
 impl Wire {
     fn start(name: &str) -> Self {
-        let home = std::env::temp_dir().join(format!("kwin-mcp-navigate-{name}-{}", std::process::id()));
+        Self::start_with(name, false)
+    }
+
+    /// With `reloadable`, the server runs a private copy of the binary, which
+    /// it re-executes when the copy changes, as every install makes it do, and
+    /// logs to `server.log` in its HOME.
+    fn start_with(name: &str, reloadable: bool) -> Self {
+        let home =
+            std::env::temp_dir().join(format!("kwin-mcp-navigate-{name}-{}", std::process::id()));
         std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
-        let binary = std::env::var("KWIN_MCP_E2E_SERVER")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned());
-        let mut child = Command::new(binary)
+        let mut binary = PathBuf::from(
+            std::env::var("KWIN_MCP_E2E_SERVER")
+                .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned()),
+        );
+        let mut command = Command::new(&binary);
+        command.stderr(Stdio::null());
+        if reloadable {
+            let copy = home.join("bin/kwin-mcp");
+            std::fs::create_dir_all(home.join("bin")).expect("create the private bin directory");
+            std::fs::copy(&binary, &copy).expect("copy kwin-mcp");
+            binary = copy;
+            command = Command::new(&binary);
+            command
+                .env("KWIN_MCP_BINARY", &binary)
+                .stderr(std::fs::File::create(home.join("server.log")).expect("server log"));
+        }
+        let mut child = command
             .args(["--autoclean", "--no-viewer"])
             .env("HOME", &home)
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()
             .expect("spawn kwin-mcp");
         let stdin = child.stdin.take().expect("server stdin");
@@ -295,6 +320,34 @@ impl Wire {
         );
         assert!(launched["error"].is_null(), "{launched}");
         launched
+    }
+
+    /// Gives the server's private binary a new modification time and waits
+    /// until the server has re-executed itself with the session (#957).
+    fn reexecute(&mut self) {
+        let binary = self.home.join("bin/kwin-mcp");
+        std::fs::File::open(&binary)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+            .expect("touch the server binary");
+        let log = self.home.join("server.log");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("reload: reattached 1 sessions")
+        {
+            assert!(Instant::now() < deadline, "the server did not re-execute");
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// browser_read of the active tab; the content of a success.
+    fn read(&mut self, arguments: Value) -> String {
+        let read = self.tool("browser_read", arguments);
+        assert!(read["error"].is_null(), "browser_read failed: {read}");
+        read["result"]["structuredContent"]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no content: {read}"))
+            .to_owned()
     }
 
     /// Keep a screenshot of the active window as evidence, when asked to.
@@ -538,6 +591,54 @@ fn an_address_longer_than_2000_characters_is_opened() {
     // The address bar keeps 512000 pasted characters; past that only CDP works.
     let too_long = wire.navigate(&long_data_url(512_001));
     failed(&too_long, "url_too_long_for_address_bar", false);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
+fn cdp_reaches_the_browser_again_after_the_server_reexecutes_itself() {
+    // #957: a re-execution, which every install causes, left the session
+    // without its CDP connection: navigation fell back to typing and
+    // browser_read refused to read.
+    let fixture = Fixture::start();
+    let mut wire = Wire::start_with("957", true);
+    let profile = wire.workdir.join("profile");
+    let launched = wire.launch(format!(
+        "google-chrome-stable --user-data-dir={} {}",
+        profile.display(),
+        fixture.url("/alpha")
+    ));
+    let content = &launched["result"]["structuredContent"];
+    assert_eq!(content["cdp"], true, "{launched}");
+    wire.window_titled("fixture/alpha");
+    let links_page = fixture.url("/links");
+    landed(&wire.navigate(&links_page), &links_page, "cdp");
+
+    // Each link with its whole target, then without queries, then one per target.
+    let links = json!({"format":"links"});
+    let whole = wire.read(links.clone());
+    assert_eq!(whole.lines().count(), 3, "{whole}");
+    assert!(whole.contains("/item?id=7&track=bbbb"), "{whole}");
+    let bare = wire.read(json!({"format":"links", "strip_query":true}));
+    assert!(!bare.contains('?') && !bare.contains('#'), "{bare}");
+    let one = wire.read(json!({"format":"links", "strip_query":true, "dedupe":true}));
+    assert_eq!(
+        one.lines().collect::<Vec<_>>(),
+        [
+            format!("Item seven\t{}", fixture.url("/item")),
+            format!("Other\t{}", fixture.url("/other")),
+        ],
+        "{one}"
+    );
+    let refused = wire.tool("browser_read", json!({"format":"text", "dedupe":true}));
+    let reason = &refused["error"]["data"]["reason"];
+    assert_eq!(reason, "invalid_option", "{refused}");
+
+    wire.reexecute();
+    let beta = fixture.url("/beta");
+    landed(&wire.navigate(&beta), &beta, "cdp");
+    let text = wire.read(json!({}));
+    assert!(text.contains("fixture/beta"), "{text}");
+    wire.keep("957-cdp-after-reexecution");
 }
 
 #[test]

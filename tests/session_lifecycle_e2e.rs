@@ -5763,7 +5763,7 @@ fn session_can_explicitly_share_live_codex_state() {
         if shared {
             // An empty report is left out of the result.
             assert!(
-                !started["result"]["structuredContent"]["oversized_read_only_files"]
+                !host_access_report(&started)["oversized_read_only_files"]
                     .as_array()
                     .is_some_and(|files| files.contains(&json!(oversized))),
                 "shared state reported read-only: {started}"
@@ -8122,7 +8122,8 @@ fn session_start_bounds_large_ancestor_copies_with_a_nested_mount() {
         );
     }
     // An empty report is left out of the result.
-    let fallback = started["result"]["structuredContent"]["oversized_read_only_files"]
+    let report = host_access_report(&started);
+    let fallback = report["oversized_read_only_files"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
     assert_eq!(fallback.contains(&json!(large)), !reflink, "{started}");
@@ -11569,7 +11570,8 @@ fn session_private_sqlite_reopens_with_new_sidecars() -> Result<(), Box<dyn std:
         let path = save_inline_screenshot(&screenshot, "private-sqlite-reopen");
         assert!(path.is_file());
         eprintln!("private_sqlite_screenshot={}", path.display());
-        let access = &started["result"]["structuredContent"]["sqlite_access"];
+        let report = host_access_report(&started);
+        let access = &report["sqlite_access"];
         let entries = access["databases"]
             .as_array()
             .ok_or("missing SQLite access list")?;
@@ -11595,6 +11597,16 @@ fn session_private_sqlite_reopens_with_new_sidecars() -> Result<(), Box<dyn std:
     outcome?;
     private_sqlite_tool_ok(&stopped)?;
     Ok(())
+}
+
+/// The file session_start names in `host_access.report`, read: every host path
+/// the result itself only counts (#957). Null when the result names none.
+fn host_access_report(started: &Value) -> Value {
+    started["result"]["structuredContent"]["host_access"]["report"]
+        .as_str()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null)
 }
 
 fn attach_test_data(reply: &Value) -> &Value {
