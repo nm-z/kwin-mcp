@@ -24005,6 +24005,32 @@ struct SessionRouter {
 struct RemoteHost {
     service: rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
     wire: remote::Handover,
+    /// Tells this connection from a later one to the same host.
+    serial: u64,
+}
+
+impl RemoteHost {
+    /// Whether the connection still carries messages. rmcp reports a service
+    /// whose transport ended (the listener restarted) as open until it is
+    /// cancelled, so the peer's own channel is asked too (#960).
+    fn open(&self) -> bool {
+        !self.service.is_closed() && !self.service.peer().is_transport_closed()
+    }
+}
+
+/// The session_list record of a session whose connection to `host` ended.
+fn connection_lost_record(id: &str, host: &str) -> serde_json::Value {
+    serde_json::json!({"session_id": id, "host": host, "status": "connection_lost"})
+}
+
+/// Whether a request to a listener failed because the connection ended, not
+/// because the listener answered with an error.
+fn connection_ended(error: &rmcp::service::ServiceError) -> bool {
+    use rmcp::service::ServiceError;
+    matches!(
+        error,
+        ServiceError::TransportClosed | ServiceError::TransportSend(_)
+    )
 }
 
 /// Sessions on other machines. A listener stops a peer's sessions when the
@@ -24017,6 +24043,11 @@ struct RemoteSessions {
     hosts: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteHost>>,
     /// session_id → the listener that owns it.
     sessions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// Sessions whose connection ended. Their listener stopped them, and a new
+    /// connection to the same host does not know them.
+    lost: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The serial of the next connection.
+    next_serial: std::sync::atomic::AtomicU64,
     /// session_id → the viewer window on this machine. Held across a whole
     /// viewer_open or viewer_close, so they run one at a time.
     viewers: tokio::sync::Mutex<std::collections::BTreeMap<String, RemoteViewer>>,
@@ -24047,6 +24078,9 @@ struct RemoteRestore {
     /// session_id → the process of its open viewer window.
     #[serde(default)]
     viewers: std::collections::BTreeMap<String, u32>,
+    /// Sessions whose connection had ended.
+    #[serde(default)]
+    lost: std::collections::BTreeSet<String>,
 }
 
 /// Everything about the sessions on other machines stands still while this
@@ -24134,14 +24168,63 @@ impl RemoteSessions {
     fn host_of(&self, id: &str) -> Option<String> {
         self.sessions().get(id).cloned()
     }
+    fn lost(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<String>> {
+        self.lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Whether session `id` ran on a connection that has ended.
+    fn is_lost(&self, id: &str) -> bool {
+        self.lost().contains(id)
+    }
+    /// Forgets session `id`, which has ended.
+    fn forget(&self, id: &str) {
+        self.sessions().remove(id);
+        self.lost().remove(id);
+    }
     /// The open connection to `host`, if there is one.
     async fn connected(&self, host: &str) -> Option<rmcp::Peer<rmcp::RoleClient>> {
         self.hosts
             .lock()
             .await
             .get(host)
-            .filter(|link| !link.service.is_closed())
+            .filter(|link| link.open())
             .map(|link| link.service.peer().clone())
+    }
+    /// Removes the connection to `host` once it has ended: connection
+    /// `serial`, or with none given whichever is not open (or none at all, as
+    /// after a re-execution that could not keep it). Its listener stopped the
+    /// sessions it carried, which are lost from then on; the next request to
+    /// `host` dials it again.
+    fn retire(
+        &self,
+        hosts: &mut std::collections::BTreeMap<String, RemoteHost>,
+        host: &str,
+        serial: Option<u64>,
+    ) {
+        let keep = match hosts.get(host) {
+            Some(link) => serial.map_or(link.open(), |serial| link.serial != serial),
+            // Connection `serial` was retired already, with its sessions.
+            None => serial.is_some(),
+        };
+        if keep {
+            return;
+        }
+        hosts.remove(host);
+        let mut lost = self.lost();
+        let carried: Vec<String> = self
+            .sessions()
+            .iter()
+            .filter(|(id, owner)| *owner == host && !lost.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !carried.is_empty() {
+            eprintln!(
+                "remote: the connection to {host} has ended; its {} sessions there stopped with it",
+                carried.len()
+            );
+        }
+        lost.extend(carried);
     }
     /// A request to a listener. A re-execution waits for it to return.
     async fn call(
@@ -24198,7 +24281,7 @@ impl RemoteSessions {
             .get(id)
             .filter(|viewer| viewer.child.is_some())
             .map(|viewer| viewer.arguments.clone().unwrap_or_default());
-        let host = self.host_of(id);
+        let host = self.host_of(id).filter(|_| !self.is_lost(id));
         let listener = match &host {
             Some(host) => self.connected(host).await,
             None => None,
@@ -24242,15 +24325,18 @@ impl RemoteSessions {
     }
     /// The connection to `host`, opened now unless one is open. The listener
     /// sees `client`, so it shapes results for the client that reads them.
+    /// A connection that has ended is dialed again; the serial tells which
+    /// connection the peer belongs to.
     async fn connect(
         &self,
         host: &str,
         client: Option<rmcp::model::ClientInfo>,
-    ) -> Result<rmcp::Peer<rmcp::RoleClient>, McpError> {
+    ) -> Result<(rmcp::Peer<rmcp::RoleClient>, u64), McpError> {
         let mut hosts = self.hosts.lock().await;
-        if let Some(link) = hosts.get(host).filter(|link| !link.service.is_closed()) {
-            return Ok(link.service.peer().clone());
+        if let Some(link) = hosts.get(host).filter(|link| link.open()) {
+            return Ok((link.service.peer().clone(), link.serial));
         }
+        self.retire(&mut hosts, host, None);
         let unreachable = |error: String| {
             remote_error(
                 "remote_host_unreachable",
@@ -24264,8 +24350,23 @@ impl RemoteSessions {
             .await
             .map_err(|error| unreachable(format!("MCP handshake failed: {error}")))?;
         let peer = service.peer().clone();
-        hosts.insert(host.to_owned(), RemoteHost { service, wire });
-        Ok(peer)
+        let serial = self.serial();
+        let link = RemoteHost {
+            service,
+            wire,
+            serial,
+        };
+        hosts.insert(host.to_owned(), link);
+        Ok((peer, serial))
+    }
+    fn serial(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.next_serial.fetch_add(1, Ordering::Relaxed)
+    }
+    /// After a request on connection `serial` to `host` found it ended.
+    async fn retire_connection(&self, host: &str, serial: u64) {
+        let mut hosts = self.hosts.lock().await;
+        self.retire(&mut hosts, host, Some(serial));
     }
     /// Before this server re-executes itself into `executable`: brings every
     /// connection that owns a session to rest between two messages and
@@ -24286,6 +24387,7 @@ impl RemoteSessions {
             }
             let state = RemoteRestore {
                 sessions,
+                lost: self.lost().clone(),
                 ..Default::default()
             };
             (state, None)
@@ -24322,7 +24424,7 @@ impl RemoteSessions {
         for (host, link) in hosts.iter() {
             use std::os::fd::AsRawFd;
             let owned = sessions.values().filter(|owner| *owner == host).count();
-            if owned == 0 || link.service.is_closed() {
+            if owned == 0 || !link.open() {
                 continue;
             }
             // No request is under way, so the socket is at rest unless the
@@ -24360,6 +24462,7 @@ impl RemoteSessions {
             hosts: kept,
             sessions,
             viewers: open_viewers,
+            lost: self.lost().clone(),
         };
         let hold = RemoteHold {
             wires,
@@ -24397,7 +24500,12 @@ impl RemoteSessions {
                         "reload: kept the connection to {} and its {owned} sessions",
                         saved.host
                     );
-                    hosts.insert(saved.host, RemoteHost { service, wire });
+                    let link = RemoteHost {
+                        service,
+                        wire,
+                        serial: self.serial(),
+                    };
+                    hosts.insert(saved.host, link);
                 }
                 Err(error) => eprintln!(
                     "reload: lost the connection to {} and its {owned} sessions: {error}",
@@ -24406,6 +24514,7 @@ impl RemoteSessions {
             }
         }
         *self.sessions() = state.sessions;
+        *self.lost() = state.lost;
         let mut viewers = self.viewers.lock().await;
         for (id, pid) in state.viewers {
             let mut viewer = RemoteViewer::new(&id);
@@ -24441,7 +24550,15 @@ async fn remote_call(
     host: &str,
     request: rmcp::model::CallToolRequestParams,
 ) -> Result<CallToolResult, McpError> {
-    match peer.call_tool(request).await {
+    remote_result(peer.call_tool(request).await, host)
+}
+
+/// A listener's answer as the result of the call it was forwarded.
+fn remote_result(
+    outcome: Result<CallToolResult, rmcp::service::ServiceError>,
+    host: &str,
+) -> Result<CallToolResult, McpError> {
+    match outcome {
         Ok(result) => Ok(result),
         Err(rmcp::service::ServiceError::McpError(error)) => Err(error),
         Err(error) => Err(remote_error(
@@ -24636,11 +24753,28 @@ impl SessionRouter {
         if let Some(arguments) = request.arguments.as_mut() {
             arguments.remove("host");
         }
-        let listener = self.remote.connect(&host, peer.peer_info().cloned()).await?;
+        let client = peer.peer_info().cloned();
+        let (mut listener, mut serial) = self.remote.connect(&host, client.clone()).await?;
+        let mut redialed = false;
         // Held until the new session's host is recorded: a re-execution in
         // between would not know the session.
-        let _calling = self.remote.calls.read().await;
-        let result = remote_call(&listener, &host, request).await;
+        let (result, _calling) = loop {
+            let calling = self.remote.calls.read().await;
+            match listener.call_tool(request.clone()).await {
+                // The connection ended, the listener's restart for one (#960).
+                // A start the listener took ended with the connection too: a
+                // listener stops a peer's sessions when its connection ends.
+                // So the start goes once more on a new connection.
+                Err(error) if connection_ended(&error) && !redialed => {
+                    drop(calling);
+                    eprintln!("remote: the connection to {host} ended ({error}); dialing it again");
+                    self.remote.retire_connection(&host, serial).await;
+                    (listener, serial) = self.remote.connect(&host, client.clone()).await?;
+                    redialed = true;
+                }
+                outcome => break (remote_result(outcome, &host), calling),
+            }
+        };
         // A failed start can leave a handle too; its error names the ID.
         let id = match &result {
             Ok(started) => started.structured_content.as_ref(),
@@ -24667,6 +24801,8 @@ impl SessionRouter {
                 ),
             ));
         }
+        // A session of an ended connection that had this ID is gone.
+        self.remote.lost().remove(&id);
         self.remote.sessions().insert(id, host);
         result
     }
@@ -24679,10 +24815,16 @@ impl SessionRouter {
         peer: &rmcp::Peer<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let stop = request.name == "session_stop";
-        let Some(listener) = self.remote.connected(host).await else {
+        // A session of an ended connection is not the business of a newer one.
+        let listener = if self.remote.is_lost(id) {
+            None
+        } else {
+            self.remote.connected(host).await
+        };
+        let Some(listener) = listener else {
             // The listener stopped the session when the connection ended.
             if stop {
-                self.remote.sessions().remove(id);
+                self.remote.forget(id);
                 self.remote.discard_viewer(id).await;
                 return Ok(structured_result(
                     peer,
@@ -24728,7 +24870,7 @@ impl SessionRouter {
                     != Some("cleanup_pending")
             });
         if stopped {
-            self.remote.sessions().remove(id);
+            self.remote.forget(id);
         }
         drop(calling);
         if stopped {
@@ -24922,23 +25064,24 @@ impl SessionRouter {
                 .as_ref()
                 .and_then(|result| result.structured_content.as_ref())
                 .and_then(|data| data["sessions"].as_array());
+            let lost = self.remote.lost().clone();
+            let of_host = owned.iter().filter(|(_, owner)| *owner == host);
             match sessions {
-                Some(sessions) => records.extend(sessions.iter().cloned().map(|mut record| {
-                    if let Some(fields) = record.as_object_mut() {
-                        fields.insert("host".to_owned(), serde_json::json!(host));
-                    }
-                    record
-                })),
-                None => records.extend(
-                    owned
-                        .iter()
-                        .filter(|(_, owner)| *owner == host)
-                        .map(|(id, _)| {
-                            serde_json::json!({
-                                "session_id": id, "host": host, "status": "connection_lost",
-                            })
-                        }),
-                ),
+                Some(sessions) => {
+                    records.extend(sessions.iter().cloned().map(|mut record| {
+                        if let Some(fields) = record.as_object_mut() {
+                            fields.insert("host".to_owned(), serde_json::json!(host));
+                        }
+                        record
+                    }));
+                    // Those of an earlier connection, which this one does not list.
+                    records.extend(
+                        of_host
+                            .filter(|(id, _)| lost.contains(*id))
+                            .map(|(id, _)| connection_lost_record(id, host)),
+                    );
+                }
+                None => records.extend(of_host.map(|(id, _)| connection_lost_record(id, host))),
             }
         }
         records
