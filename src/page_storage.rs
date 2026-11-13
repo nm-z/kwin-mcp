@@ -1375,31 +1375,33 @@ pub fn persist(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> Result<PathBuf> {
         let path = std::env::temp_dir().join(format!(
             "kwin-mcp-page-storage-{name}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 
-    fn database(path: &Path, entries: &[(Vec<u8>, Vec<u8>)]) {
-        let mut db = rusty_leveldb::DB::open(path, rusty_leveldb::Options::default()).unwrap();
+    fn database(path: &Path, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut db = rusty_leveldb::DB::open(path, rusty_leveldb::Options::default())?;
         for (key, value) in entries {
-            db.put(key, value).unwrap();
+            db.put(key, value)?;
         }
-        db.flush().unwrap();
+        db.flush()?;
+        Ok(())
     }
 
     fn key(origin: &str, name: &str) -> Vec<u8> {
         [data_prefix(origin), [&[1u8][..], name.as_bytes()].concat()].concat()
     }
 
+    /// Origin metadata with base::Time `time`, which the tests keep positive.
     fn meta(time: i64) -> Vec<u8> {
         let mut out = vec![8];
-        put_varint(&mut out, u64::try_from(time).unwrap());
+        put_varint(&mut out, u64::try_from(time).unwrap_or(0));
         out
     }
 
@@ -1422,8 +1424,8 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_appended_as_a_log_wins_when_leveldb_opens_the_database() {
-        let root = scratch("append");
+    fn a_batch_appended_as_a_log_wins_when_leveldb_opens_the_database() -> Result<()> {
+        let root = scratch("append")?;
         let db = root.join("db");
         database(
             &db,
@@ -1432,7 +1434,7 @@ mod tests {
                 (key("https://a.example", "gone"), b"\x01x".to_vec()),
                 (b"META:https://a.example".to_vec(), meta(5)),
             ],
-        );
+        )?;
         append_batch(
             &db,
             &[
@@ -1440,23 +1442,23 @@ mod tests {
                 (key("https://a.example", "gone"), None),
             ],
             0,
-        )
-        .unwrap();
+        )?;
         let copy = root.join("copy");
-        copy_leveldb(&db, &copy, &mut COPY_BUDGET.clone()).unwrap();
-        let mut reader = Reader::open(&copy).unwrap();
-        let entries = reader.entries("https://a.example").unwrap();
+        copy_leveldb(&db, &copy, &mut COPY_BUDGET.clone())?;
+        let mut reader = Reader::open(&copy)?;
+        let entries = reader.entries("https://a.example")?;
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(
-            entries.get(&b"\x01token".to_vec()),
+            entries.get(b"\x01token".as_slice()),
             Some(&b"\x01new".to_vec())
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn the_snapshot_holds_every_table_the_manifest_names() {
-        let root = scratch("snapshot");
+    fn the_snapshot_holds_every_table_the_manifest_names() -> Result<()> {
+        let root = scratch("snapshot")?;
         let db = root.join("db");
         let entries: Vec<_> = (0..2000)
             .map(|index| {
@@ -1466,23 +1468,18 @@ mod tests {
                 )
             })
             .collect();
-        database(&db, &entries);
+        database(&db, &entries)?;
         let copy = root.join("copy");
-        snapshot_leveldb(&db, &copy, &mut COPY_BUDGET.clone()).unwrap();
-        let state = leveldb_state(&copy).unwrap();
-        let present = present_numbers(&copy).unwrap();
+        snapshot_leveldb(&db, &copy, &mut COPY_BUDGET.clone())?;
+        let state = leveldb_state(&copy)?;
+        let present = present_numbers(&copy)?;
         assert!(state.live_tables.is_subset(&present));
         let read = root.join("read");
-        copy_leveldb(&copy, &read, &mut COPY_BUDGET.clone()).unwrap();
-        assert_eq!(
-            Reader::open(&read)
-                .unwrap()
-                .entries("https://b.example")
-                .unwrap()
-                .len(),
-            2000
-        );
+        copy_leveldb(&copy, &read, &mut COPY_BUDGET.clone())?;
+        let entries = Reader::open(&read)?.entries("https://b.example")?;
+        assert_eq!(entries.len(), 2000);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     fn saved_key(base: Option<&[u8]>, value: Option<&[u8]>, time: i64) -> SavedKey {
@@ -1494,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_key_applies_where_the_host_kept_the_base_or_changed_it_earlier() {
+    fn a_saved_key_applies_where_the_host_kept_the_base_or_changed_it_earlier() -> Result<()> {
         let origin = "https://c.example";
         let mut saved = SavedLocalStorage::default();
         let keys = &mut saved.origins.entry(origin.to_owned()).or_default().keys;
@@ -1509,7 +1506,7 @@ mod tests {
             (b"theme".to_vec(), b"blue".to_vec()),
             (b"removed".to_vec(), b"v".to_vec()),
         ]);
-        let mut operations = plan_local_storage(&saved, &metas, |_| Ok(host.clone())).unwrap();
+        let mut operations = plan_local_storage(&saved, &metas, |_| Ok(host.clone()))?;
         operations.sort();
         let prefix = data_prefix(origin);
         assert_eq!(
@@ -1526,6 +1523,7 @@ mod tests {
                 ),
             ]
         );
+        Ok(())
     }
 
     #[test]
@@ -1563,23 +1561,33 @@ mod tests {
     }
 
     #[test]
-    fn merged_layers_show_upper_entries_over_lower_ones() {
-        let root = scratch("layers");
+    fn merged_layers_show_upper_entries_over_lower_ones() -> Result<()> {
+        let root = scratch("layers")?;
         let lower = root.join("lower");
         let upper = root.join("upper");
-        std::fs::create_dir_all(lower.join("dir")).unwrap();
-        std::fs::create_dir_all(upper.join("dir")).unwrap();
-        std::fs::write(lower.join("kept"), b"lower").unwrap();
-        std::fs::write(lower.join("replaced"), b"lower").unwrap();
-        std::fs::write(lower.join("dir/inner"), b"lower").unwrap();
-        std::fs::write(upper.join("replaced"), b"upper").unwrap();
-        std::fs::write(upper.join("dir/new"), b"upper").unwrap();
+        std::fs::create_dir_all(lower.join("dir"))?;
+        std::fs::create_dir_all(upper.join("dir"))?;
+        for (layer, file) in [
+            (&lower, "kept"),
+            (&lower, "replaced"),
+            (&lower, "dir/inner"),
+            (&upper, "replaced"),
+            (&upper, "dir/new"),
+        ] {
+            let name = if *layer == lower { "lower" } else { "upper" };
+            std::fs::write(layer.join(file), name)?;
+        }
         let out = root.join("out");
-        merge_layers(&lower, &upper, &out, &mut COPY_BUDGET.clone(), false).unwrap();
-        assert_eq!(std::fs::read(out.join("kept")).unwrap(), b"lower");
-        assert_eq!(std::fs::read(out.join("replaced")).unwrap(), b"upper");
-        assert_eq!(std::fs::read(out.join("dir/inner")).unwrap(), b"lower");
-        assert_eq!(std::fs::read(out.join("dir/new")).unwrap(), b"upper");
+        merge_layers(&lower, &upper, &out, &mut COPY_BUDGET.clone(), false)?;
+        for (file, expected) in [
+            ("kept", "lower"),
+            ("replaced", "upper"),
+            ("dir/inner", "lower"),
+            ("dir/new", "upper"),
+        ] {
+            assert_eq!(std::fs::read_to_string(out.join(file))?, expected, "{file}");
+        }
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

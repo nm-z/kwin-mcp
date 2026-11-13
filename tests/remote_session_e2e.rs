@@ -61,7 +61,10 @@ impl Drop for Listener {
 
 impl Listener {
     fn start(home: &Path) -> Self {
-        let address = format!("127.0.0.1:{}", free_port());
+        Self::start_at(home, format!("127.0.0.1:{}", free_port()))
+    }
+
+    fn start_at(home: &Path, address: String) -> Self {
         let mut child = kwin_mcp(home)
             .args(["--listen", &address, "--autoclean"])
             .stdin(Stdio::null())
@@ -229,6 +232,91 @@ fn the_listener_needs_the_secret_and_refuses_a_peer_without_it() {
     for home in [bare, listener_home, stranger_home] {
         let _ = std::fs::remove_dir_all(home);
     }
+}
+
+/// The listener's own answer to a session_start it refuses at once.
+fn refused_start(server: &mut Server, host: &str) -> Value {
+    server.tool(
+        "session_start",
+        json!({"host":host, "startup_timeout_seconds":0}),
+    )
+}
+
+#[test]
+fn a_restarted_listener_is_dialed_again_under_the_same_name() {
+    let home = home_with_secret("redial", Some("redial-secret-0123456789"));
+    let listener = Listener::start(&home);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home);
+    let answered = refused_start(&mut server, &host);
+    assert!(
+        answered["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("startup_timeout_seconds")),
+        "the listener did not answer: {answered}"
+    );
+    // The listener stops and starts again on the same address (#960).
+    drop(listener);
+    let listener = Listener::start_at(&home, host.clone());
+    for attempt in ["at once", "after the old connection ended"] {
+        let answered = refused_start(&mut server, &host);
+        assert!(
+            answered["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("startup_timeout_seconds")),
+            "{attempt}: the restarted listener was not dialed again: {answered}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(server);
+    drop(listener);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn a_session_of_an_ended_connection_reports_it_and_a_new_one_starts() {
+    let home = home_with_secret("lost", Some("lost-secret-0123456789"));
+    let listener = Listener::start(&home);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home);
+    let (old, sandbox) = server.start_remote(&host);
+    drop(listener);
+    assert!(
+        exited(sandbox, Duration::from_secs(30)),
+        "the stopped listener left its session running"
+    );
+    let listener = Listener::start_at(&home, host.clone());
+    let (new, _) = server.start_remote(&host);
+    assert_ne!(old, new);
+    let routed = server.tool("window_list", json!({"session_id":old}));
+    assert_eq!(
+        routed["error"]["data"]["reason"], "remote_connection_lost",
+        "a session of the ended connection went to the new one: {routed}"
+    );
+    let listed = server.tool("session_list", json!({}));
+    let sessions = listed["result"]["structuredContent"]["sessions"]
+        .as_array()
+        .expect("session records");
+    let status = |id: &str| {
+        sessions
+            .iter()
+            .filter(|record| record["session_id"] == id)
+            .map(|record| record["status"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(status(&old), [json!("connection_lost")], "{listed}");
+    assert_eq!(status(&new), [json!("running")], "{listed}");
+    let cleared = server.tool("session_stop", json!({"session_id":old}));
+    assert_eq!(
+        cleared["result"]["structuredContent"]["session_status"], "connection_lost",
+        "{cleared}"
+    );
+    let stopped = server.tool("session_stop", json!({"session_id":new}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    drop(server);
+    drop(listener);
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
