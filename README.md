@@ -118,7 +118,7 @@ A link's target is part of what the element tools report ([#947](https://github.
 - `find_ui_elements` gives every element of role `link` an `href`, the absolute URL the browser would open: a relative, scheme-relative or fragment-only `href` is resolved against its document (an iframe's links against the iframe's address), and `javascript:` and `mailto:` targets are returned as written. The `cdp` backend reads the element's resolved `href` property; the `atspi` backend reads the URI of the object's AT-SPI Hyperlink interface, which Chrome publishes already resolved (it puts no target in the object attributes). The two agree. An `<a>` without `href` and a `role=link` element have no `href` field. `compact=true` leaves `href` out: compact is the cheap list of click targets, and a tracking URL is longer than everything else it keeps. A target longer than 8,000 characters (a `data:` URL) is cut to its first and last 4,000 with `…[N more characters]…` between, and `href_chars` gives its length.
 - `accessibility_tree` adds the target to link rows only with `show_links=true`, as a last field `href=URL`, so the default tree of a link-heavy page keeps its depth. A target longer than 1,000 characters is shown as its first and last 500 with `…[N more characters]…` between, the rule long names follow at 8,000; the element search returns that target whole. With `role=link` the links of a results page are one level, returned in pages as described above.
 - `accessibility_tree` returns the window tree (AT-SPI: the browser frame, tab strip, toolbar and the page inside them, with AT-SPI role names) whether or not a CDP port is open. `source=page` returns the page tree of the active tab of the focused browser window through CDP, with the browser role names (`RootWebArea`, `StaticText`); a `root=ID` taken from a page tree continues in it. It needs `cdp_port` and refuses with the same reasons as `browser_read`.
-- `browser_read` returns the page itself through CDP, without a save dialog: `format=text` (the text a reader sees), `html` (outer HTML without style sheets and without what scripts hold: code, and JSON data blocks, where a page keeps its state and tokens; only `application/ld+json` metadata stays), or `links` (one line per `a[href]`: its text, a tab, its absolute target). `selector` limits the read to the elements a CSS selector matches. A call returns at most `max_chars` characters (1 to 30,000, counted as JavaScript counts them) starting at `offset`, with `total_chars` and, while more remains, `next_offset`. It reads the active tab of the focused browser window and only its top document. It needs CDP: without a connection the error has `reason: cdp_unavailable` and says how to launch the browser so that one exists; the two tools above work either way. It does not read `chrome://` or extension pages.
+- `browser_read` returns the page itself through CDP, without a save dialog: `format=text` (the text a reader sees), `html` (outer HTML without style sheets and without what scripts hold: code, and JSON data blocks, where a page keeps its state and tokens; only `application/ld+json` metadata stays), or `links` (one line per `a[href]`: its text, a tab, its absolute target; `strip_query=true` drops each target's `?query` and `#fragment`, where shops keep their tracking, and `dedupe=true` keeps one line per target, in the order targets first appear, named by the first of its links with a name). `selector` limits the read to the elements a CSS selector matches. A call returns at most `max_chars` characters (1 to 30,000, counted as JavaScript counts them) starting at `offset`, with `total_chars` and, while more remains, `next_offset`. It reads the active tab of the focused browser window and only its top document. It needs CDP: without a connection the error has `reason: cdp_unavailable` and says how to launch the browser so that one exists; the two tools above work either way. The connection launch_app made is not needed for good: the CDP tools connect again to the session's port when there is no connection (a server reload, which every install causes, keeps none) or the kept one stops answering (#957), and `reason: cdp_unresponsive` means the browser answered on neither; `browser_navigate` then types the address and says why in `cdp_skipped`. It does not read `chrome://` or extension pages.
 
 `browser_read` reads the DOM only. It never reads `document.cookie`, `localStorage` or `sessionStorage`, and it returns no field's current value; in `html` the `value` attribute a page wrote on a password field is removed (also on a field that a "show password" switch turned into a text field, recognised by `autocomplete`, `name` or `id`, and inside a `<template>`). `format=links` lists every `a[href]` of the document, including links the accessibility tree leaves out (collapsed menus, links without a name), so it can list more targets than the tree does; every target the tree shows is in it.
 
@@ -422,7 +422,8 @@ their ancestor directories are copied into the private session. For files larger
 than 64 MiB, kwin-mcp first tries a copy-on-write reflink. If the filesystem cannot
 clone the file, it uses a read-only bind instead of copying its data during
 startup. Other files and directory overlays keep their existing write behavior.
-`session_start` reports these fallback files in `oversized_read_only_files`.
+`session_start` counts these fallback files in `host_access.oversized_read_only_files`
+and lists them in the `host_access.report` file.
 To require private writable copies for specific files or directories, pass their
 absolute paths under HOME in `writable_paths` when starting a new session.
 Explicit copies share `startup_timeout_seconds` (60 seconds by default); this option does not
@@ -449,13 +450,16 @@ host thread. Each initial database plus WAL must fit the 64 MiB snapshot limit.
 An inconsistent, oversized or otherwise failed explicit snapshot fails startup
 with its preparation error; it does not silently substitute a read-only database.
 
-`session_start` lists the live databases it discovers. When every one is
-`live_read_only` the result has one list of paths, `live_ro_dbs` (at most 128
-entries; `live_ro_dbs_total` appears when there are more). When any database has
-another mode (`private_writable_snapshot`, `shared_host`) or a note, the result
-has `sqlite_access` instead, with a `mode` per database and `total_databases`.
-Empty results (`cookie_errors`, `oversized_read_only_files`, `host_write_paths`,
-`runtime_root_fallback`) are left out. A `launch_app` result for a window it found
+`session_start` counts the live databases it discovers and the oversized files
+it binds read-only, and names no host path for them in its result (#957):
+`host_access.sqlite` has the number of databases per mode (`live_read_only`,
+`private_writable_snapshot`, `shared_host`), `host_access.oversized_read_only_files`
+the number of such files, and `host_access.notes` each database whose requested
+access could not be given, with why. `host_access.report` is a JSON file in the
+session's workdir with the lists themselves: `sqlite_access` (`databases`, at
+most 128, each with its `path` and `mode`, and `total_databases`) and
+`oversized_read_only_files`. Empty results (`cookie_errors`, `host_access`,
+`host_write_paths`, `runtime_root_fallback`) are left out. A `launch_app` result for a window it found
 carries the window, its title and how it was found (`window_outcome`); `cdp_port`,
 `warning`, `extension_warning` and the window-baseline fields appear only when they
 have something to report. If an
