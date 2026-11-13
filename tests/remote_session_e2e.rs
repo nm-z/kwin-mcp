@@ -616,6 +616,25 @@ fn a_session_runs_on_the_listener_and_ends_with_its_owner() {
         .as_array()
         .is_some_and(|content| content.iter().any(|part| part["type"] == "image"));
     assert!(image, "the remote screenshot carries no image: {shot}");
+    // save_as names a path of this machine, where the caller reads it (#971).
+    let kept = home.join("kept-971.png");
+    let saved = server.tool("screenshot", json!({"session_id":session, "save_as":kept}));
+    let content = &saved["result"]["structuredContent"];
+    assert_eq!(content["saved_as"], json!(kept), "{saved}");
+    let png = std::fs::read(&kept).expect("the screenshot saved on this machine");
+    assert!(png.starts_with(b"\x89PNG"), "not a PNG");
+    let images = saved["result"]["content"].as_array().map_or(0, |content| {
+        content
+            .iter()
+            .filter(|part| part["type"] == "image")
+            .count()
+    });
+    assert_eq!(images, 0, "an image the caller did not ask for: {saved}");
+    let again = server.tool("screenshot", json!({"session_id":session, "save_as":kept}));
+    assert_eq!(
+        again["error"]["data"]["reason"], "save_as_exists",
+        "{again}"
+    );
 
     // The viewer of a remote session is covered by remote_viewer_e2e.rs.
     let stopped = server.tool("session_stop", json!({"session_id":session}));
