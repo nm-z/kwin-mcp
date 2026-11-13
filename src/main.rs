@@ -12768,8 +12768,9 @@ struct ScreenshotParams {
     /// include structuredContent, regardless of this option.
     #[serde(default)]
     structured_metadata: bool,
-    /// Absolute host path to also save this PNG to, so the next screenshot
-    /// does not replace it. The file must not exist; its directory must.
+    /// Absolute path on this server's machine to also save this PNG to, so
+    /// the next screenshot does not replace it, also for a session started
+    /// with host (#971). The file must not exist; its directory must.
     /// Omits the pointer by default; set `include_cursor: true` to keep it.
     /// The workdir PNG and inline image use the same cursor setting.
     #[serde(default)]
@@ -18643,7 +18644,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops; it defaults to false with save_as, else true. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute host path. Inline metadata is always included as JSON text; structured_metadata=true also exposes structuredContent, only for clients that keep displaying image content alongside structured results. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops; it defaults to false with save_as, else true. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute path of this server's machine, also for a remote session. Inline metadata always comes as JSON text; structured_metadata=true also puts it in structuredContent, for clients that still show the image then. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -25517,6 +25518,15 @@ impl SessionRouter {
         if writes_host_clipboard(&request) {
             return self.write_callers_clipboard(request, host, peer).await;
         }
+        let saves_here = request.name == "screenshot"
+            && request.arguments.as_ref().is_some_and(|arguments| {
+                arguments.get("save_as").is_some_and(|path| !path.is_null())
+            });
+        if saves_here {
+            return self
+                .save_remote_screenshot_here(request, host, &listener)
+                .await;
+        }
         // Held until a stopped session is forgotten, so a re-execution never
         // carries one along.
         let calling = self.remote.calls.read().await;
@@ -25565,6 +25575,102 @@ impl SessionRouter {
                 ));
             }
         }
+    }
+    /// screenshot save_as for a session on another machine: the path is one of
+    /// this machine, where the caller reads it (#971). The listener sends the
+    /// picture inline and writes no copy of its own; the pointer is left out
+    /// unless asked for, as with save_as on one machine.
+    async fn save_remote_screenshot_here(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        host: &str,
+        listener: &rmcp::Peer<rmcp::RoleClient>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine;
+        let here = local_host_name();
+        let arguments = request.arguments.get_or_insert_with(Default::default);
+        let target = arguments
+            .remove("save_as")
+            .and_then(|path| path.as_str().map(PathBuf::from))
+            .ok_or_else(|| McpError::invalid_params("save_as must be a string", None))?;
+        if !target.is_absolute() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "save_as must be an absolute path of this machine ({here}), where a session on {host} saves its screenshots"
+                ),
+                None,
+            ));
+        }
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "no screenshot was taken: {} already exists on this machine ({here}); choose a new save_as path",
+                    target.display()
+                ),
+                Some(serde_json::json!({"reason": "save_as_exists"})),
+            ));
+        }
+        let flag = |arguments: &rmcp::model::JsonObject, name: &str| {
+            arguments
+                .get(name)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (inline, structured) = (
+            flag(arguments, "inline"),
+            flag(arguments, "structured_metadata"),
+        );
+        arguments
+            .entry("include_cursor")
+            .or_insert(serde_json::json!(false));
+        arguments.insert("inline".to_owned(), serde_json::json!(true));
+        arguments.insert("structured_metadata".to_owned(), serde_json::json!(true));
+        let calling = self.remote.calls.read().await;
+        let mut result = remote_call(listener, host, request).await?;
+        drop(calling);
+        let mut encoded = None;
+        for content in &result.content {
+            if let rmcp::model::RawContent::Image(image) = &content.raw {
+                encoded = Some(image.data.clone());
+            }
+        }
+        let png = encoded
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("{host} sent the screenshot without its picture"),
+                    None,
+                )
+            })?;
+        write_atomically(&target, &png).map_err(|error| {
+            McpError::internal_error(
+                format!(
+                    "screenshot captured but not saved to save_as on this machine ({here}): {}",
+                    describe_write_failure(&target, &error)
+                ),
+                Some(serde_json::json!({"reason": "save_as_failed"})),
+            )
+        })?;
+        let mut payload = result.structured_content.take().unwrap_or_default();
+        payload["saved_as"] = serde_json::json!(target);
+        payload["saved_on"] = serde_json::json!(here);
+        let mut text = String::new();
+        for content in &mut result.content {
+            if let rmcp::model::RawContent::Text(raw) = &mut content.raw {
+                if raw.text.starts_with('{') {
+                    raw.text = payload.to_string();
+                } else if text.is_empty() {
+                    text.clone_from(&raw.text);
+                }
+            }
+        }
+        if inline {
+            result.structured_content = structured.then_some(payload);
+            return Ok(result);
+        }
+        let mut saved = CallToolResult::success(vec![Content::text(text)]);
+        saved.structured_content = Some(payload);
+        Ok(saved)
     }
     /// clipboard_write target=host for a session on another machine. The host
     /// clipboard is the one a viewer paste reads, and that session's viewer
