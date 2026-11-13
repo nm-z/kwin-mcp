@@ -42,8 +42,19 @@ fn dead_pid(start: u32) -> u32 {
 }
 
 fn start_server(home: &Path) -> Server {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
-        .args(["--autoclean", "--no-viewer"])
+    start_server_with(home, &["--autoclean"], None)
+}
+
+/// A server with `flags`, and with `tmp` as its temporary directory, where
+/// it keeps session workdirs, when given.
+fn start_server_with(home: &Path, flags: &[&str], tmp: Option<&Path>) -> Server {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"));
+    if let Some(tmp) = tmp {
+        command.env("TMPDIR", tmp);
+    }
+    let mut child = command
+        .args(flags)
+        .arg("--no-viewer")
         .env("HOME", home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .stdin(Stdio::piped())
@@ -118,4 +129,66 @@ fn autoclean_removes_a_dead_servers_twin_and_keeps_a_live_servers() {
     assert!(live.exists(), "a live server's twin was swept");
     drop(second);
     drop(first);
+}
+
+/// A session workdir with an autoclean lease file, as a server makes it
+/// before its sandbox runs: still empty.
+fn leased_workdir(tmp: &Path, pid: u32) -> PathBuf {
+    let dir = tmp.join(format!("kwin-mcp-{pid}-1"));
+    std::fs::create_dir_all(&dir).expect("create workdir");
+    std::fs::write(dir.join(".kwin-mcp-autoclean"), "").expect("create lease");
+    dir
+}
+
+#[test]
+fn an_empty_lease_nobody_holds_does_not_keep_a_dead_servers_workdir() {
+    // #974, #975: a server killed while its session started left an empty
+    // lease, which kept the workdir and its disk twin for good.
+    let root = std::env::temp_dir().join(format!("kwin-mcp-lease-sweep-{}", std::process::id()));
+    let fixture = Fixture(root);
+    let home = fixture.0.join("home");
+    let cache = home.join(".cache/kwin-mcp");
+    let tmp = fixture.0.join("tmp");
+    std::fs::create_dir_all(&cache).expect("create private cache");
+    std::fs::create_dir_all(&tmp).expect("create private tmp");
+
+    let killed = dead_pid(4_192_000);
+    let workdir = leased_workdir(&tmp, killed);
+    let twin = leak(&cache, killed);
+    // A start still under way: its server holds the empty lease.
+    let starting = dead_pid(4_191_000);
+    let held = leased_workdir(&tmp, starting);
+    let held_twin = leak(&cache, starting);
+    let lease = std::fs::File::open(held.join(".kwin-mcp-autoclean")).expect("open lease");
+    lease.try_lock().expect("hold the lease");
+
+    let server = start_server_with(&home, &["--autoclean"], Some(&tmp));
+    wait_until_removed(&workdir);
+    wait_until_removed(&twin);
+    assert!(
+        held.exists() && held_twin.exists(),
+        "a lease still held was swept"
+    );
+    drop(server);
+    drop(lease);
+}
+
+#[test]
+fn a_server_without_autoclean_sweeps_only_dead_servers_disk_twins() {
+    let root = std::env::temp_dir().join(format!("kwin-mcp-plain-sweep-{}", std::process::id()));
+    let fixture = Fixture(root);
+    let home = fixture.0.join("home");
+    let cache = home.join(".cache/kwin-mcp");
+    let tmp = fixture.0.join("tmp");
+    std::fs::create_dir_all(&cache).expect("create private cache");
+
+    let dead = dead_pid(4_190_000);
+    // Without --autoclean a workdir outlives its session on purpose.
+    let workdir = tmp.join(format!("kwin-mcp-{dead}-1"));
+    std::fs::create_dir_all(&workdir).expect("create workdir");
+    let twin = leak(&cache, dead);
+    let server = start_server_with(&home, &[], Some(&tmp));
+    wait_until_removed(&twin);
+    assert!(workdir.exists(), "a workdir was swept without --autoclean");
+    drop(server);
 }
