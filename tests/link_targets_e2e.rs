@@ -641,6 +641,50 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
     assert_eq!(wire.refused("browser_read", json!({"selector":"#absent"})).0, "no_match");
     assert_eq!(wire.refused("browser_read", json!({"selector":"li["})).0, "invalid_selector");
     assert_eq!(wire.refused("browser_read", json!({"max_chars":0})).0, "invalid_max_chars");
+    eval_makes_rows_and_keeps_what_the_page_keeps(&mut wire);
+}
+
+/// browser_eval (#959) on the results page: one compact row per card in one
+/// call, JSON for other values, and none of what browser_read never returns.
+fn eval_makes_rows_and_keeps_what_the_page_keeps(wire: &mut Wire) {
+    let rows = wire.data(
+        "browser_eval",
+        json!({"expression": "[...document.querySelectorAll('li.card a')].map(a => new URL(a.href).pathname + '\\t' + a.textContent.split(' ')[1]).join('\\n')"}),
+    );
+    let content = rows["content"].as_str().expect("rows");
+    assert_eq!(rows["type"], "string", "{rows}");
+    assert_eq!(content.lines().count(), CARDS);
+    assert_eq!(content.lines().next(), Some("/itm/100001\t1"));
+    // Statements, top-level await, and the last statement's value as JSON.
+    let counted = wire.data(
+        "browser_eval",
+        json!({"expression": "const cards = document.querySelectorAll('li.card').length; await new Promise(done => setTimeout(done, 10)); ({cards, title: document.title})"}),
+    );
+    assert_eq!(counted["type"], "object", "{counted}");
+    let value: Value =
+        serde_json::from_str(counted["content"].as_str().expect("JSON")).expect("JSON value");
+    assert_eq!(value, json!({"cards": CARDS, "title": "Link fixture"}));
+    // Its own world: no page variable, and no cookie, storage or password.
+    let kept = wire.data(
+        "browser_eval",
+        json!({"expression": "JSON.stringify([typeof inlineToken, document.cookie, typeof localStorage, document.querySelector('input[name=pw]').value, document.querySelector('input[name=q]').value])"}),
+    );
+    assert_eq!(
+        kept["content"], r#"["undefined","","undefined","","visible-default"]"#,
+        "{kept}"
+    );
+    // Paged like browser_read.
+    let first = wire.data(
+        "browser_eval",
+        json!({"expression": "'x'.repeat(2500)", "max_chars": 1000}),
+    );
+    assert_eq!(first["chars"], 1000);
+    assert_eq!(first["total_chars"], 2500);
+    assert_eq!(first["next_offset"], 1000);
+    let thrown = json!({"expression": "throw new Error('boom')"});
+    let (reason, message) = wire.refused("browser_eval", thrown);
+    assert_eq!(reason, "exception");
+    assert!(message.contains("boom"), "{message}");
 }
 
 #[test]
