@@ -12235,16 +12235,29 @@ mod shortcut_receipt_tests {
     }
 }
 
-/// True when the active window (KWin caption `active_title`) is a
-/// Chromium-family browser whose page has no keyboard focus: the browser UI
-/// around the showing page (DocumentWeb) of that window's frame holds a Focused
-/// object, or the page holds none. Such a browser can move focus to its own UI
-/// while its window stays active, and keys then never reach the page (#176).
-/// False when the page has focus, the window is not such a browser, or it
-/// cannot be told within KEY_FOCUS_CHECK_TIMEOUT and KEY_FOCUS_CHECK_NODES.
-async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> bool {
+/// Where the keyboard focus of a Chromium-family browser window is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BrowserFocus {
+    /// The page has it, the window is not such a browser, or it cannot be told.
+    PageOrUnknown,
+    /// The address bar has it: a key goes there, as after ctrl+l or typing an
+    /// address, and Return opens what it holds (#958).
+    AddressBar,
+    /// Some other part of the browser's own interface, or nothing in the page.
+    Elsewhere,
+}
+
+/// Where the keyboard focus of the active window (KWin caption
+/// `active_title`) is when that window is a Chromium-family browser: the
+/// browser UI around the showing page (DocumentWeb) of its frame holds a
+/// Focused object, or the page holds none. Such a browser can move focus to
+/// its own UI while its window stays active, and keys then never reach the
+/// page (#176). PageOrUnknown when the page has focus, the window is not such
+/// a browser, or it cannot be told within KEY_FOCUS_CHECK_TIMEOUT and
+/// KEY_FOCUS_CHECK_NODES.
+async fn browser_focus(conn: &zbus::Connection, active_title: &str) -> BrowserFocus {
     if active_title.is_empty() {
-        return false;
+        return BrowserFocus::PageOrUnknown;
     }
     let check = async {
         use atspi::proxy::accessible::ObjectRefExt;
@@ -12298,8 +12311,9 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
                     .into_iter()
                     .map(|child| (child, false))
                     .collect();
-                let (mut page_seen, mut focused_in_page, mut focused_outside) =
-                    (false, false, false);
+                let (mut page_seen, mut focused_in_page) = (false, false);
+                // Focused objects outside the page, and how many are the address bar.
+                let (mut focused_outside, mut focused_address) = (0usize, 0usize);
                 while let Some((object, in_page)) = stack.pop() {
                     visited += 1;
                     if visited > KEY_FOCUS_CHECK_NODES {
@@ -12309,10 +12323,8 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
                         continue;
                     };
                     let states = node.get_state().await.unwrap_or_default();
-                    let page = node
-                        .get_role()
-                        .await
-                        .is_ok_and(|role| role == atspi::Role::DocumentWeb)
+                    let role = node.get_role().await.ok();
+                    let page = role == Some(atspi::Role::DocumentWeb)
                         && states.contains(atspi::State::Showing);
                     let in_page = in_page || page;
                     page_seen |= page;
@@ -12320,7 +12332,15 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
                         if in_page {
                             focused_in_page = true
                         } else {
-                            focused_outside = true
+                            focused_outside += 1;
+                            if role == Some(atspi::Role::Entry)
+                                && node.get_attributes().await.is_ok_and(|attributes| {
+                                    attributes.get("class").map(String::as_str)
+                                        == Some(browser_address::ADDRESS_BAR_CLASS)
+                                })
+                            {
+                                focused_address += 1;
+                            }
                         }
                     }
                     for child in node.get_children().await.unwrap_or_default() {
@@ -12329,15 +12349,22 @@ async fn browser_page_unfocused(conn: &zbus::Connection, active_title: &str) -> 
                 }
                 // Chromium leaves Focused on the page while its own UI (the address bar)
                 // holds focus, so focus outside the page wins.
-                return Some(page_seen && (focused_outside || !focused_in_page));
+                return Some(if !page_seen || (focused_outside == 0 && focused_in_page) {
+                    BrowserFocus::PageOrUnknown
+                } else if focused_outside > 0 && focused_address == focused_outside {
+                    BrowserFocus::AddressBar
+                } else {
+                    BrowserFocus::Elsewhere
+                });
             }
         }
-        Some(false)
+        Some(BrowserFocus::PageOrUnknown)
     };
-    matches!(
-        tokio::time::timeout(KEY_FOCUS_CHECK_TIMEOUT, check).await,
-        Ok(Some(true))
-    )
+    tokio::time::timeout(KEY_FOCUS_CHECK_TIMEOUT, check)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(BrowserFocus::PageOrUnknown)
 }
 
 fn tree_field(value: &str) -> String {
@@ -13319,6 +13346,25 @@ struct BrowserNavigateParams {
     /// The address to open: printable ASCII, no spaces. Without a scheme it is
     /// opened as http://, and a leading / as a file path.
     url: String,
+    /// auto (default): through CDP when the browser has it, else the address
+    /// bar. address_bar: typed into the address bar as a person does, also
+    /// with CDP; use it where a site answers navigations through CDP with an
+    /// error page.
+    #[serde(default)]
+    method: NavigationMethod,
+}
+
+/// How browser_navigate hands the address to the browser.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum NavigationMethod {
+    #[default]
+    Auto,
+    /// A bot-protected shop answered navigations through CDP with its error
+    /// page and the same addresses typed into the address bar with the page
+    /// (#958). Chrome 156 sends the same request headers either way, so what
+    /// the site told apart is not known; typing is what a person does.
+    AddressBar,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -19821,7 +19867,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "browser_navigate",
-        description = "Open a URL in the active tab of the focused Chromium-family browser window and verify where the tab landed. With CDP (launch_app reported cdp_port) the tab is navigated directly: no keys are sent, the clipboard is untouched, and the page gets keyboard focus. Without CDP the address bar is focused through accessibility (ctrl+l as fallback, so a page that delays or consumes the shortcut cannot swallow the address), the URL is typed, or pasted when longer than 128 characters (the session clipboard is restored), inline completion is removed with Delete, and Return is pressed only after the bar's text equals the URL. Success means the tab reached the address or the page that address redirected to: title, url, method, and redirected=true with requested_url after a redirect; loading=true if the page still loads; window_active=false if another window took focus meanwhile. Anything else is an error whose reason says what happened: download (the tab keeps its page), load_failed (Chrome's error page; the net error with CDP), not_navigated, pending, tab_changed (another tab was selected before the page could be read), searched, unverified, address_bar_unavailable, address_bar_not_focused, address_not_entered (Return was not pressed), url_too_long_for_address_bar. navigation_submitted tells whether the browser was asked to open the address. A URL without a scheme is opened as http:// (Chrome upgrades to https where the site answers there), so a bare host or IP is never searched for; a leading / is a file path. url is printable ASCII without spaces, at most 2097152 characters with CDP (Chrome's own limit) and 512000 without."
+        description = "Open a URL in the active tab of the focused Chromium-family browser window and verify where the tab landed. With CDP (launch_app reported cdp_port) the tab is navigated directly: no keys are sent, the clipboard is untouched, and the page gets keyboard focus. Some bot-protected sites answer such navigations with an error page and typed ones with the page. With method=address_bar, or without CDP, the address bar is focused through accessibility (ctrl+l as fallback, so a page that delays or consumes the shortcut cannot swallow the address), the URL is typed, or pasted when longer than 128 characters (the session clipboard is restored), inline completion is removed with Delete, and Return is pressed only after the bar's text equals the URL. Success means the tab reached the address or the page that address redirected to: title, url, method, and redirected=true with requested_url after a redirect; loading=true if the page still loads; window_active=false if another window took focus meanwhile. Anything else is an error whose reason says what happened: download (the tab keeps its page), load_failed (Chrome's error page; the net error with CDP), not_navigated, pending, tab_changed (another tab was selected before the page could be read), searched, unverified, address_bar_unavailable, address_bar_not_focused, address_not_entered (Return was not pressed), url_too_long_for_address_bar. navigation_submitted tells whether the browser was asked to open the address. A URL without a scheme is opened as http:// (Chrome upgrades to https where the site answers there), so a bare host or IP is never searched for; a leading / is a file path. url is printable ASCII without spaces, at most 2097152 characters with CDP (Chrome's own limit) and 512000 without."
     )]
     async fn browser_navigate(
         &self,
@@ -19892,7 +19938,7 @@ impl KwinMcp {
             }
             let settling = looks < NAVIGATION_CAPTION_LOOKS;
             looks += 1;
-            if cdp_trouble.is_none() {
+            if cdp_trouble.is_none() && params.method == NavigationMethod::Auto {
                 match sess.cdp.answering(sess.cdp_forward_port).await {
                     Ok((link, targets)) if link.reaches(window.pid).await => {
                         if let Some(page) =
@@ -20046,10 +20092,20 @@ impl KwinMcp {
             ));
         }
         if characters > browser_address::ADDRESS_BAR_MAX_CHARS {
+            let (why, remedy) = match params.method {
+                NavigationMethod::AddressBar => (
+                    "method=address_bar sends it",
+                    "Call again with method=auto to navigate through CDP",
+                ),
+                NavigationMethod::Auto => (
+                    "this window has no CDP connection, so it would go",
+                    "launch_app the browser by its command name, without cdp=false, to navigate through CDP",
+                ),
+            };
             return Err(refuse(
                 "url_too_long_for_address_bar",
                 format!(
-                    "the url has {characters} characters and this window has no CDP connection, so it would go through the address bar, which keeps {} pasted characters. launch_app the browser by its command name, without cdp=false, to navigate through CDP, up to {} characters",
+                    "the url has {characters} characters and {why} through the address bar, which keeps {} pasted characters. {remedy}, up to {} characters",
                     browser_address::ADDRESS_BAR_MAX_CHARS,
                     browser_address::URL_MAX_CHARS
                 ),
@@ -21216,7 +21272,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Zoom shortcuts (ctrl with minus, plus, equal or 0) report view_changed and application_effect view_changed or view_unchanged (the zoom limit, or the page did not get the key). Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. A key that goes to a browser's address bar reports keyboard_focus=address_bar. Zoom shortcuts (ctrl with minus, plus, equal or 0) report view_changed and application_effect view_changed or view_unchanged (the zoom limit, or the page did not get the key). Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -21244,15 +21300,17 @@ impl KwinMcp {
             .as_ref()
             .map(|geometry| geometry.title.clone())
             .unwrap_or_default();
-        let page_unfocused = browser_page_unfocused(&conn, &active_title).await;
+        let focus = browser_focus(&conn, &active_title).await;
         let before_view = if zoom { view_fingerprint(&conn, &kwin_unique).await } else { None };
+        // A key for the address bar, Return after an address above all, is no
+        // reason to warn (#958); the result names where it went.
         let warning = if is_chromium_devtools_shortcut(&active_title, &mods, &params.key) {
             Some(
                 "KWin can acknowledge the shortcut without Chrome opening or closing DevTools. \
                  Browser-level shortcuts can work even when the page lacks focus. \
                  Inspect a screenshot to confirm the actual browser state before retrying.",
             )
-        } else if page_unfocused {
+        } else if focus == BrowserFocus::Elsewhere {
             Some(
                 "AT-SPI did not find page keyboard focus (it may be stale across matching browser windows). \
                  Browser chrome may have focus, but this does not prove the shortcut failed. \
@@ -21366,9 +21424,14 @@ impl KwinMcp {
         let paste_is_error = paste_delivery.as_ref().is_some_and(|delivery| {
             matches!(delivery.status, "pending_or_mismatched" | "not_in_field")
         });
-        let text = match warning {
-            Some(warning) => format!("key: {}. warning: {warning}", params.key),
-            None => format!("key: {}", params.key),
+        let text = match (warning, focus) {
+            (Some(warning), _) => format!("key: {}. warning: {warning}", params.key),
+            (None, BrowserFocus::AddressBar) => {
+                format!("key: {} (to the browser's address bar)", params.key)
+            }
+            (None, BrowserFocus::PageOrUnknown | BrowserFocus::Elsewhere) => {
+                format!("key: {}", params.key)
+            }
         };
         let text = if let Some(delivery) = &paste_delivery {
             format!(
@@ -21384,6 +21447,9 @@ impl KwinMcp {
             "application_effect": "unverified",
         });
         drop_empty_fields(&mut data, &["warning"]);
+        if focus == BrowserFocus::AddressBar {
+            data["keyboard_focus"] = serde_json::json!("address_bar");
+        }
         // A zoom shortcut is checked by what it does to the screen: unchanged means
         // the zoom limit was reached or the page did not get the key.
         if zoom && let Some(changed) = view_changed_since(&conn, &kwin_unique, before_view).await {
