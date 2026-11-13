@@ -57,7 +57,38 @@
     }
     return rows.map(([name, href]) => name + '\t' + href).join('\n');
   };
-  const text = root => typeof root.innerText === 'string' ? root.innerText : (root.textContent || '');
+  // The DOM's own text, blocks on lines of their own: what a page holds before
+  // Chrome renders it. A results page that reveals its results after load had
+  // them in the DOM while innerText still had its header and footer (#978).
+  const skipped = new Set(['script', 'style', 'noscript', 'template', 'head', 'svg', 'math', 'iframe', 'object', 'embed', 'canvas', 'select', 'input', 'textarea']);
+  const blocks = new Set(['address', 'article', 'aside', 'blockquote', 'br', 'caption', 'dd', 'details', 'dialog', 'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'legend', 'li', 'main', 'nav', 'ol', 'p', 'pre', 'section', 'summary', 'table', 'tbody', 'tfoot', 'thead', 'tr', 'ul']);
+  const domText = root => {
+    const parts = [];
+    const walk = node => {
+      if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data.replace(/\s+/g, ' ')); return; }
+      if (node.nodeType !== Node.ELEMENT_NODE || skipped.has(node.localName)) return;
+      const block = blocks.has(node.localName);
+      if (block) parts.push('\n');
+      else if (node.localName === 'td' || node.localName === 'th') parts.push('\t');
+      for (const child of node.childNodes) walk(child);
+      if (block) parts.push('\n');
+    };
+    walk(root);
+    return parts.join('').replace(/ *\n\s*/g, '\n').trim();
+  };
+  // innerText when Chrome rendered the page; the DOM's text when it rendered
+  // under a quarter of it, which the result reports.
+  let renderedChars = 0, fromDom = false;
+  const text = root => {
+    const rendered = typeof root.innerText === 'string' ? root.innerText : (root.textContent || '');
+    renderedChars += rendered.length;
+    const dom = domText(root);
+    if (rendered.trim().length * 4 < dom.length && dom.length - rendered.length > 400) {
+      fromDom = true;
+      return dom;
+    }
+    return rendered;
+  };
   const read = {html, links, text}[format];
   // A lone surrogate has no JSON form the server accepts; it becomes U+FFFD.
   const whole = roots.map(read).join('\n');
@@ -68,5 +99,5 @@
   if (low(start)) start += 1;
   let end = Math.min(start + max, body.length);
   if (low(end)) end = end - 1 > start ? end - 1 : end + 1;
-  return JSON.stringify({url:location.href, title:document.title, matched:roots.length, total:body.length, start, end, content:body.slice(start, end)});
+  return JSON.stringify({url:location.href, title:document.title, matched:roots.length, total:body.length, start, end, content:body.slice(start, end), from_dom:fromDom, rendered_chars:renderedChars});
 })
