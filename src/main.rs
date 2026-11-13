@@ -14100,6 +14100,14 @@ struct ExportFileParams {
     /// missing directory fails the export without writing anything.
     #[serde(default)]
     create_parents: bool,
+    /// Wait up to this many seconds (1 to 300) for a file still being written
+    /// or downloaded: until it exists, no partial download of it remains, and
+    /// it stays unchanged for stable_for_ms. Default 0: copy what is there.
+    #[serde(default)]
+    timeout_seconds: u64,
+    /// With timeout_seconds: how long the file's inode, size and modification
+    /// time must stay unchanged, 100 to 5000 ms. Default 500.
+    stable_for_ms: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -14112,17 +14120,6 @@ struct ImportFileParams {
     /// Replace an existing session file, including private edits. Default false.
     #[serde(default)]
     overwrite: bool,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct WaitForFileParams {
-    /// Absolute path of the file as the session sees it.
-    session_path: String,
-    /// Maximum wait in seconds. Defaults to 30; accepted range is 1–300.
-    timeout_seconds: Option<u64>,
-    /// Require the file's inode, size, and modification time to remain unchanged
-    /// for this many milliseconds. Defaults to 500; accepted range is 100–5000.
-    stable_for_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -14219,6 +14216,44 @@ async fn wait_for_file_stability(
             });
         }
         tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+    }
+}
+
+/// The name of a partial download of `path` beside it (Chrome's
+/// `.crdownload`, Firefox's `.part`, Safari-style `.download`), if one exists.
+fn partial_download(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    for suffix in ["crdownload", "part", "download"] {
+        let partial = format!("{name}.{suffix}");
+        if path.with_file_name(&partial).exists() {
+            return Some(partial);
+        }
+    }
+    None
+}
+
+/// Waits until `source` exists, no partial download of it remains and it
+/// stays unchanged for `stable_for`, within `timeout`: what export_file waits
+/// for before it copies (#969).
+async fn wait_for_export(
+    source: &Path,
+    timeout: Duration,
+    stable_for: Duration,
+) -> Result<FileReadinessObservation, FileReadinessError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let observation = wait_for_file_stability(source, left, stable_for).await?;
+        if !observation.ready || partial_download(source).is_none() {
+            return Ok(observation);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(FileReadinessObservation {
+                ready: false,
+                ..observation
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -19059,6 +19094,66 @@ impl KwinMcp {
         }
     }
 
+    /// export_file's wait (#969): until the session file exists, no partial
+    /// download of it remains, and it stays unchanged for `stable_for_ms`,
+    /// within the call's timeout_seconds. A path that is no regular file is
+    /// left for the copy to name.
+    async fn wait_for_export_ready(
+        &self,
+        sandbox_pid: u32,
+        params: &ExportFileParams,
+        stable_for_ms: u64,
+    ) -> Result<(), McpError> {
+        let root = tokio::task::spawn_blocking(move || sandbox_root(sandbox_pid))
+            .await
+            .map_err(|error| McpError::internal_error(format!("export task: {error}"), None))?
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "cannot reach the session filesystem (sandbox not running)",
+                    None,
+                )
+            })?;
+        let relative = Path::new(&params.session_path)
+            .strip_prefix("/")
+            .map_err(|error| {
+                McpError::invalid_params(format!("invalid session path: {error}"), None)
+            })?;
+        let source = root.join(relative);
+        let timeout = Duration::from_secs(params.timeout_seconds);
+        let stable_for = Duration::from_millis(stable_for_ms);
+        let observation = match wait_for_export(&source, timeout, stable_for).await {
+            Ok(observation) => observation,
+            Err(FileReadinessError::NotRegularFile) => return Ok(()),
+            Err(FileReadinessError::Inspect(reason)) => {
+                return Err(McpError::internal_error(reason, None));
+            }
+        };
+        if observation.ready {
+            return Ok(());
+        }
+        let partial = partial_download(&source);
+        let state = match (&partial, observation.exists) {
+            (Some(_), _) => "downloading",
+            (None, true) => "changing",
+            (None, false) => "missing",
+        };
+        let partial_note = partial
+            .map(|name| format!(" ({name} exists)"))
+            .unwrap_or_default();
+        Err(McpError::internal_error(
+            format!(
+                "export_file wrote nothing: after {} s {} is {state}{partial_note} in the session",
+                params.timeout_seconds, params.session_path
+            ),
+            Some(serde_json::json!({
+                "status": "not_exported", "reason": "not_ready", "file": state,
+                "session_path": params.session_path, "exists": observation.exists,
+                "size_bytes": observation.size_bytes, "stable_for_ms": stable_for_ms,
+                "timeout_seconds": params.timeout_seconds,
+            })),
+        ))
+    }
+
     /// The tab the active window shows, when that window is a Chromium-family
     /// browser the session's CDP connection reaches. A refusal starts with
     /// `prefix` and carries its reason.
@@ -21765,124 +21860,8 @@ impl KwinMcp {
     }
 
     #[rmcp::tool(
-        name = "wait_for_file",
-        description = "Wait for an absolute session file path to exist as a regular file and remain unchanged for a bounded interval. Readiness compares its inode, byte size, and modification time; this does not prove the producer has exited or that the file is nonempty. The observation is inside the isolated session, not the host view of the same path. Before uploading a host-created file, compare size_bytes with the expected host size; a chooser accepting the path does not verify its contents. HOME overlays and private /tmp can expose different bytes. If the session copy is missing or differs, transfer the intended file into the session, or start a separate session with the existing host file in writable_paths for a private copy. A timeout reports missing or changing files. Call export_file after a session output is ready."
-    )]
-    async fn wait_for_file(
-        &self,
-        peer: rmcp::Peer<rmcp::RoleServer>,
-        Parameters(params): Parameters<WaitForFileParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let timeout_seconds = params.timeout_seconds.unwrap_or(30);
-        if !(1..=300).contains(&timeout_seconds) {
-            return Err(McpError::invalid_params(
-                "timeout_seconds must be between 1 and 300",
-                None,
-            ));
-        }
-        let stable_for_ms = params.stable_for_ms.unwrap_or(500);
-        if !(100..=5000).contains(&stable_for_ms) {
-            return Err(McpError::invalid_params(
-                "stable_for_ms must be between 100 and 5000",
-                None,
-            ));
-        }
-        let session_path = PathBuf::from(&params.session_path);
-        if !session_path.is_absolute() {
-            return Err(McpError::invalid_params(
-                format!("session_path must be absolute: {}", params.session_path),
-                None,
-            ));
-        }
-        if session_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(McpError::invalid_params(
-                "session_path must not contain a parent-directory component",
-                None,
-            ));
-        }
-
-        self.touch_activity().await;
-        let sandbox_pid = self
-            .with_session(|sess| Ok(sess.sandbox_child.id()))
-            .await?;
-        let timeout = Duration::from_secs(timeout_seconds);
-        let stable_for = Duration::from_millis(stable_for_ms);
-        let root = tokio::task::spawn_blocking(move || sandbox_root(sandbox_pid))
-            .await
-            .map_err(|error| {
-                McpError::internal_error(format!("wait_for_file session lookup: {error}"), None)
-            })?
-            .ok_or_else(|| {
-                McpError::internal_error(
-                    "cannot reach the session filesystem (sandbox not running)",
-                    None,
-                )
-            })?;
-        let relative = session_path.strip_prefix("/").map_err(|error| {
-            McpError::invalid_params(format!("invalid session path: {error}"), None)
-        })?;
-        let source = root.join(relative);
-        let observation = wait_for_file_stability(&source, timeout, stable_for).await;
-
-        let observation = match observation {
-            Ok(observation) => observation,
-            Err(FileReadinessError::NotRegularFile) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "{} is not a regular file in the session",
-                        params.session_path
-                    ),
-                    None,
-                ));
-            }
-            Err(FileReadinessError::Inspect(reason)) => {
-                return Err(McpError::internal_error(reason, None));
-            }
-        };
-
-        if observation.ready {
-            let size_bytes = observation.size_bytes.ok_or_else(|| {
-                McpError::internal_error("ready session file has no observed size", None)
-            })?;
-            Ok(structured_result(
-                &peer,
-                format!(
-                    "ready: {} ({size_bytes} bytes stable for {stable_for_ms} ms)",
-                    params.session_path
-                ),
-                serde_json::json!({"status": "ready", "size_bytes": size_bytes}),
-            )
-            .await)
-        } else {
-            let reason = if observation.exists {
-                "changing"
-            } else {
-                "missing"
-            };
-            Err(McpError::internal_error(
-                format!(
-                    "wait_for_file timed out after {timeout_seconds}s: {} is {reason} in the session",
-                    params.session_path
-                ),
-                Some(serde_json::json!({
-                    "status": "not_ready",
-                    "reason": reason,
-                    "session_path": params.session_path,
-                    "exists": observation.exists,
-                    "size_bytes": observation.size_bytes,
-                    "stable_for_ms": stable_for_ms,
-                    "timeout_seconds": timeout_seconds,
-                })),
-            ))
-        }
-    }
-
-    #[rmcp::tool(
         name = "export_file",
-        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Except in explicitly shared host_write_paths, session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a finished Chrome download in ~/Downloads). For an asynchronously produced file, call wait_for_file first to observe it becoming stable. host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true; create_parents=true creates missing host directories. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
+        description = "Copy a file out of the isolated session onto the real host filesystem and verify it. Except in explicitly shared host_write_paths, session writes (downloads, exports, saved files) stay in the session overlay and never reach the host on their own; call this when the user wants the file in a real directory. session_path is the absolute path the session sees (e.g. a Chrome download in ~/Downloads). For a file still being written or downloaded, timeout_seconds (1-300; default 0, no wait) waits until it exists, no partial download of it remains, and its inode, size and modification time stay unchanged for stable_for_ms (100-5000, default 500); a timeout says whether it was missing, downloading or changing. host_path is the host file or existing directory to write; omit it to use the same path on the host. An existing host file is not replaced unless overwrite=true; create_parents=true creates missing host directories. Returns the host path and byte count after a byte-for-byte comparison, or an error saying why nothing was written (including a download still in progress)."
     )]
     async fn export_file(
         &self,
@@ -21899,6 +21878,38 @@ impl KwinMcp {
                 format!("session_path must be absolute: {}", params.session_path),
                 None,
             ));
+        }
+        if session_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(McpError::invalid_params(
+                "session_path must not contain a parent-directory component",
+                None,
+            ));
+        }
+        if params.timeout_seconds > 300 {
+            return Err(McpError::invalid_params(
+                "timeout_seconds must be from 0 to 300",
+                None,
+            ));
+        }
+        let stable_for_ms = params.stable_for_ms.unwrap_or(500);
+        if !(100..=5000).contains(&stable_for_ms) {
+            return Err(McpError::invalid_params(
+                "stable_for_ms must be from 100 to 5000",
+                None,
+            ));
+        }
+        if params.stable_for_ms.is_some() && params.timeout_seconds == 0 {
+            return Err(McpError::invalid_params(
+                "stable_for_ms takes effect with timeout_seconds, which waits for the file; without it the file is copied as it is",
+                None,
+            ));
+        }
+        if params.timeout_seconds > 0 {
+            self.wait_for_export_ready(sandbox_pid, &params, stable_for_ms)
+                .await?;
         }
         let mut destination =
             PathBuf::from(params.host_path.as_deref().unwrap_or(&params.session_path));

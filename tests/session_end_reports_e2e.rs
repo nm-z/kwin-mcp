@@ -344,9 +344,11 @@ fn a_call_running_when_the_server_is_signalled_is_answered_with_the_cause() {
     let (session, sandbox) = owner.start_session();
     wait_for_sigterm_handler(owner_pid);
 
+    let never = fixture.0.join("never-exported");
     let waiting = owner.send_tool(
-        "wait_for_file",
-        json!({"session_id":session, "session_path":"/tmp/never-written", "timeout_seconds":120}),
+        "export_file",
+        json!({"session_id":session, "session_path":"/tmp/never-written",
+            "host_path":never, "timeout_seconds":120}),
     );
     std::thread::sleep(Duration::from_secs(1));
     let signalled = Instant::now();
@@ -480,9 +482,11 @@ fn forwarded_calls_survive_the_owner_re_executing() {
 
     // A forwarded call that is still running when the owner decides to
     // re-execute: the owner finishes it first.
+    let never = fixture.0.join("never-exported");
     let waiting = other.send_tool(
-        "wait_for_file",
-        json!({"session_id":session, "session_path":"/tmp/never-written", "timeout_seconds":12}),
+        "export_file",
+        json!({"session_id":session, "session_path":"/tmp/never-written",
+            "host_path":never, "timeout_seconds":12}),
     );
     std::thread::sleep(Duration::from_secs(1));
     let update = fixture.0.join("bin/kwin-mcp.new");

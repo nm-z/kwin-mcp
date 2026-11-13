@@ -98,9 +98,8 @@ class KeyboardPasteProbe
 
   def export_text(name, expected)
     session_path = "#{@home}/#{name}"
-    data(call('wait_for_file', session_path: session_path, timeout_seconds: 15, stable_for_ms: 100))
     host_path = File.join(@artifacts, "#{name}.txt")
-    data(call('export_file', session_path: session_path, host_path: host_path))
+    data(call('export_file', session_path: session_path, host_path: host_path, timeout_seconds: 15, stable_for_ms: 100))
     observed = File.read(host_path, encoding: 'UTF-8')
     raise "independent #{name} value differs: #{observed.inspect}" unless observed == expected
   end

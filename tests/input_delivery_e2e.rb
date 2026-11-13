@@ -531,9 +531,8 @@ class InputDeliveryProbe
     raise 'input was not completely submitted' unless result['submission_complete'] && result['submitted_characters'] == command.length
     raise 'input suggested blind retry' unless result['retry_safe'] == false
     raise 'terminal exposed unverified text counts' unless delivery['expected_field_characters'].nil? && delivery['observed_field_characters'].nil?
-    ready = assert_success(call('wait_for_file', session_path: session_path, timeout_seconds: 10, stable_for_ms: 100))
     destination = File.join(@artifacts, 'terminal-fast-output.txt')
-    assert_success(call('export_file', session_path: session_path, host_path: destination))
+    ready = assert_success(call('export_file', session_path: session_path, host_path: destination, timeout_seconds: 10, stable_for_ms: 100))
     observed = File.binread(destination)
     proof = { characters: command.length, speed: 4, elapsed_seconds: elapsed,
               delivery: delivery, submission_complete: result['submission_complete'],

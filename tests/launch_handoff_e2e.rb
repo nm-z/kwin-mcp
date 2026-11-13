@@ -189,9 +189,8 @@ class LaunchHandoffProbe
       raise "stdout_tail #{launched['stdout_tail'].inspect}" unless launched['stdout_tail'] == File.read(stdout)
     end
     data('launch_app', command: 'printf exported > /tmp/kwin-507.txt', expect_window: false)
-    data('wait_for_file', session_path: '/tmp/kwin-507.txt', timeout_seconds: 10)
     destination = File.join(@evidence, 'export-parents', 'a', 'b', 'kwin-507.txt')
-    refused = call('export_file', session_path: '/tmp/kwin-507.txt', host_path: destination)
+    refused = call('export_file', session_path: '/tmp/kwin-507.txt', host_path: destination, timeout_seconds: 10)
     refusal = (refused['error'] || {})['message'].to_s + refused.dig('result', 'content', 0, 'text').to_s
     raise "missing directory was not refused: #{refused}" unless refusal.include?('create_parents') && !File.exist?(destination)
     data('export_file', session_path: '/tmp/kwin-507.txt', host_path: destination, create_parents: true)
