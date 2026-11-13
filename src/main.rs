@@ -13407,6 +13407,20 @@ struct BrowserReadParams {
     dedupe: Option<bool>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct BrowserEvalParams {
+    /// JavaScript run as a script; the value of its last statement is
+    /// returned, and a promise is awaited. Top-level await works.
+    expression: String,
+    /// Where to continue: the next_offset of the previous reply. Default 0.
+    offset: Option<usize>,
+    /// Most characters to return, 1 to 30000 (the default).
+    max_chars: Option<usize>,
+}
+
+/// Name of the world browser_eval runs in, as DevTools shows it.
+const PAGE_EVAL_WORLD: &str = "kwin-mcp browser_eval";
+
 /// Pages of the browser itself (settings, the password manager, extensions,
 /// DevTools). The element tools skip them and browser_read does not read them.
 const BROWSER_OWN_PAGES: [&str; 4] = [
@@ -19862,6 +19876,133 @@ impl KwinMcp {
             info["next_offset"] = serde_json::json!(end);
         }
         let content = read["content"].as_str().unwrap_or_default().to_owned();
+        Ok(page_read_result(ResultView::of_peer(&peer), content, info))
+    }
+
+    #[rmcp::tool(
+        name = "browser_eval",
+        description = "Run JavaScript in the page of the active tab of the focused Chromium-family browser window through CDP and return its value, to turn a long page into compact rows: [...document.querySelectorAll('[data-listingid]')].map(card => card.dataset.listingid + '\\t' + card.querySelector('h3')?.innerText).join('\\n'). The code runs as a script in a world of its own, which sees the page's DOM but not its scripts' variables, and which the page's scripts do not see; the value of its last statement is returned, top-level await works, and a promise is awaited. A string comes back as it is, anything else as JSON (a DOM node has none: return its text or attributes). In that world document.cookie reads empty, Web Storage, IndexedDB and Cache Storage are absent, and a password field's value reads empty. One call returns at most max_chars characters (1 to 30000, the default) from offset; the result has url, title, type (of the value), offset, chars, total_chars, and next_offset while more remains: call again with offset=next_offset and the same expression, which runs again. Needs CDP like browser_read and refuses for its reasons (cdp_unavailable, cdp_unresponsive, not_a_browser, tab_not_found, internal_page); also exception (the code threw; its message is given) and page_unresponsive (no value within 10 s)."
+    )]
+    async fn browser_eval(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(params): Parameters<BrowserEvalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        use chromiumoxide::cdp::browser_protocol::page::{
+            CreateIsolatedWorldParams, GetFrameTreeParams,
+        };
+        use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, TimeDelta};
+        let refuse = |reason: &str, detail: String| {
+            McpError::invalid_params(
+                format!("Nothing was evaluated: {detail}."),
+                Some(serde_json::json!({"reason": reason})),
+            )
+        };
+        let max = params.max_chars.unwrap_or(PAGE_READ_MAX_CHARS);
+        if !(1..=PAGE_READ_MAX_CHARS).contains(&max) {
+            return Err(refuse(
+                "invalid_max_chars",
+                format!("max_chars must be between 1 and {PAGE_READ_MAX_CHARS}"),
+            ));
+        }
+        if params.expression.trim().is_empty() {
+            let empty = "expression is empty".to_owned();
+            return Err(refuse("invalid_expression", empty));
+        }
+        self.touch_activity().await;
+        self.settle_input().await?;
+        let page = self.active_browser_page("Nothing was evaluated").await?;
+        let (address, title) = cdp_entry(&page).await.unwrap_or_default();
+        if BROWSER_OWN_PAGES
+            .iter()
+            .any(|scheme| address.starts_with(scheme))
+        {
+            return Err(refuse(
+                "internal_page",
+                format!(
+                    "{} is a page of the browser itself, which browser_eval does not run in",
+                    browser_address::shown_url(&address)
+                ),
+            ));
+        }
+        // A world of its own for each call: nothing one call declares is in
+        // the next one's way, and the page's scripts see none of it.
+        let failed = |error: &dyn std::fmt::Display| error.to_string();
+        let evaluated = tokio::time::timeout(PAGE_READ_TIMEOUT, async {
+            let tree = page
+                .execute(GetFrameTreeParams::default())
+                .await
+                .map_err(|error| failed(&error))?;
+            let world = CreateIsolatedWorldParams::builder()
+                .frame_id(tree.result.frame_tree.frame.id.clone())
+                .world_name(PAGE_EVAL_WORLD)
+                .build()?;
+            let context = page
+                .execute(world)
+                .await
+                .map_err(|error| failed(&error))?
+                .result
+                .execution_context_id;
+            let guard = EvaluateParams::builder()
+                .expression(include_str!("page_eval_guard.js"))
+                .context_id(context)
+                .build()?;
+            page.execute(guard).await.map_err(|error| failed(&error))?;
+            let run = EvaluateParams::builder()
+                .expression(params.expression.clone())
+                .context_id(context)
+                .return_by_value(true)
+                .await_promise(true)
+                .repl_mode(true)
+                .timeout(TimeDelta::new(PAGE_READ_TIMEOUT.as_secs_f64() * 1000.0))
+                .build()?;
+            page.execute(run)
+                .await
+                .map(|reply| reply.result)
+                .map_err(|error| failed(&error))
+        })
+        .await
+        .map_err(|_| {
+            refuse(
+                "page_unresponsive",
+                format!(
+                    "the page gave no value within {} seconds",
+                    PAGE_READ_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+        .map_err(|error| refuse("cdp_failed", format!("the page could not run it ({error})")))?;
+        if let Some(exception) = &evaluated.exception_details {
+            let message = exception
+                .exception
+                .as_ref()
+                .and_then(|thrown| thrown.description.clone())
+                .unwrap_or_else(|| exception.text.clone());
+            return Err(refuse("exception", format!("the code threw {message}")));
+        }
+        let value = &evaluated.result;
+        let kind = serde_json::to_value(&value.r#type)
+            .ok()
+            .and_then(|kind| kind.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let text = match (&value.value, &value.unserializable_value) {
+            (Some(serde_json::Value::String(text)), _) => text.clone(),
+            (Some(other), _) => other.to_string(),
+            (None, Some(special)) => special.inner().clone(),
+            (None, None) => value.description.clone().unwrap_or_else(|| kind.clone()),
+        };
+        let total = text.chars().count();
+        let start = params.offset.unwrap_or(0).min(total);
+        let content: String = text.chars().skip(start).take(max).collect();
+        let end = start + content.chars().count();
+        let mut info = serde_json::json!({
+            "source": "cdp", "format": "eval", "type": kind,
+            "url": browser_address::shown_url(&address), "title": title,
+            "offset": start, "end": end, "chars": end - start, "total_chars": total,
+        });
+        if end < total {
+            info["next_offset"] = serde_json::json!(end);
+        }
         Ok(page_read_result(ResultView::of_peer(&peer), content, info))
     }
 
