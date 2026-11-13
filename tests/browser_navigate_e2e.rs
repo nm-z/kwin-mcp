@@ -31,6 +31,17 @@ const SLOW_PAGE: Duration = Duration::from_secs(3);
 /// queries, as on a shop's result page (#957).
 const LINKS: &str = "<a href='/item?id=7&track=aaaa#photo'><img alt=''></a><a href='/item?id=7&track=bbbb'>Item seven</a><a href='/other?ref=x'>Other</a>";
 
+/// A results page that has its results in the DOM and shows them only 4 s
+/// after load, as a search page that reveals them late does (#978).
+fn late_results() -> String {
+    let results: String = (1..=30)
+        .map(|n| format!("<p>Result {n}: a listing with enough words to count.</p>"))
+        .collect();
+    format!(
+        "<main id=results style='display:none'>{results}</main><script>setTimeout(() => results.style.display = '', 4000)</script>"
+    )
+}
+
 struct Fixture {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
@@ -102,6 +113,11 @@ impl Fixture {
             "/trap" => ("200 OK", "Content-Type: text/html\r\n", page(TRAP)),
             "/stall" => ("200 OK", "Content-Type: text/html\r\n", page(STALL)),
             "/links" => ("200 OK", "Content-Type: text/html\r\n", page(LINKS)),
+            "/late" => (
+                "200 OK",
+                "Content-Type: text/html\r\n",
+                page(&late_results()),
+            ),
             _ => {
                 if path == "/slow" {
                     thread::sleep(SLOW_PAGE);
@@ -639,6 +655,38 @@ fn cdp_reaches_the_browser_again_after_the_server_reexecutes_itself() {
     let text = wire.read(json!({}));
     assert!(text.contains("fixture/beta"), "{text}");
     wire.keep("957-cdp-after-reexecution");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
+fn text_comes_from_the_dom_while_the_page_has_not_shown_its_content() {
+    // #978: right after load, innerText had a results page's header and
+    // footer while its results were in the DOM, not yet shown.
+    let fixture = Fixture::start();
+    let (mut wire, _) = browser("978", &fixture, true);
+    let late = fixture.url("/late");
+    landed(&wire.navigate(&late), &late, "cdp");
+    let early = wire.tool("browser_read", json!({}));
+    let content = &early["result"]["structuredContent"];
+    assert_eq!(content["text_source"], "dom", "{early}");
+    let text = content["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Result 1:") && text.contains("Result 30:"),
+        "{early}"
+    );
+    assert!(text.lines().count() >= 30, "results run together: {early}");
+    thread::sleep(Duration::from_secs(5));
+    let shown = wire.tool("browser_read", json!({}));
+    let content = &shown["result"]["structuredContent"];
+    assert!(content.get("text_source").is_none(), "{shown}");
+    let text = content["content"].as_str().unwrap_or_default();
+    assert!(text.contains("Result 30:"), "{shown}");
+    // A page that shows what it holds reads as Chrome renders it.
+    let plain = fixture.url("/links");
+    landed(&wire.navigate(&plain), &plain, "cdp");
+    let read = wire.tool("browser_read", json!({}));
+    let rendered = &read["result"]["structuredContent"];
+    assert!(rendered.get("text_source").is_none(), "{read}");
 }
 
 #[test]
