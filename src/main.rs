@@ -10982,7 +10982,7 @@ if [[ -z $real ]]; then
 fi
 [[ -n $real ]] || exit 127
 ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
-first_run=0 default_check=0
+first_run=0 default_check=0 profile_named=0
 for arg in "$@"; do
   if (( profile_value )); then
     [[ -n "$arg" ]] && custom_profile=1
@@ -10994,6 +10994,7 @@ for arg in "$@"; do
     --force-renderer-accessibility|--force-renderer-accessibility=*) a11y=1 ;;
     --user-data-dir) profile_value=1 ;;
     --user-data-dir=*) [[ -n "${arg#*=}" ]] && custom_profile=1 ;;
+    --profile-directory|--profile-directory=*) profile_named=1 ;;
     --silent-debugger-extension-api) silent_debugger=1 ;;
     --test-type) test_type=1 ;;
     --no-first-run) first_run=1 ;;
@@ -11018,6 +11019,25 @@ case "$name" in
     (( default_check )) || flags+=(--no-default-browser-check)
     ;;
 esac
+# With two or more profiles a browser may open its profile picker, a window
+# with no page for the browser tools, in place of the address (#976). Without
+# --profile-directory it opens the profile it would have opened without the
+# picker, which the server read from Local State when the session started.
+last_profile=
+case "$name" in
+  google-chrome|google-chrome-stable|chrome) config_dir=google-chrome ;;
+  chromium|chromium-browser) config_dir=chromium ;;
+  brave|brave-browser) config_dir=BraveSoftware/Brave-Browser ;;
+  vivaldi|vivaldi-stable) config_dir=vivaldi ;;
+  microsoft-edge|microsoft-edge-stable|msedge) config_dir=microsoft-edge ;;
+  *) config_dir= ;;
+esac
+case "$config_dir" in
+@LAST_PROFILES@
+esac
+if [[ -n $last_profile ]] && (( ! custom_profile && ! profile_named )); then
+  flags+=("--profile-directory=$last_profile")
+fi
 # Google Chrome and Microsoft Edge open no debugging port on their default data
 # directory (Chromium, Brave and Vivaldi do). They call a directory the default
 # when the directory they run on, resolved, equals as text the unresolved path
@@ -11136,6 +11156,68 @@ fi
 exec "$real" "${flags[@]}" "$@"
 "#;
 
+/// What to do when the active window may be a browser's profile picker, which
+/// shows no page: its caption is the browser's name alone (#976).
+fn profile_picker_hint(caption: &str) -> &'static str {
+    const PICKER_CAPTIONS: [&str; 6] = [
+        "Google Chrome",
+        "Google Chrome Beta",
+        "Chromium",
+        "Brave",
+        "Microsoft Edge",
+        "Vivaldi",
+    ];
+    if PICKER_CAPTIONS.contains(&caption.trim()) {
+        ". A window captioned with the browser's name alone is likely its profile picker, which shows no page: pick a profile in it, or launch the browser with --profile-directory=\"DIR\" (launch_app lists the profiles)"
+    } else {
+        ""
+    }
+}
+
+/// The profile a browser opens when it shows no profile picker: Local State's
+/// profile.last_used when it names a profile, else the one used last. None
+/// with fewer than two profiles, when there is no picker (#976).
+fn profile_to_open(state: &serde_json::Value) -> Option<String> {
+    let cache = state["profile"]["info_cache"].as_object()?;
+    if cache.len() < 2 {
+        return None;
+    }
+    if let Some(last) = state["profile"]["last_used"]
+        .as_str()
+        .filter(|last| cache.contains_key(*last))
+    {
+        return Some(last.to_owned());
+    }
+    cache
+        .iter()
+        .max_by_key(|(_, info)| profile_active_time(info))
+        .map(|(directory, _)| directory.clone())
+}
+
+/// When a profile was last active, in whole Unix seconds, from its Local
+/// State entry (without a float-to-integer cast).
+fn profile_active_time(info: &serde_json::Value) -> Option<i64> {
+    info["active_time"]
+        .as_number()
+        .and_then(|time| time.to_string().split('.').next()?.parse::<i64>().ok())
+}
+
+/// The wrapper's case arms that name, for each browser data directory under
+/// `home` with two or more profiles, the profile it opens (#976).
+fn last_profile_arms(home: &Path) -> String {
+    BROWSER_CONFIG_DIRS
+        .iter()
+        .filter_map(|directory| {
+            let state = std::fs::read_to_string(home.join(directory).join("Local State")).ok()?;
+            let profile = profile_to_open(&serde_json::from_str(&state).ok()?)?;
+            let name = directory.strip_prefix(".config/")?;
+            // Single quotes keep the shell from reading anything in the name.
+            let quoted = profile.replace('\'', r"'\''");
+            Some(format!("  {name}) last_profile='{quoted}' ;;\n"))
+        })
+        .collect()
+}
+
 fn create_browser_wrappers(workdir: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let bin = workdir.join("browser-bin");
@@ -11145,12 +11227,16 @@ fn create_browser_wrappers(workdir: &Path) -> std::io::Result<PathBuf> {
         .iter()
         .filter_map(|directory| directory.strip_prefix(".config/"))
         .collect();
+    let last_profiles = std::env::var_os("HOME")
+        .map(|home| last_profile_arms(Path::new(&home)))
+        .unwrap_or_default();
     std::fs::write(
         &wrapper,
         BROWSER_WRAPPER
             .replace("@CONFIG_DIRS@", &config_dirs.join(" "))
             .replace("@CONFIG_STORE@", BROWSER_CONFIG_STORE)
-            .replace("@UNLINKED@", BROWSER_CONFIG_UNLINKED),
+            .replace("@UNLINKED@", BROWSER_CONFIG_UNLINKED)
+            .replace("@LAST_PROFILES@\n", &last_profiles),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
     for name in BROWSER_COMMANDS {
@@ -19273,8 +19359,9 @@ impl KwinMcp {
                 return Err(refuse(
                     "tab_not_found",
                     format!(
-                        "no single tab of the connected browser has the title of the active window {:?} (a dialog such as a file chooser, or a window that shows no page)",
-                        window.title
+                        "no single tab of the connected browser has the title of the active window {:?} (a dialog such as a file chooser, or a window that shows no page){}",
+                        window.title,
+                        profile_picker_hint(&window.title)
                     ),
                 ));
             }
@@ -20281,7 +20368,8 @@ impl KwinMcp {
                     return Err(refuse(
                         "address_bar_unavailable",
                         format!(
-                            "{error}, so the address bar cannot be checked and the destination could not be verified. launch_app the browser by its command name, without cdp=false, to navigate through CDP, or drive the address bar with keyboard_key ctrl+l, keyboard_type and a screenshot"
+                            "{error}, so the address bar cannot be checked and the destination could not be verified. launch_app the browser by its command name, without cdp=false, to navigate through CDP, or drive the address bar with keyboard_key ctrl+l, keyboard_type and a screenshot{}",
+                            profile_picker_hint(&window.title)
                         ),
                     ));
                 }
@@ -25314,10 +25402,7 @@ fn chrome_profile_entries(state: &serde_json::Value) -> Vec<String> {
     let mut profiles = cache
         .iter()
         .map(|(directory, info)| {
-            // Whole seconds, without a float-to-integer cast.
-            let used = info["active_time"]
-                .as_number()
-                .and_then(|time| time.to_string().split('.').next()?.parse::<i64>().ok());
+            let used = profile_active_time(info);
             (directory, info["name"].as_str().unwrap_or_default(), used)
         })
         .collect::<Vec<_>>();
@@ -25382,7 +25467,7 @@ fn host_chrome_profiles() -> Vec<String> {
 /// What a session's Chrome runs on when this machine has Chrome profiles. A
 /// model that read only launch_app took the signed-in profile for off limits
 /// (#962), so the description says what it is for.
-const SIGNED_IN_PROFILE: &str = " Without --user-data-dir, Chrome runs on a session copy of the account holder's signed-in profile: sites open signed in, and using those sign-ins is intended.";
+const SIGNED_IN_PROFILE: &str = " Without --user-data-dir, Chrome runs on a session copy of the account holder's signed-in profile (the last used by default): sites open signed in, and using those sign-ins is intended.";
 
 /// `description` with [`SIGNED_IN_PROFILE`] and as many Chrome profiles as fit
 /// the client's 2048-character description limit.
@@ -31740,7 +31825,39 @@ mod transient_capture_tests {
 
 #[cfg(test)]
 mod chrome_profile_tests {
-    use super::{chrome_profile_entries, with_chrome_profiles};
+    use super::{
+        chrome_profile_entries, last_profile_arms, profile_picker_hint, profile_to_open,
+        with_chrome_profiles,
+    };
+
+    #[test]
+    fn with_two_profiles_the_wrapper_opens_the_last_used_not_the_picker() -> Result<(), String> {
+        // #976: Chrome with "Default" and "Profile 2" opened its profile picker.
+        let two = serde_json::json!({"profile":{"last_used":"Profile 2","info_cache":{
+            "Default":{"active_time":1794271990.5}, "Profile 2":{"active_time":1794271924.6}}}});
+        assert_eq!(profile_to_open(&two).as_deref(), Some("Profile 2"));
+        // A last_used that names no profile: the one active last.
+        let stale = serde_json::json!({"profile":{"last_used":"Gone","info_cache":{
+            "Default":{"active_time":1794271990.5}, "Profile 2":{"active_time":1794271924.6}}}});
+        assert_eq!(profile_to_open(&stale).as_deref(), Some("Default"));
+        let one =
+            serde_json::json!({"profile":{"last_used":"Default","info_cache":{"Default":{}}}});
+        assert_eq!(profile_to_open(&one), None, "one profile has no picker");
+
+        let home =
+            std::env::temp_dir().join(format!("kwin-mcp-last-profile-{}", std::process::id()));
+        let chrome = home.join(".config/google-chrome");
+        std::fs::create_dir_all(&chrome).map_err(|error| error.to_string())?;
+        std::fs::write(chrome.join("Local State"), two.to_string())
+            .map_err(|error| error.to_string())?;
+        let arms = last_profile_arms(&home);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(arms, "  google-chrome) last_profile='Profile 2' ;;\n");
+
+        assert!(profile_picker_hint("Google Chrome").contains("--profile-directory"));
+        assert_eq!(profile_picker_hint("Example Domain - Google Chrome"), "");
+        Ok(())
+    }
 
     #[test]
     fn profiles_are_listed_by_last_use_with_directory_and_name() {
@@ -31777,7 +31894,7 @@ mod chrome_profile_tests {
         assert!(described.contains(super::SIGNED_IN_PROFILE), "{described}");
         assert!(described.contains("\"Profile 0\""));
         // Room for what the profile is for but for no profile: that sentence (#962).
-        let short = "x".repeat(1860);
+        let short = "x".repeat(2048 - super::SIGNED_IN_PROFILE.chars().count() - 10);
         assert_eq!(
             with_chrome_profiles(short.clone(), &profiles),
             format!("{short}{}", super::SIGNED_IN_PROFILE)
