@@ -8740,12 +8740,50 @@ fn sweep_orphaned_workdirs(owners: Option<&std::collections::HashSet<u32>>) -> s
     Ok(())
 }
 
+/// Whether `dir` carries an autoclean lease the leased sweep looks after: one
+/// that names its sandbox, or one a live server holds locked. A server writes
+/// the sandbox into its lease only once the sandbox runs, so one killed while
+/// its session was starting leaves an empty lease that nobody holds; the
+/// leased sweep cannot read it and the workdir used to stay forever, with its
+/// disk twin (#974, #975). The dead-owner checks decide about that workdir.
+fn lease_in_force(dir: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(WORKDIR_LEASE_FILE);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 0 {
+        return true;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&path)
+        .map_or(true, |lease| lease.try_lock().is_err())
+}
+
+/// Which part of the dead-owner sweep runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SweepScope {
+    /// Leaked workdirs and their disk twins: what an --autoclean server sweeps.
+    Everything,
+    /// Only disk twins under `session_disk_root`, which a session's teardown
+    /// deletes whatever the server's flags, while a workdir without
+    /// --autoclean outlives its session on purpose: every server sweeps these.
+    DiskTwins,
+}
+
+/// How often a running server sweeps again: leftovers of servers that died
+/// meanwhile are reaped even while no new server starts (#975).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
 /// Workdirs without an autoclean lease live until their server exits. Once the
 /// owning server is gone they are leaked: remove them, unless a live kwin-mcp
 /// still has that pid, something is mounted inside, or any process still names
 /// the directory on its command line (a surviving sandbox binds it by path).
 fn sweep_dead_owner_workdirs(
     owners: Option<&std::collections::HashSet<u32>>,
+    scope: SweepScope,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let runtimes = session_runtime_roots();
@@ -8758,7 +8796,11 @@ fn sweep_dead_owner_workdirs(
         .collect();
     // Disk twins (session_disk_root) count too: a twin whose workdir is gone,
     // removed above or cleared from /tmp by a reboot, is leaked the same way.
-    for root in runtimes.iter().cloned().chain([session_disk_root()]) {
+    let roots = match scope {
+        SweepScope::Everything => runtimes.clone(),
+        SweepScope::DiskTwins => Vec::new(),
+    };
+    for root in roots.into_iter().chain([session_disk_root()]) {
         let runtime = runtimes.contains(&root);
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
@@ -8784,11 +8826,15 @@ fn sweep_dead_owner_workdirs(
             }) {
                 continue;
             }
-            if !runtime
-                && runtimes
-                    .iter()
-                    .any(|temp| std::fs::symlink_metadata(temp.join(name)).is_ok())
-            {
+            // A twin waits for its workdir: the leased sweep removes both,
+            // and above the workdir goes first. A disk-twin sweep, which leaves
+            // workdirs alone, waits only for a lease in force.
+            let waits_for_workdir = |temp: &PathBuf| {
+                let workdir = temp.join(name);
+                std::fs::symlink_metadata(&workdir).is_ok()
+                    && (scope == SweepScope::Everything || lease_in_force(&workdir))
+            };
+            if !runtime && runtimes.iter().any(waits_for_workdir) {
                 continue;
             }
             let dir = entry.path();
@@ -8798,7 +8844,7 @@ fn sweep_dead_owner_workdirs(
             if !metadata.file_type().is_dir() || metadata.uid() != uid {
                 continue;
             }
-            if std::fs::symlink_metadata(dir.join(WORKDIR_LEASE_FILE)).is_ok() {
+            if lease_in_force(&dir) {
                 continue;
             }
             let owner_alive = std::fs::read_link(format!("/proc/{pid_text}/exe"))
@@ -23284,7 +23330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Result<_, _>>()?;
             let owners = (!owners.is_empty()).then_some(&owners);
             sweep_orphaned_workdirs(owners)?;
-            sweep_dead_owner_workdirs(owners)?;
+            sweep_dead_owner_workdirs(owners, SweepScope::Everything)?;
             if let Some(owners) = owners {
                 for owner in owners {
                     for root in session_runtime_roots()
@@ -27852,30 +27898,36 @@ fn client_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(owned)
 }
 
-/// Startup sweeps for `--autoclean`, on a thread of their own. Nothing a
-/// client asks first depends on them, and both take as long as the host makes
-/// them: the leased sweep deletes each orphaned workdir with its disk twin (a
+/// Sweeps at startup and every `SWEEP_INTERVAL` after, on a thread of their
+/// own: with `--autoclean` leaked workdirs and their disk twins, without it
+/// only the disk twins of servers that are gone (#974, #975). Nothing a client
+/// asks first depends on them, and they take as long as the host makes them:
+/// the leased sweep deletes each orphaned workdir with its disk twin (a
 /// browser profile is hundreds of thousands of files), and the other scans
 /// every process's command line. Run before the MCP handshake, they made
 /// `initialize` wait for another server's leftovers on a busy disk (#879).
 fn sweep_at_startup(display: DisplayConfig) {
-    if !display.autoclean {
-        return;
-    }
     let sweeps = std::thread::Builder::new()
         .name("kwin-mcp-sweep".to_owned())
-        .spawn(|| {
-            if let Err(error) = sweep_orphaned_workdirs(None) {
-                eprintln!("autoclean: orphan sweep skipped: {error}");
-            }
-            // A disk twin whose server died without a lease, or whose /tmp
-            // workdir is gone, is not reached by the leased sweep above.
-            if let Err(error) = sweep_dead_owner_workdirs(None) {
-                eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+        .spawn(move || {
+            loop {
+                if display.autoclean {
+                    if let Err(error) = sweep_orphaned_workdirs(None) {
+                        eprintln!("autoclean: orphan sweep skipped: {error}");
+                    }
+                    // A disk twin whose server died without a lease, or whose
+                    // /tmp workdir is gone, is not reached by the leased sweep.
+                    if let Err(error) = sweep_dead_owner_workdirs(None, SweepScope::Everything) {
+                        eprintln!("autoclean: leaked workdir sweep skipped: {error}");
+                    }
+                } else if let Err(error) = sweep_dead_owner_workdirs(None, SweepScope::DiskTwins) {
+                    eprintln!("sweep: leaked disk twin sweep skipped: {error}");
+                }
+                std::thread::sleep(SWEEP_INTERVAL);
             }
         });
     if let Err(error) = sweeps {
-        eprintln!("autoclean: startup sweeps skipped: {error}");
+        eprintln!("sweep: sweeps skipped: {error}");
     }
 }
 
