@@ -20,7 +20,7 @@ pub const TYPED_MAX_CHARS: usize = 128;
 const SHOWN_URL_CHARS: usize = 2000;
 
 /// Chromium's Views class of the address bar; its accessible name is translated.
-const ADDRESS_BAR_CLASS: &str = "OmniboxViewViews";
+pub const ADDRESS_BAR_CLASS: &str = "OmniboxViewViews";
 /// The address of the page Chrome shows when an address did not load.
 const ERROR_PAGE_SCHEME: &str = "chrome-error:";
 const UI_SURVEY_TIMEOUT: Duration = Duration::from_secs(3);

@@ -643,6 +643,37 @@ fn cdp_reaches_the_browser_again_after_the_server_reexecutes_itself() {
 
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
+fn method_address_bar_types_the_address_as_a_person_does_with_cdp_too() {
+    // #958: a bot-protected site answered navigations through CDP with an
+    // error page and typed ones with the page.
+    let fixture = Fixture::start();
+    let (mut wire, _) = browser("958", &fixture, true);
+    let direct = fixture.url("/direct");
+    landed(&wire.navigate(&direct), &direct, "cdp");
+    let by_hand = fixture.url("/by-hand");
+    let typed = wire.tool(
+        "browser_navigate",
+        json!({"url":by_hand, "method":"address_bar", "speed":3}),
+    );
+    landed(&typed, &by_hand, TYPED);
+    assert_eq!(fixture.requests_for("/by-hand"), 1, "{typed}");
+    wire.keep("958-typed-with-cdp");
+
+    // Return in the address bar is where the key belongs: no focus warning.
+    let shortcut = wire.tool("keyboard_key", json!({"key":"ctrl+l"}));
+    assert!(shortcut["error"].is_null(), "{shortcut}");
+    let address = fixture.url("/returned");
+    let entered = wire.tool("keyboard_type", json!({"text":address, "speed":3}));
+    assert!(entered["error"].is_null(), "{entered}");
+    let returned = wire.tool("keyboard_key", json!({"key":"Return"}));
+    let content = &returned["result"]["structuredContent"];
+    assert!(content.get("warning").is_none(), "{returned}");
+    assert_eq!(content["keyboard_focus"], "address_bar", "{returned}");
+    fixture.wait_for("/returned");
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Chrome, and input devices"]
 fn with_cdp_the_tab_is_navigated_directly_and_read_back() {
     let fixture = Fixture::start();
     let (mut wire, first) = browser("cdp", &fixture, true);
