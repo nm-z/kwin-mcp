@@ -28,17 +28,20 @@ MCP server for KWin Wayland GUI automation. Single-binary Rust using `rmcp` + `r
 | `keyboard_key` | Press a key or key combo (e.g. `ctrl+c`, `Return`). |
 | `keyboard_press` / `keyboard_release` | Hold a key or combo down across calls, then release it with the same string. For a shortcut use `keyboard_key`: a modifier left held makes every typed character a shortcut (`h` becomes Ctrl+H), so `keyboard_type` refuses with `modifier_held` until it is released. |
 | `launch_app` | Launch an application and wait for its window, or with `expect_window: false` return its session PID once the command is submitted. With no session it starts a default one and returns its `session_id`. `cdp: false` starts a browser without a debugging port (see [Browser CDP](#browser-cdp)). |
-| `wait_for_file` | Wait for a session file to appear and remain stable before exporting it. |
-| `export_file` | Copy a session file (e.g. a finished download) to a real host path and verify it byte for byte. |
+| `export_file` | Copy a session file (e.g. a download) to a real host path and verify it byte for byte, waiting for it first with `timeout_seconds`. |
 | `import_file` | Refresh a running session's file from the host, with byte verification and explicit overwrite control. |
 
-When a producer writes an artifact asynchronously, call `wait_for_file` with
-its absolute session path before `export_file`. The file is ready when it is a
-regular file whose inode, size, and modification time remain unchanged for
-`stable_for_ms` (default 500 ms, range 100–5000), within `timeout_seconds`
-(default 30, range 1–300). A timeout distinguishes a missing file from one
-that is still changing. This bounded observation does not prove that the
-producer has exited.
+When a producer writes an artifact asynchronously, give `export_file` a
+`timeout_seconds` (range 1–300; the default 0 copies what is there at once).
+It then waits until the file exists as a regular file, no partial download of
+it remains beside it (`.crdownload`, `.part`, `.download`), and its inode, size,
+and modification time stay unchanged for `stable_for_ms` (default 500 ms, range
+100–5000), and copies it in the same call. A timeout writes nothing and says
+whether the file was `missing`, `downloading` or `changing`. This bounded
+observation does not prove that the producer has exited. The wait has to run
+inside kwin-mcp: the file is in the session's HOME overlay, which the agent's
+own shell on the host does not see. The separate `wait_for_file` tool this
+replaced was removed (#969).
 
 ## Uploading a host-created file
 
@@ -48,12 +51,10 @@ overlay, files can have startup-time copies or read-only mounts, and the
 session has a private `/tmp`. A chooser accepting a path does not establish
 that the selected file matches the host attachment.
 
-Before selecting an attachment, call `wait_for_file` with its absolute
-`session_path` and compare the returned `size_bytes` with the known host file
-size. `status: "ready"` means stable, and can include a zero-byte file; it does
-not compare the host and session contents. If exact content identity matters,
-also compare the file hashes using the session application or terminal and
-the host source.
+Before selecting an attachment, call `import_file` with the host file and its
+`session_path`: it copies the host bytes into the session and verifies them
+byte for byte, so the chooser reads exactly the host file. It keeps a session
+file that already exists unless `overwrite` is true.
 
 If the session copy is missing, empty, or different, transfer the intended
 bytes into a file in the current session before selecting it. Alternatively,

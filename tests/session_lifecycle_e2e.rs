@@ -4562,18 +4562,34 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         "session write leaked to the host without export"
     );
 
+    // export_file waits for a file when asked to (#969): a timeout says why.
     let not_ready = call_tool(
         &mut client,
         4,
-        "wait_for_file",
+        "export_file",
         json!({
             "session_path": home.join("Downloads/not-yet-created.txt"),
+            "host_path": home.join("out"),
             "timeout_seconds": 1,
             "stable_for_ms": 100,
         }),
     );
-    assert_eq!(not_ready["error"]["data"]["status"], json!("not_ready"));
-    assert_eq!(not_ready["error"]["data"]["reason"], json!("missing"));
+    let refusal = &not_ready["error"]["data"];
+    assert_eq!(refusal["status"], json!("not_exported"), "{not_ready}");
+    assert_eq!(refusal["reason"], json!("not_ready"), "{not_ready}");
+    assert_eq!(refusal["file"], json!("missing"), "{not_ready}");
+    let downloading = call_tool(
+        &mut client,
+        40,
+        "export_file",
+        json!({
+            "session_path": home.join("Downloads/partial.zip"),
+            "host_path": home.join("out"),
+            "timeout_seconds": 1,
+        }),
+    );
+    let state = &downloading["error"]["data"]["file"];
+    assert_eq!(state, &json!("downloading"), "{downloading}");
 
     let delayed = home.join("Downloads/capture.txt");
     let producer = format!(
@@ -4590,24 +4606,15 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         json!("new"),
         "{launched}"
     );
-    let ready = call_tool(
-        &mut client,
-        6,
-        "wait_for_file",
-        json!({
-            "session_path": delayed,
-            "timeout_seconds": 10,
-            "stable_for_ms": 500,
-        }),
-    );
-    let readiness = &ready["result"]["structuredContent"];
-    assert_eq!(readiness["status"], json!("ready"), "{ready}");
-    assert_eq!(readiness["size_bytes"], json!(17), "{ready}");
+    // Written 3 s from now: one call waits for it and copies it.
     let delayed_export = call_tool(
         &mut client,
         7,
         "export_file",
-        json!({"session_path": delayed, "host_path": home.join("out")}),
+        json!({
+            "session_path": delayed, "host_path": home.join("out"),
+            "timeout_seconds": 10, "stable_for_ms": 500,
+        }),
     );
     assert_eq!(
         delayed_export["result"]["structuredContent"]["status"],
