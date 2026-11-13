@@ -13667,17 +13667,44 @@ async fn cdp_dial(port: u16) -> Result<CdpLink, String> {
     })
 }
 
+/// The forwarded CDP ports of this process's live sessions. A listener carries
+/// a peer's CDP connections to these ports and to no other (#961).
+static SESSION_CDP_PORTS: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn session_cdp_ports() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<u16>> {
+    SESSION_CDP_PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The session's CDP link to its browser. launch_app makes it; it is made
 /// again on demand when there is none, as after a re-execution, which keeps no
-/// connection, or when the kept one stops answering (#957).
-#[derive(Default)]
+/// connection, or when the kept one stops answering (#957). The slot holds
+/// the session's port in [`SESSION_CDP_PORTS`] for as long as it lives.
 struct CdpSlot {
     link: std::sync::Mutex<Option<CdpLink>>,
     /// Held while a new connection is dialed, so concurrent calls make one.
     dialing: tokio::sync::Mutex<()>,
+    port: u16,
+}
+
+impl Drop for CdpSlot {
+    fn drop(&mut self) {
+        session_cdp_ports().remove(&self.port);
+    }
 }
 
 impl CdpSlot {
+    fn new(port: u16) -> Self {
+        session_cdp_ports().insert(port);
+        Self {
+            link: std::sync::Mutex::default(),
+            dialing: tokio::sync::Mutex::default(),
+            port,
+        }
+    }
+
     fn current(&self) -> Option<CdpLink> {
         self.link
             .lock()
@@ -17674,7 +17701,7 @@ impl KwinMcp {
             host_xdg_dir,
             _uinput_mouse: uinput_mouse_fd,
             _uinput_keyboard: uinput_keyboard_fd,
-            cdp: Arc::default(),
+            cdp: Arc::new(CdpSlot::new(cdp_forward_port)),
             cdp_forward_port,
             service_proxy_children: service_proxy_children
                 .into_iter()
@@ -21961,7 +21988,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "launch_app",
-        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned forwarded CDP port, replacing --remote-debugging-port, on the signed-in default profile too (cdp=false: no port). Successful CDP returns cdp_port. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
+        description = "Run a shell command in the isolated desktop. With no session, starts one and returns its session_id. Waits 30s by default (window_timeout_seconds 1-120) for a new window, or the one a running browser reused. A command still running with no window by then is an error: slow_start if its processes are busy, else window_not_observed; window_list names the launch on a later window. expect_window=false (background or non-GUI work) returns the PID, plus exit_status if the command ends within one second. retry_safe=false: inspect state before repeating the command. Stdout is discarded, except with expect_window=false: then it goes to stdout_path in host_shared_dir, quoted as stdout_tail if the command already exited. Other /tmp paths are private. Absolute host path arguments must be visible inside the session. Browser names resolved through PATH get missing Wayland, KWallet, accessibility and no-first-run switches; Chromium-family ones also get a server-assigned forwarded CDP port, replacing --remote-debugging-port, on the signed-in default profile too (cdp=false: no port). Successful CDP returns cdp_port, a port of this machine's 127.0.0.1 also for a session started with host. Branded Chrome ignores --load-extension; use chrome://extensions > Load unpacked. A window mapped after the launch baseline counts, even from a helper process. HOME writes stay in an overlay unless shared (export_file copies out); home_overlay names such arguments and stale copies (import_file refreshes). Use saved-credential autofill without reading or typing credentials; otherwise open viewer_open for the user."
     )]
     async fn launch_app(
         &self,
@@ -24526,6 +24553,9 @@ struct RemoteSessions {
     /// Sessions whose connection ended. Their listener stopped them, and a new
     /// connection to the same host does not know them.
     lost: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// session_id → the port on this machine's loopback that carries CDP
+    /// connections to the session's CDP port on its machine (#961).
+    cdp_forwards: std::sync::Mutex<std::collections::BTreeMap<String, CdpForward>>,
     /// The serial of the next connection.
     next_serial: std::sync::atomic::AtomicU64,
     /// session_id → the viewer window on this machine. Held across a whole
@@ -24561,6 +24591,33 @@ struct RemoteRestore {
     /// Sessions whose connection had ended.
     #[serde(default)]
     lost: std::collections::BTreeSet<String>,
+    /// session_id → the CDP forward to keep, on the same local port.
+    #[serde(default)]
+    cdp_forwards: std::collections::BTreeMap<String, CdpForwardRestore>,
+}
+
+/// A CDP forward in the reload state.
+#[derive(Serialize, Deserialize)]
+struct CdpForwardRestore {
+    host: String,
+    remote_port: u16,
+    local_port: u16,
+}
+
+/// The loopback port of this machine that carries the CDP connections of
+/// local clients to a remote session's CDP port (#961). Dropping it stops
+/// taking new connections; those under way end with either side.
+struct CdpForward {
+    host: String,
+    remote_port: u16,
+    local_port: u16,
+    accepting: tokio::task::AbortHandle,
+}
+
+impl Drop for CdpForward {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
 }
 
 /// Everything about the sessions on other machines stands still while this
@@ -24661,6 +24718,69 @@ impl RemoteSessions {
     fn forget(&self, id: &str) {
         self.sessions().remove(id);
         self.lost().remove(id);
+        self.cdp_forwards().remove(id);
+    }
+    fn cdp_forwards(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, CdpForward>> {
+        self.cdp_forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The port on this machine's loopback that carries CDP connections to
+    /// port `remote` of session `id` on `host`: the same number when it is
+    /// free here (`preferred` names another to try first), else any. Each
+    /// connection goes over a socket of its own to the listener, which joins
+    /// it to the session's CDP port there (#961).
+    async fn forward_cdp(
+        &self,
+        id: &str,
+        host: &str,
+        remote: u16,
+        preferred: Option<u16>,
+    ) -> Result<u16, String> {
+        if let Some(forward) = self.cdp_forwards().get(id)
+            && forward.remote_port == remote
+            && forward.host == host
+        {
+            return Ok(forward.local_port);
+        }
+        let secret = Arc::new(remote::read_secret()?);
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        let mut bound = None;
+        for port in [preferred.unwrap_or(remote), remote, 0] {
+            if let Ok(listener) = tokio::net::TcpListener::bind((loopback, port)).await {
+                bound = Some(listener);
+                break;
+            }
+        }
+        let listener = bound.ok_or_else(|| "no loopback port could be bound".to_owned())?;
+        let local = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let authority = host.to_owned();
+        let accepting = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (secret, authority) = (secret.clone(), authority.clone());
+                tokio::spawn(async move {
+                    match remote::connect_cdp(&authority, &secret, remote).await {
+                        Ok(socket) => remote::pipe(socket, stream).await,
+                        Err(error) => {
+                            eprintln!("cdp forward: {authority} port {remote}: {error}")
+                        }
+                    }
+                });
+            }
+        });
+        let forward = CdpForward {
+            host: host.to_owned(),
+            remote_port: remote,
+            local_port: local,
+            accepting: accepting.abort_handle(),
+        };
+        self.cdp_forwards().insert(id.to_owned(), forward);
+        Ok(local)
     }
     /// The open connection to `host`, if there is one.
     async fn connected(&self, host: &str) -> Option<rmcp::Peer<rmcp::RoleClient>> {
@@ -24703,6 +24823,10 @@ impl RemoteSessions {
                 "remote: the connection to {host} has ended; its {} sessions there stopped with it",
                 carried.len()
             );
+        }
+        let mut forwards = self.cdp_forwards();
+        for id in &carried {
+            forwards.remove(id);
         }
         lost.extend(carried);
     }
@@ -24872,6 +24996,20 @@ impl RemoteSessions {
             };
             (state, None)
         };
+        let forwards = |sessions: &std::collections::BTreeMap<String, String>| {
+            self.cdp_forwards()
+                .iter()
+                .filter(|(id, _)| sessions.contains_key(*id))
+                .map(|(id, forward)| {
+                    let kept = CdpForwardRestore {
+                        host: forward.host.clone(),
+                        remote_port: forward.remote_port,
+                        local_port: forward.local_port,
+                    };
+                    (id.clone(), kept)
+                })
+                .collect()
+        };
         let locked = tokio::time::timeout(REMOTE_HOLD_WAIT, async {
             let viewers = self.viewers.lock().await;
             let hosts = self.hosts.lock().await;
@@ -24939,6 +25077,7 @@ impl RemoteSessions {
             })
             .collect();
         let state = RemoteRestore {
+            cdp_forwards: forwards(&sessions),
             hosts: kept,
             sessions,
             viewers: open_viewers,
@@ -24995,6 +25134,21 @@ impl RemoteSessions {
         }
         *self.sessions() = state.sessions;
         *self.lost() = state.lost;
+        // The old image's listening sockets closed with it: bind the same ports.
+        drop(hosts);
+        for (id, kept) in state.cdp_forwards {
+            let forwarded = self
+                .forward_cdp(&id, &kept.host, kept.remote_port, Some(kept.local_port))
+                .await;
+            match forwarded {
+                Ok(port) if port == kept.local_port => {}
+                Ok(port) => eprintln!(
+                    "reload: the CDP forward of {id} moved from port {} to {port}",
+                    kept.local_port
+                ),
+                Err(error) => eprintln!("reload: the CDP forward of {id} is gone: {error}"),
+            }
+        }
         let mut viewers = self.viewers.lock().await;
         for (id, pid) in state.viewers {
             let mut viewer = RemoteViewer::new(&id);
@@ -25016,6 +25170,7 @@ impl RemoteSessions {
         for viewer in viewers.into_values() {
             viewer.discard().await;
         }
+        drop(std::mem::take(&mut *self.cdp_forwards()));
         let hosts = std::mem::take(&mut *self.hosts.lock().await);
         for (host, link) in hosts {
             eprintln!("remote: closing the connection to {host}; its sessions stop with it");
@@ -25341,7 +25496,8 @@ impl SessionRouter {
         // Held until a stopped session is forgotten, so a re-execution never
         // carries one along.
         let calling = self.remote.calls.read().await;
-        let result = remote_call(&listener, host, request).await;
+        let launch = request.name == "launch_app";
+        let mut result = remote_call(&listener, host, request).await;
         let stopped = stop
             && result.as_ref().is_ok_and(|done| {
                 done.structured_content
@@ -25356,7 +25512,35 @@ impl SessionRouter {
         if stopped {
             self.remote.discard_viewer(id).await;
         }
+        if launch && let Ok(launched) = result.as_mut() {
+            self.forward_launched_cdp(launched, id, host).await;
+        }
         result
+    }
+    /// A launch_app result of a session on another machine names a CDP port
+    /// of that machine's loopback. It is forwarded to this machine's, as a
+    /// local session's port is, and the result names the port here (#961).
+    async fn forward_launched_cdp(&self, launched: &mut CallToolResult, id: &str, host: &str) {
+        let Some(content) = launched.structured_content.as_mut() else {
+            return;
+        };
+        let Some(remote) = content["cdp_port"]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+        else {
+            return;
+        };
+        match self.remote.forward_cdp(id, host, remote, None).await {
+            Ok(local) => {
+                content["cdp_port"] = serde_json::json!(local);
+                content["cdp_forwarded_from"] = serde_json::json!({"host": host, "port": remote});
+            }
+            Err(error) => {
+                content["cdp_forward_error"] = serde_json::json!(format!(
+                    "cdp_port {remote} is a port of {host}'s loopback and could not be forwarded to this machine's: {error}"
+                ));
+            }
+        }
     }
     /// clipboard_write target=host for a session on another machine. The host
     /// clipboard is the one a viewer paste reads, and that session's viewer
@@ -27160,7 +27344,7 @@ impl SessionRouter {
                 mouse_sysname: saved.mouse_sysname,
                 kbd_sysname: saved.kbd_sysname,
                 // The browser keeps its port; the next CDP call connects again (#957).
-                cdp: Arc::default(),
+                cdp: Arc::new(CdpSlot::new(saved.cdp_port)),
                 cdp_forward_port: saved.cdp_port,
                 service_proxy_children: saved
                     .proxies
@@ -27582,6 +27766,23 @@ async fn serve_listener_peer(
         Ok(remote::Accepted::Frames { ticket, socket }) => {
             eprintln!("listen: {address} opened a frame socket");
             router.frame_sockets.deliver(ticket, socket);
+            return;
+        }
+        // One connection of a CDP client on the peer's machine, to a session's
+        // CDP port here (#961). Only such a port: never another loopback service.
+        Ok(remote::Accepted::Cdp { port, socket }) => {
+            if !session_cdp_ports().contains(&port) {
+                eprintln!(
+                    "listen: {address} asked for port {port}, which is no session's CDP port"
+                );
+                return;
+            }
+            match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Ok(stream) => remote::pipe(*socket, stream).await,
+                Err(error) => {
+                    eprintln!("listen: {address}: CDP port {port} did not answer: {error}")
+                }
+            }
             return;
         }
         Err(error) => {

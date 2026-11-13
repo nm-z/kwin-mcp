@@ -28,6 +28,13 @@ const KEEPALIVE_PROBES: u32 = 3;
 const MAX_MESSAGE_BYTES: usize = 256 << 20;
 /// Request path of a viewer's frame socket; any other path is a control socket.
 const FRAMES_PATH: &str = "/frames";
+/// Request path of a socket that carries one TCP connection to a session's
+/// CDP port on the listener's loopback (#961).
+const CDP_PATH: &str = "/cdp";
+/// Handshake header naming that port.
+const CDP_PORT_HEADER: &str = "x-kwin-mcp-cdp-port";
+/// Most bytes one read of a carried connection sends in one message.
+const PIPE_CHUNK_BYTES: usize = 64 << 10;
 /// Handshake header naming the `viewer_open` call a frame socket belongs to.
 const TICKET_HEADER: &str = "x-kwin-mcp-frame-ticket";
 /// Environment variable that hands a viewer the ticket of its frame socket.
@@ -574,6 +581,9 @@ pub enum Accepted<Tx, Rx> {
         ticket: String,
         socket: std::net::TcpStream,
     },
+    /// A socket that carries one TCP connection to CDP port `port` on the
+    /// listener's loopback, as binary messages. The listener checks the port.
+    Cdp { port: u16, socket: Box<FrameSocket> },
 }
 
 /// A new frame-socket ticket: 128 random bits as hexadecimal.
@@ -620,6 +630,8 @@ where
     let expected = format!("{AUTHORIZATION_SCHEME}{}", secret.0);
     // The ticket, once the peer asked for a frame socket.
     let mut frames: Option<String> = None;
+    // The port, once the peer asked for a CDP connection.
+    let mut cdp: Option<u16> = None;
     let authorize = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
         let refuse = |status: http::StatusCode, reason: &str| {
             let mut refusal = ErrorResponse::new(Some(reason.to_owned()));
@@ -645,6 +657,16 @@ where
                 .ok_or_else(|| refuse(http::StatusCode::BAD_REQUEST, "frame ticket required"))?;
             frames = Some(ticket.to_owned());
         }
+        if request.uri().path() == CDP_PATH {
+            let port = request
+                .headers()
+                .get(CDP_PORT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(|| refuse(http::StatusCode::BAD_REQUEST, "CDP port required"))?;
+            cdp = Some(port);
+        }
         Ok(response)
     };
     let socket = tokio::time::timeout(
@@ -664,6 +686,10 @@ where
             format!("the handshake failed: {error}")
         }
     })?;
+    if let Some(port) = cdp {
+        let socket = Box::new(socket);
+        return Ok(Accepted::Cdp { port, socket });
+    }
     let Some(ticket) = frames else {
         let (sink, stream) = json_frames(socket, None);
         return Ok(Accepted::Control(sink, stream));
@@ -833,6 +859,79 @@ pub async fn connect_frames(
     })
     .await
     .map_err(|_| "connecting timed out".to_owned())?
+}
+
+/// Caller side: a socket to the listener at `authority` that carries one TCP
+/// connection to CDP port `port` on the listener's loopback (#961).
+pub async fn connect_cdp(
+    authority: &str,
+    secret: &Secret,
+    port: u16,
+) -> Result<FrameSocket, String> {
+    let mut request = client_request(authority, CDP_PATH, secret)?;
+    request
+        .headers_mut()
+        .insert(CDP_PORT_HEADER, http::HeaderValue::from(port));
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .map_err(|error| format!("could not connect: {error}"))?;
+        detect_dead_peer(&stream).map_err(|error| format!("socket options: {error}"))?;
+        let (socket, _) = async_tungstenite::tokio::client_async_with_config(
+            request,
+            stream,
+            Some(websocket_config()),
+        )
+        .await
+        .map_err(handshake_error)?;
+        Ok(socket)
+    })
+    .await
+    .map_err(|_| "connecting timed out".to_owned())?
+}
+
+/// Carries the bytes of `stream` over `socket` both ways, one binary message
+/// per read, until either side ends; then both are closed.
+pub async fn pipe(socket: FrameSocket, stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut sink, mut source) = StreamExt::split(socket);
+    let (mut reader, mut writer) = stream.into_split();
+    let outward = async {
+        let mut buffer = vec![0u8; PIPE_CHUNK_BYTES];
+        while let Ok(read) = reader.read(&mut buffer).await {
+            let Some(bytes) = buffer.get(..read).filter(|bytes| !bytes.is_empty()) else {
+                break;
+            };
+            if sink
+                .send(tungstenite::Message::binary(bytes.to_vec()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+    let inward = async {
+        while let Some(Ok(message)) = source.next().await {
+            let bytes = match message {
+                tungstenite::Message::Binary(bytes) => bytes,
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Text(_)
+                | tungstenite::Message::Ping(_)
+                | tungstenite::Message::Pong(_)
+                | tungstenite::Message::Frame(_) => continue,
+            };
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = outward => {}
+        () = inward => {}
+    }
+    let _ = writer.shutdown().await;
+    let _ = sink.close().await;
 }
 
 /// Client side: connects to a listener and presents the shared secret.
