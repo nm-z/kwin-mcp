@@ -305,6 +305,7 @@ mod input_bridge;
 mod loopback_forward;
 mod netns_holder;
 mod secret_service;
+mod serial_devices;
 mod session_registry;
 mod ui_names;
 use kwin_mcp::remote;
@@ -4468,6 +4469,8 @@ fn compact_session_result(payload: &mut serde_json::Value) {
             "host_write_paths",
             "host_loopback_warning",
             "host_access",
+            "serial_devices",
+            "serial_warning",
         ],
     );
 }
@@ -14817,6 +14820,9 @@ fn invisible_launch_path(path_error_file: &Path) -> Option<McpError> {
     // one host directory the session sees at the same path.
     let shared = path_error_file.parent();
     let detail = match shared {
+        _ if Path::new(&path).starts_with("/dev") => {
+            "of the host's device nodes the session shows its serial devices (every tty of a serial driver, and the /dev/serial links) and no others".to_owned()
+        }
         Some(shared) if Path::new(&path).starts_with("/tmp") => format!(
             "/tmp is private to the session; copy what the command needs into host_shared_dir {}, which the host and the session see at the same path, or copy a host file into the session with import_file",
             shared.display()
@@ -17371,6 +17377,9 @@ impl KwinMcp {
                 }
             }
         }
+        // Every host serial device and udev's links to them (#981).
+        let serial = serial_devices::host_devices();
+        cmd.args(serial_devices::bwrap_args(&serial));
         cmd.args([
             "--dev-bind",
             "/dev/uinput",
@@ -17567,6 +17576,33 @@ impl KwinMcp {
                     eprintln!("session_start: host loopback forwarder: {error}");
                     Some(format!(
                         "servers listening on the host's 127.0.0.1 or ::1 are not reachable from this session: the forwarder did not start ({error})"
+                    ))
+                }
+            }
+        };
+        // Serial devices plugged in from now on (see serial_devices).
+        let serial_warning = {
+            let log = std::fs::File::create(host_xdg_dir.join("serial-devices.log"));
+            let mut watcher = std::process::Command::new("/proc/self/exe");
+            watcher
+                .arg(serial_devices::WATCH_FLAG)
+                .arg(sandbox_pid.to_string())
+                .args(serial.keys())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(
+                    log.map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from),
+                );
+            terminate_with_parent(&mut watcher);
+            match spawn_session_child(watcher, false).await {
+                Ok(child) => {
+                    startup.add_proxy(child);
+                    None
+                }
+                Err(error) => {
+                    eprintln!("session_start: serial device watcher: {error}");
+                    Some(format!(
+                        "serial devices plugged in after session_start are not shown in this session: the watcher did not start ({error})"
                     ))
                 }
             }
@@ -17918,6 +17954,8 @@ impl KwinMcp {
             "host_access": host_access,
             "host_write_paths": host_write_paths,
             "host_loopback_warning": host_loopback_warning,
+            "serial_devices": serial_devices::report(&serial),
+            "serial_warning": serial_warning,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
@@ -23403,6 +23441,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Still single-threaded here, which entering a user namespace needs.
         Some(loopback_forward::SOCKETS_FLAG) => {
             loopback_forward::run_socket_maker(argv)?;
+            return Ok(());
+        }
+        Some(serial_devices::WATCH_FLAG) => {
+            serial_devices::run_watcher(argv)?;
+            return Ok(());
+        }
+        // Single-threaded as well: it enters the session's user namespace.
+        Some(serial_devices::BIND_FLAG) => {
+            serial_devices::run_binder(argv)?;
             return Ok(());
         }
         // One orphan sweep, then exit: kwin-mcp-shim runs this on a timer so
@@ -30915,8 +30962,28 @@ mod session_memory_warning_tests {
 
 #[cfg(test)]
 mod launch_failure_context_tests {
-    use super::{LaunchProgress, McpError, launch_failure, launch_script_write_error};
+    use super::{
+        LaunchProgress, McpError, invisible_launch_path, launch_failure, launch_script_write_error,
+    };
     use std::path::Path;
+
+    #[test]
+    fn issue981_a_hidden_device_node_names_what_the_session_shows() -> std::io::Result<()> {
+        let workdir = std::env::temp_dir().join(format!("kwin-mcp-981-{}", std::process::id()));
+        std::fs::create_dir_all(&workdir)?;
+        let marker = workdir.join("launch-0.path-error");
+        std::fs::write(&marker, "/dev/video0")?;
+        let error = invisible_launch_path(&marker);
+        let _ = std::fs::remove_dir_all(&workdir);
+        let error = error.ok_or_else(|| std::io::Error::other("no error for a hidden path"))?;
+        let message = &error.message;
+        assert!(
+            message.contains("/dev/video0 is not visible in the session")
+                && message.contains("serial devices"),
+            "{message}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn issue500_quota_failure_retains_errno_path_and_pre_submit_recovery() {

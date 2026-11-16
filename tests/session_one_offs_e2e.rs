@@ -10,11 +10,15 @@
 //!                 roles, also after the page renamed the element
 //!   concurrent_localhost (#862) two sessions started together both reach host servers
 //!                 bound to 127.0.0.1 or ::1 through `localhost`, every time
+//!   serial_devices (#981) every host serial device and /dev/serial link is in a session
+//!   serial_hotplug (#981) a serial device plugged in while the session runs can be
+//!                 opened there, and is gone from it once unplugged
 //!
 //! Run a case with `systemd-run --user --wait --pipe --collect env KWIN_MCP_E2E=1
 //! KWIN_MCP_E2E_SERVER=<binary> <test exe> --ignored --test-threads=1 NAME`.
 
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -826,4 +830,180 @@ fn concurrent_localhost() {
         case.join()
             .expect("a session did not reach its host server");
     }
+}
+
+/// The host's serial devices, as a session must show them: each character
+/// device in /dev whose number belongs to a driver that /proc/tty/drivers
+/// types `serial`, with its inode.
+fn host_serial_devices() -> Vec<(String, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let table = std::fs::read_to_string("/proc/tty/drivers").expect("read /proc/tty/drivers");
+    let ranges: Vec<(u64, u64, u64)> = table
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [.., major, minors, "serial"] = fields.as_slice() else {
+                return None;
+            };
+            let (first, last) = minors.split_once('-').unwrap_or((minors, minors));
+            Some((major.parse().ok()?, first.parse().ok()?, last.parse().ok()?))
+        })
+        .collect();
+    let mut devices = Vec::new();
+    for entry in std::fs::read_dir("/dev").expect("read /dev").flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_char_device() {
+            continue;
+        }
+        // glibc's encoding of a device number.
+        let rdev = metadata.rdev();
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        if ranges
+            .iter()
+            .any(|(owner, first, last)| *owner == major && (*first..=*last).contains(&minor))
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            devices.push((name, metadata.ino()));
+        }
+    }
+    devices.sort();
+    devices
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, and a host serial device (any ttyS port counts)"]
+fn serial_devices() {
+    require_e2e();
+    let host = host_serial_devices();
+    assert!(!host.is_empty(), "this case needs a host serial device");
+    let mut server = Server::start(&[]);
+    let started = server.start_session();
+    // session_start lists the ports with hardware behind them, all the host's.
+    for device in started["serial_devices"].as_array().into_iter().flatten() {
+        let path = device["path"].as_str().expect("path");
+        assert!(
+            host.iter().any(|(name, _)| format!("/dev/{name}") == path),
+            "{device} is not a host serial device"
+        );
+    }
+    let names: Vec<&str> = host.iter().map(|(name, _)| name.as_str()).collect();
+    let printed = server.shell(&format!(
+        "for name in {}; do [ -c /dev/$name ] && stat -c '%n %i' /dev/$name; done
+for link in /dev/serial/*/*; do [ -e \"$link\" ] && printf 'link %s %s\\n' \"$link\" \"$(readlink -f \"$link\")\"; done
+true",
+        names.join(" ")
+    ));
+    // The session's node is the host's inode.
+    for (name, inode) in &host {
+        assert!(
+            printed
+                .lines()
+                .any(|line| line == format!("/dev/{name} {inode}")),
+            "the session does not show /dev/{name} (inode {inode}): {printed}"
+        );
+    }
+    // Each udev link resolves to the node it names on the host.
+    for group in std::fs::read_dir("/dev/serial")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for link in std::fs::read_dir(group.path())
+            .expect("read links")
+            .flatten()
+        {
+            let target = std::fs::canonicalize(link.path()).expect("resolve link");
+            let expected = format!("link {} {}", link.path().display(), target.display());
+            assert!(
+                printed.lines().any(|line| line == expected),
+                "'{expected}' missing: {printed}"
+            );
+        }
+    }
+}
+
+/// dummy_hcd and g_serial: a gadget serial port (ttyGS*) and the ACM port
+/// (ttyACM*) the host side makes for it, two new serial devices. Unloaded
+/// when the case ends, however it ends.
+struct SerialGadget;
+
+impl SerialGadget {
+    fn plug() -> Self {
+        for module in ["dummy_hcd", "g_serial"] {
+            let (loaded, printed) =
+                output_of(Command::new("sudo").args(["-n", "modprobe", module]));
+            assert!(loaded, "sudo -n modprobe {module} failed: {printed}");
+        }
+        Self
+    }
+
+    fn unplug(&self) {
+        let (unloaded, printed) =
+            output_of(Command::new("sudo").args(["-n", "modprobe", "-r", "g_serial"]));
+        assert!(unloaded, "sudo -n modprobe -r g_serial failed: {printed}");
+    }
+}
+
+impl Drop for SerialGadget {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "modprobe", "-r", "g_serial", "dummy_hcd"])
+            .status();
+    }
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, the dummy_hcd and g_serial modules, and root through sudo -n"]
+fn serial_hotplug() {
+    require_e2e();
+    let before: BTreeSet<String> = host_serial_devices()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut server = Server::start(&[]);
+    server.start_session();
+    let gadget = SerialGadget::plug();
+    let added: Vec<String> = wait_until(30, "the gadget's ports on the host", || {
+        let added: Vec<String> = host_serial_devices()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !before.contains(name))
+            .collect();
+        (added.len() >= 2).then_some(added)
+    });
+    let port = |prefix: &str| {
+        added
+            .iter()
+            .filter(|name| name.starts_with(prefix))
+            .min()
+            .unwrap_or_else(|| panic!("no new {prefix} port: {added:?}"))
+            .clone()
+    };
+    let (gadget_port, host_port) = (port("ttyGS"), port("ttyACM"));
+    // Plugged in after session_start: both open in the session, and bytes
+    // written to the host side arrive at the gadget.
+    let printed = server.shell(&format!(
+        "for i in $(seq 100); do [ -c /dev/{gadget_port} ] && [ -c /dev/{host_port} ] && break; sleep 0.1; done
+stty -F /dev/{gadget_port} raw -echo && stty -F /dev/{host_port} raw -echo || exit 1
+timeout 3 cat /dev/{gadget_port} > \"$XDG_RUNTIME_DIR/received\" &
+sleep 0.5
+printf hello > /dev/{host_port}
+wait
+printf 'received %s\\n' \"$(cat \"$XDG_RUNTIME_DIR/received\")\""
+    ));
+    assert!(printed.contains("received hello"), "{printed}");
+    gadget.unplug();
+    let printed = server.shell(&format!(
+        "for i in $(seq 100); do [ -e /dev/{gadget_port} ] || [ -e /dev/{host_port} ] || break; sleep 0.1; done
+ls /dev/{gadget_port} /dev/{host_port}
+true"
+    ));
+    assert_eq!(
+        printed.matches("No such file").count(),
+        2,
+        "unplugged ports are still in the session: {printed}"
+    );
 }
