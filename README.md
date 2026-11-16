@@ -682,6 +682,11 @@ All coordinates are window-relative — window position is added internally via 
 
 Screenshots check the active window identity and geometry before and after the frame is captured. A changed target returns `capture_target_changed` with `expected_window` and `observed_window`; if the target cannot be read afterward, the reason is `capture_target_unavailable`. Neither failure returns or saves an image. Inspect `window_list`, activate the intended window, and capture again. Successful metadata records `target_verification.method=active_window_before_and_after` and the final observation. These two observations detect a different or moved target at the end of capture; they do not establish that focus never briefly changed and returned between observations.
 
+### Serial devices
+
+No serial device is virtual, so every session shows all of the host's ([#981](https://github.com/nm-z/kwin-mcp/issues/981)): each tty of a driver the kernel types `serial` in `/proc/tty/drivers` (`ttyACM*`, `ttyUSB*`, `ttyS*`, `ttyAMA*`, `ttyGS*`, `rfcomm*`, ...) at its host path, and `/dev/serial`, whose `by-id` and `by-path` links resolve to them. A program in the session opens the host's node, with the host's owner, mode and ACL and the user's groups (`uucp`, `dialout`), so it sets the line speed and the control lines (DTR, RTS) as on the host. A port that another process holds in exclusive mode (serialport and pyserial open ports that way by default) refuses a second open with `Device or resource busy`, in a session as on the host.
+
+`session_start` lists the ports that have hardware behind them in `serial_devices`, each with its udev `links`; legacy `ttyS` ports without a UART (type 0) are in the session but not in the list. A device plugged in while the session runs appears in it within a moment, one that is unplugged disappears (a program that has it open keeps its descriptor), and one that comes back as a new node replaces the old one: a watcher process per session (log: `serial-devices.log` in `host_shared_dir`) binds each change into the running session. When the watcher cannot start, `serial_warning` says so and only the devices present at `session_start` are shown. No other host device node is in the session; `launch_app` names a `/dev` path that the session cannot see.
 
 ### Host socket exposure
 
