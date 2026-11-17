@@ -95,7 +95,9 @@ impl Fixture {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
         let port = listener.local_addr().expect("fixture address").port();
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
@@ -138,7 +140,10 @@ impl Fixture {
         let (status, body) = match path.as_str() {
             "/" | "/index.html" => ("200 OK", page()),
             "/sub/frame.html" => ("200 OK", FRAME.to_owned()),
-            _ => ("404 Not Found", "<!doctype html><title>absent</title>".to_owned()),
+            _ => (
+                "404 Not Found",
+                "<!doctype html><title>absent</title>".to_owned(),
+            ),
         };
         let _ = write!(
             stream,
@@ -174,7 +179,8 @@ struct Wire {
 
 impl Wire {
     fn start(name: &str) -> Self {
-        let home = std::env::temp_dir().join(format!("kwin-mcp-links-{name}-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("kwin-mcp-links-{name}-{}", std::process::id()));
         std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
         let binary = std::env::var("KWIN_MCP_E2E_SERVER")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned());
@@ -296,7 +302,10 @@ impl Wire {
         let error = &reply["error"];
         assert!(!error.is_null(), "{name} was not refused: {reply}");
         (
-            error["data"]["reason"].as_str().unwrap_or_default().to_owned(),
+            error["data"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
             error["message"].as_str().unwrap_or_default().to_owned(),
         )
     }
@@ -341,7 +350,8 @@ impl Wire {
     fn links(&mut self, query: &str, extra: Value) -> Vec<Value> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let mut arguments = json!({"query":query, "role":"link", "timeout_seconds":30, "limit":200});
+            let mut arguments =
+                json!({"query":query, "role":"link", "timeout_seconds":30, "limit":200});
             for (key, value) in extra.as_object().into_iter().flatten() {
                 arguments[key] = value.clone();
             }
@@ -379,13 +389,19 @@ impl Wire {
             );
             calls += 1;
             let text = tree["tree"].as_str().expect("the tree");
-            assert!(tree["incomplete"].is_null(), "the tree was cut by time: {tree}");
+            assert!(
+                tree["incomplete"].is_null(),
+                "the tree was cut by time: {tree}"
+            );
             assert!(
                 text.chars().count() <= TREE_BUDGET,
                 "{} characters in one reply",
                 text.chars().count()
             );
-            assert_eq!(tree["chars"].as_u64(), u64::try_from(text.chars().count()).ok());
+            assert_eq!(
+                tree["chars"].as_u64(),
+                u64::try_from(text.chars().count()).ok()
+            );
             rows.extend(
                 text.lines()
                     .map(str::trim_start)
@@ -395,7 +411,12 @@ impl Wire {
             let Some(next) = tree["next_offset"].as_u64() else {
                 return (rows, calls);
             };
-            assert!(text.lines().last().is_some_and(|line| line.ends_with(&format!("offset={next}"))), "{text}");
+            assert!(
+                text.lines()
+                    .last()
+                    .is_some_and(|line| line.ends_with(&format!("offset={next}"))),
+                "{text}"
+            );
             let next = usize::try_from(next).expect("offset");
             assert!(next > offset, "the offset did not advance: {tree}");
             offset = next;
@@ -414,7 +435,10 @@ impl Wire {
             calls += 1;
             let content = read["content"].as_str().expect("content");
             assert!(content.encode_utf16().count() <= max_chars + 1, "{read}");
-            assert_eq!(read["chars"].as_u64(), u64::try_from(content.encode_utf16().count()).ok());
+            assert_eq!(
+                read["chars"].as_u64(),
+                u64::try_from(content.encode_utf16().count()).ok()
+            );
             assert_eq!(read["source"], "cdp");
             whole.push_str(content);
             let Some(next) = read["next_offset"].as_u64() else {
@@ -452,7 +476,8 @@ impl Drop for Wire {
 
 /// The `href=` a tree row ends in.
 fn row_target(row: &str) -> Option<&str> {
-    row.split('\t').find_map(|field| field.strip_prefix("href="))
+    row.split('\t')
+        .find_map(|field| field.strip_prefix("href="))
 }
 
 fn row_name(row: &str) -> &str {
@@ -476,14 +501,29 @@ fn targets(elements: &[Value], backend: &str) -> BTreeMap<String, Option<String>
 /// The targets the page gives outside its cards, as a browser resolves them.
 fn special_targets(base: &str) -> Vec<(&'static str, Option<String>)> {
     vec![
-        ("Jump to section 3", Some(format!("{base}/index.html#section-3"))),
+        (
+            "Jump to section 3",
+            Some(format!("{base}/index.html#section-3")),
+        ),
         ("Script action", Some("javascript:void(0)".to_owned())),
-        ("Mail the seller", Some("mailto:someone@example.com?subject=Hi".to_owned())),
+        (
+            "Mail the seller",
+            Some("mailto:someone@example.com?subject=Hi".to_owned()),
+        ),
         ("Scripted span link", None),
-        ("Absolute elsewhere", Some("https://example.com/abs/path?x=1&y=2".to_owned())),
+        (
+            "Absolute elsewhere",
+            Some("https://example.com/abs/path?x=1&y=2".to_owned()),
+        ),
         ("Parent relative", Some(format!("{base}/up/one.html"))),
-        ("Scheme relative", Some("http://example.net/scheme-relative".to_owned())),
-        ("Long target", Some(format!("{base}/long?q={}&end=1", "z".repeat(LONG_QUERY)))),
+        (
+            "Scheme relative",
+            Some("http://example.net/scheme-relative".to_owned()),
+        ),
+        (
+            "Long target",
+            Some(format!("{base}/long?q={}&end=1", "z".repeat(LONG_QUERY))),
+        ),
     ]
 }
 
@@ -497,7 +537,10 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
         "google-chrome-stable --user-data-dir={} {base}/index.html",
         wire.workdir.join("profile").display()
     ));
-    assert!(launched["cdp_port"].as_u64().is_some(), "no CDP: {launched}");
+    assert!(
+        launched["cdp_port"].as_u64().is_some(),
+        "no CDP: {launched}"
+    );
 
     // The element search: every card link, from the page and from AT-SPI. Right
     // after the launch the CDP connection does not list the tab yet, and a search
@@ -508,7 +551,10 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
         if found.iter().any(|element| element["backend"] == "cdp") {
             break found;
         }
-        assert!(Instant::now() < deadline, "no match from the page: {found:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no match from the page: {found:?}"
+        );
         thread::sleep(Duration::from_millis(500));
     };
     wire.keep("cdp-page");
@@ -541,21 +587,36 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
     );
     // compact keeps its shape: no href.
     let compact = wire.links("Listing 7 ", json!({"compact":true}));
-    assert!(compact.iter().all(|element| element["href"].is_null()), "{compact:?}");
-    assert!(compact.iter().all(|element| element["bounds"].is_object()), "{compact:?}");
+    assert!(
+        compact.iter().all(|element| element["href"].is_null()),
+        "{compact:?}"
+    );
+    assert!(
+        compact.iter().all(|element| element["bounds"].is_object()),
+        "{compact:?}"
+    );
 
     // The tree: without show_links no row carries a target.
     let (plain, plain_calls) = wire.link_rows_from(false, false, "page");
-    assert!(plain.iter().all(|row| row_target(row).is_none()), "{plain:?}");
+    assert!(
+        plain.iter().all(|row| row_target(row).is_none()),
+        "{plain:?}"
+    );
     assert!(plain.len() >= CARDS, "{} link rows", plain.len());
     // With it every card's row ends in the target the search reported, a page of rows
     // at a time.
     let (rows, calls) = wire.link_rows_from(true, false, "page");
-    eprintln!("tree: {} rows in {plain_calls} call(s) without targets, {} rows in {calls} calls with", plain.len(), rows.len());
+    eprintln!(
+        "tree: {} rows in {plain_calls} call(s) without targets, {} rows in {calls} calls with",
+        plain.len(),
+        rows.len()
+    );
     assert_eq!(rows.len(), plain.len(), "the paged rows are the rows");
     assert!(calls > 1, "300 targets fit one reply?");
-    let by_name: BTreeMap<&str, Option<&str>> =
-        rows.iter().map(|row| (row_name(row), row_target(row))).collect();
+    let by_name: BTreeMap<&str, Option<&str>> = rows
+        .iter()
+        .map(|row| (row_name(row), row_target(row)))
+        .collect();
     for n in 1..=CARDS {
         assert_eq!(
             by_name.get(card_name(n).as_str()),
@@ -570,7 +631,10 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
             Some(target) if target.len() > 1_000 => {
                 let shown = shown.expect("the long target");
                 let note = format!("…[{} more characters]…", target.len() - 1_000);
-                assert_eq!(shown, format!("{}{note}{}", &target[..500], &target[target.len() - 500..]));
+                assert_eq!(
+                    shown,
+                    format!("{}{note}{}", &target[..500], &target[target.len() - 500..])
+                );
             }
             target => assert_eq!(shown, target.as_deref(), "tree target of {name}"),
         }
@@ -593,19 +657,31 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
         .filter(|(name, _)| **name != "Long target")
         .map(|(_, target)| *target)
         .collect();
-    assert_eq!(from_page, from_tree, "browser_read and the tree name different targets");
+    assert_eq!(
+        from_page, from_tree,
+        "browser_read and the tree name different targets"
+    );
     assert_eq!(
         read.get("Long target").copied(),
-        special_targets(&base).pop().and_then(|(_, target)| target).as_deref()
+        special_targets(&base)
+            .pop()
+            .and_then(|(_, target)| target)
+            .as_deref()
     );
     // A selector scopes the read, and small pages add up to the same content.
-    let (cards, _) = wire.read_all(json!({"format":"links", "selector":"#results"}), TREE_BUDGET);
+    let (cards, _) = wire.read_all(
+        json!({"format":"links", "selector":"#results"}),
+        TREE_BUDGET,
+    );
     assert_eq!(cards.lines().count(), CARDS);
     let (in_pieces, piece_calls) =
         wire.read_all(json!({"format":"links", "selector":"#results"}), 1_000);
     assert_eq!(in_pieces, cards);
     assert!(piece_calls > 20, "{piece_calls} calls");
-    let each = wire.data("browser_read", json!({"format":"links", "selector":"li.card a", "max_chars":500}));
+    let each = wire.data(
+        "browser_read",
+        json!({"format":"links", "selector":"li.card a", "max_chars":500}),
+    );
     assert_eq!(each["matched"], CARDS);
 
     // Text and HTML carry what the page shows, never what it keeps. The password
@@ -617,30 +693,61 @@ fn with_cdp_both_backends_the_tree_and_the_page_read_agree_on_every_target() {
     let typed = wire.tool("keyboard_type", json!({"text":"typed-secret", "speed":3}));
     assert!(typed["error"].is_null(), "{typed}");
     let length = wire.data("browser_read", json!({"selector":"#pwlen"}));
-    assert_eq!(length["content"], "26", "the field holds its 14 characters and the 12 typed");
+    assert_eq!(
+        length["content"], "26",
+        "the field holds its 14 characters and the 12 typed"
+    );
     let (text, _) = wire.read_all(json!({}), TREE_BUDGET);
-    assert!(text.contains(&card_name(CARDS)) && text.contains("Section 3"), "{}", &text[..200]);
+    assert!(
+        text.contains(&card_name(CARDS)) && text.contains("Section 3"),
+        "{}",
+        &text[..200]
+    );
     let (html, html_calls) = wire.read_all(json!({"format":"html"}), TREE_BUDGET);
     assert!(html_calls > 1);
     assert!(html.contains("name=\"pw\"") && html.contains("value=\"visible-default\""));
     assert!(html.contains(&card_target(CARDS).replace('&', "&amp;")));
-    assert!(html.contains("ld-public"), "ld+json metadata is page content");
+    assert!(
+        html.contains("ld-public"),
+        "ld+json metadata is page content"
+    );
     for kept in [
-        "hunter2-secret", "typed-secret", "template-secret", "cookie-secret", "storage-secret",
-        "script-secret", "json-secret",
+        "hunter2-secret",
+        "typed-secret",
+        "template-secret",
+        "cookie-secret",
+        "storage-secret",
+        "script-secret",
+        "json-secret",
     ] {
         assert!(!text.contains(kept), "the text has {kept}");
         assert!(!html.contains(kept), "the HTML has {kept}");
         assert!(!links.contains(kept), "the links have {kept}");
     }
-    let form = wire.data("browser_read", json!({"format":"html", "selector":"input[type=password]"}));
+    let form = wire.data(
+        "browser_read",
+        json!({"format":"html", "selector":"input[type=password]"}),
+    );
     let field = form["content"].as_str().unwrap_or_default();
-    assert!(field.contains("name=\"pw\"") && !field.contains("value="), "{field}");
+    assert!(
+        field.contains("name=\"pw\"") && !field.contains("value="),
+        "{field}"
+    );
 
     // Refusals name their reason.
-    assert_eq!(wire.refused("browser_read", json!({"selector":"#absent"})).0, "no_match");
-    assert_eq!(wire.refused("browser_read", json!({"selector":"li["})).0, "invalid_selector");
-    assert_eq!(wire.refused("browser_read", json!({"max_chars":0})).0, "invalid_max_chars");
+    assert_eq!(
+        wire.refused("browser_read", json!({"selector":"#absent"}))
+            .0,
+        "no_match"
+    );
+    assert_eq!(
+        wire.refused("browser_read", json!({"selector":"li["})).0,
+        "invalid_selector"
+    );
+    assert_eq!(
+        wire.refused("browser_read", json!({"max_chars":0})).0,
+        "invalid_max_chars"
+    );
     eval_makes_rows_and_keeps_what_the_page_keeps(&mut wire);
 }
 
@@ -700,7 +807,10 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
 
     let found = wire.links("Listing 7 ", json!({}));
     wire.keep("atspi-page");
-    assert!(found.iter().all(|element| element["backend"] == "atspi"), "{found:?}");
+    assert!(
+        found.iter().all(|element| element["backend"] == "atspi"),
+        "{found:?}"
+    );
     let expected: BTreeMap<String, Option<String>> = std::iter::once(7)
         .chain(70..=79)
         .map(|n| (card_name(n), Some(format!("{base}{}", card_target(n)))))
@@ -708,7 +818,11 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
     assert_eq!(targets(&found, "atspi"), expected);
     for (name, target) in special_targets(&base) {
         let found = wire.links(name, json!({"exact":true}));
-        assert_eq!(targets(&found, "atspi").get(name), Some(&target), "{name}: {found:?}");
+        assert_eq!(
+            targets(&found, "atspi").get(name),
+            Some(&target),
+            "{name}: {found:?}"
+        );
     }
     let framed = wire.links("Frame absolute", json!({"exact":true}));
     assert_eq!(
@@ -721,8 +835,10 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
     let (rows, calls) = wire.link_rows(true, true);
     eprintln!("tree: {} rows in {calls} calls", rows.len());
     assert!(calls > 1);
-    let by_name: BTreeMap<&str, Option<&str>> =
-        rows.iter().map(|row| (row_name(row), row_target(row))).collect();
+    let by_name: BTreeMap<&str, Option<&str>> = rows
+        .iter()
+        .map(|row| (row_name(row), row_target(row)))
+        .collect();
     for n in 1..=CARDS {
         assert_eq!(
             by_name.get(card_name(n).as_str()),
@@ -740,7 +856,10 @@ fn without_cdp_accessibility_gives_the_targets_and_the_page_read_says_what_it_ne
 
     let (reason, message) = wire.refused("browser_read", json!({"format":"links"}));
     assert_eq!(reason, "cdp_unavailable");
-    assert!(message.contains("CDP") && message.contains("cdp=false"), "{message}");
+    assert!(
+        message.contains("CDP") && message.contains("cdp=false"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -753,7 +872,11 @@ fn replace_types_over_the_name_in_chromes_save_dialog() {
     wire.links("Listing 7 ", json!({}));
     wire.data("keyboard_key", json!({"key":"ctrl+s"}));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !wire.window_titles().iter().any(|title| title == "Save File") {
+    while !wire
+        .window_titles()
+        .iter()
+        .any(|title| title == "Save File")
+    {
         assert!(Instant::now() < deadline, "the save dialog never opened");
         thread::sleep(Duration::from_millis(300));
     }
@@ -766,10 +889,19 @@ fn replace_types_over_the_name_in_chromes_save_dialog() {
         "keyboard_type",
         json!({"text":saved.to_str().expect("path"), "replace":true, "speed":3}),
     );
-    assert!(typed["error"].is_null(), "replace=true was refused: {typed}");
+    assert!(
+        typed["error"].is_null(),
+        "replace=true was refused: {typed}"
+    );
     let delivery = &typed["result"]["structuredContent"]["delivery"];
     assert_eq!(delivery["status"], "unverified", "{typed}");
-    assert!(delivery["warning"].as_str().unwrap_or_default().contains("ctrl+a"), "{typed}");
+    assert!(
+        delivery["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ctrl+a"),
+        "{typed}"
+    );
     wire.keep("save-dialog-typed");
     // Return does not accept Chrome's save dialog; the Save mnemonic does.
     wire.data("keyboard_key", json!({"key":"Return"}));
@@ -785,11 +917,17 @@ fn replace_types_over_the_name_in_chromes_save_dialog() {
             Instant::now() < deadline,
             "nothing was saved as {}: {:?}",
             saved.display(),
-            std::fs::read_dir(&wire.workdir).map(|entries| entries.flatten().map(|entry| entry.file_name()).collect::<Vec<_>>())
+            std::fs::read_dir(&wire.workdir).map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
         );
         thread::sleep(Duration::from_millis(300));
     }
-    assert!(!wire.workdir.join("saved-947.htm.html").exists(), "the old extension stayed");
+    assert!(
+        !wire.workdir.join("saved-947.htm.html").exists(),
+        "the old extension stayed"
+    );
 }
 
 /// #951: with a CDP port open the tree is still the browser window's own
@@ -807,29 +945,59 @@ fn with_a_cdp_port_the_tree_is_the_window_and_the_page_tree_is_the_active_tab() 
         "google-chrome-stable --user-data-dir={} {base}/index.html about:blank",
         profile.display()
     ));
-    assert!(launched["cdp_port"].as_u64().is_some(), "no CDP: {launched}");
+    assert!(
+        launched["cdp_port"].as_u64().is_some(),
+        "no CDP: {launched}"
+    );
     let deadline = Instant::now() + Duration::from_secs(60);
     let tree = loop {
-        let tree = wire.data("accessibility_tree", json!({"max_depth": 12, "timeout_seconds": 15}));
+        let tree = wire.data(
+            "accessibility_tree",
+            json!({"max_depth": 12, "timeout_seconds": 15}),
+        );
         let text = tree["tree"].as_str().unwrap_or_default();
-        if text.lines().filter(|line| line.trim_start().starts_with("page tab\t")).count() >= 2 {
+        if text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("page tab\t"))
+            .count()
+            >= 2
+        {
             break tree;
         }
-        assert!(Instant::now() < deadline, "the window tree never showed two tabs: {tree}");
+        assert!(
+            Instant::now() < deadline,
+            "the window tree never showed two tabs: {tree}"
+        );
         thread::sleep(Duration::from_millis(500));
     };
     let text = tree["tree"].as_str().expect("tree");
-    assert!(tree.get("source").is_none_or(|source| source != "page"), "{tree}");
-    assert!(text.starts_with("frame\t"), "the tree does not start at the browser window: {text}");
-    assert!(!text.contains("RootWebArea"), "CDP role names in the window tree: {text}");
+    assert!(
+        tree.get("source").is_none_or(|source| source != "page"),
+        "{tree}"
+    );
+    assert!(
+        text.starts_with("frame\t"),
+        "the tree does not start at the browser window: {text}"
+    );
+    assert!(
+        !text.contains("RootWebArea"),
+        "CDP role names in the window tree: {text}"
+    );
 
     let titles = wire.window_titles();
-    let page = wire.data("accessibility_tree", json!({"source": "page", "max_depth": 3}));
+    let page = wire.data(
+        "accessibility_tree",
+        json!({"source": "page", "max_depth": 3}),
+    );
     assert_eq!(page["source"], "page", "{page}");
     let rows = page["tree"].as_str().expect("page tree");
     assert!(rows.starts_with("RootWebArea\t"), "{rows}");
     // Two tabs are open; the page tree is the one whose title the window carries.
-    let root = rows.lines().next().and_then(|row| row.split('\t').nth(1)).unwrap_or_default();
+    let root = rows
+        .lines()
+        .next()
+        .and_then(|row| row.split('\t').nth(1))
+        .unwrap_or_default();
     assert!(
         !root.is_empty() && titles.iter().any(|title| title.starts_with(root)),
         "the page tree {root:?} is not the tab the window shows ({titles:?})"

@@ -67,10 +67,7 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
         }),
     );
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -79,9 +76,12 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
         .as_str()
         .expect("workdir")
         .to_owned();
-    let mut page = String::from("<html><head><title>tall</title></head><body style=\"font-size:24px\">");
+    let mut page =
+        String::from("<html><head><title>tall</title></head><body style=\"font-size:24px\">");
     for line in 0..120 {
-        page.push_str(&format!("<p>line {line} of a tall page with some words on it</p>"));
+        page.push_str(&format!(
+            "<p>line {line} of a tall page with some words on it</p>"
+        ));
     }
     page.push_str("</body></html>");
     std::fs::write(format!("{workdir}/tall.html"), page).expect("write page");
@@ -108,7 +108,10 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
         "mouse_scroll",
         json!({"session_id":session, "x":400, "y":300, "delta":600}),
     );
-    let zoomed = wire.tool("keyboard_key", json!({"session_id":session, "key":"ctrl+minus"}));
+    let zoomed = wire.tool(
+        "keyboard_key",
+        json!({"session_id":session, "key":"ctrl+minus"}),
+    );
     let plain = wire.tool("keyboard_key", json!({"session_id":session, "key":"shift"}));
     let _ = wire.tool("session_stop", json!({"session_id":session}));
     let _ = child.kill();
@@ -117,7 +120,10 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
 
     let content = |result: &Value| result["result"]["structuredContent"].clone();
     assert_eq!(content(&down)["view_changed"], true, "{down}");
-    assert!(content(&down)["scroll_y"].as_f64().unwrap_or(0.0) > 0.0, "{down}");
+    assert!(
+        content(&down)["scroll_y"].as_f64().unwrap_or(0.0) > 0.0,
+        "{down}"
+    );
     assert_eq!(content(&down)["at_end"], false, "{down}");
     assert_eq!(content(&at_end)["view_changed"], false, "{at_end}");
     assert_eq!(content(&at_end)["at_end"], true, "{at_end}");
@@ -126,8 +132,16 @@ fn scroll_and_zoom_report_whether_the_view_changed() {
         "{at_end}"
     );
     assert_eq!(content(&zoomed)["view_changed"], true, "{zoomed}");
-    assert_eq!(content(&zoomed)["application_effect"], "view_changed", "{zoomed}");
+    assert_eq!(
+        content(&zoomed)["application_effect"],
+        "view_changed",
+        "{zoomed}"
+    );
     // An ordinary key keeps the unverified effect and gets no view check.
-    assert_eq!(content(&plain)["application_effect"], "unverified", "{plain}");
+    assert_eq!(
+        content(&plain)["application_effect"],
+        "unverified",
+        "{plain}"
+    );
     assert!(content(&plain).get("view_changed").is_none(), "{plain}");
 }

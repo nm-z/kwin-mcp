@@ -91,8 +91,14 @@ impl Desktop {
             json!({"name":"session_start", "arguments":{"width":1280, "height":800}}),
         );
         let content = &started["result"]["structuredContent"];
-        desktop.session = content["session_id"].as_str().expect("session id").to_owned();
-        desktop.workdir = content["host_shared_dir"].as_str().expect("workdir").to_owned();
+        desktop.session = content["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        desktop.workdir = content["host_shared_dir"]
+            .as_str()
+            .expect("workdir")
+            .to_owned();
         desktop
     }
 
@@ -263,7 +269,8 @@ fn chrome_fields_that_are_focused_and_editable_take_typing() {
         "the DevTools console prompt was refused: {console}"
     );
     assert_eq!(
-        status(&number_again), "verified",
+        status(&number_again),
+        "verified",
         "number input after DevTools: {number_again}"
     );
     assert_eq!(
@@ -271,15 +278,20 @@ fn chrome_fields_that_are_focused_and_editable_take_typing() {
         "{number_again}"
     );
     assert_eq!(
-        status(&search_again), "verified",
+        status(&search_again),
+        "verified",
         "search bar after DevTools: {search_again}"
     );
     assert!(
-        refusal(&locked).contains("\"locked\"") && refusal(&locked).contains("read-only or disabled"),
+        refusal(&locked).contains("\"locked\"")
+            && refusal(&locked).contains("read-only or disabled"),
         "the read-only input was not refused by name: {locked}"
     );
     assert_eq!(status(&long), "unverified", "unreadable field: {long}");
-    assert!(long_received, "the unreadable field did not receive the key: {long}");
+    assert!(
+        long_received,
+        "the unreadable field did not receive the key: {long}"
+    );
     let warning = long["result"]["structuredContent"]["delivery"]["warning"]
         .as_str()
         .unwrap_or_default();
@@ -325,15 +337,25 @@ fn konsole_paste_waits_for_the_window_and_names_its_confirmation_dialog() {
     desktop.key("Escape");
     drop(desktop);
 
-    assert_eq!(nowhere["error"]["data"]["reason"], "no_active_window", "{nowhere}");
-    assert_eq!(nowhere["error"]["data"]["shortcut_submitted"], false, "{nowhere}");
+    assert_eq!(
+        nowhere["error"]["data"]["reason"], "no_active_window",
+        "{nowhere}"
+    );
+    assert_eq!(
+        nowhere["error"]["data"]["shortcut_submitted"], false,
+        "{nowhere}"
+    );
     assert_eq!(nowhere["error"]["data"]["retry_safe"], true, "{nowhere}");
     assert!(pasted["error"].is_null(), "{pasted}");
     assert_eq!(
         pasted["result"]["structuredContent"]["delivery"]["method"], "terminal",
         "{pasted}"
     );
-    assert_eq!(arrived.trim(), "arrived", "the pasted command did not run: {pasted}");
+    assert_eq!(
+        arrived.trim(),
+        "arrived",
+        "the pasted command did not run: {pasted}"
+    );
     let content = &guarded["result"]["structuredContent"];
     assert_eq!(content["delivery"]["method"], "paste_dialog", "{guarded}");
     assert!(

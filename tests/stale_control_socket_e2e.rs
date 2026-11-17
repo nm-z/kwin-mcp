@@ -128,7 +128,10 @@ fn stale_control_sockets_are_swept_and_the_dead_owner_is_named() {
         "stale control socket was not removed: {}",
         stale.display()
     );
-    assert!(answering.exists(), "an answering control socket was removed");
+    assert!(
+        answering.exists(),
+        "an answering control socket was removed"
+    );
     assert!(unrelated.exists(), "an unrelated socket name was removed");
 
     server.send(&json!({

@@ -54,7 +54,9 @@ fn an_inherit_start_over_many_browser_profiles_returns_a_small_result() {
     let home = std::env::temp_dir().join(format!("kwin-mcp-response-size-{}", std::process::id()));
     std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
     for profile in 0..300 {
-        cookie_jar(&home.join(format!(".config/google-chrome/Profile {profile}/Network/Cookies")));
+        cookie_jar(&home.join(format!(
+            ".config/google-chrome/Profile {profile}/Network/Cookies"
+        )));
     }
     let mut child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
         .args(["--autoclean", "--no-viewer"])
@@ -89,7 +91,11 @@ fn an_inherit_start_over_many_browser_profiles_returns_a_small_result() {
         .as_str()
         .map(str::to_owned);
     if let Some(session) = &session {
-        wire.request(3, "tools/call", json!({"name":"session_stop", "arguments":{"session_id":session}}));
+        wire.request(
+            3,
+            "tools/call",
+            json!({"name":"session_stop", "arguments":{"session_id":session}}),
+        );
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -102,7 +108,9 @@ fn an_inherit_start_over_many_browser_profiles_returns_a_small_result() {
         raw.len()
     );
     assert!(
-        reply["result"]["structuredContent"].get("stage_times").is_none(),
+        reply["result"]["structuredContent"]
+            .get("stage_times")
+            .is_none(),
         "the success result lists stage times"
     );
 }

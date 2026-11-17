@@ -79,9 +79,7 @@ fn start_server_with(home: &Path, flags: &[&str], tmp: Option<&Path>) -> Server 
     stdin.flush().expect("flush initialize");
     let mut stdout = BufReader::new(stdout);
     let mut reply = String::new();
-    stdout
-        .read_line(&mut reply)
-        .expect("read initialize reply");
+    stdout.read_line(&mut reply).expect("read initialize reply");
     assert!(reply.contains("\"result\""), "initialize failed: {reply}");
     Server {
         child,

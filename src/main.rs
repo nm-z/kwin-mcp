@@ -855,7 +855,11 @@ mod wallet_mediator {
 
     type HostResult<T> = zbus::Result<T>;
 
-    pub(super) async fn host_call<B, R>(proxy: &zbus::Proxy<'_>, method: &str, body: &B) -> HostResult<R>
+    pub(super) async fn host_call<B, R>(
+        proxy: &zbus::Proxy<'_>,
+        method: &str,
+        body: &B,
+    ) -> HostResult<R>
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
         R: serde::de::DeserializeOwned + zbus::zvariant::Type,
@@ -1997,7 +2001,9 @@ tokio::task_local! {
 }
 
 fn session_pressured() -> bool {
-    SESSION_PRESSURED.try_with(|pressured| *pressured).unwrap_or(false)
+    SESSION_PRESSURED
+        .try_with(|pressured| *pressured)
+        .unwrap_or(false)
 }
 
 /// How many times longer a wait on the compositor lasts in a pressured session.
@@ -3643,7 +3649,10 @@ fn sandbox_process_tree(root: u32) -> String {
     let mut children: std::collections::BTreeMap<u32, Vec<(u32, String, char)>> =
         std::collections::BTreeMap::new();
     for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok())
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
         else {
             continue;
         };
@@ -4395,14 +4404,32 @@ fn compact_delivery(delivery: &mut serde_json::Value) {
     if delivery.get("compositor_acknowledged") == Some(&serde_json::Value::Bool(true)) {
         remove_fields(delivery, &["compositor_acknowledged"]);
     }
-    drop_empty_fields(delivery, &["warning", "expected_field_characters", "observed_field_characters", "verification_context"]);
+    drop_empty_fields(
+        delivery,
+        &[
+            "warning",
+            "expected_field_characters",
+            "observed_field_characters",
+            "verification_context",
+        ],
+    );
 }
 
 /// A keyboard_type result: the delivery verdict, whether a retry is safe, the
 /// window it went to, and a warning when there is one. The text the caller sent,
 /// its length, completion flags and timings are not returned.
 fn compact_typing_result(payload: &mut serde_json::Value) {
-    remove_fields(payload, &["action", "text", "submitted_characters", "submission_complete", "timings_ms", "elapsed_ms"]);
+    remove_fields(
+        payload,
+        &[
+            "action",
+            "text",
+            "submitted_characters",
+            "submission_complete",
+            "timings_ms",
+            "elapsed_ms",
+        ],
+    );
     drop_empty_fields(payload, &["warning", "verification_context"]);
     if let Some(delivery) = payload.get_mut("delivery") {
         compact_delivery(delivery);
@@ -4418,8 +4445,14 @@ fn compact_paste_result(payload: &mut serde_json::Value) {
     remove_fields(
         payload,
         &[
-            "action", "clipboard_characters", "shortcut", "shortcut_submitted", "submission_complete",
-            "compositor_acknowledged", "form_submission", "elapsed_ms",
+            "action",
+            "clipboard_characters",
+            "shortcut",
+            "shortcut_submitted",
+            "submission_complete",
+            "compositor_acknowledged",
+            "form_submission",
+            "elapsed_ms",
         ],
     );
     if let Some(delivery) = payload.get_mut("delivery") {
@@ -4432,10 +4465,18 @@ fn compact_paste_result(payload: &mut serde_json::Value) {
 /// (no warning, no CDP, a normal baseline) are left out.
 fn compact_launch_result(payload: &mut serde_json::Value) {
     if let Some(object) = payload.as_object_mut() {
-        for key in ["action", "command", "command_submitted", "window_timeout_seconds"] {
+        for key in [
+            "action",
+            "command",
+            "command_submitted",
+            "window_timeout_seconds",
+        ] {
             object.remove(key);
         }
-        if object.get("window_baseline").is_some_and(|baseline| baseline == "pre_launch") {
+        if object
+            .get("window_baseline")
+            .is_some_and(|baseline| baseline == "pre_launch")
+        {
             object.remove("window_baseline");
         }
     }
@@ -4766,7 +4807,11 @@ impl OverlayPlan {
     /// (a read-only bind, a shared host directory, a filesystem refusing the
     /// device node); the caller then keeps the /dev/null mask.
     fn hide_host_socket(&self, target: &Path, path: &Path) -> bool {
-        if self.host_write_paths.iter().any(|shared| path.starts_with(shared)) {
+        if self
+            .host_write_paths
+            .iter()
+            .any(|shared| path.starts_with(shared))
+        {
             return false;
         }
         let missing = |path: &Path| {
@@ -4780,7 +4825,11 @@ impl OverlayPlan {
                     .iter()
                     .chain(self.overlays.iter().map(|overlay| &overlay.destination))
                     .any(|mount| path.starts_with(mount));
-                (!covered).then(|| path.strip_prefix(target).ok().map(|relative| root.join(relative)))?
+                (!covered).then(|| {
+                    path.strip_prefix(target)
+                        .ok()
+                        .map(|relative| root.join(relative))
+                })?
             });
             return staged.is_some_and(|staged| missing(&staged));
         };
@@ -4799,7 +4848,8 @@ impl OverlayPlan {
             if !missing(&made) {
                 continue;
             }
-            let mode = std::fs::metadata(overlay.lower.join(&directory)).map(|meta| meta.permissions());
+            let mode =
+                std::fs::metadata(overlay.lower.join(&directory)).map(|meta| meta.permissions());
             if std::fs::create_dir(&made).is_err() {
                 return false;
             }
@@ -5515,10 +5565,7 @@ fn bind_live_sqlite(
                     std::fs::write(&journal, [])?;
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            &journal,
-                            std::fs::Permissions::from_mode(0o600),
-                        )?;
+                        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))?;
                     }
                     plan.sqlite_access
                         .record(database, "private_writable_snapshot");
@@ -5688,7 +5735,9 @@ fn prepare_browser_cookies(
                     service.profile_operation("snapshot host cookies", &database)?;
                     kwin_mcp::browser_cookies::snapshot_host(&database, &upper).and_then(|()| {
                         service.profile_operation("merge saved cookies", &previous)?;
-                        if let Err(error) = kwin_mcp::browser_cookies::merge_scratch(&upper, &previous) {
+                        if let Err(error) =
+                            kwin_mcp::browser_cookies::merge_scratch(&upper, &previous)
+                        {
                             merge_failed = true;
                             let message = format!("{}: {error:#}", database.display());
                             eprintln!(
@@ -7493,7 +7542,11 @@ const START_STAGE_TIMES_MAX: usize = 32;
 /// How long each startup checkpoint lasted, as `stage: 1.2s` pairs. The last
 /// entry is the checkpoint still running, so a stalled start names where the
 /// time went and not only where it stopped.
-fn format_stage_times(finished: &[(String, std::time::Duration)], current: &str, running: std::time::Duration) -> String {
+fn format_stage_times(
+    finished: &[(String, std::time::Duration)],
+    current: &str,
+    running: std::time::Duration,
+) -> String {
     finished
         .iter()
         .map(|(label, took)| (label.as_str(), *took))
@@ -7503,7 +7556,11 @@ fn format_stage_times(finished: &[(String, std::time::Duration)], current: &str,
         .join(", ")
 }
 
-fn stage_times_json(finished: &[(String, std::time::Duration)], current: &str, running: std::time::Duration) -> serde_json::Value {
+fn stage_times_json(
+    finished: &[(String, std::time::Duration)],
+    current: &str,
+    running: std::time::Duration,
+) -> serde_json::Value {
     serde_json::Value::Array(
         finished
             .iter()
@@ -7759,10 +7816,9 @@ impl KwinMcp {
             // The sandbox is already gone. No browser can flush to the
             // mediator, and this cleanup must survive cancellation of a tool
             // or of the reaper itself during transport shutdown.
-            let _ = tokio::task::spawn_blocking(move || {
-                teardown(session, &StopProgress::default())
-            })
-            .await;
+            let _ =
+                tokio::task::spawn_blocking(move || teardown(session, &StopProgress::default()))
+                    .await;
         }
         eprintln!("session died: {}: {diagnostic}", self.session_id);
         Some(diagnostic)
@@ -7811,7 +7867,10 @@ impl KwinMcp {
     /// How much longer agent input stays paused, and what kind of viewer input
     /// caused it; None when the viewer has been quiet for the whole period.
     async fn viewer_input_pause(&self) -> Result<Option<(Duration, String)>, String> {
-        recent_viewer_input(&self.path.join(VIEWER_INPUT_ACTIVITY_FILE), std::time::SystemTime::now())
+        recent_viewer_input(
+            &self.path.join(VIEWER_INPUT_ACTIVITY_FILE),
+            std::time::SystemTime::now(),
+        )
     }
 
     /// [`Self::viewer_input_pause`] after reaping a viewer that has exited. The
@@ -8357,7 +8416,11 @@ async fn tree_result(
         "accessibility tree: {} nodes, {} levels{}{} (in structuredContent.tree)",
         info["nodes"],
         info["levels"],
-        if info["more_below"] == true || info["incomplete"] == true { ", more below" } else { "" },
+        if info["more_below"] == true || info["incomplete"] == true {
+            ", more below"
+        } else {
+            ""
+        },
         match info["next_offset"].as_u64() {
             Some(next) => format!(", more rows from offset={next}"),
             None => String::new(),
@@ -9126,9 +9189,7 @@ fn stop_pending_report(
     session_status: &str,
     elapsed: Duration,
 ) -> (String, serde_json::Value) {
-    let (stage, running) = progress
-        .running()
-        .unwrap_or(("finishing", Duration::ZERO));
+    let (stage, running) = progress.running().unwrap_or(("finishing", Duration::ZERO));
     let processes = if matches!(
         stage,
         STAGE_COOKIES | STAGE_PAGE_STORAGE | STAGE_STORAGE | STAGE_WORKDIR
@@ -9575,9 +9636,9 @@ fn exiting_summary(unit: &str, processes: &[ExitingProcess], io_pressure: Option
     };
     let blocked = processes.iter().any(|process| process.state == 'D');
     let cause = match io_pressure.filter(|pressure| *pressure >= IO_PRESSURE_NOTABLE) {
-        Some(pressure) => format!(
-            "; host disk I/O pressure is {pressure:.0}%, so they are waiting on the disk"
-        ),
+        Some(pressure) => {
+            format!("; host disk I/O pressure is {pressure:.0}%, so they are waiting on the disk")
+        }
         None if blocked => "; they are blocked in the kernel".to_owned(),
         None => String::new(),
     };
@@ -9710,8 +9771,7 @@ fn teardown(mut sess: Session, progress: &StopProgress) -> TeardownReport {
         terminate_child(viewer, false, "viewer");
     }
     drop(sess.sandbox_stdin);
-    let scope_directory =
-        session_scope_cgroup_directory(sess.sandbox_child.id(), &sess.scope.unit);
+    let scope_directory = session_scope_cgroup_directory(sess.sandbox_child.id(), &sess.scope.unit);
     progress.begin(STAGE_SCOPE);
     sess.scope.stop();
     // Kill the pasta and bwrap process group (negative PID = entire group).
@@ -10322,13 +10382,22 @@ async fn view_changed_since(
 
 /// A zoom shortcut: ctrl with minus, plus, equal or 0.
 fn is_zoom_combo(modifiers: &[u32], key: &str) -> bool {
-    let main = key.rsplit('+').next().unwrap_or("").trim().to_ascii_lowercase();
-    modifiers.contains(&KEY_LEFTCTRL) && matches!(main.as_str(), "minus" | "plus" | "equal" | "0" | "-" | "=")
+    let main = key
+        .rsplit('+')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    modifiers.contains(&KEY_LEFTCTRL)
+        && matches!(main.as_str(), "minus" | "plus" | "equal" | "0" | "-" | "=")
 }
 
 /// The vertical scroll position of the browser page behind `window_title`, and the
 /// most it can scroll, through CDP: (scrollY, scrollHeight - innerHeight).
-async fn cdp_scroll_position(browser: &chromiumoxide::Browser, window_title: &str) -> Option<(f64, f64)> {
+async fn cdp_scroll_position(
+    browser: &chromiumoxide::Browser,
+    window_title: &str,
+) -> Option<(f64, f64)> {
     for page in browser.pages().await.ok()? {
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
         if title.is_empty() || !window_title.starts_with(&title) {
@@ -11297,7 +11366,11 @@ fn live_wayland_socket(runtime: &Path) -> Option<std::ffi::OsString> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
-            let number = name.to_str()?.strip_prefix("wayland-")?.parse::<u32>().ok()?;
+            let number = name
+                .to_str()?
+                .strip_prefix("wayland-")?
+                .parse::<u32>()
+                .ok()?;
             Some((number, name))
         })
         .collect();
@@ -11483,7 +11556,9 @@ fn recent_viewer_input(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read {} metadata: {error}", marker.display())),
     };
-    let age = now.duration_since(modified).unwrap_or_else(|error| error.duration());
+    let age = now
+        .duration_since(modified)
+        .unwrap_or_else(|error| error.duration());
     if age > VIEWER_INPUT_QUIET_PERIOD {
         return Ok(None);
     }
@@ -11618,7 +11693,9 @@ async fn spawn_frame_sender(
         command.arg("--link-mbps").arg(mbps.to_string());
     }
     command
-        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(socket)))
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+            socket,
+        )))
         .stdout(shared)
         .stderr(std::process::Stdio::from(log_file));
     terminate_with_parent(&mut command);
@@ -11632,7 +11709,11 @@ async fn spawn_frame_sender(
 /// Start the viewer window on this machine for a session on `host`: it opens
 /// the frame socket named by `ticket` to that machine's listener and reports
 /// through the status file and log in `dir`.
-async fn spawn_remote_viewer(dir: &Path, host: &str, ticket: &str) -> Result<SessionProcess, String> {
+async fn spawn_remote_viewer(
+    dir: &Path,
+    host: &str,
+    ticket: &str,
+) -> Result<SessionProcess, String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let log_path = dir.join("viewer.log");
     let _ = std::fs::remove_file(dir.join(VIEWER_STATUS_FILE));
@@ -11660,7 +11741,10 @@ async fn spawn_remote_viewer(dir: &Path, host: &str, ticket: &str) -> Result<Ses
     let child = spawn_session_child(command, false)
         .await
         .map_err(|error| format!("viewer spawn failed: {error}"))?;
-    eprintln!("viewer_open: spawned viewer pid={} for a session on {host}", child.id());
+    eprintln!(
+        "viewer_open: spawned viewer pid={} for a session on {host}",
+        child.id()
+    );
     Ok(child.into())
 }
 
@@ -11881,12 +11965,19 @@ impl WindowSnapshot {
             "pid": self.pid, "x": self.x, "y": self.y, "w": self.w, "h": self.h,
             "stackingOrder": self.stacking_order,
         });
-        if !self.resource_name.eq_ignore_ascii_case(&self.resource_class) {
+        if !self
+            .resource_name
+            .eq_ignore_ascii_case(&self.resource_class)
+        {
             window["resourceName"] = serde_json::json!(self.resource_name);
         }
         for (key, set) in [
-            ("active", self.active), ("minimized", self.minimized), ("hidden", self.hidden),
-            ("modal", self.modal), ("transient", self.transient), ("dialog", self.dialog),
+            ("active", self.active),
+            ("minimized", self.minimized),
+            ("hidden", self.hidden),
+            ("modal", self.modal),
+            ("transient", self.transient),
+            ("dialog", self.dialog),
             ("popup", self.popup),
         ] {
             if set {
@@ -12581,7 +12672,11 @@ fn set_href(matched: &mut serde_json::Value, target: &str) {
 /// address with that fragment) and with an empty string for a `role=link` element
 /// that has no `href`; it puts no target in the object attributes. None when the
 /// object has no such interface or no target.
-async fn atspi_link_target(bus: &zbus::Connection, destination: &str, path: &str) -> Option<String> {
+async fn atspi_link_target(
+    bus: &zbus::Connection,
+    destination: &str,
+    path: &str,
+) -> Option<String> {
     let link = atspi::proxy::hyperlink::HyperlinkProxy::builder(bus)
         .destination(destination.to_owned())
         .ok()?
@@ -12603,8 +12698,12 @@ async fn tree_row(
     show_links: bool,
 ) -> String {
     let target = if show_links && node.role == "link" {
-        atspi_link_target(bus, acc.inner().destination().as_str(), acc.inner().path().as_str())
-            .await
+        atspi_link_target(
+            bus,
+            acc.inner().destination().as_str(),
+            acc.inner().path().as_str(),
+        )
+        .await
     } else {
         None
     };
@@ -12626,7 +12725,13 @@ fn ax_link_target(
         .flatten()
         .find_map(|property| {
             (property.name == AxPropertyName::Url)
-                .then(|| property.value.value.as_ref().and_then(serde_json::Value::as_str))
+                .then(|| {
+                    property
+                        .value
+                        .value
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                })
                 .flatten()
         })
         .filter(|target| !target.is_empty())
@@ -13248,7 +13353,13 @@ enum ClickBlock {
 }
 
 impl ClickBlock {
-    const ALL: [Self; 5] = [Self::OtherWindow, Self::NotShown, Self::Covered, Self::PageDom, Self::Unmapped];
+    const ALL: [Self; 5] = [
+        Self::OtherWindow,
+        Self::NotShown,
+        Self::Covered,
+        Self::PageDom,
+        Self::Unmapped,
+    ];
 
     fn cause(self) -> &'static str {
         match self {
@@ -13272,7 +13383,11 @@ fn click_block(element: &serde_json::Value) -> Option<ClickBlock> {
             element["window_association"].as_str(),
             Some("unverified" | "title_match_geometry_unverified" | FRAME_LINK_SHARED_CAPTION)
         );
-        Some(if element["window_id"].is_string() && !unpaired { ClickBlock::OtherWindow } else { ClickBlock::Unmapped })
+        Some(if element["window_id"].is_string() && !unpaired {
+            ClickBlock::OtherWindow
+        } else {
+            ClickBlock::Unmapped
+        })
     } else if element["occluded"] == true {
         Some(ClickBlock::Covered)
     } else {
@@ -13282,28 +13397,42 @@ fn click_block(element: &serde_json::Value) -> Option<ClickBlock> {
 
 /// Controls before plain text, each in listed order: a click by name means the
 /// button called "Your Chrome", not the paragraph that mentions it.
-fn controls_first<'a>(elements: impl Iterator<Item = &'a serde_json::Value>) -> Vec<&'a serde_json::Value> {
-    let (controls, text): (Vec<_>, Vec<_>) =
-        elements.partition(|element| !folds_into_ancestor(element["role"].as_str().unwrap_or_default()));
+fn controls_first<'a>(
+    elements: impl Iterator<Item = &'a serde_json::Value>,
+) -> Vec<&'a serde_json::Value> {
+    let (controls, text): (Vec<_>, Vec<_>) = elements
+        .partition(|element| !folds_into_ancestor(element["role"].as_str().unwrap_or_default()));
     controls.into_iter().chain(text).collect()
 }
 
 /// The matches that can be clicked: shown in the active window, in its pixels.
 fn click_candidates(elements: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    controls_first(elements.iter().filter(|element| click_block(element).is_none()))
+    controls_first(
+        elements
+            .iter()
+            .filter(|element| click_block(element).is_none()),
+    )
 }
 
 /// The window to activate when no match is in the active one.
 fn click_other_window(elements: &[serde_json::Value]) -> Option<&str> {
-    controls_first(elements.iter().filter(|element| click_block(element) == Some(ClickBlock::OtherWindow)))
-        .first()
-        .and_then(|element| element["window_id"].as_str())
+    controls_first(
+        elements
+            .iter()
+            .filter(|element| click_block(element) == Some(ClickBlock::OtherWindow)),
+    )
+    .first()
+    .and_then(|element| element["window_id"].as_str())
 }
 
 /// The center of an element's bounds as window-relative pixels.
 fn element_center(element: &serde_json::Value) -> Result<(i32, i32), String> {
     let bounds = &element["bounds"];
-    let number = |key: &str| bounds[key].as_f64().ok_or_else(|| format!("the match has no bounds.{key}"));
+    let number = |key: &str| {
+        bounds[key]
+            .as_f64()
+            .ok_or_else(|| format!("the match has no bounds.{key}"))
+    };
     #[expect(clippy::as_conversions)]
     let center = (
         (number("x")? + number("w")? / 2.0).round() as i32,
@@ -13366,9 +13495,14 @@ impl ClickRefusal<'_> {
             let mut cause = "";
             let mut parts = Vec::new();
             for block in ClickBlock::ALL {
-                let blocked: Vec<&serde_json::Value> =
-                    self.matches.iter().filter(|element| click_block(element) == Some(block)).collect();
-                let Some(first) = blocked.first() else { continue };
+                let blocked: Vec<&serde_json::Value> = self
+                    .matches
+                    .iter()
+                    .filter(|element| click_block(element) == Some(block))
+                    .collect();
+                let Some(first) = blocked.first() else {
+                    continue;
+                };
                 if cause.is_empty() {
                     cause = block.cause();
                 }
@@ -13410,25 +13544,47 @@ impl ClickRefusal<'_> {
                 self.unfinished.join("; ")
             ));
         }
-        let cause = if cause == "no_match" && !self.unfinished.is_empty() { "search_unfinished" } else { cause };
+        let cause = if cause == "no_match" && !self.unfinished.is_empty() {
+            "search_unfinished"
+        } else {
+            cause
+        };
         (cause, text)
     }
 
     /// Nothing matched: which of the role filter and `exact` left out an element
     /// that carries the text.
     fn explain_no_match(&self) -> (&'static str, String) {
-        let Self { query, role, exact, .. } = *self;
+        let Self {
+            query, role, exact, ..
+        } = *self;
         let wanted = find_ui_search_text(query);
         let named = |element: &&serde_json::Value| {
             let name = find_ui_search_text(element["name"].as_str().unwrap_or_default());
-            if exact { name == wanted } else { name.contains(&wanted) }
+            if exact {
+                name == wanted
+            } else {
+                name.contains(&wanted)
+            }
         };
-        let fits = |element: &&serde_json::Value| find_ui_role_matches(role, element["role"].as_str().unwrap_or_default());
+        let fits = |element: &&serde_json::Value| {
+            find_ui_role_matches(role, element["role"].as_str().unwrap_or_default())
+        };
         let exactly = if exact { "exactly " } else { "" };
-        let with_role = role.map(|role| format!(" with role '{role}'")).unwrap_or_default();
+        let with_role = role
+            .map(|role| format!(" with role '{role}'"))
+            .unwrap_or_default();
         let near = controls_first(self.near.iter());
-        let other_role: Vec<&serde_json::Value> = near.iter().copied().filter(|element| named(element) && !fits(element)).collect();
-        let other_name: Vec<&serde_json::Value> = near.iter().copied().filter(|element| fits(element) && !named(element)).collect();
+        let other_role: Vec<&serde_json::Value> = near
+            .iter()
+            .copied()
+            .filter(|element| named(element) && !fits(element))
+            .collect();
+        let other_name: Vec<&serde_json::Value> = near
+            .iter()
+            .copied()
+            .filter(|element| fits(element) && !named(element))
+            .collect();
         if !other_role.is_empty() {
             (
                 "role_excluded",
@@ -13468,10 +13624,18 @@ impl ClickRefusal<'_> {
 /// The elements and the reasons for an unfinished search in a `find_ui_elements` result.
 fn search_outcome(result: &CallToolResult) -> (Vec<serde_json::Value>, Vec<String>) {
     let content = result.structured_content.as_ref();
-    let list = |key: &str| content.and_then(|content| content[key].as_array()).cloned().unwrap_or_default();
+    let list = |key: &str| {
+        content
+            .and_then(|content| content[key].as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
     (
         list("elements"),
-        list("errors").iter().filter_map(|error| error.as_str().map(str::to_owned)).collect(),
+        list("errors")
+            .iter()
+            .filter_map(|error| error.as_str().map(str::to_owned))
+            .collect(),
     )
 }
 
@@ -13573,8 +13737,16 @@ const PAGE_READ_NEEDS_CDP: &str = "browser_read reads the page through the Chrom
 /// The body goes where the client shows it, like the accessibility tree. A reader
 /// of the text alone gets the continuation as a last line, since the offsets are
 /// otherwise only in the structured half.
-fn page_read_result(view: ResultView, content: String, mut info: serde_json::Value) -> CallToolResult {
-    let (start, end, total) = (info["offset"].clone(), info["end"].clone(), info["total_chars"].clone());
+fn page_read_result(
+    view: ResultView,
+    content: String,
+    mut info: serde_json::Value,
+) -> CallToolResult {
+    let (start, end, total) = (
+        info["offset"].clone(),
+        info["end"].clone(),
+        info["total_chars"].clone(),
+    );
     if let Some(object) = info.as_object_mut() {
         object.remove("end");
     }
@@ -13583,7 +13755,8 @@ fn page_read_result(view: ResultView, content: String, mut info: serde_json::Val
     let summary = format!(
         "page {}: {range}{} (in structuredContent.content)",
         info["format"].as_str().unwrap_or_default(),
-        more.map(|next| format!("; continue with offset={next}")).unwrap_or_default(),
+        more.map(|next| format!("; continue with offset={next}"))
+            .unwrap_or_default(),
     );
     let shown = match more {
         Some(next) => format!("{content}\n[browser_read: {range}; continue with offset={next}]"),
@@ -13941,7 +14114,11 @@ async fn cdp_tab_visible(page: &chromiumoxide::Page) -> bool {
         .await
         .ok()
         .and_then(Result::ok)
-        .and_then(|value| value.value().and_then(|value| value.as_str().map(str::to_owned)))
+        .and_then(|value| {
+            value
+                .value()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        })
         .is_some_and(|state| state == "visible")
 }
 
@@ -13977,11 +14154,9 @@ async fn cdp_active_tab(
     for target in targets {
         if target.r#type == "page"
             && browser_address::caption_names_tab(caption, &target.title)
-            && let Ok(Ok(page)) = tokio::time::timeout(
-                CDP_STEP_TIMEOUT,
-                browser.get_page(target.target_id.clone()),
-            )
-            .await
+            && let Ok(Ok(page)) =
+                tokio::time::timeout(CDP_STEP_TIMEOUT, browser.get_page(target.target_id.clone()))
+                    .await
         {
             tabs.push(page);
         }
@@ -14087,7 +14262,11 @@ async fn cdp_loaded(page: &chromiumoxide::Page) -> bool {
         .await
         .ok()
         .and_then(Result::ok)
-        .and_then(|value| value.value().and_then(|value| value.as_str().map(str::to_owned)));
+        .and_then(|value| {
+            value
+                .value()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
         if state.as_deref() == Some("complete") {
             return true;
         }
@@ -14126,7 +14305,10 @@ fn navigation_result(
     let mut data = serde_json::json!({
         "title": title, "url": browser_address::shown_url(landed), "method": method,
     });
-    let mut text = format!("navigated: {title} at {}", browser_address::shown_url(landed));
+    let mut text = format!(
+        "navigated: {title} at {}",
+        browser_address::shown_url(landed)
+    );
     if !browser_address::same_destination(requested, landed) {
         data["redirected"] = serde_json::json!(true);
         data["requested_url"] = serde_json::json!(browser_address::shown_url(requested));
@@ -14716,7 +14898,11 @@ impl LaunchLedger {
                 .or_else(|| {
                     // An unreadable process table says nothing about any window.
                     (by_timing && processes.is_some() && waiting.is_empty())
-                        .then(|| fresh().filter(|window| owner(window).is_none()).max_by_key(topmost))
+                        .then(|| {
+                            fresh()
+                                .filter(|window| owner(window).is_none())
+                                .max_by_key(topmost)
+                        })
                         .flatten()
                         .map(|window| (window, "timing"))
                 });
@@ -15112,7 +15298,8 @@ async fn poll_launch_window(watch: LaunchWatch) -> Result<Option<LaunchWindow>, 
             && let Some(program) = watch.program.as_deref()
             && let Some(previous_windows) = previous_windows.as_deref()
             && let Ok(current_windows) = &current_windows
-            && let Some(window) = running_instance_window(previous_windows, current_windows, program)
+            && let Some(window) =
+                running_instance_window(previous_windows, current_windows, program)
         {
             return Ok(Some(LaunchWindow {
                 geometry: launch_window_geometry(window),
@@ -15435,10 +15622,18 @@ fn pair_frames_with_windows<'a>(
 ) -> Vec<Option<(&'a WindowSnapshot, &'static str)>> {
     let mut paired: Vec<Option<(&WindowSnapshot, &'static str)>> = frames
         .iter()
-        .map(|frame| find_ui_frame_window(windows, frame.name, frame.bounds).map(|window| (window, FRAME_LINK_TITLE)))
+        .map(|frame| {
+            find_ui_frame_window(windows, frame.name, frame.bounds)
+                .map(|window| (window, FRAME_LINK_TITLE))
+        })
         .collect();
     loop {
-        let taken = |window: &WindowSnapshot| paired.iter().flatten().any(|(other, _)| other.id == window.id);
+        let taken = |window: &WindowSnapshot| {
+            paired
+                .iter()
+                .flatten()
+                .any(|(other, _)| other.id == window.id)
+        };
         // An untitled frame is a menu or popup with no KWin window of its own.
         let open = |index: usize| paired[index].is_none() && !frames[index].name.is_empty();
         let candidates = |index: usize| -> Vec<&'a WindowSnapshot> {
@@ -15447,7 +15642,9 @@ fn pair_frames_with_windows<'a>(
             // captioned like some frame is not the window of a frame named otherwise.
             let captioned = find_ui_captioned_windows(windows, frame.name);
             let claimed = |window: &WindowSnapshot| {
-                frames.iter().any(|other| find_ui_captioned_windows(std::slice::from_ref(window), other.name).len() == 1)
+                frames.iter().any(|other| {
+                    find_ui_captioned_windows(std::slice::from_ref(window), other.name).len() == 1
+                })
             };
             windows
                 .iter()
@@ -15455,7 +15652,9 @@ fn pair_frames_with_windows<'a>(
                     !window.popup
                         && !taken(window)
                         && find_ui_frame_aligned(window, frame.bounds)
-                        && frame.pid.is_none_or(|pid| i64::from(window.pid) == i64::from(pid))
+                        && frame
+                            .pid
+                            .is_none_or(|pid| i64::from(window.pid) == i64::from(pid))
                         && if captioned.is_empty() {
                             !claimed(window)
                         } else {
@@ -15464,13 +15663,20 @@ fn pair_frames_with_windows<'a>(
                 })
                 .collect()
         };
-        let found = (0..frames.len()).filter(|&index| open(index)).find_map(|index| {
-            let own = candidates(index);
-            let [window] = own.as_slice() else { return None };
-            let contested = (0..frames.len())
-                .any(|other| other != index && open(other) && candidates(other).iter().any(|rival| rival.id == window.id));
-            (!contested).then_some((index, *window))
-        });
+        let found = (0..frames.len())
+            .filter(|&index| open(index))
+            .find_map(|index| {
+                let own = candidates(index);
+                let [window] = own.as_slice() else {
+                    return None;
+                };
+                let contested = (0..frames.len()).any(|other| {
+                    other != index
+                        && open(other)
+                        && candidates(other).iter().any(|rival| rival.id == window.id)
+                });
+                (!contested).then_some((index, *window))
+            });
         let Some((index, window)) = found else {
             return paired;
         };
@@ -15479,7 +15685,10 @@ fn pair_frames_with_windows<'a>(
 }
 
 /// The windows whose caption is the frame's name.
-fn find_ui_captioned_windows<'a>(windows: &'a [WindowSnapshot], name: &str) -> Vec<&'a WindowSnapshot> {
+fn find_ui_captioned_windows<'a>(
+    windows: &'a [WindowSnapshot],
+    name: &str,
+) -> Vec<&'a WindowSnapshot> {
     if name.is_empty() {
         return Vec::new();
     }
@@ -15590,7 +15799,8 @@ impl FindMatch {
             Self::WholeWord => text.match_indices(query).any(|(start, found)| {
                 let before = text[..start].chars().next_back();
                 let after = text[start + found.len()..].chars().next();
-                !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
             }),
         }
     }
@@ -15601,7 +15811,15 @@ impl FindMatch {
 /// a button, link or field is something the caller may click, and a role this does
 /// not know must not be hidden.
 const TEXT_ONLY_ROLES: [&str; 9] = [
-    "static", "label", "paragraph", "heading", "section", "math", "caption", "image", "description value",
+    "static",
+    "label",
+    "paragraph",
+    "heading",
+    "section",
+    "math",
+    "caption",
+    "image",
+    "description value",
 ];
 
 /// Whether a match that sits inside an already matched element is only a repeat of it.
@@ -15625,20 +15843,39 @@ fn compact_find_elements(
             out.push(element);
             continue;
         };
-        let surface = fields.remove("surface").filter(|surface| !surface.is_null()).map(|surface| {
-            surfaces.iter().position(|known| *known == surface).unwrap_or_else(|| {
-                surfaces.push(surface);
-                surfaces.len() - 1
-            })
-        });
+        let surface = fields
+            .remove("surface")
+            .filter(|surface| !surface.is_null())
+            .map(|surface| {
+                surfaces
+                    .iter()
+                    .position(|known| *known == surface)
+                    .unwrap_or_else(|| {
+                        surfaces.push(surface);
+                        surfaces.len() - 1
+                    })
+            });
         if compact {
             // A link's href is left out too: compact is the cheap list of click
             // targets, and a tracking URL is longer than everything it keeps.
-            fields.retain(|key, _| matches!(key.as_str(), "role" | "name" | "earlier_name" | "value" | "bounds" | "mouse_coordinates_usable" | "backend"));
+            fields.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "role"
+                        | "name"
+                        | "earlier_name"
+                        | "value"
+                        | "bounds"
+                        | "mouse_coordinates_usable"
+                        | "backend"
+                )
+            });
         } else {
             // The window is named only when it is not the active one the result names once.
             if let Some(window) = fields.remove("window")
-                && let Some(id) = window.get("id").filter(|id| !id.is_null() && id.as_str() != active_window)
+                && let Some(id) = window
+                    .get("id")
+                    .filter(|id| !id.is_null() && id.as_str() != active_window)
             {
                 fields.insert("window_id".to_owned(), id.clone());
             }
@@ -15647,17 +15884,35 @@ fn compact_find_elements(
             }
             // States the visible/enabled flags already carry are not repeated.
             if let Some(serde_json::Value::Array(states)) = fields.get_mut("states") {
-                states.retain(|state| !matches!(state.as_str(), Some("enabled" | "sensitive" | "showing" | "visible")));
+                states.retain(|state| {
+                    !matches!(
+                        state.as_str(),
+                        Some("enabled" | "sensitive" | "showing" | "visible")
+                    )
+                });
             }
-            for key in ["raw_atspi_bounds", "coordinate_space", "occlusion_note", "provider_visible", "center_hit", "object_path"] {
+            for key in [
+                "raw_atspi_bounds",
+                "coordinate_space",
+                "occlusion_note",
+                "provider_visible",
+                "center_hit",
+                "object_path",
+            ] {
                 fields.remove(key);
             }
             for key in ["visible", "enabled"] {
-                if fields.get(key).is_some_and(|value| *value == serde_json::Value::Bool(true)) {
+                if fields
+                    .get(key)
+                    .is_some_and(|value| *value == serde_json::Value::Bool(true))
+                {
                     fields.remove(key);
                 }
             }
-            if fields.get("window_association").is_some_and(|value| value == "unique_title_and_frame_size") {
+            if fields
+                .get("window_association")
+                .is_some_and(|value| value == "unique_title_and_frame_size")
+            {
                 fields.remove("window_association");
             }
             fields.retain(|_, value| !value.is_null());
@@ -15688,8 +15943,16 @@ fn find_elements_text(elements: &[serde_json::Value], surfaces: &[serde_json::Va
         if element["mouse_coordinates_usable"] == true {
             line.push_str("\tclick-usable");
         }
-        for (key, note) in [("visible", "hidden"), ("enabled", "disabled"), ("occluded", "occluded")] {
-            let flagged = if key == "occluded" { element[key] == true } else { element[key] == false };
+        for (key, note) in [
+            ("visible", "hidden"),
+            ("enabled", "disabled"),
+            ("occluded", "occluded"),
+        ] {
+            let flagged = if key == "occluded" {
+                element[key] == true
+            } else {
+                element[key] == false
+            };
             if flagged {
                 line.push('\t');
                 line.push_str(note);
@@ -16508,7 +16771,9 @@ impl KwinMcp {
         // The router sends a start that names a host to that host's listener.
         if let Some(host) = &params.host {
             return Err(McpError::invalid_params(
-                format!("host '{host}' was not routed; this desktop starts on the local machine only"),
+                format!(
+                    "host '{host}' was not routed; this desktop starts on the local machine only"
+                ),
                 None,
             ));
         }
@@ -16628,13 +16893,8 @@ impl KwinMcp {
                     attempt.finish(Some(&error.message));
                     return Err(error);
                 }
-                let mut error = hard_timeout_error(
-                    startup_timeout,
-                    &stage,
-                    blocked_for,
-                    false,
-                    &self.path,
-                );
+                let mut error =
+                    hard_timeout_error(startup_timeout, &stage, blocked_for, false, &self.path);
                 let snapshot = self
                     .startup_snapshot
                     .lock()
@@ -16647,7 +16907,8 @@ impl KwinMcp {
                     }
                 }
                 if let Some(snapshot) = snapshot {
-                    error.message = format!("{}; last sandbox snapshot: {snapshot}", error.message).into();
+                    error.message =
+                        format!("{}; last sandbox snapshot: {snapshot}", error.message).into();
                     if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
                         data.insert("sandbox_snapshot".to_owned(), serde_json::json!(snapshot));
                     }
@@ -17125,17 +17386,15 @@ impl KwinMcp {
         };
         eprintln!("session_start: KWallet: {}", wallet_snapshot.reason);
         eprintln!("session_start: Secret Service: {}", secret_snapshot.reason);
-        let secrets = match secret_service::SecretService::start(
-            &wallet_bus_address,
-            secret_snapshot.store,
-        )
-        .await
-        {
-            Ok(service) => service,
-            Err(error) => {
-                return cleanup_err(format!("session Secret Service: {error}"), &mut startup);
-            }
-        };
+        let secrets =
+            match secret_service::SecretService::start(&wallet_bus_address, secret_snapshot.store)
+                .await
+            {
+                Ok(service) => service,
+                Err(error) => {
+                    return cleanup_err(format!("session Secret Service: {error}"), &mut startup);
+                }
+            };
         let wallet = match wallet_mediator::WalletMediator::start(
             &wallet_bus_address,
             wallet_snapshot.wallet.clone(),
@@ -17565,7 +17824,9 @@ impl KwinMcp {
                 .arg(cdp_forward_port.to_string())
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(log.map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from));
+                .stderr(
+                    log.map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from),
+                );
             terminate_with_parent(&mut forwarder);
             match spawn_session_child(forwarder, false).await {
                 Ok(child) => {
@@ -18377,7 +18638,9 @@ impl KwinMcp {
             Ok(Err(_)) => {
                 return Err(McpError::internal_error(
                     "the session's cleanup worker ended without a result; call session_stop again to retry",
-                    Some(serde_json::json!({"reason": "cleanup_worker_failed", "retry_safe": true})),
+                    Some(
+                        serde_json::json!({"reason": "cleanup_worker_failed", "retry_safe": true}),
+                    ),
                 ));
             }
             // The limit: say what is still running instead of staying silent.
@@ -18728,12 +18991,7 @@ impl KwinMcp {
         let window = activate_window(&conn, &kwin_unique, &xdg, &params.window_id).await?;
         self.mark_input().await;
         let text = format!("activated {}", window.summary());
-        Ok(structured_result(
-            &peer,
-            text,
-            serde_json::json!({"window": window.compact()}),
-        )
-        .await)
+        Ok(structured_result(&peer, text, serde_json::json!({"window": window.compact()})).await)
     }
 
     // Alpha-blends the high-visibility cursor sprite onto an RGBA buffer so that
@@ -19780,7 +20038,10 @@ impl KwinMcp {
             match cdp {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => errors.push(format!("CDP search incomplete: {error}")),
-                Err(_) => errors.push(format!("CDP search reached its {}-second limit", search_timeout.as_secs())),
+                Err(_) => errors.push(format!(
+                    "CDP search reached its {}-second limit",
+                    search_timeout.as_secs()
+                )),
             }
         }
 
@@ -19968,10 +20229,16 @@ impl KwinMcp {
             Err(_) => errors.push(format!("AT-SPI search reached its {}-second limit; already collected matches are retained; pass timeout_seconds (up to {ACCESSIBILITY_TREE_TIMEOUT_MAX_SECONDS}) for a larger page", search_timeout.as_secs())),
         }
         let found = elements.len();
-        let limit = params.limit.unwrap_or(FIND_UI_DEFAULT_LIMIT).clamp(1, FIND_UI_MAX_MATCHES);
+        let limit = params
+            .limit
+            .unwrap_or(FIND_UI_DEFAULT_LIMIT)
+            .clamp(1, FIND_UI_MAX_MATCHES);
         elements.truncate(limit);
-        let (elements, surfaces) =
-            compact_find_elements(elements, params.compact.unwrap_or(false), active_id.as_deref());
+        let (elements, surfaces) = compact_find_elements(
+            elements,
+            params.compact.unwrap_or(false),
+            active_id.as_deref(),
+        );
         let mut text = if elements.is_empty() {
             format!("no observed elements matching '{}'", params.query)
         } else {
@@ -19980,7 +20247,10 @@ impl KwinMcp {
         let mut data = serde_json::json!({"matches": found, "elements": elements});
         if found > elements.len() {
             data["more"] = serde_json::json!(found - elements.len());
-            text.push_str(&format!("\n{} more matches; raise limit or narrow the query", found - elements.len()));
+            text.push_str(&format!(
+                "\n{} more matches; raise limit or narrow the query",
+                found - elements.len()
+            ));
         }
         if !surfaces.is_empty() {
             data["surfaces"] = serde_json::json!(surfaces);
@@ -20132,7 +20402,12 @@ impl KwinMcp {
                 ),
             )
         })?
-        .map_err(|error| refuse("cdp_failed", format!("the page could not be read ({error})")))?;
+        .map_err(|error| {
+            refuse(
+                "cdp_failed",
+                format!("the page could not be read ({error})"),
+            )
+        })?;
         let read: serde_json::Value = evaluated
             .value()
             .and_then(serde_json::Value::as_str)
@@ -20333,7 +20608,10 @@ impl KwinMcp {
         let characters = target.chars().count();
         let typed = characters <= browser_address::TYPED_MAX_CHARS;
         let keys = if typed {
-            target.chars().map(char_key).collect::<Result<Vec<_>, _>>()?
+            target
+                .chars()
+                .map(char_key)
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
@@ -20508,8 +20786,7 @@ impl KwinMcp {
                     .await
                     .is_some_and(|(_, window_active)| window_active)
                 {
-                    let _ =
-                        tokio::time::timeout(CDP_STEP_TIMEOUT, page.bring_to_front()).await;
+                    let _ = tokio::time::timeout(CDP_STEP_TIMEOUT, page.bring_to_front()).await;
                 }
                 let loaded = cdp_loaded(&page).await;
                 let (landed, entry_title) = cdp_entry(&page).await.unwrap_or((tab_url, tab_title));
@@ -20624,7 +20901,9 @@ impl KwinMcp {
             };
             let store = self.clipboards.clone();
             clipboard_kept = tokio::task::spawn_blocking(move || {
-                store.lock().is_ok_and(|mut store| store.take_back(loan).is_ok())
+                store
+                    .lock()
+                    .is_ok_and(|mut store| store.take_back(loan).is_ok())
             })
             .await
             .unwrap_or(false);
@@ -20655,7 +20934,9 @@ impl KwinMcp {
         check_typing_window(&typing_window).await.map_err(|error| {
             navigation_error(
                 error.reason(),
-                format!("{error}. {shown_target} is in the address bar, but Return was not pressed."),
+                format!(
+                    "{error}. {shown_target} is in the address bar, but Return was not pressed."
+                ),
                 false,
                 false,
                 requested.clone(),
@@ -20696,9 +20977,13 @@ impl KwinMcp {
                 if page.uri.is_empty() {
                     // A new document without an address: about:blank stays that
                     // way, any other page reports its address with its content.
-                    let wait = if blank { NAVIGATION_POLL * 2 } else { NAVIGATION_LOAD_WAIT };
-                    let deadline = *load_deadline
-                        .get_or_insert_with(|| tokio::time::Instant::now() + wait);
+                    let wait = if blank {
+                        NAVIGATION_POLL * 2
+                    } else {
+                        NAVIGATION_LOAD_WAIT
+                    };
+                    let deadline =
+                        *load_deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
                     if moved && tokio::time::Instant::now() >= deadline {
                         landed = Some(page);
                         break;
@@ -20734,7 +21019,11 @@ impl KwinMcp {
                 None => break (title_before.clone(), true),
             }
         };
-        let method = if typed { "address_bar_typed" } else { "address_bar_pasted" };
+        let method = if typed {
+            "address_bar_typed"
+        } else {
+            "address_bar_pasted"
+        };
         let shown_tab = shown
             .as_ref()
             .filter(|page| !page.uri.is_empty())
@@ -20887,7 +21176,10 @@ impl KwinMcp {
                     (elements, unfinished) =
                         search_outcome(&self.find_ui_elements(peer.clone(), wanted()).await?);
                     note = if window.id == window_id {
-                        format!(" Window {} ('{}') was activated to click it there.", window.id, window.title)
+                        format!(
+                            " Window {} ('{}') was activated to click it there.",
+                            window.id, window.title
+                        )
                     } else {
                         format!(
                             " Activating window {window_id} gave focus to its dialog {} ('{}'); answer or close that dialog first.",
@@ -20906,8 +21198,14 @@ impl KwinMcp {
         let ((x, y), element) = match target {
             Some(Ok(target)) => target,
             other => {
-                let near = if elements.is_empty() && (params.role.is_some() || params.exact == Some(true)) {
-                    let (near, more) = search_outcome(&self.find_ui_elements(peer.clone(), search(None, None)).await?);
+                let near = if elements.is_empty()
+                    && (params.role.is_some() || params.exact == Some(true))
+                {
+                    let (near, more) = search_outcome(
+                        &self
+                            .find_ui_elements(peer.clone(), search(None, None))
+                            .await?,
+                    );
                     unfinished.extend(more);
                     unfinished.dedup();
                     near
@@ -20927,19 +21225,24 @@ impl KwinMcp {
                     }
                     .explain(),
                 };
-                let seen: Vec<serde_json::Value> = controls_first(if elements.is_empty() { near.iter() } else { elements.iter() })
-                    .into_iter()
-                    .take(5)
-                    .map(|element| {
-                        let mut seen = serde_json::json!({"role": element["role"], "name": element["name"]});
-                        for key in ["visible", "window_id"] {
-                            if !element[key].is_null() {
-                                seen[key] = element[key].clone();
-                            }
+                let seen: Vec<serde_json::Value> = controls_first(if elements.is_empty() {
+                    near.iter()
+                } else {
+                    elements.iter()
+                })
+                .into_iter()
+                .take(5)
+                .map(|element| {
+                    let mut seen =
+                        serde_json::json!({"role": element["role"], "name": element["name"]});
+                    for key in ["visible", "window_id"] {
+                        if !element[key].is_null() {
+                            seen[key] = element[key].clone();
                         }
-                        seen
-                    })
-                    .collect();
+                    }
+                    seen
+                })
+                .collect();
                 let mut data = serde_json::json!({
                     "reason": "no_clickable_element", "cause": cause, "retry_safe": true,
                     "matches": elements.len(), "clickable": candidates.len(), "seen": seen,
@@ -20947,7 +21250,10 @@ impl KwinMcp {
                 if let Some(window) = activated {
                     data["activated_window"] = window;
                 }
-                return Err(McpError::invalid_params(format!("Nothing was clicked: {detail}{note}"), Some(data)));
+                return Err(McpError::invalid_params(
+                    format!("Nothing was clicked: {detail}{note}"),
+                    Some(data),
+                ));
             }
         };
         let clicked = serde_json::json!({"role": element["role"], "name": element["name"]});
@@ -20967,13 +21273,18 @@ impl KwinMcp {
         )
         .await?;
         let mut text = format!("clicked {clicked} at ({x},{y})");
-        let mut data = serde_json::json!({"clicked": clicked, "at": [x, y], "clickable": clickable});
+        let mut data =
+            serde_json::json!({"clicked": clicked, "at": [x, y], "clickable": clickable});
         if let Some(window) = activated {
-            text.push_str(&format!(" after activating its window {} ('{}')", window["id"], window["title"]));
+            text.push_str(&format!(
+                " after activating its window {} ('{}')",
+                window["id"], window["title"]
+            ));
             data["activated_window"] = window;
         }
         if disabled {
-            let warning = "The element reports itself disabled, so the click may have had no effect.";
+            let warning =
+                "The element reports itself disabled, so the click may have had no effect.";
             data["warning"] = serde_json::json!(warning);
             text.push_str(&format!(". {warning}"));
         }
@@ -21120,7 +21431,8 @@ impl KwinMcp {
             }
         }
         if let Some(link) = cdp_link
-            && let Ok((_, _, active)) = active_window_info(&view_conn, &view_unique, &self.host_xdg_dir().await?).await
+            && let Ok((_, _, active)) =
+                active_window_info(&view_conn, &view_unique, &self.host_xdg_dir().await?).await
             && let Ok(Some((scroll_y, max_y))) = tokio::time::timeout(
                 CDP_STEP_TIMEOUT,
                 cdp_scroll_position(&link.browser, &active.title),
@@ -21314,7 +21626,9 @@ impl KwinMcp {
                 if !blind_replace {
                     return Err(preflight_error(
                         "replace_unavailable",
-                        format!("replace=true needs a focused editable field or a dialog's entry, and {error}"),
+                        format!(
+                            "replace=true needs a focused editable field or a dialog's entry, and {error}"
+                        ),
                     ));
                 }
             }
@@ -21743,7 +22057,11 @@ impl KwinMcp {
             .map(|geometry| geometry.title.clone())
             .unwrap_or_default();
         let focus = browser_focus(&conn, &active_title).await;
-        let before_view = if zoom { view_fingerprint(&conn, &kwin_unique).await } else { None };
+        let before_view = if zoom {
+            view_fingerprint(&conn, &kwin_unique).await
+        } else {
+            None
+        };
         // A key for the address bar, Return after an address above all, is no
         // reason to warn (#958); the result names where it went.
         let warning = if is_chromium_devtools_shortcut(&active_title, &mods, &params.key) {
@@ -21896,7 +22214,11 @@ impl KwinMcp {
         // the zoom limit was reached or the page did not get the key.
         if zoom && let Some(changed) = view_changed_since(&conn, &kwin_unique, before_view).await {
             data["view_changed"] = serde_json::json!(changed);
-            data["application_effect"] = serde_json::json!(if changed { "view_changed" } else { "view_unchanged" });
+            data["application_effect"] = serde_json::json!(if changed {
+                "view_changed"
+            } else {
+                "view_unchanged"
+            });
         }
         if let Some(delivery) = paste_delivery {
             data["paste"] = serde_json::json!({
@@ -22149,22 +22471,18 @@ impl KwinMcp {
                     params.session_path,
                     destination.display()
                 );
-                Ok(structured_result(
-                    &peer,
-                    text,
-                    {
-                        // The host path is named when it is not where the caller asked
-                        // (the host_path, or session_path when none was given): a directory
-                        // the file went into, for one.
-                        let resolved = destination.display().to_string();
-                        let requested = params.host_path.as_deref().unwrap_or(&params.session_path);
-                        let mut exported = serde_json::json!({"status": "exported", "bytes": bytes});
-                        if requested != resolved {
-                            exported["host_path"] = serde_json::json!(resolved);
-                        }
-                        exported
-                    },
-                )
+                Ok(structured_result(&peer, text, {
+                    // The host path is named when it is not where the caller asked
+                    // (the host_path, or session_path when none was given): a directory
+                    // the file went into, for one.
+                    let resolved = destination.display().to_string();
+                    let requested = params.host_path.as_deref().unwrap_or(&params.session_path);
+                    let mut exported = serde_json::json!({"status": "exported", "bytes": bytes});
+                    if requested != resolved {
+                        exported["host_path"] = serde_json::json!(resolved);
+                    }
+                    exported
+                })
                 .await)
             }
             Err(reason) => Err(McpError::internal_error(
@@ -22660,8 +22978,12 @@ impl KwinMcp {
                         win_geo = Some(launch_window_geometry(window));
                         window_observed_after_timeout = true;
                     } else {
-                        timeout_window_ids =
-                            Some(windows.iter().map(|window| window.id.clone()).collect::<Vec<_>>());
+                        timeout_window_ids = Some(
+                            windows
+                                .iter()
+                                .map(|window| window.id.clone())
+                                .collect::<Vec<_>>(),
+                        );
                         timeout_window_snapshot = Some(launch_window_snapshot(&windows));
                     }
                 }
@@ -22790,9 +23112,13 @@ impl KwinMcp {
                 "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
             });
         let mut suffix = String::new();
-        for text in [warning.as_deref(), extension_warning.as_deref(), cdp_refused]
-            .into_iter()
-            .flatten()
+        for text in [
+            warning.as_deref(),
+            extension_warning.as_deref(),
+            cdp_refused,
+        ]
+        .into_iter()
+        .flatten()
         {
             suffix.push_str(". ");
             suffix.push_str(text);
@@ -22887,7 +23213,12 @@ impl KwinMcp {
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                 });
                 compact_launch_result(&mut launched);
-                Ok(structured_result(&peer, format!("launched: {} {description}{suffix}", params.command), launched).await)
+                Ok(structured_result(
+                    &peer,
+                    format!("launched: {} {description}{suffix}", params.command),
+                    launched,
+                )
+                .await)
             }
             (None, Some(status)) => {
                 let browser_unattributed = status == 0 && chromium_launch;
@@ -22992,7 +23323,9 @@ impl KwinMcp {
                         format!(
                             "is still starting: its {} processes used {:.2}s of CPU in the last {}s ({:.1}s since launch)",
                             cpu.processes,
-                            cpu.report()["recent_cpu_seconds"].as_f64().unwrap_or_default(),
+                            cpu.report()["recent_cpu_seconds"]
+                                .as_f64()
+                                .unwrap_or_default(),
                             LAUNCH_LATE_WINDOW_GRACE.as_secs(),
                             cpu.report()["cpu_seconds"].as_f64().unwrap_or_default(),
                         ),
@@ -23130,7 +23463,9 @@ fn parse_cli_args_from(mut args: impl Iterator<Item = String>) -> Result<Display
                         .parse::<u64>()
                         .ok()
                         .filter(|mbps| *mbps > 0)
-                        .ok_or_else(|| format!("--link-mbps '{value}' is not a positive whole number of Mb/s"))?,
+                        .ok_or_else(|| {
+                            format!("--link-mbps '{value}' is not a positive whole number of Mb/s")
+                        })?,
                 );
             }
             "--memory-high" => {
@@ -23347,7 +23682,9 @@ fn parse_minutes_arg(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
 ) -> Result<Duration, String> {
-    let value = args.next().ok_or_else(|| format!("{flag} requires minutes"))?;
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{flag} requires minutes"))?;
     let minutes: u64 = value
         .parse()
         .map_err(|error| format!("{flag} '{value}': {error}"))?;
@@ -23946,10 +24283,7 @@ fn sweep_stale_control_sockets() {
         match std::os::unix::net::UnixStream::connect(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                 match std::fs::remove_file(&path) {
-                    Ok(()) => eprintln!(
-                        "session control: removed stale socket {}",
-                        path.display()
-                    ),
+                    Ok(()) => eprintln!("session control: removed stale socket {}", path.display()),
                     Err(error) => eprintln!(
                         "session control: could not remove stale socket {}: {error}",
                         path.display()
@@ -24574,7 +24908,7 @@ fn unknown_session_error(id: &str) -> McpError {
             "Call session_start without session_id and relaunch your applications; a session ends when its server process exits.".to_owned()
         } else {
             format!(
-            "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
+                "This process could not reach an authenticated session-control socket for process {other_server_pid}. If it is still running an older kwin-mcp build, update it to enable routing; otherwise call session_start without session_id and relaunch your applications."
             )
         };
         let message = if owner_running == Some(false) {
@@ -25144,7 +25478,9 @@ impl RemoteSessions {
             remote_error(
                 "remote_host_unreachable",
                 host,
-                format!("kwin-mcp listener {host} could not be reached: {error}. No session was started."),
+                format!(
+                    "kwin-mcp listener {host} could not be reached: {error}. No session was started."
+                ),
             )
         };
         let secret = remote::read_secret().map_err(unreachable)?;
@@ -25294,7 +25630,11 @@ impl RemoteSessions {
     /// In the image a server re-executed into: continues on the inherited
     /// control sockets. A session whose connection did not come along is
     /// reported as `connection_lost`, as after any dropped connection.
-    async fn restore(self: &Arc<Self>, state: RemoteRestore, client: Option<rmcp::model::ClientInfo>) {
+    async fn restore(
+        self: &Arc<Self>,
+        state: RemoteRestore,
+        client: Option<rmcp::model::ClientInfo>,
+    ) {
         let mut hosts = self.hosts.lock().await;
         for saved in state.hosts {
             let owned = state
@@ -25592,7 +25932,8 @@ impl SessionRouter {
                 None,
             ));
         }
-        let host = remote::authority(host).map_err(|error| McpError::invalid_params(error, None))?;
+        let host =
+            remote::authority(host).map_err(|error| McpError::invalid_params(error, None))?;
         if let Some(arguments) = request.arguments.as_mut() {
             arguments.remove("host");
         }
@@ -25904,13 +26245,21 @@ impl SessionRouter {
         if let Some(child) = viewer.child.as_mut() {
             let shown = viewer_report(&viewer.dir, Some(child), None);
             if shown["state"] == "ready" {
-                let sending = self.remote.call(listener, host, request.clone())
+                let sending = self
+                    .remote
+                    .call(listener, host, request.clone())
                     .await
                     .ok()
                     .and_then(|result| result.structured_content)
                     .is_some_and(|data| data["status"] == "already_open");
                 if sending {
-                    return Ok(remote_viewer_result(peer, "already_open", with_path(shown, &viewer.dir), host).await);
+                    return Ok(remote_viewer_result(
+                        peer,
+                        "already_open",
+                        with_path(shown, &viewer.dir),
+                        host,
+                    )
+                    .await);
                 }
             }
             viewer.close().await;
@@ -25936,16 +26285,20 @@ impl SessionRouter {
                     before.abort();
                 }
             }
-            Err(error) => eprintln!(
-                "viewer of {id}: it cannot move to another path if its own dies: {error}"
-            ),
+            Err(error) => {
+                eprintln!("viewer of {id}: it cannot move to another path if its own dies: {error}")
+            }
         }
         // Returns once the frame sender there saw this window present a frame,
         // or with the reason it could not.
         let sender = self.remote.call(listener, host, request).await;
         let refused = match &sender {
             Err(error) => Some(error.message.to_string()),
-            Ok(result) => match result.structured_content.as_ref().map(|data| &data["viewer"]) {
+            Ok(result) => match result
+                .structured_content
+                .as_ref()
+                .map(|data| &data["viewer"])
+            {
                 Some(sender) if sender["state"] == "ready" => None,
                 Some(sender) => Some(
                     sender["reason"]
@@ -26588,7 +26941,11 @@ impl SessionRouter {
                 return Err(McpError::invalid_params(
                     format!(
                         "launch_app needs session_id: this server has no desktop of its own but uses {} ({}). Pass one of those as session_id to launch there, or call session_start (no arguments) for a new local desktop and pass its session_id.",
-                        if known.len() == 1 { "this session" } else { "these sessions" },
+                        if known.len() == 1 {
+                            "this session"
+                        } else {
+                            "these sessions"
+                        },
                         known.join(", "),
                     ),
                     Some(serde_json::json!({
@@ -26704,7 +27061,9 @@ impl SessionRouter {
             {
                 data.insert("viewer".to_owned(), shown);
             }
-            result.content.push(Content::text(format!("viewer: {text}")));
+            result
+                .content
+                .push(Content::text(format!("viewer: {text}")));
         }
         Ok(result)
     }
@@ -26793,7 +27152,10 @@ impl SessionRouter {
                 // An owner that is gone cannot be asked, and its viewer went
                 // with it: that is the state viewer_close asks for.
                 Err(error) if request.name == "viewer_close" => {
-                    match self.close_viewer_unregistered(Some(id), &context.peer).await? {
+                    match self
+                        .close_viewer_unregistered(Some(id), &context.peer)
+                        .await?
+                    {
                         Some(result) => return Ok(result),
                         None => return Err(error),
                     }
@@ -26822,7 +27184,9 @@ impl SessionRouter {
         if self.listener_peer && writes_host_clipboard(&request) {
             return Err(McpError::invalid_params(
                 "clipboard_write target=host is not accepted over a remote connection: the host clipboard is the calling machine's, which its own kwin-mcp server writes. Update kwin-mcp on the calling machine.",
-                Some(serde_json::json!({"reason": "host_clipboard_is_the_callers", "retry_safe": false})),
+                Some(
+                    serde_json::json!({"reason": "host_clipboard_is_the_callers", "retry_safe": false}),
+                ),
             ));
         }
         let (id, session) = self.resolve(&mut request)?;
@@ -26882,23 +27246,21 @@ impl SessionRouter {
             None
         };
         if agent_input {
-            let viewer_pause =
-                session
-                    .viewer_active_pause()
-                    .await
-                    .map_err(|error| {
-                        McpError::internal_error(
-                            format!("Could not check live viewer input activity: {error}"),
-                            Some(serde_json::json!({
-                                "reason":"viewer_activity_check_failed",
-                                "retry_safe":true
-                            })),
-                        )
-                    })?;
+            let viewer_pause = session.viewer_active_pause().await.map_err(|error| {
+                McpError::internal_error(
+                    format!("Could not check live viewer input activity: {error}"),
+                    Some(serde_json::json!({
+                        "reason":"viewer_activity_check_failed",
+                        "retry_safe":true
+                    })),
+                )
+            })?;
             if let Some((remaining, kind)) = viewer_pause {
                 let remaining_ms = remaining.as_millis();
                 return Err(McpError::internal_error(
-                    format!("Agent input is paused for {remaining_ms} more ms after viewer input ({kind}) to avoid interfering with the user's recent interaction. Retry then; the viewer can stay open."),
+                    format!(
+                        "Agent input is paused for {remaining_ms} more ms after viewer input ({kind}) to avoid interfering with the user's recent interaction. Retry then; the viewer can stay open."
+                    ),
                     Some(serde_json::json!({
                         "reason":"recent_viewer_input",
                         "retry_safe":true,
@@ -26930,7 +27292,10 @@ impl SessionRouter {
                             Ok(None) => {}
                             Ok(Some((remaining, kind))) => {
                                 break McpError::internal_error(
-                                    format!("Viewer input ({kind}) interrupted the agent operation. Some input may already have arrived; inspect the target before retrying, and wait {} ms for the viewer to be quiet.", remaining.as_millis()),
+                                    format!(
+                                        "Viewer input ({kind}) interrupted the agent operation. Some input may already have arrived; inspect the target before retrying, and wait {} ms for the viewer to be quiet.",
+                                        remaining.as_millis()
+                                    ),
                                     Some(
                                         serde_json::json!({"reason":"viewer_input_interrupted", "retry_safe":false, "submission_complete":false, "remaining_ms":remaining.as_millis(), "viewer_input":kind}),
                                     ),
@@ -27795,7 +28160,11 @@ impl SessionRouter {
                     .iter()
                     .map(SessionProcess::id)
                     .collect(),
-                viewer: session.viewer_child.as_ref().filter(|viewer| viewer.status.is_none()).map(SessionProcess::id),
+                viewer: session
+                    .viewer_child
+                    .as_ref()
+                    .filter(|viewer| viewer.status.is_none())
+                    .map(SessionProcess::id),
                 kwin_unique: session.kwin_unique_name.clone(),
                 service_bus: session.service_bus_address.clone(),
                 atspi_bus: session.atspi_bus_address.clone(),
@@ -28677,8 +29046,10 @@ mod host_wayland_scan_tests {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let runtime = std::env::temp_dir()
-            .join(format!("kwin-mcp-wayland-scan-{}-{unique}", std::process::id()));
+        let runtime = std::env::temp_dir().join(format!(
+            "kwin-mcp-wayland-scan-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(&runtime)?;
         // A socket file nothing answers a stream connect on, like a dead
@@ -28731,7 +29102,10 @@ mod sandbox_process_tree_tests {
         let _ = shell.kill();
         let _ = shell.wait();
         assert!(tree.contains("sleep["), "child missing from: {tree}");
-        assert!(tree.contains(&format!("<-{}", shell.id())), "parent missing from: {tree}");
+        assert!(
+            tree.contains(&format!("<-{}", shell.id())),
+            "parent missing from: {tree}"
+        );
         assert!(!tree.contains("sh -c"), "a command line leaked: {tree}");
         Ok(())
     }
@@ -28856,8 +29230,13 @@ mod memory_limit_tests {
             assert_eq!(held[..args.len()], args[..]);
             assert_eq!(
                 held[args.len()..],
-                ["/disk/kwin-mcp-exe", "--netns-holder", "/disk/pasta.pid", "pasta"]
-                    .map(std::ffi::OsString::from)
+                [
+                    "/disk/kwin-mcp-exe",
+                    "--netns-holder",
+                    "/disk/pasta.pid",
+                    "pasta"
+                ]
+                .map(std::ffi::OsString::from)
             );
             // Exercise the same scope properties with a readback process
             // instead of starting a compositor or application.
@@ -28943,7 +29322,12 @@ mod level_tree_tests {
 
     /// The rows a `role=link show_links=true` call gathers on a results page:
     /// every link on the first level, each with a target of `href` characters.
-    fn link_rows(tree: &mut LevelTree, parent: Option<usize>, rows: usize, href: usize) -> Vec<String> {
+    fn link_rows(
+        tree: &mut LevelTree,
+        parent: Option<usize>,
+        rows: usize,
+        href: usize,
+    ) -> Vec<String> {
         let mut pushed = Vec::new();
         for row in 0..rows {
             if tree.skips_row(parent) {
@@ -28967,10 +29351,17 @@ mod level_tree_tests {
             link_rows(&mut tree, None, 463, 300);
             let (text, info) = tree.render(usize::MAX);
             calls += 1;
-            assert!(text.chars().count() <= A11Y_TREE_MAX_CHARS, "{}", text.chars().count());
+            assert!(
+                text.chars().count() <= A11Y_TREE_MAX_CHARS,
+                "{}",
+                text.chars().count()
+            );
             assert_eq!(info["chars"], text.chars().count());
             assert_eq!(info["levels"], 1);
-            let rows: Vec<&str> = text.lines().filter(|line| line.starts_with("link\t")).collect();
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with("link\t"))
+                .collect();
             assert!(!rows.is_empty());
             seen.extend(rows.iter().map(|row| row.to_string()));
             let Some(next) = info["next_offset"].as_u64() else {
@@ -28982,7 +29373,10 @@ mod level_tree_tests {
             // Every row of a page names the node that opens it.
             assert!(rows.iter().all(|row| row.contains("\troot=id-")), "{text}");
             let more = info["more_rows"].as_u64().unwrap_or(0);
-            assert_eq!(text.lines().last(), Some(format!("+{more} more rows\toffset={next}").as_str()));
+            assert_eq!(
+                text.lines().last(),
+                Some(format!("+{more} more rows\toffset={next}").as_str())
+            );
             assert_eq!(usize::try_from(next).ok(), Some(seen.len()));
             assert_eq!(usize::try_from(more).ok(), Some(463 - seen.len()));
             offset = seen.len();
@@ -28999,16 +29393,27 @@ mod level_tree_tests {
         link_rows(&mut tree, Some(root), 200, 300);
         let (text, info) = tree.render(usize::MAX);
         assert!(text.chars().count() <= A11Y_TREE_MAX_CHARS);
-        assert!(text.starts_with("list\tResults\n\tlink\tListing 0\thref="), "{}", &text[..80]);
+        assert!(
+            text.starts_with("list\tResults\n\tlink\tListing 0\thref="),
+            "{}",
+            &text[..80]
+        );
         assert_eq!(info["levels"], 2);
-        let next = info["next_offset"].as_u64().and_then(|next| usize::try_from(next).ok()).unwrap_or(0);
+        let next = info["next_offset"]
+            .as_u64()
+            .and_then(|next| usize::try_from(next).ok())
+            .unwrap_or(0);
         assert!(next > 0 && next < 200, "{info}");
         // The next call skips those rows of the root, not the root.
         let mut tree = LevelTree::paged(next, true);
         let root = tree.push("list\tResults".to_owned(), "list-id".to_owned(), None);
         link_rows(&mut tree, Some(root), 200, 300);
         let (text, info) = tree.render(usize::MAX);
-        assert!(text.starts_with(&format!("list\tResults\n\tlink\tListing {next}\thref=")), "{}", &text[..80]);
+        assert!(
+            text.starts_with(&format!("list\tResults\n\tlink\tListing {next}\thref=")),
+            "{}",
+            &text[..80]
+        );
         assert_eq!(info["offset"], next);
     }
 
@@ -29018,8 +29423,14 @@ mod level_tree_tests {
         link_rows(&mut tree, None, 40, 300);
         let (text, info) = tree.render(usize::MAX);
         assert_eq!(text.lines().count(), 40);
-        assert!(info["next_offset"].is_null() && info["offset"].is_null(), "{info}");
-        assert!(!text.contains("root="), "a leaf of a whole level carries no id");
+        assert!(
+            info["next_offset"].is_null() && info["offset"].is_null(),
+            "{info}"
+        );
+        assert!(
+            !text.contains("root="),
+            "a leaf of a whole level carries no id"
+        );
     }
 
     #[test]
@@ -29030,10 +29441,21 @@ mod level_tree_tests {
         let long = format!("https://example.com/itm/1?q={}&end=1", "z".repeat(3_000));
         let shown = tree_href(&long);
         let omitted = long.chars().count() - A11Y_HREF_MAX_CHARS;
-        assert!(shown.starts_with("\thref=https://example.com/itm/1?q=zzz"), "{shown}");
+        assert!(
+            shown.starts_with("\thref=https://example.com/itm/1?q=zzz"),
+            "{shown}"
+        );
         assert!(shown.ends_with("zzz&end=1"), "{shown}");
-        assert!(shown.contains(&format!("…[{omitted} more characters]…")), "{shown}");
-        assert_eq!(shown.chars().count(), "\thref=".len() + A11Y_HREF_MAX_CHARS + format!("…[{omitted} more characters]…").chars().count());
+        assert!(
+            shown.contains(&format!("…[{omitted} more characters]…")),
+            "{shown}"
+        );
+        assert_eq!(
+            shown.chars().count(),
+            "\thref=".len()
+                + A11Y_HREF_MAX_CHARS
+                + format!("…[{omitted} more characters]…").chars().count()
+        );
         // The element search returns that target whole, and cuts only past its own bound.
         let mut matched = serde_json::json!({});
         set_href(&mut matched, &long);
@@ -29043,7 +29465,11 @@ mod level_tree_tests {
         set_href(&mut matched, &data);
         assert_eq!(matched["href_chars"], data.len());
         let cut = matched["href"].as_str().unwrap_or_default().to_owned();
-        assert!(cut.starts_with("data:text/plain,ddd") && cut.contains("…[16 more characters]…"), "{}", &cut[..40]);
+        assert!(
+            cut.starts_with("data:text/plain,ddd") && cut.contains("…[16 more characters]…"),
+            "{}",
+            &cut[..40]
+        );
         // The page script hands such a target over as its ends and its length.
         let mut from_page = serde_json::json!({});
         let half = FIND_UI_HREF_MAX_CHARS / 2;
@@ -29052,17 +29478,23 @@ mod level_tree_tests {
             &serde_json::json!({"head": &data[..half], "tail": &data[data.len() - half..], "chars": data.len()}),
         );
         assert_eq!(from_page, matched);
-        assert!(include_str!("find_ui_dom.js").contains(&format!("HREF_MAX = {FIND_UI_HREF_MAX_CHARS};")));
+        assert!(
+            include_str!("find_ui_dom.js")
+                .contains(&format!("HREF_MAX = {FIND_UI_HREF_MAX_CHARS};"))
+        );
     }
 
     #[test]
     fn a_page_read_names_its_continuation_in_the_half_the_client_shows() {
         use super::{ResultView, page_read_result};
-        let info = || {
-            serde_json::json!({"format":"links", "offset":0, "end":5, "chars":5, "total_chars":12, "next_offset":5})
-        };
+        let info = || serde_json::json!({"format":"links", "offset":0, "end":5, "chars":5, "total_chars":12, "next_offset":5});
         let text_of = |result: &rmcp::model::CallToolResult| {
-            result.content.first().and_then(|content| content.as_text()).map(|text| text.text.clone()).unwrap_or_default()
+            result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|text| text.text.clone())
+                .unwrap_or_default()
         };
         let structured = page_read_result(ResultView::StructuredOnly, "a\tb\nc".to_owned(), info());
         let content = structured.structured_content.clone().unwrap_or_default();
@@ -29072,10 +29504,14 @@ mod level_tree_tests {
         assert!(text_of(&structured).contains("continue with offset=5"));
         assert!(!text_of(&structured).contains("a\tb"));
         let text = page_read_result(ResultView::TextOnly, "a\tb\nc".to_owned(), info());
-        assert_eq!(text_of(&text), "a\tb\nc\n[browser_read: characters 0 to 5 of 12; continue with offset=5]");
+        assert_eq!(
+            text_of(&text),
+            "a\tb\nc\n[browser_read: characters 0 to 5 of 12; continue with offset=5]"
+        );
         assert!(text.structured_content.unwrap_or_default()["content"].is_null());
         let mut last = info();
-        last.as_object_mut().map(|object| object.remove("next_offset"));
+        last.as_object_mut()
+            .map(|object| object.remove("next_offset"));
         let whole = page_read_result(ResultView::TextOnly, "tail".to_owned(), last);
         assert_eq!(text_of(&whole), "tail");
     }
@@ -29166,7 +29602,12 @@ mod launch_attribution_tests {
         }
     }
 
-    fn pending(marker: &str, command: &str, baseline: &[&str], submitted: Instant) -> PendingLaunch {
+    fn pending(
+        marker: &str,
+        command: &str,
+        baseline: &[&str],
+        submitted: Instant,
+    ) -> PendingLaunch {
         PendingLaunch {
             marker: marker.to_owned(),
             command: command.to_owned(),
@@ -29178,7 +29619,8 @@ mod launch_attribution_tests {
 
     #[test]
     fn a_stat_line_gives_parent_and_cpu_even_with_a_spaced_command_name() {
-        let stat = "73 (Web Content) (x) S 61 61 61 0 -1 4194560 900 0 3 0 41 17 0 0 20 0 30 0 5000 1 1";
+        let stat =
+            "73 (Web Content) (x) S 61 61 61 0 -1 4194560 900 0 3 0 41 17 0 0 20 0 30 0 5000 1 1";
         assert_eq!(parse_process_stat(stat), Some((61, 58)));
         assert_eq!(parse_process_stat("73 (chrome"), None);
     }
@@ -29201,7 +29643,10 @@ mod launch_attribution_tests {
         assert_eq!(process_launch(&table, 90), Some("b"));
         assert_eq!(process_launch(&table, 1), None);
         assert_eq!(process_launch(&table, 999), None);
-        assert_eq!(launch_cpu(&table, "a").into_iter().collect::<Vec<_>>(), [(70, 9), (80, 30)]);
+        assert_eq!(
+            launch_cpu(&table, "a").into_iter().collect::<Vec<_>>(),
+            [(70, 9), (80, 30)]
+        );
     }
 
     #[test]
@@ -29218,29 +29663,49 @@ mod launch_attribution_tests {
             })
         );
         assert_eq!(cpu.map(|cpu| cpu.busy()), Some(true));
-        assert_eq!(cpu.map(|cpu| cpu.report()["state"].clone()), Some("busy".into()));
-        let resting = [(70, 100 + LAUNCH_BUSY_TICKS - 1), (80, 40)].into_iter().collect();
+        assert_eq!(
+            cpu.map(|cpu| cpu.report()["state"].clone()),
+            Some("busy".into())
+        );
+        let resting = [(70, 100 + LAUNCH_BUSY_TICKS - 1), (80, 40)]
+            .into_iter()
+            .collect();
         let cpu = LaunchCpu::between(Some(&earlier), Some(&resting));
         assert_eq!(cpu.map(|cpu| cpu.busy()), Some(false));
-        assert_eq!(cpu.map(|cpu| cpu.report()["state"].clone()), Some("idle".into()));
+        assert_eq!(
+            cpu.map(|cpu| cpu.report()["state"].clone()),
+            Some("idle".into())
+        );
         // Nothing can be said without both samples, or once the processes are gone.
         assert_eq!(LaunchCpu::between(None, Some(&working)), None);
-        assert_eq!(LaunchCpu::between(Some(&earlier), Some(&Default::default())), None);
+        assert_eq!(
+            LaunchCpu::between(Some(&earlier), Some(&Default::default())),
+            None
+        );
     }
 
     #[test]
     fn a_late_window_goes_to_the_launch_that_started_its_process() {
         let now = Instant::now();
         let mut ledger = LaunchLedger::default();
-        ledger.pending.push(pending("slow", "slow-app", &["old"], now));
-        ledger.pending.push(pending("other", "other-app", &["old"], now));
+        ledger
+            .pending
+            .push(pending("slow", "slow-app", &["old"], now));
+        ledger
+            .pending
+            .push(pending("other", "other-app", &["old"], now));
         let table = [
             process(70, 1, 10, Some("slow")),
             process(71, 1, 10, Some("other")),
             process(72, 1, 10, Some("done")),
         ];
         // Nothing has mapped: both keep waiting.
-        ledger.settle(&[window("old", 60, "konsole", "old", true)], Some(&table), now, true);
+        ledger.settle(
+            &[window("old", 60, "konsole", "old", true)],
+            Some(&table),
+            now,
+            true,
+        );
         assert_eq!(ledger.pending.len(), 2);
         assert!(ledger.late.is_empty());
         // The second launch's window maps first, then one of a finished launch.
@@ -29306,13 +29771,20 @@ mod launch_attribution_tests {
             window("mine", 71, "kdialog", "mine", false),
         ];
         let id = |window: Option<&WindowSnapshot>| window.map(|window| window.id.clone());
-        assert_eq!(id(newly_mapped_window(&before, &now, &[])), Some("theirs".to_owned()));
+        assert_eq!(
+            id(newly_mapped_window(&before, &now, &[])),
+            Some("theirs".to_owned())
+        );
         assert_eq!(
             id(newly_mapped_window(&before, &now, &["theirs".to_owned()])),
             Some("mine".to_owned())
         );
         assert_eq!(
-            id(newly_mapped_window(&before, &now[..2], &["theirs".to_owned()])),
+            id(newly_mapped_window(
+                &before,
+                &now[..2],
+                &["theirs".to_owned()]
+            )),
             None
         );
     }
@@ -29325,14 +29797,28 @@ mod launch_attribution_tests {
         let open = [monitor.clone(), terminal.clone()];
         let id = |window: Option<&WindowSnapshot>| window.map(|window| window.id.clone());
         assert_eq!(
-            id(running_instance_window(&open, &open, "plasma-systemmonitor")),
+            id(running_instance_window(
+                &open,
+                &open,
+                "plasma-systemmonitor"
+            )),
             Some("mon".to_owned())
         );
-        assert_eq!(id(running_instance_window(&open, &open, "konsole")), Some("term".to_owned()));
+        assert_eq!(
+            id(running_instance_window(&open, &open, "konsole")),
+            Some("term".to_owned())
+        );
         // A command that is no open application's has no window, and neither
         // has one whose only window mapped after the launch.
         assert_eq!(id(running_instance_window(&open, &open, "true")), None);
-        assert_eq!(id(running_instance_window(&open[1..], &open, "plasma-systemmonitor")), None);
+        assert_eq!(
+            id(running_instance_window(
+                &open[1..],
+                &open,
+                "plasma-systemmonitor"
+            )),
+            None
+        );
         // Of several windows of the application, the one with the focus.
         let mut second = terminal.clone();
         second.id = "term-2".to_owned();
@@ -29340,13 +29826,22 @@ mod launch_attribution_tests {
         assert_eq!(id(running_instance_window(&two, &two, "konsole")), None);
         second.active = true;
         let two = [terminal, second];
-        assert_eq!(id(running_instance_window(&two, &two, "konsole")), Some("term-2".to_owned()));
+        assert_eq!(
+            id(running_instance_window(&two, &two, "konsole")),
+            Some("term-2".to_owned())
+        );
     }
 
     #[test]
     fn a_browser_hand_off_names_the_window_that_took_the_request() {
         let picker = window("picker", 70, "google-chrome", "Google Chrome", true);
-        let page = window("page", 70, "google-chrome", "Example - Google Chrome", false);
+        let page = window(
+            "page",
+            70,
+            "google-chrome",
+            "Example - Google Chrome",
+            false,
+        );
         let terminal = window("term", 60, "konsole", "sh", false);
         let id = |target: Option<(&WindowSnapshot, &'static str)>| {
             target.map(|(window, evidence)| (window.id.clone(), evidence))
@@ -29385,7 +29880,10 @@ mod launch_attribution_tests {
         );
         let mut second = unfocused.clone();
         second.id = "page-2".to_owned();
-        assert_eq!(id(HandoffEvidence::default().target(&[focused, unfocused, second])), None);
+        assert_eq!(
+            id(HandoffEvidence::default().target(&[focused, unfocused, second])),
+            None
+        );
     }
 }
 
@@ -29595,7 +30093,10 @@ mod user_namespace_guidance_tests {
             super::netns_holder::NAMESPACE_REFUSAL
         );
         let guidance = user_namespace_guidance(&stderr, &confined()).unwrap_or_default();
-        assert!(guidance.contains("NoNewPrivs: 1"), "no guidance for: {stderr}");
+        assert!(
+            guidance.contains("NoNewPrivs: 1"),
+            "no guidance for: {stderr}"
+        );
     }
 
     #[test]
@@ -29605,7 +30106,11 @@ mod user_namespace_guidance_tests {
             "bwrap: Can't find source path /nonexistent: No such file or directory",
             "bwrap: execvp kwin_wayland: No such file or directory",
         ] {
-            assert_eq!(user_namespace_guidance(stderr, &confined()), None, "{stderr}");
+            assert_eq!(
+                user_namespace_guidance(stderr, &confined()),
+                None,
+                "{stderr}"
+            );
         }
         assert!(
             user_namespace_guidance("bwrap: No permissions to create new namespace", &confined())
@@ -29632,7 +30137,10 @@ mod launch_warning_tests {
             "the warning must name the remedy: {warning}"
         );
         assert!(warning.contains("sign in inside the session"), "{warning}");
-        assert_eq!(launch_wallet_warning(Some(reason.to_owned()), "kate notes.txt"), None);
+        assert_eq!(
+            launch_wallet_warning(Some(reason.to_owned()), "kate notes.txt"),
+            None
+        );
         assert_eq!(launch_wallet_warning(None, "google-chrome-stable"), None);
         Ok(())
     }
@@ -29671,11 +30179,13 @@ mod launch_warning_tests {
 #[cfg(test)]
 mod startup_report_tests {
     use super::{
-        DisplayConfig, HOST_ACCESS_REPORT, KwinMcp, SCREENSHOT_FRAME_TIMEOUT, SqliteAccessReport,
-        FindMatch, ResultView, WindowSnapshot, ClickRefusal, click_candidates, click_other_window, element_center, folds_into_ancestor, place_body, existing_text_warning, field_excerpt, compact_find_elements, compact_launch_result, compact_paste_result, compact_session_result,
-        compact_typing_result, find_elements_text,
-        SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED, SESSION_PRESSURED,
-        descriptor_targets, hard_timeout_error, lifecycle_busy_error, scaled_for_pressure,
+        ClickRefusal, DisplayConfig, FindMatch, HOST_ACCESS_REPORT, KwinMcp, ResultView,
+        SCREENSHOT_FRAME_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT, SCREENSHOT_TOOL_TIMEOUT_PRESSURED,
+        SESSION_PRESSURED, SqliteAccessReport, WindowSnapshot, click_candidates,
+        click_other_window, compact_find_elements, compact_launch_result, compact_paste_result,
+        compact_session_result, compact_typing_result, descriptor_targets, element_center,
+        existing_text_warning, field_excerpt, find_elements_text, folds_into_ancestor,
+        hard_timeout_error, lifecycle_busy_error, place_body, scaled_for_pressure,
         screenshot_frame_timeout, screenshot_tool_timeout,
     };
     use std::path::{Path, PathBuf};
@@ -29772,7 +30282,8 @@ mod startup_report_tests {
     }
 
     #[test]
-    fn stage_times_name_every_checkpoint_of_the_start_and_end_with_the_running_one() -> Result<(), String> {
+    fn stage_times_name_every_checkpoint_of_the_start_and_end_with_the_running_one()
+    -> Result<(), String> {
         let service = server();
         service.begin_start_stage_log();
         service.set_start_stage("preparing the session workdir");
@@ -29782,14 +30293,19 @@ mod startup_report_tests {
         service.set_start_stage("waiting for the container D-Bus daemon");
         let (text, json) = service.start_stage_times().ok_or("no stage times")?;
         assert!(text.contains("preparing the session workdir 0."), "{text}");
-        assert!(text.contains("spawning the pasta and bwrap sandbox 0."), "{text}");
+        assert!(
+            text.contains("spawning the pasta and bwrap sandbox 0."),
+            "{text}"
+        );
         assert!(text.ends_with('s'), "{text}");
         let stages = json.as_array().ok_or("stage times are not a list")?;
         let last = stages.last().ok_or("empty list")?;
         assert_eq!(last["stage"], "waiting for the container D-Bus daemon");
         assert!(
-            stages.iter().any(|stage| stage["stage"] == "preparing the session workdir"
-                && stage["milliseconds"].as_u64().unwrap_or(0) >= 15),
+            stages
+                .iter()
+                .any(|stage| stage["stage"] == "preparing the session workdir"
+                    && stage["milliseconds"].as_u64().unwrap_or(0) >= 15),
             "{json}"
         );
         // A new start forgets the previous start's checkpoints.
@@ -29814,15 +30330,24 @@ mod startup_report_tests {
         assert_eq!(screenshot_tool_timeout(true), Duration::from_secs(50));
         let pressured = SESSION_PRESSURED
             .scope(true, async {
-                (screenshot_frame_timeout(), scaled_for_pressure(Duration::from_secs(10)))
+                (
+                    screenshot_frame_timeout(),
+                    scaled_for_pressure(Duration::from_secs(10)),
+                )
             })
             .await;
         let calm = SESSION_PRESSURED
             .scope(false, async {
-                (screenshot_frame_timeout(), scaled_for_pressure(Duration::from_secs(10)))
+                (
+                    screenshot_frame_timeout(),
+                    scaled_for_pressure(Duration::from_secs(10)),
+                )
             })
             .await;
-        assert_eq!(pressured, (Duration::from_secs(30), Duration::from_secs(30)));
+        assert_eq!(
+            pressured,
+            (Duration::from_secs(30), Duration::from_secs(30))
+        );
         assert_eq!(calm, (Duration::from_secs(10), Duration::from_secs(10)));
         // The tool limit always leaves room for a frame wait plus the window queries.
         assert!(SCREENSHOT_TOOL_TIMEOUT_PRESSURED > screenshot_frame_timeout_pressured());
@@ -29849,15 +30374,37 @@ mod startup_report_tests {
 
     #[test]
     fn found_elements_list_each_surface_once_and_drop_constants() {
-        let elements: Vec<_> = (0..12).map(|index| native_element(&format!("Start {index}"), index)).collect();
-        let before = serde_json::to_string(&elements).map(|text| text.len()).unwrap_or(0);
+        let elements: Vec<_> = (0..12)
+            .map(|index| native_element(&format!("Start {index}"), index))
+            .collect();
+        let before = serde_json::to_string(&elements)
+            .map(|text| text.len())
+            .unwrap_or(0);
         let (compacted, surfaces) = compact_find_elements(elements, false, Some("{other}"));
-        let after = serde_json::to_string(&compacted).map(|text| text.len()).unwrap_or(0)
-            + serde_json::to_string(&surfaces).map(|text| text.len()).unwrap_or(0);
+        let after = serde_json::to_string(&compacted)
+            .map(|text| text.len())
+            .unwrap_or(0)
+            + serde_json::to_string(&surfaces)
+                .map(|text| text.len())
+                .unwrap_or(0);
         assert_eq!(surfaces.len(), 1);
         assert!(compacted.iter().all(|element| element["surface"] == 0));
         for element in &compacted {
-            for gone in ["raw_atspi_bounds", "coordinate_space", "occlusion_note", "provider_visible", "center_hit", "window", "object_path", "visible", "enabled", "occluded", "clickable", "mapped_screen_bounds", "window_association"] {
+            for gone in [
+                "raw_atspi_bounds",
+                "coordinate_space",
+                "occlusion_note",
+                "provider_visible",
+                "center_hit",
+                "window",
+                "object_path",
+                "visible",
+                "enabled",
+                "occluded",
+                "clickable",
+                "mapped_screen_bounds",
+                "window_association",
+            ] {
                 assert!(element.get(gone).is_none(), "{gone} in {element}");
             }
             assert_eq!(element["window_id"], "{w}");
@@ -29874,20 +30421,41 @@ mod startup_report_tests {
         assert_eq!(kept[0]["occluded"], true);
         assert_eq!(kept[0]["window_association"], "unverified");
         // The active window is not repeated on each element; another window is named.
-        assert!(kept[0].get("window_id").is_none() && kept[0].get("mapped_screen_bounds").is_none());
+        assert!(
+            kept[0].get("window_id").is_none() && kept[0].get("mapped_screen_bounds").is_none()
+        );
         assert_eq!(kept[0]["states"], serde_json::json!(["focusable"]));
     }
 
     #[test]
     fn compact_found_elements_keep_role_name_and_bounds_only() {
-        let (compacted, surfaces) = compact_find_elements(vec![native_element("Start", 0)], true, None);
-        let element = compacted[0].as_object().map(|fields| fields.keys().cloned().collect::<Vec<_>>());
+        let (compacted, surfaces) =
+            compact_find_elements(vec![native_element("Start", 0)], true, None);
+        let element = compacted[0]
+            .as_object()
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>());
         let mut keys = element.unwrap_or_default();
         keys.sort();
-        assert_eq!(keys, ["backend", "bounds", "mouse_coordinates_usable", "name", "role", "surface"]);
+        assert_eq!(
+            keys,
+            [
+                "backend",
+                "bounds",
+                "mouse_coordinates_usable",
+                "name",
+                "role",
+                "surface"
+            ]
+        );
         let text = find_elements_text(&compacted, &surfaces);
         assert_eq!(text.lines().count(), 2, "{text}");
-        assert!(text.contains("surface 0: ") && text.contains("Start\t") && text.contains("click-usable") && text.contains("surface=0"), "{text}");
+        assert!(
+            text.contains("surface 0: ")
+                && text.contains("Start\t")
+                && text.contains("click-usable")
+                && text.contains("surface=0"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -29942,44 +30510,80 @@ mod startup_report_tests {
     #[test]
     fn a_window_is_listed_with_only_the_flags_that_are_set() {
         let window = WindowSnapshot {
-            id: "{w}".to_owned(), title: "~ : bash — Konsole".to_owned(),
-            resource_class: "org.kde.konsole".to_owned(), resource_name: "konsole".to_owned(), pid: 67,
-            active: true, minimized: false, hidden: false, modal: false, transient: false,
-            dialog: false, popup: false, transient_for: None, x: 0.0, y: 0.0, w: 3840.0, h: 2160.0,
+            id: "{w}".to_owned(),
+            title: "~ : bash — Konsole".to_owned(),
+            resource_class: "org.kde.konsole".to_owned(),
+            resource_name: "konsole".to_owned(),
+            pid: 67,
+            active: true,
+            minimized: false,
+            hidden: false,
+            modal: false,
+            transient: false,
+            dialog: false,
+            popup: false,
+            transient_for: None,
+            x: 0.0,
+            y: 0.0,
+            w: 3840.0,
+            h: 2160.0,
             stacking_order: 0,
         };
         let compact = window.compact();
         assert_eq!(compact["active"], true);
-        for absent in ["minimized", "hidden", "modal", "transient", "dialog", "popup", "transientFor"] {
+        for absent in [
+            "minimized",
+            "hidden",
+            "modal",
+            "transient",
+            "dialog",
+            "popup",
+            "transientFor",
+        ] {
             assert!(compact.get(absent).is_none(), "{absent} in {compact}");
         }
         // The resource name is kept only when it says something the class does not.
         assert_eq!(compact["resourceName"], "konsole");
-        let same = WindowSnapshot { resource_name: "ORG.KDE.KONSOLE".to_owned(), ..window };
+        let same = WindowSnapshot {
+            resource_name: "ORG.KDE.KONSOLE".to_owned(),
+            ..window
+        };
         assert!(same.compact().get("resourceName").is_none());
     }
 
     #[test]
     fn viewer_input_pause_names_the_kind_and_the_time_left() -> std::io::Result<()> {
-        use super::{recent_viewer_input, VIEWER_INPUT_QUIET_PERIOD};
-        let directory = std::env::temp_dir().join(format!("kwin-mcp-viewer-pause-{}", std::process::id()));
+        use super::{VIEWER_INPUT_QUIET_PERIOD, recent_viewer_input};
+        let directory =
+            std::env::temp_dir().join(format!("kwin-mcp-viewer-pause-{}", std::process::id()));
         std::fs::create_dir_all(&directory)?;
         let marker = directory.join("viewer-input-activity");
         // No marker: never any input.
-        assert_eq!(recent_viewer_input(&marker, std::time::SystemTime::now()), Ok(None));
+        assert_eq!(
+            recent_viewer_input(&marker, std::time::SystemTime::now()),
+            Ok(None)
+        );
         std::fs::write(&marker, "scroll wheel")?;
         let written = std::fs::metadata(&marker)?.modified()?;
         let (remaining, kind) = recent_viewer_input(&marker, written + Duration::from_millis(300))
             .map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::other("no pause"))?;
         assert_eq!(kind, "scroll wheel");
-        assert_eq!(remaining, VIEWER_INPUT_QUIET_PERIOD - Duration::from_millis(300));
+        assert_eq!(
+            remaining,
+            VIEWER_INPUT_QUIET_PERIOD - Duration::from_millis(300)
+        );
         // Past the quiet period the viewer no longer pauses the agent.
-        assert_eq!(recent_viewer_input(&marker, written + Duration::from_millis(1_500)), Ok(None));
+        assert_eq!(
+            recent_viewer_input(&marker, written + Duration::from_millis(1_500)),
+            Ok(None)
+        );
         // A marker with no kind (an older viewer) is still a pause.
         std::fs::write(&marker, "")?;
         let written = std::fs::metadata(&marker)?.modified()?;
-        let kind = recent_viewer_input(&marker, written).map_err(std::io::Error::other)?.map(|(_, kind)| kind);
+        let kind = recent_viewer_input(&marker, written)
+            .map_err(std::io::Error::other)?
+            .map(|(_, kind)| kind);
         assert_eq!(kind.as_deref(), Some("input"));
         std::fs::remove_dir_all(&directory)
     }
@@ -29989,10 +30593,16 @@ mod startup_report_tests {
         assert_eq!(field_excerpt("10.5"), "10.5");
         let long = "x".repeat(450);
         let cut = field_excerpt(&long);
-        assert!(cut.starts_with(&"x".repeat(200)) && cut.ends_with("… (450 characters)"), "{cut}");
+        assert!(
+            cut.starts_with(&"x".repeat(200)) && cut.ends_with("… (450 characters)"),
+            "{cut}"
+        );
         assert!(cut.chars().count() < 230);
         let warning = existing_text_warning("1");
-        assert!(warning.contains("\"1\"") && warning.contains("replace=true"), "{warning}");
+        assert!(
+            warning.contains("\"1\"") && warning.contains("replace=true"),
+            "{warning}"
+        );
     }
 
     #[test]
@@ -30013,7 +30623,16 @@ mod startup_report_tests {
         assert_eq!(element_center(clickable[0]), Ok((140, 112)));
         assert_eq!(element_center(clickable[1]), Ok((340, 112)));
         let refusal = |index: usize, matches: &[serde_json::Value]| {
-            ClickRefusal { query: "x", role: None, exact: false, index, matches, near: &[], unfinished: &[] }.explain()
+            ClickRefusal {
+                query: "x",
+                role: None,
+                exact: false,
+                index,
+                matches,
+                near: &[],
+                unfinished: &[],
+            }
+            .explain()
         };
         let (cause, text) = refusal(2, &elements);
         assert_eq!(cause, "index_out_of_range");
@@ -30031,11 +30650,17 @@ mod startup_report_tests {
                 "bounds":{"x":0.0,"y":0.0,"w":10,"h":10}})
         };
         let elements = vec![
-            element("static", "With Chrome profiles, you can separate all your Chrome stuff."),
+            element(
+                "static",
+                "With Chrome profiles, you can separate all your Chrome stuff.",
+            ),
             element("button", "Open Your Chrome profile. Google membership"),
             element("button", "More actions for Your Chrome"),
         ];
-        let names: Vec<_> = click_candidates(&elements).iter().map(|element| element["name"].clone()).collect();
+        let names: Vec<_> = click_candidates(&elements)
+            .iter()
+            .map(|element| element["name"].clone())
+            .collect();
         assert_eq!(names[0], "Open Your Chrome profile. Google membership");
         assert_eq!(names[1], "More actions for Your Chrome");
         assert_eq!(names[2], elements[0]["name"]);
@@ -30051,54 +30676,124 @@ mod startup_report_tests {
             }
             element
         };
-        let explain = |role: Option<&str>, exact: bool, matches: &[serde_json::Value], near: &[serde_json::Value], unfinished: &[String]| {
-            ClickRefusal { query: "Wallet", role, exact, index: 0, matches, near, unfinished }.explain()
+        let explain = |role: Option<&str>,
+                       exact: bool,
+                       matches: &[serde_json::Value],
+                       near: &[serde_json::Value],
+                       unfinished: &[String]| {
+            ClickRefusal {
+                query: "Wallet",
+                role,
+                exact,
+                index: 0,
+                matches,
+                near,
+                unfinished,
+            }
+            .explain()
         };
         // #882: role "text" asked for, and the name belongs to a page tab.
-        let tab = element("page tab", "Wallet", serde_json::json!({"mouse_coordinates_usable":true}));
+        let tab = element(
+            "page tab",
+            "Wallet",
+            serde_json::json!({"mouse_coordinates_usable":true}),
+        );
         let (cause, text) = explain(Some("text"), true, &[], std::slice::from_ref(&tab), &[]);
         assert_eq!(cause, "role_excluded");
-        assert!(text.contains("page tab 'Wallet'") && text.contains("without role"), "{text}");
+        assert!(
+            text.contains("page tab 'Wallet'") && text.contains("without role"),
+            "{text}"
+        );
         // exact asked for, and a longer name of the wanted role holds the text.
-        let long = element("button", "Open Wallet. Google membership", serde_json::json!({}));
+        let long = element(
+            "button",
+            "Open Wallet. Google membership",
+            serde_json::json!({}),
+        );
         let (cause, text) = explain(Some("button"), true, &[], std::slice::from_ref(&long), &[]);
         assert_eq!(cause, "exact_excluded");
-        assert!(text.contains("button 'Open Wallet. Google membership'") && text.contains("exact=false"), "{text}");
+        assert!(
+            text.contains("button 'Open Wallet. Google membership'")
+                && text.contains("exact=false"),
+            "{text}"
+        );
         let (cause, _) = explain(Some("link"), true, &[], std::slice::from_ref(&long), &[]);
         assert_eq!(cause, "role_and_exact_excluded");
         // Matches that exist but cannot be clicked where they are.
-        let other = element("button", "Wallet", serde_json::json!({"window_id":"{other}"}));
+        let other = element(
+            "button",
+            "Wallet",
+            serde_json::json!({"window_id":"{other}"}),
+        );
         let (cause, text) = explain(None, false, std::slice::from_ref(&other), &[], &[]);
         assert_eq!(cause, "other_window");
-        assert!(text.contains("window_activate") && text.contains("{other}"), "{text}");
-        let hidden = element("button", "Wallet", serde_json::json!({"visible":false,"mouse_coordinates_usable":true}));
+        assert!(
+            text.contains("window_activate") && text.contains("{other}"),
+            "{text}"
+        );
+        let hidden = element(
+            "button",
+            "Wallet",
+            serde_json::json!({"visible":false,"mouse_coordinates_usable":true}),
+        );
         let (cause, text) = explain(None, false, std::slice::from_ref(&hidden), &[], &[]);
         assert_eq!(cause, "not_shown");
         assert!(text.contains("scroll"), "{text}");
-        let covered = element("button", "Wallet", serde_json::json!({"occluded":true,"mouse_coordinates_usable":true}));
-        assert_eq!(explain(None, false, std::slice::from_ref(&covered), &[], &[]).0, "covered");
+        let covered = element(
+            "button",
+            "Wallet",
+            serde_json::json!({"occluded":true,"mouse_coordinates_usable":true}),
+        );
+        assert_eq!(
+            explain(None, false, std::slice::from_ref(&covered), &[], &[]).0,
+            "covered"
+        );
         let dom = element("button", "Wallet", serde_json::json!({"backend":"cdp"}));
-        assert_eq!(explain(None, false, std::slice::from_ref(&dom), &[], &[]).0, "page_dom_only");
-        let unpaired = element("button", "Wallet", serde_json::json!({"window_association":"unverified"}));
+        assert_eq!(
+            explain(None, false, std::slice::from_ref(&dom), &[], &[]).0,
+            "page_dom_only"
+        );
+        let unpaired = element(
+            "button",
+            "Wallet",
+            serde_json::json!({"window_association":"unverified"}),
+        );
         let (cause, text) = explain(None, false, std::slice::from_ref(&unpaired), &[], &[]);
         assert_eq!(cause, "frame_not_paired_with_window");
-        assert!(text.contains("screenshot") && text.contains("mouse_click"), "{text}");
-        let twin = element("button", "Wallet", serde_json::json!({"window_association":"caption_shared_by_windows"}));
+        assert!(
+            text.contains("screenshot") && text.contains("mouse_click"),
+            "{text}"
+        );
+        let twin = element(
+            "button",
+            "Wallet",
+            serde_json::json!({"window_association":"caption_shared_by_windows"}),
+        );
         let (cause, text) = explain(None, false, std::slice::from_ref(&twin), &[], &[]);
         assert_eq!(cause, "frame_not_paired_with_window");
-        assert!(text.contains("several windows") && text.contains("caption"), "{text}");
+        assert!(
+            text.contains("several windows") && text.contains("caption"),
+            "{text}"
+        );
         // A search cut short is said, not reported as no match.
         let cut = ["AT-SPI search reached its 5-second limit".to_owned()];
         let (cause, text) = explain(None, false, &[], &[], &cut);
         assert_eq!(cause, "search_unfinished");
-        assert!(text.contains("timeout_seconds") && text.contains("5-second limit"), "{text}");
+        assert!(
+            text.contains("timeout_seconds") && text.contains("5-second limit"),
+            "{text}"
+        );
         // The window to activate is the one of the first control shown elsewhere.
-        assert_eq!(click_other_window(&[hidden, unpaired, other]), Some("{other}"));
+        assert_eq!(
+            click_other_window(&[hidden, unpaired, other]),
+            Some("{other}")
+        );
     }
 
     #[test]
     fn queries_match_by_part_whole_word_or_whole_name() {
-        let spoken = "upper r subscript parallel to baseline equals startfraction 1 over 2 endfraction";
+        let spoken =
+            "upper r subscript parallel to baseline equals startfraction 1 over 2 endfraction";
         assert!(FindMatch::Contains.matches(spoken, "start"));
         // 'start' is only a piece of 'startfraction'.
         assert!(!FindMatch::WholeWord.matches(spoken, "start"));
@@ -30110,9 +30805,18 @@ mod startup_report_tests {
         assert!(FindMatch::WholeWord.matches("a startfraction start", "start"));
         assert!(FindMatch::Exact.matches("start", "start"));
         assert!(!FindMatch::Exact.matches("start now", "start"));
-        assert!(matches!(FindMatch::from_params(Some(true), Some(true)), FindMatch::Exact));
-        assert!(matches!(FindMatch::from_params(None, Some(true)), FindMatch::WholeWord));
-        assert!(matches!(FindMatch::from_params(Some(false), None), FindMatch::Contains));
+        assert!(matches!(
+            FindMatch::from_params(Some(true), Some(true)),
+            FindMatch::Exact
+        ));
+        assert!(matches!(
+            FindMatch::from_params(None, Some(true)),
+            FindMatch::WholeWord
+        ));
+        assert!(matches!(
+            FindMatch::from_params(Some(false), None),
+            FindMatch::Contains
+        ));
     }
 
     #[test]
@@ -30121,7 +30825,17 @@ mod startup_report_tests {
             assert!(folds_into_ancestor(role), "{role}");
         }
         // Controls (Chrome names its buttons just "button") and unknown roles stay listed.
-        for role in ["button", "push button", "link", "entry", "check box", "menu item", "combo box", "page tab", "something new"] {
+        for role in [
+            "button",
+            "push button",
+            "link",
+            "entry",
+            "check box",
+            "menu item",
+            "combo box",
+            "page tab",
+            "something new",
+        ] {
             assert!(!folds_into_ancestor(role), "{role}");
         }
     }
@@ -30129,26 +30843,56 @@ mod startup_report_tests {
     #[test]
     fn a_big_body_is_sent_once_in_the_half_the_client_shows() {
         // Measured: Claude Code shows the model only structuredContent, Codex only the text.
-        assert_eq!(ResultView::of_client("claude-code"), ResultView::StructuredOnly);
-        assert_eq!(ResultView::of_client("codex-mcp-client"), ResultView::TextOnly);
+        assert_eq!(
+            ResultView::of_client("claude-code"),
+            ResultView::StructuredOnly
+        );
+        assert_eq!(
+            ResultView::of_client("codex-mcp-client"),
+            ResultView::TextOnly
+        );
         assert_eq!(ResultView::of_client("some-other-client"), ResultView::Both);
         let body = "frame\tKonsole\n".repeat(400);
         let summary = "accessibility tree: 400 nodes";
         let info = || serde_json::json!({"nodes": 400, "tree": "stale"});
 
         let mut structured = info();
-        let text = place_body(ResultView::StructuredOnly, body.clone(), summary, &mut structured, "tree");
-        assert_eq!((text.as_str(), structured["tree"].as_str()), (summary, Some(body.as_str())));
+        let text = place_body(
+            ResultView::StructuredOnly,
+            body.clone(),
+            summary,
+            &mut structured,
+            "tree",
+        );
+        assert_eq!(
+            (text.as_str(), structured["tree"].as_str()),
+            (summary, Some(body.as_str()))
+        );
 
         let mut structured = info();
-        let text = place_body(ResultView::TextOnly, body.clone(), summary, &mut structured, "tree");
+        let text = place_body(
+            ResultView::TextOnly,
+            body.clone(),
+            summary,
+            &mut structured,
+            "tree",
+        );
         assert_eq!(text, body);
         assert!(structured.get("tree").is_none(), "{structured}");
         assert_eq!(structured["nodes"], 400);
 
         let mut structured = info();
-        let text = place_body(ResultView::Both, body.clone(), summary, &mut structured, "tree");
-        assert_eq!((text.as_str(), structured["tree"].as_str()), (body.as_str(), Some(body.as_str())));
+        let text = place_body(
+            ResultView::Both,
+            body.clone(),
+            summary,
+            &mut structured,
+            "tree",
+        );
+        assert_eq!(
+            (text.as_str(), structured["tree"].as_str()),
+            (body.as_str(), Some(body.as_str()))
+        );
     }
 
     #[test]
@@ -30233,7 +30977,10 @@ mod startup_report_tests {
             "host_access": null, "host_write_paths": [], "workdir": "/tmp/w",
         });
         compact_session_result(&mut payload);
-        assert_eq!(payload, serde_json::json!({"status": "started", "workdir": "/tmp/w"}));
+        assert_eq!(
+            payload,
+            serde_json::json!({"status": "started", "workdir": "/tmp/w"})
+        );
         let mut kept = serde_json::json!({"cookie_errors": ["host cookie snapshot failed"], "host_write_paths": ["/home/u/.codex"]});
         compact_session_result(&mut kept);
         assert_eq!(kept["cookie_errors"][0], "host cookie snapshot failed");
@@ -30247,12 +30994,18 @@ mod startup_report_tests {
         service.set_start_stage("preparing browser profiles");
         for file in 0..5000 {
             service
-                .profile_operation("inspect cookie database", Path::new(&format!("/home/u/.config/p{file}/Cookies")))
+                .profile_operation(
+                    "inspect cookie database",
+                    Path::new(&format!("/home/u/.config/p{file}/Cookies")),
+                )
                 .map_err(|error| error.to_string())?;
         }
         // The running checkpoint still names the file a stall is stuck on.
         assert!(
-            service.start_stage_report().0.contains("/home/u/.config/p4999/Cookies"),
+            service
+                .start_stage_report()
+                .0
+                .contains("/home/u/.config/p4999/Cookies"),
             "{}",
             service.start_stage_report().0
         );
@@ -30261,9 +31014,16 @@ mod startup_report_tests {
         }
         let (text, json) = service.start_stage_times().ok_or("no stage times")?;
         let entries = json.as_array().ok_or("stage times are not a list")?.len();
-        assert!(entries <= super::START_STAGE_TIMES_MAX + 1, "{entries} entries");
+        assert!(
+            entries <= super::START_STAGE_TIMES_MAX + 1,
+            "{entries} entries"
+        );
         assert!(text.len() < 4096, "{} bytes of stage text", text.len());
-        assert!(json.to_string().len() < 4096, "{} bytes of stage json", json.to_string().len());
+        assert!(
+            json.to_string().len() < 4096,
+            "{} bytes of stage json",
+            json.to_string().len()
+        );
         Ok(())
     }
 
@@ -31252,10 +32012,17 @@ mod ui_match_context_tests {
     }
 
     fn frame(name: &str, pid: Option<u32>) -> FrameFacts<'_> {
-        FrameFacts { name, bounds: (0, 0, 1920, 1080), pid }
+        FrameFacts {
+            name,
+            bounds: (0, 0, 1920, 1080),
+            pid,
+        }
     }
 
-    fn pairs(windows: &[WindowSnapshot], frames: &[FrameFacts]) -> Vec<Option<(String, &'static str)>> {
+    fn pairs(
+        windows: &[WindowSnapshot],
+        frames: &[FrameFacts],
+    ) -> Vec<Option<(String, &'static str)>> {
         pair_frames_with_windows(windows, frames)
             .into_iter()
             .map(|pair| pair.map(|(window, how)| (window.id.clone(), how)))
@@ -31267,11 +32034,23 @@ mod ui_match_context_tests {
     #[test]
     fn issue907_a_frame_named_unlike_its_window_is_paired_by_process_and_size() {
         let picker = chrome_window("picker", "Google Chrome", true);
-        let paired = pairs(std::slice::from_ref(&picker), &[frame("Who's using Chrome?", Some(76))]);
-        assert_eq!(paired, [Some(("picker".to_owned(), "process_and_frame_size"))]);
+        let paired = pairs(
+            std::slice::from_ref(&picker),
+            &[frame("Who's using Chrome?", Some(76))],
+        );
+        assert_eq!(
+            paired,
+            [Some(("picker".to_owned(), "process_and_frame_size"))]
+        );
         // A bus that does not report the process leaves the size and the lack of rivals.
-        let paired = pairs(std::slice::from_ref(&picker), &[frame("Who's using Chrome?", None)]);
-        assert_eq!(paired, [Some(("picker".to_owned(), "process_and_frame_size"))]);
+        let paired = pairs(
+            std::slice::from_ref(&picker),
+            &[frame("Who's using Chrome?", None)],
+        );
+        assert_eq!(
+            paired,
+            [Some(("picker".to_owned(), "process_and_frame_size"))]
+        );
         // The picker beside a browser window that its own frame names.
         let browser = chrome_window("browser", "Settings - Google Chrome", false);
         let windows = [browser, picker.clone()];
@@ -31308,8 +32087,15 @@ mod ui_match_context_tests {
         let picker = chrome_window("picker", "Google Chrome", true);
         let windows = std::slice::from_ref(&picker);
         // Another process, another size, or an untitled popup frame.
-        assert_eq!(pairs(windows, &[frame("Who's using Chrome?", Some(9))]), [None]);
-        let small = FrameFacts { name: "Who's using Chrome?", bounds: (0, 0, 800, 600), pid: Some(76) };
+        assert_eq!(
+            pairs(windows, &[frame("Who's using Chrome?", Some(9))]),
+            [None]
+        );
+        let small = FrameFacts {
+            name: "Who's using Chrome?",
+            bounds: (0, 0, 800, 600),
+            pid: Some(76),
+        };
         assert_eq!(pairs(windows, &[small]), [None]);
         assert_eq!(pairs(windows, &[frame("", Some(76))]), [None]);
         // Two frames that could both be the one window.
@@ -31333,7 +32119,11 @@ mod ui_match_context_tests {
         ];
         assert_eq!(
             pairs(&windows, &frames),
-            [None, None, Some(("picker".to_owned(), "process_and_frame_size"))]
+            [
+                None,
+                None,
+                Some(("picker".to_owned(), "process_and_frame_size"))
+            ]
         );
         // One of the two frames alone is no more certain.
         assert_eq!(pairs(&windows[..2], &frames[..1]), [None]);
@@ -31534,7 +32324,10 @@ mod browser_alias_tests {
         // Only google-chrome-stable exists; the caller typed google-chrome.
         let run = |name: &str| {
             std::process::Command::new(bin.join(name))
-                .env("PATH", format!("{}:{}:/usr/bin:/bin", bin.display(), stubs.display()))
+                .env(
+                    "PATH",
+                    format!("{}:{}:/usr/bin:/bin", bin.display(), stubs.display()),
+                )
                 .env_remove("KWIN_MCP_CDP_PORT")
                 .output()
         };
@@ -31579,13 +32372,16 @@ mod default_profile_port_tests {
                 .collect()
         }
         fn has_port(&self) -> bool {
-            self.args.iter().any(|arg| arg == "--remote-debugging-port=4321")
+            self.args
+                .iter()
+                .any(|arg| arg == "--remote-debugging-port=4321")
         }
     }
 
     impl Fixture {
         fn new(name: &str, browsers: &[&str]) -> std::io::Result<Self> {
-            let root = std::env::temp_dir().join(format!("kwin-mcp-948-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("kwin-mcp-948-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("stubs"))?;
             std::fs::create_dir_all(root.join("home/.config"))?;
@@ -31674,10 +32470,19 @@ mod default_profile_port_tests {
         std::fs::create_dir_all(fixture.config().join("chromium"))?;
         let profile = fixture.config().join("google-chrome");
         for name in ["google-chrome-stable", "google-chrome"] {
-            let run = fixture.run(name, &["--profile-directory=Profile 2", "about:blank"], true, None)?;
+            let run = fixture.run(
+                name,
+                &["--profile-directory=Profile 2", "about:blank"],
+                true,
+                None,
+            )?;
             assert_eq!(run.data_dirs(), [profile.to_string_lossy()], "{name}");
             assert!(run.has_port(), "{:?}", run.args);
-            assert!(run.args.iter().any(|arg| arg == "--profile-directory=Profile 2"));
+            assert!(
+                run.args
+                    .iter()
+                    .any(|arg| arg == "--profile-directory=Profile 2")
+            );
             assert_eq!(run.marker.as_deref(), Some("cdp linked"));
             // The default Chrome derives is a symlink to the directory it runs
             // on, inside the session's own store.
@@ -31711,12 +32516,25 @@ mod default_profile_port_tests {
 
     #[test]
     fn a_callers_data_directory_and_other_browsers_are_left_alone() -> std::io::Result<()> {
-        let fixture = Fixture::new("alone", &["google-chrome-stable", "chromium", "chrome", "brave"])?;
-        for args in [vec!["--user-data-dir=/elsewhere"], vec!["--user-data-dir", "/elsewhere"]] {
+        let fixture = Fixture::new(
+            "alone",
+            &["google-chrome-stable", "chromium", "chrome", "brave"],
+        )?;
+        for args in [
+            vec!["--user-data-dir=/elsewhere"],
+            vec!["--user-data-dir", "/elsewhere"],
+        ] {
             let run = fixture.run("google-chrome-stable", &args, true, None)?;
             assert!(run.config_home.is_none(), "{:?}", run.config_home);
-            assert!(run.args.ends_with(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()));
-            assert!(run.data_dirs().len() <= 1 && run.has_port(), "{:?}", run.args);
+            assert!(
+                run.args
+                    .ends_with(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+            );
+            assert!(
+                run.data_dirs().len() <= 1 && run.has_port(),
+                "{:?}",
+                run.args
+            );
             assert_eq!(run.marker.as_deref(), Some("cdp"));
         }
         for name in ["chromium", "brave"] {
@@ -31760,10 +32578,21 @@ mod default_profile_port_tests {
         assert_eq!(run.marker.as_deref(), Some("cdp linked"));
 
         // The flags file names the same directory: nothing is added twice.
-        std::fs::write(&flags, format!("# comment\n--no-sandbox\n--user-data-dir={}\n", profile.display()))?;
+        std::fs::write(
+            &flags,
+            format!(
+                "# comment\n--no-sandbox\n--user-data-dir={}\n",
+                profile.display()
+            ),
+        )?;
         for config_home in [None, Some(preset.as_path())] {
             let run = fixture.run("google-chrome-stable", &[], true, config_home)?;
-            assert_eq!(run.data_dirs(), [profile.to_string_lossy()], "{:?}", run.args);
+            assert_eq!(
+                run.data_dirs(),
+                [profile.to_string_lossy()],
+                "{:?}",
+                run.args
+            );
             assert!(run.has_port());
             assert_eq!(run.marker.as_deref(), Some("cdp linked"));
             let link = run.config_home.unwrap_or_default().join("google-chrome");
@@ -31779,7 +32608,12 @@ mod default_profile_port_tests {
         assert_eq!(run.marker.as_deref(), Some("cdp launcher"));
 
         // A caller's own directory still comes last, where Chrome takes it.
-        let run = fixture.run("google-chrome-stable", &["--user-data-dir=/mine"], true, None)?;
+        let run = fixture.run(
+            "google-chrome-stable",
+            &["--user-data-dir=/mine"],
+            true,
+            None,
+        )?;
         assert_eq!(run.data_dirs(), ["/elsewhere", "/mine"]);
         assert!(run.config_home.is_none());
         Ok(())
@@ -31806,25 +32640,49 @@ mod default_profile_port_tests {
         assert_eq!(run.data_dirs(), [profile.to_string_lossy()]);
         assert_eq!(run.marker.as_deref(), Some("cdp unlinked"));
         let config_home = run.config_home.unwrap_or_default();
-        assert!(config_home.starts_with(fixture.store()) && !config_home.exists(), "{config_home:?}");
+        assert!(
+            config_home.starts_with(fixture.store()) && !config_home.exists(),
+            "{config_home:?}"
+        );
         Ok(())
     }
 
     #[test]
     fn the_marker_tells_how_the_default_directory_got_its_port() {
-        assert_eq!(DefaultProfilePort::from_marker(b"cdp"), Some(DefaultProfilePort::NotInvolved));
-        assert_eq!(DefaultProfilePort::from_marker(b"cdp "), Some(DefaultProfilePort::NotInvolved));
-        assert_eq!(DefaultProfilePort::from_marker(b"cdp launcher"), Some(DefaultProfilePort::NotInvolved));
-        assert_eq!(DefaultProfilePort::from_marker(b"cdp linked"), Some(DefaultProfilePort::Linked));
-        assert_eq!(DefaultProfilePort::from_marker(b"cdp unlinked"), Some(DefaultProfilePort::Unlinked));
+        assert_eq!(
+            DefaultProfilePort::from_marker(b"cdp"),
+            Some(DefaultProfilePort::NotInvolved)
+        );
+        assert_eq!(
+            DefaultProfilePort::from_marker(b"cdp "),
+            Some(DefaultProfilePort::NotInvolved)
+        );
+        assert_eq!(
+            DefaultProfilePort::from_marker(b"cdp launcher"),
+            Some(DefaultProfilePort::NotInvolved)
+        );
+        assert_eq!(
+            DefaultProfilePort::from_marker(b"cdp linked"),
+            Some(DefaultProfilePort::Linked)
+        );
+        assert_eq!(
+            DefaultProfilePort::from_marker(b"cdp unlinked"),
+            Some(DefaultProfilePort::Unlinked)
+        );
         assert_eq!(DefaultProfilePort::from_marker(b""), None);
         assert_eq!(DefaultProfilePort::from_marker(b"other"), None);
 
         // Chrome 156's own line.
         let refusal = "[12:12:1112/013433.2:ERROR:chrome/browser/devtools/remote_debugging_server.cc:91] DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.\n";
         let listening = "DevTools listening on ws://127.0.0.1:35013/devtools/browser/0\n";
-        assert!(matches!(DefaultProfilePort::Linked.refusal(refusal), Some((true, _))));
-        assert!(matches!(DefaultProfilePort::Unlinked.refusal(refusal), Some((false, _))));
+        assert!(matches!(
+            DefaultProfilePort::Linked.refusal(refusal),
+            Some((true, _))
+        ));
+        assert!(matches!(
+            DefaultProfilePort::Unlinked.refusal(refusal),
+            Some((false, _))
+        ));
         assert_eq!(DefaultProfilePort::NotInvolved.refusal(refusal), None);
         assert_eq!(DefaultProfilePort::Linked.refusal(listening), None);
     }
@@ -32010,13 +32868,26 @@ mod session_reach_tests {
     fn only_a_live_avahi_socket_is_bound_and_only_the_socket() -> std::io::Result<()> {
         let root = scratch("mdns")?;
         let socket = root.join("socket");
-        assert!(mdns_socket_bind(&socket).is_empty(), "a host without Avahi binds nothing");
+        assert!(
+            mdns_socket_bind(&socket).is_empty(),
+            "a host without Avahi binds nothing"
+        );
         std::fs::write(&socket, b"")?;
-        assert!(mdns_socket_bind(&socket).is_empty(), "a plain file is not the socket");
+        assert!(
+            mdns_socket_bind(&socket).is_empty(),
+            "a plain file is not the socket"
+        );
         std::fs::remove_file(&socket)?;
         let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
         let arguments = mdns_socket_bind(&socket);
-        assert_eq!(arguments, ["--ro-bind".into(), socket.clone().into_os_string(), socket.into_os_string()]);
+        assert_eq!(
+            arguments,
+            [
+                "--ro-bind".into(),
+                socket.clone().into_os_string(),
+                socket.into_os_string()
+            ]
+        );
         std::fs::remove_dir_all(root)
     }
 
@@ -32040,7 +32911,10 @@ mod session_reach_tests {
         // Overlayfs shows no entry where the upper layer has a 0:0 character device.
         assert!(whiteout.file_type().is_char_device() && whiteout.rdev() == 0);
         // The directory made for it shows the host directory's mode in the session.
-        assert_eq!(std::fs::metadata(&upper)?.permissions().mode() & 0o7777, 0o750);
+        assert_eq!(
+            std::fs::metadata(&upper)?.permissions().mode() & 0o7777,
+            0o750
+        );
         // Asked again (a restored session), the entry that is there is kept.
         assert!(plan.hide_host_socket(&home, &socket));
 
@@ -32048,11 +32922,16 @@ mod session_reach_tests {
             let mut command = std::process::Command::new("bwrap");
             plan.add_bwrap_args(&mut command, &home, &[]);
             let arguments: Vec<_> = command.get_args().map(std::ffi::OsStr::to_owned).collect();
-            arguments.windows(2).any(|pair| pair[0] == "/dev/null" && pair[1] == socket.as_os_str())
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "/dev/null" && pair[1] == socket.as_os_str())
         };
         assert!(mask(&plan), "a socket that is not hidden keeps its mask");
         plan.absent_socket_paths = vec![socket.clone()];
-        assert!(!mask(&plan), "a hidden socket must not get a mount point in its place");
+        assert!(
+            !mask(&plan),
+            "a hidden socket must not get a mount point in its place"
+        );
 
         // In a directory shared with the host there is no upper layer to hide it in.
         plan.host_write_paths = vec![directory.clone()];
@@ -32077,10 +32956,21 @@ mod viewer_and_scope_exit_tests {
     // session, whoever holds them.
     #[test]
     fn the_hosts_media_sockets_are_hidden_from_a_session_by_name() {
-        for hidden in ["pipewire-0", "pipewire-0-manager", "pulse/native", "bus", "keyring/control"] {
+        for hidden in [
+            "pipewire-0",
+            "pipewire-0-manager",
+            "pulse/native",
+            "bus",
+            "keyring/control",
+        ] {
             assert!(hidden_host_runtime_entry(Path::new(hidden)), "{hidden}");
         }
-        for shown in ["ssh-agent.socket", "gnupg/S.gpg-agent", "pipewire-0.lock.d/x", "app/pulse"] {
+        for shown in [
+            "ssh-agent.socket",
+            "gnupg/S.gpg-agent",
+            "pipewire-0.lock.d/x",
+            "app/pulse",
+        ] {
             assert!(!hidden_host_runtime_entry(Path::new(shown)), "{shown}");
         }
     }
@@ -32119,16 +33009,22 @@ mod viewer_and_scope_exit_tests {
             workdir_cleanup: "removed".to_owned(),
             detail: None,
         };
-        let (status, detail) = ended_session_viewer_state(Some(&record), Some(4242), Some(false))
-            .unwrap_or_default();
+        let (status, detail) =
+            ended_session_viewer_state(Some(&record), Some(4242), Some(false)).unwrap_or_default();
         assert_eq!(status, "stopped");
-        assert!(detail.contains("kwin-mcp process 4242, is no longer running"), "{detail}");
+        assert!(
+            detail.contains("kwin-mcp process 4242, is no longer running"),
+            "{detail}"
+        );
         assert!(detail.contains("1794200000"), "{detail}");
         // The owner was killed and recorded nothing: its sessions went with it.
         let (status, detail) =
             ended_session_viewer_state(None, Some(4242), Some(false)).unwrap_or_default();
         assert_eq!(status, SESSION_STATUS_OWNER_EXITED);
-        assert!(detail.contains("end with the server that owns them"), "{detail}");
+        assert!(
+            detail.contains("end with the server that owns them"),
+            "{detail}"
+        );
         // A live owner that could not be reached may still show a viewer.
         assert!(ended_session_viewer_state(None, Some(4242), Some(true)).is_none());
         assert!(ended_session_viewer_state(None, None, None).is_none());
@@ -32143,16 +33039,31 @@ mod viewer_and_scope_exit_tests {
             state: 'D',
             waiting_in: Some("rq_qos_wait".to_owned()),
         };
-        let saturated = exiting_summary("kwin-mcp-1-1.scope", std::slice::from_ref(&kwin), Some(92.4));
+        let saturated = exiting_summary(
+            "kwin-mcp-1-1.scope",
+            std::slice::from_ref(&kwin),
+            Some(92.4),
+        );
         assert!(saturated.starts_with("1 process(es) of kwin-mcp-1-1.scope are still exiting after SIGKILL (kwin_wayland[7] uninterruptible kernel wait in rq_qos_wait)"), "{saturated}");
-        assert!(saturated.contains("host disk I/O pressure is 92%"), "{saturated}");
+        assert!(
+            saturated.contains("host disk I/O pressure is 92%"),
+            "{saturated}"
+        );
         assert!(saturated.contains("not a leak"), "{saturated}");
         let idle_disk = exiting_summary("kwin-mcp-1-1.scope", &[kwin], Some(0.3));
         assert!(idle_disk.contains("blocked in the kernel"), "{idle_disk}");
         assert!(!idle_disk.contains("I/O pressure"), "{idle_disk}");
-        let zombie = ExitingProcess { pid: 9, name: "bwrap".to_owned(), state: 'Z', waiting_in: None };
+        let zombie = ExitingProcess {
+            pid: 9,
+            name: "bwrap".to_owned(),
+            state: 'Z',
+            waiting_in: None,
+        };
         let reaping = exiting_summary("kwin-mcp-1-1.scope", &[zombie], None);
-        assert!(reaping.contains("bwrap[9] exited, not yet reaped)."), "{reaping}");
+        assert!(
+            reaping.contains("bwrap[9] exited, not yet reaped)."),
+            "{reaping}"
+        );
     }
 
     #[test]
@@ -32166,7 +33077,8 @@ mod viewer_and_scope_exit_tests {
     // the member; one that is gone or empty is not.
     #[test]
     fn a_scope_that_stays_populated_is_reported_after_the_wait() -> Result<(), String> {
-        let directory = std::env::temp_dir().join(format!("kwin-mcp-scope-test-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("kwin-mcp-scope-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         let write = |name: &str, text: &str| {
             std::fs::write(directory.join(name), text).map_err(|error| error.to_string())
@@ -32182,10 +33094,15 @@ mod viewer_and_scope_exit_tests {
         let report = report.ok_or("a populated scope must be reported")?;
         assert_eq!(report["scope"], "kwin-mcp-1-1.scope");
         assert_eq!(report["processes"][0]["pid"], std::process::id());
-        assert!(report["summary"].as_str().is_some_and(|text| text.contains("still exiting")));
+        assert!(
+            report["summary"]
+                .as_str()
+                .is_some_and(|text| text.contains("still exiting"))
+        );
         // The kill of the whole cgroup was asked for once more.
         assert_eq!(
-            std::fs::read_to_string(directory.join("cgroup.kill")).map_err(|error| error.to_string())?,
+            std::fs::read_to_string(directory.join("cgroup.kill"))
+                .map_err(|error| error.to_string())?,
             "1"
         );
         write("cgroup.procs", "")?;
@@ -32200,13 +33117,12 @@ mod viewer_and_scope_exit_tests {
 #[cfg(test)]
 mod session_end_report_tests {
     use super::{
-        BROWSER_SHUTDOWN_GRACE, CDP_BROWSER_CLOSE_TIMEOUT, DEATH_LOG_TAIL_BYTES,
-        EXIT_ORDER_MARGIN, KWIN_EXIT_FILE, SANDBOX_TOP_HOLDER, SANDBOX_TOP_PASTA,
-        SESSION_LIFECYCLE_DETAIL_MAX_CHARS, SESSION_STOP_LIMIT, STAGE_KWIN_CLOSE, STAGE_SANDBOX,
-        STAGE_SCOPE, STAGE_STORAGE, STOP_FORCED_RESERVE, STOP_KWIN_CLOSE_LIMIT,
-        STOP_WALLET_LIMIT, SessionLifecycleRecord, StopProgress, death_detail,
-        death_summary_note, lifecycle_detail, sandbox_exit_evidence, sandbox_exit_summary,
-        server_ending_error, signal_sender, stop_pending_report,
+        BROWSER_SHUTDOWN_GRACE, CDP_BROWSER_CLOSE_TIMEOUT, DEATH_LOG_TAIL_BYTES, EXIT_ORDER_MARGIN,
+        KWIN_EXIT_FILE, SANDBOX_TOP_HOLDER, SANDBOX_TOP_PASTA, SESSION_LIFECYCLE_DETAIL_MAX_CHARS,
+        SESSION_STOP_LIMIT, STAGE_KWIN_CLOSE, STAGE_SANDBOX, STAGE_SCOPE, STAGE_STORAGE,
+        STOP_FORCED_RESERVE, STOP_KWIN_CLOSE_LIMIT, STOP_WALLET_LIMIT, SessionLifecycleRecord,
+        StopProgress, death_detail, death_summary_note, lifecycle_detail, sandbox_exit_evidence,
+        sandbox_exit_summary, server_ending_error, signal_sender, stop_pending_report,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -32258,9 +33174,15 @@ mod session_end_report_tests {
 
     #[test]
     fn a_signal_and_a_signal_status_are_named() {
-        let (_, killed) =
-            sandbox_exit_summary(SANDBOX_TOP_PASTA, ExitStatus::from_raw(nix::libc::SIGKILL), None);
-        assert!(killed.contains("was killed by SIGKILL (signal 9)"), "{killed}");
+        let (_, killed) = sandbox_exit_summary(
+            SANDBOX_TOP_PASTA,
+            ExitStatus::from_raw(nix::libc::SIGKILL),
+            None,
+        );
+        assert!(
+            killed.contains("was killed by SIGKILL (signal 9)"),
+            "{killed}"
+        );
         assert!(killed.contains("out-of-memory killer"), "{killed}");
         let (_, relayed) = sandbox_exit_summary(SANDBOX_TOP_PASTA, exited(143), None);
         assert!(
@@ -32274,13 +33196,17 @@ mod session_end_report_tests {
     // death record must already hold what they said.
     #[test]
     fn evidence_keeps_the_log_tail_and_the_compositor_status() -> Result<(), String> {
-        let root = std::env::temp_dir().join(format!("kwin-mcp-exit-evidence-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("kwin-mcp-exit-evidence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         let log = root.join("sandbox.log");
         let filler = "x".repeat(usize::try_from(DEATH_LOG_TAIL_BYTES).unwrap_or(0));
-        std::fs::write(&log, format!("{filler}\nkwin_wayland: lost the GPU\nlast line\n"))
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &log,
+            format!("{filler}\nkwin_wayland: lost the GPU\nlast line\n"),
+        )
+        .map_err(|error| error.to_string())?;
         let now = std::time::SystemTime::now();
         let running = sandbox_exit_evidence(exited(0), &root, &log, SANDBOX_TOP_PASTA, now);
         assert_eq!(running["ended_first"], "sandbox_top_process");
@@ -32288,7 +33214,10 @@ mod session_end_report_tests {
         assert_eq!(running["exit_code"], 0);
         assert_eq!(running["sandbox_log_truncated"], true);
         let tail = running["sandbox_log_tail"].as_str().unwrap_or_default();
-        assert!(tail.ends_with("kwin_wayland: lost the GPU\nlast line"), "{tail}");
+        assert!(
+            tail.ends_with("kwin_wayland: lost the GPU\nlast line"),
+            "{tail}"
+        );
         assert!(
             u64::try_from(tail.len()).unwrap_or(u64::MAX) <= DEATH_LOG_TAIL_BYTES,
             "{}",
@@ -32302,7 +33231,10 @@ mod session_end_report_tests {
         assert_eq!(crashed["kwin_exit_status"], "11");
         let detail = death_detail(&serde_json::Value::Object(crashed.clone()))
             .ok_or("a dead session has a lifecycle detail")?;
-        assert!(detail.starts_with("kwin_wayland exited first, with status 11"), "{detail}");
+        assert!(
+            detail.starts_with("kwin_wayland exited first, with status 11"),
+            "{detail}"
+        );
         assert!(
             detail.contains(". Sandbox log ended: x")
                 && detail.ends_with("x\nkwin_wayland: lost the GPU\nlast line"),
@@ -32353,7 +33285,10 @@ mod session_end_report_tests {
             ..parsed
         };
         let line = serde_json::to_string(&with_detail).map_err(|error| error.to_string())?;
-        assert!(line.contains(r#""detail":"SIGTERM from PID 9 (pkill, uid 1000)""#), "{line}");
+        assert!(
+            line.contains(r#""detail":"SIGTERM from PID 9 (pkill, uid 1000)""#),
+            "{line}"
+        );
         Ok(())
     }
 
@@ -32367,9 +33302,18 @@ mod session_end_report_tests {
             "SIGTERM from PID 42 (pkill, uid 1000)",
         );
         let message = error.message.to_string();
-        assert!(message.contains("is shutting down (SIGTERM from PID 42 (pkill, uid 1000))"), "{message}");
-        assert!(message.contains("window_list for session s3680185-1 was not completed"), "{message}");
-        assert!(message.contains("call session_start without session_id"), "{message}");
+        assert!(
+            message.contains("is shutting down (SIGTERM from PID 42 (pkill, uid 1000))"),
+            "{message}"
+        );
+        assert!(
+            message.contains("window_list for session s3680185-1 was not completed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("call session_start without session_id"),
+            "{message}"
+        );
         let data = error.data.unwrap_or_default();
         assert_eq!(data["reason"], "server_shutting_down");
         assert_eq!(data["session_id"], "s3680185-1");
@@ -32408,7 +33352,10 @@ mod session_end_report_tests {
         );
         assert_eq!(stages[0].note.as_deref(), Some("KWin did not answer"));
         assert_eq!(stages[1].note, None);
-        assert_eq!(progress.running().map(|(stage, _)| stage), Some(STAGE_STORAGE));
+        assert_eq!(
+            progress.running().map(|(stage, _)| stage),
+            Some(STAGE_STORAGE)
+        );
         progress.end();
         assert!(progress.running().is_none());
         assert_eq!(progress.stages().len(), 3);
@@ -32426,7 +33373,10 @@ mod session_end_report_tests {
             ),
             "{message}"
         );
-        assert!(message.contains("Every process of the session has ended"), "{message}");
+        assert!(
+            message.contains("Every process of the session has ended"),
+            "{message}"
+        );
         assert!(message.contains("call session_stop again"), "{message}");
         assert_eq!(data["status"], "cleanup_pending");
         assert_eq!(data["session_status"], "stopped");
@@ -32437,7 +33387,10 @@ mod session_end_report_tests {
         let killing = StopProgress::default();
         killing.begin(STAGE_SCOPE);
         let (message, data) = stop_pending_report(&killing, "stopped", SESSION_STOP_LIMIT);
-        assert!(message.contains("those that have not are being killed"), "{message}");
+        assert!(
+            message.contains("those that have not are being killed"),
+            "{message}"
+        );
         assert!(!message.contains("Every process"), "{message}");
         assert_eq!(data["unfinished"]["stage"], STAGE_SCOPE);
     }

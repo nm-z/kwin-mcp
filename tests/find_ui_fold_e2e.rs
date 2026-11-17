@@ -80,10 +80,7 @@ fn child_matches_fold_into_the_parent_and_whole_word_skips_longer_words() {
         }),
     );
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -128,16 +125,38 @@ fn child_matches_fold_into_the_parent_and_whole_word_skips_longer_words() {
     assert!(all_names.iter().any(|name| name == "Start panel"), "{all}");
     assert!(all_names.iter().any(|name| name == "Start button"), "{all}");
     assert!(
-        !all_names.iter().any(|name| name == "Start the engine" || name == "Start the pump"),
+        !all_names
+            .iter()
+            .any(|name| name == "Start the engine" || name == "Start the pump"),
         "text inside the panel was listed again: {all}"
     );
     let panel = all["result"]["structuredContent"]["elements"]
         .as_array()
-        .and_then(|elements| elements.iter().find(|element| element["name"] == "Start panel"))
+        .and_then(|elements| {
+            elements
+                .iter()
+                .find(|element| element["name"] == "Start panel")
+        })
         .expect("the panel");
-    assert!(panel["children_matched"].as_u64().unwrap_or(0) >= 2, "{all}");
+    assert!(
+        panel["children_matched"].as_u64().unwrap_or(0) >= 2,
+        "{all}"
+    );
     // 'Start' is a whole word in the panel and the button, only a piece of StartFraction.
-    assert!(names(&all).iter().any(|name| name.starts_with("StartFraction")), "{all}");
-    assert!(!names(&whole).iter().any(|name| name.starts_with("StartFraction")), "{whole}");
-    assert!(names(&whole).iter().any(|name| name == "Start panel"), "{whole}");
+    assert!(
+        names(&all)
+            .iter()
+            .any(|name| name.starts_with("StartFraction")),
+        "{all}"
+    );
+    assert!(
+        !names(&whole)
+            .iter()
+            .any(|name| name.starts_with("StartFraction")),
+        "{whole}"
+    );
+    assert!(
+        names(&whole).iter().any(|name| name == "Start panel"),
+        "{whole}"
+    );
 }

@@ -4681,7 +4681,12 @@ fn export_file_hands_session_files_to_the_host_and_verifies_them() {
         json!("exported"),
         "{default}"
     );
-    assert!(default["result"]["structuredContent"].get("host_path").is_none(), "{default}");
+    assert!(
+        default["result"]["structuredContent"]
+            .get("host_path")
+            .is_none(),
+        "{default}"
+    );
     assert!(download.exists());
 
     let note = call_tool(
@@ -11131,7 +11136,14 @@ fn launch_app_reads_the_initial_empty_desktop_without_a_second_active_window_pro
     let payload = &launched["result"]["structuredContent"];
     // A found window reports how it was found; the usual baseline, the submitted
     // command and the empty diagnostics are not repeated.
-    for omitted in ["command_submitted", "window_baseline", "window_baseline_errors", "command", "cdp", "warning"] {
+    for omitted in [
+        "command_submitted",
+        "window_baseline",
+        "window_baseline_errors",
+        "command",
+        "cdp",
+        "warning",
+    ] {
         assert!(payload.get(omitted).is_none(), "{omitted} in {launched}");
     }
     assert_eq!(payload["window_outcome"], "new", "{launched}");

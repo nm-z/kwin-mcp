@@ -80,7 +80,10 @@ fn a_stalled_start_names_the_processes_in_its_sandbox() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&home);
 
-    assert_eq!(response["error"]["data"]["reason"], "hard_timeout", "{response}");
+    assert_eq!(
+        response["error"]["data"]["reason"], "hard_timeout",
+        "{response}"
+    );
     let snapshot = response["error"]["data"]["sandbox_snapshot"]
         .as_str()
         .expect("the stall error carries a sandbox snapshot");
@@ -98,7 +101,10 @@ fn a_stalled_start_names_the_processes_in_its_sandbox() {
         Some(response["error"]["data"]["stage"].clone()),
         "{response}"
     );
-    assert!(stages.len() <= 24, "per-process checkpoints leaked into {response}");
+    assert!(
+        stages.len() <= 24,
+        "per-process checkpoints leaked into {response}"
+    );
     assert!(
         response["error"]["message"]
             .as_str()

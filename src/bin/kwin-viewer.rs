@@ -254,16 +254,24 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
                 "wl_output" if state.output.is_none() => {
-                    state.output = Some(registry.bind(name, version.min(WL_OUTPUT_VERSION), qh, ()));
+                    state.output =
+                        Some(registry.bind(name, version.min(WL_OUTPUT_VERSION), qh, ()));
                 }
                 "zkde_screencast_unstable_v1" => {
-                    state.screencast = Some(registry.bind(name, version.min(SCREENCAST_VERSION), qh, ()));
+                    state.screencast =
+                        Some(registry.bind(name, version.min(SCREENCAST_VERSION), qh, ()));
                 }
                 "org_kde_kwin_fake_input" => {
-                    state.fake_input = Some(registry.bind(name, version.min(FAKE_INPUT_VERSION), qh, ()));
+                    state.fake_input =
+                        Some(registry.bind(name, version.min(FAKE_INPUT_VERSION), qh, ()));
                 }
                 _ => {}
             }
@@ -591,7 +599,11 @@ impl SessionClipboard {
             "isolated",
             shutdown,
         )?;
-        Ok(Self { isolated: Arc::new(isolated), restore: None, superseded: Arc::default() })
+        Ok(Self {
+            isolated: Arc::new(isolated),
+            restore: None,
+            superseded: Arc::default(),
+        })
     }
 
     // Ends the handoff before this one and returns the agent's selection.
@@ -606,7 +618,10 @@ impl SessionClipboard {
         self.isolated.read()
     }
 
-    fn finish(&mut self, restore: impl FnOnce() -> anyhow::Result<()> + Send + 'static) -> anyhow::Result<()> {
+    fn finish(
+        &mut self,
+        restore: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         self.restore = Some(
             std::thread::Builder::new()
                 .name("clipboard-restore".to_owned())
@@ -686,7 +701,8 @@ impl ClipboardBridge {
         match chord {
             ClipChord::Copy => {
                 let host = Arc::clone(&self.host);
-                self.session.copy(move |session| host.write(session.read()?).map(|()| true))
+                self.session
+                    .copy(move |session| host.write(session.read()?).map(|()| true))
             }
             ClipChord::Paste => self.session.paste(self.host.read()?),
         }
@@ -708,21 +724,26 @@ struct CopyAnswer {
 
 impl CopyAnswer {
     fn pending(&self) -> std::sync::MutexGuard<'_, Option<(u64, Instant)>> {
-        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // The session's host answered copy request `id`.
     fn receive(self: &Arc<Self>, id: u64, text: Option<ClipText>) {
         let asked = {
             let mut pending = self.pending();
-            let asked = pending.is_some_and(|(asked, at)| asked == id && at.elapsed() <= COPY_ANSWER_TIMEOUT);
+            let asked = pending
+                .is_some_and(|(asked, at)| asked == id && at.elapsed() <= COPY_ANSWER_TIMEOUT);
             if asked {
                 *pending = None;
             }
             asked
         };
         if !asked {
-            eprintln!("kwin-viewer: stream: ignored a clipboard text this viewer is not waiting for");
+            eprintln!(
+                "kwin-viewer: stream: ignored a clipboard text this viewer is not waiting for"
+            );
             return;
         }
         let Some(text) = text else {
@@ -764,7 +785,10 @@ impl StreamClipboard {
             ClipChord::Copy => {
                 self.copies += 1;
                 *self.answer.pending() = Some((self.copies, Instant::now()));
-                Request::ClipboardCopy { id: self.copies, max_bytes: self.limit as u64 }
+                Request::ClipboardCopy {
+                    id: self.copies,
+                    max_bytes: self.limit as u64,
+                }
             }
             ClipChord::Paste => {
                 *self.answer.pending() = None;
@@ -773,7 +797,9 @@ impl StreamClipboard {
                 let (text, secret) = match self.answer.host.read_utf8(self.limit) {
                     Ok(Some((text, secret))) => (ClipText::new(text, self.limit), secret),
                     Ok(None) => {
-                        eprintln!("kwin-viewer: paste shortcut: this machine's clipboard holds no text; nothing is pasted");
+                        eprintln!(
+                            "kwin-viewer: paste shortcut: this machine's clipboard holds no text; nothing is pasted"
+                        );
                         (None, false)
                     }
                     Err(error) => {
@@ -781,7 +807,10 @@ impl StreamClipboard {
                         (None, false)
                     }
                 };
-                Request::ClipboardPaste { secret: secret && text.is_some(), text }
+                Request::ClipboardPaste {
+                    secret: secret && text.is_some(),
+                    text,
+                }
             }
         };
         self.out.request(request);
@@ -820,7 +849,9 @@ impl SenderClipboard {
     fn post(outbox: &Mutex<Option<Notice>>, mailbox: &FrameMailbox, notice: Notice) {
         let (latest, ready) = &**mailbox;
         let guard = latest.lock();
-        *outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notice);
+        *outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notice);
         drop(guard);
         ready.notify_all();
     }
@@ -829,7 +860,10 @@ impl SenderClipboard {
     // that follows it on the socket.
     fn receive(&mut self, message: &str) {
         let Some(request) = Request::decode(message) else {
-            eprintln!("kwin-viewer: stream: unreadable request of {} bytes", message.len());
+            eprintln!(
+                "kwin-viewer: stream: unreadable request of {} bytes",
+                message.len()
+            );
             return;
         };
         let handled = match request {
@@ -842,7 +876,8 @@ impl SenderClipboard {
                         "the viewer's machine sent no text, so the session pastes nothing"
                     }
                 );
-                let contents = text.map_or_else(Arc::default, |text| text_contents(text.as_str(), secret));
+                let contents =
+                    text.map_or_else(Arc::default, |text| text_contents(text.as_str(), secret));
                 self.session.paste(contents)
             }
             Request::ClipboardCopy { id, max_bytes } => {
@@ -909,7 +944,11 @@ fn main() -> anyhow::Result<()> {
             write_status(&session_path, "starting", "");
             let result = run(session_dir, argv);
             match &result {
-                Ok(()) => write_status(&session_path, "closed", "viewer exited: window closed or session ended"),
+                Ok(()) => write_status(
+                    &session_path,
+                    "closed",
+                    "viewer exited: window closed or session ended",
+                ),
                 Err(error) => write_status(&session_path, "failed", &format!("{error:#}")),
             }
             result
@@ -927,7 +966,10 @@ fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u
         }
     };
     let size = (next(3840, "width")?, next(2160, "height")?);
-    anyhow::ensure!(size.0 > 0 && size.1 > 0, "viewer dimensions must be positive");
+    anyhow::ensure!(
+        size.0 > 0 && size.1 > 0,
+        "viewer dimensions must be positive"
+    );
     Ok(size)
 }
 
@@ -969,7 +1011,12 @@ fn foreign_node_reason(node_id: u32, socket: &std::path::Path) -> String {
 
 fn write_pipewire_state(path: &std::path::Path, node_id: u32, state: &str) {
     let temporary = path.with_extension("tmp");
-    if std::fs::write(&temporary, serde_json::json!({"node_id": node_id, "state": state}).to_string()).is_ok() {
+    if std::fs::write(
+        &temporary,
+        serde_json::json!({"node_id": node_id, "state": state}).to_string(),
+    )
+    .is_ok()
+    {
         let _ = std::fs::rename(temporary, path);
     }
 }
@@ -1007,9 +1054,16 @@ impl SessionLink {
 
         event_queue.roundtrip(&mut state)?;
 
-        let output = state.output.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise wl_output"))?;
-        let screencast = state.screencast.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise zkde_screencast_unstable_v1"))?;
-        let fake_input = state.fake_input.clone().ok_or_else(|| anyhow::anyhow!("compositor did not advertise org_kde_kwin_fake_input"))?;
+        let output = state
+            .output
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("compositor did not advertise wl_output"))?;
+        let screencast = state.screencast.clone().ok_or_else(|| {
+            anyhow::anyhow!("compositor did not advertise zkde_screencast_unstable_v1")
+        })?;
+        let fake_input = state.fake_input.clone().ok_or_else(|| {
+            anyhow::anyhow!("compositor did not advertise org_kde_kwin_fake_input")
+        })?;
 
         // KWin silently drops input from unauthenticated fake_input clients — no
         // error event, just nothing happens. Must be the first request on the
@@ -1030,7 +1084,11 @@ impl SessionLink {
             }
         };
         eprintln!("kwin-viewer: connected to pipewire node {node_id}");
-        write_status(session_path, "starting", &format!("waiting for a frame from pipewire node {node_id}"));
+        write_status(
+            session_path,
+            "starting",
+            &format!("waiting for a frame from pipewire node {node_id}"),
+        );
 
         // The pipewire loop runs on its own thread and is stopped through this
         // channel, so main can join it instead of leaving it behind on exit.
@@ -1044,9 +1102,13 @@ impl SessionLink {
             std::thread::Builder::new()
                 .name("pipewire".to_owned())
                 .spawn(move || {
-                    if let Err(e) = run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx, layout) {
+                    if let Err(e) =
+                        run_pipewire(pipewire_sock, node_id, mailbox, virt, pw_quit_rx, layout)
+                    {
                         eprintln!("kwin-viewer: pipewire loop exited: {e}");
-                        *capture_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        *capture_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(format!("{e:#}"));
                     }
                     // Losing the video feed ends the viewer the same way a dead
@@ -1060,9 +1122,17 @@ impl SessionLink {
         // fake_input requests are sent on. Moving the real state here, instead
         // of dispatching a throwaway copy, is what lets a closed stream end the
         // viewer.
-        let wl_dispatch = DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, shutdown)?;
+        let wl_dispatch =
+            DispatchThread::spawn("screencast".to_owned(), conn, event_queue, state, shutdown)?;
         let conn = wl_dispatch.connection().clone();
-        Ok(Self { fake_input, conn, _wl_dispatch: wl_dispatch, pw_quit, pw_thread, capture_failure })
+        Ok(Self {
+            fake_input,
+            conn,
+            _wl_dispatch: wl_dispatch,
+            pw_quit,
+            pw_thread,
+            capture_failure,
+        })
     }
 
     // Stop the PipeWire loop and wait for it. The caller has already requested
@@ -1074,7 +1144,10 @@ impl SessionLink {
         if self.pw_thread.join().is_err() {
             eprintln!("kwin-viewer: pipewire thread panicked");
         }
-        self.capture_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        self.capture_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -1138,7 +1211,13 @@ fn run(session_dir: String, mut argv: impl Iterator<Item = String>) -> anyhow::R
     };
 
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox, CaptureLayout::Rgba)?;
+    let link = SessionLink::connect(
+        &session_path,
+        virt,
+        &shutdown,
+        &mailbox,
+        CaptureLayout::Rgba,
+    )?;
     numlock.apply(&link.fake_input, &link.conn)?;
 
     let mut input_state = InputState {
@@ -1188,7 +1267,9 @@ impl ViewerTitle<'_> {
         match self {
             Self::Local(path) => session_title(path),
             Self::Remote(title, host) => {
-                let title = title.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let title = title
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 format!("{title} ({host})")
             }
         }
@@ -1204,14 +1285,24 @@ impl ViewerTitle<'_> {
 // the first UNORM one, then the surface's first.
 fn exact_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     let rank = |format: &vk::SurfaceFormatKHR| {
-        let unorm = matches!(format.format, vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM);
-        match (unorm, format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR) {
+        let unorm = matches!(
+            format.format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
+        );
+        match (
+            unorm,
+            format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        ) {
             (true, true) => 0,
             (true, false) => 1,
             (false, _) => 2,
         }
     };
-    let chosen = formats.iter().min_by_key(|format| rank(format)).copied().unwrap_or_default();
+    let chosen = formats
+        .iter()
+        .min_by_key(|format| rank(format))
+        .copied()
+        .unwrap_or_default();
     eprintln!(
         "kwin-viewer: swapchain {}{}",
         surface_text(chosen),
@@ -1259,7 +1350,9 @@ fn window_loop(
             let surface = Arc::clone(&surface);
             move |formats| {
                 let chosen = exact_surface_format(formats);
-                *surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chosen);
+                *surface
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chosen);
                 chosen
             }
         })
@@ -1291,13 +1384,18 @@ fn window_loop(
     // draw and whenever it changes.
     let reported_size = Cell::new(None::<(u32, u32)>);
     let report_size = |size: PhysicalSize<u32>| {
-        let Some(OpSink::Socket(..)) = remote_output.as_ref() else { return };
+        let Some(OpSink::Socket(..)) = remote_output.as_ref() else {
+            return;
+        };
         let size = (size.width, size.height);
         if size.0 == 0 || size.1 == 0 || reported_size.get() == Some(size) {
             return;
         }
         reported_size.set(Some(size));
-        eprintln!("kwin-viewer: stream: drawable size {}x{} reported to the sender", size.0, size.1);
+        eprintln!(
+            "kwin-viewer: stream: drawable size {}x{} reported to the sender",
+            size.0, size.1
+        );
         if let Some(sink) = remote_output.as_ref() {
             sink.send(Op::Size(size.0, size.1));
         }
@@ -1329,9 +1427,11 @@ fn window_loop(
         }
 
         if !ready_reported.get() && started.elapsed() >= FIRST_FRAME_TIMEOUT {
-            let reason=frame_timeout_reason(status_dir);
-            if let Some(dir)=status_dir {write_status(dir,"failed",&reason);}
-            startup_error=Some(reason);
+            let reason = frame_timeout_reason(status_dir);
+            if let Some(dir) = status_dir {
+                write_status(dir, "failed", &reason);
+            }
+            startup_error = Some(reason);
             shutdown.request();
             frame.exit();
             return;
@@ -1357,11 +1457,7 @@ fn window_loop(
         let latest = if first_frame_queued.get() {
             take_frame(mailbox)
         } else {
-            match wait_for_first_frame(
-                mailbox,
-                shutdown,
-                started + FIRST_FRAME_TIMEOUT,
-            ) {
+            match wait_for_first_frame(mailbox, shutdown, started + FIRST_FRAME_TIMEOUT) {
                 Some(frame) => Some(frame),
                 None if shutdown.requested() => {
                     frame.exit();
@@ -1409,7 +1505,9 @@ fn window_loop(
                     Ok(staging) => {
                         let staging_node = frame.render_graph.bind_node(staging);
                         let image_node = frame.render_graph.bind_node(image);
-                        frame.render_graph.copy_buffer_to_image(staging_node, image_node);
+                        frame
+                            .render_graph
+                            .copy_buffer_to_image(staging_node, image_node);
                         session_frame_queued = true;
                         staged_capture.set(Some((f.captured_micros, unshown)));
                     }
@@ -1420,7 +1518,9 @@ fn window_loop(
                 stream.shown(f);
             }
         }
-        let chosen = *surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let chosen = *surface
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if chosen != noted_surface.get() {
             noted_surface.set(chosen);
             if let (Some(stream), Some(chosen)) = (stream, chosen) {
@@ -1529,7 +1629,9 @@ fn window_loop(
             true
         },
     )?;
-if let Some(error)=startup_error {anyhow::bail!(error);}
+    if let Some(error) = startup_error {
+        anyhow::bail!(error);
+    }
     Ok(())
 }
 
@@ -1683,7 +1785,13 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     pipewire::init();
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let link = SessionLink::connect(&session_path, virt, &shutdown, &mailbox, CaptureLayout::Rgba)?;
+    let link = SessionLink::connect(
+        &session_path,
+        virt,
+        &shutdown,
+        &mailbox,
+        CaptureLayout::Rgba,
+    )?;
     let input = InputOut::Local {
         fake_input: link.fake_input.clone(),
         conn: link.conn.clone(),
@@ -1697,26 +1805,32 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         let (input, shutdown) = (input, shutdown.clone());
         let submitted = submitted.clone();
         let session_path = session_path.clone();
-        std::thread::Builder::new().name("remote-input".to_owned()).spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            while let Ok(Some(op)) = Op::decode(&mut stdin) {
-                if matches!(op, Op::Presented) {
-                    submitted.store(true, Ordering::Release);
-                    write_status(
-                        &session_path,
-                        "ready",
-                        "remote viewer submitted its first frame for presentation",
-                    );
-                } else {
-                    input.send(op);
+        std::thread::Builder::new()
+            .name("remote-input".to_owned())
+            .spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                while let Ok(Some(op)) = Op::decode(&mut stdin) {
+                    if matches!(op, Op::Presented) {
+                        submitted.store(true, Ordering::Release);
+                        write_status(
+                            &session_path,
+                            "ready",
+                            "remote viewer submitted its first frame for presentation",
+                        );
+                    } else {
+                        input.send(op);
+                    }
                 }
-            }
-            shutdown.request();
-        })?;
+                shutdown.request();
+            })?;
     }
 
-    write_status(&session_path, "starting", "waiting for remote first-frame submission");
-    let started=Instant::now();
+    write_status(
+        &session_path,
+        "starting",
+        "waiting for remote first-frame submission",
+    );
+    let started = Instant::now();
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     let mut result = Ok(());
     let mut sent_title = String::new();
@@ -1728,8 +1842,11 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         }
         let title = session_title(&session_path);
         if title != sent_title {
-            if let Err(error) = write_title(&mut stdout,&title) { result=Err(error); break; }
-            sent_title=title;
+            if let Err(error) = write_title(&mut stdout, &title) {
+                result = Err(error);
+                break;
+            }
+            sent_title = title;
         }
         let latest = take_frame(&mailbox);
         match latest {
@@ -1746,8 +1863,8 @@ fn serve(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     shutdown.request();
     let result = with_capture_failure(result, link.close());
     match &result {
-        Ok(()) => write_status(&session_path,"closed","remote viewer disconnected"),
-        Err(error) => write_status(&session_path,"failed",&error.to_string()),
+        Ok(()) => write_status(&session_path, "closed", "remote viewer disconnected"),
+        Err(error) => write_status(&session_path, "failed", &error.to_string()),
     }
     result
 }
@@ -1761,12 +1878,15 @@ fn find_wayland_socket(runtime: &std::path::Path) -> Option<String> {
         .ok()?
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .filter(|name| {
-            name.strip_prefix("wayland-")
-                .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+            name.strip_prefix("wayland-").is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
         .collect();
     names.sort();
-    names.into_iter().find(|name| UnixStream::connect(runtime.join(name)).is_ok())
+    names
+        .into_iter()
+        .find(|name| UnixStream::connect(runtime.join(name)).is_ok())
 }
 
 /// `--remote` runs on the machine with the screen, often from an SSH shell that
@@ -1781,7 +1901,10 @@ fn ensure_host_display() -> anyhow::Result<()> {
     }
     let runtime = match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
         Some(runtime) => PathBuf::from(runtime),
-        None => PathBuf::from(format!("/run/user/{}", std::fs::metadata("/proc/self")?.uid())),
+        None => PathBuf::from(format!(
+            "/run/user/{}",
+            std::fs::metadata("/proc/self")?.uid()
+        )),
     };
     let socket = find_wayland_socket(&runtime).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1789,7 +1912,10 @@ fn ensure_host_display() -> anyhow::Result<()> {
             runtime.display()
         )
     })?;
-    eprintln!("kwin-viewer: no display variables set; using {socket} in {}", runtime.display());
+    eprintln!(
+        "kwin-viewer: no display variables set; using {socket} in {}",
+        runtime.display()
+    );
     // SAFETY: this runs first in `--remote`, before any thread exists, so nothing
     // can read the environment while it changes.
     unsafe {
@@ -1804,46 +1930,86 @@ fn run_remote(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let host = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let session_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let virt = parse_size(&mut argv)?;
-    let plain = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "-_./@:".contains(c));
-    anyhow::ensure!(plain(&host) && plain(&session_dir), "host and session directory must be plain names");
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./@:".contains(c))
+    };
+    anyhow::ensure!(
+        plain(&host) && plain(&session_dir),
+        "host and session directory must be plain names"
+    );
     let remote_bin = std::env::var("KWIN_VIEWER_REMOTE_BIN")
         .ok()
-        .or_else(|| std::env::current_exe().ok().map(|path| path.display().to_string()))
-        .ok_or_else(|| anyhow::anyhow!("cannot locate the remote kwin-viewer; set KWIN_VIEWER_REMOTE_BIN"))?;
-    anyhow::ensure!(plain(&remote_bin), "remote kwin-viewer path must be a plain name");
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot locate the remote kwin-viewer; set KWIN_VIEWER_REMOTE_BIN")
+        })?;
+    anyhow::ensure!(
+        plain(&remote_bin),
+        "remote kwin-viewer path must be a plain name"
+    );
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
-    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(&session_dir))));
+    let title = Arc::new(Mutex::new(session_title_fallback(std::path::Path::new(
+        &session_dir,
+    ))));
     let mut child = std::process::Command::new("ssh")
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+        ])
         .arg(&host)
         .arg(&remote_bin)
-        .args(["--serve", &session_dir, &virt.0.to_string(), &virt.1.to_string()])
+        .args([
+            "--serve",
+            &session_dir,
+            &virt.0.to_string(),
+            &virt.1.to_string(),
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("ssh stdin missing"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("ssh stdout missing"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ssh stdin missing"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ssh stdout missing"))?;
 
     let reader = {
         let title = Arc::clone(&title);
         let (mailbox, shutdown) = (Arc::clone(&mailbox), shutdown.clone());
-        std::thread::Builder::new().name("remote-frames".to_owned()).spawn(move || {
-            loop {
-                match read_frame(&mut stdout,Some(&title)) {
-                    Ok(Some(frame)) => {
-                        store_frame(&mailbox, frame);
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        eprintln!("kwin-viewer: remote stream ended: {error:#}");
-                        break;
+        std::thread::Builder::new()
+            .name("remote-frames".to_owned())
+            .spawn(move || {
+                loop {
+                    match read_frame(&mut stdout, Some(&title)) {
+                        Ok(Some(frame)) => {
+                            store_frame(&mailbox, frame);
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            eprintln!("kwin-viewer: remote stream ended: {error:#}");
+                            break;
+                        }
                     }
                 }
-            }
-            shutdown.request();
-        })?
+                shutdown.request();
+            })?
     };
 
     let mut input_state = InputState {
@@ -1935,14 +2101,19 @@ fn mode_text(mode: Mode) -> String {
 type BufferPool = Arc<Mutex<Vec<Vec<u8>>>>;
 
 fn recycle(pool: &BufferPool, buffer: Vec<u8>) {
-    let mut pool = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if pool.len() < CAPTURE_POOL_BUFFERS {
         pool.push(buffer);
     }
 }
 
 fn recycled(pool: &BufferPool) -> Vec<u8> {
-    pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop().unwrap_or_default()
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_default()
 }
 
 // What the viewer told the sender.
@@ -1954,7 +2125,10 @@ struct ViewerLink {
 
 impl ViewerLink {
     fn size(&self) -> Option<(u32, u32)> {
-        *self.size.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // Stored under the mailbox lock, which the sender holds from its check of
@@ -1962,7 +2136,10 @@ impl ViewerLink {
     fn resize(&self, mailbox: &FrameMailbox, size: (u32, u32)) {
         let (latest, ready) = &**mailbox;
         let guard = latest.lock();
-        *self.size.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size);
+        *self
+            .size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size);
         drop(guard);
         ready.notify_all();
     }
@@ -2028,17 +2205,24 @@ impl<'a> OnWire<'a> {
     fn begin(share: &'a ShareLink, probe: &'a std::net::TcpStream) -> Self {
         share.report(links::Report::Wire(true));
         let now = Instant::now();
-        Self { share, probe, started: now, looked: now, told: true }
+        Self {
+            share,
+            probe,
+            started: now,
+            looked: now,
+            told: true,
+        }
     }
 
     // Tells the scheduler when the socket stalled or sends again.
     fn look(&mut self) {
-        if self.started.elapsed() < Self::STALLED_AFTER || self.looked.elapsed() < Self::LOOK_EVERY {
+        if self.started.elapsed() < Self::STALLED_AFTER || self.looked.elapsed() < Self::LOOK_EVERY
+        {
             return;
         }
         self.looked = Instant::now();
-        let sending =
-            !viewer_stream::since_data_sent(self.probe).is_ok_and(|idle| idle >= Self::STALLED_AFTER);
+        let sending = !viewer_stream::since_data_sent(self.probe)
+            .is_ok_and(|idle| idle >= Self::STALLED_AFTER);
         if sending != self.told {
             self.told = sending;
             self.share.report(links::Report::Wire(sending));
@@ -2123,12 +2307,19 @@ impl ShareLink {
         use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage, getsockname};
         use std::io::Read;
         use std::os::fd::{AsFd, AsRawFd};
-        let whole = links::Grant { pace: budget.unwrap_or(0), share: budget.unwrap_or(0), streams: 1 };
+        let whole = links::Grant {
+            pace: budget.unwrap_or(0),
+            share: budget.unwrap_or(0),
+            streams: 1,
+        };
         let mut link = Self {
             grant: Arc::new(Mutex::new(whole)),
             changed: Arc::new(AtomicBool::new(false)),
             reports: None,
-            alone: frames.try_clone().ok().map(|frames| (budget, Arc::new(frames))),
+            alone: frames
+                .try_clone()
+                .ok()
+                .map(|frames| (budget, Arc::new(frames))),
         };
         let Some(budget) = budget else { return link };
         let stdout = std::io::stdout();
@@ -2139,40 +2330,60 @@ impl ShareLink {
             .flatten()
             .map(std::os::unix::net::UnixStream::from);
         let (Some(listener), Ok(frames)) = (listener, frames.try_clone()) else {
-            eprintln!("kwin-viewer: stream: no link scheduler; this stream paces itself to the whole budget");
+            eprintln!(
+                "kwin-viewer: stream: no link scheduler; this stream paces itself to the whole budget"
+            );
             return link;
         };
         let mut record = [0u8; links::GRANT_BYTES];
         let _ = listener.set_read_timeout(Some(SHARE_FIRST_GRANT_WAIT));
         if let Err(error) = (&listener).read_exact(&mut record) {
-            eprintln!("kwin-viewer: stream: the link scheduler granted nothing ({error}); this stream paces itself to the whole budget");
+            eprintln!(
+                "kwin-viewer: stream: the link scheduler granted nothing ({error}); this stream paces itself to the whole budget"
+            );
             return link;
         }
         let _ = listener.set_read_timeout(None);
-        *link.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = links::Grant::decode(&record);
-        let Ok(reader) = listener.try_clone() else { return link };
+        *link
+            .grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = links::Grant::decode(&record);
+        let Ok(reader) = listener.try_clone() else {
+            return link;
+        };
         link.reports = Some(Arc::new(Mutex::new(listener)));
         link.alone = None;
         let (grant, changed) = (Arc::clone(&link.grant), Arc::clone(&link.changed));
-        let spawned = std::thread::Builder::new().name("link-share".to_owned()).spawn(move || {
-            let mut record = [0u8; links::GRANT_BYTES];
-            loop {
-                // A listener that is gone grants nothing more: the whole
-                // budget again, as before there was a scheduler.
-                let (next, last) = match (&reader).read_exact(&mut record) {
-                    Ok(()) => (links::Grant::decode(&record), false),
-                    Err(_) => (links::Grant { pace: budget, share: budget, streams: 1 }, true),
-                };
-                if next.pace > 0 {
-                    let _ = viewer_stream::pace(&frames, next.pace);
+        let spawned = std::thread::Builder::new()
+            .name("link-share".to_owned())
+            .spawn(move || {
+                let mut record = [0u8; links::GRANT_BYTES];
+                loop {
+                    // A listener that is gone grants nothing more: the whole
+                    // budget again, as before there was a scheduler.
+                    let (next, last) = match (&reader).read_exact(&mut record) {
+                        Ok(()) => (links::Grant::decode(&record), false),
+                        Err(_) => (
+                            links::Grant {
+                                pace: budget,
+                                share: budget,
+                                streams: 1,
+                            },
+                            true,
+                        ),
+                    };
+                    if next.pace > 0 {
+                        let _ = viewer_stream::pace(&frames, next.pace);
+                    }
+                    *grant
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                    changed.store(true, Ordering::Release);
+                    if last {
+                        break;
+                    }
                 }
-                *grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-                changed.store(true, Ordering::Release);
-                if last {
-                    break;
-                }
-            }
-        });
+            });
         if let Err(error) = spawned {
             eprintln!("kwin-viewer: stream: link scheduler thread: {error}");
         }
@@ -2180,26 +2391,41 @@ impl ShareLink {
     }
 
     fn grant(&self) -> links::Grant {
-        *self.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // The grant, when it changed since the last call.
     fn take_change(&self) -> Option<links::Grant> {
-        self.changed.swap(false, Ordering::AcqRel).then(|| self.grant())
+        self.changed
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.grant())
     }
 
     fn report(&self, report: links::Report) {
         use std::io::Write;
         if let Some(reports) = &self.reports {
-            let mut reports = reports.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reports = reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = reports.write_all(&report.encode());
-        } else if let (links::Report::Cap(Some(cap)), Some((budget, frames))) = (report, &self.alone) {
+        } else if let (links::Report::Cap(Some(cap)), Some((budget, frames))) =
+            (report, &self.alone)
+        {
             // Nobody to share with: the stream holds itself to the slower of
             // its own link and the viewer's.
             let pace = budget.map_or(cap, |budget| budget.min(cap)).max(1);
             let _ = viewer_stream::pace(&**frames, pace);
-            *self.grant.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                links::Grant { pace, share: pace, streams: 1 };
+            *self
+                .grant
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = links::Grant {
+                pace,
+                share: pace,
+                streams: 1,
+            };
             self.changed.store(true, Ordering::Release);
         }
     }
@@ -2299,8 +2525,14 @@ impl PictureSender {
         let now = (grant.share, grant.streams);
         (self.budget.is_some() && now != self.told).then(|| {
             self.told = now;
-            eprintln!("kwin-viewer: stream: this stream now has {}", self.share_text());
-            Notice::Share { bits_per_second: grant.share, streams: grant.streams }
+            eprintln!(
+                "kwin-viewer: stream: this stream now has {}",
+                self.share_text()
+            );
+            Notice::Share {
+                bits_per_second: grant.share,
+                streams: grant.streams,
+            }
         })
     }
 
@@ -2333,7 +2565,11 @@ impl PictureSender {
         }
         match dsc::Config::new(target.0, target.1).and_then(dsc::Encoder::new) {
             Ok(encoder) => {
-                self.dsc = Some(DscStream { size: target, encoder, pps_sent: false });
+                self.dsc = Some(DscStream {
+                    size: target,
+                    encoder,
+                    pps_sent: false,
+                });
                 true
             }
             Err(error) => {
@@ -2367,29 +2603,47 @@ impl PictureSender {
         if resized {
             let sized = match self.scaler.take() {
                 Some(sized) if (sized.source, sized.target) == (source, target) => sized,
-                _ => SizedScaler { source, target, scaler: viewer_stream::Scaler::new(source, target)? },
+                _ => SizedScaler {
+                    source,
+                    target,
+                    scaler: viewer_stream::Scaler::new(source, target)?,
+                },
             };
             let sized = self.scaler.insert(sized);
             if self.scaled.len() != sized.scaler.scaled_len() {
                 self.scaled.resize(sized.scaler.scaled_len(), 0);
             }
-            sized.scaler.scale(&mut self.workers, &frame.pixels, source_stride, &mut self.scaled)?;
+            sized.scaler.scale(
+                &mut self.workers,
+                &frame.pixels,
+                source_stride,
+                &mut self.scaled,
+            )?;
         }
         let scaled = Instant::now();
 
         let pixel_count = u64::from(target.0) * u64::from(target.1);
         // The encoder is made only for a size the rule may send as DSC.
-        let dsc_ready = !settle && self.control.may_choose_dsc(pixel_count) && self.encoder_for(target);
-        let (pixels, stride): (&[u8], usize) =
-            if resized { (&self.scaled, target.0 as usize * 4) } else { (&frame.pixels, source_stride) };
+        let dsc_ready =
+            !settle && self.control.may_choose_dsc(pixel_count) && self.encoder_for(target);
+        let (pixels, stride): (&[u8], usize) = if resized {
+            (&self.scaled, target.0 as usize * 4)
+        } else {
+            (&frame.pixels, source_stride)
+        };
         if dsc_ready
             && self.control.wants_encode_time(pixel_count)
             && let Some(dsc) = self.dsc.as_ref()
         {
             // The rule needs an encode time no picture has given it yet.
             let trial = Instant::now();
-            let picture = dsc::Frame { data: pixels, stride, format: dsc::PixelFormat::Bgrx };
-            dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
+            let picture = dsc::Frame {
+                data: pixels,
+                stride,
+                format: dsc::PixelFormat::Bgrx,
+            };
+            dsc.encoder
+                .encode_parallel(&picture, &mut self.encoded, self.threads)?;
             let took = trial.elapsed();
             self.control.encode_measured(pixel_count, took);
             eprintln!(
@@ -2400,7 +2654,11 @@ impl PictureSender {
             );
         }
         let before = self.control.switches();
-        let mode = if settle { Mode::Raw } else { self.control.mode(pixel_count, dsc_ready) };
+        let mode = if settle {
+            Mode::Raw
+        } else {
+            self.control.mode(pixel_count, dsc_ready)
+        };
         let estimate = self.control.estimate(pixel_count);
         let prepare_started = Instant::now();
         let mut header = Header {
@@ -2428,15 +2686,33 @@ impl PictureSender {
                 header.payload = Payload::Dsc;
                 header.bpp_x16 = dsc.encoder.config().bits_per_pixel_x16;
                 if !dsc.pps_sent {
-                    let mut pps = Header { payload: Payload::Pps, ..header }.encode().to_vec();
+                    let mut pps = Header {
+                        payload: Payload::Pps,
+                        ..header
+                    }
+                    .encode()
+                    .to_vec();
                     pps.extend_from_slice(&dsc.encoder.pps().to_bytes());
-                    deliver(runtime, sink, &self.probe, &self.shutdown, Message::Binary(pps.into()), None)?;
+                    deliver(
+                        runtime,
+                        sink,
+                        &self.probe,
+                        &self.shutdown,
+                        Message::Binary(pps.into()),
+                        None,
+                    )?;
                     dsc.pps_sent = true;
                     self.window.pps += 1;
                 }
-                let picture = dsc::Frame { data: pixels, stride, format: dsc::PixelFormat::Bgrx };
-                dsc.encoder.encode_parallel(&picture, &mut self.encoded, self.threads)?;
-                self.message.resize(viewer_stream::HEADER_BYTES + self.encoded.len(), 0);
+                let picture = dsc::Frame {
+                    data: pixels,
+                    stride,
+                    format: dsc::PixelFormat::Bgrx,
+                };
+                dsc.encoder
+                    .encode_parallel(&picture, &mut self.encoded, self.threads)?;
+                self.message
+                    .resize(viewer_stream::HEADER_BYTES + self.encoded.len(), 0);
                 self.message[viewer_stream::HEADER_BYTES..].copy_from_slice(&self.encoded);
             }
             (Mode::Raw | Mode::Dsc { .. }, _) => {
@@ -2454,7 +2730,9 @@ impl PictureSender {
             }
         }
         let sent_mode = match header.payload {
-            Payload::Dsc => Mode::Dsc { bpp_x16: header.bpp_x16 },
+            Payload::Dsc => Mode::Dsc {
+                bpp_x16: header.bpp_x16,
+            },
             Payload::Raw | Payload::Pps => Mode::Raw,
         };
         let prepared = Instant::now();
@@ -2464,7 +2742,8 @@ impl PictureSender {
         let bytes = self.message.len();
         // The message goes to the socket without a copy and comes back for
         // the next picture once the socket has let go of it.
-        let message = async_tungstenite::tungstenite::Bytes::from(std::mem::take(&mut self.message));
+        let message =
+            async_tungstenite::tungstenite::Bytes::from(std::mem::take(&mut self.message));
         // The listener divides the interface among the streams that are on
         // the wire while this one delivers.
         let delivered = deliver(
@@ -2499,7 +2778,11 @@ impl PictureSender {
                 estimate.dsc.as_secs_f64() * 1e3,
                 bits_per_pixel(estimate.dsc_bpp_x16),
                 budget_text(estimate.link_bits_per_second),
-                if self.control.switches() > before { "; mode switched" } else { "" },
+                if self.control.switches() > before {
+                    "; mode switched"
+                } else {
+                    ""
+                },
             );
         }
         let time = sent - started;
@@ -2551,7 +2834,10 @@ impl PictureSender {
 }
 
 fn budget_text(budget: Option<u64>) -> String {
-    budget.map_or_else(|| "unlimited".to_owned(), |bits| format!("{:.0} Mb/s", megabits(bits)))
+    budget.map_or_else(
+        || "unlimited".to_owned(),
+        |bits| format!("{:.0} Mb/s", megabits(bits)),
+    )
 }
 
 fn send_notice(
@@ -2591,7 +2877,11 @@ fn stream_sender(
         None => None,
         Some("--link-mbps") => {
             let value = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
-            Some(value.parse::<u64>().map_err(|error| anyhow::anyhow!("--link-mbps '{value}': {error}"))?)
+            Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|error| anyhow::anyhow!("--link-mbps '{value}': {error}"))?,
+            )
         }
         Some(other) => anyhow::bail!("unknown argument '{other}'\n{USAGE}"),
     };
@@ -2602,7 +2892,10 @@ fn stream_sender(
     // it, and the kernel keeps this one inside what it is granted.
     let share = ShareLink::connect(budget.bits_per_second, &socket);
     let granted = share.grant();
-    let paced = match budget.bits_per_second.map(|_| viewer_stream::pace(&socket, granted.pace)) {
+    let paced = match budget
+        .bits_per_second
+        .map(|_| viewer_stream::pace(&socket, granted.pace))
+    {
         None => "not paced".to_owned(),
         Some(Ok(())) => format!("paced to {}", budget_text(Some(granted.pace))),
         Some(Err(error)) => format!("not paced ({error})"),
@@ -2620,8 +2913,13 @@ fn stream_sender(
     let shutdown = Shutdown::default();
     let mailbox: FrameMailbox = Arc::new((Mutex::new(None), Condvar::new()));
     let pool: BufferPool = Arc::default();
-    let link =
-        SessionLink::connect(session_path, virt, &shutdown, &mailbox, CaptureLayout::Bgrx(Arc::clone(&pool)))?;
+    let link = SessionLink::connect(
+        session_path,
+        virt,
+        &shutdown,
+        &mailbox,
+        CaptureLayout::Bgrx(Arc::clone(&pool)),
+    )?;
     let input = InputOut::Local {
         fake_input: link.fake_input.clone(),
         conn: link.conn.clone(),
@@ -2641,12 +2939,19 @@ fn stream_sender(
             None
         }
     };
-    let clipboard_text_bytes = clipboard.as_ref().map(|_| viewer_stream::CLIPBOARD_TEXT_BYTES as u64);
+    let clipboard_text_bytes = clipboard
+        .as_ref()
+        .map(|_| viewer_stream::CLIPBOARD_TEXT_BYTES as u64);
     let runtime = stream_runtime()?;
-    let socket = runtime.block_on(remote::adopt_frames(socket)).map_err(anyhow::Error::msg)?;
+    let socket = runtime
+        .block_on(remote::adopt_frames(socket))
+        .map_err(anyhow::Error::msg)?;
     let (mut sink, mut stream) = StreamExt::split(socket);
 
-    let viewer = Arc::new(ViewerLink { size: Mutex::new(None), presented: AtomicBool::new(false) });
+    let viewer = Arc::new(ViewerLink {
+        size: Mutex::new(None),
+        presented: AtomicBool::new(false),
+    });
     runtime.spawn({
         let (viewer, mailbox, shutdown) = (Arc::clone(&viewer), Arc::clone(&mailbox), shutdown.clone());
         let session_path = session_path.to_owned();
@@ -2735,12 +3040,22 @@ fn stream_sender(
             ));
         }
         if presented && heartbeat.elapsed() >= VIEWER_STATUS_HEARTBEAT {
-            write_status(session_path, "ready", "remote viewer is showing the session");
+            write_status(
+                session_path,
+                "ready",
+                "remote viewer is showing the session",
+            );
             heartbeat = Instant::now();
         }
         let title = session_title(session_path);
         if title != sent_title {
-            if let Err(error) = send_notice(&runtime, &mut sink, &Notice::Title { title: title.clone() }) {
+            if let Err(error) = send_notice(
+                &runtime,
+                &mut sink,
+                &Notice::Title {
+                    title: title.clone(),
+                },
+            ) {
                 eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
                 break Ok(());
             }
@@ -2755,11 +3070,23 @@ fn stream_sender(
         // The answer to the viewer's copy request goes out between two
         // pictures, like them once its last byte has left: it is that
         // viewer's own request, on that viewer's own socket.
-        let answer = clipboard_answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let answer = clipboard_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(answer) = answer {
             let sent = serde_json::to_string(&answer)
                 .map_err(anyhow::Error::from)
-                .and_then(|text| deliver(&runtime, &mut sink, &sender.probe, &shutdown, Message::text(text), None));
+                .and_then(|text| {
+                    deliver(
+                        &runtime,
+                        &mut sink,
+                        &sender.probe,
+                        &shutdown,
+                        Message::text(text),
+                        None,
+                    )
+                });
             if let Err(error) = sent {
                 eprintln!("kwin-viewer: stream: frame socket closed: {error:#}");
                 break Ok(());
@@ -2770,12 +3097,24 @@ fn stream_sender(
         // as exact pixels.
         let fresh = {
             let (slot, ready) = &*mailbox;
-            let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let resized = latest.is_some() && viewer.size().is_some_and(|size| Some(size) != sent_size);
-            let answering = clipboard_answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
-            let wait = sender.settle_due_in().map_or(STREAM_IDLE_POLL, |due| due.min(STREAM_IDLE_POLL));
-            if slot.is_none() && !resized && !answering && !wait.is_zero() && !shutdown.requested() {
-                slot = ready.wait_timeout(slot, wait).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            let mut slot = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resized =
+                latest.is_some() && viewer.size().is_some_and(|size| Some(size) != sent_size);
+            let answering = clipboard_answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            let wait = sender
+                .settle_due_in()
+                .map_or(STREAM_IDLE_POLL, |due| due.min(STREAM_IDLE_POLL));
+            if slot.is_none() && !resized && !answering && !wait.is_zero() && !shutdown.requested()
+            {
+                slot = ready
+                    .wait_timeout(slot, wait)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
             }
             slot.take()
         };
@@ -2785,7 +3124,8 @@ fn stream_sender(
             // PipeWire delivers on damage; a delivery with the same pixels is
             // still not a change and is never sent.
             let unchanged = latest.as_ref().is_some_and(|shown| {
-                (shown.width, shown.height) == (frame.width, frame.height) && shown.pixels == frame.pixels
+                (shown.width, shown.height) == (frame.width, frame.height)
+                    && shown.pixels == frame.pixels
             });
             let spare = if unchanged {
                 sender.window.unchanged += 1;
@@ -2804,7 +3144,9 @@ fn stream_sender(
         pending |= Some(size) != sent_size;
         // A still picture that went out as DSC goes out once more, exactly.
         let settle = !pending && sender.settle_due_in().is_some_and(|due| due.is_zero());
-        let Some(frame) = latest.as_ref().filter(|_| pending || settle) else { continue };
+        let Some(frame) = latest.as_ref().filter(|_| pending || settle) else {
+            continue;
+        };
         // A picture sent again is timed from now.
         let captured_micros = captured_micros.unwrap_or_else(unix_micros);
         if let Err(error) = sender.send(&runtime, &mut sink, frame, size, captured_micros, settle) {
@@ -2818,7 +3160,8 @@ fn stream_sender(
         sent_size = Some(size);
     };
     shutdown.request();
-    let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink.close()).await });
+    let _ =
+        runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink.close()).await });
     with_capture_failure(result, link.close())
 }
 
@@ -2880,11 +3223,15 @@ struct RecentCounters {
 
 impl StreamStats {
     fn counters(&self) -> std::sync::MutexGuard<'_, StreamCounters> {
-        self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn path(&self) -> std::sync::MutexGuard<'_, StreamPath> {
-        self.path.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // A picture message came off the socket.
@@ -2930,14 +3277,23 @@ impl StreamStats {
 
     // The window uploaded `frame`: it is the picture on screen now.
     fn shown(&self, frame: Frame) {
-        let before = self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(frame);
+        let before = self
+            .shown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(frame);
         if let Some(before) = before {
             recycle(&self.pool, before.pixels);
         }
     }
 
     fn surface(&self, format: &str) {
-        format.clone_into(&mut self.surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        format.clone_into(
+            &mut self
+                .surface
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     // The counters, with `recent` starting again.
@@ -2950,12 +3306,20 @@ impl StreamStats {
 
     // Writes the picture on screen to `path` as a PNG, once per picture.
     fn dump(&self, path: &std::path::Path, dumped: &mut Option<u64>) {
-        let shown = self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(frame) = shown.as_ref().filter(|frame| *dumped != Some(frame.serial)) else { return };
+        let shown = self
+            .shown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(frame) = shown.as_ref().filter(|frame| *dumped != Some(frame.serial)) else {
+            return;
+        };
         let temporary = path.with_extension("tmp");
         let written = (|| -> anyhow::Result<()> {
-            let mut encoder =
-                png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&temporary)?), frame.width, frame.height);
+            let mut encoder = png::Encoder::new(
+                std::io::BufWriter::new(std::fs::File::create(&temporary)?),
+                frame.width,
+                frame.height,
+            );
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(png::Compression::Fast);
@@ -3036,7 +3400,11 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
                 if counters.raw { "exact" } else { "dsc" },
             );
         }
-        let surface = stats.surface.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let surface = stats
+            .surface
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let body = serde_json::json!({
             "frames": counters.frames, "bytes": counters.bytes, "presented": counters.presented,
             "presented_unshown": counters.presented_unshown,
@@ -3063,7 +3431,15 @@ fn report_stream(stats: &StreamStats, status_dir: &std::path::Path, shutdown: &S
 
 // The newest picture message that is not decoded yet, with the decoder for
 // the parameter set that was current when it arrived.
-type Undecoded = Arc<(Mutex<Option<(async_tungstenite::tungstenite::Bytes, Option<Arc<dsc::Decoder>>)>>, Condvar)>;
+type Undecoded = Arc<(
+    Mutex<
+        Option<(
+            async_tungstenite::tungstenite::Bytes,
+            Option<Arc<dsc::Decoder>>,
+        )>,
+    >,
+    Condvar,
+)>;
 
 // One picture message from the sender, decoded for the window.
 fn receive_picture(
@@ -3094,10 +3470,19 @@ fn receive_picture(
         Payload::Dsc => {
             let decoder = decoder
                 .filter(|decoder| {
-                    (decoder.pps().pic_width, decoder.pps().pic_height) == (header.width, header.height)
+                    (decoder.pps().pic_width, decoder.pps().pic_height)
+                        == (header.width, header.height)
                 })
-                .ok_or_else(|| anyhow::anyhow!("DSC {width}x{height} frame without its parameter set"))?;
-            decoder.decode_parallel(payload, &mut rgba, width * 4, dsc::PixelFormat::Rgbx, workers.threads())?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DSC {width}x{height} frame without its parameter set")
+                })?;
+            decoder.decode_parallel(
+                payload,
+                &mut rgba,
+                width * 4,
+                dsc::PixelFormat::Rgbx,
+                workers.threads(),
+            )?;
         }
     }
     stats.received(&header, message.len(), arrived.elapsed());
@@ -3125,7 +3510,11 @@ fn run_stream(mut argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     write_status(&status_dir, "starting", "connecting to the session's host");
     let result = stream_viewer(&authority, &status_dir);
     match &result {
-        Ok(()) => write_status(&status_dir, "closed", "viewer exited: window closed or stream ended"),
+        Ok(()) => write_status(
+            &status_dir,
+            "closed",
+            "viewer exited: window closed or stream ended",
+        ),
         Err(error) => write_status(&status_dir, "failed", &format!("{error:#}")),
     }
     result
@@ -3180,7 +3569,10 @@ impl StreamPath {
     // `enp10s0 (192.168.1.211, 1000 Mb/s) from sentry:47913 (enp0s25, 1000
     // Mb/s); share 450 Mb/s of 900 Mb/s among 2 streams`.
     fn text(&self) -> String {
-        let speed = self.mbps.map_or_else(|| "no speed reported".to_owned(), |mbps| format!("{mbps} Mb/s"));
+        let speed = self.mbps.map_or_else(
+            || "no speed reported".to_owned(),
+            |mbps| format!("{mbps} Mb/s"),
+        );
         let share = match (self.share, self.budget) {
             (Some(share), Some(budget)) => format!(
                 "share {} of {} among {} streams",
@@ -3222,7 +3614,10 @@ impl StreamPaths {
         use std::net::ToSocketAddrs;
         Self {
             authority: authority.to_owned(),
-            peer: authority.to_socket_addrs().ok().and_then(|mut addresses| addresses.next()),
+            peer: authority
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addresses| addresses.next()),
             listed: std::env::var_os(links::PATHS_ENV).map(PathBuf::from),
         }
     }
@@ -3236,14 +3631,19 @@ impl StreamPaths {
             let paths = self
                 .peer
                 .filter(|peer| !peer.ip().to_canonical().is_loopback())
-                .map_or_else(Vec::new, |peer| links::paths_to(&links::interfaces(), peer.ip(), routed));
+                .map_or_else(Vec::new, |peer| {
+                    links::paths_to(&links::interfaces(), peer.ip(), routed)
+                });
             return (paths, links::Registry::new(None));
         };
         let table = std::fs::read_to_string(file)
             .map_err(anyhow::Error::from)
             .and_then(|text| Ok(serde_json::from_str::<links::PathTable>(&text)?))
             .unwrap_or_else(|error| {
-                eprintln!("kwin-viewer: stream: path table {}: {error:#}", file.display());
+                eprintln!(
+                    "kwin-viewer: stream: path table {}: {error:#}",
+                    file.display()
+                );
                 links::PathTable::default()
             });
         let mut paths = table.paths;
@@ -3258,13 +3658,20 @@ impl StreamPaths {
     // usable path while another one is.
     fn dead(&self, interface: &str) -> Option<String> {
         let (paths, _) = self.table();
-        (!paths.is_empty() && !paths.iter().any(|path| path.interface == interface))
-            .then(|| format!("{interface} is no longer up with an address that reaches {}", self.authority))
+        (!paths.is_empty() && !paths.iter().any(|path| path.interface == interface)).then(|| {
+            format!(
+                "{interface} is no longer up with an address that reaches {}",
+                self.authority
+            )
+        })
     }
 
     // Whether a stream could move off `interface`.
     fn has_other(&self, interface: &str) -> bool {
-        self.table().0.iter().any(|path| path.interface != interface)
+        self.table()
+            .0
+            .iter()
+            .any(|path| path.interface != interface)
     }
 }
 
@@ -3315,8 +3722,16 @@ fn open_stream(
     let source = chosen
         .as_ref()
         .filter(|path| !path.routed)
-        .map(|path| remote::Source { address: path.source, interface: path.interface.clone() });
-    let connected = runtime.block_on(remote::connect_frames(authority, secret, ticket, source.as_ref()));
+        .map(|path| remote::Source {
+            address: path.source,
+            interface: path.interface.clone(),
+        });
+    let connected = runtime.block_on(remote::connect_frames(
+        authority,
+        secret,
+        ticket,
+        source.as_ref(),
+    ));
     let (socket, bound) = match connected {
         Ok(connected) => connected,
         // A first socket that does not connect from the chosen path uses the
@@ -3352,25 +3767,49 @@ fn open_stream(
         }
     });
     let (sink, mut stream) = StreamExt::split(socket);
-    let hello = runtime.block_on(async { tokio::time::timeout(STREAM_HELLO_TIMEOUT, stream.next()).await });
+    let hello =
+        runtime.block_on(async { tokio::time::timeout(STREAM_HELLO_TIMEOUT, stream.next()).await });
     let (virt, title, clipboard_text_bytes, budget, sender_link) = match hello {
         Ok(Some(Ok(Message::Text(text)))) => match Notice::decode(text.as_str()) {
-            Ok(Notice::Hello { width, height, title, budget_bits_per_second, link, clipboard_text_bytes }) => {
-                ((width, height), title, clipboard_text_bytes, budget_bits_per_second, link)
-            }
-            Ok(Notice::Title { .. } | Notice::Clipboard { .. } | Notice::Share { .. } | Notice::Unknown) => {
+            Ok(Notice::Hello {
+                width,
+                height,
+                title,
+                budget_bits_per_second,
+                link,
+                clipboard_text_bytes,
+            }) => (
+                (width, height),
+                title,
+                clipboard_text_bytes,
+                budget_bits_per_second,
+                link,
+            ),
+            Ok(
+                Notice::Title { .. }
+                | Notice::Clipboard { .. }
+                | Notice::Share { .. }
+                | Notice::Unknown,
+            ) => {
                 anyhow::bail!("{authority} did not begin the frame socket with hello")
             }
-            Err(reason) => anyhow::bail!("{authority} began the frame socket with an unreadable notice: {reason}"),
+            Err(reason) => anyhow::bail!(
+                "{authority} began the frame socket with an unreadable notice: {reason}"
+            ),
         },
         Ok(Some(Ok(_))) => anyhow::bail!("{authority} did not begin the frame socket with hello"),
         Ok(Some(Err(error))) => anyhow::bail!("frame socket to {authority}: {error}"),
         Ok(None) => anyhow::bail!(
             "{authority} closed the frame socket before sending anything: the session's capture did not start"
         ),
-        Err(_) => anyhow::bail!("{authority} sent nothing on the frame socket within {STREAM_HELLO_TIMEOUT:?}"),
+        Err(_) => anyhow::bail!(
+            "{authority} sent nothing on the frame socket within {STREAM_HELLO_TIMEOUT:?}"
+        ),
     };
-    anyhow::ensure!(virt.0 > 0 && virt.1 > 0, "session dimensions must be positive");
+    anyhow::ensure!(
+        virt.0 > 0 && virt.1 > 0,
+        "session dimensions must be positive"
+    );
     let bound_text = match bound {
         None => "route",
         Some(remote::Bound::Device) => "device",
@@ -3383,8 +3822,10 @@ fn open_stream(
         path.describe(),
         match bound {
             None => "the routing table's choice, nothing bound".to_owned(),
-            Some(remote::Bound::Device) =>
-                format!("socket bound to {} and to the interface (SO_BINDTODEVICE)", path.source),
+            Some(remote::Bound::Device) => format!(
+                "socket bound to {} and to the interface (SO_BINDTODEVICE)",
+                path.source
+            ),
             Some(remote::Bound::Address) => format!(
                 "socket bound to {} only: SO_BINDTODEVICE {} was refused, so what this side sends leaves on the routing table's interface",
                 path.source, path.interface
@@ -3401,7 +3842,9 @@ fn open_stream(
     Ok(OpenedStream {
         sink,
         stream,
-        cap: bound.map(|_| path.usable_bits_per_second()).filter(|bits| *bits > 0),
+        cap: bound
+            .map(|_| path.usable_bits_per_second())
+            .filter(|bits| *bits > 0),
         path: StreamPath {
             interface: path.interface,
             source: local.to_string(),
@@ -3427,14 +3870,18 @@ fn open_stream(
 // socket that presents the ticket.
 fn request_ticket(status_dir: &std::path::Path) -> anyhow::Result<String> {
     use std::io::{BufRead, Write};
-    let mut socket = std::os::unix::net::UnixStream::connect(status_dir.join(links::RECONNECT_SOCKET))?;
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(status_dir.join(links::RECONNECT_SOCKET))?;
     socket.set_read_timeout(Some(STREAM_TICKET_WAIT))?;
     socket.set_write_timeout(Some(STREAM_TICKET_WAIT))?;
     writeln!(socket, "{}", links::RECONNECT_REQUEST)?;
     let mut line = String::new();
     std::io::BufReader::new(&socket).read_line(&mut line)?;
     let ticket = line.trim();
-    anyhow::ensure!(remote::valid_ticket(ticket), "the server gave no ticket: {ticket}");
+    anyhow::ensure!(
+        remote::valid_ticket(ticket),
+        "the server gave no ticket: {ticket}"
+    );
     Ok(ticket.to_owned())
 }
 
@@ -3463,13 +3910,24 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     use futures::{SinkExt, StreamExt};
     ensure_host_display()?;
     let ticket = std::env::var(remote::TICKET_ENV).map_err(|_| {
-        anyhow::anyhow!("{} is not set; kwin-mcp viewer_open starts this viewer", remote::TICKET_ENV)
+        anyhow::anyhow!(
+            "{} is not set; kwin-mcp viewer_open starts this viewer",
+            remote::TICKET_ENV
+        )
     })?;
     let secret = remote::read_secret().map_err(anyhow::Error::msg)?;
     let runtime = stream_runtime()?;
     let paths = StreamPaths::new(authority);
-    let OpenedStream { sink, mut stream, path, registry, virt, title: first_title, clipboard_text_bytes, cap } =
-        open_stream(runtime.handle(), &paths, &secret, &ticket, None)?;
+    let OpenedStream {
+        sink,
+        mut stream,
+        path,
+        registry,
+        virt,
+        title: first_title,
+        clipboard_text_bytes,
+        cap,
+    } = open_stream(runtime.handle(), &paths, &secret, &ticket, None)?;
     let sender_clipboard = clipboard_text_bytes;
 
     let title = Arc::new(Mutex::new(first_title));
@@ -3568,7 +4026,9 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     // no access to its clipboard.
     let clipboard = match sender_clipboard {
         None => {
-            eprintln!("kwin-viewer: stream: {authority} does not bridge the clipboard; copy and paste shortcuts stay in the session");
+            eprintln!(
+                "kwin-viewer: stream: {authority} does not bridge the clipboard; copy and paste shortcuts stay in the session"
+            );
             None
         }
         Some(limit) => match Connection::connect_to_env()
@@ -3583,53 +4043,80 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
                     "kwin-viewer: stream: clipboard bridge: copy and paste shortcuts use this machine's clipboard; UTF-8 text of at most {limit} bytes, unencrypted on the frame socket"
                 );
                 Some(StreamClipboard {
-                    answer: Arc::new(CopyAnswer { host: Arc::new(host), pending: Mutex::new(None) }),
+                    answer: Arc::new(CopyAnswer {
+                        host: Arc::new(host),
+                        pending: Mutex::new(None),
+                    }),
                     out: ops.clone(),
                     limit,
                     copies: 0,
                 })
             }
             Err(error) => {
-                eprintln!("kwin-viewer: stream: no clipboard bridge: this machine's clipboard: {error:#}");
+                eprintln!(
+                    "kwin-viewer: stream: no clipboard bridge: this machine's clipboard: {error:#}"
+                );
                 None
             }
         },
     };
-    let copy_answer = clipboard.as_ref().map(|clipboard| Arc::clone(&clipboard.answer));
+    let copy_answer = clipboard
+        .as_ref()
+        .map(|clipboard| Arc::clone(&clipboard.answer));
     // One thread takes messages off the socket as they arrive and keeps only
     // the newest picture; another decodes it. A viewer that decodes slower
     // than pictures arrive therefore skips to the newest instead of falling
     // behind, and the sender's send time measures the link, not this machine.
     let undecoded: Undecoded = Arc::new((Mutex::new(None), Condvar::new()));
     {
-        let (undecoded, mailbox, stats, shutdown) =
-            (Arc::clone(&undecoded), Arc::clone(&mailbox), Arc::clone(&stats), shutdown.clone());
-        std::thread::Builder::new().name("stream-decode".to_owned()).spawn(move || {
-            let mut workers = viewer_stream::Workers::all_cores();
-            let (newest, arrived) = &*undecoded;
-            loop {
-                let picture = {
-                    let mut newest = newest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    while newest.is_none() && !shutdown.requested() {
-                        newest = arrived
-                            .wait_timeout(newest, DISPATCH_POLL_INTERVAL)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .0;
+        let (undecoded, mailbox, stats, shutdown) = (
+            Arc::clone(&undecoded),
+            Arc::clone(&mailbox),
+            Arc::clone(&stats),
+            shutdown.clone(),
+        );
+        std::thread::Builder::new()
+            .name("stream-decode".to_owned())
+            .spawn(move || {
+                let mut workers = viewer_stream::Workers::all_cores();
+                let (newest, arrived) = &*undecoded;
+                loop {
+                    let picture = {
+                        let mut newest = newest
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while newest.is_none() && !shutdown.requested() {
+                            newest = arrived
+                                .wait_timeout(newest, DISPATCH_POLL_INTERVAL)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .0;
+                        }
+                        newest.take()
+                    };
+                    let Some((message, decoder)) = picture else {
+                        break;
+                    };
+                    if let Err(error) = receive_picture(
+                        &message,
+                        decoder.as_deref(),
+                        &mailbox,
+                        &stats,
+                        &mut workers,
+                    ) {
+                        eprintln!("kwin-viewer: stream: {error:#}");
+                        shutdown.request();
+                        break;
                     }
-                    newest.take()
-                };
-                let Some((message, decoder)) = picture else { break };
-                if let Err(error) = receive_picture(&message, decoder.as_deref(), &mailbox, &stats, &mut workers) {
-                    eprintln!("kwin-viewer: stream: {error:#}");
-                    shutdown.request();
-                    break;
                 }
-            }
-        })?;
+            })?;
     }
     {
-        let (title, stats, shutdown, registry) =
-            (Arc::clone(&title), Arc::clone(&stats), shutdown.clone(), Arc::clone(&registry));
+        let (title, stats, shutdown, registry) = (
+            Arc::clone(&title),
+            Arc::clone(&stats),
+            shutdown.clone(),
+            Arc::clone(&registry),
+        );
         let (handle, status_dir) = (runtime.handle().clone(), status_dir.to_owned());
         std::thread::Builder::new().name("stream-frames".to_owned()).spawn(move || {
             let mut decoder: Option<Arc<dsc::Decoder>> = None;
@@ -3757,7 +4244,8 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
         })?;
     }
     {
-        let (stats, shutdown, status_dir) = (Arc::clone(&stats), shutdown.clone(), status_dir.to_owned());
+        let (stats, shutdown, status_dir) =
+            (Arc::clone(&stats), shutdown.clone(), status_dir.to_owned());
         std::thread::Builder::new()
             .name("stream-report".to_owned())
             .spawn(move || report_stream(&stats, &status_dir, &shutdown))?;
@@ -3786,9 +4274,14 @@ fn stream_viewer(authority: &str, status_dir: &std::path::Path) -> anyhow::Resul
     // session's host. The frame thread may still be parked on the socket; it
     // ends with the process.
     drop(input_state);
-    let _ = runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink_closed).await });
+    let _ =
+        runtime.block_on(async { tokio::time::timeout(STREAM_CLOSE_TIMEOUT, sink_closed).await });
     // The next viewer no longer counts this stream on its path.
-    if let Some(registry) = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+    if let Some(registry) = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
         registry.release();
     }
     result
@@ -3815,7 +4308,7 @@ impl Op {
             Op::Button(code, state) => (2, u64::from(code), u64::from(state)),
             Op::Axis(axis, value) => (3, u64::from(axis), value.to_bits()),
             Op::Key(code, state) => (4, u64::from(code), u64::from(state)),
-            Op::Presented => (5,0,0),
+            Op::Presented => (5, 0, 0),
             Op::Size(width, height) => (6, u64::from(width), u64::from(height)),
         };
         let mut record = [0u8; 17];
@@ -3842,11 +4335,17 @@ impl Op {
         let narrow = |value: u64| u32::try_from(value).ok();
         Ok(match record[0] {
             1 => Some(Op::Motion(f64::from_bits(a), f64::from_bits(b))),
-            2 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Button(code, state)),
+            2 => narrow(a)
+                .zip(narrow(b))
+                .map(|(code, state)| Op::Button(code, state)),
             3 => narrow(a).map(|axis| Op::Axis(axis, f64::from_bits(b))),
-            4 => narrow(a).zip(narrow(b)).map(|(code, state)| Op::Key(code, state)),
-            5 if a==0 && b==0 => Some(Op::Presented),
-            6 => narrow(a).zip(narrow(b)).map(|(width, height)| Op::Size(width, height)),
+            4 => narrow(a)
+                .zip(narrow(b))
+                .map(|(code, state)| Op::Key(code, state)),
+            5 if a == 0 && b == 0 => Some(Op::Presented),
+            6 => narrow(a)
+                .zip(narrow(b))
+                .map(|(width, height)| Op::Size(width, height)),
             _ => None,
         })
     }
@@ -3906,7 +4405,9 @@ impl OpSink {
 
     fn queue(&self, outgoing: Outgoing) {
         use tokio::sync::mpsc::error::TrySendError;
-        let OpSink::Socket(queue, shutdown) = self else { return };
+        let OpSink::Socket(queue, shutdown) = self else {
+            return;
+        };
         match queue.try_send(outgoing) {
             Ok(()) => {}
             Err(TrySendError::Closed(_)) => eprintln!("kwin-viewer: frame socket closed"),
@@ -3949,10 +4450,13 @@ impl InputOut {
                     let kind = op.kind();
                     if let Err(error) = activity
                         .set_len(kind.len() as u64)
-                        .and_then(|()| std::os::unix::fs::FileExt::write_all_at(activity, kind.as_bytes(), 0))
+                        .and_then(|()| {
+                            std::os::unix::fs::FileExt::write_all_at(activity, kind.as_bytes(), 0)
+                        })
                         .and_then(|()| {
                             activity.set_times(
-                                std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+                                std::fs::FileTimes::new()
+                                    .set_modified(std::time::SystemTime::now()),
                             )
                         })
                     {
@@ -4002,8 +4506,15 @@ struct InputState {
     clipboard: Option<ViewerClipboard>,
 }
 
-fn map_window_to_virtual(pos: (f64, f64), win_w: u32, win_h: u32, virt: (u32, u32)) -> Option<(f64, f64)> {
-    if win_w == 0 || win_h == 0 { return None }
+fn map_window_to_virtual(
+    pos: (f64, f64),
+    win_w: u32,
+    win_h: u32,
+    virt: (u32, u32),
+) -> Option<(f64, f64)> {
+    if win_w == 0 || win_h == 0 {
+        return None;
+    }
     Some((
         pos.0 * f64::from(virt.0) / f64::from(win_w),
         pos.1 * f64::from(virt.1) / f64::from(win_h),
@@ -4177,18 +4688,58 @@ fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
     // Linux input-event-codes.h values. Intentionally a flat match — expands
     // only for keys we actually need to forward.
     Some(match kc {
-        K::KeyA => 30, K::KeyB => 48, K::KeyC => 46, K::KeyD => 32, K::KeyE => 18,
-        K::KeyF => 33, K::KeyG => 34, K::KeyH => 35, K::KeyI => 23, K::KeyJ => 36,
-        K::KeyK => 37, K::KeyL => 38, K::KeyM => 50, K::KeyN => 49, K::KeyO => 24,
-        K::KeyP => 25, K::KeyQ => 16, K::KeyR => 19, K::KeyS => 31, K::KeyT => 20,
-        K::KeyU => 22, K::KeyV => 47, K::KeyW => 17, K::KeyX => 45, K::KeyY => 21,
+        K::KeyA => 30,
+        K::KeyB => 48,
+        K::KeyC => 46,
+        K::KeyD => 32,
+        K::KeyE => 18,
+        K::KeyF => 33,
+        K::KeyG => 34,
+        K::KeyH => 35,
+        K::KeyI => 23,
+        K::KeyJ => 36,
+        K::KeyK => 37,
+        K::KeyL => 38,
+        K::KeyM => 50,
+        K::KeyN => 49,
+        K::KeyO => 24,
+        K::KeyP => 25,
+        K::KeyQ => 16,
+        K::KeyR => 19,
+        K::KeyS => 31,
+        K::KeyT => 20,
+        K::KeyU => 22,
+        K::KeyV => 47,
+        K::KeyW => 17,
+        K::KeyX => 45,
+        K::KeyY => 21,
         K::KeyZ => 44,
-        K::Digit0 => 11, K::Digit1 => 2, K::Digit2 => 3, K::Digit3 => 4, K::Digit4 => 5,
-        K::Digit5 => 6, K::Digit6 => 7, K::Digit7 => 8, K::Digit8 => 9, K::Digit9 => 10,
-        K::Enter => 28, K::Escape => 1, K::Backspace => 14, K::Tab => 15, K::Space => 57,
-        K::Minus => 12, K::Equal => 13,
-        K::BracketLeft => 26, K::BracketRight => 27, K::Backslash => 43, K::Semicolon => 39,
-        K::Quote => 40, K::Backquote => 41, K::Comma => 51, K::Period => 52, K::Slash => 53,
+        K::Digit0 => 11,
+        K::Digit1 => 2,
+        K::Digit2 => 3,
+        K::Digit3 => 4,
+        K::Digit4 => 5,
+        K::Digit5 => 6,
+        K::Digit6 => 7,
+        K::Digit7 => 8,
+        K::Digit8 => 9,
+        K::Digit9 => 10,
+        K::Enter => 28,
+        K::Escape => 1,
+        K::Backspace => 14,
+        K::Tab => 15,
+        K::Space => 57,
+        K::Minus => 12,
+        K::Equal => 13,
+        K::BracketLeft => 26,
+        K::BracketRight => 27,
+        K::Backslash => 43,
+        K::Semicolon => 39,
+        K::Quote => 40,
+        K::Backquote => 41,
+        K::Comma => 51,
+        K::Period => 52,
+        K::Slash => 53,
         K::CapsLock => 58,
         K::NumLock => evdev_code(evdev::KeyCode::KEY_NUMLOCK),
         K::Numpad0 => evdev_code(evdev::KeyCode::KEY_KP0),
@@ -4209,15 +4760,36 @@ fn key_code_to_evdev(kc: winit::keyboard::KeyCode) -> Option<u32> {
         K::NumpadEqual => evdev_code(evdev::KeyCode::KEY_KPEQUAL),
         K::NumpadMultiply => evdev_code(evdev::KeyCode::KEY_KPASTERISK),
         K::NumpadSubtract => evdev_code(evdev::KeyCode::KEY_KPMINUS),
-        K::F1 => 59, K::F2 => 60, K::F3 => 61, K::F4 => 62, K::F5 => 63, K::F6 => 64,
-        K::F7 => 65, K::F8 => 66, K::F9 => 67, K::F10 => 68, K::F11 => 87, K::F12 => 88,
-        K::ArrowUp => 103, K::ArrowDown => 108, K::ArrowLeft => 105, K::ArrowRight => 106,
-        K::Home => 102, K::End => 107, K::PageUp => 104, K::PageDown => 109,
-        K::Delete => 111, K::Insert => 110,
-        K::ShiftLeft => 42, K::ShiftRight => 54,
-        K::ControlLeft => 29, K::ControlRight => 97,
-        K::AltLeft => 56, K::AltRight => 100,
-        K::SuperLeft => 125, K::SuperRight => 126,
+        K::F1 => 59,
+        K::F2 => 60,
+        K::F3 => 61,
+        K::F4 => 62,
+        K::F5 => 63,
+        K::F6 => 64,
+        K::F7 => 65,
+        K::F8 => 66,
+        K::F9 => 67,
+        K::F10 => 68,
+        K::F11 => 87,
+        K::F12 => 88,
+        K::ArrowUp => 103,
+        K::ArrowDown => 108,
+        K::ArrowLeft => 105,
+        K::ArrowRight => 106,
+        K::Home => 102,
+        K::End => 107,
+        K::PageUp => 104,
+        K::PageDown => 109,
+        K::Delete => 111,
+        K::Insert => 110,
+        K::ShiftLeft => 42,
+        K::ShiftRight => 54,
+        K::ControlLeft => 29,
+        K::ControlRight => 97,
+        K::AltLeft => 56,
+        K::AltRight => 100,
+        K::SuperLeft => 125,
+        K::SuperRight => 126,
         _ => return None,
     })
 }
@@ -4258,11 +4830,18 @@ fn run_pipewire(
     };
     let core = context.connect_rc(Some(remote_props))?;
 
-    let state_path=socket_path.parent().unwrap_or(std::path::Path::new(".")).join("viewer-pipewire.json");
+    let state_path = socket_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("viewer-pipewire.json");
     // The node the compositor named must be one of this daemon's. The list
     // of its objects is complete once the daemon answers the sync that
     // follows the registry request.
-    write_pipewire_state(&state_path, node_id, "listing the nodes of the session's PipeWire daemon");
+    write_pipewire_state(
+        &state_path,
+        node_id,
+        "listing the nodes of the session's PipeWire daemon",
+    );
     let node_listed = std::rc::Rc::new(Cell::new(false));
     {
         let registry = core.get_registry()?;
@@ -4276,9 +4855,9 @@ fn run_pipewire(
                     // what the compositor named.
                     if global.id == node_id
                         && global.type_ == pw::types::ObjectType::Node
-                        && global
-                            .props
-                            .is_some_and(|props| props.get("media.class") == Some(SCREENCAST_MEDIA_CLASS))
+                        && global.props.is_some_and(|props| {
+                            props.get("media.class") == Some(SCREENCAST_MEDIA_CLASS)
+                        })
                     {
                         node_listed.set(true);
                     }
@@ -4417,7 +4996,8 @@ fn run_pipewire(
         .register()?;
 
     let format_pod = build_format_pod(virt)?;
-    let mut params = [Pod::from_bytes(&format_pod).ok_or_else(|| anyhow::anyhow!("format pod invalid"))?];
+    let mut params =
+        [Pod::from_bytes(&format_pod).ok_or_else(|| anyhow::anyhow!("format pod invalid"))?];
 
     stream.connect(
         spa::utils::Direction::Input,
@@ -4441,11 +5021,21 @@ fn build_format_pod(virt: (u32, u32)) -> anyhow::Result<Vec<u8>> {
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
-        spa::pod::property!(spa::param::format::FormatProperties::MediaType, Id, spa::param::format::MediaType::Video),
-        spa::pod::property!(spa::param::format::FormatProperties::MediaSubtype, Id, spa::param::format::MediaSubtype::Raw),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaType,
+            Id,
+            spa::param::format::MediaType::Video
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            spa::param::format::MediaSubtype::Raw
+        ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoFormat,
-            Choice, Enum, Id,
+            Choice,
+            Enum,
+            Id,
             spa::param::video::VideoFormat::BGRx,
             spa::param::video::VideoFormat::BGRx,
             spa::param::video::VideoFormat::BGRA,
@@ -4454,14 +5044,27 @@ fn build_format_pod(virt: (u32, u32)) -> anyhow::Result<Vec<u8>> {
         ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoSize,
-            Choice, Range, Rectangle,
-            spa::utils::Rectangle { width: virt.0, height: virt.1 },
-            spa::utils::Rectangle { width: 1, height: 1 },
-            spa::utils::Rectangle { width: 8192, height: 8192 }
+            Choice,
+            Range,
+            Rectangle,
+            spa::utils::Rectangle {
+                width: virt.0,
+                height: virt.1
+            },
+            spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
         ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoFramerate,
-            Choice, Range, Fraction,
+            Choice,
+            Range,
+            Fraction,
             spa::utils::Fraction { num: 60, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
             spa::utils::Fraction { num: 240, denom: 1 }
@@ -4493,7 +5096,9 @@ fn copy_as_bgrx(
     out.clear();
     out.reserve_exact(row * h);
     for y in 0..h {
-        let Some(line) = src.get(y * stride..y * stride + row) else { break };
+        let Some(line) = src.get(y * stride..y * stride + row) else {
+            break;
+        };
         out.extend_from_slice(line);
     }
     out.resize(row * h, 0);
@@ -4517,7 +5122,9 @@ fn convert_to_rgba(
     for y in 0..h {
         let row_off = y * stride;
         let dst_off = y * w * 4;
-        if row_off + w * 4 > src.len() || dst_off + w * 4 > dst.len() { break }
+        if row_off + w * 4 > src.len() || dst_off + w * 4 > dst.len() {
+            break;
+        }
         let row = &src[row_off..row_off + w * 4];
         let out = &mut dst[dst_off..dst_off + w * 4];
         match fmt {
@@ -4528,14 +5135,21 @@ fn convert_to_rgba(
                     out[i] = row[i + 2];
                     out[i + 1] = row[i + 1];
                     out[i + 2] = row[i];
-                    out[i + 3] = if matches!(fmt, F::BGRA) { row[i + 3] } else { 255 };
+                    out[i + 3] = if matches!(fmt, F::BGRA) {
+                        row[i + 3]
+                    } else {
+                        255
+                    };
                 }
             }
             _ => {
                 // Unsupported — paint magenta so the bug is visible.
                 for x in 0..w {
                     let i = x * 4;
-                    out[i] = 255; out[i + 1] = 0; out[i + 2] = 255; out[i + 3] = 255;
+                    out[i] = 255;
+                    out[i + 1] = 0;
+                    out[i + 2] = 255;
+                    out[i + 3] = 255;
                 }
             }
         }
@@ -4550,7 +5164,8 @@ mod display_discovery_tests {
 
     #[test]
     fn the_live_wayland_socket_wins_over_stale_and_unrelated_names() {
-        let runtime = std::env::temp_dir().join(format!("kwin-viewer-display-{}", std::process::id()));
+        let runtime =
+            std::env::temp_dir().join(format!("kwin-viewer-display-{}", std::process::id()));
         std::fs::create_dir_all(&runtime).expect("create runtime directory");
         // A bound-then-dropped listener leaves a socket file nothing answers on.
         drop(UnixListener::bind(runtime.join("wayland-0")).expect("stale socket"));
@@ -4564,7 +5179,8 @@ mod display_discovery_tests {
 
     #[test]
     fn no_display_socket_is_none() {
-        let runtime = std::env::temp_dir().join(format!("kwin-viewer-nodisplay-{}", std::process::id()));
+        let runtime =
+            std::env::temp_dir().join(format!("kwin-viewer-nodisplay-{}", std::process::id()));
         std::fs::create_dir_all(&runtime).expect("create runtime directory");
         assert_eq!(find_wayland_socket(&runtime), None);
         assert_eq!(find_wayland_socket(&runtime.join("missing")), None);
@@ -4582,7 +5198,14 @@ mod wire_tests {
 
     #[test]
     fn input_records_round_trip() -> std::io::Result<()> {
-        let ops = [Op::Motion(12.5, 700.25), Op::Button(BTN_LEFT, 1), Op::Axis(AXIS_VERTICAL, -30.0), Op::Key(30, 0), Op::Presented, Op::Size(1280, 720)];
+        let ops = [
+            Op::Motion(12.5, 700.25),
+            Op::Button(BTN_LEFT, 1),
+            Op::Axis(AXIS_VERTICAL, -30.0),
+            Op::Key(30, 0),
+            Op::Presented,
+            Op::Size(1280, 720),
+        ];
         let bytes: Vec<u8> = ops.iter().flat_map(|op| op.encode()).collect();
         let mut input = Cursor::new(bytes);
         for op in ops {
@@ -4616,7 +5239,16 @@ mod wire_tests {
     }
 
     fn picture(payload: Payload, settle: bool) -> Header {
-        Header { payload, settle, width: 4, height: 2, bpp_x16: 96, sequence: 0, captured_micros: 0, sender_micros: 0 }
+        Header {
+            payload,
+            settle,
+            width: 4,
+            height: 2,
+            bpp_x16: 96,
+            sequence: 0,
+            captured_micros: 0,
+            sender_micros: 0,
+        }
     }
 
     #[test]
@@ -4641,9 +5273,15 @@ mod wire_tests {
         stats.presented(unix_micros(), true);
         let counters = stats.take();
         assert_eq!((counters.presented, counters.presented_unshown), (3, 2));
-        assert_eq!((counters.recent.presented, counters.recent.presented_unshown), (3, 2));
+        assert_eq!(
+            (counters.recent.presented, counters.recent.presented_unshown),
+            (3, 2)
+        );
         let next = stats.take();
-        assert_eq!((next.presented_unshown, next.recent.presented_unshown), (2, 0));
+        assert_eq!(
+            (next.presented_unshown, next.recent.presented_unshown),
+            (2, 0)
+        );
     }
 
     #[test]
@@ -4656,7 +5294,14 @@ mod wire_tests {
         stats.arrived(&picture(Payload::Dsc, false), 100);
         {
             let counters = stats.counters();
-            assert_eq!((counters.mode_switches, counters.settles, counters.stream_raw), (0, 1, Some(false)));
+            assert_eq!(
+                (
+                    counters.mode_switches,
+                    counters.settles,
+                    counters.stream_raw
+                ),
+                (0, 1, Some(false))
+            );
             assert_eq!((counters.bytes, counters.recent.bytes), (500, 500));
         }
         // The stream turns raw and back to DSC: two switches.
@@ -4666,7 +5311,14 @@ mod wire_tests {
         stats.arrived(&picture(Payload::Dsc, false), 100);
         stats.arrived(&picture(Payload::Raw, true), 300);
         let counters = stats.counters();
-        assert_eq!((counters.mode_switches, counters.settles, counters.stream_raw), (2, 2, Some(false)));
+        assert_eq!(
+            (
+                counters.mode_switches,
+                counters.settles,
+                counters.stream_raw
+            ),
+            (2, 2, Some(false))
+        );
     }
 
     #[test]
@@ -4675,15 +5327,35 @@ mod wire_tests {
         let pool: BufferPool = Arc::default();
         let (width, height, stride) = (3usize, 2usize, 3 * 4 + 4);
         let source: Vec<u8> = (0..stride * height).map(|index| index as u8).collect();
-        let rows: Vec<u8> = source.chunks_exact(stride).flat_map(|row| row[..width * 4].to_vec()).collect();
-        let first = copy_as_bgrx(&source, width, height, stride, VideoFormat::BGRx, recycled(&pool));
+        let rows: Vec<u8> = source
+            .chunks_exact(stride)
+            .flat_map(|row| row[..width * 4].to_vec())
+            .collect();
+        let first = copy_as_bgrx(
+            &source,
+            width,
+            height,
+            stride,
+            VideoFormat::BGRx,
+            recycled(&pool),
+        );
         assert_eq!(first, rows);
         let address = first.as_ptr();
         recycle(&pool, first);
         // The next capture of the same size fills the same allocation.
-        let second = copy_as_bgrx(&source, width, height, stride, VideoFormat::RGBx, recycled(&pool));
+        let second = copy_as_bgrx(
+            &source,
+            width,
+            height,
+            stride,
+            VideoFormat::RGBx,
+            recycled(&pool),
+        );
         assert_eq!(second.as_ptr(), address);
-        let swapped: Vec<u8> = rows.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]]).collect();
+        let swapped: Vec<u8> = rows
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+            .collect();
         assert_eq!(second, swapped);
         // The pool keeps a few buffers, not every one it is handed.
         for _ in 0..3 * CAPTURE_POOL_BUFFERS {
@@ -4694,12 +5366,18 @@ mod wire_tests {
 
     #[test]
     fn the_swapchain_is_unorm_in_the_srgb_colour_space_when_the_surface_offers_it() {
-        let offer = |format, color_space| vk::SurfaceFormatKHR { format, color_space };
+        let offer = |format, color_space| vk::SurfaceFormatKHR {
+            format,
+            color_space,
+        };
         let srgb = vk::ColorSpaceKHR::SRGB_NONLINEAR;
         let offered = [
             offer(vk::Format::B8G8R8A8_SRGB, srgb),
             offer(vk::Format::A2B10G10R10_UNORM_PACK32, srgb),
-            offer(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT),
+            offer(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
+            ),
             offer(vk::Format::R8G8B8A8_UNORM, srgb),
             offer(vk::Format::B8G8R8A8_UNORM, srgb),
         ];
@@ -4712,22 +5390,34 @@ mod wire_tests {
     }
     #[test]
     fn frames_keep_their_pixels_across_the_wire() -> anyhow::Result<()> {
-        let rgba: Vec<u8> = (0..4 * 6 * 3).map(|i| u8::try_from(i * 7 % 256).unwrap_or(0)).collect();
-        let frame = Frame { width: 6, height: 3, pixels: rgba.clone(), captured_micros: 0, serial: 0 };
+        let rgba: Vec<u8> = (0..4 * 6 * 3)
+            .map(|i| u8::try_from(i * 7 % 256).unwrap_or(0))
+            .collect();
+        let frame = Frame {
+            width: 6,
+            height: 3,
+            pixels: rgba.clone(),
+            captured_micros: 0,
+            serial: 0,
+        };
         let mut wire = Vec::new();
-        write_title(&mut wire,"kwin-viewer s1: First instruction")?;
+        write_title(&mut wire, "kwin-viewer s1: First instruction")?;
         write_frame(&mut wire, &frame)?;
-        write_title(&mut wire,"kwin-viewer s1: Updated instruction")?;
+        write_title(&mut wire, "kwin-viewer s1: Updated instruction")?;
         write_frame(&mut wire, &frame)?;
         let mut input = Cursor::new(wire);
         let title = Mutex::new(String::new());
-        for expected in ["kwin-viewer s1: First instruction","kwin-viewer s1: Updated instruction"] {
-            let got = read_frame(&mut input,Some(&title))?.ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
-            assert_eq!(*title.lock().unwrap(),expected);
+        for expected in [
+            "kwin-viewer s1: First instruction",
+            "kwin-viewer s1: Updated instruction",
+        ] {
+            let got = read_frame(&mut input, Some(&title))?
+                .ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
+            assert_eq!(*title.lock().unwrap(), expected);
             assert_eq!((got.width, got.height), (6, 3));
             assert_eq!(got.pixels, rgba);
         }
-        assert!(read_frame(&mut input,None)?.is_none());
+        assert!(read_frame(&mut input, None)?.is_none());
         Ok(())
     }
 }

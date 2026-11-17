@@ -68,10 +68,7 @@ fn typing_into_a_filled_field_reports_before_and_after_and_replace_overwrites() 
         }),
     );
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -96,7 +93,10 @@ fn typing_into_a_filled_field_reports_before_and_after_and_replace_overwrites() 
     std::thread::sleep(std::time::Duration::from_secs(4));
 
     // Click at the right end of the field: the caret lands after the existing "1".
-    wire.tool("mouse_click", json!({"session_id":session, "x":450, "y":140}));
+    wire.tool(
+        "mouse_click",
+        json!({"session_id":session, "x":450, "y":140}),
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
     let inserted = wire.tool("keyboard_type", json!({"session_id":session, "text":"0.5"}));
     let after_insert = &inserted["result"]["structuredContent"];
@@ -114,7 +114,9 @@ fn typing_into_a_filled_field_reports_before_and_after_and_replace_overwrites() 
 
     assert_eq!(after_insert["value_before"], "1", "{inserted}");
     assert_eq!(after_insert["value_after"], "10.5", "{inserted}");
-    let warning = after_insert["delivery"]["warning"].as_str().unwrap_or_default();
+    let warning = after_insert["delivery"]["warning"]
+        .as_str()
+        .unwrap_or_default();
     assert!(warning.contains("replace=true"), "{inserted}");
 
     assert_eq!(after_replace["value_before"], "10.5", "{replaced}");

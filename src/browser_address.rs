@@ -584,7 +584,10 @@ mod tests {
             absolute_url("localhost:8090/v1/blocks"),
             "http://localhost:8090/v1/blocks"
         );
-        assert_eq!(absolute_url("192.168.1.211:8090"), "http://192.168.1.211:8090");
+        assert_eq!(
+            absolute_url("192.168.1.211:8090"),
+            "http://192.168.1.211:8090"
+        );
         assert_eq!(absolute_url("//cdn.test/x"), "http://cdn.test/x");
         assert_eq!(absolute_url("/tmp/page.html"), "file:///tmp/page.html");
         for kept in [
@@ -627,17 +630,32 @@ mod tests {
             "http://example.test/a#new",
             "https://example.test/a#old"
         ));
-        assert!(same_destination("HTTPS://Example.test", "https://example.test/"));
+        assert!(same_destination(
+            "HTTPS://Example.test",
+            "https://example.test/"
+        ));
         assert!(!same_destination(
             "https://www.digikey.com/en/products/result?keywords=TwinMax",
             "https://www.digikey.com/en/products/filter/coaxial-cables-rf/475?s=N4Ig"
         ));
         // Another fragment is the same document, which keeps reporting the
         // address it was loaded from; another query or path is not.
-        assert!(same_document("http://example.test/a#two", "http://example.test/a#one"));
-        assert!(same_document("http://example.test/a#two", "https://example.test/a"));
-        assert!(!same_document("http://example.test/a?x=2#two", "http://example.test/a?x=1#two"));
-        assert!(!same_document("http://example.test/b#one", "http://example.test/a#one"));
+        assert!(same_document(
+            "http://example.test/a#two",
+            "http://example.test/a#one"
+        ));
+        assert!(same_document(
+            "http://example.test/a#two",
+            "https://example.test/a"
+        ));
+        assert!(!same_document(
+            "http://example.test/a?x=2#two",
+            "http://example.test/a?x=1#two"
+        ));
+        assert!(!same_document(
+            "http://example.test/b#one",
+            "http://example.test/a#one"
+        ));
         assert!(!same_document("about:blank", ""));
     }
 
@@ -670,7 +688,10 @@ mod tests {
         assert!(shown.starts_with("data:text/html,xxx") && shown.ends_with("[5015 characters]"));
         assert!(shown.chars().count() < 2040);
         assert!(caption_names_tab("New Tab - Google Chrome", "New Tab"));
-        assert!(caption_names_tab("page - Audio playing - Google Chrome", "page"));
+        assert!(caption_names_tab(
+            "page - Audio playing - Google Chrome",
+            "page"
+        ));
         assert!(caption_names_tab("page", "page"));
         // #866: a tab is not the window's tab because its title starts the caption.
         assert!(!caption_names_tab("page-alpha - Google Chrome", "page"));

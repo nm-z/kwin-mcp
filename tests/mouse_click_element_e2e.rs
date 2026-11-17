@@ -117,7 +117,10 @@ impl Desk {
     }
 
     fn launch(&mut self, command: &str) {
-        let launched = self.tool("launch_app", json!({"command":command, "window_timeout_seconds":40}));
+        let launched = self.tool(
+            "launch_app",
+            json!({"command":command, "window_timeout_seconds":40}),
+        );
         assert!(launched["error"].is_null(), "{launched}");
     }
 
@@ -160,7 +163,10 @@ impl Desk {
     fn shown(&mut self, query: &str, seconds: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
-            let found = self.tool("find_ui_elements", json!({"query":query, "timeout_seconds":20}));
+            let found = self.tool(
+                "find_ui_elements",
+                json!({"query":query, "timeout_seconds":20}),
+            );
             let matches = &found["result"]["structuredContent"]["matches"];
             if matches.as_u64().is_some_and(|matches| matches > 0) || Instant::now() >= deadline {
                 return found;
@@ -236,11 +242,20 @@ fn a_click_by_name_lands_after_the_layout_moved() {
     );
 
     assert!(first["error"].is_null(), "{first}");
-    assert!(after_first.contains("first-clicked"), "title after first click: {after_first}");
+    assert!(
+        after_first.contains("first-clicked"),
+        "title after first click: {after_first}"
+    );
     assert!(second["error"].is_null(), "{second}");
     assert_eq!(clicked(&second)["name"], "Second");
-    assert!(after_second.contains("second-clicked"), "title after second click: {after_second}");
-    assert_eq!(missing["error"]["data"]["reason"], "no_clickable_element", "{missing}");
+    assert!(
+        after_second.contains("second-clicked"),
+        "title after second click: {after_second}"
+    );
+    assert_eq!(
+        missing["error"]["data"]["reason"], "no_clickable_element",
+        "{missing}"
+    );
     assert_eq!(missing["error"]["data"]["cause"], "no_match", "{missing}");
 }
 
@@ -275,7 +290,9 @@ fn a_profile_picker_card_is_clicked_by_name() {
     let card = cards["result"]["structuredContent"]["elements"]
         .as_array()
         .and_then(|elements| {
-            let card = elements.iter().position(|element| element["role"] == json!("button"))?;
+            let card = elements
+                .iter()
+                .position(|element| element["role"] == json!("button"))?;
             elements.get(card)
         })
         .cloned()
@@ -283,17 +300,25 @@ fn a_profile_picker_card_is_clicked_by_name() {
     let picker = desk.title();
     desk.evidence("picker-before");
     // The query also matches other elements of the picker; the card is the control.
-    let reply = desk.tool("mouse_click_element", json!({"query":"Beta", "timeout_seconds":20}));
+    let reply = desk.tool(
+        "mouse_click_element",
+        json!({"query":"Beta", "timeout_seconds":20}),
+    );
     // Clicking a card closes the picker and opens that profile's browser window.
     let browser = desk.window_titled(" - Google Chrome", 40);
     desk.evidence("picker-after");
 
     assert_eq!(picker, "Google Chrome", "the picker's window caption");
-    assert_eq!(card["mouse_coordinates_usable"], true, "the card as the search lists it: {cards}");
+    assert_eq!(
+        card["mouse_coordinates_usable"], true,
+        "the card as the search lists it: {cards}"
+    );
     assert!(reply["error"].is_null(), "{reply}");
     assert_eq!(clicked(&reply)["role"], "button", "{reply}");
     assert!(
-        clicked(&reply)["name"].as_str().is_some_and(|name| name.contains("Open Beta profile")),
+        clicked(&reply)["name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Open Beta profile")),
         "{reply}"
     );
     assert!(browser.is_some(), "no browser window opened after {reply}");
@@ -342,16 +367,28 @@ fn a_named_control_is_clicked_or_the_refusal_says_why() {
 
     assert!(item["error"].is_null(), "{item}");
     assert_eq!(clicked(&item)["role"], "menu item", "{item}");
-    assert!(after_item.contains("settings-opened"), "title after the menu item: {after_item}");
+    assert!(
+        after_item.contains("settings-opened"),
+        "title after the menu item: {after_item}"
+    );
     let refusal = as_text["error"]["message"].as_str().unwrap_or_default();
-    assert_eq!(as_text["error"]["data"]["cause"], "role_excluded", "{as_text}");
+    assert_eq!(
+        as_text["error"]["data"]["cause"], "role_excluded",
+        "{as_text}"
+    );
     assert!(
         refusal.contains("page tab 'Wallet'") && refusal.contains("without role"),
         "the refusal names the element and the next step: {refusal}"
     );
-    assert!(after_refusal.contains("settings-opened"), "a refused click changed the page: {after_refusal}");
+    assert!(
+        after_refusal.contains("settings-opened"),
+        "a refused click changed the page: {after_refusal}"
+    );
     assert!(as_tab["error"].is_null(), "{as_tab}");
-    assert!(after_tab.contains("wallet-opened"), "title after the tab: {after_tab}");
+    assert!(
+        after_tab.contains("wallet-opened"),
+        "title after the tab: {after_tab}"
+    );
 }
 
 /// Two browser windows on one page have one caption, and Chrome does not mark the
@@ -385,15 +422,25 @@ fn two_windows_with_one_caption_are_refused_with_the_reason() {
     desk.evidence("one-caption-after");
 
     assert_eq!(before.len(), 2, "two windows: {before:?}");
-    assert_eq!(before[0]["title"], before[1]["title"], "one caption: {before:?}");
+    assert_eq!(
+        before[0]["title"], before[1]["title"],
+        "one caption: {before:?}"
+    );
     let refusal = reply["error"]["message"].as_str().unwrap_or_default();
-    assert_eq!(reply["error"]["data"]["cause"], "frame_not_paired_with_window", "{reply}");
+    assert_eq!(
+        reply["error"]["data"]["cause"], "frame_not_paired_with_window",
+        "{reply}"
+    );
     assert!(
-        refusal.contains("several windows") && refusal.contains("caption") && refusal.contains("mouse_click"),
+        refusal.contains("several windows")
+            && refusal.contains("caption")
+            && refusal.contains("mouse_click"),
         "the refusal says why and what to do: {refusal}"
     );
     assert!(
-        after.iter().all(|window| window["title"].as_str().is_some_and(|title| title.contains("twin"))),
+        after.iter().all(|window| window["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("twin"))),
         "a refused click changed a page: {after:?}"
     );
 }
@@ -426,11 +473,17 @@ fn a_match_in_another_window_is_clicked_after_activating_it() {
     let clicked_window = desk.window_titled("back-clicked", 5);
     desk.evidence("other-window-after");
 
-    assert!(before.contains("front-start"), "the second window is the active one: {before}");
+    assert!(
+        before.contains("front-start"),
+        "the second window is the active one: {before}"
+    );
     assert!(reply["error"].is_null(), "{reply}");
     assert_eq!(
         reply["result"]["structuredContent"]["activated_window"]["id"], back_window["id"],
         "{reply}"
     );
-    assert!(clicked_window.is_some(), "the back window's button was not clicked: {reply}");
+    assert!(
+        clicked_window.is_some(),
+        "the back window's button was not clicked: {reply}"
+    );
 }
