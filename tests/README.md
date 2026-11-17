@@ -275,6 +275,36 @@ pixels under the chooser's identity, and the candidate's verified chooser and
 subsequent parent capture. The candidate rejects the race, so that response
 intentionally has no PNG.
 
+## A dialog's own dropdown (#983)
+
+```bash
+systemd-run --user --quiet --wait --pipe --collect --same-dir -p RuntimeMaxSec=600 \
+  --setenv=KWIN_MCP_E2E_SERVER=target/debug/kwin-mcp \
+  target/debug/deps/dialog_popup_capture_e2e-<hash> --ignored --test-threads=1
+```
+
+`tests/dialog_popup_capture_e2e.rs` builds `tests/fixtures/dialog_dropdown.c`
+with cc and GTK 3 into the session's workdir: a main window and a dialog
+transient for it whose button or combo box opens a magenta dropdown.
+`KWIN_MCP_E2E_EVIDENCE=<directory>` keeps the replies and images.
+
+- `a_wx_style_dropdown_over_an_x11_dialog_is_in_its_screenshot`: under X11 the
+  dropdown is an override-redirect window with no type hint, the way wxWidgets
+  makes one (Bambu Studio, the report), and `window_list` shows only the two
+  windows. The screenshot is pixel-verified, reports the dropdown as an
+  unlisted popup at the rectangle the fixture wrote, shows it magenta, and a
+  region equal to that rectangle shows all of it, including the part below the
+  dialog; a cursor crop is not refused either.
+- `a_combo_menu_over_a_wayland_dialog_is_in_its_screenshot`: a combo box's
+  menu, an xdg_popup that `window_list` lists as a popup transient for the
+  dialog, is reported with its ID and region and shown in the image.
+- `another_programs_window_over_the_dialog_is_still_refused`: a second process
+  maps an override-redirect window over the dialog, and the screenshot is still
+  refused with `transient_capture_unverified`.
+
+Against a server built before the fix the first two fail with the report's
+`transient_capture_unverified`; the third passes on both.
+
 # Remote viewer stream
 
 ```bash
