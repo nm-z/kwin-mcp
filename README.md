@@ -591,7 +591,7 @@ kwin-mcp (host process)
   └── pasta private network namespace
         └── bwrap container (bubblewrap, overlayfs on $HOME)
               ├── dbus-daemon        (isolated session bus, anonymous auth)
-              ├── kwin_wayland       (virtual display 1000x1000, XWayland)
+              ├── kwin_wayland       (virtual display, XWayland)
               ├── pipewire + wireplumber
               ├── at-spi-bus-launcher
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
