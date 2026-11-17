@@ -2148,12 +2148,12 @@ const CURSOR_ZOOM_HALF_EDGE: i32 = 200;
 
 // ── Virtual-session display & font settings ──────────────────────────────
 
-// Compiled-in defaults. Overridable at server launch via --width/--height CLI
-// flags, and per-session via session_start's optional width/height params
-// (unless the server was launched with --no-override, which pins the CLI/
-// compiled size and silently ignores tool params).
-const VIRTUAL_SCREEN_WIDTH: u32 = 3840;
-const VIRTUAL_SCREEN_HEIGHT: u32 = 2160;
+// Compiled-in defaults, in the library because kwin-viewer shares them.
+// Overridable at server launch via --width/--height CLI flags, and
+// per-session via session_start's optional width/height params (unless the
+// server was launched with --no-override, which pins the CLI/compiled size
+// and silently ignores tool params).
+use kwin_mcp::{VIRTUAL_SCREEN_HEIGHT, VIRTUAL_SCREEN_WIDTH};
 // Sanity bounds for any requested dimension. Max matches the viewer's
 // PipeWire format-pod range ceiling (kwin-viewer.rs build_format_pod).
 const MIN_SCREEN_DIM: u32 = 240;

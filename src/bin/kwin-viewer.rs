@@ -917,8 +917,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-// Virtual display size, passed by kwin-mcp at spawn. Defaults match the
-// server's compiled-in VIRTUAL_SCREEN_WIDTH/HEIGHT for manual invocation.
+// Virtual display size, passed by kwin-mcp at spawn. A manual invocation
+// without one gets the server's default size.
 fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u32)> {
     let mut next = |default: u32, name: &str| -> anyhow::Result<u32> {
         match argv.next() {
@@ -926,7 +926,10 @@ fn parse_size(argv: &mut impl Iterator<Item = String>) -> anyhow::Result<(u32, u
             None => Ok(default),
         }
     };
-    let size = (next(3840, "width")?, next(2160, "height")?);
+    let size = (
+        next(kwin_mcp::VIRTUAL_SCREEN_WIDTH, "width")?,
+        next(kwin_mcp::VIRTUAL_SCREEN_HEIGHT, "height")?,
+    );
     anyhow::ensure!(size.0 > 0 && size.1 > 0, "viewer dimensions must be positive");
     Ok(size)
 }
