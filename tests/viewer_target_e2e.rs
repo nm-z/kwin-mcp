@@ -168,8 +168,7 @@ fn require_e2e() {
 fn dead_pid() -> u32 {
     (2..=4_194_000_u32)
         .rev()
-        .skip_while(|pid| Path::new(&format!("/proc/{pid}")).exists())
-        .next()
+        .find(|pid| !Path::new(&format!("/proc/{pid}")).exists())
         .expect("a free pid")
 }
 
@@ -438,7 +437,7 @@ fn session_scope(server: &mut Server, session: &str) -> (String, PathBuf) {
     let listed = server.tool("session_list", json!({}));
     let record = listed["result"]["structuredContent"]["sessions"]
         .as_array()
-        .and_then(|sessions| sessions.iter().skip_while(|entry| entry["session_id"] != session).next())
+        .and_then(|sessions| sessions.iter().find(|entry| entry["session_id"] == session))
         .unwrap_or_else(|| panic!("session is not listed: {listed}"))
         .clone();
     let unit = record["scope_unit"].as_str().expect("scope unit").to_owned();

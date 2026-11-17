@@ -393,10 +393,11 @@ fn install_local(directory: &Path, host: &str, destination: &str) -> Result<()> 
         println!("installed={host}:{destination} mode=local");
         Ok(())
     })();
-    if result.is_err() && path_exists(stage_path)? {
-        if let Err(error) = fs::remove_dir_all(stage_path) {
-            eprintln!("could not remove local staging path {stage}: {error}");
-        }
+    if result.is_err()
+        && path_exists(stage_path)?
+        && let Err(error) = fs::remove_dir_all(stage_path)
+    {
+        eprintln!("could not remove local staging path {stage}: {error}");
     }
     result
 }

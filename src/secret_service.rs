@@ -1217,18 +1217,17 @@ mod tests {
     }
 
     fn session(store: &mut Store) -> Result<OwnedObjectPath, Refusal> {
-        match call(
+        let Out::Session(path) = call(
             store,
             ROOT,
             SERVICE_INTERFACE,
             "OpenSession",
             &("plain", Value::new("")),
-        )? {
-            Out::Session(path) => {
-                OwnedObjectPath::try_from(path).map_err(|error| (INVALID_ARGS, error.to_string()))
-            }
-            _ => refuse(INVALID_ARGS, "OpenSession did not return a session"),
-        }
+        )?
+        else {
+            return refuse(INVALID_ARGS, "OpenSession did not return a session");
+        };
+        OwnedObjectPath::try_from(path).map_err(|error| (INVALID_ARGS, error.to_string()))
     }
 
     fn store_item(
@@ -1246,19 +1245,18 @@ mod tests {
         );
         let secret = (session, Vec::<u8>::new(), secret.to_vec(), "text/plain");
         let default = format!("{ALIASES}{DEFAULT_ALIAS}");
-        match call(
+        let Out::TwoPaths(item, prompt) = call(
             store,
             &default,
             COLLECTION_INTERFACE,
             "CreateItem",
             &(given, secret, replace),
-        )? {
-            Out::TwoPaths(item, prompt) => {
-                assert_eq!(prompt, NO_PROMPT);
-                Ok(item)
-            }
-            _ => refuse(INVALID_ARGS, "CreateItem did not return an item"),
-        }
+        )?
+        else {
+            return refuse(INVALID_ARGS, "CreateItem did not return an item");
+        };
+        assert_eq!(prompt, NO_PROMPT);
+        Ok(item)
     }
 
     fn fresh() -> Store {
@@ -1275,25 +1273,25 @@ mod tests {
         let item = store_item(&mut store, &session, "octocat", b"gho_secret", false)?;
         assert_eq!(item, item_path(LOCAL_COLLECTION, 1));
         let wanted = HashMap::from([("service", "copilot-cli"), ("user", "octocat")]);
-        match call(&mut store, ROOT, SERVICE_INTERFACE, "SearchItems", &wanted)? {
-            Out::TwoLists(unlocked, locked) => {
-                assert_eq!(unlocked, vec![item.clone()]);
-                assert!(locked.is_empty());
-            }
-            _ => return refuse(INVALID_ARGS, "unexpected search reply"),
-        }
+        let Out::TwoLists(unlocked, locked) =
+            call(&mut store, ROOT, SERVICE_INTERFACE, "SearchItems", &wanted)?
+        else {
+            return refuse(INVALID_ARGS, "unexpected search reply");
+        };
+        assert_eq!(unlocked, vec![item.clone()]);
+        assert!(locked.is_empty());
         let other = HashMap::from([("service", "copilot-cli"), ("user", "someone-else")]);
         assert!(matches!(
             call(&mut store, ROOT, SERVICE_INTERFACE, "SearchItems", &other)?,
             Out::TwoLists(unlocked, _) if unlocked.is_empty()
         ));
-        match call(&mut store, &item, ITEM_INTERFACE, "GetSecret", &(&session,))? {
-            Out::Secret(_, value, content_type) => {
-                assert_eq!(value, b"gho_secret");
-                assert_eq!(content_type, "text/plain");
-            }
-            _ => return refuse(INVALID_ARGS, "unexpected secret reply"),
-        }
+        let Out::Secret(_, value, content_type) =
+            call(&mut store, &item, ITEM_INTERFACE, "GetSecret", &(&session,))?
+        else {
+            return refuse(INVALID_ARGS, "unexpected secret reply");
+        };
+        assert_eq!(value, b"gho_secret");
+        assert_eq!(content_type, "text/plain");
         Ok(())
     }
 

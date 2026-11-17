@@ -571,7 +571,7 @@ mod tests {
         assert!(url_problem(&format!("data:text/html,{}", "a".repeat(2001))).is_none());
         assert!(url_problem(&"a".repeat(URL_MAX_CHARS)).is_none());
         assert!(url_problem(&"a".repeat(URL_MAX_CHARS + 1)).is_some());
-        assert!(ADDRESS_BAR_MAX_CHARS < URL_MAX_CHARS);
+        const { assert!(ADDRESS_BAR_MAX_CHARS < URL_MAX_CHARS) };
     }
 
     #[test]

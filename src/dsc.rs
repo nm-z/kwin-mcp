@@ -5378,6 +5378,9 @@ mod tests {
         Ok(())
     }
 
+    /// The image, its bitstream and the encoder that wrote it.
+    type Encoded = (Vec<u8>, Vec<u8>, Encoder);
+
     impl Vector {
         fn config(&self) -> Config {
             Config {
@@ -5392,7 +5395,7 @@ mod tests {
             }
         }
 
-        fn encode(&self) -> Result<(Vec<u8>, Vec<u8>, Encoder), Box<dyn Error>> {
+        fn encode(&self) -> Result<Encoded, Box<dyn Error>> {
             let image = match self.session {
                 Some(path) => session_frame(path)?,
                 None => picture(self.pattern, size(self.width), size(self.height)),

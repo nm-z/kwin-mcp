@@ -23663,7 +23663,7 @@ const PASTE_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
 const PASTE_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
 
 enum PreparedPaste {
-    Ready(input_bridge::TextReceipt),
+    Ready(Box<input_bridge::TextReceipt>),
     Unavailable {
         method: &'static str,
         warning: &'static str,
@@ -23714,7 +23714,7 @@ async fn prepare_paste_text(
         };
     };
     match input_bridge::TextReceipt::capture_paste(address, window, None, &text).await {
-        Ok(receipt) => PreparedPaste::Ready(receipt),
+        Ok(receipt) => PreparedPaste::Ready(Box::new(receipt)),
         // A terminal takes the paste but shows it only on screen, so say that
         // instead of calling the target unobservable.
         Err(error) if error.is::<input_bridge::TerminalFocus>() => PreparedPaste::Unavailable {
@@ -29567,12 +29567,12 @@ mod user_namespace_guidance_tests {
     }
 
     #[test]
-    fn a_refused_uid_map_is_explained_with_the_kernel_settings() {
+    fn a_refused_uid_map_is_explained_with_the_kernel_settings() -> Result<(), String> {
         let guidance = user_namespace_guidance(
             "bwrap: setting up uid map: Operation not permitted\n",
             &confined(),
         )
-        .expect("a refused uid map gets guidance");
+        .ok_or("a refused uid map gets guidance")?;
         for fact in [
             "uid_map: 0 1000 1",
             "user.max_user_namespaces: 0",
@@ -29585,6 +29585,7 @@ mod user_namespace_guidance_tests {
         ] {
             assert!(guidance.contains(fact), "missing {fact:?}: {guidance}");
         }
+        Ok(())
     }
 
     #[test]
@@ -29620,10 +29621,11 @@ mod launch_warning_tests {
     };
 
     #[test]
-    fn a_walletless_chromium_launch_says_how_to_get_the_saved_logins() {
+    fn a_walletless_chromium_launch_says_how_to_get_the_saved_logins() -> Result<(), String> {
         let reason = "org.kde.ksecretd is not running on the host; kwin-mcp does not start it";
-        let warning = launch_wallet_warning(Some(reason.to_owned()), "google-chrome-stable about:blank")
-            .expect("a Chromium launch without a wallet warns");
+        let warning =
+            launch_wallet_warning(Some(reason.to_owned()), "google-chrome-stable about:blank")
+                .ok_or("a Chromium launch without a wallet warns")?;
         assert!(warning.contains(reason), "{warning}");
         assert!(
             warning.contains("start and unlock the host's KWallet before session_start"),
@@ -29632,6 +29634,7 @@ mod launch_warning_tests {
         assert!(warning.contains("sign in inside the session"), "{warning}");
         assert_eq!(launch_wallet_warning(Some(reason.to_owned()), "kate notes.txt"), None);
         assert_eq!(launch_wallet_warning(None, "google-chrome-stable"), None);
+        Ok(())
     }
 
     #[test]
@@ -31186,7 +31189,7 @@ mod ui_match_context_tests {
         let result = find_ui_native_match(
             &node((135, 65, 80, 25)),
             Some(&win),
-            &[win.clone()],
+            std::slice::from_ref(&win),
             (0, 0, 312, 101),
         );
         assert_eq!(result["mouse_coordinates_usable"], true);
@@ -31207,7 +31210,7 @@ mod ui_match_context_tests {
         let result = find_ui_native_match(
             &node((479, 364, 80, 25)),
             Some(&win),
-            &[win.clone()],
+            std::slice::from_ref(&win),
             (344, 299, 312, 101),
         );
         assert_eq!(result["bounds"]["x"], 135.0);
@@ -31221,7 +31224,7 @@ mod ui_match_context_tests {
         let result = find_ui_native_match(
             &node((50, 20, 80, 25)),
             Some(&win),
-            &[win.clone()],
+            std::slice::from_ref(&win),
             (0, 0, 156, 50),
         );
         assert_eq!(result["mouse_coordinates_usable"], false);
