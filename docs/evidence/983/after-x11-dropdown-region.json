@@ -1,0 +1,65 @@
+{
+  "id": 13,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "/tmp/kwin-mcp-2966616-1/screenshot.png size=240x220; the dialog's own popups over it, window-relative: [140,258,380,478]",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "structuredContent": {
+      "height": 220,
+      "path": "/tmp/kwin-mcp-2966616-1/screenshot.png",
+      "popups": [
+        {
+          "region": [
+            140,
+            258,
+            380,
+            478
+          ],
+          "unlisted": true
+        }
+      ],
+      "region": [
+        140,
+        258,
+        380,
+        478
+      ],
+      "transient_pixel_check": {
+        "captures": 1,
+        "client_origin": [
+          380,
+          190
+        ],
+        "client_size": [
+          520,
+          420
+        ],
+        "compared_pixels": 140864,
+        "cursor_excluded_pixels": 9409,
+        "mismatch_samples": [],
+        "mismatching_pixels": 0,
+        "popup_excluded_pixels": 53343,
+        "reference_method": "CaptureWindow",
+        "reference_window_id": "{8158eec7-a83c-4631-919d-7b8e41d4b262}",
+        "screen_alpha_below_255": 0,
+        "status": "matches_window_capture",
+        "visible_interior_pixels": 203616,
+        "window_alpha_below_255": 0
+      },
+      "width": 240,
+      "window": {
+        "height": 420,
+        "id": "{8158eec7-a83c-4631-919d-7b8e41d4b262}",
+        "title": "Dropdown dialog",
+        "width": 520,
+        "x": 380,
+        "y": 190
+      }
+    }
+  }
+}
