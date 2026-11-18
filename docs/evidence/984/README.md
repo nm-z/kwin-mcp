@@ -2,12 +2,14 @@
 
 `systemd/kwin-mcp-listen.service` starts the listener as `kwin-mcp --listen ADDRESS --no-viewer --autoclean --ttl 120`, with no `--width`/`--height`. Every session it started was 3840x2160, the compiled default, while the stdio servers registered with `--width 1920 --height 1080` told agents the default was 1920x1080. The compiled default is now 1920x1080, so a stdio server and a listener without size options agree.
 
-Both screenshots show a maximized Konsole in a session that a stdio server started on such a listener on engi, with no size in `session_start`:
+Each screenshot shows a maximized Konsole in a session that a stdio server started on such a listener, with no size in `session_start`. The issue's listener ran on sentry, so the test ran there too, against kwin-mcp built on sentry with rustc 1.99.1. Konsole's size popup in the sentry screenshots counts the terminal's columns and rows:
 
-| Build | `session_start` reported | Screenshot |
-| --- | --- | --- |
-| master 3be7567 | 3840x2160 | [`before.png`](before.png), 3840x2160 |
-| this change | 1920x1080 | [`after.png`](after.png), 1920x1080 |
+| Host | Build | `session_start` reported | Screenshot |
+| --- | --- | --- | --- |
+| engi, KWin 6.8.3 | master 3be7567 | 3840x2160 | [`before.png`](before.png), 3840x2160 |
+| engi, KWin 6.8.3 | this change | 1920x1080 | [`after.png`](after.png), 1920x1080 |
+| sentry, KWin 6.8.2 | master 3be7567 | 3840x2160 | [`sentry-before.png`](sentry-before.png), 3840x2160, Konsole 544x176 |
+| sentry, KWin 6.8.2 | this change at 877e490 | 1920x1080 | [`sentry-after.png`](sentry-after.png), 1920x1080, Konsole 270x86 |
 
 ## Reproduce
 
