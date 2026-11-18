@@ -31,3 +31,27 @@ Kept by `tests/dialog_popup_capture_e2e.rs` with `KWIN_MCP_E2E_EVIDENCE`, in
 - `after-other-program-refused.json`: a second process's override-redirect
   window over the dialog is not the dialog's own, and the screenshot is still
   refused with `transient_capture_unverified`, as before the fix.
+
+## Bambu Studio
+
+Taken by hand through the stdio server, in a 1920x1080 session whose private
+HOME held a copy of Bambu Studio's settings, with no login and no network
+plugin. Bambu Studio 2.9.1.70 (AppImage), Preferences dialog: 640x640 at
+(640,220), modal and transient for the main window. Its Language dropdown is a
+wxWidgets popup window, as the report's filament mapping is. It was opened
+with a click at (543,94), and the pointer was then moved to (100,560), so that
+the 97-pixel square around it covers none of the dropdown. `window_list`
+listed only the main window and the dialog.
+
+- `before-bambu-language-refused.json` (master, 3be7567): `13549 of 379967
+  opaque dialog pixels differ from the independent window capture ... still
+  differing after 30 captures`. `region=[400,60,640,640]` and `cursor=true`
+  were refused the same way. After a click outside closed the dropdown, the
+  dialog matched again: 0 of 379967.
+- `after-bambu-language.png` and `.json` (this branch): the dialog with the
+  dropdown in it. `transient_pixel_check` is `matches_window_capture` on the
+  first capture, 0 of 287423 compared pixels differ and 92544 are left out.
+  `popups` is `[{"region":[472,114,616,532],"unlisted":true}]`: like the
+  fixture's, the dropdown is an override-redirect X11 window that KWin does
+  not manage. `region=[472,114,616,532]` (the whole list, 144x418) and
+  `cursor=true` were not refused either.
