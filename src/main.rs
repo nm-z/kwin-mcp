@@ -1947,6 +1947,13 @@ const SESSION_START_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_START_MAX_SECONDS: u64 = 300;
 // How often a start that is still running records its sandbox's process tree.
 const STARTUP_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
+// Pressure (PSI "some": percent of the last 10 s or 60 s in which a task waited
+// for disk I/O, memory or CPU) of the host or of this server's own cgroup from
+// which a start that ran out of time tells its caller to wait before the next.
+const START_BACK_OFF_PRESSURE: f64 = 25.0;
+// That wait: the longer PSI average spans 60 s, so a start after it meets a
+// host whose last minute no longer includes this one.
+const START_BACK_OFF: Duration = Duration::from_secs(60);
 
 // Session overlay layers and the FUSE bridge image live on disk under
 // ${XDG_CACHE_HOME:-~/.cache}/kwin-mcp (/tmp is RAM with a per-user quota);
@@ -6890,12 +6897,18 @@ fn read_cgroup_limit(directory: &Path, name: &str) -> Option<u64> {
 }
 
 fn parse_pressure_avg10(pressure: &str, kind: &str) -> Option<f64> {
+    parse_pressure_average(pressure, kind, "avg10=")
+}
+
+/// One average of a PSI file: `kind` is "some" or "full", `window` the field
+/// prefix ("avg10=", "avg60=").
+fn parse_pressure_average(pressure: &str, kind: &str, window: &str) -> Option<f64> {
     let line = pressure
         .lines()
         .find(|line| line.split_whitespace().next() == Some(kind))?;
     let value = line
         .split_whitespace()
-        .find_map(|field| field.strip_prefix("avg10="))?
+        .find_map(|field| field.strip_prefix(window))?
         .parse::<f64>()
         .ok()?;
     (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
@@ -7116,6 +7129,95 @@ impl Drop for StartupResources {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+/// The images this server staged in its sessions' disk twins, newest last: a
+/// later session links one of them while it is still there.
+static STAGED_IMAGES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// How many of them are kept for that.
+const STAGED_IMAGES_KEPT: usize = 8;
+
+/// This server's image staged in a session's disk twin. Dropped, it removes
+/// the file unless the start kept it, so a start that ran out of time while
+/// the image was staged leaves none behind.
+struct StagedImage {
+    path: Option<PathBuf>,
+    /// How it got there ("linked from <path>" or "copied"), for the log.
+    how: String,
+}
+
+impl StagedImage {
+    fn keep(mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+}
+
+impl Drop for StagedImage {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Stages this server's image at `exe` in a session's disk twin. A hard link
+/// writes no data: to the file this server was started from while that still
+/// is its image (an install renames a new file over the path, which leaves the
+/// linked inode as it was), else to the image an earlier session of this
+/// server staged. Only when neither links (the binary is on another filesystem
+/// or was replaced, and no earlier image is left) is the image copied, tens of
+/// megabytes that a loaded disk can take minutes to accept (#985). Starts stage
+/// one at a time, so the other starts of a burst link the copy the first made.
+fn stage_server_image(exe: &Path) -> Result<StagedImage, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut earlier = STAGED_IMAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let running = std::fs::metadata("/proc/self/exe")
+        .map_err(|error| format!("read this server's image: {error}"))?;
+    let mut how = None;
+    if let Ok(started_from) = std::fs::read_link("/proc/self/exe")
+        && std::fs::hard_link(&started_from, exe).is_ok()
+    {
+        // The path names another file once a rebuild replaced it.
+        if std::fs::metadata(exe)
+            .is_ok_and(|linked| linked.dev() == running.dev() && linked.ino() == running.ino())
+        {
+            how = Some(format!("linked from {}", started_from.display()));
+        } else {
+            let _ = std::fs::remove_file(exe);
+        }
+    }
+    while how.is_none()
+        && let Some(image) = earlier.pop()
+    {
+        // An image whose session has ended is gone with its twin.
+        if std::fs::hard_link(&image, exe).is_ok() {
+            how = Some(format!("linked from {}", image.display()));
+            earlier.push(image);
+        }
+    }
+    let how = match how {
+        Some(how) => how,
+        None => {
+            let temporary = exe.with_extension("partial");
+            std::fs::copy("/proc/self/exe", &temporary)
+                .and_then(|_| std::fs::rename(&temporary, exe))
+                .map_err(|error| {
+                    let _ = std::fs::remove_file(&temporary);
+                    describe_write_failure(&temporary, &error)
+                })?;
+            "copied".to_owned()
+        }
+    };
+    earlier.push(exe.to_owned());
+    if earlier.len() > STAGED_IMAGES_KEPT {
+        earlier.remove(0);
+    }
+    Ok(StagedImage {
+        path: Some(exe.to_owned()),
+        how,
+    })
 }
 
 /// Debug-only pause used by the production-stdio cancellation regression. It
@@ -7940,6 +8042,34 @@ impl KwinMcp {
         anyhow::ensure!(!elapsed, "startup deadline elapsed before {stage}");
         self.set_start_stage(stage);
         Ok(())
+    }
+    /// Runs a host call of a start that can wait in the kernel (a loaded disk,
+    /// a hung mount, a busy systemd) on a blocking thread, as stage `stage`.
+    /// Run on a runtime worker it would hold that worker and every task queued
+    /// behind it, so the server's other calls and this start's hard limit went
+    /// unanswered until it returned (#985). Its handle stays in `host_work`
+    /// until it returns, so a start that ran out of time defers its workdir
+    /// cleanup until the thread is done; a result that nobody waits for any
+    /// more is dropped on that thread.
+    async fn host_blocking<T: Send + 'static>(
+        &self,
+        host_work: &HostWork,
+        stage: impl Into<String>,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, tokio::sync::oneshot::error::RecvError> {
+        self.set_start_stage(stage);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _ = sender.send(call());
+        });
+        if let Ok(mut slot) = host_work.lock() {
+            *slot = Some(handle);
+        }
+        let result = receiver.await;
+        if let Ok(mut slot) = host_work.lock() {
+            slot.take();
+        }
+        result
     }
     /// One file of the browser-profile step: it names the call for a stall and
     /// honors the start budget, but it is not a stage of its own, so a profile
@@ -16372,6 +16502,121 @@ fn hard_timeout_error(
     )
 }
 
+/// The resources whose pressure a start that ran out of time reports: its PSI
+/// file and the name the error gives it.
+const START_PRESSURE_RESOURCES: [(&str, &str); 3] =
+    [("io", "disk I/O"), ("memory", "memory"), ("cpu", "CPU")];
+
+/// PSI "some" of one resource: the percent of the last 10 s and of the last
+/// 60 s in which at least one task waited for it.
+#[derive(Debug, PartialEq)]
+struct Pressure {
+    resource: &'static str,
+    name: &'static str,
+    avg10: f64,
+    avg60: f64,
+}
+
+/// The pressure of those resources, from `/proc/pressure/<resource>` or a
+/// cgroup's `<resource>.pressure`. One the kernel does not report is left out.
+fn read_pressure(directory: &Path, cgroup: bool) -> Vec<Pressure> {
+    START_PRESSURE_RESOURCES
+        .iter()
+        .filter_map(|&(resource, name)| {
+            let file = if cgroup {
+                format!("{resource}.pressure")
+            } else {
+                resource.to_owned()
+            };
+            let text = std::fs::read_to_string(directory.join(file)).ok()?;
+            Some(Pressure {
+                resource,
+                name,
+                avg10: parse_pressure_average(&text, "some", "avg10=")?,
+                avg60: parse_pressure_average(&text, "some", "avg60=")?,
+            })
+        })
+        .collect()
+}
+
+/// Adds to the error of a start that ran out of time the pressure of the host
+/// and of this server's own cgroup (on a host with many busy CPUs the host's
+/// figure dilutes the few tasks of this server that waited). When either was at
+/// least START_BACK_OFF_PRESSURE it also says how long to wait before the next
+/// start, which would otherwise meet the same disk, memory or CPU (#985).
+fn add_start_pressure(error: &mut McpError) {
+    let host = read_pressure(Path::new("/proc/pressure"), false);
+    let server = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|groups| {
+            groups.lines().find_map(|line| {
+                line.strip_prefix("0::")
+                    .map(|group| Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')))
+            })
+        })
+        .map(|directory| read_pressure(&directory, true))
+        .unwrap_or_default();
+    let describe = |readings: &[Pressure]| {
+        readings
+            .iter()
+            .map(|reading| {
+                format!(
+                    "{} {:.0}%/{:.0}%",
+                    reading.name, reading.avg10, reading.avg60
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut clauses = Vec::new();
+    if !host.is_empty() {
+        clauses.push(format!("host {}", describe(&host)));
+    }
+    if !server.is_empty() {
+        clauses.push(format!("this server {}", describe(&server)));
+    }
+    if clauses.is_empty() {
+        return;
+    }
+    let overloaded = host
+        .iter()
+        .chain(&server)
+        .any(|reading| reading.avg10.max(reading.avg60) >= START_BACK_OFF_PRESSURE);
+    let mut message = format!(
+        "{}; pressure (share of the last 10 s/60 s in which a task waited): {}",
+        error.message.trim_end_matches('.'),
+        clauses.join("; ")
+    );
+    if overloaded {
+        message.push_str(&format!(
+            "; the host is too busy to start a session in time: wait {}s before the next session_start instead of retrying at once",
+            START_BACK_OFF.as_secs()
+        ));
+    }
+    error.message = message.into();
+    if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
+        let as_json = |readings: &[Pressure]| {
+            readings
+                .iter()
+                .map(|reading| {
+                    (
+                        reading.resource.to_owned(),
+                        serde_json::json!({"some_avg10_percent": reading.avg10, "some_avg60_percent": reading.avg60}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+        };
+        data.insert("host_pressure".to_owned(), as_json(&host).into());
+        data.insert("server_pressure".to_owned(), as_json(&server).into());
+        if overloaded {
+            data.insert(
+                "retry_after_ms".to_owned(),
+                serde_json::json!(u64::try_from(START_BACK_OFF.as_millis()).unwrap_or(u64::MAX)),
+            );
+        }
+    }
+}
+
 struct SessionStartAttempt {
     started: std::time::Instant,
     recorded: bool,
@@ -16623,8 +16868,9 @@ impl KwinMcp {
                         this.set_pending_cleanup(None);
                         drop(gate);
                     });
-                    let error =
+                    let mut error =
                         hard_timeout_error(startup_timeout, &stage, blocked_for, true, &self.path);
+                    add_start_pressure(&mut error);
                     attempt.finish(Some(&error.message));
                     return Err(error);
                 }
@@ -16635,6 +16881,7 @@ impl KwinMcp {
                     false,
                     &self.path,
                 );
+                add_start_pressure(&mut error);
                 let snapshot = self
                     .startup_snapshot
                     .lock()
@@ -16839,37 +17086,31 @@ impl KwinMcp {
                 .ok_or_else(|| McpError::invalid_params("disk_min_free_mib is too large", None))?,
         };
         // Mount, socket, and /proc scans can block in the kernel on a hung
-        // FUSE or network mount, or on a process stuck in D state. Run them on
-        // a blocking thread so the hard limit can still answer; the handle
-        // stays in `host_work` so a timed-out start defers workdir cleanup
-        // until this thread has stopped writing into it.
-        self.set_start_stage("scanning host mounts, sockets, and processes");
-        let (view_tx, view_rx) = tokio::sync::oneshot::channel();
+        // FUSE or network mount, or on a process stuck in D state.
         let view_target = overlay_target.clone();
         let view_xdg = host_xdg_dir.clone();
         let view_runtime = host_runtime.clone();
         let view_service = self.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            let _ = view_tx.send(prepare_host_view(
-                &view_target,
-                &view_xdg,
-                &view_runtime,
-                &writable_paths,
-                &host_write_paths,
-                &view_service,
-                HostViewOptions { disk_min_free },
-            ));
-        });
-        if let Ok(mut slot) = host_work.lock() {
-            *slot = Some(handle);
-        }
-        let host_view = view_rx
+        let host_view = self
+            .host_blocking(
+                &host_work,
+                "scanning host mounts, sockets, and processes",
+                move || {
+                    prepare_host_view(
+                        &view_target,
+                        &view_xdg,
+                        &view_runtime,
+                        &writable_paths,
+                        &host_write_paths,
+                        &view_service,
+                        HostViewOptions { disk_min_free },
+                    )
+                },
+            )
             .await
             .map_err(|error| ver_err(format!("host scan thread: {error}")))?
             .map_err(|error| ver_err(format!("{error:#}")))?;
-        if let Ok(mut slot) = host_work.lock() {
-            slot.take();
-        }
+        self.set_start_stage("writing the session's desktop settings");
         let HostView {
             mut overlay_plan,
             kdeglobals: mut kdeglobals_content,
@@ -16998,8 +17239,15 @@ impl KwinMcp {
             done\n"
         );
         // Create uinput virtual devices before bwrap so we can bind-mount them
-        let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) =
-            create_uinput_devices().map_err(|e| ver_err(format!("uinput: {e}")))?;
+        let (uinput_mouse, mouse_evdev, uinput_keyboard, kbd_evdev) = self
+            .host_blocking(
+                &host_work,
+                "creating the virtual mouse and keyboard (/dev/uinput)",
+                create_uinput_devices,
+            )
+            .await
+            .map_err(|e| ver_err(format!("uinput thread: {e}")))?
+            .map_err(|e| ver_err(format!("uinput: {e}")))?;
         let mouse_evdev_str = mouse_evdev.display().to_string();
         let kbd_evdev_str = kbd_evdev.display().to_string();
         eprintln!("session_start: uinput mouse={mouse_evdev_str} keyboard={kbd_evdev_str}");
@@ -17145,6 +17393,7 @@ impl KwinMcp {
             Ok(mediator) => mediator,
             Err(error) => return cleanup_err(format!("KWallet service: {error}"), &mut startup),
         };
+        self.set_start_stage("starting the session D-Bus proxy");
         match spawn_dbus_proxy(
             &wallet_bus_address,
             &service_proxy_socket,
@@ -17165,6 +17414,7 @@ impl KwinMcp {
         let service_bus_address = format!("unix:path={}", service_proxy_socket.display());
         let proxy_sock_str = system_proxy_socket.display().to_string();
 
+        self.set_start_stage("preparing the sandbox command");
         let cdp_forward_port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr().map(|address| address.port()))
             .map_err(|error| ver_err(format!("reserve CDP forwarding port: {error}")))?;
@@ -17192,37 +17442,41 @@ impl KwinMcp {
         let fuse = fuse_support();
         let hold_netns = no_new_privs();
         // The FUSE helper inside the sandbox and the namespace holder outside
-        // it both run this server's image, from a copy (the FUSE bind below
-        // says why).
+        // it both run this server's image, from a file in the disk twin (the
+        // FUSE bind below says why), which stage_server_image links if it can.
         let staged_image = if fuse.is_some() || hold_netns {
-            // Keep this large copy on the disk-backed session twin. Putting it
-            // in host_xdg_dir charges it to /tmp's per-user tmpfs quota and can
+            // Keep this file on the disk-backed session twin. A copy in
+            // host_xdg_dir is charged to /tmp's per-user tmpfs quota and can
             // leave later session operations unable to write there.
             let exe = session_disk_path(&host_xdg_dir).join("kwin-mcp-exe");
-            let temporary = exe.with_extension("partial");
-            let copied = std::fs::copy("/proc/self/exe", &temporary)
-                .and_then(|_| std::fs::rename(&temporary, &exe));
-            if let Err(error) = copied {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(ver_err(format!(
-                    "copy running binary for the session: {}",
-                    describe_write_failure(&temporary, &error)
-                )));
-            }
-            startup.staged_image = Some(exe.clone());
-            Some(exe)
+            let target = exe.clone();
+            let image = self
+                .host_blocking(
+                    &host_work,
+                    format!(
+                        "linking or copying this server's image to {}",
+                        exe.display()
+                    ),
+                    move || stage_server_image(&target),
+                )
+                .await
+                .map_err(|error| ver_err(format!("server image thread: {error}")))?
+                .map_err(|error| {
+                    ver_err(format!("copy running binary for the session: {error}"))
+                })?;
+            eprintln!(
+                "session_start: server image {} {}",
+                exe.display(),
+                image.how
+            );
+            startup.staged_image = image.keep();
+            startup.staged_image.clone()
         } else {
             None
         };
         let pasta_ready_file = session_disk_path(&host_xdg_dir).join("pasta.pid");
-        let holder = staged_image
-            .as_deref()
-            .filter(|_| hold_netns)
-            .map(|image| NetnsHolder {
-                image,
-                ready_file: &pasta_ready_file,
-            });
-        if holder.is_some() {
+        let holder_image = staged_image.clone().filter(|_| hold_netns);
+        if holder_image.is_some() {
             eprintln!(
                 "session_start: NoNewPrivs is set; pasta attaches to namespaces the session creates"
             );
@@ -17233,15 +17487,35 @@ impl KwinMcp {
         );
         let scope = SessionScope::new(&self.path, memory);
         startup.scope_unit = Some(scope_unit.clone());
-        let mut cmd = match sandbox_launcher(
-            memory,
-            &host_runtime,
-            &host_session_bus,
-            Some(&scope_unit),
-            holder,
-        ) {
-            Ok(command) => command,
-            Err(error) => return cleanup_err(error, &mut startup),
+        let launcher = {
+            let (runtime, bus, unit) = (
+                host_runtime.clone(),
+                host_session_bus.clone(),
+                scope_unit.clone(),
+            );
+            self.host_blocking(
+                &host_work,
+                "checking the systemd user manager (systemd-run --user --scope)",
+                move || {
+                    let holder = holder_image.as_deref().map(|image| NetnsHolder {
+                        image,
+                        ready_file: &pasta_ready_file,
+                    });
+                    sandbox_launcher(memory, &runtime, &bus, Some(&unit), holder)
+                },
+            )
+            .await
+        };
+        self.set_start_stage("finishing the sandbox command");
+        let mut cmd = match launcher {
+            Ok(Ok(command)) => command,
+            Ok(Err(error)) => return cleanup_err(error, &mut startup),
+            Err(error) => {
+                return cleanup_err(
+                    format!("systemd user manager check thread: {error}"),
+                    &mut startup,
+                );
+            }
         };
         let cdp_forward_spec = format!("127.0.0.1/{cdp_forward_port}");
         // With auto, an explicit range defines the complete scan set, not
@@ -30957,6 +31231,75 @@ mod session_memory_warning_tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(warning, Some("memory_high"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_start_host_tests {
+    use super::{Pressure, read_pressure, stage_server_image};
+
+    #[test]
+    fn start_pressure_reads_host_and_cgroup_files() -> Result<(), String> {
+        let directory =
+            std::env::temp_dir().join(format!("kwin-mcp-start-pressure-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let io = "some avg10=94.10 avg60=88.00 avg300=40.00 total=5\nfull avg10=70.00 avg60=60.00 avg300=20.00 total=3\n";
+        let memory = "some avg10=0.00 avg60=12.50 avg300=1.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        for (name, text) in [
+            ("io", io),
+            ("memory", memory),
+            ("io.pressure", io),
+            ("memory.pressure", memory),
+        ] {
+            std::fs::write(directory.join(name), text).map_err(|error| error.to_string())?;
+        }
+        let expected = vec![
+            Pressure {
+                resource: "io",
+                name: "disk I/O",
+                avg10: 94.1,
+                avg60: 88.0,
+            },
+            Pressure {
+                resource: "memory",
+                name: "memory",
+                avg10: 0.0,
+                avg60: 12.5,
+            },
+        ];
+        // No CPU file: the kernel does not report it, so it is left out.
+        assert_eq!(read_pressure(&directory, false), expected);
+        assert_eq!(read_pressure(&directory, true), expected);
+        std::fs::remove_dir_all(&directory).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_staged_server_image_is_this_image_and_leaves_with_its_guard() -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        // Beside the test executable, on its filesystem, so it can be linked.
+        let directory = std::env::current_exe()
+            .map_err(|error| error.to_string())?
+            .with_file_name(format!("kwin-mcp-staged-image-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let running = std::fs::metadata("/proc/self/exe").map_err(|error| error.to_string())?;
+        let identity = |name: &str| {
+            std::fs::metadata(directory.join(name)).map(|staged| (staged.dev(), staged.ino()))
+        };
+        let first = stage_server_image(&directory.join("first"))?;
+        assert_eq!(
+            identity("first").map_err(|error| error.to_string())?,
+            (running.dev(), running.ino()),
+            "{}",
+            first.how
+        );
+        let second = stage_server_image(&directory.join("second"))?;
+        assert!(second.how.starts_with("linked from"), "{}", second.how);
+        let kept = second.keep();
+        // A start that is gone when its image arrives leaves no image behind.
+        drop(first);
+        assert!(!directory.join("first").exists());
+        assert!(kept.is_some_and(|path| path.is_file()));
+        std::fs::remove_dir_all(&directory).map_err(|error| error.to_string())
     }
 }
 
