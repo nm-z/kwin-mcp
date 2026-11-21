@@ -10079,7 +10079,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         8,
         "launch_app",
         json!({
-            "session_id": host_id, "command": "konsole --separate -p tabtitle=Viewer-host"
+            "session_id": host_id, "command": "konsole --separate --hold -e echo Waiting for the viewer"
         }),
     );
     assert!(
@@ -10105,7 +10105,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         &mut client,
         3,
         "launch_app",
-        json!({"session_id":session,"command":"konsole --separate -p tabtitle=Recovered-viewer"}),
+        json!({"session_id":session,"command":"konsole --separate --hold -e echo Recovered private viewer"}),
     );
     assert!(
         launched["result"]["structuredContent"]["window"].is_string(),
