@@ -1318,6 +1318,15 @@ The budget includes waiting for the lifecycle gate and preparing host profiles;
 it does not disable bounded startup or cleanup. Increase it explicitly when a
 large profile set needs more preparation time.
 
+A start that runs out of its budget names the operation it was in and the time
+each stage took, and the pressure it met: the share of the last 10 s and 60 s
+in which a task waited for disk I/O, memory or CPU (PSI "some"), on the host and
+in the server's own cgroup (`host_pressure`, `server_pressure`). When one of
+them reached 25%, the error asks the caller to wait 60 s before the next
+`session_start` (`retry_after_ms`) instead of retrying into the same load. Host
+calls of a start that can wait in the kernel run on blocking threads, so the
+budget ends on time and the server keeps answering other calls meanwhile.
+
 Every session inherits the host's Chromium profiles and their cookies. When the
 server starts, it reads Chrome's `Local State` and lists each profile's
 directory, name and last use in the `launch_app` description, most recently
