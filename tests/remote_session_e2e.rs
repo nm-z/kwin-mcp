@@ -47,6 +47,14 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// What this test sends a server with `initialize`.
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion":"2025-06-18", "capabilities":{},
+        "clientInfo":{"name":"remote-session-e2e","version":"1"}
+    })
+}
+
 struct Listener {
     child: Child,
     address: String,
@@ -61,12 +69,22 @@ impl Drop for Listener {
 
 impl Listener {
     fn start(home: &Path) -> Self {
-        Self::start_at(home, format!("127.0.0.1:{}", free_port()))
+        Self::start_with(home, &["--autoclean"])
+    }
+
+    /// A listener on a free port, started with these options.
+    fn start_with(home: &Path, options: &[&str]) -> Self {
+        Self::spawn(home, format!("127.0.0.1:{}", free_port()), options)
     }
 
     fn start_at(home: &Path, address: String) -> Self {
+        Self::spawn(home, address, &["--autoclean"])
+    }
+
+    fn spawn(home: &Path, address: String, options: &[&str]) -> Self {
         let mut child = kwin_mcp(home)
-            .args(["--listen", &address, "--autoclean"])
+            .args(["--listen", &address])
+            .args(options)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -90,6 +108,8 @@ struct Server {
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
+    /// The instructions the server gave at `initialize`.
+    instructions: String,
 }
 
 impl Drop for Server {
@@ -137,15 +157,14 @@ impl Server {
             stdin,
             stdout,
             next_id: 0,
+            instructions: String::new(),
         };
-        let reply = server.request(
-            "initialize",
-            json!({
-                "protocolVersion":"2025-06-18", "capabilities":{},
-                "clientInfo":{"name":"remote-session-e2e","version":"1"}
-            }),
-        );
+        let reply = server.request("initialize", initialize_params());
         assert!(reply["result"].is_object(), "{reply}");
+        server.instructions = reply["result"]["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         writeln!(
             server.stdin,
             "{}",
@@ -183,10 +202,16 @@ impl Server {
 
     /// Starts a session on `host` and returns its ID and sandbox PID.
     fn start_remote(&mut self, host: &str) -> (String, u64) {
-        let started = self.tool(
-            "session_start",
-            json!({"host":host, "width":1280, "height":720}),
-        );
+        let (started, sandbox) = self.start_remote_with(host, json!({"width":1280, "height":720}));
+        let session = started["session_id"].as_str().expect("session id");
+        (session.to_owned(), sandbox)
+    }
+
+    /// Starts a session on `host` with these other session_start arguments,
+    /// and returns what the start answered and the session's sandbox PID.
+    fn start_remote_with(&mut self, host: &str, mut arguments: Value) -> (Value, u64) {
+        arguments["host"] = json!(host);
+        let started = self.tool("session_start", arguments);
         let session = started["result"]["structuredContent"]["session_id"]
             .as_str()
             .unwrap_or_else(|| panic!("no session id: {started}"))
@@ -204,7 +229,7 @@ impl Server {
         assert_eq!(record["host"], host, "remote session not listed: {listed}");
         assert_eq!(record["status"], "running", "{record}");
         let sandbox = record["sandbox_pid"].as_u64().expect("sandbox pid");
-        (session, sandbox)
+        (started["result"]["structuredContent"].clone(), sandbox)
     }
 }
 
@@ -287,20 +312,39 @@ fn http_get(port: u16, path: &str) -> String {
     String::from_utf8_lossy(&body).into_owned()
 }
 
-/// One CDP call over a WebSocket of its own to `url`, by hand (RFC 6455: a
-/// masked text frame out, one unmasked frame back).
+/// One CDP call over a WebSocket of its own to `url`.
 fn cdp_call(url: &str, request: &Value) -> Value {
-    use std::io::Read;
     let rest = url.strip_prefix("ws://").expect("ws URL");
     let (authority, path) = rest.split_once('/').expect("ws path");
+    websocket_call(authority, &format!("/{path}"), "", request)
+}
+
+/// The `initialize` answer of the listener at `address`, on a control socket
+/// of its own that presents `secret`.
+fn listener_initialize(address: &str, secret: &str) -> Value {
+    let request =
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":initialize_params()});
+    websocket_call(
+        address,
+        "/",
+        &format!("Authorization: Bearer {secret}\r\n"),
+        &request,
+    )
+}
+
+/// One message and its answer over a WebSocket of its own to `path` at
+/// `authority`, by hand (RFC 6455: a masked text frame out, one unmasked frame
+/// back). `headers` are more handshake lines, each ending in CRLF.
+fn websocket_call(authority: &str, path: &str, headers: &str, request: &Value) -> Value {
+    use std::io::Read;
     let mut stream = std::net::TcpStream::connect(authority).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
     write!(
         stream,
-        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: a2l3aW4tbWNwLTk2MS1rZXk=\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: a2l3aW4tbWNwLTk2MS1rZXk=\r\nSec-WebSocket-Version: 13\r\n{headers}\r\n"
     )
     .expect("send upgrade");
     let mut head = Vec::new();
@@ -315,10 +359,16 @@ fn cdp_call(url: &str, request: &Value) -> Value {
         String::from_utf8_lossy(&head)
     );
     let payload = request.to_string().into_bytes();
-    let length = u8::try_from(payload.len()).expect("a short request");
-    assert!(length < 126);
     let mask = [7u8, 3, 1, 9];
-    let mut frame = vec![0x81, 0x80 | length];
+    let mut frame = vec![0x81];
+    match u8::try_from(payload.len()) {
+        Ok(length) if length < 126 => frame.push(0x80 | length),
+        Ok(_) | Err(_) => {
+            let length = u16::try_from(payload.len()).expect("a request under 64 KiB");
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&length.to_be_bytes());
+        }
+    }
     frame.extend_from_slice(&mask);
     frame.extend(
         payload
@@ -335,12 +385,12 @@ fn cdp_call(url: &str, request: &Value) -> Value {
             stream.read_exact(&mut extended).expect("frame length");
             usize::from(u16::from_be_bytes(extended))
         }
-        127 => panic!("an unexpectedly long CDP answer"),
+        127 => panic!("an unexpectedly long answer"),
         short => usize::from(short),
     };
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body).expect("frame body");
-    serde_json::from_slice(&body).expect("CDP answer")
+    serde_json::from_slice(&body).expect("a JSON answer")
 }
 
 /// Asks the listener at `address` for a CDP socket to loopback `port`, sends
@@ -659,4 +709,187 @@ fn a_session_runs_on_the_listener_and_ends_with_its_owner() {
     drop(server);
     drop(listener);
     let _ = std::fs::remove_dir_all(home);
+}
+
+// ── The size of a listener's desktops (#984) ────────────────────────────
+
+/// The options of the listener that systemd/kwin-mcp-listen.service starts,
+/// which name no size.
+const SERVICE_OPTIONS: [&str; 4] = ["--no-viewer", "--autoclean", "--ttl", "120"];
+
+/// What a server's instructions say about the size of the desktops it starts:
+/// the words after "The virtual display" to the end of their clause.
+fn size_sentence(instructions: &str) -> &str {
+    instructions
+        .split_once("The virtual display ")
+        .and_then(|(_, rest)| rest.split_inclusive(['.', ';']).next())
+        .unwrap_or(instructions)
+}
+
+/// The size the compositor of the session whose sandbox is `sandbox` was
+/// started at: the `--width` and `--height` of the kwin_wayland process in
+/// the session's scope.
+fn compositor_size(sandbox: u64) -> (u32, u32) {
+    let cgroup =
+        std::fs::read_to_string(format!("/proc/{sandbox}/cgroup")).expect("sandbox cgroup");
+    let scope = cgroup
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .next()
+        .expect("cgroup v2 path");
+    let members = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/cgroup.procs"))
+        .expect("scope members");
+    let compositors: Vec<&str> = members
+        .lines()
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == "kwin_wayland")
+        })
+        .collect();
+    let [compositor] = compositors.as_slice() else {
+        panic!("kwin_wayland in {scope}: {compositors:?}");
+    };
+    let argv = std::fs::read(format!("/proc/{compositor}/cmdline")).expect("compositor argv");
+    let argv: Vec<String> = argv
+        .split(|byte| *byte == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    let value = |flag: &str| -> u32 {
+        argv.iter()
+            .position(|arg| arg == flag)
+            .and_then(|at| argv.get(at + 1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no {flag} in {argv:?}"))
+    };
+    (value("--width"), value("--height"))
+}
+
+#[test]
+fn a_listener_without_a_size_offers_the_stdio_default_of_1920x1080() {
+    // The listener of the service gave every desktop 3840x2160.
+    let secret = "size-secret-0123456789";
+    let home = home_with_secret("size", Some(secret));
+    for (options, size) in [
+        (&SERVICE_OPTIONS[..], "defaults to 1920x1080;"),
+        (
+            &["--autoclean", "--width", "1280", "--height", "720"][..],
+            "defaults to 1280x720;",
+        ),
+        (
+            &[
+                "--autoclean",
+                "--width",
+                "1280",
+                "--height",
+                "720",
+                "--no-override",
+            ][..],
+            "is fixed at 1280x720 ",
+        ),
+    ] {
+        let listener = Listener::start_with(&home, options);
+        let answer = listener_initialize(&listener.address, secret);
+        let instructions = answer["result"]["instructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no instructions: {answer}"));
+        let said = size_sentence(instructions);
+        assert!(
+            said.contains(size),
+            "a listener with {options:?} said: {said}"
+        );
+    }
+    // A stdio server that names no size has the same default.
+    let server = Server::start(&home);
+    let said = size_sentence(&server.instructions);
+    assert!(
+        said.contains("defaults to 1920x1080;"),
+        "a stdio server said: {said}"
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
+fn a_listener_without_a_size_starts_1920x1080_desktops() {
+    // The listener of the service gave every desktop 3840x2160. Everything is
+    // read before the checks, so a failed check leaves no session behind.
+    let home = home_with_secret("display", Some("display-secret-0123456789"));
+    let listener = Listener::start_with(&home, &SERVICE_OPTIONS);
+    let host = listener.address.clone();
+    let mut server = Server::start(&home);
+    let (started, sandbox) = server.start_remote_with(&host, json!({}));
+    let session = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let reported = (started["width"].as_u64(), started["height"].as_u64());
+    let compositor = compositor_size(sandbox);
+    // A window maximized on the display covers all of it.
+    let launched = server.tool(
+        "launch_app",
+        json!({"session_id":session, "command":"konsole", "window_timeout_seconds":40}),
+    );
+    let window = launched["result"]["structuredContent"]["window"].clone();
+    let windows = server.tool("window_list", json!({"session_id":session}));
+    let geometry: Vec<_> = windows["result"]["structuredContent"]["windows"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|entry| entry["id"] == window)
+        .map(|entry| ["x", "y", "w", "h"].map(|key| entry[key].as_f64()))
+        .collect();
+    // KWIN_MCP_E2E_EVIDENCE names a directory that keeps a screenshot of it,
+    // taken once the window's opening animation is over.
+    if let Some(directory) = std::env::var_os("KWIN_MCP_E2E_EVIDENCE") {
+        std::thread::sleep(Duration::from_secs(2));
+        let kept = PathBuf::from(directory).join("listener-default-size.png");
+        let shot = server.tool("screenshot", json!({"session_id":session, "save_as":kept}));
+        assert!(shot["error"].is_null(), "{shot}");
+    }
+    // A size the start names still wins: start_remote names 1280x720.
+    let (named, named_sandbox) = server.start_remote(&host);
+    let named_size = compositor_size(named_sandbox);
+    // A listener's own size is its desktops' default, and with --no-override
+    // their only size: the 1280x720 that start_remote names is not taken.
+    let pinned = Listener::start_with(
+        &home,
+        &[
+            "--autoclean",
+            "--width",
+            "1600",
+            "--height",
+            "900",
+            "--no-override",
+        ],
+    );
+    let (fixed, fixed_sandbox) = server.start_remote(&pinned.address);
+    let fixed_size = compositor_size(fixed_sandbox);
+    for id in [&session, &named, &fixed] {
+        let stopped = server.tool("session_stop", json!({"session_id":id}));
+        assert!(stopped["error"].is_null(), "{stopped}");
+    }
+    drop(server);
+    drop(pinned);
+    drop(listener);
+    let _ = std::fs::remove_dir_all(home);
+
+    assert_eq!(
+        reported,
+        (Some(1920), Some(1080)),
+        "the size session_start reported"
+    );
+    assert_eq!(compositor, (1920, 1080), "the compositor's virtual output");
+    let full = [0.0, 0.0, 1920.0, 1080.0].map(Some);
+    assert_eq!(
+        geometry,
+        [full],
+        "the maximized window's x, y, w, h: {windows}; {launched}"
+    );
+    assert_eq!(named_size, (1280, 720), "a session that named its size");
+    assert_eq!(
+        fixed_size,
+        (1600, 900),
+        "a session of a --no-override listener"
+    );
 }
