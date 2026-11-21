@@ -43,7 +43,10 @@ impl Wire {
 
 /// The clipboard read and the tree as a client of this name receives them.
 fn read_as(client: &str) -> (Value, Value) {
-    let home = std::env::temp_dir().join(format!("kwin-mcp-client-body-{}-{client}", std::process::id()));
+    let home = std::env::temp_dir().join(format!(
+        "kwin-mcp-client-body-{}-{client}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(home.join(".cache")).expect("create private HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_kwin-mcp"))
         .args(["--autoclean", "--no-viewer"])
@@ -82,7 +85,10 @@ fn read_as(client: &str) -> (Value, Value) {
         json!({"session_id":session, "target":"session", "text":"clipboard-body-xyz"}),
     );
     let clipboard = wire.tool("clipboard_read", json!({"session_id":session}));
-    let tree = wire.tool("accessibility_tree", json!({"session_id":session, "max_depth":2}));
+    let tree = wire.tool(
+        "accessibility_tree",
+        json!({"session_id":session, "max_depth":2}),
+    );
     let _ = wire.tool("session_stop", json!({"session_id":session}));
     let _ = child.kill();
     let _ = child.wait();
@@ -93,23 +99,55 @@ fn read_as(client: &str) -> (Value, Value) {
 #[test]
 #[ignore = "requires KDE, KWin, bubblewrap, pasta, Konsole, and input devices"]
 fn each_client_gets_the_body_in_the_half_it_shows() {
-    let text = |result: &Value| result["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
-    let structured = |result: &Value, key: &str| result["result"]["structuredContent"][key].as_str().map(str::to_owned);
+    let text = |result: &Value| {
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let structured = |result: &Value, key: &str| {
+        result["result"]["structuredContent"][key]
+            .as_str()
+            .map(str::to_owned)
+    };
 
     let (clipboard, tree) = read_as("claude-code");
-    assert_eq!(structured(&clipboard, "text").as_deref(), Some("clipboard-body-xyz"), "{clipboard}");
-    assert!(!text(&clipboard).contains("clipboard-body-xyz"), "{clipboard}");
-    assert!(structured(&tree, "tree").is_some_and(|tree| tree.contains("Konsole")), "{tree}");
-    assert!(text(&tree).len() < 200, "the tree is also in the text: {tree}");
+    assert_eq!(
+        structured(&clipboard, "text").as_deref(),
+        Some("clipboard-body-xyz"),
+        "{clipboard}"
+    );
+    assert!(
+        !text(&clipboard).contains("clipboard-body-xyz"),
+        "{clipboard}"
+    );
+    assert!(
+        structured(&tree, "tree").is_some_and(|tree| tree.contains("Konsole")),
+        "{tree}"
+    );
+    assert!(
+        text(&tree).len() < 200,
+        "the tree is also in the text: {tree}"
+    );
 
     let (clipboard, tree) = read_as("codex-mcp-client");
     assert_eq!(text(&clipboard), "clipboard-body-xyz", "{clipboard}");
     assert!(structured(&clipboard, "text").is_none(), "{clipboard}");
     assert!(text(&tree).contains("Konsole"), "{tree}");
-    assert!(structured(&tree, "tree").is_none(), "the tree is also in structuredContent");
+    assert!(
+        structured(&tree, "tree").is_none(),
+        "the tree is also in structuredContent"
+    );
 
     let (clipboard, tree) = read_as("some-other-client");
     assert_eq!(text(&clipboard), "clipboard-body-xyz", "{clipboard}");
-    assert_eq!(structured(&clipboard, "text").as_deref(), Some("clipboard-body-xyz"), "{clipboard}");
-    assert!(text(&tree).contains("Konsole") && structured(&tree, "tree").is_some(), "{tree}");
+    assert_eq!(
+        structured(&clipboard, "text").as_deref(),
+        Some("clipboard-body-xyz"),
+        "{clipboard}"
+    );
+    assert!(
+        text(&tree).contains("Konsole") && structured(&tree, "tree").is_some(),
+        "{tree}"
+    );
 }

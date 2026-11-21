@@ -105,10 +105,7 @@ fn a_second_server_reaches_a_session_whose_client_closed() {
     let mut first = Server::start(&home, &["--keep-sessions", "5"]);
     let first_pid = first.child.id();
 
-    let started = first.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = first.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")

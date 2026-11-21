@@ -35,7 +35,11 @@ impl Wire {
     }
 
     fn tool(&mut self, id: u64, name: &str, arguments: Value) -> Value {
-        self.request(id, "tools/call", json!({"name":name, "arguments":arguments}))
+        self.request(
+            id,
+            "tools/call",
+            json!({"name":name, "arguments":arguments}),
+        )
     }
 }
 
@@ -49,7 +53,12 @@ fn processes() -> Vec<(u32, String, u32)> {
             let text = std::fs::read_to_string(entry.path().join("stat")).ok()?;
             let (open, close) = (text.find('(')?, text.rfind(')')?);
             let comm = text.get(open + 1..close)?.to_owned();
-            let parent = text.get(close + 1..)?.split_whitespace().nth(1)?.parse().ok()?;
+            let parent = text
+                .get(close + 1..)?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
             Some((pid, comm, parent))
         })
         .collect()
@@ -73,7 +82,11 @@ fn compositor_below(root: u32) -> Option<u32> {
 
 fn signal(pid: u32, signal: i32) {
     let pid = i32::try_from(pid).expect("pid fits");
-    assert_eq!(unsafe { nix::libc::kill(pid, signal) }, 0, "signal {signal}");
+    assert_eq!(
+        unsafe { nix::libc::kill(pid, signal) },
+        0,
+        "signal {signal}"
+    );
 }
 
 /// A running session with Konsole open, and its compositor's pid.
@@ -102,11 +115,7 @@ fn session_with_compositor(home: &std::path::Path) -> (Child, Wire, String, u32)
     );
     assert!(reply["result"].is_object(), "{reply}");
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        2,
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool(2, "session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -185,5 +194,8 @@ fn window_list_with_a_stopped_compositor_ends_with_an_error() {
     let snapshot = stalled["error"]["data"]["sandbox_snapshot"]
         .as_str()
         .expect("the error carries a sandbox snapshot");
-    assert!(snapshot.contains(&format!("kwin_wayland[{compositor}<-")), "{snapshot}");
+    assert!(
+        snapshot.contains(&format!("kwin_wayland[{compositor}<-")),
+        "{snapshot}"
+    );
 }

@@ -70,10 +70,7 @@ fn a_paste_that_landed_is_verified_and_one_into_a_non_field_is_not() {
     );
     assert!(reply["result"].is_object(), "{reply}");
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -99,14 +96,20 @@ fn a_paste_that_landed_is_verified_and_one_into_a_non_field_is_not() {
     std::thread::sleep(std::time::Duration::from_secs(4));
 
     // Into the editable div: the text appears, so the paste is verified.
-    wire.tool("mouse_click", json!({"session_id":session, "x":200, "y":135}));
+    wire.tool(
+        "mouse_click",
+        json!({"session_id":session, "x":200, "y":135}),
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
     let landed = wire.tool(
         "keyboard_paste",
         json!({"session_id":session, "text":"PASTED-TEXT-123"}),
     );
     // With focus on page text that is not a field nothing can be confirmed.
-    wire.tool("mouse_click", json!({"session_id":session, "x":100, "y":230}));
+    wire.tool(
+        "mouse_click",
+        json!({"session_id":session, "x":100, "y":230}),
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
     let missed = wire.tool(
         "keyboard_paste",

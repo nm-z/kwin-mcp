@@ -53,7 +53,9 @@ impl Fixture {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
         let port = listener.local_addr().expect("fixture address").port();
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (worker_stop, worker_requests) = (stop.clone(), requests.clone());
@@ -324,7 +326,10 @@ impl Wire {
                     return window["id"].as_str().expect("window id").to_owned();
                 }
             }
-            assert!(Instant::now() < deadline, "no window titled {title}: {windows:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no window titled {title}: {windows:?}"
+            );
             thread::sleep(Duration::from_millis(250));
         }
     }
@@ -448,7 +453,10 @@ fn navigate_while_another_window_takes_focus(
 fn browser(name: &str, fixture: &Fixture, cdp: bool) -> (Wire, String) {
     let mut wire = Wire::start(name);
     let profile = if cdp {
-        format!("--user-data-dir={} ", wire.workdir.join("profile").display())
+        format!(
+            "--user-data-dir={} ",
+            wire.workdir.join("profile").display()
+        )
     } else {
         String::new()
     };
@@ -484,7 +492,10 @@ fn a_page_that_keeps_ctrl_l_does_not_keep_the_tab() {
     );
     let content = landed(&left, &fixture.url("/beta"), TYPED);
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("fixture/beta"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fixture/beta"),
         "{left}"
     );
     wire.keep("853-left-a-page-that-keeps-ctrl-l");
@@ -500,7 +511,11 @@ fn a_page_that_keeps_ctrl_l_does_not_keep_the_tab() {
     let redirect = wire.navigate(&fixture.url("/redirect"));
     let content = landed(&redirect, &fixture.url("/elsewhere"), TYPED);
     assert_eq!(content["redirected"], true, "{redirect}");
-    assert_eq!(content["requested_url"], fixture.url("/redirect"), "{redirect}");
+    assert_eq!(
+        content["requested_url"],
+        fixture.url("/redirect"),
+        "{redirect}"
+    );
 
     // Another part of the page the tab shows opens no new document, and the
     // blank page has no address in accessibility: both are still reached.
@@ -535,7 +550,10 @@ fn a_router_address_is_opened_and_never_searched_for() {
     );
     let content = landed(&router, &fixture.url("/v1/blocks"), TYPED);
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("fixture/v1/blocks"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fixture/v1/blocks"),
         "{router}"
     );
     wire.keep("865-router-address-after-a-busy-page");
@@ -586,15 +604,24 @@ fn an_address_longer_than_2000_characters_is_opened() {
     );
     assert!(kept["error"].is_null(), "{kept}");
     let pasted = wire.navigate(&long_data_url(3000));
-    assert!(pasted["error"].is_null(), "the address was refused: {pasted}");
+    assert!(
+        pasted["error"].is_null(),
+        "the address was refused: {pasted}"
+    );
     let content = &pasted["result"]["structuredContent"];
     assert_eq!(content["method"], "address_bar_pasted", "{pasted}");
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("long-3000"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("long-3000"),
         "{pasted}"
     );
     assert!(
-        content["url"].as_str().unwrap_or_default().ends_with("[3000 characters]"),
+        content["url"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("[3000 characters]"),
         "the whole address did not arrive: {pasted}"
     );
     assert!(content.get("redirected").is_none(), "{pasted}");
@@ -728,12 +755,19 @@ fn with_cdp_the_tab_is_navigated_directly_and_read_back() {
 
     // #853, #865: no key is sent, so a page that keeps ctrl+l changes nothing,
     // and a bare host is opened as an address.
-    landed(&wire.navigate(&fixture.url("/trap")), &fixture.url("/trap"), "cdp");
+    landed(
+        &wire.navigate(&fixture.url("/trap")),
+        &fixture.url("/trap"),
+        "cdp",
+    );
     let bare = wire.navigate(&format!("127.0.0.1:{}/v1/blocks", fixture.port));
     assert_eq!(fixture.requests_for("/v1/blocks"), 1, "{bare}");
     let content = landed(&bare, &fixture.url("/v1/blocks"), "cdp");
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("fixture/v1/blocks"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fixture/v1/blocks"),
         "{bare}"
     );
     wire.keep("865-bare-router-address-with-cdp");
@@ -742,7 +776,11 @@ fn with_cdp_the_tab_is_navigated_directly_and_read_back() {
     let content = landed(&redirect, &fixture.url("/elsewhere"), "cdp");
     assert_eq!(content["redirected"], true, "{redirect}");
     landed(&wire.navigate("about:blank"), "about:blank", "cdp");
-    landed(&wire.navigate(&fixture.url("/elsewhere")), &fixture.url("/elsewhere"), "cdp");
+    landed(
+        &wire.navigate(&fixture.url("/elsewhere")),
+        &fixture.url("/elsewhere"),
+        "cdp",
+    );
     let part = wire.navigate(&fixture.url("/elsewhere#part"));
     landed(&part, &fixture.url("/elsewhere#part"), "cdp");
     assert_eq!(fixture.requests_for("/elsewhere"), 2, "{part}");
@@ -768,11 +806,17 @@ fn with_cdp_the_tab_is_navigated_directly_and_read_back() {
     let content = &long["result"]["structuredContent"];
     assert_eq!(content["method"], "cdp", "{long}");
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("long-200000"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("long-200000"),
         "{long}"
     );
     assert!(
-        content["url"].as_str().unwrap_or_default().ends_with("[200000 characters]"),
+        content["url"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("[200000 characters]"),
         "{long}"
     );
     let clipboard = wire.tool("clipboard_read", json!({}));
@@ -807,7 +851,10 @@ fn with_cdp_the_tab_is_navigated_directly_and_read_back() {
     let stolen = navigate_while_another_window_takes_focus(&mut wire, &fixture, &other);
     let content = landed(&stolen, &fixture.url("/slow"), "cdp");
     assert!(
-        content["title"].as_str().unwrap_or_default().contains("fixture/slow"),
+        content["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fixture/slow"),
         "the title is not the opened page's: {stolen}"
     );
     assert_eq!(content["window_active"], false, "{stolen}");

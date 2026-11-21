@@ -68,10 +68,7 @@ fn inputs_show_their_value_and_a_refused_type_names_the_focus() {
         }),
     );
     wire.send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
-    let started = wire.tool(
-        "session_start",
-        json!({"width":1280, "height":720}),
-    );
+    let started = wire.tool("session_start", json!({"width":1280, "height":720}));
     let session = started["result"]["structuredContent"]["session_id"]
         .as_str()
         .expect("session id")
@@ -112,7 +109,10 @@ fn inputs_show_their_value_and_a_refused_type_names_the_focus() {
         located["y"].as_f64().unwrap_or(0.0) + located["h"].as_f64().unwrap_or(0.0) / 2.0,
     );
     #[expect(clippy::as_conversions)]
-    wire.tool("mouse_click", json!({"session_id":session, "x":x as i64, "y":y as i64}));
+    wire.tool(
+        "mouse_click",
+        json!({"session_id":session, "x":x as i64, "y":y as i64}),
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
     let refused = wire.tool("keyboard_type", json!({"session_id":session, "text":"x"}));
     let _ = wire.tool("session_stop", json!({"session_id":session}));
@@ -129,6 +129,9 @@ fn inputs_show_their_value_and_a_refused_type_names_the_focus() {
         "{locked}"
     );
     let message = refused["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("locked"), "the refusal does not name the field: {refused}");
+    assert!(
+        message.contains("locked"),
+        "the refusal does not name the field: {refused}"
+    );
     assert!(message.contains("read-only or disabled"), "{refused}");
 }

@@ -154,26 +154,34 @@ impl Desk {
             part.display(),
             done.display()
         );
-        let launched = self.tool("launch_app", json!({"command":command, "expect_window":false}));
+        let launched = self.tool(
+            "launch_app",
+            json!({"command":command, "expect_window":false}),
+        );
         assert!(launched["error"].is_null(), "{launched}");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(output) = std::fs::read_to_string(&done) {
                 return output;
             }
-            assert!(Instant::now() < deadline, "the session never finished: {script}");
+            assert!(
+                Instant::now() < deadline,
+                "the session never finished: {script}"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
     /// The command line of the session's browser process named `process`.
     fn browser_argv(&mut self, process: &str) -> Vec<String> {
-        self.run(&format!("tr '\\0' '\\n' < /proc/$(pgrep -o -x {process})/cmdline"))
-            // Chrome rewrites its command line as one string, so spaces part
-            // the switches too; no path in these cases holds one.
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect()
+        self.run(&format!(
+            "tr '\\0' '\\n' < /proc/$(pgrep -o -x {process})/cmdline"
+        ))
+        // Chrome rewrites its command line as one string, so spaces part
+        // the switches too; no path in these cases holds one.
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
     }
 
     /// How many browsers (not their helper processes) named `process` run.
@@ -220,8 +228,11 @@ impl Desk {
     /// A page titled `name` that the session reads from the shared workdir.
     fn page(&self, name: &str) -> String {
         let path = self.workdir.join(format!("{name}.html"));
-        std::fs::write(&path, format!("<!doctype html><title>{name}</title><h1>{name}</h1>"))
-            .expect("write page");
+        std::fs::write(
+            &path,
+            format!("<!doctype html><title>{name}</title><h1>{name}</h1>"),
+        )
+        .expect("write page");
         format!("file://{}", path.display())
     }
 
@@ -259,7 +270,11 @@ impl Drop for Desk {
 
 /// The session's forwarded port from a launch result that connected.
 fn cdp_port(launched: &Value) -> u16 {
-    assert_eq!(launched["cdp"], json!(true), "no CDP connection: {launched}");
+    assert_eq!(
+        launched["cdp"],
+        json!(true),
+        "no CDP connection: {launched}"
+    );
     launched["cdp_port"]
         .as_u64()
         .and_then(|port| u16::try_from(port).ok())
@@ -288,7 +303,11 @@ fn tabs(port: u16) -> Vec<String> {
         if let Some((head, body)) = text.split_once("\r\n\r\n") {
             let length = head
                 .lines()
-                .filter_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::to_owned))
+                .filter_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::to_owned)
+                })
                 .filter_map(|value| value.trim().parse::<usize>().ok())
                 .next();
             if length.is_some_and(|length| body.len() >= length) {
@@ -316,7 +335,9 @@ fn tabs_include(port: u16, addresses: &[&str]) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let open = tabs(port);
-        if addresses.iter().all(|address| open.iter().any(|tab| tab == address))
+        if addresses
+            .iter()
+            .all(|address| open.iter().any(|tab| tab == address))
             || Instant::now() >= deadline
         {
             return open;
@@ -394,10 +415,13 @@ fn chrome_without_a_data_directory_gets_the_port_on_its_default_profile() {
     let first = desk.launch(&format!("google-chrome-stable {}", pages[0]), json!({}));
     let port = cdp_port(&first);
     let argv = desk.browser_argv("chrome");
-    let state = desk.run("test -f \"$HOME/.config/google-chrome/Local State\" && echo state=present");
+    let state =
+        desk.run("test -f \"$HOME/.config/google-chrome/Local State\" && echo state=present");
     // The variable is the browser's alone.
     let session_variable = desk.run("echo \"variable=${CHROME_CONFIG_HOME-unset}\"");
-    let link = desk.linked_config_home(&desk.home.join(".config")).join("google-chrome");
+    let link = desk
+        .linked_config_home(&desk.home.join(".config"))
+        .join("google-chrome");
     let linked_to = std::fs::read_link(&link);
 
     let navigated = desk.tool("browser_navigate", json!({"url":pages[1]}));
@@ -410,7 +434,8 @@ fn chrome_without_a_data_directory_gets_the_port_on_its_default_profile() {
     let inherited = desk.launch(
         &format!(
             "CHROME_CONFIG_HOME='{}' {} {}",
-            desk.linked_config_home(&desk.home.join(".config")).display(),
+            desk.linked_config_home(&desk.home.join(".config"))
+                .display(),
             chrome.display(),
             pages[4]
         ),
@@ -422,8 +447,14 @@ fn chrome_without_a_data_directory_gets_the_port_on_its_default_profile() {
     desk.evidence("default-profile");
 
     assert_eq!(data_dirs(&argv), [profile.to_string_lossy()], "{argv:?}");
-    assert!(state.contains("state=present"), "the default directory holds no profile: {state}");
-    assert!(session_variable.contains("variable=unset"), "{session_variable}");
+    assert!(
+        state.contains("state=present"),
+        "the default directory holds no profile: {state}"
+    );
+    assert!(
+        session_variable.contains("variable=unset"),
+        "{session_variable}"
+    );
     assert_eq!(linked_to.ok(), Some(profile), "{}", link.display());
     assert_eq!(
         navigated["result"]["structuredContent"]["method"], "cdp",
@@ -433,12 +464,22 @@ fn chrome_without_a_data_directory_gets_the_port_on_its_default_profile() {
         scrolled["result"]["structuredContent"]["scroll_y"].is_number(),
         "scroll reporting needs CDP: {scrolled}"
     );
-    for (how, launched) in [("wrapper", &second), ("absolute path", &direct), ("inherited", &inherited)] {
-        assert_eq!(launched["window_outcome"], "reused_existing", "{how}: {launched}");
+    for (how, launched) in [
+        ("wrapper", &second),
+        ("absolute path", &direct),
+        ("inherited", &inherited),
+    ] {
+        assert_eq!(
+            launched["window_outcome"], "reused_existing",
+            "{how}: {launched}"
+        );
     }
     assert_eq!(cdp_port(&second), port);
     for page in &expected {
-        assert!(open.iter().any(|tab| tab == page), "{page} is not among {open:?}");
+        assert!(
+            open.iter().any(|tab| tab == page),
+            "{page} is not among {open:?}"
+        );
     }
     assert_eq!(browsers, 1, "every launch reaches one browser");
 }
@@ -459,7 +500,10 @@ fn a_profile_directory_opens_that_profile_with_the_port() {
     desk.evidence("profile-directory");
 
     assert!(open.contains(&page), "{open:?}");
-    assert!(second && !default, "opened Default: {default}, Profile 2: {second}");
+    assert!(
+        second && !default,
+        "opened Default: {default}, Profile 2: {second}"
+    );
     assert_eq!(
         data_dirs(&argv),
         [desk.home.join(".config/google-chrome").to_string_lossy()]
@@ -474,14 +518,20 @@ fn the_profile_picker_window_has_the_port() {
     let launched = desk.launch("google-chrome-stable", json!({}));
     let port = cdp_port(&launched);
     desk.evidence("picker");
-    let reply = desk.tool("mouse_click_element", json!({"query":"Beta", "timeout_seconds":30}));
+    let reply = desk.tool(
+        "mouse_click_element",
+        json!({"query":"Beta", "timeout_seconds":30}),
+    );
     let browser = desk.window_titled(" - Google Chrome", 40);
     let navigated = desk.tool("browser_navigate", json!({"url":page}));
     let open = tabs_include(port, &[&page]);
     let (_, second) = opened_profiles(&mut desk);
     desk.evidence("picker-after");
 
-    assert_eq!(launched["window_title"], "Google Chrome", "the picker: {launched}");
+    assert_eq!(
+        launched["window_title"], "Google Chrome",
+        "the picker: {launched}"
+    );
     assert!(reply["error"].is_null(), "{reply}");
     assert!(browser, "no browser window opened after {reply}");
     assert_eq!(
@@ -501,7 +551,8 @@ fn a_preset_config_home_and_a_launcher_flags_file_are_followed() {
         let preset = home.join(".config/chrome-default");
         std::fs::create_dir_all(&profile).expect("create Chrome data directory");
         std::fs::create_dir_all(&preset).expect("create the preset config home");
-        std::os::unix::fs::symlink(&profile, preset.join("google-chrome")).expect("link the default");
+        std::os::unix::fs::symlink(&profile, preset.join("google-chrome"))
+            .expect("link the default");
         // Read by a launcher that has such a file (Arch); ignored by others.
         std::fs::write(
             home.join(".config/chrome-flags.conf"),
@@ -549,7 +600,10 @@ fn a_preset_config_home_and_a_launcher_flags_file_are_followed() {
 fn cdp_false_starts_chrome_without_a_port() {
     let mut desk = Desk::start("optout", None, |_| {});
     let page = desk.page("no-port");
-    let launched = desk.launch(&format!("google-chrome-stable {page}"), json!({"cdp":false}));
+    let launched = desk.launch(
+        &format!("google-chrome-stable {page}"),
+        json!({"cdp":false}),
+    );
     let argv = desk.browser_argv("chrome");
     let navigated = desk.tool("browser_navigate", json!({"url":desk.page("typed")}));
 
@@ -599,7 +653,9 @@ fn a_browser_that_resolves_the_linked_default_gets_an_unlinked_one() {
 
     assert_ne!(refused["cdp"], json!(true), "{refused}");
     assert!(
-        refused["cdp_refused"].as_str().is_some_and(|note| note.contains("launch it again")),
+        refused["cdp_refused"]
+            .as_str()
+            .is_some_and(|note| note.contains("launch it again")),
         "{refused}"
     );
     assert!(mark, "the refusal left no mark for the wrapper");
@@ -636,7 +692,10 @@ fn edge_on_its_default_profile_gets_the_port() {
     let first = desk.launch(&format!("{edge} {one}"), json!({}));
     let port = cdp_port(&first);
     let argv = desk.browser_argv("msedge");
-    let navigated = desk.tool("browser_navigate", json!({"url":desk.page("edge-navigated")}));
+    let navigated = desk.tool(
+        "browser_navigate",
+        json!({"url":desk.page("edge-navigated")}),
+    );
     let second = desk.launch(&format!("{edge} {two}"), json!({}));
     let open = tabs_include(port, &[&two]);
     let browsers = desk.browsers("msedge");

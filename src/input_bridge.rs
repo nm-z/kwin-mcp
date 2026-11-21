@@ -1011,7 +1011,11 @@ fn is_insertion(before: &str, after: &str, inserted: &str) -> bool {
 /// The number `after` spells when it differs from the number `before` spells.
 /// A value that input does not change cannot show that the input arrived.
 fn changed_number(before: &str, after: &str) -> Option<f64> {
-    let number = after.trim().parse::<f64>().ok().filter(|number| number.is_finite())?;
+    let number = after
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())?;
     (before.trim().parse::<f64>().ok() != Some(number)).then_some(number)
 }
 
@@ -1339,10 +1343,7 @@ async fn describe_control(node: &atspi::proxy::accessible::AccessibleProxy<'_>) 
     use atspi::proxy::proxy_ext::ProxyExt;
     let bounds = match node.proxies().await {
         Ok(proxies) => match proxies.component().await {
-            Ok(component) => component
-                .get_extents(atspi::CoordType::Screen)
-                .await
-                .ok(),
+            Ok(component) => component.get_extents(atspi::CoordType::Screen).await.ok(),
             Err(_) => None,
         },
         Err(_) => None,
@@ -1846,9 +1847,7 @@ impl TextReceipt {
         let before = text.get_text(0, -1).await?;
         let initial_blank_line = before == "\n";
         if before.chars().count() != usize::try_from(count)? {
-            anyhow::bail!(
-                "focused field character offsets do not match its text snapshot"
-            );
+            anyhow::bail!("focused field character offsets do not match its text snapshot");
         }
         // atspi-proxies 0.13 derives "GetNselections" from its
         // Rust spelling; the wire protocol uses "GetNSelections".
@@ -2356,7 +2355,9 @@ mod null_ref_tests {
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl NullRegistry {
         #[zbus(name = "GetChildren")]
-        fn get_children(&self) -> zbus::fdo::Result<Vec<(String, zbus::zvariant::OwnedObjectPath)>> {
+        fn get_children(
+            &self,
+        ) -> zbus::fdo::Result<Vec<(String, zbus::zvariant::OwnedObjectPath)>> {
             let null = zbus::zvariant::OwnedObjectPath::try_from("/org/a11y/atspi/null")
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
             Ok(vec![(String::new(), null)])
@@ -2430,7 +2431,10 @@ mod null_ref_tests {
             error.is::<super::TextDiscoveryTimedOut>(),
             "slowness was not reported as a timeout: {error}"
         );
-        assert!(error.to_string().contains("timed out after 300ms"), "{error}");
+        assert!(
+            error.to_string().contains("timed out after 300ms"),
+            "{error}"
+        );
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
         Ok(())
     }
@@ -2655,7 +2659,8 @@ mod null_ref_tests {
     // was used. The caption then matches no frame, and the window is found as
     // the frame of its own process that covers it.
     #[tokio::test]
-    async fn a_frame_renamed_by_its_application_is_bound_through_its_process() -> anyhow::Result<()> {
+    async fn a_frame_renamed_by_its_application_is_bound_through_its_process() -> anyhow::Result<()>
+    {
         let (_bus, address) = start_bus()?;
         let _served = serve_application(
             &address,
@@ -2669,7 +2674,10 @@ mod null_ref_tests {
         else {
             anyhow::bail!("a frame with another name was bound without knowing its process");
         };
-        assert!(by_caption.to_string().contains("no focused editable text"), "{by_caption}");
+        assert!(
+            by_caption.to_string().contains("no focused editable text"),
+            "{by_caption}"
+        );
         let other = TextReceipt::capture(&address, browser_window(Some(own + 1)), None, "7").await;
         assert!(other.is_err(), "a frame of another process was bound");
         let elsewhere = TextWindow {
@@ -2677,7 +2685,10 @@ mod null_ref_tests {
             ..browser_window(Some(own))
         };
         let moved = TextReceipt::capture(&address, elsewhere, None, "7").await;
-        assert!(moved.is_err(), "a frame that does not cover the window was bound");
+        assert!(
+            moved.is_err(),
+            "a frame that does not cover the window was bound"
+        );
 
         let receipt = TextReceipt::capture(&address, browser_window(Some(own)), None, "7").await?;
         assert_eq!(receipt.expected, "7");
@@ -2690,16 +2701,22 @@ mod null_ref_tests {
     #[tokio::test]
     async fn a_focused_editable_field_without_readable_text_is_named() -> anyhow::Result<()> {
         let (_bus, address) = start_bus()?;
-        let _served =
-            serve_application(&address, "New Tab - Google Chrome", &["Accessible", "Component"])
-                .await?;
+        let _served = serve_application(
+            &address,
+            "New Tab - Google Chrome",
+            &["Accessible", "Component"],
+        )
+        .await?;
         let Err(error) = TextReceipt::capture(&address, browser_window(None), None, "7").await
         else {
             anyhow::bail!("a field without a Text interface produced a receipt");
         };
         assert!(error.is::<super::UnreadableFocus>(), "{error}");
         let message = error.to_string();
-        assert!(message.contains("entry \"answer\" at screen (20,115 400x60)"), "{message}");
+        assert!(
+            message.contains("entry \"answer\" at screen (20,115 400x60)"),
+            "{message}"
+        );
         Ok(())
     }
 

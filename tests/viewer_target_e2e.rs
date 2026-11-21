@@ -67,19 +67,29 @@ impl Drop for Server {
 }
 
 fn server_binary() -> String {
-    std::env::var("KWIN_MCP_E2E_SERVER").unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned())
+    std::env::var("KWIN_MCP_E2E_SERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kwin-mcp").to_owned())
 }
 
 fn viewer_binary() -> PathBuf {
     let server = PathBuf::from(server_binary());
     let beside = server.with_file_name("kwin-viewer");
-    if beside.exists() { beside } else { PathBuf::from(env!("CARGO_BIN_EXE_kwin-viewer")) }
+    if beside.exists() {
+        beside
+    } else {
+        PathBuf::from(env!("CARGO_BIN_EXE_kwin-viewer"))
+    }
 }
 
 impl Server {
     /// `wrapper` runs the server under another program (for instance in a new
     /// user namespace); `environment` is added to a private HOME.
-    fn start(home: &Path, wrapper: &[&str], arguments: &[&str], environment: &[(&str, &str)]) -> Self {
+    fn start(
+        home: &Path,
+        wrapper: &[&str],
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Self {
         let binary = server_binary();
         let mut command = match wrapper.split_first() {
             Some((program, rest)) => {
@@ -104,7 +114,12 @@ impl Server {
         let mut child = command.spawn().expect("spawn kwin-mcp");
         let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-        let mut server = Self { child, stdin, stdout, next: 1 };
+        let mut server = Self {
+            child,
+            stdin,
+            stdout,
+            next: 1,
+        };
         let reply = server.request(
             "initialize",
             json!({
@@ -147,7 +162,9 @@ impl Server {
     fn session(&mut self, width: u32, height: u32) -> (String, PathBuf) {
         let started = self.tool("session_start", json!({"width":width, "height":height}));
         let content = &started["result"]["structuredContent"];
-        let id = content["session_id"].as_str().unwrap_or_else(|| panic!("session_start: {started}"));
+        let id = content["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session_start: {started}"));
         let workdir = content["workdir"].as_str().expect("session workdir");
         (id.to_owned(), PathBuf::from(workdir))
     }
@@ -161,15 +178,18 @@ impl Server {
 }
 
 fn require_e2e() {
-    assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"), "set KWIN_MCP_E2E=1 to run");
+    assert_eq!(
+        std::env::var("KWIN_MCP_E2E").as_deref(),
+        Ok("1"),
+        "set KWIN_MCP_E2E=1 to run"
+    );
 }
 
 /// A pid with no process, so no live `kwin-mcp` can be it.
 fn dead_pid() -> u32 {
     (2..=4_194_000_u32)
         .rev()
-        .skip_while(|pid| Path::new(&format!("/proc/{pid}")).exists())
-        .next()
+        .find(|pid| !Path::new(&format!("/proc/{pid}")).exists())
         .expect("a free pid")
 }
 
@@ -179,14 +199,22 @@ fn viewer_close_succeeds_for_a_session_whose_owner_is_gone() {
     let fixture = Fixture::new("gone");
     let runtime = fixture.0.join("run");
     std::fs::create_dir_all(&runtime).expect("runtime directory");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).expect("restrict runtime");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict runtime");
     let runtime_text = runtime.to_str().expect("runtime path");
-    let mut server =
-        Server::start(&fixture.home(), &[], &["--no-viewer"], &[("XDG_RUNTIME_DIR", runtime_text)]);
+    let mut server = Server::start(
+        &fixture.home(),
+        &[],
+        &["--no-viewer"],
+        &[("XDG_RUNTIME_DIR", runtime_text)],
+    );
     let dead = dead_pid();
     let session = format!("s{dead}-1");
     let closed = server.tool("viewer_close", json!({"session_id":session}));
-    assert!(closed["error"].is_null(), "viewer_close must not fail for an ended session: {closed}");
+    assert!(
+        closed["error"].is_null(),
+        "viewer_close must not fail for an ended session: {closed}"
+    );
     let content = &closed["result"]["structuredContent"];
     assert_eq!(content["status"], "already_closed", "{closed}");
     assert_eq!(content["session_status"], "owner_exited", "{closed}");
@@ -195,7 +223,10 @@ fn viewer_close_succeeds_for_a_session_whose_owner_is_gone() {
     assert_eq!(content["viewer"]["state"], "closed", "{closed}");
     // Other tools still say that the session is gone.
     let shot = server.tool("screenshot", json!({"session_id":session}));
-    assert_eq!(shot["error"]["data"]["reason"], "different_server_process", "{shot}");
+    assert_eq!(
+        shot["error"]["data"]["reason"], "different_server_process",
+        "{shot}"
+    );
 }
 
 // #894 as reported: the owner opened a viewer, shut down and recorded its
@@ -211,14 +242,30 @@ fn viewer_close_after_the_owner_shut_down_reports_the_stopped_session() {
     let display = desk_dir.join("wayland-0");
     let display = display.to_str().expect("desk display");
 
-    let mut owner = Server::start(&home, &[], &["--autoclean"], &[("WAYLAND_DISPLAY", display)]);
+    let mut owner = Server::start(
+        &home,
+        &[],
+        &["--autoclean"],
+        &[("WAYLAND_DISPLAY", display)],
+    );
     let (session, workdir) = owner.session(800, 600);
     let opened = owner.tool("viewer_open", json!({"session_id":session}));
-    assert_eq!(opened["result"]["structuredContent"]["viewer"]["state"], "ready", "{opened}");
-    let viewer = opened["result"]["structuredContent"]["viewer"]["pid"].as_u64().expect("viewer pid");
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{opened}"
+    );
+    let viewer = opened["result"]["structuredContent"]["viewer"]["pid"]
+        .as_u64()
+        .expect("viewer pid");
     owner.shut_down();
-    assert!(!Path::new(&format!("/proc/{viewer}")).exists(), "the viewer outlived its server");
-    assert!(!workdir.join("wayland-0").exists(), "the session outlived its server");
+    assert!(
+        !Path::new(&format!("/proc/{viewer}")).exists(),
+        "the viewer outlived its server"
+    );
+    assert!(
+        !workdir.join("wayland-0").exists(),
+        "the session outlived its server"
+    );
 
     let closed = desk.tool("viewer_close", json!({"session_id":session}));
     assert!(closed["error"].is_null(), "{closed}");
@@ -238,7 +285,9 @@ fn host_socket_links(directory: &Path) -> Vec<String> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if std::fs::read_link(&path).is_ok_and(|target| target.starts_with("/run/kwin-mcp-host-sockets")) {
+        if std::fs::read_link(&path)
+            .is_ok_and(|target| target.starts_with("/run/kwin-mcp-host-sockets"))
+        {
             links.push(entry.file_name().to_string_lossy().into_owned());
         } else if path.is_dir() && !path.is_symlink() {
             for nested in host_socket_links(&path) {
@@ -276,11 +325,20 @@ fn a_confined_server_links_no_host_socket_and_its_viewer_opens() {
     );
     let (session, workdir) = confined.session(800, 600);
     let links = host_socket_links(&workdir);
-    assert!(links.is_empty(), "host sockets were linked into the session: {links:?}");
+    assert!(
+        links.is_empty(),
+        "host sockets were linked into the session: {links:?}"
+    );
     let opened = confined.tool("viewer_open", json!({"session_id":session}));
-    assert_eq!(opened["result"]["structuredContent"]["viewer"]["state"], "ready", "{opened}");
+    assert_eq!(
+        opened["result"]["structuredContent"]["viewer"]["state"], "ready",
+        "{opened}"
+    );
     let closed = confined.tool("viewer_close", json!({"session_id":session}));
-    assert_eq!(closed["result"]["structuredContent"]["status"], "closed", "{closed}");
+    assert_eq!(
+        closed["result"]["structuredContent"]["status"], "closed",
+        "{closed}"
+    );
 }
 
 /// A child that leads its own process group, ended with the whole group:
@@ -291,7 +349,12 @@ struct Kill(Child);
 impl Kill {
     fn spawn(command: &mut Command, what: &str) -> Self {
         use std::os::unix::process::CommandExt;
-        Self(command.process_group(0).spawn().unwrap_or_else(|error| panic!("spawn {what}: {error}")))
+        Self(
+            command
+                .process_group(0)
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn {what}: {error}")),
+        )
     }
 
     fn signal(&self, signal: nix::sys::signal::Signal) {
@@ -362,7 +425,8 @@ fn the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon() {
     let own = fixture.0.join("own");
     for directory in [&other, &own] {
         std::fs::create_dir_all(directory).expect("runtime directory");
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).expect("restrict runtime");
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict runtime");
     }
     // The private session managers leave the tester's sound cards, cameras
     // and Bluetooth alone.
@@ -374,13 +438,27 @@ fn the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon() {
     )
     .expect("session manager configuration");
     let _other_pipewire = daemon("pipewire", &[], &home, &other);
-    wait_for("the other PipeWire daemon", || other.join("pipewire-0").exists());
+    wait_for("the other PipeWire daemon", || {
+        other.join("pipewire-0").exists()
+    });
     let _other_manager = daemon("wireplumber", &[], &home, &other);
-    std::os::unix::fs::symlink(other.join("pipewire-0"), own.join("pipewire-0")).expect("link the other daemon");
+    std::os::unix::fs::symlink(other.join("pipewire-0"), own.join("pipewire-0"))
+        .expect("link the other daemon");
     let _compositor = {
         let mut command = Command::new("dbus-run-session");
         command
-            .args(["--", "kwin_wayland", "--virtual", "--no-lockscreen", "--width", "800", "--height", "600", "--socket", "wayland-0"])
+            .args([
+                "--",
+                "kwin_wayland",
+                "--virtual",
+                "--no-lockscreen",
+                "--width",
+                "800",
+                "--height",
+                "600",
+                "--socket",
+                "wayland-0",
+            ])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_RUNTIME_DIR", &own)
@@ -394,12 +472,15 @@ fn the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon() {
             .stderr(Stdio::null());
         Kill::spawn(&mut command, "kwin_wayland")
     };
-    wait_for("the compositor's Wayland socket", || own.join("wayland-0").exists());
+    wait_for("the compositor's Wayland socket", || {
+        own.join("wayland-0").exists()
+    });
     // The compositor connects to PipeWire as it starts.
     std::thread::sleep(Duration::from_secs(3));
     let _own_pipewire = daemon("pipewire", &[], &home, &own);
     wait_for("the session's own PipeWire daemon", || {
-        std::fs::symlink_metadata(own.join("pipewire-0")).is_ok_and(|metadata| !metadata.is_symlink())
+        std::fs::symlink_metadata(own.join("pipewire-0"))
+            .is_ok_and(|metadata| !metadata.is_symlink())
     });
     let _own_manager = daemon("wireplumber", &[], &home, &own);
     std::thread::sleep(Duration::from_secs(2));
@@ -426,7 +507,10 @@ fn the_viewer_names_a_screencast_node_that_is_in_another_pipewire_daemon() {
             && detail.contains("connected to another PipeWire daemon"),
         "the viewer did not name the cause: {detail}\n{log}"
     );
-    assert!(!output.status.success(), "the viewer exited successfully\n{log}");
+    assert!(
+        !output.status.success(),
+        "the viewer exited successfully\n{log}"
+    );
     assert!(
         took < Duration::from_secs(3),
         "the viewer waited {took:?} for a frame that cannot come\n{log}"
@@ -438,16 +522,29 @@ fn session_scope(server: &mut Server, session: &str) -> (String, PathBuf) {
     let listed = server.tool("session_list", json!({}));
     let record = listed["result"]["structuredContent"]["sessions"]
         .as_array()
-        .and_then(|sessions| sessions.iter().skip_while(|entry| entry["session_id"] != session).next())
+        .and_then(|sessions| sessions.iter().find(|entry| entry["session_id"] == session))
         .unwrap_or_else(|| panic!("session is not listed: {listed}"))
         .clone();
-    let unit = record["scope_unit"].as_str().expect("scope unit").to_owned();
+    let unit = record["scope_unit"]
+        .as_str()
+        .expect("scope unit")
+        .to_owned();
     let sandbox = record["sandbox_pid"].as_u64().expect("sandbox pid");
     let group = std::fs::read_to_string(format!("/proc/{sandbox}/cgroup")).expect("sandbox cgroup");
-    let group = group.lines().filter_map(|line| line.strip_prefix("0::")).next().expect("cgroup v2 path");
-    let (parent, _) = group.rsplit_once(unit.as_str()).expect("scope in cgroup path");
+    let group = group
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .next()
+        .expect("cgroup v2 path");
+    let (parent, _) = group
+        .rsplit_once(unit.as_str())
+        .expect("scope in cgroup path");
     let directory = PathBuf::from(format!("/sys/fs/cgroup{parent}{unit}"));
-    assert!(directory.join("cgroup.procs").exists(), "scope cgroup: {}", directory.display());
+    assert!(
+        directory.join("cgroup.procs").exists(),
+        "scope cgroup: {}",
+        directory.display()
+    );
     (unit, directory)
 }
 
@@ -474,7 +571,9 @@ fn session_stop_answers_after_the_scope_is_empty_or_names_what_is_left() {
     let members = std::fs::read_to_string(directory.join("cgroup.procs")).unwrap_or_default();
     let content = &stopped["result"]["structuredContent"];
     assert_eq!(content["status"], "stopped", "{stopped}");
-    let named = content["processes_exiting"]["processes"].as_array().map_or(0, Vec::len);
+    let named = content["processes_exiting"]["processes"]
+        .as_array()
+        .map_or(0, Vec::len);
     assert!(
         members.trim().is_empty() || named > 0,
         "session_stop answered stopped with processes still in {unit} and named none: {members:?}\n{stopped}"
