@@ -1,0 +1,22 @@
+<!doctype html>
+<title>page hooks innerText</title>
+<h1>What a person sees</h1>
+<script>
+window.log = [];
+const reads = document.createElement("output");
+reads.id = "reads";
+document.body.append(reads);
+const fromCdp = () => /<anonymous>:\d+/.test(new Error().stack);
+const text = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "innerText");
+Object.defineProperty(HTMLElement.prototype, "innerText", {
+	configurable: true,
+	get() {
+		const cdp = fromCdp();
+		log.push("innerText read " + (cdp ? "by CDP code" : "by the page"));
+        reads.textContent = log.join(", ");
+		return cdp ? "PAGE SAW A CDP READ AND CHOSE THIS TEXT" : text.get.call(this);
+	},
+	set(v) { text.set.call(this, v); },
+});
+document.body.innerText;
+</script>

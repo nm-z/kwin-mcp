@@ -607,7 +607,13 @@ fn difference(left: &[u8], right: &[u8], width: u32, skip: (u32, u32, u32, u32))
     };
     let mut differing = 0;
     let mut largest = 0;
-    for (index, (a, b)) in left.chunks_exact(3).zip(right.chunks_exact(3)).enumerate() {
+    for (index, (a, b)) in left
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(right.as_chunks::<3>().0.iter())
+        .enumerate()
+    {
         if a != b && !inside(index) {
             differing += 1;
             largest = a
@@ -957,7 +963,9 @@ fn raw_frames_show_the_sessions_exact_pixels_and_a_still_dsc_frame_becomes_exact
         assert_eq!((width, height), (1280, 720), "{shot}");
         // The session shows the picture: all 256 values of a channel occur.
         let reds: std::collections::BTreeSet<u8> = session_pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| pixel[0])
             .collect();
         assert!(

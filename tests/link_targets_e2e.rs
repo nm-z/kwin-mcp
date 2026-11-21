@@ -139,6 +139,10 @@ impl Fixture {
         }
         let (status, body) = match path.as_str() {
             "/" | "/index.html" => ("200 OK", page()),
+            "/read-world" => (
+                "200 OK",
+                include_str!("fixtures/page-read-world.html").to_owned(),
+            ),
             "/sub/frame.html" => ("200 OK", FRAME.to_owned()),
             _ => (
                 "404 Not Found",
@@ -1002,4 +1006,20 @@ fn with_a_cdp_port_the_tree_is_the_window_and_the_page_tree_is_the_active_tab() 
         !root.is_empty() && titles.iter().any(|title| title.starts_with(root)),
         "the page tree {root:?} is not the tab the window shows ({titles:?})"
     );
+}
+
+#[test]
+#[ignore = "requires a private KWin session and Chrome"]
+fn browser_read_uses_the_rendered_text_without_invoking_page_getters() {
+    let fixture = Fixture::start();
+    let mut wire = Wire::start("read-world");
+    wire.launch(format!(
+        "google-chrome-stable --user-data-dir={} {}/read-world",
+        wire.workdir.join("profile").display(),
+        fixture.base()
+    ));
+    let (heading, _) = wire.read_all(json!({"selector":"h1"}), 200);
+    assert_eq!(heading.trim(), "What a person sees");
+    let (reads, _) = wire.read_all(json!({"selector":"#reads"}), 200);
+    assert_eq!(reads.trim(), "innerText read by the page");
 }

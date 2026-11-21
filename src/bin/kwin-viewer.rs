@@ -5106,7 +5106,7 @@ fn copy_as_bgrx(
     }
     out.resize(row * h, 0);
     if matches!(fmt, F::RGBA | F::RGBx) {
-        for pixel in out.chunks_exact_mut(4) {
+        for pixel in out.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }
@@ -5356,7 +5356,9 @@ mod wire_tests {
         );
         assert_eq!(second.as_ptr(), address);
         let swapped: Vec<u8> = rows
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
             .collect();
         assert_eq!(second, swapped);

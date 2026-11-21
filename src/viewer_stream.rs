@@ -1214,7 +1214,11 @@ impl Scaler {
                     for (byte, sum) in mean.iter_mut().zip(sums.iter()) {
                         *byte = (sum + WEIGHT_ONE / 2).to_le_bytes()[1];
                     }
-                    for (pixel, tap) in out_row.chunks_exact_mut(BYTES_PER_PIXEL).zip(&columns.taps)
+                    for (pixel, tap) in out_row
+                        .as_chunks_mut::<BYTES_PER_PIXEL>()
+                        .0
+                        .iter_mut()
+                        .zip(&columns.taps)
                     {
                         let weights = columns.weights.get(tap.weights.clone()).unwrap_or(&[]);
                         let start = tap.first * BYTES_PER_PIXEL;
@@ -1222,8 +1226,9 @@ impl Scaler {
                             .get(start..start + weights.len() * BYTES_PER_PIXEL)
                             .unwrap_or(&[]);
                         let mut sum = [u32::from(WEIGHT_ONE / 2); BYTES_PER_PIXEL];
-                        for (weight, sample) in
-                            weights.iter().zip(samples.chunks_exact(BYTES_PER_PIXEL))
+                        for (weight, sample) in weights
+                            .iter()
+                            .zip(samples.as_chunks::<BYTES_PER_PIXEL>().0.iter())
                         {
                             for (sum, channel) in sum.iter_mut().zip(sample) {
                                 *sum += u32::from(*weight) * u32::from(*channel);
@@ -1285,8 +1290,10 @@ pub fn pack_rgb(
                     return;
                 };
                 for (rgb, bgrx) in packed
-                    .chunks_exact_mut(RAW_BYTES_PER_PIXEL)
-                    .zip(line.chunks_exact(BYTES_PER_PIXEL))
+                    .as_chunks_mut::<RAW_BYTES_PER_PIXEL>()
+                    .0
+                    .iter_mut()
+                    .zip(line.as_chunks::<BYTES_PER_PIXEL>().0.iter())
                 {
                     rgb[0] = bgrx[2];
                     rgb[1] = bgrx[1];
@@ -1319,8 +1326,10 @@ pub fn unpack_rgb(
             let at = first_row * width * RAW_BYTES_PER_PIXEL;
             let Some(source) = rgb.get(at..) else { return };
             for (rgba, rgb) in band
-                .chunks_exact_mut(BYTES_PER_PIXEL)
-                .zip(source.chunks_exact(RAW_BYTES_PER_PIXEL))
+                .as_chunks_mut::<BYTES_PER_PIXEL>()
+                .0
+                .iter_mut()
+                .zip(source.as_chunks::<RAW_BYTES_PER_PIXEL>().0.iter())
             {
                 rgba[0] = rgb[0];
                 rgba[1] = rgb[1];
