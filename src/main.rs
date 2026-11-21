@@ -10343,7 +10343,7 @@ async fn capture_source_inner(
     if matches!(format, 16..=18) {
         let row_bytes = usize::try_from(u64::from(width) * 4).map_err(KwinError::from)?;
         for row in pixels.chunks_exact_mut(usize::try_from(stride).map_err(KwinError::from)?) {
-            for pixel in row[..row_bytes].chunks_exact_mut(4) {
+            for pixel in row[..row_bytes].as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
         }
@@ -13399,6 +13399,9 @@ impl LevelTree {
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 struct ScreenshotParams {
+    /// Capture the entire composited display. Mutually exclusive with region and cursor.
+    #[serde(default)]
+    full: bool,
     /// Crop region [x1, y1, x2, y2] in window-relative pixels (the same space
     /// as mouse input). It may extend past the window edges, e.g. negative
     /// values to include a popup; it is clamped to the screen. Omit to capture
@@ -14509,6 +14512,29 @@ impl CdpSlot {
     }
 }
 
+async fn isolated_context(
+    page: &chromiumoxide::Page,
+    name: &str,
+) -> Result<chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId, String> {
+    use chromiumoxide::cdp::browser_protocol::page::{
+        CreateIsolatedWorldParams, GetFrameTreeParams,
+    };
+    let tree = page
+        .execute(GetFrameTreeParams::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    let world = CreateIsolatedWorldParams::builder()
+        .frame_id(tree.result.frame_tree.frame.id.clone())
+        .world_name(name)
+        .build()?;
+    Ok(page
+        .execute(world)
+        .await
+        .map_err(|error| error.to_string())?
+        .result
+        .execution_context_id)
+}
+
 /// The committed entry of a tab, from the browser process: it answers while the
 /// page is busy or navigating.
 async fn cdp_entry(page: &chromiumoxide::Page) -> Option<(String, String)> {
@@ -14527,18 +14553,33 @@ async fn cdp_entry(page: &chromiumoxide::Page) -> Option<(String, String)> {
     Some((entry.url.clone(), entry.title.clone()))
 }
 
+async fn read_in_isolated_world(
+    page: &chromiumoxide::Page,
+    script: impl Into<String>,
+) -> Result<chromiumoxide::js::EvaluationResult, String> {
+    let context = isolated_context(page, "kwin-mcp browser_read").await?;
+    let mut run = chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::new(script);
+    run.context_id = Some(context);
+    page.evaluate_expression(run)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Whether a tab is the one its window shows.
 async fn cdp_tab_visible(page: &chromiumoxide::Page) -> bool {
-    tokio::time::timeout(CDP_STEP_TIMEOUT, page.evaluate("document.visibilityState"))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .and_then(|value| {
-            value
-                .value()
-                .and_then(|value| value.as_str().map(str::to_owned))
-        })
-        .is_some_and(|state| state == "visible")
+    tokio::time::timeout(
+        CDP_STEP_TIMEOUT,
+        read_in_isolated_world(page, "document.visibilityState"),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|value| {
+        value
+            .value()
+            .and_then(|value| value.as_str().map(str::to_owned))
+    })
+    .is_some_and(|state| state == "visible")
 }
 
 /// Whether the browser behind the CDP connection is process `pid`, the client of
@@ -14797,6 +14838,8 @@ struct MouseDragParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct KeyboardTypeParams {
+    /// Set false to skip field read-back after KWin acknowledges typing, for example in a remote desktop canvas.
+    verify: Option<bool>,
     /// Timing multiplier. Default 1.0; larger values send input faster.
     speed: Option<f64>,
     text: String,
@@ -17768,7 +17811,7 @@ impl KwinMcp {
             test -S '{xdg_dir_str}/bus' || {{ echo 'container D-Bus daemon did not create its socket' >&2; exit 1; }}\n\
             export DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_dir_str}/bus'\n\
             touch '{xdg_dir_str}/dbus-ready'\n\
-            n=0; while [ ! -f '{xdg_dir_str}/bridge-ready' ] && [ $n -lt 300 ]; do sleep 0.05; n=$((n+1)); done\n\
+            while [ ! -f '{xdg_dir_str}/bridge-ready' ]; do sleep 0.05; done\n\
             {{ KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             kwin_wayland --virtual --xwayland --no-lockscreen --width {screen_w} --height {screen_h}; \
             echo $? > '{xdg_dir_str}/{KWIN_EXIT_FILE}'; }} &\n\
@@ -19645,7 +19688,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "screenshot",
-        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops; it defaults to false with save_as, else true. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. region and cursor are mutually exclusive. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute path of this server's machine, also for a remote session. Inline metadata always comes as JSON text; structured_metadata=true also puts it in structuredContent, for clients that still show the image then. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
+        description = "Capture the active window as a PNG written to the session workdir. Pixels are 1:1 and window-relative, the same space as mouse input: pixel (x,y) of a default screenshot is mouse_click (x,y), also for a non-maximized dialog. The active window identity and geometry are checked before and after capture; a changed or unavailable target returns a retryable error without an image, and success reports target_verification. The metadata names the captured window (id, title, display x/y, size) and, for a crop, region=[x1,y1,x2,y2], the window-relative rectangle the image covers (omitted when the image is the whole window); image pixel (px,py) is mouse_click (px+x1, py+y1). include_cursor appears only when false. Pass cursor=true for an image centered on the cursor. include_cursor=false omits both pointer layers without moving it, also for cursor crops; it defaults to false with save_as, else true. A screenshot within 1.5s of an input tool waits until the screen has been unchanged for 200ms, so it reflects input the app has already handled (settle.settled=false means the screen was still changing, e.g. an animation). Pass region=[x1,y1,x2,y2] in window-relative pixels to crop (it may extend past the window, e.g. negative values to include a popup outside a small dialog); prefer cropping when you know which area matters. full=true captures the whole display. Choose one of full, region or cursor. inline=true returns the PNG in the tool result (base64); the file on disk is written either way; save_as keeps a copy at a new absolute path of this server's machine, also for a remote session. Inline metadata always comes as JSON text; structured_metadata=true also puts it in structuredContent, for clients that still show the image then. With no active window, it waits up to 2 seconds for focus to land. Requires an open app (call launch_app first if needed).",
         annotations(read_only_hint = true)
     )]
     async fn screenshot(
@@ -19668,6 +19711,12 @@ impl KwinMcp {
         let conn = self.kwin_conn().await?;
         let kwin_unique = self.kwin_unique_name().await?;
         let xdg = self.host_xdg_dir().await?;
+        if params.full && (params.cursor || params.region.is_some()) {
+            return Err(McpError::invalid_params(
+                "full cannot be combined with region or cursor",
+                None,
+            ));
+        }
         if params.cursor && params.region.is_some() {
             return Err(McpError::invalid_params(
                 "region and cursor are mutually exclusive",
@@ -19867,7 +19916,11 @@ impl KwinMcp {
                 .unwrap_or(0)
                 .min(height)
         };
-        let (cx1, cy1, cx2, cy2) = (clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2));
+        let (cx1, cy1, cx2, cy2) = if params.full {
+            (0, 0, width, height)
+        } else {
+            (clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2))
+        };
         let cw = cx2.saturating_sub(cx1);
         let ch = cy2.saturating_sub(cy1);
         if cw == 0 || ch == 0 {
@@ -19996,7 +20049,18 @@ impl KwinMcp {
             remove_fields(&mut payload, &["include_cursor"]);
         }
         drop_empty_fields(&mut payload, &["saved_as"]);
-        if payload["region"] == serde_json::json!([0, 0, win_w, win_h]) {
+        if params.region.is_some() && (x1 < 0 || y1 < 0 || x2 > win_w || y2 > win_h) {
+            payload["extends_outside_window"] = serde_json::json!(true);
+        }
+        let clipped = params
+            .region
+            .is_some_and(|requested| requested != out_region);
+        if clipped {
+            payload["requested_region"] = serde_json::json!(params.region);
+            payload["clipped"] = serde_json::json!(true);
+        }
+        if !clipped && !params.full && payload["region"] == serde_json::json!([0, 0, win_w, win_h])
+        {
             remove_fields(&mut payload, &["region"]);
         }
         let mut popups_text = None;
@@ -20020,6 +20084,14 @@ impl KwinMcp {
             None => format!("{path_str} size={out_w}x{out_h}"),
             Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
         };
+        if clipped {
+            text.push_str(&format!(
+                "; clipped to window-relative region {out_region:?}"
+            ));
+        }
+        if (win_x, win_y) != (0, 0) {
+            text.push_str(&format!("; mouse coordinates are relative to the active window at screen ({win_x},{win_y}); image origin in mouse coordinates is ({origin_x},{origin_y})"));
+        }
         if let Some(popups) = popups_text {
             text = format!("{text}; {popups}");
         }
@@ -20914,12 +20986,18 @@ impl KwinMcp {
         drop(sent);
         drop(guard);
         self.mark_input().await;
-        Ok(structured_result(
-            &peer,
-            format!("clicked ({x},{y}) x{count}"),
-            serde_json::json!({"ok": true}),
-        )
-        .await)
+        let mut message = format!("clicked ({x},{y}) x{count}");
+        let mut data = serde_json::json!({"ok":true});
+        if x < 0 || y < 0 || f64::from(x) >= geometry.w || f64::from(y) >= geometry.h {
+            message.push_str(&format!(
+                " outside the active window at requested screen point ({ax},{ay})"
+            ));
+            data["inside_window"] = serde_json::json!(false);
+            data["window_id"] = serde_json::json!(geometry.id);
+            data["window_origin"] = serde_json::json!([wx, wy]);
+            data["screen_point"] = serde_json::json!([ax, ay]);
+        }
+        Ok(structured_result(&peer, message, data).await)
     }
 
     #[rmcp::tool(
@@ -20980,28 +21058,24 @@ impl KwinMcp {
             "bare": strip_query, "dedupe": dedupe,
         });
         let script = format!("{}({arguments})", include_str!("page_read.js").trim_end());
-        let evaluated = tokio::time::timeout(
-            PAGE_READ_TIMEOUT,
-            page.evaluate_expression(
-                chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::new(script),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            refuse(
-                "page_unresponsive",
-                format!(
-                    "the page did not hand over its content within {} seconds",
-                    PAGE_READ_TIMEOUT.as_secs()
-                ),
-            )
-        })?
-        .map_err(|error| {
-            refuse(
-                "cdp_failed",
-                format!("the page could not be read ({error})"),
-            )
-        })?;
+        let evaluated =
+            tokio::time::timeout(PAGE_READ_TIMEOUT, read_in_isolated_world(&page, script))
+                .await
+                .map_err(|_| {
+                    refuse(
+                        "page_unresponsive",
+                        format!(
+                            "the page did not hand over its content within {} seconds",
+                            PAGE_READ_TIMEOUT.as_secs()
+                        ),
+                    )
+                })?
+                .map_err(|error| {
+                    refuse(
+                        "cdp_failed",
+                        format!("the page could not be read ({error})"),
+                    )
+                })?;
         let read: serde_json::Value = evaluated
             .value()
             .and_then(serde_json::Value::as_str)
@@ -21057,9 +21131,6 @@ impl KwinMcp {
         peer: rmcp::Peer<rmcp::RoleServer>,
         Parameters(params): Parameters<BrowserEvalParams>,
     ) -> Result<CallToolResult, McpError> {
-        use chromiumoxide::cdp::browser_protocol::page::{
-            CreateIsolatedWorldParams, GetFrameTreeParams,
-        };
         use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, TimeDelta};
         let refuse = |reason: &str, detail: String| {
             McpError::invalid_params(
@@ -21098,20 +21169,7 @@ impl KwinMcp {
         // the next one's way, and the page's scripts see none of it.
         let failed = |error: &dyn std::fmt::Display| error.to_string();
         let evaluated = tokio::time::timeout(PAGE_READ_TIMEOUT, async {
-            let tree = page
-                .execute(GetFrameTreeParams::default())
-                .await
-                .map_err(|error| failed(&error))?;
-            let world = CreateIsolatedWorldParams::builder()
-                .frame_id(tree.result.frame_tree.frame.id.clone())
-                .world_name(PAGE_EVAL_WORLD)
-                .build()?;
-            let context = page
-                .execute(world)
-                .await
-                .map_err(|error| failed(&error))?
-                .result
-                .execution_context_id;
+            let context = isolated_context(&page, PAGE_EVAL_WORLD).await?;
             let guard = EvaluateParams::builder()
                 .expression(include_str!("page_eval_guard.js"))
                 .context_id(context)
@@ -22101,7 +22159,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_type",
-        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (editable fields or an inaccessible dialog's entry, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. Single-line browser text requires an observable editable target before sending; terminals, protected fields and editable fields whose text cannot be read are typed into and stay unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
+        description = "Type printable ASCII (letters, digits, standard punctuation, space, tab, newline) with paced key events into the focused field. Click or Tab into the target field first. Text goes in at the caret: text already in the field stays, and the result then has value_before, value_after and a warning; replace=true selects the field's text first (editable fields or an inaccessible dialog's entry, never a terminal). Waits for KWin to acknowledge all events, then verifies the complete expected text through focused-field accessibility or rich-text descendants when available. A rich-text value that AT-SPI cannot reconstruct is reported as unverified. unverified or pending_or_mismatched requires inspecting the field before sending or retrying, because retyping can duplicate delayed text. If keys were submitted but accessibility focus is on a non-editable control, the result is unverified because the keys may have reached the application. not_in_field is returned only when no characters were submitted; its warning names the focused control. For a remote canvas, verify=false permits typing without an observable field and skips read-back. By default single-line browser text requires an observable editable target; terminals, protected fields and editable fields whose text cannot be read are typed into and stay unverified. During typing, a changed or unobservable original focus/window cancels remaining keys and reports partial counts with retry_safe:false. Polling cannot prevent every key from reaching a newly focused surface. Tab/Return cannot be field-verified. For key combinations use keyboard_key. Non-ASCII input errors before any keys are sent. For fast UTF-8 or long input use keyboard_paste. keyboard_type is paced like a person, about 0.1 s per character and 45 s at most; raise speed to type faster. A terminal's text is unreadable through AT-SPI, so the result stays unverified: screenshot the terminal before pressing Return."
     )]
     async fn keyboard_type(
         &self,
@@ -22180,6 +22238,7 @@ impl KwinMcp {
         // A transient window of the browser (its GTK file chooser) is not web
         // content and exposes nothing to AT-SPI; it types unverified like any app.
         let needs_editable_target = chrome
+            && params.verify != Some(false)
             && !snapshot.transient
             && !params.text.is_empty()
             && !params.text.contains(['\t', '\n']);
@@ -22345,6 +22404,11 @@ impl KwinMcp {
         let acknowledgment_elapsed_ms = acknowledgment_started.elapsed().as_millis();
         let verification_started = std::time::Instant::now();
         let mut delivery = tokio::time::timeout(TYPING_VERIFICATION_TIMEOUT, async {
+            if params.verify == Some(false) {
+                return input_bridge::TextDelivery::unavailable(
+                    "field read-back was disabled by the caller".to_owned(),
+                );
+            }
             match receipt {
                 Ok(receipt) => receipt.confirm().await,
                 // A terminal or other inaccessible target can receive these key
@@ -22622,7 +22686,7 @@ impl KwinMcp {
 
     #[rmcp::tool(
         name = "keyboard_key",
-        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. A key that goes to a browser's address bar reports keyboard_focus=address_bar. Zoom shortcuts (ctrl with minus, plus, equal or 0) report view_changed and application_effect view_changed or view_unchanged (the zoom limit, or the page did not get the key). Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
+        description = "Press a key or combo in the focused window. Combos use modifier+key syntax (ctrl+shift+t, alt+F4, ctrl+minus); modifiers are ctrl, shift, alt, super. Keys are a single character or a name: Return, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, PageDown, arrows (Up/Down/Left/Right), F1-F12, NumLock, and punctuation names minus, plus, equal, comma, period, slash, backslash, semicolon, apostrophe, grave, bracketleft, bracketright. An invalid combo sends nothing. The response distinguishes KWin acknowledgement from the unverified application effect. Browser DevTools shortcuts carry an explicit inspection warning, even when browser chrome (not the page) has focus. Return with unconfirmed page focus reports a visible change when measurable. A key that goes to a browser's address bar reports keyboard_focus=address_bar. Zoom shortcuts (ctrl with minus, plus, equal or 0) report view_changed and application_effect view_changed or view_unchanged (the zoom limit, or the page did not get the key). Ctrl+V and Shift+Insert also report compositor acknowledgment and focused editable-value verification when session clipboard text is observable. Protected clipboard values are not read back. A verified value does not prove later form submission; inspect unverified or mismatched results before retrying. Use keyboard_type for text."
     )]
     async fn keyboard_key(
         &self,
@@ -22651,7 +22715,16 @@ impl KwinMcp {
             .map(|geometry| geometry.title.clone())
             .unwrap_or_default();
         let focus = browser_focus(&conn, &active_title).await;
-        let before_view = if zoom {
+        // Return also accepts browser-owned suggestions. Report visible feedback
+        // without reading the autofilled field or guessing what Chrome accepted.
+        let browser_return = focus == BrowserFocus::Elsewhere
+            && mods.is_empty()
+            && matches!(
+                params.key.trim().to_ascii_lowercase().as_str(),
+                "return" | "enter"
+            );
+        let compare_view = zoom || browser_return;
+        let before_view = if compare_view {
             view_fingerprint(&conn, &kwin_unique).await
         } else {
             None
@@ -22664,7 +22737,7 @@ impl KwinMcp {
                  Browser-level shortcuts can work even when the page lacks focus. \
                  Inspect a screenshot to confirm the actual browser state before retrying.",
             )
-        } else if focus == BrowserFocus::Elsewhere {
+        } else if focus == BrowserFocus::Elsewhere && !browser_return {
             Some(
                 "AT-SPI did not find page keyboard focus (it may be stale across matching browser windows). \
                  Browser chrome may have focus, but this does not prove the shortcut failed. \
@@ -22806,7 +22879,9 @@ impl KwinMcp {
         }
         // A zoom shortcut is checked by what it does to the screen: unchanged means
         // the zoom limit was reached or the page did not get the key.
-        if zoom && let Some(changed) = view_changed_since(&conn, &kwin_unique, before_view).await {
+        if compare_view
+            && let Some(changed) = view_changed_since(&conn, &kwin_unique, before_view).await
+        {
             data["view_changed"] = serde_json::json!(changed);
             data["application_effect"] = serde_json::json!(if changed {
                 "view_changed"

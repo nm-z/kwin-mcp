@@ -1736,7 +1736,7 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
     let background = pixel(&hidden_pixels, 0, 0);
     assert_eq!(background, pixel(&before_pixels, 0, 0));
     let mut colors = std::collections::BTreeMap::new();
-    for rgba in hidden_pixels.1.chunks_exact(4) {
+    for rgba in hidden_pixels.1.as_chunks::<4>().0.iter() {
         *colors.entry(rgba.to_vec()).or_insert(0usize) += 1;
     }
     let mut colors: Vec<_> = colors.into_iter().collect();
@@ -1747,8 +1747,10 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
     );
     let changed = before_pixels
         .1
-        .chunks_exact(4)
-        .zip(hidden_pixels.1.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(hidden_pixels.1.as_chunks::<4>().0.iter())
         .filter(|(before, after)| before != after)
         .count();
     assert!(
@@ -1758,8 +1760,10 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
     assert!(
         hidden_pixels
             .1
-            .chunks_exact(4)
-            .all(|rgba| rgba == background),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|rgba| *rgba == background),
         "cursor-free static body contains unexpected pixels"
     );
     // #854: a kept image must be clean by default, with both explicit
@@ -1870,8 +1874,10 @@ fn screenshot_can_omit_both_cursor_layers_without_moving_the_pointer() {
     assert!(
         decode_rgba(&zoom)
             .1
-            .chunks_exact(4)
-            .all(|rgba| rgba == background),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|rgba| *rgba == background),
         "cursor crop unexpectedly drew a pointer"
     );
     if let Some(proof) = std::env::var_os("KWIN_MCP_E2E_PROOF_DIR").map(PathBuf::from) {
@@ -8300,7 +8306,7 @@ fn save_session_image(client: &mut RpcClient, request: u64, session: &str, name:
     );
     let image = result["result"]["content"]
         .as_array()
-        .expect("screenshot content")
+        .unwrap_or_else(|| panic!("screenshot {name}: {result}"))
         .iter()
         .find(|item| item["type"] == "image")
         .expect("session screenshot");
@@ -10054,7 +10060,7 @@ fn viewer_titles_identify_sessions_and_update_reasons_in_private_desktop() {
 }
 
 #[test]
-#[ignore = "requires private KWin sessions, PipeWire, WirePlumber, and Vulkan"]
+#[ignore = "requires private KWin sessions, Konsole, PipeWire, WirePlumber, and Vulkan"]
 fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     assert_eq!(std::env::var("KWIN_MCP_E2E").as_deref(), Ok("1"));
     let mut desktop = RpcClient::start();
@@ -10066,6 +10072,20 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         json!({"width":800,"height":600}),
     );
     let host_id = session_handle(&host);
+    // A stalled viewer can fail before it maps its first buffer. Give the
+    // private host desktop a window so its pre-recovery image is capturable.
+    let launched = call_tool(
+        &mut desktop,
+        8,
+        "launch_app",
+        json!({
+            "session_id": host_id, "command": "konsole --separate -p tabtitle=Viewer-host"
+        }),
+    );
+    assert!(
+        launched["result"]["structuredContent"]["window"].is_string(),
+        "{launched}"
+    );
     let display = workdir(&host).join("wayland-0");
     assert!(display.exists());
     let mut client = RpcClient::start_with_env(&[(
@@ -10081,11 +10101,15 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     );
     let session = session_handle(&started);
     let path = workdir(&started);
-    call_tool(
+    let launched = call_tool(
         &mut client,
         3,
         "launch_app",
-        json!({"session_id":session,"command":"kdialog --title pipewire-recovery --inputbox 'Recovered private viewer'"}),
+        json!({"session_id":session,"command":"konsole --separate -p tabtitle=Recovered-viewer"}),
+    );
+    assert!(
+        launched["result"]["structuredContent"]["window"].is_string(),
+        "{launched}"
     );
     struct GraphMonitor(Child);
     impl Drop for GraphMonitor {
@@ -10128,19 +10152,18 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     let began = Instant::now();
     client.send(4,"tools/call",json!({"name":"viewer_open","arguments":{"session_id":session,"reason":"Verify the picture is visible"}}));
     let deadline = Instant::now() + Duration::from_secs(3);
+    // A suspended policy manager can block registry enumeration before
+    // PipeWire creates a stream. Both stages must surface a bounded failure.
     let node = loop {
-        let log = std::fs::read_to_string(path.join("viewer.log")).unwrap_or_default();
-        if log.contains("pw stream Unconnected -> Connecting")
-            && let Some(id) = log.lines().find_map(|line| {
-                line.strip_prefix("kwin-viewer: connected to pipewire node ")
-                    .and_then(|id| id.parse::<u64>().ok())
-            })
-        {
-            break id;
+        let state = std::fs::read(path.join("viewer-pipewire.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(node) = state.as_ref().and_then(|value| value["node_id"].as_u64()) {
+            break node;
         }
         assert!(
             Instant::now() < deadline,
-            "private stream did not reach Connecting: {log}"
+            "viewer did not reach the private graph: {state:?}"
         );
         thread::sleep(Duration::from_millis(20));
     };
@@ -10182,7 +10205,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         "kwin_wayland"
     );
     println!(
-        "Connecting target: live node {node}, serial {}, owner {}",
+        "Stalled target: live node {node}, serial {}, owner {}",
         props["object.serial"], owner["info"]["props"]["application.process.binary"]
     );
     let connecting: Value = serde_json::from_str(
@@ -10201,7 +10224,20 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         result["result"]["structuredContent"]["viewer"]["state"], "unavailable",
         "{result}"
     );
-    assert!(result.to_string().contains("Connecting"), "{result}");
+    let stalled: Value = serde_json::from_slice(
+        &std::fs::read(path.join("viewer-pipewire.json")).expect("last PipeWire state"),
+    )
+    .expect("PipeWire state JSON");
+    assert_eq!(stalled["node_id"], node);
+    let stage = stalled["state"].as_str().expect("PipeWire stage");
+    assert!(
+        matches!(
+            stage,
+            "listing the nodes of the session's PipeWire daemon" | "Connecting"
+        ),
+        "{stalled}"
+    );
+    assert!(result.to_string().contains(stage), "{result}");
     assert!(began.elapsed() < Duration::from_secs(8));
     let status: Value = serde_json::from_str(
         &std::fs::read_to_string(path.join("viewer-status.json")).expect("status file"),
@@ -10212,7 +10248,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
         status["detail"]
             .as_str()
             .expect("failure detail")
-            .contains("Connecting")
+            .contains(stage)
     );
     drop(resume);
     let ready = call_tool(
@@ -10256,7 +10292,7 @@ fn viewer_reports_stalled_pipewire_as_failed_and_recovers() {
     );
     desktop.stop_process();
     println!(
-        "PASS: live KWin node stalled while its policy manager was suspended; bounded unavailable/failed result with Connecting; retry presents a frame"
+        "PASS: live KWin node stalled while its policy manager was suspended; bounded unavailable/failed result with its PipeWire stage; retry presents a frame"
     );
 }
 

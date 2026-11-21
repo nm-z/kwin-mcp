@@ -895,7 +895,7 @@ fn a_panicking_job_is_reported_and_the_workers_carry_on() -> Result<(), StreamEr
 fn solid(width: usize, height: usize, stride: usize, pixel: [u8; 4]) -> Vec<u8> {
     let mut data = vec![0xEEu8; stride * height];
     for row in data.chunks_exact_mut(stride) {
-        for target in row[..width * 4].chunks_exact_mut(4) {
+        for target in row[..width * 4].as_chunks_mut::<4>().0.iter_mut() {
             target.copy_from_slice(&pixel);
         }
     }
@@ -953,7 +953,7 @@ fn scaling_keeps_flat_colour_exact_and_ignores_row_padding_and_threads() -> Resu
             usize::try_from(target.0 * target.1 * 4).unwrap_or(0)
         );
         assert!(
-            one.chunks_exact(4).all(|scaled| scaled == pixel),
+            one.as_chunks::<4>().0.iter().all(|scaled| *scaled == pixel),
             "{target:?}"
         );
         assert_eq!(one, many, "{target:?}");
@@ -996,7 +996,12 @@ fn raw_pixels_drop_the_padding_byte_and_come_back_as_rgba() -> Result<(), Stream
     let mut source = vec![0xEEu8; stride * height];
     let mut expected = Vec::new();
     for (row, line) in source.chunks_exact_mut(stride).enumerate() {
-        for (column, pixel) in line[..width * 4].chunks_exact_mut(4).enumerate() {
+        for (column, pixel) in line[..width * 4]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             let value = u8::try_from(row * 16 + column).unwrap_or(0);
             // Blue, green, red, padding: the layout KWin delivers.
             pixel.copy_from_slice(&[value, value + 100, value + 200, 0]);

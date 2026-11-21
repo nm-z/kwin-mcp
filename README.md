@@ -698,6 +698,8 @@ restores the caller's credentials before launching the server.
 
 All coordinates are window-relative — window position is added internally via KWin scripting. `screenshot` returns the active window by default, so a pixel read off the image is the `mouse_click` coordinate even for a small dialog away from the display origin; a cropped screenshot reports `region=[x1,y1,x2,y2]` and its pixel (px,py) is `mouse_click` (px+x1, py+y1).
 
+With a dialog active, pass `full=true` to capture the whole display. An explicit crop that crosses the window boundary reports `extends_outside_window`. If the display edge clips it, `requested_region` preserves the request and `region` gives the pixels returned. An outside `mouse_click` reports the requested screen point and the original window.
+
 Screenshots check the active window identity and geometry before and after the frame is captured. A changed target returns `capture_target_changed` with `expected_window` and `observed_window`; if the target cannot be read afterward, the reason is `capture_target_unavailable`. Neither failure returns or saves an image. Inspect `window_list`, activate the intended window, and capture again. Successful metadata records `target_verification.method=active_window_before_and_after` and the final observation. These two observations detect a different or moved target at the end of capture; they do not establish that focus never briefly changed and returned between observations.
 
 ### Serial devices

@@ -1364,9 +1364,8 @@ fn code_units<V: Lanes>(
     let max_value = max_values::<V>();
     let rebuild =
         |prediction: V, quantized: V| prediction.add(quantized.mul(scale)).clamp(zero, max_value);
-    let predictions;
-    let residuals;
-    match pred {
+
+    let (predictions, residuals) = match pred {
         Pred::Map { a, c, b, d, e } => {
             let slope = a.sub(c);
             let (low, high) = (a.min(b), a.max(b));
@@ -1378,8 +1377,7 @@ fn code_units<V: Lanes>(
             let (low, high) = (low.min(e), high.max(e));
             let p2 = slope.add(e).add(q0.add(q1).mul(scale)).clamp(low, high);
             let q2 = residual(2, p2);
-            predictions = [p0, p1, p2];
-            residuals = [q0, q1, q2];
+            ([p0, p1, p2], [q0, q1, q2])
         }
         Pred::Left { a } => {
             let q0 = residual(0, a);
@@ -1387,18 +1385,17 @@ fn code_units<V: Lanes>(
             let q1 = residual(1, p1);
             let p2 = a.add(q0.add(q1).mul(scale)).clamp(zero, max_value);
             let q2 = residual(2, p2);
-            predictions = [a, p1, p2];
-            residuals = [q0, q1, q2];
+            ([a, p1, p2], [q0, q1, q2])
         }
-        Pred::Block(block) => {
-            predictions = block;
-            residuals = [
+        Pred::Block(block) => (
+            block,
+            [
                 residual(0, block[0]),
                 residual(1, block[1]),
                 residual(2, block[2]),
-            ];
-        }
-    }
+            ],
+        ),
+    };
     let rebuilt = [
         rebuild(predictions[0], residuals[0]),
         rebuild(predictions[1], residuals[1]),
@@ -1502,7 +1499,7 @@ impl Kernels for Scalar {
 fn row_to_ycocg<K: Kernels>(kernels: K, row: &[u8], red_first: bool, line: &mut [Pixel]) {
     let done = kernels.to_ycocg(row, red_first, line);
     let (red, blue) = if red_first { (0, 2) } else { (2, 0) };
-    let sources = row.chunks_exact(4).skip(done);
+    let sources = row.as_chunks::<4>().0.iter().skip(done);
     for (target, source) in line.iter_mut().skip(done).zip(sources) {
         *target = rgb_to_ycocg(source[red], source[1], source[blue]);
     }
@@ -1514,7 +1511,7 @@ fn row_to_ycocg<K: Kernels>(kernels: K, row: &[u8], red_first: bool, line: &mut 
 fn row_to_rgb<K: Kernels>(kernels: K, line: &[Pixel], red_first: bool, row: &mut [u8]) {
     let done = kernels.to_rgb(line, red_first, row);
     let (red, blue) = if red_first { (0, 2) } else { (2, 0) };
-    let targets = row.chunks_exact_mut(4).skip(done);
+    let targets = row.as_chunks_mut::<4>().0.iter_mut().skip(done);
     for (target, source) in targets.zip(line.iter().skip(done)) {
         let [r, g, b] = ycocg_to_rgb(*source);
         target[red] = r;
@@ -2961,8 +2958,8 @@ impl Core {
             return;
         }
         edge.fill(0);
-        for component in 0..3 {
-            let Some(current) = self.planes[component].get(PAD_LEFT..PAD_LEFT + pixels) else {
+        for (component, plane) in self.planes.iter().enumerate() {
+            let Some(current) = plane.get(PAD_LEFT..PAD_LEFT + pixels) else {
                 return;
             };
             let mid = sample(mid_value(component));
@@ -2973,8 +2970,8 @@ impl Core {
             }
         }
         pred.fill(0);
-        let has_edge = |flags: &[i16]| flags.iter().any(|flag| *flag != 0);
-        let mut edge_groups = edge.chunks_exact(BP_EDGE_COUNT);
+        let has_edge = |flags: &[i16; BP_EDGE_COUNT]| flags.iter().any(|flag| *flag != 0);
+        let mut edge_groups = edge.as_chunks::<BP_EDGE_COUNT>().0.iter();
         let Some(first_edge) = edge_groups.position(has_edge) else {
             return;
         };
@@ -4956,7 +4953,12 @@ mod tests {
         let mut squared = 0u64;
         let mut samples = 0u32;
         let mut max_error = 0u8;
-        for (a, b) in original.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+        for (a, b) in original
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(decoded.as_chunks::<4>().0.iter())
+        {
             for channel in 0..3 {
                 let error = a[channel].abs_diff(b[channel]);
                 max_error = max_error.max(error);
@@ -5191,7 +5193,12 @@ mod tests {
             .chunks_exact_mut(stride)
             .zip(bgrx.chunks_exact(width * 4))
         {
-            for (target, pixel) in row.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+            for (target, pixel) in row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source.as_chunks::<4>().0.iter())
+            {
                 target.copy_from_slice(&[pixel[2], pixel[1], pixel[0], 0x11]);
             }
         }
@@ -5225,8 +5232,13 @@ mod tests {
         let mut plain = vec![0u8; width * height * 4];
         decoder.decode(&from_bgrx, &mut plain, width * 4, PixelFormat::Bgrx)?;
         for (row, expected) in out.chunks_exact(stride).zip(plain.chunks_exact(width * 4)) {
-            for (pixel, wanted) in row.chunks_exact(4).zip(expected.chunks_exact(4)) {
-                assert_eq!(pixel, [wanted[2], wanted[1], wanted[0], 255]);
+            for (pixel, wanted) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(expected.as_chunks::<4>().0.iter())
+            {
+                assert_eq!(*pixel, [wanted[2], wanted[1], wanted[0], 255]);
             }
         }
         Ok(())
@@ -5359,7 +5371,7 @@ mod tests {
         assert_eq!(info.color_type, png::ColorType::Rgba);
         assert_eq!(info.bit_depth, png::BitDepth::Eight);
         pixels.truncate(info.buffer_size());
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.swap(0, 2);
         }
         Ok(pixels)
@@ -5710,7 +5722,7 @@ mod tests {
             let (width, height) = (size(item.width), size(item.height));
             let ppm = |pixels: &[u8]| {
                 let mut file = format!("P6\n{width} {height}\n255\n").into_bytes();
-                for pixel in pixels.chunks_exact(4) {
+                for pixel in pixels.as_chunks::<4>().0.iter() {
                     file.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
                 }
                 file
@@ -6016,8 +6028,13 @@ mod tests {
                 // Converting back gives the row again, padding byte 255.
                 let mut back = vec![1u8; length * 4];
                 row_to_rgb(kernels, &line, red_first, &mut back);
-                for (pixel, original) in back.chunks_exact(4).zip(row.chunks_exact(4)) {
-                    assert_eq!(pixel, [original[0], original[1], original[2], 255]);
+                for (pixel, original) in back
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(row.as_chunks::<4>().0.iter())
+                {
+                    assert_eq!(*pixel, [original[0], original[1], original[2], 255]);
                 }
                 // Any reconstructed samples, also ones no picture produces.
                 let line: Vec<Pixel> = (0..length)
