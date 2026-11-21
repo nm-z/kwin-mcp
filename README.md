@@ -91,20 +91,36 @@ needs no dialog at all.
 For an active dialog, modal, or transient window, `screenshot` compares the
 composited image with a separate KWin `CaptureWindow` reference before returning
 an image. The comparison uses the opaque client interior, excluding a 97-pixel
-square around each sampled cursor position and an eight-pixel border. Success includes `transient_pixel_check` with the
+square around each sampled cursor position, an eight-pixel border, and the
+dialog's own popups (below). Success includes `transient_pixel_check` with the
 reference window ID and pixel counts. Qt's native-word and byte-ordered 32-bit
 capture formats are normalized before comparison and PNG encoding.
 
-If the dialog disappears, its identity or geometry changes, its pixels differ,
-or a sufficient opaque interior cannot be compared, the tool returns
-`transient_capture_unverified` without an image. Wait at least the reported
-`retry_after_ms` and observe again. `settle.settled` alone only describes an
-unchanging sequence of frames; it cannot prove that a dialog was drawn.
+If the dialog disappears, its identity or geometry changes, or its pixels
+differ, the tool returns `transient_capture_unverified` without an image. Wait
+at least the reported `retry_after_ms` and observe again. When too little opaque
+interior is left to compare (a translucent dialog, or one its own popups cover),
+the image is returned with `transient_pixel_check.status` `not_comparable`; the
+identity and geometry checks still apply. `settle.settled` alone only describes
+an unchanging sequence of frames; it cannot prove that a dialog was drawn.
 
-The returned image still comes from the composited screen so it can include
-popups and regions extending outside the client window. A changing or
-translucent dialog, or a popup covering its interior, can therefore require a
-retry. The reference comparison does not prove that application content is
+The returned image still comes from the composited screen, so it includes
+popups and regions extending outside the client window. A dropdown, menu or
+other popup that the dialog opened is part of what it shows
+([#983](https://github.com/nm-z/kwin-mcp/issues/983)). `window_list` lists a
+Wayland popup (`popup`, `transientFor`), but under X11 a dropdown is often an
+override-redirect window that KWin lists nowhere and links to no window, as in
+wxWidgets applications such as Bambu Studio. The dialog's own surfaces are the
+shown windows stacked above it that are transient for it (directly or through
+other popups), popups of its parent windows, and override-redirect windows of
+its own process. Their rectangles, with 32 pixels around each for a shadow, are
+left out of the comparison (`popup_excluded_pixels`), and `popups` gives each
+one's frame as a window-relative `region` with its `id`, or `unlisted: true`
+when `window_list` does not show it. The default image is still the dialog; to
+see a popup that hangs past it, pass its region (or one covering both) as
+`region`. A window of another program over the dialog is not part of it and
+still fails the comparison. A changing or translucent dialog can still require
+a retry. The reference comparison does not prove that application content is
 semantically up to date.
 
 ## Large accessibility trees

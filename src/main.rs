@@ -2032,6 +2032,11 @@ const TRANSIENT_MISMATCH_PERCENT: u64 = 1;
 const TRANSIENT_CHANNEL_TOLERANCE: u8 = 2;
 // How long screenshot recaptures a dialog missing from the composited screen.
 const TRANSIENT_CAPTURE_WAIT: Duration = Duration::from_secs(2);
+// Pixels around a dialog's own popup that the popup's shadow can darken on the
+// screen, where the dialog's window capture has no shadow. GTK draws its shadow
+// inside the popup's buffer; KWin draws a Breeze popup's outside it, up to some
+// 30 pixels at the largest shadow size.
+const TRANSIENT_POPUP_SHADOW: f64 = 32.0;
 // A click that closes one window leaves KWin without an active window until
 // the next one maps and takes focus; screenshot waits this long for one.
 const ACTIVE_WINDOW_WAIT: Duration = Duration::from_secs(2);
@@ -10181,14 +10186,153 @@ fn frame_pixel(frame: &Frame, x: u32, y: u32) -> Result<&[u8], String> {
         .ok_or_else(|| "capture buffer is incomplete".to_owned())
 }
 
+/// What a dialog shows over itself: the shown windows stacked above `target`
+/// (`stack` runs from bottom to top) that belong to it. Those are a window
+/// transient for it, directly or through others (a submenu of its dropdown), a
+/// popup whose owner, the first window up its transient chain that is no
+/// popup, is one of the target's parents, and an override-redirect window of
+/// the target's own process, which KWin links to no window (a wxWidgets
+/// dropdown under X11, #983). Any other window over the dialog is not its own.
+fn own_surfaces<'a>(stack: &'a [StackedWindow], target: &str) -> Vec<&'a StackedWindow> {
+    let listed = |id: &str| {
+        stack
+            .iter()
+            .position(|window| window.id == id)
+            .and_then(|at| stack.get(at))
+    };
+    // The windows up `window`'s transient chain, nearest first, until a cycle.
+    let parents = |window: &StackedWindow| {
+        let mut chain: Vec<&StackedWindow> = Vec::new();
+        let mut next = window.transient_for.as_deref().and_then(listed);
+        while let Some(parent) = next {
+            if parent.id == window.id || chain.iter().any(|seen| seen.id == parent.id) {
+                break;
+            }
+            chain.push(parent);
+            next = parent.transient_for.as_deref().and_then(listed);
+        }
+        chain
+    };
+    let popup_like = |window: &StackedWindow| window.popup || !window.managed;
+    let Some(at) = stack.iter().position(|window| window.id == target) else {
+        return Vec::new();
+    };
+    let Some((dialog, above)) = stack.get(at..).and_then(<[StackedWindow]>::split_first) else {
+        return Vec::new();
+    };
+    let ancestors = parents(dialog);
+    above
+        .iter()
+        .filter(|window| window.shown)
+        .filter(|window| {
+            let chain = parents(window);
+            if chain.iter().any(|parent| parent.id == dialog.id) {
+                return true;
+            }
+            if !popup_like(window) {
+                return false;
+            }
+            match chain.iter().position(|parent| !popup_like(parent)) {
+                Some(owner) => chain
+                    .get(owner)
+                    .is_some_and(|owner| ancestors.iter().any(|parent| parent.id == owner.id)),
+                None => {
+                    chain.is_empty()
+                        && !window.managed
+                        && window.pid > 0
+                        && window.pid == dialog.pid
+                }
+            }
+        })
+        .collect()
+}
+
+/// `[x1, y1, x2, y2]` from x, y, width, height, out to whole pixels.
+#[expect(clippy::as_conversions)]
+fn pixel_rect([x, y, width, height]: [f64; 4]) -> [i64; 4] {
+    [
+        x.floor() as i64,
+        y.floor() as i64,
+        (x + width).ceil() as i64,
+        (y + height).ceil() as i64,
+    ]
+}
+
+/// The screen rectangle a dialog's own `surface` and its shadow can cover,
+/// which the dialog's window capture cannot show.
+fn own_surface_area(surface: &StackedWindow) -> [i64; 4] {
+    let [x, y, width, height] = surface.frame;
+    let [bx, by, b_width, b_height] = surface.buffer;
+    let left = x.min(bx) - TRANSIENT_POPUP_SHADOW;
+    let top = y.min(by) - TRANSIENT_POPUP_SHADOW;
+    let right = (x + width).max(bx + b_width) + TRANSIENT_POPUP_SHADOW;
+    let bottom = (y + height).max(by + b_height) + TRANSIENT_POPUP_SHADOW;
+    pixel_rect([left, top, right - left, bottom - top])
+}
+
+/// A dialog's own popup as screenshot reports it.
+struct OwnPopup {
+    /// Its frame `[x1, y1, x2, y2]` relative to the dialog's client origin, the
+    /// space of mouse input and of a crop region.
+    region: [i64; 4],
+    /// Its window_list ID; None for an override-redirect window, which
+    /// window_list does not list.
+    id: Option<String>,
+}
+
+impl OwnPopup {
+    fn of(surface: &StackedWindow, origin: (i32, i32)) -> Self {
+        let [x1, y1, x2, y2] = pixel_rect(surface.frame);
+        let (left, top) = (i64::from(origin.0), i64::from(origin.1));
+        Self {
+            region: [x1 - left, y1 - top, x2 - left, y2 - top],
+            id: surface.managed.then(|| surface.id.clone()),
+        }
+    }
+
+    fn report(&self) -> serde_json::Value {
+        match &self.id {
+            Some(id) => serde_json::json!({"region": self.region, "id": id}),
+            None => serde_json::json!({"region": self.region, "unlisted": true}),
+        }
+    }
+}
+
+/// The screenshot text for a dialog's own popups, given the window-relative
+/// rectangle the image covers.
+fn own_popups_text(popups: &[OwnPopup], image: [i32; 4]) -> String {
+    let regions: Vec<String> = popups
+        .iter()
+        .map(|popup| serde_json::json!(popup.region).to_string())
+        .collect();
+    let [left, top, right, bottom] = image.map(i64::from);
+    let cut = popups.iter().any(|popup| {
+        let [x1, y1, x2, y2] = popup.region;
+        x1 < left || y1 < top || x2 > right || y2 > bottom
+    });
+    let mut text = format!(
+        "the dialog's own popups over it, window-relative: {}",
+        regions.join(", ")
+    );
+    if cut {
+        text.push_str(
+            "; part lies outside this image, so pass a region that covers it to see it whole",
+        );
+    }
+    text
+}
+
 /// Compare only the opaque client interior. A native window capture excludes
 /// separately composited popups; it is a verification reference, not our output.
+/// `own_areas` are screen rectangles `[x1, y1, x2, y2]` of the dialog's own
+/// popups (`own_surface_area`), which the comparison leaves out.
 fn compare_transient_capture(
     composite: &Frame,
     reference: &Frame,
     client_origin: (i32, i32),
     client_size: (u32, u32),
     cursor_positions: &[(i32, i32)],
+    own_areas: &[[i64; 4]],
 ) -> Result<serde_json::Value, String> {
     if (reference.0, reference.1) != client_size {
         return Err(format!(
@@ -10200,6 +10344,7 @@ fn compare_transient_capture(
     let inset_y = 8_u32.min(reference.1 / 4);
     let mut visible = 0_u64;
     let mut excluded = 0_u64;
+    let mut popup_excluded = 0_u64;
     let mut compared = 0_u64;
     let mut mismatches = 0_u64;
     let mut screen_translucent = 0_u64;
@@ -10217,6 +10362,14 @@ fn compare_transient_capture(
                 (sx - i64::from(*cx)).abs() <= 48 && (sy - i64::from(*cy)).abs() <= 48
             }) {
                 excluded += 1;
+                continue;
+            }
+            // The dialog's own dropdown is on the screen, not in its capture.
+            if own_areas
+                .iter()
+                .any(|[x1, y1, x2, y2]| (*x1..*x2).contains(&sx) && (*y1..*y2).contains(&sy))
+            {
+                popup_excluded += 1;
                 continue;
             }
             let a = frame_pixel(
@@ -10253,15 +10406,17 @@ fn compare_transient_capture(
     let counts = serde_json::json!({
         "reference_method":"CaptureWindow", "compared_pixels":compared,
         "mismatching_pixels":mismatches, "visible_interior_pixels":visible,
-        "cursor_excluded_pixels":excluded, "screen_alpha_below_255":screen_translucent,
+        "cursor_excluded_pixels":excluded, "popup_excluded_pixels":popup_excluded,
+        "screen_alpha_below_255":screen_translucent,
         "window_alpha_below_255":reference_translucent,
         "mismatch_samples":samples, "client_origin":[client_origin.0, client_origin.1], "client_size":[client_size.0, client_size.1],
     });
-    let eligible = visible.saturating_sub(excluded);
+    let eligible = visible.saturating_sub(excluded + popup_excluded);
     let required = (eligible - eligible / 5).max(1_024.min(visible));
     if compared < required {
-        // A translucent window cannot be checked this way; the target identity
-        // check still applies, so return the image and say it is unverified.
+        // A translucent window, or one its own popups cover, cannot be checked
+        // this way; the target identity check still applies, so return the
+        // image and say it is unverified.
         let mut evidence = counts;
         evidence["status"] = serde_json::json!("not_comparable");
         evidence["required_pixels"] = serde_json::json!(required);
@@ -11783,6 +11938,15 @@ fn viewer_summary(report: &serde_json::Value) -> String {
     }
 }
 
+/// A KWin script statement that sets `active` to the active window as
+/// `WindowGeometry` reads it, or to null when no window is active.
+const ACTIVE_WINDOW_SCRIPT: &str = "var w = workspace.activeWindow;\
+     var c = workspace.cursorPos;\
+     var active = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
+     w:w.clientGeometry.width,h:w.clientGeometry.height,\
+     title:w.caption,id:w.internalId.toString(),pid:w.pid,\
+     transient:w.transient === true,cx:c.x,cy:c.y} : null;";
+
 async fn active_window_info(
     conn: &zbus::Connection,
     kwin_unique: &str,
@@ -11792,12 +11956,7 @@ async fn active_window_info(
         conn,
         kwin_unique,
         host_xdg_dir,
-        "var w = workspace.activeWindow;\
-         var c = workspace.cursorPos;\
-         var result = w ? {x:w.clientGeometry.x,y:w.clientGeometry.y,\
-         w:w.clientGeometry.width,h:w.clientGeometry.height,\
-         title:w.caption,id:w.internalId.toString(),pid:w.pid,\
-         transient:w.transient === true,cx:c.x,cy:c.y} : null;",
+        &format!("{ACTIVE_WINDOW_SCRIPT}var result = active;"),
     )
     .await?;
     if json == "null" {
@@ -11807,6 +11966,68 @@ async fn active_window_info(
     #[expect(clippy::as_conversions)]
     let (x, y) = (info.x.round() as i32, info.y.round() as i32);
     Ok((x, y, info))
+}
+
+/// A window in KWin's stacking order as screenshot's dialog check reads it.
+/// The order also holds what window_list leaves out: an X11 application's
+/// override-redirect popups are no managed windows.
+#[derive(Clone, Debug, Deserialize)]
+struct StackedWindow {
+    id: String,
+    /// The owning process as KWin sees it; zero or less when unknown.
+    pid: i32,
+    managed: bool,
+    popup: bool,
+    #[serde(rename = "transientFor")]
+    transient_for: Option<String>,
+    /// Neither minimized nor hidden.
+    shown: bool,
+    /// Frame geometry: x, y, width, height.
+    frame: [f64; 4],
+    /// Buffer geometry, which also holds a client-side shadow.
+    buffer: [f64; 4],
+}
+
+/// The active window and KWin's stacking order from bottom to top, read in one
+/// script so that the windows over the active one are those over it then.
+async fn active_window_and_stack(
+    conn: &zbus::Connection,
+    kwin_unique: &str,
+    host_xdg_dir: &std::path::Path,
+) -> Result<(WindowGeometry, Vec<StackedWindow>), KwinError> {
+    #[derive(Deserialize)]
+    struct ActiveAndStack {
+        active: Option<WindowGeometry>,
+        stack: Vec<StackedWindow>,
+    }
+    let json = run_kwin_script(
+        conn,
+        kwin_unique,
+        host_xdg_dir,
+        &format!(
+            "{ACTIVE_WINDOW_SCRIPT}\
+             var stack = [];\
+             var windows = workspace.stackingOrder;\
+             for (var i = 0; i < windows.length; ++i) {{\
+               var s = windows[i];\
+               if (s.deleted) continue;\
+               var f = s.frameGeometry, b = s.bufferGeometry;\
+               stack.push({{\
+                 id:s.internalId.toString(),pid:s.pid,managed:s.managed,popup:s.popupWindow,\
+                 transientFor:s.transientFor ? s.transientFor.internalId.toString() : null,\
+                 shown:!s.minimized && s.hidden !== true,\
+                 frame:[f.x,f.y,f.width,f.height],buffer:[b.x,b.y,b.width,b.height]\
+               }});\
+             }}\
+             var result = {{active:active,stack:stack}};"
+        ),
+    )
+    .await?;
+    let read: ActiveAndStack = serde_json::from_str(&json)?;
+    let active = read
+        .active
+        .ok_or_else(|| KwinError::Msg(NO_ACTIVE_WINDOW.to_owned()))?;
+    Ok((active, read.stack))
 }
 
 /// The active window, waiting up to `ACTIVE_WINDOW_WAIT` while focus is
@@ -18947,9 +19168,17 @@ impl KwinMcp {
                     transient_capture_error(&win_geo.id, "independent dialog capture timed out")
                 })?
                 .map_err(|error| transient_capture_error(&win_geo.id, error.message.to_string()))?;
-                let (_, _, after) = active_window_info(&conn, &kwin_unique, &xdg)
+                // The dialog's own dropdowns and menus, read after both
+                // captures: one that closed since shows in neither, and one
+                // that opened since only leaves more of the dialog unchecked.
+                let (after, stack) = active_window_and_stack(&conn, &kwin_unique, &xdg)
                     .await
                     .map_err(|error| transient_capture_error(&win_geo.id, error.to_string()))?;
+                let own = own_surfaces(&stack, &win_geo.id);
+                let own_areas: Vec<[i64; 4]> = own
+                    .iter()
+                    .map(|surface| own_surface_area(surface))
+                    .collect();
                 if after.id != win_geo.id
                     || [after.x, after.y, after.w, after.h]
                         != [win_geo.x, win_geo.y, win_geo.w, win_geo.h]
@@ -18974,13 +19203,18 @@ impl KwinMcp {
                         u32::try_from(win_h).map_err(KwinError::from)?,
                     ),
                     &cursors,
+                    &own_areas,
                 );
                 pixels = composite.3;
                 match compared {
                     Ok(mut evidence) => {
                         evidence["reference_window_id"] = serde_json::json!(win_geo.id);
                         evidence["captures"] = serde_json::json!(attempts);
-                        break Some(evidence);
+                        let popups: Vec<OwnPopup> = own
+                            .iter()
+                            .map(|surface| OwnPopup::of(surface, (win_x, win_y)))
+                            .collect();
+                        break Some((evidence, popups));
                     }
                     Err(detail) if tokio::time::Instant::now() >= deadline => {
                         return Err(transient_capture_error(
@@ -19155,8 +19389,13 @@ impl KwinMcp {
         if payload["region"] == serde_json::json!([0, 0, win_w, win_h]) {
             remove_fields(&mut payload, &["region"]);
         }
-        if let Some(evidence) = transient_pixel_check {
+        let mut popups_text = None;
+        if let Some((evidence, popups)) = transient_pixel_check {
             payload["transient_pixel_check"] = evidence;
+            if !popups.is_empty() {
+                payload["popups"] = popups.iter().map(OwnPopup::report).collect();
+                popups_text = Some(own_popups_text(&popups, out_region));
+            }
         }
         if let Some(settle) = &settle {
             payload["settle"] = serde_json::json!({
@@ -19171,6 +19410,9 @@ impl KwinMcp {
             None => format!("{path_str} size={out_w}x{out_h}"),
             Some(error) => format!("inline only, file not saved ({error}) size={out_w}x{out_h}"),
         };
+        if let Some(popups) = popups_text {
+            text = format!("{text}; {popups}");
+        }
         // The capture matched the active window, but show desktop hides it.
         if showing_desktop(&conn, &kwin_unique).await.unwrap_or(false) {
             payload["showing_desktop"] = serde_json::json!(true);
@@ -31857,7 +32099,10 @@ mod input_log_path_tests {
 
 #[cfg(test)]
 mod transient_capture_tests {
-    use super::compare_transient_capture;
+    use super::{
+        OwnPopup, StackedWindow, compare_transient_capture, own_popups_text, own_surface_area,
+        own_surfaces,
+    };
 
     fn frame(fill: impl Fn(u32, u32) -> [u8; 4]) -> super::Frame {
         let (w, h) = (200_u32, 200_u32);
@@ -31881,7 +32126,8 @@ mod transient_capture_tests {
                 [170, 128, 48, 255]
             }
         });
-        let compared = compare_transient_capture(&composite, &reference, (0, 0), (200, 200), &[]);
+        let compared =
+            compare_transient_capture(&composite, &reference, (0, 0), (200, 200), &[], &[]);
         assert!(compared.is_ok(), "{compared:?}");
         // Other content under the dialog's identity still fails.
         let parent = frame(|_, y| {
@@ -31891,7 +32137,162 @@ mod transient_capture_tests {
                 [170, 128, 48, 255]
             }
         });
-        assert!(compare_transient_capture(&parent, &reference, (0, 0), (200, 200), &[]).is_err());
+        assert!(
+            compare_transient_capture(&parent, &reference, (0, 0), (200, 200), &[], &[]).is_err()
+        );
+    }
+
+    /// A window in KWin's stacking order with a 100x80 frame at (x, y).
+    fn stacked(id: &str, pid: i32, parent: Option<&str>, x: f64, y: f64) -> StackedWindow {
+        StackedWindow {
+            id: id.to_owned(),
+            pid,
+            managed: true,
+            popup: false,
+            transient_for: parent.map(str::to_owned),
+            shown: true,
+            frame: [x, y, 100.0, 80.0],
+            buffer: [x, y, 100.0, 80.0],
+        }
+    }
+
+    fn popup(id: &str, pid: i32, parent: Option<&str>) -> StackedWindow {
+        StackedWindow {
+            popup: true,
+            ..stacked(id, pid, parent, 20.0, 30.0)
+        }
+    }
+
+    fn override_redirect(id: &str, pid: i32) -> StackedWindow {
+        StackedWindow {
+            managed: false,
+            ..stacked(id, pid, None, 20.0, 30.0)
+        }
+    }
+
+    #[test]
+    fn a_dropdown_over_its_dialog_is_left_out_of_the_comparison() {
+        // #983: the dialog's dropdown is on the screen, not in the dialog's capture.
+        let reference = frame(|_, _| [46, 125, 50, 255]);
+        let dropdown = |x: u32, y: u32| (60..140).contains(&x) && (90..190).contains(&y);
+        let composite = frame(|x, y| {
+            if dropdown(x, y) {
+                [255, 0, 255, 255]
+            } else {
+                [46, 125, 50, 255]
+            }
+        });
+        let refused =
+            compare_transient_capture(&composite, &reference, (0, 0), (200, 200), &[], &[]);
+        assert!(refused.is_err(), "{refused:?}");
+        let mut menu = override_redirect("menu", 7);
+        menu.frame = [60.0, 90.0, 80.0, 100.0];
+        menu.buffer = menu.frame;
+        let area = own_surface_area(&menu);
+        assert_eq!(area, [28, 58, 172, 222], "frame and its shadow margin");
+        let compared =
+            compare_transient_capture(&composite, &reference, (0, 0), (200, 200), &[], &[area]);
+        let evidence = compared.unwrap_or_else(|detail| panic!("{detail}"));
+        assert_eq!(evidence["status"], "matches_window_capture");
+        assert_eq!(evidence["mismatching_pixels"], 0);
+        assert!(
+            evidence["popup_excluded_pixels"].as_u64() > Some(0),
+            "{evidence}"
+        );
+        // The parent's pixels under the dialog's identity still fail outside it.
+        let parent = frame(|x, y| {
+            if dropdown(x, y) {
+                [255, 0, 255, 255]
+            } else {
+                [30, 30, 30, 255]
+            }
+        });
+        assert!(
+            compare_transient_capture(&parent, &reference, (0, 0), (200, 200), &[], &[area])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_client_side_shadow_outside_the_frame_is_left_out() {
+        // GTK draws a menu's shadow in its buffer, around the frame KWin lists.
+        let mut menu = popup("menu", 7, Some("dialog"));
+        menu.frame = [100.0, 100.0, 50.0, 40.0];
+        menu.buffer = [90.0, 94.0, 70.0, 60.0];
+        assert_eq!(own_surface_area(&menu), [58, 62, 192, 186]);
+    }
+
+    #[test]
+    fn a_dialogs_own_popups_are_those_it_or_its_process_opened() {
+        let stack = [
+            stacked("main", 7, None, 0.0, 0.0),
+            override_redirect("under", 7),
+            stacked("dialog", 7, Some("main"), 10.0, 10.0),
+            // window_list lists these: an xdg_popup, a submenu of it, a child window.
+            popup("menu", 7, Some("dialog")),
+            popup("submenu", 7, Some("menu")),
+            stacked("child", 7, Some("dialog"), 40.0, 40.0),
+            // A popup of the dialog's parent: a tooltip of the main window.
+            popup("tooltip", 7, Some("main")),
+            // An X11 dropdown: override-redirect, linked to nothing (#983).
+            override_redirect("wx", 7),
+            // Not the dialog's: another program's, a sibling dialog and its menu.
+            override_redirect("stranger", 8),
+            stacked("sibling", 7, Some("main"), 30.0, 30.0),
+            popup("sibling-menu", 7, Some("sibling")),
+            stacked("other", 8, None, 0.0, 0.0),
+            StackedWindow {
+                shown: false,
+                ..popup("minimized-child", 7, Some("dialog"))
+            },
+            // A process KWin does not know is no match for an unknown one.
+            override_redirect("unknown", 0),
+        ];
+        let own: Vec<&str> = own_surfaces(&stack, "dialog")
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect();
+        assert_eq!(own, ["menu", "submenu", "child", "tooltip", "wx"]);
+        let unknown = [
+            stacked("dialog", 0, None, 0.0, 0.0),
+            override_redirect("x", 0),
+        ];
+        assert!(own_surfaces(&unknown, "dialog").is_empty());
+        assert!(own_surfaces(&stack, "gone").is_empty());
+        // A transient cycle ends the walk instead of looping.
+        let cycle = [
+            stacked("dialog", 7, Some("loop-b"), 0.0, 0.0),
+            popup("loop-a", 7, Some("loop-b")),
+            popup("loop-b", 7, Some("loop-a")),
+        ];
+        assert!(own_surfaces(&cycle, "dialog").is_empty());
+    }
+
+    #[test]
+    fn a_popup_is_reported_window_relative_with_its_listing() {
+        let mut wx = override_redirect("wx", 7);
+        wx.frame = [520.0, 448.0, 240.0, 220.0];
+        let mut menu = popup("{menu}", 7, Some("dialog"));
+        menu.frame = [400.5, 250.0, 240.0, 190.0];
+        let popups = [
+            OwnPopup::of(&wx, (380, 190)),
+            OwnPopup::of(&menu, (380, 190)),
+        ];
+        assert_eq!(
+            popups.iter().map(OwnPopup::report).collect::<Vec<_>>(),
+            [
+                serde_json::json!({"region": [140, 258, 380, 478], "unlisted": true}),
+                serde_json::json!({"region": [20, 60, 261, 250], "id": "{menu}"}),
+            ]
+        );
+        let text = own_popups_text(&popups, [0, 0, 520, 420]);
+        assert!(
+            text.contains("[140,258,380,478], [20,60,261,250]"),
+            "{text}"
+        );
+        assert!(text.contains("pass a region"), "{text}");
+        let inside = own_popups_text(&popups[1..], [0, 0, 520, 420]);
+        assert!(!inside.contains("pass a region"), "{inside}");
     }
 }
 
