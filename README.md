@@ -153,7 +153,7 @@ Both tools report the same objects, and a name copied from one works in the othe
 
 ## Browser CDP
 
-`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port, on the profile the command opens:
+The `launch_app` description lists the browser commands installed on the machine of the server the client talks to, and names that machine. `session_start` returns those of the machine the session runs on as `browsers`, which differ for a session started with `host` (#986). Chromium-family commands receive the session's forwarded CDP port, on the profile the command opens:
 
 ```text
 google-chrome-stable https://example.com/
@@ -169,7 +169,9 @@ Chrome 136 and later, and Edge, [ignore remote-debugging switches for the defaul
 
 Should a later Chrome resolve that symlink and refuse the port, `launch_app` reports `cdp_refused` once; after the browser is closed and launched again, the session gives it a default directory with no profile in it, which also opens the port (checked on Chrome 156 and, headless, on Edge 157), at the cost that a browser started by that browser without `--user-data-dir` gets a new profile.
 
-Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
+A Chromium-family command whose browser the session's machine has under none of its names runs the first Chromium-family browser that machine has, in the order Chrome, Chromium, Brave, Vivaldi, Edge (#986): on a `--listen` host with Chromium alone, `google-chrome-stable https://example.com/` opens Chromium. The browser that runs gets its own handling (data directory, last used profile, CDP port), and `launch_app` names it in its text and in `browser_substitute` (`requested`, `ran`). `code`, `codium`, `vscodium` and `electron` are never replaced. A machine without any Chromium-family browser still answers such a command with status 127, and the result then lists that machine's browser commands in `browsers`.
+
+Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, or one of them ran in place of the command's browser, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
 
 ## Resize a maximized session window
 

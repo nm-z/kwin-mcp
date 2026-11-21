@@ -4452,6 +4452,7 @@ fn compact_launch_result(payload: &mut serde_json::Value) {
             "cdp_refused",
             "warning",
             "extension_warning",
+            "browser_substitute",
             "window_reused",
             "reuse_evidence",
             "window_observed_after_timeout",
@@ -11123,6 +11124,44 @@ const BROWSER_COMMANDS: &[&str] = &[
     "electron",
 ];
 
+/// Appended to a launch's browser marker path: the file in which the wrapper
+/// names the browser it ran in place of one the machine does not have (#986).
+const BROWSER_SUBSTITUTE_MARK: &str = ".substitute";
+
+/// A browser the wrapper ran in place of the one a launch named, which the
+/// session's machine has under none of its names (#986).
+#[derive(Serialize)]
+struct BrowserSubstitute {
+    requested: String,
+    ran: String,
+}
+
+impl BrowserSubstitute {
+    /// What the wrapper wrote for launch `browser_marker`; the file is removed.
+    fn take(browser_marker: &Path) -> Option<Self> {
+        let mut path = browser_marker.as_os_str().to_owned();
+        path.push(BROWSER_SUBSTITUTE_MARK);
+        let text = std::fs::read_to_string(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        let text = text?;
+        let (requested, ran) = text.trim().split_once(' ')?;
+        Some(Self {
+            requested: requested.to_owned(),
+            ran: ran.to_owned(),
+        })
+    }
+
+    /// The launch result's note: the machine is the one this server runs on.
+    fn note(&self) -> String {
+        format!(
+            "{} is not installed on {}, so {} ran in its place",
+            self.requested,
+            local_host_name(),
+            self.ran
+        )
+    }
+}
+
 // Bash resolves the browser itself, so compound commands and wrappers need no
 // second shell parser in the MCP server.
 const BROWSER_WRAPPER: &str = r#"#!/usr/bin/env bash
@@ -11134,9 +11173,29 @@ if [[ -z $real ]]; then
   case "$name" in
     google-chrome|google-chrome-stable) alts="google-chrome-stable google-chrome" ;;
     chromium|chromium-browser) alts="chromium chromium-browser" ;;
+    brave|brave-browser) alts="brave brave-browser" ;;
+    vivaldi|vivaldi-stable) alts="vivaldi-stable vivaldi" ;;
+    microsoft-edge|microsoft-edge-stable|msedge) alts="microsoft-edge-stable microsoft-edge msedge" ;;
     *) alts= ;;
   esac
   for alt in $alts; do real=$(PATH="${PATH#*:}" command -v "$alt") && break || real=; done
+fi
+if [[ -z $real ]]; then
+  # A machine may have another browser of the family alone, such as a --listen
+  # host with Chromium for a caller whose machine has Chrome (#986). That one
+  # runs as itself; a file beside the marker tells launch_app which it was.
+  case "$name" in
+    code|codium|vscodium|electron) ;;
+    *)
+      for alt in @FALLBACK_BROWSERS@; do
+        real=$(PATH="${PATH#*:}" command -v "$alt") || continue
+        [[ -z ${KWIN_MCP_BROWSER_MARKER:-} ]] ||
+          printf '%s %s' "$name" "$alt" > "$KWIN_MCP_BROWSER_MARKER@SUBSTITUTE@" || true
+        name=$alt
+        break
+      done
+      ;;
+  esac
 fi
 [[ -n $real ]] || exit 127
 ozone=0 wallet=0 a11y=0 silent_debugger=0 test_type=0 custom_profile=0 profile_value=0
@@ -11388,9 +11447,18 @@ fn create_browser_wrappers(workdir: &Path) -> std::io::Result<PathBuf> {
     let last_profiles = std::env::var_os("HOME")
         .map(|home| last_profile_arms(Path::new(&home)))
         .unwrap_or_default();
+    // What runs in place of a browser the machine lacks (#986): the wrapped
+    // browsers among KNOWN_BROWSERS, in its order.
+    let fallback: Vec<&str> = KNOWN_BROWSERS
+        .iter()
+        .copied()
+        .filter(|name| BROWSER_COMMANDS.contains(name))
+        .collect();
     std::fs::write(
         &wrapper,
         BROWSER_WRAPPER
+            .replace("@FALLBACK_BROWSERS@", &fallback.join(" "))
+            .replace("@SUBSTITUTE@", BROWSER_SUBSTITUTE_MARK)
             .replace("@CONFIG_DIRS@", &config_dirs.join(" "))
             .replace("@CONFIG_STORE@", BROWSER_CONFIG_STORE)
             .replace("@UNLINKED@", BROWSER_CONFIG_UNLINKED)
@@ -18058,8 +18126,17 @@ impl KwinMcp {
                 ),
             })
         });
+        // This machine's browser commands. launch_app's description lists those
+        // of the machine whose server the client talks to, which for a session
+        // started with host is another one (#986).
+        let browsers = detect_browsers();
+        let browser_list = if browsers.is_empty() {
+            "none".to_owned()
+        } else {
+            browsers.join(",")
+        };
         let msg = format!(
-            "{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h}"
+            "{version_stamp} — session started bus={bus_name} kwin={kwin_unique_name} display={screen_w}x{screen_h} browsers={browser_list}"
         );
         let viewer = viewer_report(&host_xdg_dir, None, None);
         let msg = format!("{msg} {}", viewer_summary(&viewer));
@@ -18177,6 +18254,7 @@ impl KwinMcp {
             "host_loopback_warning": host_loopback_warning,
             "serial_devices": serial_devices::report(&serial),
             "serial_warning": serial_warning,
+            "browsers": browsers,
             "wallet": {
                 "mode": if wallet_snapshot.wallet.is_some() { "session-local copy" } else { "disabled" },
                 "entries": wallet_snapshot.wallet.as_ref().map_or(0, wallet_mediator::Wallet::entry_count),
@@ -22770,10 +22848,13 @@ impl KwinMcp {
                     .and_then(|text| text.trim().parse::<i32>().ok())
             };
             let warning = launch_wallet_warning(wallet_note, &params.command);
-            let suffix = warning
-                .as_deref()
+            let substitute = BrowserSubstitute::take(&browser_marker);
+            let suffix: String = substitute
+                .iter()
+                .map(BrowserSubstitute::note)
+                .chain(warning.clone())
                 .map(|text| format!(". {text}"))
-                .unwrap_or_default();
+                .collect();
             let pid_text = pid.map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"));
             let text = match exit_status {
                 Some(status) => format!(
@@ -22802,7 +22883,7 @@ impl KwinMcp {
                     "command_submitted": true, "retry_safe": false,
                     "pid": pid, "exit_status": exit_status,
                     "stdout_path": stdout_file, "stdout_tail": stdout_tail,
-                    "cdp": false, "warning": warning,
+                    "cdp": false, "warning": warning, "browser_substitute": substitute,
                 }),
             )
             .await;
@@ -22988,6 +23069,7 @@ impl KwinMcp {
             .and_then(|marker| DefaultProfilePort::from_marker(&marker));
         let cdp_requested = default_profile_port.is_some();
         let _ = std::fs::remove_file(&browser_marker);
+        let substitute = BrowserSubstitute::take(&browser_marker);
         let mut cdp_connected = false;
         let mut cdp_refused = None;
         if cdp_requested && win_geo.is_some() {
@@ -23027,7 +23109,13 @@ impl KwinMcp {
         // A Chromium-family browser without the wallet cannot decrypt the copied
         // profile's cookies and saved logins, so its sites show signed out.
         let warning = launch_wallet_warning(wallet_note, &params.command);
-        let extension_warning = requests_blocked_google_chrome_extension_load(&params.command)
+        // The browser that ran decides, which is another one when the wrapper
+        // ran it in place of a browser the machine lacks (#986).
+        let ran_command = substitute.as_ref().map_or_else(
+            || params.command.clone(),
+            |substitute| format!("{} {}", substitute.ran, params.command),
+        );
+        let extension_warning = requests_blocked_google_chrome_extension_load(&ran_command)
             .then(|| {
                 "warning: Google Chrome ignores --load-extension in its branded build; --disable-features=DisableLoadExtensionCommandLineSwitch does not restore command-line loading. Open chrome://extensions and use Load unpacked, or use unbranded Chromium.".to_owned()
             });
@@ -23048,7 +23136,11 @@ impl KwinMcp {
                 ". warning: KWin did not answer before or after submission, so a window reported here may predate the command"
             }
         };
-        let suffix = format!("{suffix}{baseline_note}");
+        let substitute_note = substitute
+            .as_ref()
+            .map(|substitute| format!(". {}", substitute.note()))
+            .unwrap_or_default();
+        let suffix = format!("{substitute_note}{suffix}{baseline_note}");
         // The call gives up here, but a command that is still running (or left
         // processes behind when it exited 0) may map its window yet. The launch
         // keeps waiting in the ledger, where window_list and the next launch_app
@@ -23124,7 +23216,7 @@ impl KwinMcp {
                     "window_title": geo.title, "reuse_evidence": reuse_evidence,
                     "cdp": cdp_connected, "cdp_port": cdp_connected.then_some(cdp_port),
                     "cdp_refused": cdp_refused, "warning": warning,
-                    "extension_warning": extension_warning,
+                    "extension_warning": extension_warning, "browser_substitute": substitute,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                 });
@@ -23138,6 +23230,26 @@ impl KwinMcp {
                     Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
                 };
                 let diagnostics = exit_diagnostics(sandbox_output, &command_paths);
+                // A browser this machine has under none of its names, with no
+                // member of the family to run in its place: the browsers it has,
+                // which launch_app's description may list for another machine (#986).
+                let browsers = (status == 127
+                    && substitute.is_none()
+                    && (chromium_launch
+                        || launch_program_name(&params.command)
+                            .is_some_and(|program| KNOWN_BROWSERS.contains(&program.as_str()))))
+                .then(detect_browsers);
+                let failure_note = match browsers.as_deref() {
+                    Some([]) => {
+                        format!(". {} has no known browser on its PATH", local_host_name())
+                    }
+                    Some(browsers) => format!(
+                        ". Installed browser commands on {}: {}",
+                        local_host_name(),
+                        browsers.join(", ")
+                    ),
+                    None => substitute_note,
+                };
                 let text = match status {
                     0 if browser_unattributed => format!(
                         "launched: {} (browser launch returned status 0, but no matching existing window could be attributed: {} after {}s){suffix}",
@@ -23158,11 +23270,11 @@ impl KwinMcp {
                         }
                     ),
                     127 => format!(
-                        "{} failed: command not found (exit status 127)",
+                        "{} failed: command not found (exit status 127){failure_note}",
                         params.command
                     ),
                     _ => format!(
-                        "{} exited with status {status} without opening a window",
+                        "{} exited with status {status} without opening a window{failure_note}",
                         params.command
                     ),
                 };
@@ -23191,7 +23303,7 @@ impl KwinMcp {
                     "window": if browser_unattributed { "unattributed" } else { "exited" },
                     "window_outcome": window_outcome,
                     "exit_status": status, "cdp": false, "cdp_port": null, "warning": warning,
-                    "extension_warning": extension_warning,
+                    "extension_warning": extension_warning, "browser_substitute": substitute,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
                     "window_snapshot": timeout_window_snapshot,
@@ -23209,6 +23321,9 @@ impl KwinMcp {
                         "reason": handoff_reason,
                         "candidate_windows": handoff_candidates,
                     });
+                }
+                if let Some(browsers) = browsers {
+                    payload["browsers"] = serde_json::json!(browsers);
                 }
                 let mut result = structured_result(&peer, text, payload).await;
                 result.is_error = Some(status != 0);
@@ -23267,6 +23382,7 @@ impl KwinMcp {
                     "action": "launch", "command": params.command, "window": "timeout",
                     "window_outcome": "timeout", "reason": reason,
                     "cdp": false, "cdp_port": null, "warning": warning, "extension_warning": extension_warning,
+                    "browser_substitute": substitute,
                     "stage": "waiting for a window", "command_submitted": true, "retry_safe": false,
                     "window_timeout_seconds": window_timeout.as_secs(),
                     "window_baseline": baseline.as_str(), "window_baseline_errors": baseline_errors,
@@ -23766,11 +23882,14 @@ fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<K
         }
     );
     if let Some(route) = tool_router.map.get_mut("launch_app") {
+        // Named, because a session started with host runs on another machine,
+        // whose browsers session_start returns (#986).
+        let host = local_host_name();
         let hint = if browsers.is_empty() {
-            "\n\nNo known browser was found on this host's PATH.".to_owned()
+            format!("\n\nNo known browser was found on {host}'s PATH.")
         } else {
             format!(
-                "\n\nInstalled browser commands: {}. Firefox supports launch, screenshots and input.",
+                "\n\nInstalled browser commands on {host}: {}. Firefox supports launch, screenshots and input.",
                 browsers.join(", ")
             )
         };
@@ -31781,7 +31900,196 @@ mod browser_alias_tests {
         let missing = run("brave")?;
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(String::from_utf8_lossy(&aliased.stdout).trim(), "stub-ran");
-        assert_eq!(missing.status.code(), Some(127));
+        // Brave is there under none of its names, so the browser of the family
+        // that is there runs in its place (#986).
+        assert_eq!(String::from_utf8_lossy(&missing.stdout).trim(), "stub-ran");
+        Ok(())
+    }
+}
+
+/// #986: a browser the machine has under none of its names runs as another
+/// browser of the family the machine has, which the wrapper names for
+/// launch_app.
+#[cfg(test)]
+mod browser_substitute_tests {
+    use super::{BrowserSubstitute, DefaultProfilePort, create_browser_wrappers};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// A machine whose PATH holds `browsers` alone, as stubs that print their
+    /// name and arguments, and the programs the wrapper runs: no directory of
+    /// the machine running the test, whose own browsers would answer.
+    struct Machine {
+        root: PathBuf,
+        bin: PathBuf,
+        stubs: PathBuf,
+    }
+
+    /// What one launch through the wrapper did.
+    struct Ran {
+        status: Option<i32>,
+        /// The stub's output: the browser that ran, then its arguments.
+        argv: Vec<String>,
+        marker: Option<DefaultProfilePort>,
+        substitute: Option<BrowserSubstitute>,
+    }
+
+    impl Ran {
+        fn program(&self) -> Option<&str> {
+            self.argv.first().map(String::as_str)
+        }
+
+        fn has(&self, argument: &str) -> bool {
+            self.argv.iter().any(|arg| arg == argument)
+        }
+
+        fn substitute(&self) -> Option<(&str, &str)> {
+            self.substitute
+                .as_ref()
+                .map(|substitute| (substitute.requested.as_str(), substitute.ran.as_str()))
+        }
+    }
+
+    impl Machine {
+        fn with(label: &str, browsers: &[&str]) -> std::io::Result<Self> {
+            let root =
+                std::env::temp_dir().join(format!("kwin-mcp-986-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("stubs"))?;
+            // Resolved, as the wrapper's realpath gives it.
+            let root = root.canonicalize()?;
+            let stubs = root.join("stubs");
+            for browser in browsers {
+                let stub = stubs.join(browser);
+                std::fs::write(&stub, "#!/bin/sh\necho \"${0##*/}\" \"$@\"\n")?;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            for tool in ["bash", "realpath", "mkdir", "ln", "readlink"] {
+                for directory in std::env::split_paths(&path) {
+                    let program = directory.join(tool);
+                    if program.is_file() {
+                        std::os::unix::fs::symlink(program, stubs.join(tool))?;
+                        break;
+                    }
+                }
+            }
+            let bin = create_browser_wrappers(&root)?;
+            Ok(Self { root, bin, stubs })
+        }
+
+        /// Runs `name` through the wrapper as launch_app does.
+        fn run(&self, name: &str) -> std::io::Result<Ran> {
+            let marker = self.root.join("browser-launch-0");
+            let output = std::process::Command::new(self.bin.join(name))
+                .arg("about:blank")
+                .env(
+                    "PATH",
+                    format!("{}:{}", self.bin.display(), self.stubs.display()),
+                )
+                .env("HOME", self.root.join("home"))
+                .env_remove("CHROME_CONFIG_HOME")
+                .env_remove("XDG_CONFIG_HOME")
+                .env("KWIN_MCP_CDP_PORT", "4321")
+                .env("KWIN_MCP_BROWSER_MARKER", &marker)
+                .output()?;
+            let written = std::fs::read(&marker).ok();
+            let _ = std::fs::remove_file(&marker);
+            Ok(Ran {
+                status: output.status.code(),
+                argv: String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+                marker: written.and_then(|text| DefaultProfilePort::from_marker(&text)),
+                substitute: BrowserSubstitute::take(&marker),
+            })
+        }
+    }
+
+    impl Drop for Machine {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The --listen host of the issue: Chromium alone, for a caller whose
+    /// description listed Chrome.
+    #[test]
+    fn a_browser_the_machine_lacks_runs_chromium_as_itself() -> std::io::Result<()> {
+        let machine = Machine::with("chromium", &["chromium"])?;
+        for requested in [
+            "google-chrome-stable",
+            "google-chrome",
+            "brave",
+            "microsoft-edge",
+        ] {
+            let ran = machine.run(requested)?;
+            assert_eq!(ran.status, Some(0), "{requested}");
+            assert_eq!(ran.program(), Some("chromium"), "{requested}");
+            assert_eq!(ran.substitute(), Some((requested, "chromium")));
+            // Chromium's own handling: the port on its default directory,
+            // without the data directory the wrapper gives Chrome.
+            assert!(ran.has("--remote-debugging-port=4321"), "{requested}");
+            assert!(ran.has("--no-first-run"), "{requested}");
+            assert!(ran.has("--ozone-platform=wayland"), "{requested}");
+            assert!(
+                !ran.argv
+                    .iter()
+                    .any(|arg| arg.starts_with("--user-data-dir"))
+            );
+            assert_eq!(ran.marker, Some(DefaultProfilePort::NotInvolved));
+        }
+        Ok(())
+    }
+
+    /// Chrome in place of Chromium gets what Chrome gets: the port on its
+    /// default profile through the linked config home.
+    #[test]
+    fn chrome_in_place_of_chromium_gets_the_port_on_its_default_profile() -> std::io::Result<()> {
+        let machine = Machine::with("chrome", &["google-chrome-stable"])?;
+        let ran = machine.run("chromium")?;
+        assert_eq!(ran.status, Some(0));
+        assert_eq!(ran.program(), Some("google-chrome-stable"));
+        assert_eq!(ran.substitute(), Some(("chromium", "google-chrome-stable")));
+        let profile = machine.root.join("home/.config/google-chrome");
+        assert!(ran.has(&format!("--user-data-dir={}", profile.display())));
+        assert!(ran.has("--remote-debugging-port=4321"));
+        assert_eq!(ran.marker, Some(DefaultProfilePort::Linked));
+        Ok(())
+    }
+
+    /// Nothing is replaced while the machine has the browser under another of
+    /// its names, and KNOWN_BROWSERS decides between the others.
+    #[test]
+    fn the_same_browser_under_another_name_is_no_substitute() -> std::io::Result<()> {
+        for (installed, requested) in [
+            ("brave-browser", "brave"),
+            ("vivaldi", "vivaldi-stable"),
+            ("microsoft-edge-stable", "msedge"),
+            ("chromium-browser", "chromium"),
+        ] {
+            let ran =
+                Machine::with("alias", &[installed, "google-chrome-stable"])?.run(requested)?;
+            assert_eq!(ran.program(), Some(installed), "{requested}");
+            assert_eq!(ran.substitute(), None, "{requested}");
+        }
+        let machine = Machine::with("order", &["brave-browser", "chromium"])?;
+        let ran = machine.run("google-chrome-stable")?;
+        assert_eq!(ran.substitute(), Some(("google-chrome-stable", "chromium")));
+        Ok(())
+    }
+
+    /// An editor is no browser to replace, and a machine without the family
+    /// still answers 127, which launch_app reports with the machine's browsers.
+    #[test]
+    fn editors_and_a_machine_without_the_family_still_exit_127() -> std::io::Result<()> {
+        let editor = Machine::with("editor", &["chromium"])?.run("code")?;
+        assert_eq!(editor.status, Some(127));
+        assert_eq!(editor.substitute(), None);
+        let bare = Machine::with("bare", &[])?.run("google-chrome-stable")?;
+        assert_eq!(bare.status, Some(127));
+        assert_eq!(bare.substitute(), None);
         Ok(())
     }
 }
