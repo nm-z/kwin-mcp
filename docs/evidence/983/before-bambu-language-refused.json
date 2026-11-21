@@ -1,0 +1,23 @@
+{
+  "error": {
+    "code": -32603,
+    "data": {
+      "detail": "13549 of 379967 opaque dialog pixels differ from the independent window capture ({\"client_origin\":[640,220],\"client_size\":[640,640],\"compared_pixels\":379967,\"cursor_excluded_pixels\":9409,\"mismatch_samples\":[{\"screen\":[79,72,72,255],\"window\":[49,45,45,255],\"x\":472,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":473,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":474,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":475,\"y\":114}],\"mismatching_pixels\":13549,\"reference_method\":\"CaptureWindow\",\"screen_alpha_below_255\":0,\"visible_interior_pixels\":389376,\"window_alpha_below_255\":0}); still differing after 30 captures",
+      "memory": {
+        "current_bytes": 1359368192,
+        "high_bytes": 6442450944,
+        "high_events": 0,
+        "pressure_full_avg10_percent": 0.0,
+        "swap_current_bytes": 0,
+        "swap_max_bytes": 2147483648
+      },
+      "reason": "transient_capture_unverified",
+      "retry_after_ms": 200,
+      "retry_safe": true,
+      "window_id": "{413fa137-616c-49b8-84fa-640c0c393577}"
+    },
+    "message": "screenshot: active dialog pixels could not be verified: 13549 of 379967 opaque dialog pixels differ from the independent window capture ({\"client_origin\":[640,220],\"client_size\":[640,640],\"compared_pixels\":379967,\"cursor_excluded_pixels\":9409,\"mismatch_samples\":[{\"screen\":[79,72,72,255],\"window\":[49,45,45,255],\"x\":472,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":473,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":474,\"y\":114},{\"screen\":[81,74,74,255],\"window\":[49,45,45,255],\"x\":475,\"y\":114}],\"mismatching_pixels\":13549,\"reference_method\":\"CaptureWindow\",\"screen_alpha_below_255\":0,\"visible_interior_pixels\":389376,\"window_alpha_below_255\":0}); still differing after 30 captures. Wait for the dialog to finish drawing and retry."
+  },
+  "id": 18,
+  "jsonrpc": "2.0"
+}

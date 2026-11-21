@@ -1,0 +1,64 @@
+{
+  "id": 18,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "/tmp/kwin-mcp-1147935-1/screenshot.png size=640x640; the dialog's own popups over it, window-relative: [472,114,616,532]",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "structuredContent": {
+      "height": 640,
+      "include_cursor": false,
+      "path": "/tmp/kwin-mcp-1147935-1/screenshot.png",
+      "popups": [
+        {
+          "region": [
+            472,
+            114,
+            616,
+            532
+          ],
+          "unlisted": true
+        }
+      ],
+      "settle": {
+        "settled": false,
+        "waited_ms": 73
+      },
+      "transient_pixel_check": {
+        "captures": 1,
+        "client_origin": [
+          640,
+          220
+        ],
+        "client_size": [
+          640,
+          640
+        ],
+        "compared_pixels": 287423,
+        "cursor_excluded_pixels": 9409,
+        "mismatch_samples": [],
+        "mismatching_pixels": 0,
+        "popup_excluded_pixels": 92544,
+        "reference_method": "CaptureWindow",
+        "reference_window_id": "{af276635-88b0-4ae3-bbab-4a28ef28a9cb}",
+        "screen_alpha_below_255": 0,
+        "status": "matches_window_capture",
+        "visible_interior_pixels": 389376,
+        "window_alpha_below_255": 0
+      },
+      "width": 640,
+      "window": {
+        "height": 640,
+        "id": "{af276635-88b0-4ae3-bbab-4a28ef28a9cb}",
+        "title": "Preferences",
+        "width": 640,
+        "x": 640,
+        "y": 220
+      }
+    }
+  }
+}

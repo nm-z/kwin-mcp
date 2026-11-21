@@ -91,20 +91,36 @@ needs no dialog at all.
 For an active dialog, modal, or transient window, `screenshot` compares the
 composited image with a separate KWin `CaptureWindow` reference before returning
 an image. The comparison uses the opaque client interior, excluding a 97-pixel
-square around each sampled cursor position and an eight-pixel border. Success includes `transient_pixel_check` with the
+square around each sampled cursor position, an eight-pixel border, and the
+dialog's own popups (below). Success includes `transient_pixel_check` with the
 reference window ID and pixel counts. Qt's native-word and byte-ordered 32-bit
 capture formats are normalized before comparison and PNG encoding.
 
-If the dialog disappears, its identity or geometry changes, its pixels differ,
-or a sufficient opaque interior cannot be compared, the tool returns
-`transient_capture_unverified` without an image. Wait at least the reported
-`retry_after_ms` and observe again. `settle.settled` alone only describes an
-unchanging sequence of frames; it cannot prove that a dialog was drawn.
+If the dialog disappears, its identity or geometry changes, or its pixels
+differ, the tool returns `transient_capture_unverified` without an image. Wait
+at least the reported `retry_after_ms` and observe again. When too little opaque
+interior is left to compare (a translucent dialog, or one its own popups cover),
+the image is returned with `transient_pixel_check.status` `not_comparable`; the
+identity and geometry checks still apply. `settle.settled` alone only describes
+an unchanging sequence of frames; it cannot prove that a dialog was drawn.
 
-The returned image still comes from the composited screen so it can include
-popups and regions extending outside the client window. A changing or
-translucent dialog, or a popup covering its interior, can therefore require a
-retry. The reference comparison does not prove that application content is
+The returned image still comes from the composited screen, so it includes
+popups and regions extending outside the client window. A dropdown, menu or
+other popup that the dialog opened is part of what it shows
+([#983](https://github.com/nm-z/kwin-mcp/issues/983)). `window_list` lists a
+Wayland popup (`popup`, `transientFor`), but under X11 a dropdown is often an
+override-redirect window that KWin lists nowhere and links to no window, as in
+wxWidgets applications such as Bambu Studio. The dialog's own surfaces are the
+shown windows stacked above it that are transient for it (directly or through
+other popups), popups of its parent windows, and override-redirect windows of
+its own process. Their rectangles, with 32 pixels around each for a shadow, are
+left out of the comparison (`popup_excluded_pixels`), and `popups` gives each
+one's frame as a window-relative `region` with its `id`, or `unlisted: true`
+when `window_list` does not show it. The default image is still the dialog; to
+see a popup that hangs past it, pass its region (or one covering both) as
+`region`. A window of another program over the dialog is not part of it and
+still fails the comparison. A changing or translucent dialog can still require
+a retry. The reference comparison does not prove that application content is
 semantically up to date.
 
 ## Large accessibility trees
@@ -137,7 +153,7 @@ Both tools report the same objects, and a name copied from one works in the othe
 
 ## Browser CDP
 
-`launch_app` lists the exact browser commands available on the host. Chromium-family commands receive the session's forwarded CDP port, on the profile the command opens:
+The `launch_app` description lists the browser commands installed on the machine of the server the client talks to, and names that machine. `session_start` returns those of the machine the session runs on as `browsers`, which differ for a session started with `host` (#986). Chromium-family commands receive the session's forwarded CDP port, on the profile the command opens:
 
 ```text
 google-chrome-stable https://example.com/
@@ -153,7 +169,9 @@ Chrome 136 and later, and Edge, [ignore remote-debugging switches for the defaul
 
 Should a later Chrome resolve that symlink and refuse the port, `launch_app` reports `cdp_refused` once; after the browser is closed and launched again, the session gives it a default directory with no profile in it, which also opens the port (checked on Chrome 156 and, headless, on Edge 157), at the cost that a browser started by that browser without `--user-data-dir` gets a new profile.
 
-Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
+A Chromium-family command whose browser the session's machine has under none of its names runs the first Chromium-family browser that machine has, in the order Chrome, Chromium, Brave, Vivaldi, Edge (#986): on a `--listen` host with Chromium alone, `google-chrome-stable https://example.com/` opens Chromium. The browser that runs gets its own handling (data directory, last used profile, CDP port), and `launch_app` names it in its text and in `browser_substitute` (`requested`, `ran`). `code`, `codium`, `vscodium` and `electron` are never replaced. A machine without any Chromium-family browser still answers such a command with status 127, and the result then lists that machine's browser commands in `browsers`.
+
+Google Chrome's branded builds ignore `--load-extension`. When `launch_app` sees that switch with `google-chrome` or `google-chrome-stable`, or one of them ran in place of the command's browser, it sets `extension_warning` in the result and explains the supported path: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the extension directory in the isolated session. Passing `--disable-features=DisableLoadExtensionCommandLineSwitch` does not restore command-line loading; use unbranded Chromium if command-line loading is required.
 
 ## Resize a maximized session window
 
@@ -191,7 +209,7 @@ kwin-mcp --listen 192.168.1.20 --autoclean --ttl 120
 
 To keep the listener running across reboots, install [`systemd/kwin-mcp-listen.service`](systemd/kwin-mcp-listen.service) as a user unit, put the address in `~/.config/kwin-mcp/listen.env` as `KWIN_MCP_LISTEN=192.168.1.20`, then run `systemctl --user enable --now kwin-mcp-listen` and, on a machine nobody logs in to, `loginctl enable-linger`. The unit holds no session alive: each session still ends with its owner's connection or its `--ttl`.
 
-`--listen ADDRESS[:PORT]` takes the IP address to bind (default port 47913) and serves kwin-mcp peers instead of an MCP client on stdio; the other options (`--ttl`, `--autoclean`, `--width`, memory limits) apply to the sessions it starts. `--keep-sessions` is rejected with it. `--link-mbps N` sets the link speed its viewer frames are budgeted against (see **Viewer** below).
+`--listen ADDRESS[:PORT]` takes the IP address to bind (default port 47913) and serves kwin-mcp peers instead of an MCP client on stdio; the other options (`--ttl`, `--autoclean`, `--width`/`--height`, memory limits) apply to the sessions it starts. Without `--width`/`--height` they are 1920x1080, as on a stdio server. `--keep-sessions` is rejected with it. `--link-mbps N` sets the link speed its viewer frames are budgeted against (see **Viewer** below).
 
 Then pass `host` to `session_start` on the local server: a hostname or IP address with an optional `:port`, for example `{"host": "sentry"}` or `{"host": "192.168.1.20:47913"}`. The local server connects to that listener (one connection per host, reused by later starts), and the listener starts the desktop as its own child process exactly as a local `session_start` does. The returned `session_id` is the listener's; every later call with it is routed over the socket and its result returned unchanged. `session_list` gives each session a `host`: this machine's hostname for local sessions, the `name:port` passed to `session_start` for remote ones.
 
@@ -591,7 +609,7 @@ kwin-mcp (host process)
   └── pasta private network namespace
         └── bwrap container (bubblewrap, overlayfs on $HOME)
               ├── dbus-daemon        (isolated session bus, anonymous auth)
-              ├── kwin_wayland       (virtual display 1000x1000, XWayland)
+              ├── kwin_wayland       (virtual display, XWayland)
               ├── pipewire + wireplumber
               ├── at-spi-bus-launcher
               └── uinput devices     (virtual mouse + keyboard, bind-mounted)
@@ -1175,9 +1193,9 @@ at original detail or request a narrow `region` crop before diagnosing a
 compositor failure. An inline image and its saved PNG can contain identical,
 correct pixels even when a client presents them differently (see #435).
 
-Virtual display is 2000×1875 (3.75MP). By default all windows open maximized. `session_start` with `window_mode: "native"` maps each window at the size its app requests instead, so a relaunched app reopens at its own size. Windows have no decorations or shadows in either mode. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
+The virtual display is 1920×1080 unless the server's `--width`/`--height` or `session_start`'s `width`/`height` give another size (`--no-override` keeps the server's). By default all windows open maximized. `session_start` with `window_mode: "native"` maps each window at the size its app requests instead, so a relaunched app reopens at its own size. Windows have no decorations or shadows in either mode. Font hinting disabled, grayscale antialiasing, 96 DPI, scale 1.0.
 
-Token cost: ~1 token per 750 pixels. A 2000×1875 screenshot costs ~5000 tokens.
+Token cost: ~1 token per 750 pixels. A 1920×1080 screenshot costs ~2800 tokens.
 
 ### Interrupted desktop control connections
 

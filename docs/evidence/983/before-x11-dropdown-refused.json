@@ -1,0 +1,23 @@
+{
+  "error": {
+    "code": -32603,
+    "data": {
+      "detail": "36863 of 194207 opaque dialog pixels differ from the independent window capture ({\"client_origin\":[380,190],\"client_size\":[520,420],\"compared_pixels\":194207,\"cursor_excluded_pixels\":9409,\"mismatch_samples\":[{\"screen\":[255,0,255,255],\"window\":[50,124,46,255],\"x\":140,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[49,123,45,255],\"x\":141,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[49,122,45,255],\"x\":142,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[48,121,44,255],\"x\":143,\"y\":258}],\"mismatching_pixels\":36863,\"reference_method\":\"CaptureWindow\",\"screen_alpha_below_255\":0,\"visible_interior_pixels\":203616,\"window_alpha_below_255\":0}); still differing after 15 captures",
+      "memory": {
+        "current_bytes": 161935360,
+        "high_bytes": 6442450944,
+        "high_events": 0,
+        "pressure_full_avg10_percent": 0.0,
+        "swap_current_bytes": 0,
+        "swap_max_bytes": 2147483648
+      },
+      "reason": "transient_capture_unverified",
+      "retry_after_ms": 200,
+      "retry_safe": true,
+      "window_id": "{50ab5bf3-46e7-4a7f-a603-e82dc15d84fe}"
+    },
+    "message": "screenshot: active dialog pixels could not be verified: 36863 of 194207 opaque dialog pixels differ from the independent window capture ({\"client_origin\":[380,190],\"client_size\":[520,420],\"compared_pixels\":194207,\"cursor_excluded_pixels\":9409,\"mismatch_samples\":[{\"screen\":[255,0,255,255],\"window\":[50,124,46,255],\"x\":140,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[49,123,45,255],\"x\":141,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[49,122,45,255],\"x\":142,\"y\":258},{\"screen\":[255,0,255,255],\"window\":[48,121,44,255],\"x\":143,\"y\":258}],\"mismatching_pixels\":36863,\"reference_method\":\"CaptureWindow\",\"screen_alpha_below_255\":0,\"visible_interior_pixels\":203616,\"window_alpha_below_255\":0}); still differing after 15 captures. Wait for the dialog to finish drawing and retry."
+  },
+  "id": 11,
+  "jsonrpc": "2.0"
+}
