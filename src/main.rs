@@ -11433,6 +11433,12 @@ case "$name" in
     # the requested URL, and its default-browser infobar shifts page content.
     (( first_run )) || flags+=(--no-first-run)
     (( default_check )) || flags+=(--no-default-browser-check)
+    # ANGLE on Vulkan (often forced from chrome-flags.conf) leaves WebGL canvases
+    # that pages composite themselves blank under the session's KWin: Goodnotes
+    # documents never drew while a plain WebGL clear did (#1003). ANGLE on
+    # OpenGL draws them. These follow the launcher's flags file, so they win
+    # over it, and come before the caller's arguments, which win over them.
+    flags+=(--use-angle=gl --disable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE)
     ;;
 esac
 # With two or more profiles a browser may open its profile picker, a window
